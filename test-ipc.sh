@@ -78,9 +78,9 @@ python3 -c "from PIL import Image" 2>/dev/null || { echo "test-ipc.sh: 需要 py
 
 mkdir -p "$CFGDIR/.config/vidow" "$RUNDIR/run"
 chmod 700 "$RUNDIR/run"
-cat > "$CFGDIR/.config/vidow/config" <<'EOF'
-scale = 1
-xwayland = 0
+cat > "$CFGDIR/.config/vidow/config.lua" <<'EOF'
+scale = "1"
+xwayland = false
 window_open_ms = 60
 window_move_ms = 60
 EOF
@@ -231,6 +231,10 @@ export VIDOW_CONFIG_LUA="$CFGDIR/.config/vidow/config.lua"
 # ------------------------------------------------------------ 1) 起来 + 版本
 mark "IPC 起来了：socket 在，版本能查"
 cat > "$CFGDIR/.config/vidow/config.lua" <<'EOF'
+scale = "1"
+xwayland = false
+window_open_ms = 60
+window_move_ms = 60
 for i = 1, 3 do vidow.workspace_create(tostring(i)) end
 vidow.workspace_special("scratch")
 vidow.bind("Mod+1", "workspace 1")

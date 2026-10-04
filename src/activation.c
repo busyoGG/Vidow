@@ -438,6 +438,18 @@ void vidow_activation_init(struct vidow_server *server) {
 		wlr_log(WLR_ERROR, "activation: 无法创建 xdg_activation_v1");
 		return;
 	}
+	vidow_activation_apply_config(server);
+}
+
+/* 配置落地后调（配置是 Lua，跑得比这里晚）：扫过期令牌的定时器按
+ * activation_token_timeout 重设一遍，两行策略日志也重打一次。判定本身
+ * （token_expired）每次都用当前配置，所以这里只需要跟上定时器。 */
+void vidow_activation_apply_config(struct vidow_server *server) {
+	if (server->activation_timer != NULL) {
+		wl_event_source_remove(server->activation_timer);
+		server->activation_timer = NULL;
+	}
+	server->activation_sweep_ms = 0;
 
 	int timeout = server->config.activation_token_timeout;
 	if (timeout > 0) {
@@ -449,7 +461,9 @@ void vidow_activation_init(struct vidow_server *server) {
 		struct wl_event_loop *loop = wl_display_get_event_loop(server->display);
 		server->activation_timer =
 			wl_event_loop_add_timer(loop, activation_sweep, server);
-		wl_event_source_timer_update(server->activation_timer, period);
+		if (server->activation_timer != NULL) {
+			wl_event_source_timer_update(server->activation_timer, period);
+		}
 	}
 
 	wlr_log(WLR_INFO, "activation: 激活令牌 %s（xdg-activation 自己实现）",

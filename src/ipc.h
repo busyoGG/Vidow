@@ -33,6 +33,9 @@ struct wlr_output;
 /* 建 socket、开始听（配置里 ipc = false 时什么都不做）。失败只打日志：IPC 坏了
  * 不该拦住合成器起来。 */
 bool vidow_ipc_init(struct vidow_server *server);
+/* 配置落地后调：按 ipc / ipc_socket 建、拆或换 socket。配置是 Lua，跑得比 IPC
+ * 初始化晚，所以这里得能对账（见 script.c 的 vidow_config_sync()）。 */
+bool vidow_ipc_apply_config(struct vidow_server *server);
 /* 关掉监听和所有连接（退出时调）。 */
 void vidow_ipc_finish(struct vidow_server *server);
 /* socket 路径（没起来的话是空串）。 */

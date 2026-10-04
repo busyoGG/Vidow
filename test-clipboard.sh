@@ -153,11 +153,11 @@ done
 
 mkdir -p "$CFGDIR/.config/vidow" "$RUNDIR/run"
 chmod 700 "$RUNDIR/run"
-cat > "$CFGDIR/.config/vidow/config" <<'EOF'
-scale = 1
-xwayland = 1
-clipboard = 1
-clipboard_primary = 1
+cat > "$CFGDIR/.config/vidow/config.lua" <<'EOF'
+scale = "1"
+xwayland = true
+clipboard = true
+clipboard_primary = true
 window_open_ms = 60
 window_move_ms = 60
 EOF

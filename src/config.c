@@ -1,3 +1,17 @@
+/* 配置系统。
+ *
+ * 配置文件只有一个，而且是 Lua（script.c 负责跑）：~/.config/vidow/config.lua。
+ * 这里管的是另外三件事：
+ *
+ *   1. 默认值（defaults()）—— 没有配置文件也要能跑；
+ *   2. 键表（entries[]）—— 键名 / 类型 / 范围，Lua 那边和 IPC 那边都靠它，
+ *      所以配置键不需要在 Lua 里声明一遍，写 `corner_radius = 12` 就生效；
+ *   3. 环境变量覆盖（VIDOW_<KEY>）—— 优先级最高，测试靠它。
+ *
+ * 文件的读取时机见 script.c：要等合成器起得来（输出、seat 都在了）才跑，
+ * 所以 `ipc` / `xwayland` 这类「启动时就消费掉」的键，配置落地后由
+ * vidow_config_sync() 再对一次账。
+ */
 #include "server.h"
 
 #include <ctype.h>
@@ -180,6 +194,55 @@ static bool apply(struct vidow_config *cfg, const char *key, const char *value) 
 	return false;
 }
 
+/* ------------------------------------------------------------ 文件位置 */
+
+/* 配置目录：$XDG_CONFIG_HOME/vidow，没设就是 ~/.config/vidow。 */
+void vidow_config_dir(char *buf, size_t size) {
+	const char *xdg = getenv("XDG_CONFIG_HOME");
+	if (xdg != NULL && xdg[0] == '/') {
+		snprintf(buf, size, "%s/vidow", xdg);
+		return;
+	}
+	const char *home = getenv("HOME");
+	snprintf(buf, size, "%s/.config/vidow", home != NULL ? home : ".");
+}
+
+/* 唯一的配置文件。$VIDOW_CONFIG 指哪读哪（$VIDOW_CONFIG_LUA 是旧名，还认）。 */
+void vidow_config_path(char *buf, size_t size) {
+	const char *override = getenv("VIDOW_CONFIG");
+	if (override == NULL || override[0] == '\0') {
+		override = getenv("VIDOW_CONFIG_LUA");
+	}
+	if (override != NULL && override[0] != '\0') {
+		snprintf(buf, size, "%s", override);
+		return;
+	}
+	char dir[PATH_MAX];
+	vidow_config_dir(dir, sizeof(dir));
+	snprintf(buf, size, "%s/config.lua", dir);
+}
+
+/* 配置统一成 Lua 之前那个 key = value 文件：还在的话喊一声，别让它悄悄失效
+ * （用户会以为 vidow 坏了）。只喊一次。 */
+static void warn_legacy_flat(void) {
+	static bool warned = false;
+	if (warned) {
+		return;
+	}
+	warned = true;
+	char dir[PATH_MAX - 16];
+	vidow_config_dir(dir, sizeof(dir));
+	char path[PATH_MAX];
+	snprintf(path, sizeof(path), "%s/config", dir);
+	FILE *f = fopen(path, "r");
+	if (f == NULL) {
+		return;
+	}
+	fclose(f);
+	wlr_log(WLR_ERROR, "config: %s 不再被读取了（配置已统一成 Lua）—— "
+		"把里面的键搬进 %s/config.lua，然后删掉这个文件", path, dir);
+}
+
 static void defaults(struct vidow_config *cfg) {
 	memset(cfg, 0, sizeof(*cfg));
 	cfg->force_render_hz = 60; /* 视口外补帧：跟屏幕刷新率差不多就够 */
@@ -275,11 +338,11 @@ static void defaults(struct vidow_config *cfg) {
 	cfg->portal_conf_sync = true;
 	snprintf(cfg->portal_desktop, sizeof(cfg->portal_desktop), "Vidow");
 
-	const char *home = getenv("HOME");
-	snprintf(cfg->shader_dir, sizeof(cfg->shader_dir), "%s/.config/vidow/shaders",
-		home != NULL ? home : ".");
+	/* 自定义 shader 的默认目录：跟着配置文件走（$XDG_CONFIG_HOME/vidow/shaders）。 */
+	char dir[PATH_MAX - 16];
+	vidow_config_dir(dir, sizeof(dir));
+	snprintf(cfg->shader_dir, sizeof(cfg->shader_dir), "%s/shaders", dir);
 }
-
 /* VIDOW_WINDOW_OPEN_MS=90 ./build/vidow — handy for tests. */
 void vidow_config_apply_env(struct vidow_config *cfg) {
 	char name[128];
@@ -425,54 +488,11 @@ void vidow_config_log(const struct vidow_config *cfg) {
 		cfg->shader_idle[0] ? cfg->shader_idle : "-");
 }
 
-void vidow_config_load(struct vidow_config *cfg) {
+/* 回到默认值，再压上环境变量。配置文件（Lua）跑之前、以及每次重载之前都调
+ * 这个 —— 重载等于「重新读一遍配置」，删掉的行才会真的消失。 */
+void vidow_config_reset(struct vidow_config *cfg) {
 	defaults(cfg);
-
-	const char *home = getenv("HOME");
-	const char *override = getenv("VIDOW_CONFIG");
-	char path[PATH_MAX];
-	if (override != NULL) {
-		snprintf(path, sizeof(path), "%s", override);
-	} else {
-		snprintf(path, sizeof(path), "%s/.config/vidow/config",
-			home != NULL ? home : ".");
-	}
-
-	FILE *f = fopen(path, "r");
-	if (f != NULL) {
-		char line[512];
-		int lineno = 0;
-		while (fgets(line, sizeof(line), f) != NULL) {
-			lineno++;
-			char *hash = strchr(line, '#');
-			if (hash != NULL) {
-				*hash = '\0';
-			}
-			char *eq = strchr(line, '=');
-			if (eq == NULL) {
-				continue;
-			}
-			*eq = '\0';
-			char *key = line;
-			char *value = eq + 1;
-			while (isspace((unsigned char)*key)) key++;
-			char *end = key + strlen(key);
-			while (end > key && isspace((unsigned char)end[-1])) *--end = '\0';
-			while (isspace((unsigned char)*value)) value++;
-			end = value + strlen(value);
-			while (end > value && isspace((unsigned char)end[-1])) *--end = '\0';
-			if (*key == '\0') {
-				continue;
-			}
-			if (!apply(cfg, key, value)) {
-				wlr_log(WLR_ERROR, "config %s:%d: unknown key '%s'",
-					path, lineno, key);
-			}
-		}
-		fclose(f);
-	}
-
 	vidow_config_apply_env(cfg);
-
+	warn_legacy_flat();
 	vidow_config_log(cfg);
 }

@@ -1,10 +1,10 @@
 -- vidow 配置（Lua 5.4）。放在 ~/.config/vidow/config.lua 即生效。
 --
--- 在 ~/.config/vidow/config 之后加载，可以覆盖其中任何一项；
--- 环境变量 VIDOW_* 仍然优先级最高（方便临时测试）。
+-- 这是**唯一**的配置文件（旧的那个 key = value 文件已经不再读了）；
+-- 环境变量 VIDOW_* 优先级最高（方便临时测试）。路径也能用 $VIDOW_CONFIG 指到别处。
 -- 改完不用重启：  kill -HUP $(pgrep -x vidow)
 --
--- 全局名就是配置键，写起来和 config 文件一样：
+-- 全局名就是配置键，写起来像配置文件：
 --     border_width = 2
 --     corner_radius = 12
 --
@@ -146,7 +146,7 @@ activation_token_timeout = 0
 --     $XDG_RUNTIME_DIR/vidow-<WAYLAND_DISPLAY>.sock
 -- 起状态栏 / 脚本时用 vidow.ipc_path() 把路径喂给子进程，别让它自己猜：
 --     vidow.exec("waybar -c ~/.config/waybar/vidow.toml")     -- 子进程里 $VIDOW_SOCKET
--- 也可以直接写死路径（两个键都能用普通配置 / 环境变量 VIDOW_IPC / VIDOW_IPC_SOCKET 覆盖）：
+-- 也可以直接写死路径（两个键都能用环境变量 VIDOW_IPC / VIDOW_IPC_SOCKET 覆盖）：
 -- ipc = 0
 -- ipc_socket = "/run/user/1000/vidow.sock"
 

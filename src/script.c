@@ -504,6 +504,28 @@ static void register_api(struct vidow_script *s) {
 
 /* ------------------------------------------------------------- lifecycle */
 
+/* 配置落地之后对一次账。
+ *
+ * 有几个键是在「配置还跑不了」的时候就被消费掉的：ipc / xwayland 的初始化早于
+ * 配置文件的执行（IPC socket 必须在配置之前就在，配置里才拿得到
+ * vidow.ipc_path()；X 服务的 DISPLAY 也必须在配置里的子进程之前设好），而缩放
+ * 是在建输出的时候读的。所以启动时先按默认值建好，等配置跑完再由这里按配置
+ * 修正一遍。全是幂等的，没变就什么都不做。 */
+void vidow_config_sync(struct vidow_server *server) {
+	vidow_ipc_apply_config(server);
+	vidow_xwayland_apply_config(server);
+	/* 配置可能改了 scale / outputs / xwayland_scale：改到的输出立刻换缩放，
+	 * XWayland 的全局缩放也跟着重算。 */
+	vidow_output_apply_scale_all(server);
+	vidow_xwayland_scale_apply(server);
+	/* clipboard / clipboard_primary 可能被改过：重新评估接不接管 */
+	vidow_clipboard_apply_config(server);
+	/* 激活令牌的作废定时器是在 init 里按当时的配置建的 */
+	vidow_activation_apply_config(server);
+	/* decor 开关改了：客户端要不要自己画标题栏得重新通知（见 decoration.c） */
+	vidow_decoration_apply_config(server);
+}
+
 static void script_apply(struct vidow_script *s) {
 	struct vidow_server *server = s->server;
 
@@ -511,14 +533,15 @@ static void script_apply(struct vidow_script *s) {
 	vidow_config_apply_env(&server->config);
 	vidow_config_log(&server->config);
 
+	/* 有些键的消费时机早于配置文件的执行（ipc / xwayland / scale / 剪贴板），
+	 * 这里按最终的配置修正一遍。 */
+	vidow_config_sync(server);
+
 	/* 规则可能按 app_id / 标题匹配已经开着的窗口：重载之后重新判一遍。 */
 	vidow_rule_apply_all(server);
 
 	vidow_backdrop_damage(server, true);
 	vidow_arrange(server);
-
-	/* decor 开关变了：客户端要不要自己画标题栏得重新通知（见 decoration.c） */
-	vidow_decoration_apply_config(server);
 
 	/* Decorations are only redrawn on commit or layout change, so a config
 	 * that changes the radius or the colours has to push them through. */
@@ -759,26 +782,24 @@ bool vidow_script_load(struct vidow_server *server) {
 	/* 重载 = 重新声明一遍键位和窗口规则：清掉旧的，免得 SIGHUP 之后越攒越多。 */
 	vidow_keybind_clear(server);
 	vidow_rule_clear(server);
+	/* 重载 = 重新读一遍配置：先回到默认值（再压上环境变量）。配置文件里删掉的
+	 * 行才会真的消失 —— 不然改完配置重载，被删的键还留着旧值。 */
+	vidow_config_reset(&server->config);
 
 	char path[PATH_MAX];
-	const char *override = getenv("VIDOW_CONFIG_LUA");
-	if (override != NULL) {
-		snprintf(path, sizeof(path), "%s", override);
-	} else {
-		const char *home = getenv("HOME");
-		snprintf(path, sizeof(path), "%s/.config/vidow/config.lua",
-			home != NULL ? home : ".");
-	}
+	vidow_config_path(path, sizeof(path));
 
 	FILE *probe = fopen(path, "r");
 	if (probe == NULL) {
-		wlr_log(WLR_DEBUG, "config.lua: no %s, using the plain config", path);
+		wlr_log(WLR_INFO, "config.lua: 没有 %s，全部用默认值", path);
+		vidow_config_sync(server);
 		return false;
 	}
 	fclose(probe);
 
 	struct vidow_script *s = calloc(1, sizeof(*s));
 	if (s == NULL) {
+		vidow_config_sync(server);
 		return false;
 	}
 	s->server = server;
@@ -786,6 +807,7 @@ bool vidow_script_load(struct vidow_server *server) {
 	if (s->L == NULL) {
 		free(s);
 		wlr_log(WLR_ERROR, "config.lua: cannot create a Lua state");
+		vidow_config_sync(server);
 		return false;
 	}
 	luaL_openlibs(s->L);
@@ -797,6 +819,7 @@ bool vidow_script_load(struct vidow_server *server) {
 			lua_tostring(s->L, -1) != NULL ? lua_tostring(s->L, -1) : "?");
 		lua_close(s->L);
 		free(s);
+		vidow_config_sync(server);
 		return false;
 	}
 
@@ -813,15 +836,13 @@ bool vidow_script_load(struct vidow_server *server) {
 	return true;
 }
 
-/* 重载配置（SIGHUP 和 IPC 的 reload-config 共用）。 */
+/* 重载配置（SIGHUP 和 IPC 的 reload-config 共用）。
+ *
+ * 重新跑 config.lua；跟缩放 / 剪贴板有关的东西不在这里应用 —— 配置带
+ * vidow.exec() 时它是分几步跑完的（每次 yield 回事件循环），要等配置真正跑完
+ * 才该动输出，那一步在 script_apply() 里（见 vidow_config_sync()）。 */
 void vidow_config_reload(struct vidow_server *server) {
 	vidow_script_load(server);
-	/* 脚本可能改了 scale / outputs / xwayland_scale：改到的输出立刻换缩放，
-	 * XWayland 的全局缩放也跟着重算。 */
-	vidow_output_apply_scale_all(server);
-	vidow_xwayland_scale_apply(server);
-	/* clipboard / clipboard_primary 可能被改过：重新评估接不接管 */
-	vidow_clipboard_apply_config(server);
 	vidow_ipc_emit_note(server, "config-reloaded");
 }
 

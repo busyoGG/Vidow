@@ -56,14 +56,12 @@ python3 -c "import gi" 2>/dev/null || { echo "test-workspace.sh: 需要 python3-
 
 mkdir -p "$CFGDIR/.config/vidow" "$RUNDIR/run"
 chmod 700 "$RUNDIR/run"
-cat > "$CFGDIR/.config/vidow/config" <<'EOF'
-scale = 1
-xwayland = 0
+cat > "$CFGDIR/.config/vidow/config.lua" <<'EOF'
+scale = "1"
+xwayland = false
 window_open_ms = 80
 window_close_ms = 80
 window_move_ms = 80
-EOF
-cat > "$CFGDIR/.config/vidow/config.lua" <<'EOF'
 -- 工作区由用户建；键位由用户绑。
 for i = 1, 4 do
 	vidow.workspace_create(tostring(i))

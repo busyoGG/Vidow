@@ -12,8 +12,8 @@
 - **xdg-activation 自己实现**（`src/activation.c`）：令牌过期时间可配、serial 校验不过的
   请求也能配成「照样理」（niri 的 `honor-xdg-activation-with-invalid-serial`，vidow 同名
   选项）—— wlroots 那份把这个校验写死了，配不动
-- **配置**：`config` 纯文本 + `config.lua`（Lua 5.4），配置里能异步跑 shell 拿返回值，
-  不阻塞渲染；SIGHUP 热重载
+- **配置**：就是一个 Lua 5.4 文件（`~/.config/vidow/config.lua`）—— 全局名就是配置键，
+  需要环境信息时直接 `vidow.exec()` 跑 shell 拿返回值，不阻塞渲染；SIGHUP 热重载
 - **IPC**（`src/ipc.c` / `src/ipcstate.c`）：unix socket 上的一行一个 JSON 请求/应答。
   状态输出**尽量全**（窗口的标题/坐标/尺寸/列/工作区/输出/规则、layer surface、
   工作区、输出与模式、配置全量、键位、规则、激活令牌、动画、输入法、光标…），
@@ -242,7 +242,7 @@ Wayland 的帧回调（`wl_surface.frame`）是合成器「我要用你的画面
 
 ```lua
 -- 全局节流：视口外补帧每秒最多几帧（0 = 不限速，跟输出的帧节奏走）
-force_render_hz = 60          -- 也可以写在普通配置里，或用 VIDOW_FORCE_RENDER_HZ 覆盖
+force_render_hz = 60          -- 也可以用 VIDOW_FORCE_RENDER_HZ 覆盖
 
 -- ① 窗口规则：哪些窗口值得保活、各补多少帧，由你说了算（子串匹配，大小写不敏感）
 vidow.rule{ app_id = "mpv", force_render = true }              -- 用全局的 60Hz
@@ -349,7 +349,7 @@ wlroots 给 `xdg-activation` 的令牌设了 **30 秒**的作废时间，而「�
 token`），**合成器连信号都收不到** —— 想在窗口规则里补救都没机会。所以默认改成不过期：
 
 ```ini
-# 普通配置 / config.lua 里写同名键 / VIDOW_ACTIVATION_TOKEN_TIMEOUT 覆盖
+# config.lua 里写同名键 / VIDOW_ACTIVATION_TOKEN_TIMEOUT 覆盖
 activation_token_timeout = 0     # 秒，0 = 不过期（默认）；想严格就写个秒数
 ```
 
@@ -375,7 +375,7 @@ vidow.rule{ app_id = "令牌不灵的应用", honor_invalid_serial = true }
 ```
 
 ```ini
-# 或者全局开（所有应用都理）；普通配置 / config.lua 里写同名键 /
+# 或者全局开（所有应用都理）；config.lua 里写同名键 /
 # VIDOW_HONOR_XDG_ACTIVATION_WITH_INVALID_SERIAL 也能覆盖
 honor_xdg_activation_with_invalid_serial = 1   # 默认 0 = 不理
 ```
@@ -472,6 +472,7 @@ python3 test-float.py        # 三个真实 GTK 窗口，验证浮动模式自�
 ./test-dpi.sh                        # 混合 DPI + XWayland（全 headless，15 项断言）
 ./test-focus.sh                      # 焦点规则 + 激活请求（全 headless，61 项断言）
 ./test-ipc.sh                        # IPC：状态输出 / 命令 / 事件 / 多屏（全 headless，162 项断言）
+./test-config.sh                     # 配置系统：一个 Lua 文件 + 改了就自动重载（全 headless，15 项断言）
 ./build/jsontest                     # 只看 JSON 写出/读入（离线，30 项）
 ./build/scaletest                    # 只看缩放计算（24 项）
 ```
@@ -528,13 +529,13 @@ overview 里：左键点窗口 = 选中它并缩回去，点空白 = 取消，`E
 目标很具体：**同一个逻辑尺寸，在两块 DPI 不同的屏上是同一个物理尺寸，而且都清晰。**
 缩放就是这一条：逻辑像素 = 1/96 英寸。
 
-```ini
-# ~/.config/vidow/config
-scale = auto                       # 缩放 = ppi / 96
-outputs = DP-1:2 HDMI-A-1:1.25      # 按输出名覆盖（也可以写 auto / off）
-xwayland = 1                        # 起 XWayland（懒启动：真有人连 X 才 fork）
-xwayland_scale = auto               # X 的全局缩放 = ceil(最密那块屏的缩放)
-xwayland_env = 1                    # 给 X11 客户端下发 GDK_SCALE / QT_SCALE_FACTOR
+```lua
+-- ~/.config/vidow/config.lua
+scale = "auto"                      -- 缩放 = ppi / 96
+outputs = "DP-1:2 HDMI-A-1:1.25"    -- 按输出名覆盖（也可以写 auto / off）
+xwayland = true                     -- 起 XWayland（懒启动：真有人连 X 才 fork）
+xwayland_scale = "auto"             -- X 的全局缩放 = ceil(最密那块屏的缩放)
+xwayland_env = true                 -- 给 X11 客户端下发 GDK_SCALE / QT_SCALE_FACTOR
 ```
 
 `scale = auto` 按 EDID 的物理尺寸算 `ppi / 96`：4K 27 寸 ≈ 1.70、1440p 27 寸 ≈ 1.15、
@@ -1080,7 +1081,7 @@ vidowmsg clipboard-clear
 真实表面节点仍然保留（不透明度置 0）——**点击命中不受影响**，因为输入走的是场景图，
 不是像素。
 
-配置在 `~/.config/vidow/config`：`decor_enabled` / `corner_radius` / `border_width` /
+配置在 `~/.config/vidow/config.lua`：`decor_enabled` / `corner_radius` / `border_width` /
 `border_color` / `border_color_focus` / `shadow_radius` / `shadow_color` /
 `shadow_offset_x,y` / `window_opacity` / `noise`。
 
@@ -1202,29 +1203,40 @@ gl_FragColor = sum / 12.0 + texture2D(u_add, v_uv);
 
 （trace 里另一条 `move update` 是隔壁 w1 的：视口滚了 6px，它本来就该平滑跟过去。）
 
-### 配置
+### 配置：就是一个 Lua 文件
 
-`~/.config/vidow/config`（key = value，`#` 注释），任意键都可用环境变量覆盖：
-`VIDOW_WINDOW_OPEN_MS=90 ./build/vidow`。完整键名见文件内注释。
+`~/.config/vidow/config.lua`（Lua 5.4）是**唯一**的配置文件 —— 没有第二套语法、
+没有加载顺序要记。**改完保存就生效，什么都不用做**（也可以手动
+`kill -HUP $(pgrep -x vidow)`）。
 
-缩放 / XWayland 相关的五个键见「混合 DPI 与 XWayland」一节。
+- 文件不在 = 全用内置默认值（默认值本身是能用的配置）
+- 路径可以用 `$VIDOW_CONFIG` 指到别处；`$XDG_CONFIG_HOME` 也认
+- 任意键都能用环境变量覆盖：`VIDOW_WINDOW_OPEN_MS=90 ./build/vidow`（优先级最高）
+- 重载 = **重新读一遍**：先回默认值再跑文件，所以删掉的行会真的消失（运行时
+  `set-config` 改的值也会被抹掉，这正是重载该有的意思）
+- 旧的那个 `key = value` 文件（`~/.config/vidow/config`）**已经不再读取**；
+  它还在的话启动时会喊一声，把键搬进 `config.lua` 即可
 
-portal 相关的两个键：
+**自动重载**（`src/configwatch.c`）：inotify 盯的是配置文件的**目录**，不是文件本身 ——
+编辑器保存文件的方式不止一种，直接写进去（同 inode）和写临时文件再 rename 过来
+（换 inode）都得认；盯文件的话第二种会把 watch 留在那个已经被删掉的 inode 上，
+之后再也收不到事件。收到事件后自己 `stat()` 目标文件，比对 `(dev, ino, mtime, size)`
+真变了才重载，顺带把一次保存里的好几个事件合成一次（去抖 150ms）：
 
-| 键 | 默认 | 作用 |
-| --- | --- | --- |
-| `portal_desktop` | `Vidow` | vidow 设给自己的 `XDG_CURRENT_DESKTOP`，也是 `<name>-portals.conf` 的那个 name。留空 = 完全不碰 portal |
-| `portal_conf_sync` | `true` | 把生效的 portals.conf 写到 portal 的配置目录并重启它；`false` = 只算不写 |
-
-### config.lua：能跑 shell 的配置
-
-`~/.config/vidow/config.lua` 在 `config` 之后加载，可以覆盖其中任何一项，用的是 Lua 5.4。
-改完不用重启：`kill -HUP $(pgrep -x vidow)`。
+| 你怎么改 | 结果 |
+| --- | --- |
+| 编辑器里改完保存（原地写 / rename 覆盖） | 自动重载 |
+| 删掉配置文件 | 自动重载，回默认值 |
+| 删掉某个键再保存 | 那个键回默认值 |
+| 同一个目录里动别的文件（`portals.conf` / `shaders/`） | 不重载 |
+| 配置文件是符号链接（dotfiles 仓库） | 认（盯的是解析后的真身） |
 
 ```lua
--- 全局名就是配置键，写起来和 config 文件一样
+-- 全局名就是配置键
 border_width = 2
 corner_radius = 12
+scale = "auto"
+outputs = "DP-1:2 HDMI-A-1:1.25"
 
 -- 需要 shell 结果时用 vidow.exec()：看起来是同步的，实际不阻塞渲染
 local accent = vidow.exec("theme.sh accent")   -- 拿到 stdout
@@ -1256,6 +1268,23 @@ if code ~= 0 then vidow.log("截图失败: " .. err) end
 
 命令连的是 **vidow 自己**（`WAYLAND_DISPLAY` 在加载配置前就指向了自己的 socket，
 并且后端已经起来了），所以 `grim` / `slurp` / `wf-recorder` 截的是 vidow 的画面。
+
+**加载时机**：配置文件要等合成器起得来（输出、seat 都在了）才跑 —— 配置里的
+`vidow.workspace_create("1", "DP-1")`、`vidow.workspace_list()`、`vidow.ipc_path()`
+都得有真东西可看。代价是 `ipc` / `xwayland` / `scale` 这几个键的消费时机比配置更早：
+启动时先按默认值建好，配置跑完（带 `vidow.exec()` 的配置是分几步跑完的）再按配置
+对一次账（`vidow_config_sync()`）—— 所以 `ipc = false` 在配置里照样有效，只是
+socket 先建后拆。
+
+**`ipc` / `xwayland` 在重载时也对账**：把 `ipc = false` 那行删掉再 SIGHUP，socket
+会回来；`xwayland = false` 同理（拆掉时已连上的 X 客户端会被断开，和启动时就关掉等效）。
+
+portal 相关的两个键：
+
+| 键 | 默认 | 作用 |
+| --- | --- | --- |
+| `portal_desktop` | `Vidow` | vidow 设给自己的 `XDG_CURRENT_DESKTOP`，也是 `<name>-portals.conf` 的那个 name。留空 = 完全不碰 portal |
+| `portal_conf_sync` | `true` | 把生效的 portals.conf 写到 portal 的配置目录并重启它；`false` = 只算不写 |
 实测：配置里 `grim /tmp/shot-cfg.png` → `code=0`，产出的 1280x720 PNG 四象限颜色正确；
 `grim --nope` → `code=1`，`err="grim: invalid option -- '-'"`。
 
@@ -1422,7 +1451,7 @@ portal —— 不会每次开机都白重启一遍、打断正在进行的 porta
 的，异步、不阻塞渲染。
 
 两个环境变量（给测试/排查用）：`VIDOW_PORTAL_NO_RESTART=1` 只写文件不重启；
-`VIDOW_CONFIG=/path` 换配置文件位置。
+`VIDOW_CONFIG=/path` 换配置文件位置（`VIDOW_CONFIG_LUA` 是同一个东西的旧名字，还认）。
 
 后端是被 DBus 激活起来的，继承的是 systemd user session 的环境，所以重启前必须
 `import-environment`（否则对话框会画到宿主桌面上）。vidow 自动做这一步：
@@ -2079,6 +2108,27 @@ protocols/     wlr-layer-shell / wlr-virtual-pointer / input-method-v2 /
      修法：入场动画开始时撤掉位移补间并接管 offset，`vidow_place_view` 在入场动画
      期间只更新 `geom`。实测见「动画与自定义 shader」一节
 
+103. 配置系统收敛成一个 Lua 文件（原来是 `config` key = value + `config.lua` 两层）：
+     去掉 `src/config.c` 里那套行解析（`vidow_config_load` → `vidow_config_reset`，
+     只剩默认值 + 环境变量），文件由 `vidow_script_load()` 跑，路径认
+     `$VIDOW_CONFIG` / `$VIDOW_CONFIG_LUA` / `$XDG_CONFIG_HOME`。两个副作用要处理：
+     ① 重载现在**先回默认值**再跑文件（删掉的行才会真的消失）；
+     ② `ipc` / `xwayland` / `scale` 的消费时机早于配置文件 → 新增
+     `vidow_config_sync()`，在配置真正跑完（`script_apply`）或配置缺失 / 语法错时
+     按配置对一次账，`vidow_ipc_apply_config()` 能建能拆、`vidow_xwayland_apply_config()`
+     能建能拆。旧的 `config` 文件还在的话启动时打一行 ERROR 提示搬走。
+     11 个测试脚本里的 key = value 配置同步改成 Lua
+
+104. 配置改完自动重载（`src/configwatch.c`，不用再手动 SIGHUP）：inotify 盯的是
+     配置文件的**目录**而不是文件本身 —— 编辑器保存要么原地写（同 inode）、要么写
+     临时文件再 rename（换 inode），盯文件的话第二种会把 watch 留在已经被删掉的
+     inode 上，之后再也收不到事件。收到事件后自己 `stat()` 比对
+     `(dev, ino, mtime, size)`，真变了才 `vidow_config_reload()`（和 SIGHUP 同一个
+     入口），顺便把一次保存里的好几个事件合成一次（去抖 150ms，慢速编辑器分几段
+     写也只重载一次）。配置文件是符号链接时先 `realpath()` 解析，盯真身。
+     实测：原地写 / rename 覆盖 / 删文件（回默认值）都认，同目录里动 `portals.conf`
+     不重载。`./test-config.sh`（15 项断言）
+
 ## 尚未实现（原型边界）
 
 1. 强制渲染的边界：
@@ -2199,7 +2249,7 @@ protocols/     wlr-layer-shell / wlr-virtual-pointer / input-method-v2 /
    - 命令覆盖到的是「合成器自己的功能」，没有 shell 执行（能跑 shell 的只有 config.lua）、
      没有窗口规则的运行时增删（要改规则就改 config.lua + `reload-config`）
    - 输出设置（缩放 / 方向 / 模式 / 位置）是**运行时**的，不写回配置文件：SIGHUP 之后按
-     配置重算（想让它持久就写进 config.lua / config 的 `scale` / `outputs`）
+     配置重算（想让它持久就写进 config.lua 的 `scale` / `outputs`）
    - 没有权限分级：socket 是 0600（只有本人能连），但连上之后所有命令都能用
    - 事件没有背压策略之外的流控：订阅者卡住（不读 socket）攒到 8 MiB 会被踢掉
 

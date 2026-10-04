@@ -206,8 +206,28 @@ static bool global_filter(const struct wl_client *client,
 }
 
 bool vidow_xwayland_init(struct vidow_server *server) {
+	return vidow_xwayland_apply_config(server);
+}
+
+/* 按配置把 X 服务建起来或拆掉。
+ *
+ * 配置是 Lua，跑得比这里晚（要等输出、seat 都在），所以启动时先按默认值建起来
+ * —— 配置里的子进程得能拿到 DISPLAY —— 等配置落地后由 vidow_config_sync()
+ * 再调一次这里对账：配置说关就拆（X 客户端会被断开，和启动时就关掉等效），
+ * 之后又把开关打开（或者删掉那行再 SIGHUP）就重新建起来。 */
+bool vidow_xwayland_apply_config(struct vidow_server *server) {
 	if (!server->config.xwayland) {
-		wlr_log(WLR_INFO, "xwayland: 配置里关了，不注册 X 服务");
+		if (server->xwayland == NULL) {
+			return true;
+		}
+		wlr_log(WLR_INFO, "xwayland: 配置里关了，拆掉 X 服务");
+		/* destroy 的信号处理里会把监听摘掉、把 server->xwayland 置空；
+		 * global_filter 那时就成了直通车，不用再动。 */
+		wlr_xwayland_destroy(server->xwayland);
+		unsetenv("DISPLAY");
+		return true;
+	}
+	if (server->xwayland != NULL) {
 		return true;
 	}
 	if (server->compositor == NULL) {

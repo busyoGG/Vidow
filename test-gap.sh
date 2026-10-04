@@ -51,9 +51,9 @@ python3 -c "import gi" 2>/dev/null || { echo "test-gap.sh: 需要 python3-gobjec
 
 mkdir -p "$CFGDIR/.config/vidow" "$RUNDIR/run"
 chmod 700 "$RUNDIR/run"
-cat > "$CFGDIR/.config/vidow/config" <<'EOF'
-scale = 1
-xwayland = 0
+cat > "$CFGDIR/.config/vidow/config.lua" <<'EOF'
+scale = "1"
+xwayland = false
 window_open_ms = 60
 window_close_ms = 60
 window_move_ms = 60

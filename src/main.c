@@ -116,17 +116,19 @@ int main(int argc, char *argv[]) {
 	wl_list_init(&server.anims);
 	wl_list_init(&server.closing);
 
-	vidow_config_load(&server.config);
+	/* 默认值 + 环境变量。配置文件是 Lua，跑得比这里晚（见下面的
+	 * vidow_script_load）—— 需要配置在更早生效的键由 vidow_config_sync()
+	 * 在配置落地后对账。 */
+	vidow_config_reset(&server.config);
 
 	/* portal 靠 XDG_CURRENT_DESKTOP 选 <name>-portals.conf，而配置里启动的
 	 * 客户端也继承它 —— 所以要在任何子进程之前设好。 */
 	vidow_portal_desktop_env(&server.config);
 
 	/* The custom-shader path drives raw GL, which only exists on the GLES2
-	 * renderer. Respect an explicit choice from the environment. */
-	if (server.config.shader_enabled) {
-		setenv("WLR_RENDERER", "gles2", 0);
-	}
+	 * renderer. 配置跑得比渲染器创建晚，所以这里无条件设一次：setenv 的
+	 * overwrite = 0 表示不覆盖 —— 用户自己在环境里指定了渲染器就听他的。 */
+	setenv("WLR_RENDERER", "gles2", 0);
 
 	server.display = wl_display_create();
 	if (server.display == NULL) {
@@ -253,20 +255,25 @@ int main(int argc, char *argv[]) {
 		return 1;
 	}
 
-	/* ~/.config/vidow/config.lua runs after the plain config, so it can
-	 * override anything in it. Loaded last on purpose: a config command like
-	 * grim needs our socket *and* a running output. It may still be waiting
-	 * for a command here; the rest of the config lands while the compositor
-	 * is already rendering. */
+	/* 配置文件是 Lua，加载得最晚：它要能看见输出和 seat（配置里的
+	 * vidow.workspace_create(name, output) / workspace_list() / ipc_path() 都得
+	 * 有真东西可看），而配置里跑的命令（grim 之类）也要连得上我们自己。
+	 * 带 vidow.exec() 的配置是分几步跑完的 —— 这里返回时可能还没跑完，
+	 * 剩下的部分在合成器已经开始渲染之后落地。 */
 	vidow_script_load(&server);
 
-	/* config.lua 可能改了 portal_desktop / portal_conf_sync，所以同步放在
-	 * 脚本之后。内容没变的话这里什么都不做（也不会重启 portal）。 */
+	/* 改完文件自动重载（不用再 kill -HUP）。放在配置加载之后：初始化那一下
+	 * 记的是文件当前状态，不该被当成「变了」。 */
+	vidow_configwatch_init(&server);
+
+	/* 配置可能改了 portal_desktop / portal_conf_sync，所以同步放在脚本之后。
+	 * 内容没变的话这里什么都不做（也不会重启 portal）。 */
 	vidow_portal_desktop_env(&server.config);
 	vidow_portal_conf_sync(&server.config);
 
 	wl_display_run(server.display);
 
+	vidow_configwatch_finish(&server);
 	vidow_ipc_finish(&server);
 	vidow_clipboard_finish(&server);
 	server_finish(&server);

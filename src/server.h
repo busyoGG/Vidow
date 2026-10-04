@@ -942,6 +942,7 @@ struct vidow_server {
 	struct wl_event_source *capture_timer; /* drives pending screen captures */
 	struct vidow_script *script;      /* NULL when there is no config.lua */
 	struct wl_event_source *reload_sig; /* SIGHUP */
+	struct vidow_configwatch *configwatch; /* 配置文件变了自动重载，NULL = 没盯上 */
 
 	struct wl_listener new_output;
 	struct wl_listener new_input;
@@ -1043,7 +1044,13 @@ void vidow_im_focus(struct vidow_server *server, struct wlr_surface *surface);
 
 /* ---------------------------------------------------------------- config */
 
-void vidow_config_load(struct vidow_config *cfg);
+/* 配置文件只有一个，而且是 Lua（见 script.c）：~/.config/vidow/config.lua。
+ * 这里只负责默认值 + 环境变量覆盖；文件本身由 vidow_script_load() 跑。 */
+void vidow_config_reset(struct vidow_config *cfg);
+/* 配置目录（$XDG_CONFIG_HOME/vidow 或 ~/.config/vidow）。 */
+void vidow_config_dir(char *buf, size_t size);
+/* 配置文件的完整路径（$VIDOW_CONFIG / $VIDOW_CONFIG_LUA 优先）。 */
+void vidow_config_path(char *buf, size_t size);
 /* 把所有配置键按名字喂给回调（IPC 的 config 命令 / state 里的 config 用它）。
  * 顺序就是 config.c 里那张表的顺序；value 一律是文本。 */
 void vidow_config_each(const struct vidow_config *cfg,
@@ -1079,9 +1086,16 @@ void vidow_exec_detached(const char *script);
 /* 重载配置：重新跑 config.lua（键位、窗口规则重新声明），再把跟缩放有关的
  * 东西应用一遍。SIGHUP 和 IPC 的 reload-config 走的是同一个函数。 */
 void vidow_config_reload(struct vidow_server *server);
+/* 配置落地后对账：ipc / xwayland 这两个「启动时就消费掉」的键要跟上配置。 */
+void vidow_config_sync(struct vidow_server *server);
 bool vidow_script_init(struct vidow_server *server);
 bool vidow_script_load(struct vidow_server *server);
 void vidow_script_finish(struct vidow_server *server);
+
+/* 配置文件一改就自动重载（inotify 盯目录 + stat 比对，见 configwatch.c）。
+ * 失败只打日志：自动重载是锦上添花，SIGHUP 永远还在。 */
+bool vidow_configwatch_init(struct vidow_server *server);
+void vidow_configwatch_finish(struct vidow_server *server);
 
 /* ------------------------------------------------------------- animation */
 
@@ -1295,6 +1309,8 @@ void vidow_view_toggle_fullscreen(struct vidow_view *view);
 /* 起 XWayland 服务（懒启动：真有人连 X 才 fork 出服务进程）。xwayland=false
  * 时什么也不注册，返回 true —— 没有 X 也是一种正常配置。 */
 bool vidow_xwayland_init(struct vidow_server *server);
+/* 配置落地后调：配置说关就把 X 服务拆掉，说开（或又打开）就建起来。 */
+bool vidow_xwayland_apply_config(struct vidow_server *server);
 /* 改完配置（scale / outputs / xwayland_scale）之后重算 X 的全局缩放并同步给
  * 客户端环境。 */
 void vidow_xwayland_scale_apply(struct vidow_server *server);
@@ -1323,6 +1339,8 @@ bool vidow_portal_init(struct vidow_server *server);
 /* xdg-activation-v1（见 activation.c）。在 portal 初始化之前调：窗口规则 /
  * 激活请求这条链路跟 portal 无关，portal 只是碰巧也需要它。 */
 void vidow_activation_init(struct vidow_server *server);
+/* 配置落地后调：按 activation_token_timeout 重设扫过期令牌的定时器。 */
+void vidow_activation_apply_config(struct vidow_server *server);
 /* 窗口刚建 / 将销毁：维护窗口列表 handle。 */
 void vidow_portal_view_new(struct vidow_view *view);
 void vidow_portal_view_free(struct vidow_view *view);

@@ -1186,6 +1186,11 @@ static bool cmd_set_config(struct vidow_server *server, struct jval *req,
 			strcmp(key, "clipboard_primary") == 0) {
 		vidow_clipboard_apply_config(server);
 	}
+	/* 激活令牌那两个键改了要重设定时器 */
+	if (strcmp(key, "activation_token_timeout") == 0 ||
+			strcmp(key, "honor_xdg_activation_with_invalid_serial") == 0) {
+		vidow_activation_apply_config(server);
+	}
 	vidow_arrange(server);
 	const char *now = vidow_config_get(&server->config, key);
 	jb_obj(out);
@@ -2086,14 +2091,28 @@ bool vidow_ipc_init(struct vidow_server *server) {
 	wl_list_init(&server->ipc_clients);
 	server->ipc_path[0] = '\0';
 	server->ipc_subscribers = 0;
+	return vidow_ipc_apply_config(server);
+}
 
-	if (!server->config.ipc) {
-		wlr_log(WLR_INFO, "ipc: 关着（config 里 ipc = false）");
-		return true;
-	}
-
+/* 建 / 拆 / 换 socket，看配置怎么说。配置是 Lua，跑得比这里晚（要等合成器起
+ * 得来），所以配置落地后还要再调一次：ipc = false 就拆掉，改了 ipc_socket 就
+ * 换一个。已经在听、路径也没变就什么都不做。 */
+bool vidow_ipc_apply_config(struct vidow_server *server) {
 	char path[PATH_MAX];
 	ipc_path_build(server, path, sizeof(path));
+
+	if (server->ipc_listen != NULL && server->config.ipc &&
+			strcmp(path, server->ipc_path) == 0) {
+		return true; /* 没变 */
+	}
+	if (server->ipc_listen != NULL) {
+		vidow_ipc_finish(server);
+	}
+
+	if (!server->config.ipc) {
+		wlr_log(WLR_INFO, "ipc: 关着（配置里 ipc = false）");
+		return true;
+	}
 
 	int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
 	if (fd < 0) {

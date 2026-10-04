@@ -65,10 +65,10 @@ T_SHOT3=19500
 
 mkdir -p "$CFGDIR/.config/vidow" "$RUNDIR/run"
 chmod 700 "$RUNDIR/run"
-cat > "$CFGDIR/.config/vidow/config" <<'EOF'
-scale = 1
-outputs = HEADLESS-1:1 HEADLESS-2:1
-xwayland = 0
+cat > "$CFGDIR/.config/vidow/config.lua" <<'EOF'
+scale = "1"
+outputs = "HEADLESS-1:1 HEADLESS-2:1"
+xwayland = false
 window_open_ms = 150
 window_close_ms = 150
 window_move_ms = 150

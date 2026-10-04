@@ -46,15 +46,15 @@ fi
 # ---------------------------------------------------------------- 起合成器
 mkdir -p "$CFGDIR/.config/vidow" "$RUNDIR/run"
 chmod 700 "$RUNDIR/run"
-cat > "$CFGDIR/.config/vidow/config" <<'EOF'
-# HEADLESS-2 是 2 倍屏，HEADLESS-1 是 1 倍屏：模拟一块 4K 一块 1080p
-scale = auto
-outputs = HEADLESS-1:1 HEADLESS-2:2
-xwayland = 1
+cat > "$CFGDIR/.config/vidow/config.lua" <<'EOF'
+-- HEADLESS-2 是 2 倍屏，HEADLESS-1 是 1 倍屏：模拟一块 4K 一块 1080p
+scale = "auto"
+outputs = "HEADLESS-1:1 HEADLESS-2:2"
+xwayland = true
 EOF
 
 # 子进程真实拿到的环境：X11 缩放是这样传给客户端的
-cat > "$CFGDIR/.config/vidow/config.lua" <<'EOF'
+cat >> "$CFGDIR/.config/vidow/config.lua" <<'EOF'
 -- vidow.exec 返回 stdout（失败时 nil + 原因）；要退出码用 vidow.exec_status
 local v = vidow.exec("printenv GDK_SCALE")
 vidow.log("childenv GDK_SCALE=" .. tostring(v or "nil"))

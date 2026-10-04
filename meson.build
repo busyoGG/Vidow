@@ -81,6 +81,7 @@ sources = files(
   'src/fx.c',
   'src/exec.c',
   'src/script.c',
+  'src/configwatch.c',
   'src/im.c',
   'src/bgeffect.c',
   'src/portal.c',

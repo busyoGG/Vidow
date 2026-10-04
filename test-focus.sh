@@ -94,13 +94,12 @@ python3 -c "import gi" 2>/dev/null || { echo "test-focus.sh: 需要 python3-gobj
 
 mkdir -p "$CFGDIR/.config/vidow" "$RUNDIR/run"
 chmod 700 "$RUNDIR/run"
-cat > "$CFGDIR/.config/vidow/config" <<'EOF'
-scale = 1
-xwayland = 0
+cat > "$CFGDIR/.config/vidow/config.lua" <<'EOF'
+scale = "1"
+xwayland = false
 window_open_ms = 60
 window_move_ms = 60
 EOF
-rm -f "$CFGDIR/.config/vidow/config.lua"
 
 export XDG_RUNTIME_DIR="$RUNDIR/run"
 export WLR_BACKENDS=headless
@@ -192,6 +191,10 @@ open_pattern() { # open_pattern <标题>
 # ------------------------------------------------------------ 1) 基线
 mark "基线：没有规则 —— 新窗口默认抢焦点"
 cat > "$CFGDIR/.config/vidow/config.lua" <<'EOF'
+scale = "1"
+xwayland = false
+window_open_ms = 60
+window_move_ms = 60
 for i = 1, 3 do vidow.workspace_create(tostring(i)) end
 EOF
 start_vidow
@@ -204,6 +207,10 @@ stop_vidow
 # ------------------------------------------------------------ 2) 开窗口不抢焦点
 mark "规则 focus_on_open = false：窗口照常出现，但不抢键盘"
 cat > "$CFGDIR/.config/vidow/config.lua" <<'EOF'
+scale = "1"
+xwayland = false
+window_open_ms = 60
+window_move_ms = 60
 for i = 1, 3 do vidow.workspace_create(tostring(i)) end
 vidow.rule{ app_id = "demo", focus_on_open = false }
 for i, r in ipairs(vidow.rules()) do
@@ -229,6 +236,10 @@ stop_vidow
 # ------------------------------------------------------------ 3) 激活：藏起来的工作区
 mark "激活请求：窗口在藏起来的工作区上 —— 先端出来再给焦点"
 cat > "$CFGDIR/.config/vidow/config.lua" <<'EOF'
+scale = "1"
+xwayland = false
+window_open_ms = 60
+window_move_ms = 60
 for i = 1, 3 do vidow.workspace_create(tostring(i)) end
 vidow.rule{ app_id = "demo", focus_on_open = false }
 EOF
@@ -259,6 +270,10 @@ stop_vidow
 # ------------------------------------------------------------ 4) 激活：特殊工作区
 mark "激活请求：窗口在特殊工作区上 —— 把那块特殊工作区开到它那块屏上"
 cat > "$CFGDIR/.config/vidow/config.lua" <<'EOF'
+scale = "1"
+xwayland = false
+window_open_ms = 60
+window_move_ms = 60
 for i = 1, 3 do vidow.workspace_create(tostring(i)) end
 vidow.workspace_special("scratch")
 vidow.rule{ app_id = "demo", focus_on_open = false }
@@ -285,14 +300,12 @@ stop_vidow
 
 # ------------------------------------------------------------ 5) 令牌过期
 mark "激活令牌：过期（1 秒）就被丢掉；默认不过期（0）就放行"
-cat > "$CFGDIR/.config/vidow/config" <<'EOF'
-scale = 1
-xwayland = 0
+cat > "$CFGDIR/.config/vidow/config.lua" <<'EOF'
+scale = "1"
+xwayland = false
 window_open_ms = 60
 window_move_ms = 60
 activation_token_timeout = 1
-EOF
-cat > "$CFGDIR/.config/vidow/config.lua" <<'EOF'
 for i = 1, 3 do vidow.workspace_create(tostring(i)) end
 EOF
 start_vidow
@@ -303,9 +316,9 @@ cp "$LOG" "$RUNDIR/log-5a.txt"
 stop_clients
 stop_vidow
 
-cat > "$CFGDIR/.config/vidow/config" <<'EOF'
-scale = 1
-xwayland = 0
+cat > "$CFGDIR/.config/vidow/config.lua" <<'EOF'
+scale = "1"
+xwayland = false
 window_open_ms = 60
 window_move_ms = 60
 activation_token_timeout = 0
@@ -320,13 +333,11 @@ stop_vidow
 
 # ------------------------------------------------------------ 6) 不理激活请求
 mark "规则 focus_on_activate = false：激活请求直接不理"
-cat > "$CFGDIR/.config/vidow/config" <<'EOF'
-scale = 1
-xwayland = 0
+cat > "$CFGDIR/.config/vidow/config.lua" <<'EOF'
+scale = "1"
+xwayland = false
 window_open_ms = 60
 window_move_ms = 60
-EOF
-cat > "$CFGDIR/.config/vidow/config.lua" <<'EOF'
 for i = 1, 3 do vidow.workspace_create(tostring(i)) end
 vidow.rule{ app_id = "demo", focus_on_activate = false }
 EOF
@@ -342,6 +353,10 @@ stop_vidow
 # ------------------------------------------------------------ 7) 还没上屏就请求
 mark "窗口还没上屏就请求激活：记下来，等它出来再聚焦"
 cat > "$CFGDIR/.config/vidow/config.lua" <<'EOF'
+scale = "1"
+xwayland = false
+window_open_ms = 60
+window_move_ms = 60
 for i = 1, 3 do vidow.workspace_create(tostring(i)) end
 EOF
 start_vidow
@@ -357,13 +372,11 @@ stop_vidow
 
 # ------------------------------------------------- 8) 守护进程式激活（令牌不带 surface）
 mark "守护进程式激活：令牌不带 surface，被激活的应用在 activate 里带自己的"
-cat > "$CFGDIR/.config/vidow/config" <<'EOF'
-scale = 1
-xwayland = 0
+cat > "$CFGDIR/.config/vidow/config.lua" <<'EOF'
+scale = "1"
+xwayland = false
 window_open_ms = 60
 window_move_ms = 60
-EOF
-cat > "$CFGDIR/.config/vidow/config.lua" <<'EOF'
 for i = 1, 3 do vidow.workspace_create(tostring(i)) end
 EOF
 start_vidow
@@ -378,13 +391,11 @@ stop_vidow
 
 # ------------------------------------------- 9) serial 校验不过（默认不理）
 mark "serial 校验不过（set_serial(0, seat)）：默认令牌照发，但激活被忽略"
-cat > "$CFGDIR/.config/vidow/config" <<'EOF'
-scale = 1
-xwayland = 0
+cat > "$CFGDIR/.config/vidow/config.lua" <<'EOF'
+scale = "1"
+xwayland = false
 window_open_ms = 60
 window_move_ms = 60
-EOF
-cat > "$CFGDIR/.config/vidow/config.lua" <<'EOF'
 for i = 1, 3 do vidow.workspace_create(tostring(i)) end
 EOF
 start_vidow
@@ -398,14 +409,12 @@ stop_vidow
 
 # ------------------------------------------- 10) 同一个请求 + 开关打开
 mark "honor_xdg_activation_with_invalid_serial = 1：同一个请求就理它了"
-cat > "$CFGDIR/.config/vidow/config" <<'EOF'
-scale = 1
-xwayland = 0
+cat > "$CFGDIR/.config/vidow/config.lua" <<'EOF'
+scale = "1"
+xwayland = false
 window_open_ms = 60
 window_move_ms = 60
-honor_xdg_activation_with_invalid_serial = 1
-EOF
-cat > "$CFGDIR/.config/vidow/config.lua" <<'EOF'
+honor_xdg_activation_with_invalid_serial = true
 for i = 1, 3 do vidow.workspace_create(tostring(i)) end
 EOF
 start_vidow
@@ -419,13 +428,11 @@ stop_vidow
 
 # ---------------------------------- 11) 窗口规则 honor_invalid_serial（按应用开口子）
 mark "窗口规则 honor_invalid_serial = true：只给这个应用开口子，别的应用还是不理"
-cat > "$CFGDIR/.config/vidow/config" <<'EOF'
-scale = 1
-xwayland = 0
+cat > "$CFGDIR/.config/vidow/config.lua" <<'EOF'
+scale = "1"
+xwayland = false
 window_open_ms = 60
 window_move_ms = 60
-EOF
-cat > "$CFGDIR/.config/vidow/config.lua" <<'EOF'
 for i = 1, 3 do vidow.workspace_create(tostring(i)) end
 vidow.rule{ app_id = "demo", honor_invalid_serial = true }
 for i, r in ipairs(vidow.rules()) do

@@ -29,7 +29,7 @@ switch-*)
 	export XDG_CONFIG_HOME="$HOME/.config"
 	mkdir -p "$HOME/.config/vidow"
 	# vidow 自己的配置：这里不设 portal_desktop，走默认的 Vidow
-	rm -f "$HOME/.config/vidow/config"
+	rm -f "$HOME/.config/vidow/config.lua"
 	cat >"$HOME/.config/vidow/portals.conf" <<EOF
 [preferred]
 # 换文件选择器就这一行
@@ -43,8 +43,8 @@ raw-*)
 	mkdir -p "$HOME/.config/vidow" "$XDG_CONFIG_HOME/xdg-desktop-portal"
 	rm -f "$XDG_CONFIG_HOME/xdg-desktop-portal/"*-portals.conf
 	# vidow 别碰 portal 配置，这份手写的才是唯一真相
-	cat >"$HOME/.config/vidow/config" <<'EOF'
-portal_desktop=
+	cat > "$HOME/.config/vidow/config.lua" <<'EOF'
+portal_desktop = ""
 EOF
 	rm -f "$HOME/.config/vidow/portals.conf"
 	cat >"$XDG_CONFIG_HOME/xdg-desktop-portal/vidow-portals.conf" <<EOF

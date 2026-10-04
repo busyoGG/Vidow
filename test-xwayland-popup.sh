@@ -48,10 +48,10 @@ fi
 
 mkdir -p "$CFGDIR/.config/vidow" "$RUNDIR/run"
 chmod 700 "$RUNDIR/run"
-cat > "$CFGDIR/.config/vidow/config" <<'EOF'
-scale = 1
-xwayland = 1
-# 动画拉长：弹出物真做了动画的话，0.45 秒时一眼就能看出来
+cat > "$CFGDIR/.config/vidow/config.lua" <<'EOF'
+scale = "1"
+xwayland = true
+-- 动画拉长：弹出物真做了动画的话，0.45 秒时一眼就能看出来
 window_open_ms = 2500
 window_close_ms = 2500
 window_move_ms = 2500
@@ -336,10 +336,10 @@ grep -aq "Assertion" "$LOG" && fail "日志里有 assert" || true
 mark "混合 DPI：X 坐标按全局缩放除回逻辑坐标"
 kill -TERM -- "-$VIDOW_PGID" 2>/dev/null
 sleep 0.6
-cat > "$CFGDIR/.config/vidow/config" <<'EOF'
-scale = auto
-outputs = HEADLESS-1:1 HEADLESS-2:2
-xwayland = 1
+cat > "$CFGDIR/.config/vidow/config.lua" <<'EOF'
+scale = "auto"
+outputs = "HEADLESS-1:1 HEADLESS-2:2"
+xwayland = true
 window_open_ms = 2500
 window_close_ms = 2500
 window_move_ms = 2500
