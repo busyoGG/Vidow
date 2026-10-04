@@ -215,40 +215,49 @@ static const char *kawase_prefix =
 	"uniform float u_alpha_min;\n"
 	"varying vec2 v_uv;\n"
 	"\n"
-	/* Alpha culling: pixels that are too transparent must not bleed into the
-	 * blur, otherwise an empty desktop turns into a grey smear. */
-	"vec4 tap(sampler2D t, vec2 uv) {\n"
-	"	vec4 c = texture2D(t, uv);\n"
-	"	return c * step(u_alpha_min, c.a);\n"
+	/* Alpha culling: 太透明的东西不该渗进模糊（空桌面会把底衬冲成一片灰）。
+	 * 原来是硬阈值 step(u_alpha_min, a)：alpha 刚过线就满权重、差一点就整个丢掉，
+	 * 阈值那条等值线上于是留下一道**一刀切**的边（模糊结果里看得见一条硬边）。
+	 * 现在改成在 [u_alpha_min/2, u_alpha_min] 之间平滑淡出，权重仍然除以整个核
+	 * （不按采纳的那几份重新归一化 —— 那样「一个抽样被采纳」的瞬间会把那一份
+	 * 直接放大到满值，等于换个位置又造一道硬边）。u_alpha_min = 0 时只剩
+	 * 「全透明的像素不参与」这一件事。 */
+	"float cull(float a) {\n"
+	"	return smoothstep(u_alpha_min * 0.5, max(u_alpha_min, 1e-4), a);\n"
+	"}\n"
+	"vec4 tap(sampler2D t, vec2 uv, float weight) {\n"
+	"	return texture2D(t, uv) * (cull(texture2D(t, uv).a) * weight);\n"
 	"}\n"
 	"\n";
 
 static const char *kawase_down_src =
 	"void main() {\n"
 	"	vec2 t = u_texel * u_offset;\n"
-	"	vec4 sum = tap(u_tex, v_uv) * 4.0;\n"
-	"	sum += tap(u_tex, v_uv - vec2(t.x, 0.0));\n"
-	"	sum += tap(u_tex, v_uv + vec2(t.x, 0.0));\n"
-	"	sum += tap(u_tex, v_uv + vec2(t.x, -t.y));\n"
-	"	sum += tap(u_tex, v_uv + vec2(-t.x, t.y));\n"
+	"	vec4 sum = tap(u_tex, v_uv, 4.0);\n"
+	"	sum += tap(u_tex, v_uv - vec2(t.x, 0.0), 1.0);\n"
+	"	sum += tap(u_tex, v_uv + vec2(t.x, 0.0), 1.0);\n"
+	"	sum += tap(u_tex, v_uv + vec2(t.x, -t.y), 1.0);\n"
+	"	sum += tap(u_tex, v_uv + vec2(-t.x, t.y), 1.0);\n"
 	"	gl_FragColor = sum / 8.0;\n"
 	"}\n";
 
 static const char *kawase_up_src =
 	"void main() {\n"
 	"	vec2 t = u_texel * u_offset;\n"
-	"	vec4 sum = tap(u_tex, v_uv + vec2(-t.x * 2.0, 0.0));\n"
-	"	sum += tap(u_tex, v_uv + vec2(-t.x, t.y)) * 2.0;\n"
-	"	sum += tap(u_tex, v_uv + vec2(0.0, t.y * 2.0));\n"
-	"	sum += tap(u_tex, v_uv + vec2(t.x, t.y)) * 2.0;\n"
-	"	sum += tap(u_tex, v_uv + vec2(t.x * 2.0, 0.0));\n"
-	"	sum += tap(u_tex, v_uv + vec2(t.x, -t.y)) * 2.0;\n"
-	"	sum += tap(u_tex, v_uv + vec2(0.0, -t.y * 2.0));\n"
-	"	sum += tap(u_tex, v_uv + vec2(-t.x, -t.y)) * 2.0;\n"
+	"	vec4 sum = tap(u_tex, v_uv + vec2(-t.x * 2.0, 0.0), 1.0);\n"
+	"	sum += tap(u_tex, v_uv + vec2(-t.x, t.y), 2.0);\n"
+	"	sum += tap(u_tex, v_uv + vec2(0.0, t.y * 2.0), 1.0);\n"
+	"	sum += tap(u_tex, v_uv + vec2(t.x, t.y), 2.0);\n"
+	"	sum += tap(u_tex, v_uv + vec2(t.x * 2.0, 0.0), 1.0);\n"
+	"	sum += tap(u_tex, v_uv + vec2(t.x, -t.y), 2.0);\n"
+	"	sum += tap(u_tex, v_uv + vec2(0.0, -t.y * 2.0), 1.0);\n"
+	"	sum += tap(u_tex, v_uv + vec2(-t.x, -t.y), 2.0);\n"
 	/* 8 个抽样的权重是 1+2+1+2+1+2+1+2 = 12，加上 u_add 那一份正好 13 —— 必须
 	 * 一起除以 13，模糊核的和才是 1。原来是 sum/12 + add：常量输入下
-	 * = c + c = 2c，窗口后面整整亮一倍（半透明窗口透出来的底一片惨白）。 */
-	"	gl_FragColor = (sum + texture2D(u_add, v_uv)) / 13.0;\n"
+	 * = c + c = 2c，窗口后面整整亮一倍（半透明窗口透出来的底一片惨白）。
+	 * u_add 是同一级的降采样副本，用同一套剔除规则，别一边剔一边不剔。 */
+	"	vec4 add = texture2D(u_add, v_uv);\n"
+	"	gl_FragColor = (sum + add * cull(add.a)) / 13.0;\n"
 	"}\n";
 
 /* --------------------------------------------------------- program build */
@@ -902,6 +911,12 @@ static void blur_chain(struct vidow_server *server, struct vidow_blur_set *set,
 struct backdrop_ctx {
 	struct wlr_render_pass *pass;
 	struct vidow_server *server;
+	/* 场景图里的一切（节点坐标、dst 尺寸）都是**逻辑像素**，底衬缓冲却是设备
+	 * 像素 —— 少了这个倍率，1.7 倍屏上底衬只在左上角 1/1.7 的一小块里画了内容
+	 * （缩小的），其余全空：模糊采到的是空像素，越糊越透明，layer 背后的底衬
+	 * 也跟着错位。原点同理：多屏时得减掉这块屏自己的布局原点。 */
+	double scale;
+	int ox, oy; /* 这块屏在布局里的原点，换算成设备像素 */
 };
 
 static void backdrop_iter(struct wlr_scene_buffer *sb, int sx, int sy,
@@ -910,8 +925,21 @@ static void backdrop_iter(struct wlr_scene_buffer *sb, int sx, int sy,
 	if (sb->buffer == NULL) {
 		return;
 	}
-	int w = sb->dst_width > 0 ? sb->dst_width : sb->buffer->width;
-	int h = sb->dst_height > 0 ? sb->dst_height : sb->buffer->height;
+	/* 节点尺寸优先用场景给的目标尺寸（逻辑像素）；客户端缓冲自己带倍率的
+	 * 情况下（缓冲 1280x720、逻辑 640x360）退到 surface 的逻辑尺寸，
+	 * 别把设备像素当逻辑像素用。 */
+	int w = sb->dst_width > 0 ? sb->dst_width : 0;
+	int h = sb->dst_height > 0 ? sb->dst_height : 0;
+	if (w <= 0 || h <= 0) {
+		struct wlr_scene_surface *ss = wlr_scene_surface_try_from_buffer(sb);
+		if (ss != NULL) {
+			w = ss->surface->current.width;
+			h = ss->surface->current.height;
+		} else {
+			w = sb->buffer->width;
+			h = sb->buffer->height;
+		}
+	}
 	if (w <= 0 || h <= 0) {
 		return;
 	}
@@ -920,10 +948,19 @@ static void backdrop_iter(struct wlr_scene_buffer *sb, int sx, int sy,
 	if (tex == NULL) {
 		return;
 	}
+	/* 按**边**取整（而不是位置 + 宽度各自取整），相邻的两块 buffer 之间就不会
+	 * 因为各自四舍五入而露出一像素缝。 */
+	int x1 = (int)lround((double)sx * ctx->scale) - ctx->ox;
+	int y1 = (int)lround((double)sy * ctx->scale) - ctx->oy;
+	int x2 = (int)lround((double)(sx + w) * ctx->scale) - ctx->ox;
+	int y2 = (int)lround((double)(sy + h) * ctx->scale) - ctx->oy;
+	if (x2 <= x1 || y2 <= y1) {
+		return;
+	}
 	float alpha = sb->opacity;
 	struct wlr_render_texture_options opts = {
 		.texture = tex,
-		.dst_box = { .x = sx, .y = sy, .width = w, .height = h },
+		.dst_box = { .x = x1, .y = y1, .width = x2 - x1, .height = y2 - y1 },
 		.alpha = &alpha,
 		.transform = sb->transform,
 		.filter_mode = WLR_SCALE_FILTER_BILINEAR,
@@ -947,7 +984,17 @@ static bool backdrop_render(struct vidow_server *server,
 	};
 	wlr_render_pass_add_rect(pass, &clear);
 
-	struct backdrop_ctx ctx = { .pass = pass, .server = server };
+	double scale = output->wlr_output->scale;
+	if (!(scale > 0.0)) {
+		scale = 1.0;
+	}
+	struct backdrop_ctx ctx = {
+		.pass = pass,
+		.server = server,
+		.scale = scale,
+		.ox = (int)lround((double)output->box.x * scale),
+		.oy = (int)lround((double)output->box.y * scale),
+	};
 	struct wlr_scene_tree *trees[] = {
 		server->layer_background, server->layer_bottom, server->layer_toplevels,
 	};
