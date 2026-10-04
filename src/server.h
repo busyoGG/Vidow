@@ -253,6 +253,8 @@ struct vidow_blur_set {
 	struct wlr_buffer *up[4];
 	int w, h, levels;
 	uint64_t gen;  /* scene generation this pyramid was built for */
+	double offset; /* kawase 采样步长，建这张金字塔时用的 */
+	double alpha_min;
 	bool valid;
 };
 
@@ -322,6 +324,10 @@ struct vidow_fx_target {
 	bool blur_region_on;
 	float blur_region[4]; /* x, y, w, h */
 
+	/* 只画「背后的模糊」：layer surface 的底衬用它。内容和阴影/边框/圆角/噪点
+	 * 全部关掉，输出就是一层模糊，垫在 layer surface 自己的节点下面。 */
+	bool blur_only;
+
 	bool hidden;  /* temporarily disabled for the backdrop capture */
 };
 
@@ -387,6 +393,10 @@ struct vidow_output {
 	uint64_t blur_id;   /* identity of blur_tex, 0 = none */
 	uint64_t blur_gen;  /* gen_layer the pyramid was captured at */
 	int blur_levels;
+	/* 建这张金字塔时用的是哪套参数：改 blur_offset / blur_alpha_min 也得重算
+	 * （它们是在 kawase 的着色器里作为 uniform 用的，缓存的贴图不会跟着变）。 */
+	double blur_offset;
+	double blur_alpha_min;
 
 	/* 视口外补帧的到点闹钟：节流到 30Hz / 15Hz 的时候，光靠客户端提交来推进
 	 * 是不行的（提交一次之后就没人再推了，链子断在半路）—— 到点了由它叫醒一次。 */
@@ -610,6 +620,10 @@ struct vidow_layer_surface {
 	struct wl_listener commit;
 	struct wl_listener destroy;
 	struct wl_listener new_popup;
+
+	/* 它背后的模糊：一个垫在 ls->scene->tree 底下的节点，用和窗口装饰同一套
+	 * 着色器画（blur_only）。半透明的状态栏透出来就是模糊的底衬。 */
+	struct vidow_fx_target fx;
 };
 
 /* ---------------------------------------------------------------- keyboard */
@@ -1137,6 +1151,9 @@ bool vidow_fx_set_shader(struct vidow_server *server,
 		struct vidow_fx_target *fx, const char *name,
 		enum vidow_shader_phase phase);
 int vidow_fx_pad(struct vidow_server *server);
+/* layer surface 背后的模糊：位置/尺寸变了要作废重画（见 fx.c）。 */
+void vidow_layer_blur_invalidate(struct vidow_layer_surface *ls);
+void vidow_layer_blur_release(struct vidow_layer_surface *ls);
 void vidow_blur_update(struct vidow_output *output);
 /* Mark the cached backdrops stale. layers = true for a change to the wallpaper
  * or a background/bottom layer surface; false for anything that only moves or

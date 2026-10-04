@@ -791,6 +791,8 @@ static void blur_set_drop(struct vidow_blur_set *set) {
 	set->h = 0;
 	set->levels = 0;
 	set->gen = 0;
+	set->offset = 0.0;
+	set->alpha_min = 0.0;
 	set->valid = false;
 }
 
@@ -817,6 +819,8 @@ static bool blur_set_alloc(struct vidow_server *server,
 	set->w = w;
 	set->h = h;
 	set->levels = levels;
+	set->offset = server->config.blur_offset;
+	set->alpha_min = server->config.blur_alpha_min;
 	return true;
 }
 
@@ -1045,6 +1049,14 @@ static void blur_target_release(struct vidow_fx_target *fx) {
 	blur_set_drop(&fx->blur_set);
 }
 
+/* layer surface 背后的模糊（实现在下面「draw」之后）：先声明，抓底衬的时候
+ * 要用它把节点藏起来。 */
+static bool layer_blur_wanted(struct vidow_server *server,
+		struct vidow_layer_surface *ls);
+static bool layer_blur_frame(struct vidow_server *server,
+		struct vidow_output *output, struct vidow_layer_surface *ls);
+static void layer_blur_capture_visible(struct vidow_server *server, bool on);
+
 static int blur_levels_for(struct vidow_server *server, int w, int h) {
 	int levels = server->config.blur_levels;
 	if (levels < 2) {
@@ -1086,7 +1098,11 @@ static bool shared_blur_rebuild(struct vidow_server *server,
 			wlr_scene_node_set_enabled(&closing->fx.node->node, false);
 		}
 	}
+	/* layer 的模糊节点也得藏：bottom 层的那个就在被抓的场景里，不藏就是
+	 * 「模糊结果里混进上一帧的模糊」。 */
+	layer_blur_capture_visible(server, false);
 	bool ok = backdrop_render(server, output, w, h);
+	layer_blur_capture_visible(server, true);
 	wl_list_for_each(view, &server->views, link) {
 		view_set_capture_visible(view, true);
 	}
@@ -1124,7 +1140,10 @@ static bool shared_blur_rebuild(struct vidow_server *server,
 	output->blur_id = server->blur_serial++;
 	output->blur_gen = server->gen_layer;
 	output->blur_levels = levels;
-	wlr_log(WLR_DEBUG, "blur: shared rebuild %dx%d levels=%d", w, h, levels);
+	output->blur_offset = server->config.blur_offset;
+	output->blur_alpha_min = server->config.blur_alpha_min;
+	wlr_log(WLR_DEBUG, "blur: shared rebuild %dx%d levels=%d offset=%.2f", w, h,
+		levels, output->blur_offset);
 	return true;
 }
 
@@ -1135,7 +1154,9 @@ static bool blur_own_rebuild(struct vidow_server *server,
 		struct vidow_output *output, struct vidow_view *view,
 		int w, int h, int levels) {
 	view_set_capture_visible(view, false);
+	layer_blur_capture_visible(server, false);
 	bool ok = backdrop_render(server, output, w, h);
+	layer_blur_capture_visible(server, true);
 	view_set_capture_visible(view, true);
 	if (!ok) {
 		return false;
@@ -1196,6 +1217,10 @@ void vidow_blur_update(struct vidow_output *output) {
 		wl_list_for_each(view, &server->views, link) {
 			blur_target_release(&view->fx);
 		}
+		struct vidow_layer_surface *off;
+		wl_list_for_each(off, &server->layers, link) {
+			vidow_layer_blur_release(off);
+		}
 		shared_blur_drop(output);
 		blur_drop(output);
 		return;
@@ -1215,9 +1240,14 @@ void vidow_blur_update(struct vidow_output *output) {
 		output->backdrop_h = h;
 	}
 
+	/* 缓存键必须把所有影响结果的参数都算上：级数、采样步长、剔除阈值。
+	 * 漏了 blur_offset / blur_alpha_min 的时候，运行时改这两个键看着「没反应」
+	 * —— 贴图是旧参数算的，谁也没让它重算。 */
 	bool shared_ok = output->blur_tex != NULL &&
 		output->blur_gen == server->gen_layer &&
 		output->blur_levels == levels &&
+		fabs(output->blur_offset - server->config.blur_offset) < 1e-6 &&
+		fabs(output->blur_alpha_min - server->config.blur_alpha_min) < 1e-6 &&
 		output->blur_set.w == w && output->blur_set.h == h;
 	if (!shared_ok) {
 		shared_ok = shared_blur_rebuild(server, output, w, h, levels);
@@ -1258,6 +1288,7 @@ void vidow_blur_update(struct vidow_output *output) {
 			view->fx.blur_set.gen == server->gen_scene &&
 			view->fx.blur_set.w == w && view->fx.blur_set.h == h &&
 			view->fx.blur_set.levels == levels &&
+			fabs(view->fx.blur_set.offset - server->config.blur_offset) < 1e-6 &&
 			view->fx.blur_own_tex != NULL;
 		if (!fresh && !blur_own_rebuild(server, output, view, w, h, levels)) {
 			blur_assign(&view->fx, NULL, false, 0);
@@ -1269,6 +1300,23 @@ void vidow_blur_update(struct vidow_output *output) {
 		}
 		blur_assign(&view->fx, view->fx.blur_own_tex, true,
 			view->fx.blur_own_id);
+	}
+
+	/* layer surface 背后的模糊（状态栏 / 面板那层）。用的是共享的那份底衬
+	 * （壁纸 + background/bottom 层，窗口被藏起来），所以状态栏不会随窗口
+	 * 内容重画而重画 —— 它们的底衬本来就是同一张。 */
+	struct vidow_layer_surface *ls;
+	wl_list_for_each(ls, &server->layers, link) {
+		if (ls->output != output) {
+			continue;
+		}
+		if (!layer_blur_wanted(server, ls)) {
+			vidow_layer_blur_release(ls);
+			continue;
+		}
+		/* 这一帧画不出来（两个目标都还在飞 / 底衬还没建好）就留着上一帧的
+		 * 节点：别一帧有、一帧没有地闪。 */
+		(void)layer_blur_frame(server, output, ls);
 	}
 }
 
@@ -1345,6 +1393,16 @@ static void decor_draw(struct vidow_server *server,
 		(float)(fx->blur_region[1] * scale),
 		(float)(fx->blur_region[2] * scale),
 		(float)(fx->blur_region[3] * scale));
+
+	if (fx->blur_only) {
+		/* 只要那一层模糊：内容、阴影、边框、圆角、噪点全关（layer surface 的
+		 * 底衬用；内容由 wlroots 自己的场景节点画在上面）。 */
+		glUniform1f(d->u_radius, 0.0f);
+		glUniform1f(d->u_border_width, 0.0f);
+		glUniform4f(d->u_border_color, 0.0f, 0.0f, 0.0f, 0.0f);
+		glUniform4f(d->u_shadow_color, 0.0f, 0.0f, 0.0f, 0.0f);
+		glUniform1f(d->u_noise, 0.0f);
+	}
 
 	draw_quad(d->program);
 	glUseProgram(0);
@@ -1568,6 +1626,142 @@ void vidow_fx_release(struct vidow_fx_target *fx) {
 }
 
 /* --------------------------------------------------------- closing windows */
+
+/* ------------------------------------------------------- layer 的背景模糊 */
+
+/* 状态栏 / 面板这些 layer surface 背后的模糊。
+ *
+ * 做法和窗口不一样：窗口是把内容和装饰一起画进一张离屏图，再让场景节点画那张图；
+ * layer surface 的内容渲染归 wlroots 的 scene 管（subsurface 树、buffer scale、
+ * damage 都在它手里），接管过来等于重写一遍。所以在它**下面垫一层**就够 —— 一个
+ * 和它一样大的场景节点，里面只有模糊。客户端半透明的地方透出来就是模糊的底衬，
+ * 不透明的地方把它盖住，等于没画。
+ *
+ * 用共享的那份底衬（壁纸 + background/bottom 层，窗口被藏起来），所以：
+ *   - 状态栏不会随窗口重画而重画（它们的底衬本来就是同一张）
+ *   - 代价：压在窗口上的 overlay 面板透出来的是壁纸的模糊，不是窗口的模糊
+ *     （niri / Hyprland 对 layer 的模糊也是这个语义） */
+static bool layer_blur_wanted(struct vidow_server *server,
+		struct vidow_layer_surface *ls) {
+	if (!server->shader_ok || !server->config.blur_enabled) {
+		return false;
+	}
+	/* 壁纸自己（background 层）不模糊：模糊的底衬里就有它，垫一层等于画重。 */
+	if (ls->layer == ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND) {
+		return false;
+	}
+	return ls->geom.width > 0 && ls->geom.height > 0 && ls->scene != NULL;
+}
+
+static bool layer_blur_frame(struct vidow_server *server,
+		struct vidow_output *output, struct vidow_layer_surface *ls) {
+	struct vidow_fx_target *fx = &ls->fx;
+
+	if (output->blur_tex == NULL || ls->scene == NULL) {
+		return false;
+	}
+	double scale = output->wlr_output->scale;
+	if (!(scale > 0.0)) {
+		scale = 1.0;
+	}
+	int logical_w = ls->geom.width, logical_h = ls->geom.height;
+	int px_w = (int)lround((double)logical_w * scale);
+	int px_h = (int)lround((double)logical_h * scale);
+	if (px_w < 1 || px_h < 1 || px_w > MAX_TARGET_PX || px_h > MAX_TARGET_PX) {
+		return false;
+	}
+
+	if (fx->node == NULL) {
+		fx->node = wlr_scene_buffer_create(ls->scene->tree, NULL);
+		if (fx->node == NULL) {
+			return false;
+		}
+		fx->node->point_accepts_input = fx_node_rejects_input;
+		/* 垫在 layer surface 自己那个节点下面。 */
+		wlr_scene_node_lower_to_bottom(&fx->node->node);
+	}
+	fx->blur_only = true;
+	fx->active = true;
+	/* 着色器里 u_blur_strength 看的是 fx->blur（窗口那条路是 vidow_fx_begin
+	 * 设的），这儿得自己开：不开就是垫了一张全透明的东西，什么都看不见。 */
+	fx->blur = true;
+
+	if (fx->buf[0] == NULL || fx->w != px_w || fx->h != px_h ||
+			fabs(fx->scale - scale) > 1e-3) {
+		drop_targets(fx);
+		for (int i = 0; i < 2; i++) {
+			fx->buf[i] = alloc_target(server, px_w, px_h);
+			if (fx->buf[i] == NULL) {
+				drop_targets(fx);
+				return false;
+			}
+		}
+		fx->w = px_w;
+		fx->h = px_h;
+		fx->content_w = px_w;
+		fx->content_h = px_h;
+		fx->px_pad = 0;
+		fx->dst_w = logical_w;
+		fx->dst_h = logical_h;
+		fx->scale = scale;
+		fx->blur_drawn = 0; /* 尺寸变了，必须重画 */
+	}
+
+	blur_assign(fx, output->blur_tex, false, output->blur_id);
+	if (fx->blur_drawn == fx->blur_ver) {
+		return true; /* 已经画的就是这一版 */
+	}
+
+	struct wlr_buffer *target = pick_free(fx->buf);
+	if (target == NULL) {
+		return false;
+	}
+	static const float no_border[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+	decor_draw(server, fx, target, server->empty_tex, no_border,
+		ls->geom.x, ls->geom.y, 1.0, scale);
+
+	wlr_scene_node_set_position(&fx->node->node, 0, 0);
+	wlr_scene_buffer_set_dest_size(fx->node, logical_w, logical_h);
+	wlr_scene_buffer_set_opacity(fx->node, 1.0f);
+	pixman_region32_t damage;
+	pixman_region32_init_rect(&damage, 0, 0, logical_w, logical_h);
+	wlr_scene_buffer_set_buffer_with_damage(fx->node, target, &damage);
+	pixman_region32_fini(&damage);
+	wlr_scene_node_set_enabled(&fx->node->node, true);
+
+	fx->blur_drawn = fx->blur_ver;
+	return true;
+}
+
+static void layer_blur_capture_visible(struct vidow_server *server, bool on) {
+	struct vidow_layer_surface *ls;
+	wl_list_for_each(ls, &server->layers, link) {
+		if (ls->fx.node != NULL) {
+			wlr_scene_node_set_enabled(&ls->fx.node->node, on);
+		}
+	}
+}
+
+/* 位置 / 尺寸变了（或者底衬换了）：作废已画的那一版，下一帧重画。
+ * 距离和采样坐标都在着色器里，节点自己动了也得重算。 */
+void vidow_layer_blur_invalidate(struct vidow_layer_surface *ls) {
+	ls->fx.blur_ver++;
+	if (ls->output != NULL) {
+		wlr_output_schedule_frame(ls->output->wlr_output);
+	}
+}
+
+void vidow_layer_blur_release(struct vidow_layer_surface *ls) {
+	if (ls->fx.node == NULL && ls->fx.buf[0] == NULL) {
+		return;
+	}
+	if (ls->fx.node != NULL) {
+		wlr_scene_node_destroy(&ls->fx.node->node);
+		ls->fx.node = NULL;
+	}
+	vidow_fx_release(&ls->fx);
+	ls->fx.blur_drawn = 0;
+}
 
 static void closing_update(void *data, double t) {
 	struct vidow_closing *closing = data;

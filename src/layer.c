@@ -62,11 +62,18 @@ void vidow_arrange_layers(struct vidow_server *server) {
 
 				int lx = 0, ly = 0;
 				wlr_scene_node_coords(&ls->scene->tree->node, &lx, &ly);
-				ls->geom = (struct wlr_box){
+				struct wlr_box box = {
 					.x = lx, .y = ly,
 					.width = ls->layer_surface->surface->current.width,
 					.height = ls->layer_surface->surface->current.height,
 				};
+				/* 位置 / 尺寸真的变了才作废背后的模糊：这个函数在开关动画里
+				 * 每帧都调，而 anim_off 是加在场景节点上的、geom 不含它 ——
+				 * 所以动画期间这里不会每帧作废。 */
+				if (memcmp(&box, &ls->geom, sizeof(box)) != 0) {
+					ls->geom = box;
+					vidow_layer_blur_invalidate(ls);
+				}
 				wlr_scene_node_set_position(&ls->scene->tree->node,
 					lx + (int)lround(ls->anim_off_x),
 					ly + (int)lround(ls->anim_off_y));
@@ -300,6 +307,7 @@ static void layer_surface_destroy(struct wl_listener *listener, void *data) {
 
 	vidow_ipc_emit_layer(server, "layer-closed", ls);
 	layer_unfocus(ls);
+	vidow_layer_blur_release(ls);
 	vidow_anim_cancel(ls->anim);
 	ls->anim = NULL;
 	wlr_buffer_unlock(ls->last_buffer);

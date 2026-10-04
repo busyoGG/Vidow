@@ -473,6 +473,7 @@ python3 test-float.py        # 三个真实 GTK 窗口，验证浮动模式自�
 ./test-focus.sh                      # 焦点规则 + 激活请求（全 headless，61 项断言）
 ./test-ipc.sh                        # IPC：状态输出 / 命令 / 事件 / 多屏（全 headless，162 项断言）
 ./test-config.sh                     # 配置系统：一个 Lua 文件 + 改了就自动重载（全 headless，15 项断言）
+./test-layerblur.sh                  # 半透明状态栏背后的模糊（全 headless，4 项断言）
 ./build/jsontest                     # 只看 JSON 写出/读入（离线，30 项）
 ./build/scaletest                    # 只看缩放计算（24 项）
 ```
@@ -1131,6 +1132,57 @@ vidowmsg clipboard-clear
 所以 4 级 = 1/2、1/4、1/8、1/16，最终结果是**半分辨率**（`up[0]`，给装饰着色器采样的
 那张）。级数越大模糊半径越大、也越贵（每级一趟 pass）。运行时夹在 2..4
 （`MAX_BLUR_LEVELS`），并且最小那一级会小于 4px 时自动降一级（`blur_levels_for`）。
+
+**实测半径**（1280×720 + `tools/wall.py` 壁纸，`VIDOW_BLUR_DUMP` 导出最终模糊图，
+再拿「和哪一档高斯最像」估等效半径 —— 注意别用「平均梯度」这类指标：它对
+1/4 分辨率上的降采样几乎不敏感，会得出「怎么调都一样」的错误结论）：
+
+| `blur_levels` | 等效模糊半径（屏幕像素） |
+| --- | --- |
+| 2 | ≈8 |
+| 3 | ≈16 |
+| 4 | ≈28 |
+
+### layer surface 背后的模糊
+
+状态栏 / 面板（bottom / top / overlay 层的 layer surface）也有背景模糊 —— 客户端是
+半透明的（waybar 的 `rgba(...)`、大部分面板都是）就直接透出来。
+
+做法和窗口不同：窗口是把内容和装饰一起画进一张离屏图再让场景节点画那张图；layer
+surface 的内容渲染归 wlroots 的 scene 管（subsurface 树、buffer scale、damage 都在
+它手里），接管过来等于重写一遍。所以在它**下面垫一个节点**就够 —— 一块和它一样大的
+场景节点，用同一个装饰着色器画，但把内容 / 阴影 / 边框 / 圆角 / 噪点全关掉
+（`fx->blur_only`），只留模糊。半透明的地方透出来，不透明的地方盖住，等于没画。
+
+- 用的是**共享的那份底衬**（壁纸 + background/bottom 层，窗口被藏起来），所以
+  状态栏不会随窗口重画而重画
+- `background` 层（壁纸自己）跳过：模糊的底衬里就有它，垫一层等于画重
+- 抓底衬的时候这些节点要先藏起来（bottom 层的那个就在被抓的场景里，不藏就是
+  「模糊结果里混进上一帧的模糊」）
+- 位置 / 尺寸变了要作废重画（采样坐标在着色器里，节点动了就得重算），见
+  `vidow_layer_blur_invalidate()`
+
+实测（`tools/wall.py` 壁纸 + `tools/bar.py`：一块 50% 透明的 top 层状态栏，量状态栏
+那 40px 里的最大梯度；壁纸本身的硬边是 107.7）：
+
+| | 状态栏内最大梯度 |
+| --- | --- |
+| `blur_enabled = false` | 74.0（透出来的是硬边，只是被 50% 黑压暗了） |
+| `blur_levels = 2` | 4.67 |
+| `blur_levels = 4` | 2.33 |
+
+代价（说清楚）：压在窗口上的 overlay 面板透出来的是**壁纸**的模糊，不是窗口的模糊
+（用的是共享底衬）。niri / Hyprland 对 layer 的模糊也是这个语义。
+
+`./test-layerblur.sh` 就是这个靶子（4 项断言）。
+
+### 顺手修掉的两个真 bug（模糊）
+
+**⓪ 改 `blur_offset` / `blur_alpha_min` 看着「没反应」**：这两个键是在 kawase 的
+着色器里当 uniform 用的，缓存的贴图不会跟着变 —— 而共享金字塔的缓存键里
+**只有 `levels`**，没有它们，于是运行时（`set-config` 或改配置重载）改这两个键，
+只要背景没别的变化，用旧参数算的那张图就一直被复用。缓存键现在把 `levels` /
+`offset` / `alpha_min` 都算上了（窗口自己那份私有金字塔同理）。
 
 ### 顺手修掉的两个真 bug（模糊）
 
@@ -2128,6 +2180,20 @@ protocols/     wlr-layer-shell / wlr-virtual-pointer / input-method-v2 /
      写也只重载一次）。配置文件是符号链接时先 `realpath()` 解析，盯真身。
      实测：原地写 / rename 覆盖 / 删文件（回默认值）都认，同目录里动 `portals.conf`
      不重载。`./test-config.sh`（15 项断言）
+
+105. layer surface 背后的模糊（状态栏 / 面板）：在 layer surface 自己的场景节点**下面**
+     垫一块和它一样大的节点，用同一个装饰着色器画、但把内容/阴影/边框/圆角/噪点全关
+     （`fx->blur_only`），只留模糊。半透明处透出来，不透明处盖住。用共享底衬（壁纸 +
+     background/bottom 层），background 层跳过；抓底衬时这些节点要先藏起来（不然
+     bottom 层的会自己糊自己）。实测状态栏内最大梯度 74.0（关）→ 4.67（levels=2）→
+     2.33（levels=4），壁纸硬边是 107.7。`./test-layerblur.sh`
+
+106. `blur_offset` / `blur_alpha_min` 没进模糊缓存键：它们是 kawase 着色器的 uniform，
+     改完缓存的贴图不会跟着变，而共享金字塔的缓存键只有 `levels` —— 于是运行时改这
+     两个键看着「怎么调都没反应」。缓存键补上这两个（私有金字塔同理）。
+     另外把「平均梯度」这个测量方法记下来当反面教材：它对降采样几乎不敏感，会给出
+     「4 级和 2 级一样」的错误结论；同一批图换成「和哪档高斯最像」，量出来是
+     8 / 16 / 28 屏幕像素，逐级翻倍
 
 ## 尚未实现（原型边界）
 
