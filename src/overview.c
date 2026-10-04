@@ -1,0 +1,348 @@
+#include "server.h"
+#include "ipc.h"
+
+#include <math.h>
+#include <stdlib.h>
+
+#include <wlr/util/log.h>
+
+/* niri 风格的 overview：把一块屏上的整条列带缩到这块屏里看全景，点谁就去谁。
+ *
+ * 场景是全局的，所以这里不动布局、不改客户端尺寸，只算一个「世界 -> 屏幕」的变换
+ * （见 server.h 里 struct vidow_overview 的注释），view.c 的 vidow_view_apply_anim
+ * 负责把它套到每个窗口的场景节点上。
+ *
+ * t = 0 时必须是**恒等变换**：进出的动画都在 t 上插值，t = 0 那一端不能有跳变。 */
+
+/* 这块屏上「所有窗口」在世界坐标里的范围（用每个窗口实际摆好的 geom，
+ * 所以带上了视口的滚动偏移 —— 正好是它们现在真正在的地方）。 */
+static bool strip_box(struct vidow_server *server,
+		struct wlr_output *output, struct wlr_box *out) {
+	bool any = false;
+	int x0 = 0, x1 = 0, y0 = 0, y1 = 0;
+
+	struct vidow_view *view;
+	wl_list_for_each(view, &server->views, link) {
+		if (view->output != output || view->popup || !view->mapped ||
+				view->geom.width < 1 || view->geom.height < 1) {
+			continue;
+		}
+		/* overview 看的是**现在显示着的那块工作区**：藏起来的工作区不在场
+		 * （它们的 geom 还是上次显示时的老值，算进去会把镜头拉偏）。 */
+		if (!vidow_workspace_view_visible(server, view)) {
+			continue;
+		}
+		int left = view->geom.x, right = left + view->geom.width;
+		int top = view->geom.y, bottom = top + view->geom.height;
+		if (!any) {
+			x0 = left;
+			x1 = right;
+			y0 = top;
+			y1 = bottom;
+			any = true;
+			continue;
+		}
+		if (left < x0) {
+			x0 = left;
+		}
+		if (right > x1) {
+			x1 = right;
+		}
+		if (top < y0) {
+			y0 = top;
+		}
+		if (bottom > y1) {
+			y1 = bottom;
+		}
+	}
+	if (!any) {
+		return false;
+	}
+	*out = (struct wlr_box){
+		.x = x0,
+		.y = y0,
+		.width = x1 - x0,
+		.height = y1 - y0,
+	};
+	return true;
+}
+
+bool vidow_overview_active(const struct vidow_server *server) {
+	return server->overview.t > 0.0 || server->overview.on;
+}
+
+/* 算好这一帧的 scale / cam / 输出矩形，并把所有窗口按它摆一遍。 */
+static void overview_apply(struct vidow_server *server) {
+	struct vidow_overview *ov = &server->overview;
+	struct wlr_output *output = ov->output;
+	if (output == NULL) {
+		return;
+	}
+
+	struct wlr_box work = vidow_work_area(server, output);
+	if (work.width < 1 || work.height < 1) {
+		return;
+	}
+	ov->out_x = work.x;
+	ov->out_y = work.y;
+	ov->out_w = work.width;
+	ov->out_h = work.height;
+
+	/* 恒等那一端：scale = 1、相机在世界坐标的屏中心 */
+	double id_cx = work.x + work.width / 2.0;
+	double id_cy = work.y + work.height / 2.0;
+	double to_cx = id_cx, to_cy = id_cy, to_scale = 1.0;
+
+	struct wlr_box strip;
+	if (strip_box(server, output, &strip)) {
+		/* 展开那一端：整条带（留 4% 边）铺进工作区，相机跟到带中心 */
+		double sx = (double)work.width * 0.92 / (double)strip.width;
+		double sy = (double)work.height * 0.92 / (double)strip.height;
+		to_scale = sx < sy ? sx : sy;
+		if (to_scale > 1.0) {
+			to_scale = 1.0; /* 只有两列时别放大：放大反而糊 */
+		}
+		to_cx = strip.x + strip.width / 2.0 + ov->pan;
+		to_cy = strip.y + strip.height / 2.0;
+	}
+
+	double t = ov->t;
+	if (t < 0.0) {
+		t = 0.0;
+	}
+	if (t > 1.0) {
+		t = 1.0;
+	}
+	ov->scale = 1.0 + (to_scale - 1.0) * t;
+	ov->cam_x = id_cx + (to_cx - id_cx) * t;
+	ov->cam_y = id_cy + (to_cy - id_cy) * t;
+	ov->out_cx = id_cx;
+	ov->out_cy = id_cy;
+
+	/* 遮罩：压暗壁纸，让缩小的窗口浮在上面。盖住那块屏（用它的整个布局框） */
+	if (ov->dim != NULL) {
+		struct wlr_box box = {0};
+		wlr_output_layout_get_box(server->output_layout, output, &box);
+		if (box.width < 1) {
+			box = (struct wlr_box){ .x = work.x, .y = work.y,
+				.width = work.width, .height = work.height };
+		}
+		float dim[4] = { 0.02f, 0.02f, 0.03f, (float)(0.60 * t) };
+		wlr_scene_rect_set_color(ov->dim, dim);
+		wlr_scene_rect_set_size(ov->dim, box.width, box.height);
+		wlr_scene_node_set_position(&ov->dim->node, box.x, box.y);
+		bool want = t > 0.002;
+		if (ov->dim->node.enabled != want) {
+			wlr_log(WLR_DEBUG, "overview: 遮罩 %s（t=%.3f，alpha=%.2f）",
+				want ? "开" : "关", t, 0.60 * t);
+		}
+		wlr_scene_node_set_enabled(&ov->dim->node, want);
+	}
+
+	/* 屏幕空间的东西在 overview 里没有意义：弹出物 / 通知 / 输入法候选框收起来。
+	 * 关窗残影是世界坐标的、缩不了，也一起收。 */
+	bool on = t > 0.002;
+	wlr_scene_node_set_enabled(&server->layer_popups->node, !on);
+	wlr_scene_node_set_enabled(&server->layer_top->node, !on);
+	wlr_scene_node_set_enabled(&server->layer_overlay->node, !on);
+	wlr_scene_node_set_enabled(&server->layer_im->node, !on);
+	struct vidow_closing *closing;
+	wl_list_for_each(closing, &server->closing, link) {
+		if (closing->fx.node != NULL) {
+			wlr_scene_node_set_enabled(&closing->fx.node->node, !on);
+		}
+	}
+
+	/* 所有窗口重新摆一遍：变换在 vidow_view_apply_anim 里生效 */
+	struct vidow_view *view;
+	wl_list_for_each(view, &server->views, link) {
+		vidow_view_apply_anim(view);
+	}
+	vidow_backdrop_damage(server, false);
+}
+
+/* ------------------------------------------------------------- 进出 */
+
+static void overview_update(void *data, double t) {
+	struct vidow_server *server = data;
+	server->overview.t = t;
+	overview_apply(server);
+}
+
+static void overview_done(void *data, bool cancelled) {
+	(void)cancelled;
+	struct vidow_server *server = data;
+	server->overview.anim = NULL;
+	server->overview.t = server->overview.on ? 1.0 : 0.0;
+	overview_apply(server);
+	if (!server->overview.on) {
+		server->overview.output = NULL;
+		server->overview.pan = 0.0;
+	}
+}
+
+static void overview_start(struct vidow_server *server) {
+	struct vidow_overview *ov = &server->overview;
+	vidow_anim_cancel(ov->anim);
+	ov->anim = vidow_anim_start(server, "overview", server->config.window_move_ms,
+		server->config.easing, overview_update, overview_done, server);
+	if (ov->anim == NULL) {
+		overview_done(server, false);
+	}
+}
+
+void vidow_overview_toggle(struct vidow_server *server) {
+	struct vidow_overview *ov = &server->overview;
+	if (ov->on) {
+		vidow_overview_exit(server);
+		return;
+	}
+	if (server->focused_output == NULL) {
+		return; /* 一块屏都没有，没得看 */
+	}
+	ov->on = true;
+	ov->output = server->focused_output;
+	ov->pan = 0.0;
+	/* 缩下去的窗口不该还挂着指针焦点（否则客户端以为鼠标还在它身上） */
+	wlr_seat_pointer_notify_clear_focus(server->seat);
+	overview_start(server);
+
+	/* 顺手把每个窗口在 overview 里的位置算出来打一行：一是让日志能自证，
+	 * 二是测试要拿它做像素断言（缩放后的矩形）。 */
+	struct wlr_box strip;
+	if (strip_box(server, ov->output, &strip)) {
+		struct wlr_box work = vidow_work_area(server, ov->output);
+		double sx = (double)work.width * 0.92 / (double)strip.width;
+		double sy = (double)work.height * 0.92 / (double)strip.height;
+		double scale = sx < sy ? sx : sy;
+		if (scale > 1.0) {
+			scale = 1.0;
+		}
+		wlr_log(WLR_INFO, "overview: 进入（%s 上 %d 个窗口，占 %dx%d 缩到 %.3f，"
+			"铺在工作区 %dx%d 里）", ov->output->name,
+			wl_list_length(&server->views), strip.width, strip.height,
+			scale, work.width, work.height);
+
+		int id_cx = work.x + work.width / 2;
+		int id_cy = work.y + work.height / 2;
+		int to_cx = strip.x + strip.width / 2;
+		int to_cy = strip.y + strip.height / 2;
+		struct vidow_view *view;
+		wl_list_for_each(view, &server->views, link) {
+			if (view->output != ov->output || !view->mapped) {
+				continue;
+			}
+			int x = (int)lround(id_cx + (view->geom.x - to_cx) * scale);
+			int y = (int)lround(id_cy + (view->geom.y - to_cy) * scale);
+			wlr_log(WLR_INFO, "overview: 窗口 %s -> 屏幕 %d,%d %dx%d（缩放 %.3f）",
+				vidow_view_title(view) != NULL ? vidow_view_title(view) : "(无题)",
+				x, y, (int)lround(view->geom.width * scale),
+				(int)lround(view->geom.height * scale), scale);
+		}
+	} else {
+		wlr_log(WLR_INFO, "overview: 进入（%s 上没有列）", ov->output->name);
+	}
+	vidow_ipc_emit_note(server, "overview-toggled");
+}
+
+void vidow_overview_exit(struct vidow_server *server) {
+	struct vidow_overview *ov = &server->overview;
+	if (!ov->on && ov->t <= 0.0) {
+		return;
+	}
+	ov->on = false;
+	ov->pan = 0.0;
+	overview_start(server);
+	wlr_log(WLR_INFO, "overview: 退出");
+	vidow_ipc_emit_note(server, "overview-toggled");
+}
+
+/* ------------------------------------------------------------- 坐标 */
+
+void vidow_overview_map(struct vidow_server *server, double wx, double wy,
+		double *sx, double *sy) {
+	const struct vidow_overview *ov = &server->overview;
+	if (ov->t <= 0.0) {
+		*sx = wx;
+		*sy = wy;
+		return;
+	}
+	*sx = ov->out_cx + (wx - ov->cam_x) * ov->scale;
+	*sy = ov->out_cy + (wy - ov->cam_y) * ov->scale;
+}
+
+void vidow_overview_unmap(struct vidow_server *server, double sx, double sy,
+		double *wx, double *wy) {
+	const struct vidow_overview *ov = &server->overview;
+	if (ov->t <= 0.0 || ov->scale <= 0.0) {
+		*wx = sx;
+		*wy = sy;
+		return;
+	}
+	*wx = ov->cam_x + (sx - ov->out_cx) / ov->scale;
+	*wy = ov->cam_y + (sy - ov->out_cy) / ov->scale;
+}
+
+double vidow_overview_scale(const struct vidow_server *server) {
+	const struct vidow_overview *ov = &server->overview;
+	return ov->t > 0.0 ? ov->scale : 1.0;
+}
+
+/* ------------------------------------------------------------- 交互 */
+
+/* 点一下：命中的那个窗口就选中（焦点给它，然后退出 overview 缩回去）。
+ * 点在空白处 = 什么都不选，直接退出。返回 true 表示这次点击被吃掉了。 */
+bool vidow_overview_click(struct vidow_server *server, double sx, double sy) {
+	struct vidow_overview *ov = &server->overview;
+	if (!vidow_overview_active(server)) {
+		return false;
+	}
+
+	struct wlr_surface *surface = NULL;
+	double lx = 0, ly = 0;
+	struct vidow_view *hit = vidow_view_at(server, sx, sy, &surface, &lx, &ly);
+	if (hit != NULL && hit->output == ov->output) {
+		if (hit->popup) {
+			/* 弹出物在 overview 里是收着的，不该被点到 */
+			return true;
+		}
+		vidow_focus_view(hit);
+		/* 点下去就退出，但客户端从没收到这次按下；对应的松手也吃掉，
+		 * 免得它收到一个没有按下配对的 release。 */
+		ov->swallow_release = true;
+		wlr_log(WLR_INFO, "overview: 选中 %s",
+			vidow_view_title(hit) != NULL ? vidow_view_title(hit) : "(无题)");
+	}
+	vidow_overview_exit(server);
+	return true;
+}
+
+/* 滚轮：平移相机（世界坐标）。换列（Mod+H/L）会把平移清零、改回跟焦点走。 */
+void vidow_overview_pan(struct vidow_server *server, double dx) {
+	struct vidow_overview *ov = &server->overview;
+	if (!vidow_overview_active(server)) {
+		return;
+	}
+	ov->pan += dx;
+	overview_apply(server);
+}
+
+void vidow_overview_update(struct vidow_server *server) {
+	if (!vidow_overview_active(server)) {
+		return;
+	}
+	overview_apply(server);
+}
+
+bool vidow_overview_init(struct vidow_server *server) {
+	/* 层本身由 main.c 按叠放顺序创建（紧贴壁纸之上、窗口之下），这里只放遮罩。
+	 * 别再 wlr_scene_tree_create 一次：那会新建一层挂到最后，遮罩就跑窗口上面去了
+	 * （踩过一次：overview 里连窗口都被一起压暗）。 */
+	server->overview.dim = wlr_scene_rect_create(server->layer_overview_dim, 1, 1,
+		(float[4]){ 0.0f, 0.0f, 0.0f, 0.0f });
+	if (server->overview.dim == NULL) {
+		return false;
+	}
+	wlr_scene_node_set_enabled(&server->overview.dim->node, false);
+	return true;
+}

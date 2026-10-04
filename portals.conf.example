@@ -1,0 +1,47 @@
+# vidow 的 portal 后端选择 —— 拷成 ~/.config/vidow/portals.conf 就能用。
+#
+# 生效链路：
+#   内置默认（src/portalconf.c）  ←  vidow 自带的兜底
+#        ↓ 被下面这份逐键覆盖
+#   ~/.config/vidow/portals.conf  ← 你改这里
+#        ↓ vidow 启动时同步
+#   ~/.config/xdg-desktop-portal/vidow-portals.conf  ← xdg-desktop-portal 真正读的
+#
+# 逐键合并，不是整份替换：只写你想改的那一行，其余保持内置默认。
+# 值留空 = 删掉这一项。
+#
+# 改完重启 vidow（不是重启 portal），vidow 会重写并重启 xdg-desktop-portal。
+# 内容没变的话它什么都不做，不会白重启。
+#
+# 前提：vidow 当整个会话的合成器，XDG_CURRENT_DESKTOP=Vidow（vidow 自己会设）。
+# 嵌套在别的桌面里跑的话，portal 读的是那个桌面的 <name>-portals.conf。
+
+[preferred]
+
+# 默认后端。gtk 覆盖 FileChooser / AppChooser / Print / Notification / Inhibit /
+# Access / Account / Email / DynamicLauncher / Lockdown / Settings。
+default=gtk
+
+# ── 换文件选择器 ──────────────────────────────────────────────
+# gtk  = GTK 的文件选择器（GNOME 风格，带路径栏和搜索）
+# kde  = KDE 的（Dolphin 风格，带面包屑和分割视图）
+# 这一行就是「切换文件选择器」的全部：
+org.freedesktop.impl.portal.FileChooser=kde
+
+# ── GTK 没有的接口交给 KDE ────────────────────────────────────
+org.freedesktop.impl.portal.GlobalShortcuts=kde
+org.freedesktop.impl.portal.Wallpaper=kde
+org.freedesktop.impl.portal.Usb=kde
+org.freedesktop.impl.portal.Clipboard=kde
+org.freedesktop.impl.portal.Background=kde
+
+# ── 录屏 / 截图：故意不给 KDE ─────────────────────────────────
+# KDE 的 ScreenCast / Screenshot 实现走 KWin 私有 IPC，在 vidow 上必然失败。
+# vidow 实现的是 wlr-screencopy + ext-image-copy-capture，那两个接口应该交给
+# xdg-desktop-portal-wlr（装了以后把下面两行的注释去掉）：
+#org.freedesktop.impl.portal.ScreenCast=wlr
+#org.freedesktop.impl.portal.Screenshot=wlr
+
+# ── 不想让某个接口有实现 ──────────────────────────────────────
+# 值留空即可（例：不要 KDE 的剪贴板同步）
+#org.freedesktop.impl.portal.Clipboard=

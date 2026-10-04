@@ -1,0 +1,6 @@
+build/
+subprojects/*/
+*.o
+*.raw
+__pycache__/
+*.pyc

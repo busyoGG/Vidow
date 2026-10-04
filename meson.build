@@ -1,0 +1,291 @@
+project('vidow', 'c',
+  version: '0.1.0',
+  license: 'MIT',
+  default_options: ['c_std=c11', 'warning_level=2'])
+
+cc = meson.get_compiler('c')
+
+# Arch ships versioned wlroots packages: wlroots-0.19.pc / wlroots-0.20.pc
+wlroots_dep = dependency('wlroots-0.20', version: '>=0.20.0')
+xkbcommon_dep = dependency('xkbcommon')
+wayland_server_dep = dependency('wayland-server')
+math_dep = cc.find_library('m', required: false)
+# 自定义 shader 走 GLES2：需要 EGL 和 GLES2 头/库
+egl_dep = dependency('egl')
+gles2_dep = dependency('glesv2')
+pixman_dep = dependency('pixman-1')
+# XWayland：wlr_xwayland_get_xwm_connection() 给的是 xcb 连接，诊断和 Xresources
+# 都直接用 xcb 说话。
+xcb_dep = dependency('xcb')
+# 剪贴板桥（clipboard.c）靠 XFixes 监听 X 侧的 owner 变化。
+xcb_xfixes_dep = dependency('xcb-xfixes')
+# 配置语言：Lua 5.4（Arch 的 lua54 包）。没有就退回系统默认 lua。
+lua_dep = dependency('lua5.4', required: false)
+if not lua_dep.found()
+  lua_dep = dependency('lua', required: true)
+endif
+
+add_project_arguments(
+  '-D_POSIX_C_SOURCE=200809L',
+  '-DWLR_USE_UNSTABLE',
+  language: 'c')
+
+wayland_scanner = find_program('wayland-scanner')
+wayland_client_dep = dependency('wayland-client')
+
+# Arch 的 wlroots0.20 包没有安装 wlr-layer-shell-unstable-v1-protocol.h
+# （wlroots 头文件里 #include 了它），所以从协议 XML 现场生成。
+layer_shell_header = custom_target('wlr-layer-shell-unstable-v1-protocol.h',
+  input: 'protocols/wlr-layer-shell-unstable-v1.xml',
+  output: 'wlr-layer-shell-unstable-v1-protocol.h',
+  command: [wayland_scanner, 'server-header', '@INPUT@', '@OUTPUT@'])
+
+# ext-background-effect-v1：wlroots 0.20 没实现，服务端自己生成
+bge_xml = 'protocols/ext-background-effect-v1.xml'
+bgeffect_header = custom_target('ext-background-effect-v1-server-protocol.h',
+  input: bge_xml,
+  output: 'ext-background-effect-v1-server-protocol.h',
+  command: [wayland_scanner, 'server-header', '@INPUT@', '@OUTPUT@'])
+bgeffect_code = custom_target('ext-background-effect-v1-protocol.c',
+  input: bge_xml,
+  output: 'ext-background-effect-v1-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
+
+# xdg-activation-v1：服务端**自己实现**（见 src/activation.c —— wlroots 那份把
+# serial 校验写死了，配不了「invalid serial 也认」），所以服务端头 + 代码自己生成。
+xa_xml = 'protocols/xdg-activation-v1.xml'
+xa_server_header = custom_target('xdg-activation-v1-server-protocol.h',
+  input: xa_xml,
+  output: 'xdg-activation-v1-server-protocol.h',
+  command: [wayland_scanner, 'server-header', '@INPUT@', '@OUTPUT@'])
+xa_server_code = custom_target('xdg-activation-v1-server-protocol.c',
+  input: xa_xml,
+  output: 'xdg-activation-v1-server-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
+
+sources = files(
+  'src/main.c',
+  'src/output.c',
+  'src/view.c',
+  'src/input.c',
+  'src/layer.c',
+  'src/float.c',
+  'src/config.c',
+  'src/scale.c',
+  'src/hotplug.c',
+  'src/workspace.c',
+  'src/keybind.c',
+  'src/rule.c',
+  'src/overview.c',
+  'src/anim.c',
+  'src/fx.c',
+  'src/exec.c',
+  'src/script.c',
+  'src/im.c',
+  'src/bgeffect.c',
+  'src/portal.c',
+  'src/decoration.c',
+  'src/activation.c',
+  'src/json.c',
+  'src/ipc.c',
+  'src/clipboard.c',
+  'src/ipcstate.c',
+  'src/portalconf.c',
+  'src/xwayland.c',
+) + [layer_shell_header, bgeffect_header, xa_server_header]
+
+# 测试工具：用虚拟指针模拟鼠标拖拽
+vp_xml = 'protocols/wlr-virtual-pointer-unstable-v1.xml'
+vp_header = custom_target('wlr-virtual-pointer-unstable-v1-client-protocol.h',
+  input: vp_xml,
+  output: 'wlr-virtual-pointer-unstable-v1-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'])
+vp_code = custom_target('wlr-virtual-pointer-unstable-v1-protocol.c',
+  input: vp_xml,
+  output: 'wlr-virtual-pointer-unstable-v1-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
+
+executable('vdrag',
+  ['tools/vdrag.c', vp_header, vp_code],
+  dependencies: [wayland_client_dep],
+  include_directories: include_directories('.'),
+  install: false)
+
+# 测试工具：假输入法，验证 input-method-v2 中继
+im_xml = 'protocols/input-method-unstable-v2.xml'
+im_header = custom_target('input-method-unstable-v2-client-protocol.h',
+  input: im_xml,
+  output: 'input-method-unstable-v2-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'])
+im_code = custom_target('input-method-unstable-v2-protocol.c',
+  input: im_xml,
+  output: 'input-method-unstable-v2-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
+
+executable('fakeim',
+  ['tools/fakeim.c', im_header, im_code],
+  dependencies: [wayland_client_dep],
+  include_directories: include_directories('.'),
+  install: false)
+
+# 测试工具：ext-background-effect 客户端（顺带要 xdg-shell 客户端协议）
+xs_xml = 'protocols/xdg-shell.xml'
+xs_header = custom_target('xdg-shell-client-protocol.h',
+  input: xs_xml,
+  output: 'xdg-shell-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'])
+xs_code = custom_target('xdg-shell-protocol.c',
+  input: xs_xml,
+  output: 'xdg-shell-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
+bge_client_header = custom_target('ext-background-effect-v1-client-protocol.h',
+  input: bge_xml,
+  output: 'ext-background-effect-v1-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'])
+
+# 测试工具：帧回调计数器（只按合成器的许可出帧，打印每一帧）
+# 测试工具：窗口录屏 / 预览的最小客户端（ext-image-copy-capture + 窗口截图源）
+etl_xml = 'protocols/ext-foreign-toplevel-list-v1.xml'
+etl_header = custom_target('ext-foreign-toplevel-list-v1-client-protocol.h',
+  input: etl_xml,
+  output: 'ext-foreign-toplevel-list-v1-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'])
+etl_code = custom_target('ext-foreign-toplevel-list-v1-protocol.c',
+  input: etl_xml,
+  output: 'ext-foreign-toplevel-list-v1-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
+
+eics_xml = 'protocols/ext-image-capture-source-v1.xml'
+eics_header = custom_target('ext-image-capture-source-v1-client-protocol.h',
+  input: eics_xml,
+  output: 'ext-image-capture-source-v1-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'])
+eics_code = custom_target('ext-image-capture-source-v1-protocol.c',
+  input: eics_xml,
+  output: 'ext-image-capture-source-v1-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
+
+eicc_xml = 'protocols/ext-image-copy-capture-v1.xml'
+eicc_header = custom_target('ext-image-copy-capture-v1-client-protocol.h',
+  input: eicc_xml,
+  output: 'ext-image-copy-capture-v1-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'])
+eicc_code = custom_target('ext-image-copy-capture-v1-protocol.c',
+  input: eicc_xml,
+  output: 'ext-image-copy-capture-v1-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
+
+executable('capture',
+  ['tools/capture.c', etl_header, etl_code, eics_header, eics_code,
+   eicc_header, eicc_code],
+  dependencies: [wayland_client_dep],
+  include_directories: include_directories('.'),
+  install: false)
+
+executable('frames',
+  ['tools/frames.c', xs_header, xs_code],
+  dependencies: [wayland_client_dep],
+  include_directories: include_directories('.'),
+  install: false)
+
+# 测试工具：激活请求客户端（xdg-activation-v1：窗口自己请求被顶上来）
+xa_header = custom_target('xdg-activation-v1-client-protocol.h',
+  input: xa_xml,
+  output: 'xdg-activation-v1-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'])
+xa_code = custom_target('xdg-activation-v1-protocol.c',
+  input: xa_xml,
+  output: 'xdg-activation-v1-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
+
+executable('activate',
+  ['tools/activate.c', xs_header, xs_code, xa_header, xa_code],
+  dependencies: [wayland_client_dep],
+  include_directories: include_directories('.'),
+  install: false)
+
+executable('bgblur',
+  ['tools/bgblur.c', xs_header, xs_code, bge_client_header, bgeffect_code],
+  dependencies: [wayland_client_dep],
+  include_directories: include_directories('.'),
+  install: false)
+
+# 测试工具：xdg-foreign 导出端（portal 的 parent_window 从这儿来）
+xfv1_xml = 'protocols/xdg-foreign-unstable-v1.xml'
+xfv2_xml = 'protocols/xdg-foreign-unstable-v2.xml'
+xfv1_header = custom_target('xdg-foreign-unstable-v1-client-protocol.h',
+  input: xfv1_xml,
+  output: 'xdg-foreign-unstable-v1-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'])
+xfv1_code = custom_target('xdg-foreign-unstable-v1-protocol.c',
+  input: xfv1_xml,
+  output: 'xdg-foreign-unstable-v1-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
+xfv2_header = custom_target('xdg-foreign-unstable-v2-client-protocol.h',
+  input: xfv2_xml,
+  output: 'xdg-foreign-unstable-v2-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'])
+xfv2_code = custom_target('xdg-foreign-unstable-v2-protocol.c',
+  input: xfv2_xml,
+  output: 'xdg-foreign-unstable-v2-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
+
+executable('foreign',
+  ['tools/foreign.c', xs_header, xs_code, xfv1_header, xfv1_code,
+   xfv2_header, xfv2_code],
+  dependencies: [wayland_client_dep],
+  include_directories: include_directories('.'),
+  install: false)
+
+# IPC 客户端：往 vidow 的 unix socket 上发一行 JSON，把应答打出来
+# （纯 socket 客户端，不依赖 wayland，也不依赖 json.c —— 它只做漂亮的缩进）。
+executable('vidowmsg',
+  ['tools/vidowmsg.c'],
+  install: false)
+
+# 离线自检：JSON 写出 / 读入（纯函数，不开合成器）
+executable('jsontest',
+  ['tools/jsontest.c', 'src/json.c'],
+  include_directories: include_directories('src'),
+  install: false)
+
+# 离线自检：混合 DPI 的缩放计算（纯函数，不开合成器）
+executable('scaletest',
+  ['tools/scaletest.c', 'src/scale.c'],
+  dependencies: [math_dep],
+  include_directories: include_directories('src'),
+  install: false)
+
+# 离线自检：热插拔记忆的纯逻辑（输出身份 / 记忆台账 / 挑接收的屏 / 稳定重排）
+executable('hotplugtest',
+  ['tools/hotplugtest.c', 'src/hotplug.c'],
+  dependencies: [wayland_server_dep],
+  include_directories: include_directories('src'),
+  install: false)
+
+# 测试工具：按绝对坐标造 X11 窗口（弹出物分类 / 定位 / 不许被布局搬走）
+xcb_icccm_dep = dependency('xcb-icccm')
+executable('xpopup',
+  ['tools/xpopup.c'],
+  dependencies: [xcb_dep, xcb_icccm_dep],
+  install: false)
+
+executable('vidow',
+  sources + [bgeffect_code, xa_server_code],
+  dependencies: [wlroots_dep, xkbcommon_dep, wayland_server_dep, math_dep,
+                 egl_dep, gles2_dep, pixman_dep, lua_dep, xcb_dep,
+                 xcb_xfixes_dep],
+  include_directories: include_directories('.'),
+  install: false)
+
+# 示例 shader 装到 ~/.config/vidow/shaders/
+install_data(
+  'shaders/zoom.frag',
+  'shaders/genie.frag',
+  'shaders/wave.frag',
+  'shaders/round.frag',
+  install_dir: join_paths(get_option('prefix'), 'share/vidow/shaders'))
+
+# portal 后端选择的示例（拷成 ~/.config/vidow/portals.conf）
+install_data('portals.conf.example',
+  install_dir: join_paths(get_option('prefix'), 'share/vidow'))

@@ -1,0 +1,499 @@
+/* 输入法中继：zwp_text_input_v3 <-> zwp_input_method_v2。
+ *
+ * 两个协议是一对，合成器夹在中间搬数据：
+ *
+ *   客户端(GTK/Qt/浏览器) --text-input-v3--> 合成器 --input-method-v2--> fcitx5
+ *   客户端(GTK/Qt/浏览器) <--text-input-v3-- 合成器 <--input-method-v2-- fcitx5
+ *
+ * 客户端说「我有输入框、光标在这、周围文字是这些」，输入法回 preedit 和
+ * commit。除此之外还有两件协议规定只能由合成器干的事：
+ *   - 候选框：输入法开的 popup surface 由我们渲染并摆位，光标位置得我们喂回去
+ *   - 抢键盘：输入法要拿原始按键；抢到之后按键不再进 seat，由输入法决定
+ *     消费还是用虚拟键盘回注
+ */
+
+#include "server.h"
+
+#include <stdlib.h>
+
+#include <wlr/types/wlr_scene.h>
+#include <wlr/util/box.h>
+#include <wlr/util/log.h>
+
+/* --------------------------------------------------------------- helpers */
+
+/* wlroots 把客户端 commit 的状态搬进 current、还是只留在 pending，各版本
+ * 不一样。谁有数据用谁，两种都成立。 */
+static const struct wlr_text_input_v3_state *input_state(
+		const struct wlr_text_input_v3 *input) {
+	if (input->current.surrounding.text != NULL ||
+			!wlr_box_empty(&input->current.cursor_rectangle)) {
+		return &input->current;
+	}
+	return &input->pending;
+}
+
+/* 输入法回给我们的状态同理。 */
+static const struct wlr_input_method_v2_state *method_state(
+		const struct wlr_input_method_v2 *method) {
+	if (method->current.preedit.text != NULL ||
+			method->current.commit_text != NULL ||
+			method->current.delete.before_length > 0 ||
+			method->current.delete.after_length > 0) {
+		return &method->current;
+	}
+	return &method->pending;
+}
+
+/* 真正在等输入的那个输入框：客户端说要输入，且它的窗口有键盘焦点。 */
+static struct vidow_text_input *active_text_input(struct vidow_server *server) {
+	struct vidow_text_input *ti;
+	wl_list_for_each(ti, &server->text_inputs, link) {
+		if (ti->enabled && ti->input->focused_surface != NULL) {
+			return ti;
+		}
+	}
+	return NULL;
+}
+
+/* 唤醒 / 让输入法睡觉。输入法只在有输入框时才该吃键。 */
+static void im_set_active(struct vidow_server *server, bool active) {
+	struct vidow_im *im = &server->im;
+	if (im->method == NULL || im->active == active) {
+		return;
+	}
+	im->active = active;
+	if (active) {
+		wlr_input_method_v2_send_activate(im->method);
+	} else {
+		wlr_input_method_v2_send_deactivate(im->method);
+	}
+	wlr_log(WLR_DEBUG, "input method %s", active ? "activated" : "deactivated");
+}
+
+/* --------------------------------------------------------------- 候选框 */
+
+static void im_popup_clear(struct vidow_im_popup *popup) {
+	if (popup->popup == NULL) {
+		return;
+	}
+	wl_list_remove(&popup->commit.link);
+	wl_list_remove(&popup->destroy.link);
+	if (popup->scene != NULL) {
+		wlr_scene_node_destroy(&popup->scene->buffer->node);
+	}
+	popup->popup = NULL;
+	popup->scene = NULL;
+}
+
+/* 把候选框摆到光标下面，并把光标在候选框坐标系里的位置告诉输入法。 */
+static void im_popup_update(struct vidow_server *server) {
+	struct vidow_im_popup *popup = &server->im_popup;
+	if (popup->popup == NULL || popup->scene == NULL) {
+		return;
+	}
+	struct vidow_text_input *ti = active_text_input(server);
+	if (ti == NULL || ti->input->focused_surface == NULL) {
+		return;
+	}
+	struct vidow_view *view =
+		vidow_view_from_surface(server, ti->input->focused_surface);
+	if (view == NULL) {
+		return;
+	}
+	int vx, vy;
+	if (!wlr_scene_node_coords(&view->scene_tree->node, &vx, &vy)) {
+		return;
+	}
+	struct wlr_box rect = input_state(ti->input)->cursor_rectangle;
+	/* 光标矩形是窗口 surface 的局部坐标，加上窗口在场景里的位置才是屏幕坐标 */
+	int px = vx + view->fx_dx + rect.x;
+	int py = vy + view->fx_dy + rect.y + rect.height;
+	wlr_scene_node_set_position(&popup->scene->buffer->node, px, py);
+	/* 输入法只认候选框自己的坐标系：给它相对候选框左上角的光标矩形 */
+	struct wlr_box rel = {
+		.x = -rect.x,
+		.y = -rect.y - rect.height,
+		.width = rect.width,
+		.height = rect.height,
+	};
+	wlr_input_popup_surface_v2_send_text_input_rectangle(popup->popup, &rel);
+}
+
+/* ---------------------------------------------------------- 客户端输入框 */
+
+/* 把输入框的当前状态推给输入法：周围文字、内容类型、光标。 */
+static void im_push_state(struct vidow_text_input *ti) {
+	struct wlr_input_method_v2 *method = ti->server->im.method;
+	if (method == NULL) {
+		return;
+	}
+	const struct wlr_text_input_v3_state *state = input_state(ti->input);
+	if (state->surrounding.text != NULL) {
+		wlr_input_method_v2_send_surrounding_text(method,
+			state->surrounding.text, state->surrounding.cursor,
+			state->surrounding.anchor);
+	}
+	wlr_input_method_v2_send_content_type(method, state->content_type.hint,
+		state->content_type.purpose);
+	wlr_input_method_v2_send_text_change_cause(method, state->text_change_cause);
+	wlr_input_method_v2_send_done(method);
+}
+
+static void text_input_enable(struct vidow_text_input *ti) {
+	ti->enabled = true;
+	ti->input->current_enabled = true;
+	/* 窗口可能早就有键盘焦点了：补一次 enter，否则输入法拿不到周围文字 */
+	vidow_im_focus(ti->server, ti->server->seat->keyboard_state.focused_surface);
+	im_set_active(ti->server, true);
+	im_push_state(ti);
+	im_popup_update(ti->server);
+	wlr_log(WLR_DEBUG, "text input enabled");
+}
+
+static void text_input_disable(struct vidow_text_input *ti) {
+	ti->enabled = false;
+	ti->input->current_enabled = false;
+	if (ti->input->focused_surface != NULL) {
+		wlr_text_input_v3_send_leave(ti->input);
+	}
+	if (active_text_input(ti->server) == NULL) {
+		im_set_active(ti->server, false);
+	}
+	wlr_log(WLR_DEBUG, "text input disabled");
+}
+
+static void text_input_commit(struct wl_listener *listener, void *data) {
+	(void)data;
+	struct vidow_text_input *ti = wl_container_of(listener, ti, commit);
+
+	/* 用我们自己的 enabled 判断开/关，不依赖 wlroots 有没有同步
+	 * pending_enabled -> current_enabled */
+	if (ti->input->pending_enabled != ti->enabled) {
+		if (ti->input->pending_enabled) {
+			text_input_enable(ti);
+		} else {
+			text_input_disable(ti);
+		}
+	}
+	if (!ti->enabled) {
+		return;
+	}
+	im_push_state(ti);
+	im_popup_update(ti->server);
+}
+
+static void text_input_enable_event(struct wl_listener *listener, void *data) {
+	(void)data;
+	struct vidow_text_input *ti = wl_container_of(listener, ti, enable);
+	if (!ti->enabled) {
+		text_input_enable(ti);
+	}
+}
+
+static void text_input_disable_event(struct wl_listener *listener, void *data) {
+	(void)data;
+	struct vidow_text_input *ti = wl_container_of(listener, ti, disable);
+	if (ti->enabled) {
+		text_input_disable(ti);
+	}
+}
+
+static void text_input_destroy(struct wl_listener *listener, void *data) {
+	(void)data;
+	struct vidow_text_input *ti = wl_container_of(listener, ti, destroy);
+	struct vidow_server *server = ti->server;
+	bool was_enabled = ti->enabled;
+
+	wl_list_remove(&ti->enable.link);
+	wl_list_remove(&ti->commit.link);
+	wl_list_remove(&ti->disable.link);
+	wl_list_remove(&ti->destroy.link);
+	wl_list_remove(&ti->link);
+	free(ti);
+
+	if (was_enabled && active_text_input(server) == NULL) {
+		im_set_active(server, false);
+	}
+}
+
+static void server_new_text_input(struct wl_listener *listener, void *data) {
+	struct vidow_server *server =
+		wl_container_of(listener, server, new_text_input);
+	struct wlr_text_input_v3 *input = data;
+
+	struct vidow_text_input *ti = calloc(1, sizeof(*ti));
+	if (ti == NULL) {
+		return;
+	}
+	ti->server = server;
+	ti->input = input;
+
+	ti->enable.notify = text_input_enable_event;
+	wl_signal_add(&input->events.enable, &ti->enable);
+	ti->commit.notify = text_input_commit;
+	wl_signal_add(&input->events.commit, &ti->commit);
+	ti->disable.notify = text_input_disable_event;
+	wl_signal_add(&input->events.disable, &ti->disable);
+	ti->destroy.notify = text_input_destroy;
+	wl_signal_add(&input->events.destroy, &ti->destroy);
+
+	wl_list_insert(&server->text_inputs, &ti->link);
+}
+
+/* --------------------------------------------------------------- 输入法侧 */
+
+static void im_popup_commit(struct wl_listener *listener, void *data) {
+	(void)data;
+	struct vidow_im_popup *popup = wl_container_of(listener, popup, commit);
+	im_popup_update(popup->server);
+}
+
+static void im_popup_destroy(struct wl_listener *listener, void *data) {
+	(void)data;
+	struct vidow_im_popup *popup = wl_container_of(listener, popup, destroy);
+	im_popup_clear(popup);
+}
+
+static void im_new_popup(struct wl_listener *listener, void *data) {
+	struct vidow_im *im = wl_container_of(listener, im, new_popup);
+	struct vidow_server *server = im->server;
+	struct wlr_input_popup_surface_v2 *surface = data;
+	struct vidow_im_popup *popup = &server->im_popup;
+
+	im_popup_clear(popup);
+	popup->popup = surface;
+	popup->scene = wlr_scene_surface_create(server->layer_im, surface->surface);
+	if (popup->scene == NULL) {
+		popup->popup = NULL;
+		return;
+	}
+	popup->commit.notify = im_popup_commit;
+	wl_signal_add(&surface->surface->events.commit, &popup->commit);
+	popup->destroy.notify = im_popup_destroy;
+	wl_signal_add(&surface->events.destroy, &popup->destroy);
+	wlr_log(WLR_DEBUG, "input method popup surface");
+	im_popup_update(server);
+}
+
+/* 输入法回话：把 preedit / commit / 删除请求转给客户端输入框。 */
+static void im_commit(struct wl_listener *listener, void *data) {
+	/* 注意：这个信号不带 data（wlroots 0.20 传 NULL），要用自己存的那个 */
+	(void)data;
+	struct vidow_im *im = wl_container_of(listener, im, commit);
+	struct vidow_server *server = im->server;
+	struct wlr_input_method_v2 *method = im->method;
+	if (method == NULL) {
+		return;
+	}
+	struct vidow_text_input *ti = active_text_input(server);
+	if (ti == NULL) {
+		/* 没有输入框在等：告诉它这次白说了，别攒着 */
+		wlr_input_method_v2_send_unavailable(method);
+		return;
+	}
+	struct wlr_text_input_v3 *input = ti->input;
+	const struct wlr_input_method_v2_state *state = method_state(method);
+
+	wlr_log(WLR_DEBUG, "im commit: preedit=[%s] commit=[%s] del=%u/%u",
+		state->preedit.text != NULL ? state->preedit.text : "",
+		state->commit_text != NULL ? state->commit_text : "",
+		state->delete.before_length, state->delete.after_length);
+
+	if (state->preedit.text != NULL) {
+		wlr_text_input_v3_send_preedit_string(input, state->preedit.text,
+			state->preedit.cursor_begin, state->preedit.cursor_end);
+	}
+	if (state->delete.before_length > 0 || state->delete.after_length > 0) {
+		wlr_text_input_v3_send_delete_surrounding_text(input,
+			state->delete.before_length, state->delete.after_length);
+	}
+	if (state->commit_text != NULL) {
+		wlr_text_input_v3_send_commit_string(input, state->commit_text);
+	}
+	wlr_text_input_v3_send_done(input);
+}
+
+static void im_grab_destroy(struct wl_listener *listener, void *data);
+
+static void im_grab_keyboard(struct wl_listener *listener, void *data) {
+	struct vidow_im *im = wl_container_of(listener, im, grab_keyboard);
+	struct wlr_input_method_keyboard_grab_v2 *grab = data;
+
+	im->grab = grab;
+	im->grab_destroy.notify = im_grab_destroy;
+	wl_signal_add(&grab->events.destroy, &im->grab_destroy);
+
+	/* 把当前键盘交给它（它会收到 keymap），并同步一次修饰键 */
+	vidow_im_set_keyboard(im->server, wlr_seat_get_keyboard(im->server->seat));
+	wlr_log(WLR_DEBUG, "input method grabbed the keyboard");
+}
+
+static void im_grab_destroy(struct wl_listener *listener, void *data) {
+	(void)data;
+	struct vidow_im *im = wl_container_of(listener, im, grab_destroy);
+	wl_list_remove(&im->grab_destroy.link);
+	im->grab = NULL;
+	wlr_log(WLR_DEBUG, "input method released the keyboard");
+}
+
+static void im_destroy(struct wl_listener *listener, void *data) {
+	(void)data;
+	struct vidow_im *im = wl_container_of(listener, im, destroy);
+	struct vidow_server *server = im->server;
+
+	im_popup_clear(&server->im_popup);
+	if (im->grab != NULL) {
+		wl_list_remove(&im->grab_destroy.link);
+		im->grab = NULL;
+	}
+	wl_list_remove(&im->commit.link);
+	wl_list_remove(&im->new_popup.link);
+	wl_list_remove(&im->grab_keyboard.link);
+	wl_list_remove(&im->destroy.link);
+	im->method = NULL;
+	im->active = false;
+	wlr_log(WLR_INFO, "input method disconnected");
+}
+
+static void server_new_input_method(struct wl_listener *listener, void *data) {
+	struct vidow_server *server =
+		wl_container_of(listener, server, new_input_method);
+	struct wlr_input_method_v2 *method = data;
+	struct vidow_im *im = &server->im;
+
+	if (im->method != NULL) {
+		/* 一个就够：后来的直接劝退 */
+		wlr_log(WLR_INFO, "another input method tried to connect, refusing");
+		wlr_input_method_v2_send_unavailable(method);
+		return;
+	}
+	im->method = method;
+
+	im->commit.notify = im_commit;
+	wl_signal_add(&method->events.commit, &im->commit);
+	im->new_popup.notify = im_new_popup;
+	wl_signal_add(&method->events.new_popup_surface, &im->new_popup);
+	im->grab_keyboard.notify = im_grab_keyboard;
+	wl_signal_add(&method->events.grab_keyboard, &im->grab_keyboard);
+	im->destroy.notify = im_destroy;
+	wl_signal_add(&method->events.destroy, &im->destroy);
+
+	wlr_log(WLR_INFO, "input method connected");
+	/* 输入法晚于输入框启动：立刻把它唤醒 */
+	im_set_active(server, active_text_input(server) != NULL);
+}
+
+/* ------------------------------------------------------------------- api */
+
+bool vidow_im_grabbed(struct vidow_server *server) {
+	return server->im.grab != NULL;
+}
+
+bool vidow_im_owns_keyboard(struct vidow_server *server,
+		struct vidow_keyboard *kb) {
+	struct vidow_im *im = &server->im;
+	if (im->grab == NULL) {
+		return false;
+	}
+	/* 输入法自己回注的按键不能再喂回去：那是它决定「这个键我不消费」的
+	 * 产物，喂回去就自己喂自己，死循环。 */
+	if (kb->virtual != NULL && im->method != NULL &&
+			wl_resource_get_client(kb->virtual->resource) ==
+			wl_resource_get_client(im->method->resource)) {
+		return false;
+	}
+	return true;
+}
+
+void vidow_im_set_keyboard(struct vidow_server *server,
+		struct wlr_keyboard *kb) {
+	struct vidow_im *im = &server->im;
+	if (im->grab == NULL || kb == NULL) {
+		return;
+	}
+	/* 输入法靠这个 keymap 把回注的按键翻译回去，抢键盘时 seat 上可能还
+	 * 没有键盘（第一个键盘刚被销毁），所以每次键盘变了都要重发一次 */
+	wlr_input_method_keyboard_grab_v2_set_keyboard(im->grab, kb);
+	wlr_input_method_keyboard_grab_v2_send_modifiers(im->grab, &kb->modifiers);
+	wlr_log(WLR_DEBUG, "input method keyboard updated");
+}
+
+void vidow_im_key(struct vidow_server *server, uint32_t time_msec,
+		uint32_t keycode, uint32_t state) {
+	if (server->im.grab == NULL) {
+		return;
+	}
+	wlr_input_method_keyboard_grab_v2_send_key(server->im.grab, time_msec,
+		keycode, state);
+}
+
+void vidow_im_modifiers(struct vidow_server *server, struct wlr_keyboard *kb) {
+	if (server->im.grab == NULL) {
+		return;
+	}
+	wlr_input_method_keyboard_grab_v2_send_modifiers(server->im.grab,
+		&kb->modifiers);
+}
+
+void vidow_im_focus(struct vidow_server *server, struct wlr_surface *surface) {
+	wlr_log(WLR_DEBUG, "im focus -> %p", (void *)surface);
+	if (server->text_input_mgr == NULL) {
+		return;
+	}
+	struct vidow_text_input *ti;
+	wl_list_for_each(ti, &server->text_inputs, link) {
+		/* 输入框属于某个客户端，那个客户端的窗口拿到焦点就 enter。注意不能
+		 * 等客户端先 enable：客户端正是收到 enter 之后才会 enable（它有焦点
+		 * 了才需要输入法），等它先开口就是死锁。 */
+		bool mine = surface != NULL &&
+			wl_resource_get_client(ti->input->resource) ==
+			wl_resource_get_client(surface->resource);
+		if (mine) {
+			if (ti->input->focused_surface == surface) {
+				continue; /* 已经停在这个 surface 上了 */
+			}
+			/* wlr_text_input_v3_send_enter() 要求 focused_surface 是 NULL，
+			 * 而且 wlroots 0.20 里这是 assert。同一个客户端从一个窗口切到
+			 * 另一个窗口时，得先 leave 再 enter —— 少这一步会直接把合成器
+			 * abort 掉（Qt/KDE 的 portal 对话框就撞上了）。 */
+			if (ti->input->focused_surface != NULL) {
+				wlr_text_input_v3_send_leave(ti->input);
+			}
+			wlr_text_input_v3_send_enter(ti->input, surface);
+		} else if (ti->input->focused_surface != NULL) {
+			wlr_text_input_v3_send_leave(ti->input);
+		}
+	}
+	im_set_active(server, active_text_input(server) != NULL);
+	im_popup_update(server);
+}
+
+bool vidow_im_init(struct vidow_server *server) {
+	wl_list_init(&server->text_inputs);
+	server->im.server = server;
+	server->im_popup.server = server;
+
+	if (getenv("VIDOW_NO_TEXT_INPUT") == NULL) { /* TEMP 实验开关 */
+	server->text_input_mgr = wlr_text_input_manager_v3_create(server->display);
+	if (server->text_input_mgr == NULL) {
+		wlr_log(WLR_ERROR, "failed to create text-input-manager-v3");
+		return false;
+	}
+	server->new_text_input.notify = server_new_text_input;
+	wl_signal_add(&server->text_input_mgr->events.new_text_input,
+		&server->new_text_input);
+	}
+
+	server->input_method_mgr =
+		wlr_input_method_manager_v2_create(server->display);
+	if (server->input_method_mgr == NULL) {
+		wlr_log(WLR_ERROR, "failed to create input-method-manager-v2");
+		return false;
+	}
+	server->new_input_method.notify = server_new_input_method;
+	wl_signal_add(&server->input_method_mgr->events.new_input_method,
+		&server->new_input_method);
+
+	return true;
+}
