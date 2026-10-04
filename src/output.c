@@ -291,10 +291,17 @@ bool vidow_output_set_scale(struct vidow_server *server,
 			scale);
 		return false;
 	}
-	wlr_log(WLR_INFO, "output %s: 缩放 %.2f -> %.2f（%s），逻辑尺寸 %dx%d",
-		wlr_output->name, before, scale, why != NULL ? why : "运行时改的",
+	/* 和「上屏那一刻」用同一套字段：日志里每块屏的最后一行永远是这个屏现在的
+	 * 样子（配置是 Lua、跑得比输出创建晚，所以运行时换缩放是常态 —— 只打
+	 * 「24 -> 2.00」的话，从日志里看不出它现在到底是几倍、逻辑尺寸多少）。 */
+	wlr_log(WLR_INFO, "output %s: %dx%d @ %.3fHz scale %.2f（%s），逻辑 %dx%d，"
+		"布局 %d,%d（缩放 %.2f -> %.2f）",
+		wlr_output->name, wlr_output->width, wlr_output->height,
+		(float)wlr_output->refresh / 1000.0f, wlr_output->scale,
+		why != NULL ? why : "运行时改的",
 		(int)lround(wlr_output->width / wlr_output->scale),
-		(int)lround(wlr_output->height / wlr_output->scale));
+		(int)lround(wlr_output->height / wlr_output->scale),
+		output->box.x, output->box.y, before, scale);
 	output_state_applied(server, output);
 	return true;
 }

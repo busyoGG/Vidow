@@ -1073,12 +1073,14 @@ vidowmsg clipboard-clear
 | --- | --- |
 | 圆角 | 圆角矩形的 SDF，`smoothstep` 一像素抗锯齿 |
 | 描边 | SDF 的环带；聚焦/失焦两种颜色 |
-| 阴影 | 另一条偏移的 SDF，只在窗口**外侧**绘制（否则半透明窗口会透出自己的阴影） |
+| 阴影 | 另一条偏移的 SDF，只在窗口**外侧**绘制（否则半透明窗口会透出自己的阴影）；默认半径 8px、下移 2px —— 薄薄贴边一圈 |
 | 窗口透明度 | `window_opacity`，只作用于内容与描边 |
 | 噪点 | 逐像素 hash 噪声，乘进阴影/模糊层 |
 | 背景模糊 | kawase 双滤波（见下） |
 
 离屏缓冲比窗口大 `shadow_radius + |shadow_offset|` 圈 padding，所以阴影不会被裁掉。
+默认（`shadow_radius = 8`、`shadow_offset_y = 2`）padding 是 12px；想要大光环就往上调，
+两块数字要一起看（半径太大而 padding 不够的话，阴影会在离屏图边界上被切出一条直边）。
 真实表面节点仍然保留（不透明度置 0）——**点击命中不受影响**，因为输入走的是场景图，
 不是像素。
 
@@ -2187,6 +2189,13 @@ protocols/     wlr-layer-shell / wlr-virtual-pointer / input-method-v2 /
      background/bottom 层），background 层跳过；抓底衬时这些节点要先藏起来（不然
      bottom 层的会自己糊自己）。实测状态栏内最大梯度 74.0（关）→ 4.67（levels=2）→
      2.33（levels=4），壁纸硬边是 107.7。`./test-layerblur.sh`
+
+107. 阴影默认改薄：`shadow_radius` 24 → 8、`shadow_offset_y` 6 → 2。24px 的衰减
+     晕开太散，看着像窗口浮在一团灰里；8px 正好是沿窗口边缘一圈，偏移收到 2 之后
+     左右几乎对称、只留一点方向感。副作用是装饰离屏图的 padding 从 32 降到 12
+     （`vidow_fx_pad()` 按同一个公式算），那块缓冲也跟着小了。实测（同一块壁纸 +
+     一个不透明窗口，截图对比）：旧的在窗口右下铺开 ~30px 的暗区，新的是一条 8px
+     的暗边，紧挨着就能看到壁纸的方块。`test-dpi.sh` 里写死的 `PAD = 32` 跟着改成 12
 
 106. `blur_offset` / `blur_alpha_min` 没进模糊缓存键：它们是 kawase 着色器的 uniform，
      改完缓存的贴图不会跟着变，而共享金字塔的缓存键只有 `levels` —— 于是运行时改这

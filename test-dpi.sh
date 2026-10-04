@@ -273,7 +273,7 @@ def slice_log(path):
     except OSError:
         return ""
 
-PAD = 32   # shadow_radius 24 + |shadow_offset_y| 6 + 2，见 vidow_fx_pad()
+PAD = 12   # shadow_radius 8 + |shadow_offset_y| 2 + 2，见 vidow_fx_pad()
 def targets(txt):
     return set((int(a), int(b)) for a, b in
                re.findall(r"fx: target (\d+)x(\d+)", txt))

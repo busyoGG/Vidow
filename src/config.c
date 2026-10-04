@@ -299,13 +299,16 @@ static void defaults(struct vidow_config *cfg) {
 	cfg->border_color_focus[1] = 0.65f;
 	cfg->border_color_focus[2] = 0.97f;
 	cfg->border_color_focus[3] = 1.0f;
-	cfg->shadow_radius = 24.0;
+	/* 薄薄贴边一圈：24px 那个晕开太散（看着像窗口浮在一团灰里）。8px 的衰减
+	 * 正好是「沿窗口边缘一圈」，偏移也从 6 收到 2（几乎对称，只留一点方向感）。
+	 * vidow_fx_pad() 按它算装饰离屏图的内边距，所以变小也省了那块缓冲。 */
+	cfg->shadow_radius = 8.0;
 	cfg->shadow_color[0] = 0.0f;
 	cfg->shadow_color[1] = 0.0f;
 	cfg->shadow_color[2] = 0.0f;
 	cfg->shadow_color[3] = 0.55f;
 	cfg->shadow_offset_x = 0;
-	cfg->shadow_offset_y = 6;
+	cfg->shadow_offset_y = 2;
 	cfg->window_opacity = 1.0;
 	cfg->noise = 0.0;
 

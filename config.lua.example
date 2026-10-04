@@ -39,7 +39,7 @@ end
 local power = vidow.exec("cat /sys/class/power_supply/BAT0/status 2>/dev/null")
 if power == "Discharging" then
 	blur_levels = 3
-	shadow_radius = 16
+	shadow_radius = 6
 end
 
 -- 高分辨率屏幕上圆角大一点

@@ -576,6 +576,19 @@ static void script_done(struct vidow_script *s, const char *why) {
 
 static void script_resume(struct vidow_script *s);
 
+/* 配置里跑 shell 命令之前，先把「子进程会继承的东西」落到环境和输出上。
+ *
+ * 配置是分步跑完的：每次 vidow.exec() 让回事件循环，命令在事件循环里执行。而
+ * scale / outputs 要到配置跑完才对上输出，XWayland 的全局缩放又跟着输出走 ——
+ * 配置里第一条命令（尤其是 X11 的）就会拿到**启动那一刻**的 GDK_SCALE /
+ * QT_SCALE_FACTOR / DISPLAY。所以每条命令之前先对一次账：这几个调用都是幂等的，
+ * 没变就什么都不做。 */
+static void script_sync_env_for_child(struct vidow_server *server) {
+	vidow_output_apply_scale_all(server);
+	vidow_xwayland_scale_apply(server);
+	vidow_portal_desktop_env(&server->config);
+}
+
 static void script_exec_done(void *data, const char *out, const char *errout,
 		int status, bool ok) {
 	struct vidow_script *s = data;
@@ -639,6 +652,7 @@ static void script_resume(struct vidow_script *s) {
 		}
 		s->execs++;
 		s->want_status = want_status;
+		script_sync_env_for_child(s->server);
 		/* On failure this calls script_exec_done() before returning. */
 		s->job = vidow_exec_run(s->server, copy, script_exec_done, s);
 		free(copy);
