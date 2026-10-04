@@ -229,7 +229,7 @@ struct vidow_shader {
 /* A tiny GLSL program plus its uniform locations. */
 struct vidow_gl_prog {
 	unsigned int program;
-	int u_tex, u_add, u_texel, u_offset, u_alpha_min;
+	int u_tex, u_texel, u_offset, u_alpha_min;
 };
 
 /* The built-in decoration program: rounded corners, border, drop shadow,
@@ -248,9 +248,14 @@ struct vidow_decor_prog {
  * (captured with every toplevel hidden) plus a private one per window that
  * actually overlaps another window, because that window's backdrop has to
  * keep its neighbour in it. */
+/* kawase 金字塔的级数上限。每多一级模糊半径（原始像素）翻一倍：1080p 上 4 级
+ * 半径 ~14px、6 级 ~56px。niri 的 passes 是同一个意思（那边允许到 31）。
+ * 数组尺寸也跟着它走，改这儿就够，别再用字面量 4。 */
+#define MAX_BLUR_LEVELS 6
+
 struct vidow_blur_set {
-	struct wlr_buffer *down[4];
-	struct wlr_buffer *up[4];
+	struct wlr_buffer *down[MAX_BLUR_LEVELS];
+	struct wlr_buffer *up[MAX_BLUR_LEVELS];
 	int w, h, levels;
 	uint64_t gen;  /* scene generation this pyramid was built for */
 	double offset; /* kawase 采样步长，建这张金字塔时用的 */
@@ -624,6 +629,8 @@ struct vidow_layer_surface {
 	/* 它背后的模糊：一个垫在 ls->scene->tree 底下的节点，用和窗口装饰同一套
 	 * 着色器画（blur_only）。半透明的状态栏透出来就是模糊的底衬。 */
 	struct vidow_fx_target fx;
+	/* 抓底衬时这个 surface 被我们临时藏起来过（抓完要还原，见 fx.c）。 */
+	bool capture_hidden;
 };
 
 /* ---------------------------------------------------------------- keyboard */
@@ -920,7 +927,8 @@ struct vidow_server {
 
 	struct vidow_config config;
 	struct vidow_decor_prog decor;
-	struct vidow_gl_prog kawase_down, kawase_up;
+	/* kawase_final = 最后一趟上升 + 透明度剔除（见 fx.c 的着色器注释）。 */
+	struct vidow_gl_prog kawase_down, kawase_up, kawase_final;
 	struct wlr_texture *empty_tex; /* 1x1 transparent, for disabled samplers */
 	uint64_t blur_serial;          /* hands out blur texture identities */
 

@@ -20,8 +20,6 @@ extern const struct wlr_drm_format_set *wlr_renderer_get_render_formats(
 
 #define MAX_SHADER_SIZE (256 * 1024)
 #define MAX_TARGET_PX 8192
-#define MAX_BLUR_LEVELS 4
-
 /* ------------------------------------------------------------ scene alpha */
 
 static void alpha_iter(struct wlr_scene_buffer *buffer, int sx, int sy,
@@ -208,55 +206,64 @@ static const char *decor_fragment_src =
 static const char *kawase_prefix =
 	"precision mediump float;\n"
 	"uniform sampler2D u_tex;\n"
-	"uniform sampler2D u_add;\n"
 	"uniform vec2 u_texel;\n" /* 1 / source size */
-	"uniform float u_offset;\n"
-	"uniform float u_alpha_min;\n"
+	"uniform float u_offset;\n" /* 半径，单位：源 texel */
+	"uniform float u_alpha_min;\n" /* 只有最后一趟（kawase_final）会用 */
 	"varying vec2 v_uv;\n"
 	"\n"
-	/* Alpha culling: 太透明的东西不该渗进模糊（空桌面会把底衬冲成一片灰）。
-	 * 原来是硬阈值 step(u_alpha_min, a)：alpha 刚过线就满权重、差一点就整个丢掉，
-	 * 阈值那条等值线上于是留下一道**一刀切**的边（模糊结果里看得见一条硬边）。
-	 * 现在改成在 [u_alpha_min/2, u_alpha_min] 之间平滑淡出，权重仍然除以整个核
-	 * （不按采纳的那几份重新归一化 —— 那样「一个抽样被采纳」的瞬间会把那一份
-	 * 直接放大到满值，等于换个位置又造一道硬边）。u_alpha_min = 0 时只剩
-	 * 「全透明的像素不参与」这一件事。 */
-	"float cull(float a) {\n"
-	"	return smoothstep(u_alpha_min * 0.5, max(u_alpha_min, 1e-4), a);\n"
-	"}\n"
-	"vec4 tap(sampler2D t, vec2 uv, float weight) {\n"
-	"	return texture2D(t, uv) * (cull(texture2D(t, uv).a) * weight);\n"
+	/* 抽样就是抽样：**不在里面做透明度剔除**。剔除放进每一趟的抽样里会逐趟相乘，
+	 * 越糊越透明（实测 alpha 0.45 的均匀底衬过完整条链只剩 0.0246，颜色也一起没
+	 * 了）—— 级数越多掉得越狠，看起来就像「半径没变大，只是变淡了」。剔除挪到
+	 * 最后一趟做一次（kawase_final），底衬本身是预乘的，直接糊就行。 */
+	"vec4 tap(vec2 uv, float weight) {\n"
+	"	return texture2D(u_tex, uv) * weight;\n"
 	"}\n"
 	"\n";
 
+/* 降采样：抽样半径 = u_offset 个**源** texel。源每降一级尺寸减半，所以同一个
+ * u_offset 换算回原始像素每级翻倍 —— 半径就是这么跟着降采样扩展的。抽样的形状
+ * 跟 niri 的 blur_down 一致：中心 4 份 + 四个斜角各 1 份，除以 8。 */
 static const char *kawase_down_src =
 	"void main() {\n"
-	"	vec2 t = u_texel * u_offset;\n"
-	"	vec4 sum = tap(u_tex, v_uv, 4.0);\n"
-	"	sum += tap(u_tex, v_uv - vec2(t.x, 0.0), 1.0);\n"
-	"	sum += tap(u_tex, v_uv + vec2(t.x, 0.0), 1.0);\n"
-	"	sum += tap(u_tex, v_uv + vec2(t.x, -t.y), 1.0);\n"
-	"	sum += tap(u_tex, v_uv + vec2(-t.x, t.y), 1.0);\n"
+	"	vec2 o = u_texel * u_offset;\n"
+	"	vec4 sum = tap(v_uv, 4.0);\n"
+	"	sum += tap(v_uv + vec2(-o.x, -o.y), 1.0);\n"
+	"	sum += tap(v_uv + vec2( o.x, -o.y), 1.0);\n"
+	"	sum += tap(v_uv + vec2(-o.x,  o.y), 1.0);\n"
+	"	sum += tap(v_uv + vec2( o.x,  o.y), 1.0);\n"
 	"	gl_FragColor = sum / 8.0;\n"
 	"}\n";
 
+/* 上升：采样单位是**源 texel 的一半**（niri 的 blur_up）。目标比源大一倍，半步
+ * 就是 1/4 目标 texel；12 个抽样权重和也是 12，除以 12 就归一了。老代码额外加了
+ * 一份同级降采样副本再除以 13（dual filter 的 add）—— 那份是**没这么糊**的图，
+ * 等于每一级都掺回一点锐度，实测半径每级只涨 1.5 倍而不是 2 倍，级数一多就「看
+ * 不出在变大」。去掉之后级数每加一级半径翻倍，和 niri 对得上。 */
+#define KAWASE_UP_TAPS \
+	"	vec2 t = u_texel * u_offset * 0.5;\n" \
+	"	vec4 sum = vec4(0.0);\n" \
+	"	sum += tap(v_uv + vec2(-t.x * 2.0, 0.0), 1.0);\n" \
+	"	sum += tap(v_uv + vec2(-t.x, t.y), 2.0);\n" \
+	"	sum += tap(v_uv + vec2(0.0, t.y * 2.0), 1.0);\n" \
+	"	sum += tap(v_uv + vec2(t.x, t.y), 2.0);\n" \
+	"	sum += tap(v_uv + vec2(t.x * 2.0, 0.0), 1.0);\n" \
+	"	sum += tap(v_uv + vec2(t.x, -t.y), 2.0);\n" \
+	"	sum += tap(v_uv + vec2(0.0, -t.y * 2.0), 1.0);\n" \
+	"	sum += tap(v_uv + vec2(-t.x, -t.y), 2.0);\n"
+
 static const char *kawase_up_src =
-	"void main() {\n"
-	"	vec2 t = u_texel * u_offset;\n"
-	"	vec4 sum = tap(u_tex, v_uv + vec2(-t.x * 2.0, 0.0), 1.0);\n"
-	"	sum += tap(u_tex, v_uv + vec2(-t.x, t.y), 2.0);\n"
-	"	sum += tap(u_tex, v_uv + vec2(0.0, t.y * 2.0), 1.0);\n"
-	"	sum += tap(u_tex, v_uv + vec2(t.x, t.y), 2.0);\n"
-	"	sum += tap(u_tex, v_uv + vec2(t.x * 2.0, 0.0), 1.0);\n"
-	"	sum += tap(u_tex, v_uv + vec2(t.x, -t.y), 2.0);\n"
-	"	sum += tap(u_tex, v_uv + vec2(0.0, -t.y * 2.0), 1.0);\n"
-	"	sum += tap(u_tex, v_uv + vec2(-t.x, -t.y), 2.0);\n"
-	/* 8 个抽样的权重是 1+2+1+2+1+2+1+2 = 12，加上 u_add 那一份正好 13 —— 必须
-	 * 一起除以 13，模糊核的和才是 1。原来是 sum/12 + add：常量输入下
-	 * = c + c = 2c，窗口后面整整亮一倍（半透明窗口透出来的底一片惨白）。
-	 * u_add 是同一级的降采样副本，用同一套剔除规则，别一边剔一边不剔。 */
-	"	vec4 add = texture2D(u_add, v_uv);\n"
-	"	gl_FragColor = (sum + add * cull(add.a)) / 13.0;\n"
+	"void main() {\n" KAWASE_UP_TAPS
+	"	gl_FragColor = sum / 12.0;\n"
+	"}\n";
+
+/* 最后一趟（写 up[0]，也就是装饰着色器采样的那张）多干一件事：把底衬本来就透明
+ * 的地方剔掉。u_alpha_min = 0 时这行等于不干活（a > 0 一律放过）。阈值上下仍然
+ * 平滑过渡 —— 硬 step 会在等值线上留一道看得见的边。 */
+static const char *kawase_final_src =
+	"void main() {\n" KAWASE_UP_TAPS
+	"	gl_FragColor = sum / 12.0;\n"
+	"	gl_FragColor *= smoothstep(u_alpha_min * 0.5,"
+	" max(u_alpha_min, 1e-4), gl_FragColor.a);\n"
 	"}\n";
 
 /* --------------------------------------------------------- program build */
@@ -329,11 +336,12 @@ static void load_kawase_programs(struct vidow_server *server) {
 		struct vidow_gl_prog *prog;
 		const char *body;
 		const char *name;
-	} pass[2] = {
+	} pass[3] = {
 		{ &server->kawase_down, kawase_down_src, "kawase-down" },
 		{ &server->kawase_up, kawase_up_src, "kawase-up" },
+		{ &server->kawase_final, kawase_final_src, "kawase-final" },
 	};
-	for (size_t i = 0; i < 2; i++) {
+	for (size_t i = 0; i < 3; i++) {
 		snprintf(buf, sizeof(buf), "%s%s", kawase_prefix, pass[i].body);
 		unsigned int prog = 0;
 		if (!link_program(&prog, buf, pass[i].name)) {
@@ -341,7 +349,6 @@ static void load_kawase_programs(struct vidow_server *server) {
 		}
 		pass[i].prog->program = prog;
 		pass[i].prog->u_tex = glGetUniformLocation(prog, "u_tex");
-		pass[i].prog->u_add = glGetUniformLocation(prog, "u_add");
 		pass[i].prog->u_texel = glGetUniformLocation(prog, "u_texel");
 		pass[i].prog->u_offset = glGetUniformLocation(prog, "u_offset");
 		pass[i].prog->u_alpha_min = glGetUniformLocation(prog, "u_alpha_min");
@@ -813,9 +820,9 @@ static bool blur_set_alloc(struct vidow_server *server,
 			return false;
 		}
 	}
-	/* up[i] 和 down[i] 同尺寸：dual filter 每一步都是「把小一号的结果放大，再
-	 * 加上这一级的降采样副本」。所以 up[0]（半分辨率）就是最终结果，也是给
-	 * 装饰着色器采样的那张。 */
+	/* up[i] 和 down[i] 同尺寸：up[i] 是「把 up[i+1]（或者最底层 down[levels-1]）
+	 * 放大一圈」的结果，up[0]（半分辨率）就是最终产物，也是给装饰着色器采样的
+	 * 那张。down[0..levels-2] 只是链条中途的暂存。 */
 	for (int i = 0; i < levels - 1; i++) {
 		set->up[i] = alloc_target(server, w >> (i + 1), h >> (i + 1));
 		if (set->up[i] == NULL) {
@@ -833,7 +840,7 @@ static bool blur_set_alloc(struct vidow_server *server,
 
 static void kawase_pass(struct vidow_server *server,
 		struct vidow_gl_prog *prog, struct wlr_buffer *dst, int dst_w, int dst_h,
-		struct wlr_texture *src, struct wlr_texture *add, int src_w, int src_h) {
+		struct wlr_texture *src, int src_w, int src_h) {
 	if (prog->program == 0 || src == NULL) {
 		return;
 	}
@@ -847,14 +854,6 @@ static void kawase_pass(struct vidow_server *server,
 	glUseProgram(prog->program);
 	bind_tex(0, sa.target, sa.tex);
 	glUniform1i(prog->u_tex, 0);
-	if (add != NULL) {
-		struct wlr_gles2_texture_attribs aa;
-		wlr_gles2_texture_get_attribs(add, &aa);
-		bind_tex(1, aa.target, aa.tex);
-		glUniform1i(prog->u_add, 1);
-	} else {
-		glUniform1i(prog->u_add, 0);
-	}
 	glUniform2f(prog->u_texel, 1.0f / (float)src_w, 1.0f / (float)src_h);
 	glUniform1f(prog->u_offset, (float)server->config.blur_offset);
 	glUniform1f(prog->u_alpha_min, (float)server->config.blur_alpha_min);
@@ -874,7 +873,7 @@ static void blur_chain(struct vidow_server *server, struct vidow_blur_set *set,
 	for (int i = 0; i < levels && tex != NULL; i++) {
 		int sw = i == 0 ? w : (w >> i), sh = i == 0 ? h : (h >> i);
 		kawase_pass(server, &server->kawase_down, set->down[i], w >> (i + 1),
-			h >> (i + 1), tex, NULL, sw, sh);
+			h >> (i + 1), tex, sw, sh);
 		wlr_texture_destroy(tex);
 		tex = wlr_texture_from_buffer(server->renderer, set->down[i]);
 	}
@@ -882,19 +881,16 @@ static void blur_chain(struct vidow_server *server, struct vidow_blur_set *set,
 		wlr_texture_destroy(tex);
 	}
 
-	/* 往上走：每一级都是「放大上一级的结果 + 这一级的降采样副本」（dual filter）。
-	 * 目标尺寸必须和 down[i] 一样（w >> (i+1)）—— 否则加进来的那张是另一个分辨率
-	 * 的图，u_texel 也会跟着对不上（放大倍数全靠它算）。 */
+	/* 往上走：每一级只把上一级的结果放大一圈（niri 的 blur_up）。目标必须比源大一
+	 * 倍，u_texel 传的是**源**的尺寸 —— 放大倍数全靠它算。最后一趟（写 up[0]）换成
+	 * kawase_final：多一道透明度剔除，且只在这儿做一次。 */
 	struct wlr_texture *lower =
 		wlr_texture_from_buffer(server->renderer, set->down[levels - 1]);
 	for (int i = levels - 2; i >= 0 && lower != NULL; i--) {
-		struct wlr_texture *add =
-			wlr_texture_from_buffer(server->renderer, set->down[i]);
-		kawase_pass(server, &server->kawase_up, set->up[i], w >> (i + 1),
-			h >> (i + 1), lower, add, w >> (i + 2), h >> (i + 2));
-		if (add != NULL) {
-			wlr_texture_destroy(add);
-		}
+		kawase_pass(server,
+			i == 0 ? &server->kawase_final : &server->kawase_up,
+			set->up[i], w >> (i + 1), h >> (i + 1), lower,
+			w >> (i + 2), h >> (i + 2));
 		wlr_texture_destroy(lower);
 		lower = wlr_texture_from_buffer(server->renderer, set->up[i]);
 	}
@@ -1098,6 +1094,7 @@ static void blur_target_release(struct vidow_fx_target *fx) {
  * 要用它把节点藏起来。 */
 static bool layer_blur_wanted(struct vidow_server *server,
 		struct vidow_layer_surface *ls);
+/* 抓底衬时要不要把这个 layer surface 自己藏起来（见下面的定义）。 */
 static bool layer_blur_frame(struct vidow_server *server,
 		struct vidow_output *output, struct vidow_layer_surface *ls);
 static void layer_blur_capture_visible(struct vidow_server *server, bool on);
@@ -1782,6 +1779,20 @@ static void layer_blur_capture_visible(struct vidow_server *server, bool on) {
 	wl_list_for_each(ls, &server->layers, link) {
 		if (ls->fx.node != NULL) {
 			wlr_scene_node_set_enabled(&ls->fx.node->node, on);
+		}
+		/* 光藏模糊节点不够：**会被模糊的那个 surface 本身**也不能进底衬。
+		 * bottom 层的面板（dock 这类）自己也在抓的树里，它要的那份底衬如果含它
+		 * 自己，模糊里就会浮出一个自己的影子（半透明的地方透出「自己的糊版」）。
+		 * 藏之前记一笔，免得回填的时候把本来就该藏着的东西点亮。 */
+		if (!on) {
+			if (ls->scene != NULL && layer_blur_wanted(server, ls) &&
+					ls->scene->tree->node.enabled) {
+				wlr_scene_node_set_enabled(&ls->scene->tree->node, false);
+				ls->capture_hidden = true;
+			}
+		} else if (ls->capture_hidden) {
+			ls->capture_hidden = false;
+			wlr_scene_node_set_enabled(&ls->scene->tree->node, true);
 		}
 	}
 }
