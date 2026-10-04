@@ -524,6 +524,10 @@ void vidow_config_sync(struct vidow_server *server) {
 	vidow_activation_apply_config(server);
 	/* decor 开关改了：客户端要不要自己画标题栏得重新通知（见 decoration.c） */
 	vidow_decoration_apply_config(server);
+	/* portal 那两个键改了也要跟上：XDG_CURRENT_DESKTOP 重设一遍，生效的
+	 * portals.conf 重新算一遍（内容没变的话什么都不做，不会白重启 portal）。 */
+	vidow_portal_desktop_env(&server->config);
+	vidow_portal_conf_sync(&server->config);
 }
 
 static void script_apply(struct vidow_script *s) {

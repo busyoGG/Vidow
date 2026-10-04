@@ -266,11 +266,6 @@ int main(int argc, char *argv[]) {
 	 * 记的是文件当前状态，不该被当成「变了」。 */
 	vidow_configwatch_init(&server);
 
-	/* 配置可能改了 portal_desktop / portal_conf_sync，所以同步放在脚本之后。
-	 * 内容没变的话这里什么都不做（也不会重启 portal）。 */
-	vidow_portal_desktop_env(&server.config);
-	vidow_portal_conf_sync(&server.config);
-
 	wl_display_run(server.display);
 
 	vidow_configwatch_finish(&server);

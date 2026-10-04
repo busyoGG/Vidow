@@ -96,6 +96,9 @@ grep -aq "不再被读取" "$LOG" && pass "启动时喊了一声，提示搬走�
 	|| fail "没有提示旧文件不再读取"
 grep -aq "config.lua: running .*config.lua" "$LOG" && pass "跑的是 config.lua" \
 	|| fail "日志里没看到跑 config.lua"
+./build/vidowmsg state 2>/dev/null | grep -aq '"watch": *true' &&
+	pass "state 里报了自动重载盯着（config_lua.watch）" ||
+	fail "state 里没说盯上了"
 
 # ------------------------------------------------------------ 2) 自动重载（原地写）
 mark "改文件就自动重载（原地写，inode 不变）"

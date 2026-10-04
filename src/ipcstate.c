@@ -2,6 +2,7 @@
  * 除了往订阅者的连接上写事件。 */
 #include "ipcstate.h"
 
+#include <limits.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -934,15 +935,16 @@ void vidow_ipc_json_state(struct jbuf *b, struct vidow_server *server) {
 	jb_kv_str(b, "wayland_display", getenv("WAYLAND_DISPLAY"));
 	jb_kv_str(b, "log_level", getenv("VIDOW_LOG"));
 	jb_key(b, "config_lua");
-	if (server->script != NULL) {
+	{
+		/* 配置文件就是这一份 Lua（$VIDOW_CONFIG / $XDG_CONFIG_HOME 都可能改过
+		 * 位置，所以报的是真正算出来的路径，不是环境变量本身）。 */
+		char path[PATH_MAX];
+		vidow_config_path(path, sizeof(path));
 		jb_obj(b);
-		jb_kv_bool(b, "loaded", true);
-		jb_kv_str(b, "path", getenv("VIDOW_CONFIG_LUA"));
-		jb_obj_end(b);
-	} else {
-		jb_obj(b);
-		jb_kv_bool(b, "loaded", false);
-		jb_kv_str(b, "path", getenv("VIDOW_CONFIG_LUA"));
+		jb_kv_bool(b, "loaded", server->script != NULL);
+		jb_kv_str(b, "path", path);
+		/* 盯上了才会自动重载（inotify 起不来时是 false，那就得手动 SIGHUP） */
+		jb_kv_bool(b, "watch", server->configwatch != NULL);
 		jb_obj_end(b);
 	}
 
