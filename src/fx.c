@@ -245,7 +245,10 @@ static const char *kawase_up_src =
 	"	sum += tap(u_tex, v_uv + vec2(t.x, -t.y)) * 2.0;\n"
 	"	sum += tap(u_tex, v_uv + vec2(0.0, -t.y * 2.0));\n"
 	"	sum += tap(u_tex, v_uv + vec2(-t.x, -t.y)) * 2.0;\n"
-	"	gl_FragColor = sum / 12.0 + texture2D(u_add, v_uv);\n"
+	/* 8 个抽样的权重是 1+2+1+2+1+2+1+2 = 12，加上 u_add 那一份正好 13 —— 必须
+	 * 一起除以 13，模糊核的和才是 1。原来是 sum/12 + add：常量输入下
+	 * = c + c = 2c，窗口后面整整亮一倍（半透明窗口透出来的底一片惨白）。 */
+	"	gl_FragColor = (sum + texture2D(u_add, v_uv)) / 13.0;\n"
 	"}\n";
 
 /* --------------------------------------------------------- program build */
@@ -801,11 +804,11 @@ static bool blur_set_alloc(struct vidow_server *server,
 			return false;
 		}
 	}
-	/* up[i] lives at size >> (levels-1-i); up[levels-2] is the final, half-res
-	 * blurred backdrop. */
+	/* up[i] 和 down[i] 同尺寸：dual filter 每一步都是「把小一号的结果放大，再
+	 * 加上这一级的降采样副本」。所以 up[0]（半分辨率）就是最终结果，也是给
+	 * 装饰着色器采样的那张。 */
 	for (int i = 0; i < levels - 1; i++) {
-		set->up[i] = alloc_target(server, w >> (levels - 1 - i),
-			h >> (levels - 1 - i));
+		set->up[i] = alloc_target(server, w >> (i + 1), h >> (i + 1));
 		if (set->up[i] == NULL) {
 			blur_set_drop(set);
 			return false;
@@ -868,14 +871,16 @@ static void blur_chain(struct vidow_server *server, struct vidow_blur_set *set,
 		wlr_texture_destroy(tex);
 	}
 
-	/* Walk back up, adding each level's downsampled copy (dual filter). */
+	/* 往上走：每一级都是「放大上一级的结果 + 这一级的降采样副本」（dual filter）。
+	 * 目标尺寸必须和 down[i] 一样（w >> (i+1)）—— 否则加进来的那张是另一个分辨率
+	 * 的图，u_texel 也会跟着对不上（放大倍数全靠它算）。 */
 	struct wlr_texture *lower =
 		wlr_texture_from_buffer(server->renderer, set->down[levels - 1]);
 	for (int i = levels - 2; i >= 0 && lower != NULL; i--) {
 		struct wlr_texture *add =
 			wlr_texture_from_buffer(server->renderer, set->down[i]);
-		kawase_pass(server, &server->kawase_up, set->up[i], w >> (levels - 1 - i),
-			h >> (levels - 1 - i), lower, add, w >> (i + 2), h >> (i + 2));
+		kawase_pass(server, &server->kawase_up, set->up[i], w >> (i + 1),
+			h >> (i + 1), lower, add, w >> (i + 2), h >> (i + 2));
 		if (add != NULL) {
 			wlr_texture_destroy(add);
 		}
@@ -1100,9 +1105,9 @@ static bool shared_blur_rebuild(struct vidow_server *server,
 		return false;
 	}
 	blur_chain(server, &output->blur_set, output->backdrop, w, h);
-	if (output->blur_set.up[levels - 2] != NULL) {
+	if (output->blur_set.up[0] != NULL) {
 		output->blur_tex = wlr_texture_from_buffer(server->renderer,
-			output->blur_set.up[levels - 2]);
+			output->blur_set.up[0]);
 	}
 	if (output->blur_tex == NULL) {
 		return false;
@@ -1110,8 +1115,8 @@ static bool shared_blur_rebuild(struct vidow_server *server,
 	static int dumped = 0;
 	if (dumped < blur_dump_limit()) {
 		dump_buffer(server, output->backdrop, w, h, "vidow-bd", dumped);
-		if (output->blur_set.up[levels - 2] != NULL) {
-			dump_buffer(server, output->blur_set.up[levels - 2], w >> 1, h >> 1,
+		if (output->blur_set.up[0] != NULL) {
+			dump_buffer(server, output->blur_set.up[0], w >> 1, h >> 1,
 				"vidow-blur", dumped);
 		}
 		dumped++;
@@ -1140,9 +1145,9 @@ static bool blur_own_rebuild(struct vidow_server *server,
 		return false;
 	}
 	blur_chain(server, &view->fx.blur_set, output->backdrop, w, h);
-	if (view->fx.blur_set.up[levels - 2] != NULL) {
+	if (view->fx.blur_set.up[0] != NULL) {
 		view->fx.blur_own_tex = wlr_texture_from_buffer(server->renderer,
-			view->fx.blur_set.up[levels - 2]);
+			view->fx.blur_set.up[0]);
 	}
 	if (view->fx.blur_own_tex == NULL) {
 		return false;

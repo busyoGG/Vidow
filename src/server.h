@@ -92,6 +92,14 @@ struct vidow_config {
 	int workspace_gaps_outer;
 	int window_gaps_inner;
 	int window_gaps_outer;
+	/* 四边单独设「离屏幕边」的距离（i3-gaps 的 gaps top|bottom|left|right 那套）。
+	 * -1 = 没设，跟着上面的统一值走；>= 0 就盖住那一边。
+	 * 只对「屏幕边 → 窗口」有意义：窗口之间的间距本来就是横向（列间距）和纵向
+	 * （同列上下）两个方向，没有第四边。 */
+	int gaps_top;
+	int gaps_bottom;
+	int gaps_left;
+	int gaps_right;
 	/* Durations are wall-clock milliseconds. A slow compositor drops frames;
 	 * it never stretches an animation. */
 	/* 视口外强制渲染（窗口规则 / 录屏预览）每秒补多少帧，0 = 不限。

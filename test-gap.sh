@@ -8,6 +8,7 @@
 #   4) workspace_gaps_outer + window_gaps_outer 相加才是「离屏幕边」的距离
 #   5) 同列两个窗口的纵向间距 = window_gaps_inner
 #   6) 负值当 0（负 gap 会让工作区比屏幕还大）
+#   7) 四边单独设置：gaps_left/top 只改那一边，-1 回到跟随统一值
 #
 # 注意：geometry 是**滚动之后**的位置，所以断言只看「列间距」「y」「宽高」这些
 # 与滚动无关的量，不去猜滚动量。
@@ -114,6 +115,19 @@ mark "负值当 0（-50）"
 setcfg window_gaps_inner -50
 snap "$RUNDIR/s-stackneg.json"
 
+mark "四边单独：gaps_left 40（其余仍跟随统一值 6）"
+setcfg gaps 6
+setcfg gaps_left 40
+snap "$RUNDIR/s-side-left.json"
+
+mark "四边单独：再加 gaps_top 30"
+setcfg gaps_top 30
+snap "$RUNDIR/s-side-top.json"
+
+mark "四边单独：gaps_left -1 回到跟随"
+setcfg gaps_left -1
+snap "$RUNDIR/s-side-back.json"
+
 mark "断言"
 python3 - "$RUNDIR" <<'PY'
 import json, sys, os
@@ -201,6 +215,34 @@ tg, bg = stacked("s-stackneg.json")
 check(bg["y"] - (tg["y"] + tg["height"]) == 0,
 	"负值当 0：纵向间距 0px（%d）" % (bg["y"] - (tg["y"] + tg["height"])))
 check(tg["height"] == 348, "负值当 0：每格高 348（%d）" % tg["height"])
+
+# --- 6) 四边单独设置（此时是一个列里两个窗口：视口不滚动，x 就是左边距）
+def one_col(name):
+	w = load(name)
+	check(len(w) == 2, "%s：两个窗口还在" % name)
+	items = sorted(w.items(), key=lambda kv: kv[1]["y"])
+	return items[0][1], items[1][1]
+
+# 这几步的前置是 `gaps 6`：它把 workspace/window 的 outer 都设成 6，所以
+# 「离屏幕边」= 6 + 6 = 12（niri 的语义），列宽 = (1280 - 左 - 右) / 2。
+top, bot = one_col("s-side-left.json")
+check(top["x"] == 40, "gaps_left 40 → 窗口左边距 40px（%d）" % top["x"])
+check(top["width"] == 614,
+	"左边距 40 后列宽 = (1280-40-12)/2 = 614（%d）" % top["width"])
+check(top["y"] == 12 and top["height"] == 345,
+	"上/下没设，还是统一值 12（y=%d h=%d）" % (top["y"], top["height"]))
+
+top, bot = one_col("s-side-top.json")
+check(top["y"] == 30, "gaps_top 30 → 窗口上边距 30px（%d）" % top["y"])
+check(top["height"] == 336, "上边距 30 后每格高 = (720-30-12-6)/2 = 336（%d）"
+	% top["height"])
+check(top["x"] == 40, "左边距 40 不受影响（%d）" % top["x"])
+
+top, bot = one_col("s-side-back.json")
+check(top["x"] == 12 and top["width"] == 628,
+	"gaps_left -1 回到跟随统一值 → 左边距 12、列宽 628（x=%d w=%d）"
+	% (top["x"], top["width"]))
+check(top["y"] == 30, "gaps_top 30 仍然生效（y=%d）" % top["y"])
 
 print()
 if failed:

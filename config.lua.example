@@ -72,6 +72,13 @@ vidow.log(string.format("config.lua: accent=%q power=%q width=%s",
 -- window_gaps_inner = 20           -- 只改窗口之间
 -- window_gaps_outer = 0
 -- workspace_gaps_outer = 40        -- 离屏幕边 40px
+--
+-- 四边单独设「离屏幕边」（i3-gaps 那套；只对外边距有意义，窗口之间只有横向和
+-- 纵向两个方向）：-1 = 没设、跟随上面的统一值，>= 0 就用这个数。
+-- gaps_top = 30                     -- 上边距 30，其余照旧
+-- gaps_bottom = 0
+-- gaps_left = 40
+-- gaps_right = -1                   -- 显式回到「跟随统一值」
 
 -- ---------------------------------------------------------- 工作区与窗口规则
 

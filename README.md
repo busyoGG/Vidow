@@ -69,6 +69,15 @@ niri 的配置能整段搬过来）：
 | `window_gaps_inner` | 窗口 ↔ 窗口 | 列与列之间、同列上下之间 |
 | `workspace_gaps_inner` | 工作区 ↔ 工作区 | **暂时不生效**（一块屏同时只显示一个工作区） |
 | `gaps` | 简写：一次设满四个 | 同 niri |
+| `gaps_top` / `gaps_bottom` / `gaps_left` / `gaps_right` | —（i3-gaps 那套） | 单独盖住那一边的「离屏幕边」 |
+
+- 眼睛看到的「屏幕边到窗口」= `workspace_gaps_outer + window_gaps_outer`：
+  vidow 没有可见的工作区背景，所以两个外间距加起来才是那圈留白
+- 四边单独设置（`gaps_top` 等）盖的是**合计值**那一边：`-1`（默认）= 没设、跟随统一
+  值，`>= 0` 就用这个数。只对「屏幕边 → 窗口」有意义 —— 窗口之间的间距本来就是横向
+  （列间距）和纵向（同列上下）两个方向，没有第四边
+- `gaps <n>` 只改那四个统一值，**不动**四边单独设置（否则之后改 `window_gaps_outer`
+  会被这些「隐式设过」的值盖住，很反直觉）
 
 - 眼睛看到的「屏幕边到窗口」= `workspace_gaps_outer + window_gaps_outer`：
   vidow 没有可见的工作区背景，所以两个外间距加起来才是那圈留白
@@ -84,6 +93,8 @@ vidowmsg set-config gaps 16                 # 一次设满四个
 vidowmsg set-config window_gaps_inner 20    # 只改窗口之间
 vidowmsg set-config window_gaps_outer 0     # 离屏幕边 40px
 vidowmsg set-config workspace_gaps_outer 40
+vidowmsg set-config gaps_top 30             # 只把上边距设成 30（其余跟随）
+vidowmsg set-config gaps_left -1            # 左边界回到「跟随统一值」
 ```
 
 实测（headless 1280×720、两个 `tools/pattern.py`，读 IPC `state` 的 `geometry`；
@@ -98,7 +109,10 @@ vidowmsg set-config workspace_gaps_outer 40
 
 同列两个窗口（`move-window-direction -1` 并进一列后）纵向间距跟着
 `window_gaps_inner` 走：6 → 每格高 345 / 起点 y=12；20 → 338；-50（当 0）→ 348。
-回归脚本：`./test-gap.sh`（22 条断言，全走 IPC，不截屏）。
+四边单独（前置是 `gaps 6`，所以统一的外间距 = 6 + 6 = 12）：`gaps_left 40` → 左边距
+40、列宽 (1280-40-12)/2 = 614、上下仍是 12；再加 `gaps_top 30` → 上边距 30、每格高
+(720-30-12-6)/2 = 336；`gaps_left -1` → 左边距回到 12、列宽 628、`gaps_top 30` 仍然生效。
+回归脚本：`./test-gap.sh`（26 条断言，全走 IPC，不截屏）。
 
 ### 浮动窗口
 
@@ -1110,6 +1124,42 @@ vidowmsg clipboard-clear
 
 模糊结果按帧缓存，但**只要背景变了就立刻重算**，所以视频、滚动、拖动背后都是实时模糊。
 
+### `blur_levels` 是降采样次数
+
+是。`blur_levels = n` 就是「降采样 n 次」：链上第 i 级的分辨率是 `输出 >> (i+1)`，
+所以 4 级 = 1/2、1/4、1/8、1/16，最终结果是**半分辨率**（`up[0]`，给装饰着色器采样的
+那张）。级数越大模糊半径越大、也越贵（每级一趟 pass）。运行时夹在 2..4
+（`MAX_BLUR_LEVELS`），并且最小那一级会小于 4px 时自动降一级（`blur_levels_for`）。
+
+### 顺手修掉的两个真 bug（模糊）
+
+**① 升采样每级把亮度乘一遍（过曝）**：`kawase_up` 原来是
+
+```glsl
+gl_FragColor = sum / 12.0 + texture2D(u_add, v_uv);
+```
+
+8 个抽样的权重是 1+2+1+2+1+2+1+2 = 12，`sum/12` 本身没错，但**加进来的 `u_add`
+没有参与平均** —— 常量输入下结果是 `c + c = 2c`。半透明窗口后面那层底整整亮一倍，
+看着就是「过曝、颜色不对」。实测（headless 1280×720 + `tools/wall.py` 壁纸，
+`VIDOW_BLUR_DUMP` 同时导出 backdrop 与最终模糊图，比平均色）：
+
+| | backdrop 平均 RGB | 模糊图平均 RGB | 亮度比 |
+| --- | --- | --- | --- |
+| 修前 | (82.4, 74.7, 88.9) | (148.9, 141.8, 177.9) | **1.905** |
+| 修后 | (82.4, 74.7, 88.9) | (81.8, 74.3, 88.8) | **0.995** |
+
+改成 `gl_FragColor = (sum + texture2D(u_add, v_uv)) / 13.0;` —— 12 份抽样 + 1 份
+`u_add` 一起除以 13，模糊核的和才是 1（模糊必须保亮度，否则每级都在加亮）。
+
+**② 升采样链的目标尺寸写反了**：`up[i]` 原来按 `w >> (levels-1-i)` 分配，于是 `up[0]`
+是最小的、`up[levels-2]` 才是半分辨率；而循环从 `i = levels-2` 往下走 —— 真正被采样的
+那张（`up[levels-2]`）是**第一个**算出来的，后面两级纯属白算，`u_texel` 也跟着对不上
+（i=1 那一步拿 w/2 的图、按 w/8 的 texel 抽样）。现象是模糊「糊成一团」：结果只由最糊
+的那两级拼出来，细一级的降采样全丢了。改成 `up[i]` 与 `down[i]` 同尺寸（`w >> (i+1)`）、
+最终取 `up[0]`：这样每一步的 `u_add` 正好和目标是同一分辨率（dual filter 的本意），
+四级的结果才真的逐级叠上去。
+
 ## 动画与自定义 shader
 
 所有动画的进度都来自 `CLOCK_MONOTONIC`，**不是帧计数**：系统卡顿、掉帧、GPU 慢，
@@ -1124,6 +1174,33 @@ vidowmsg clipboard-clear
 
 把合成器人为冻住（每 130ms 里 `SIGSTOP` 70ms），同一个 180ms 打开动画变成
 **216ms / 6 帧** —— 帧数掉了一半，时长没有翻倍，这就是「时长不受运行速度影响」。
+
+### 开窗动画为什么曾经「闪一下再弹一下」
+
+`anim_off_x/y` 这一组偏移**同时**被入场动画和位移补间写。新窗口 map 的同一帧里
+`vidow_arrange` 会跑好几遍（建列、抢焦点、视口滚动各一次）：
+
+1. 第一次摆放：`placed == false` → 只记位置，不起补间
+2. 第二次摆放：列偏移变了（646 → 640）→ 满足 `moved`，而**这时入场动画还没开始**
+   （`vidow_view_open_anim` 在 map 处理函数里排在摆放之后）→ 位移补间起来了
+3. 入场动画开始：设 `anim_alpha = 0`、`anim_off_y = open_slide_px`，但没管已经起步的
+   位移补间
+4. 两个动画每帧互相覆盖：位移补间把 `off_y` 抹成 0（上滑没了），入场动画又把 `off_x`
+   留在补间的位置 → 窗口在「淡入上滑」和「横移到位」两个位置之间来回跳
+
+修法：入场动画开始时**撤掉位移补间**并接管 `anim_off_x/y`（`vidow_view_open_anim`
+里 `vidow_anim_cancel(anim_move)` + 清零），`vidow_place_view` 在入场动画进行期间只
+更新 `geom`，不再开补间、也不碰 offset。
+
+实测（`vidow B` 嵌在 headless 的 `vidow A` 里跑：B 的输出有真实的 frame callback 节奏，
+和用户那套嵌套一样；用临时 trace 打每帧的 t/alpha/off_y/落点）：
+
+| | 同一帧里的两次更新 | 渲染出来的落点 |
+| --- | --- | --- |
+| 修前 | `off_y=22` 与 `off_y=0` 交替 | `640,28` / `646,6` 来回跳 |
+| 修后 | 只剩入场动画的 `off_y` | `640,28 → 640,24 → … → 640,6` 单调上滑 |
+
+（trace 里另一条 `move update` 是隔壁 w1 的：视口滚了 6px，它本来就该平滑跟过去。）
 
 ### 配置
 
@@ -1986,6 +2063,21 @@ protocols/     wlr-layer-shell / wlr-virtual-pointer / input-method-v2 /
     「blur 项是**运行时值**」时才出现（常量 `0.0` 会被编译器把 `x * 0` 折成 0，
     `NaN` 因此消失），指向噪点那一行。修完复测：resize 前后 18 帧、`noise=0.4`、
     `blur_enabled=1` 三种情况下「不透明黑」占比都是 **0.000**
+
+100. 升采样把亮度乘了一遍（模糊过曝）：`kawase_up` 是 `sum / 12.0 + u_add`，12 份抽样
+     除对了、但加进来的 `u_add` 没参与平均 → 常量输入下 `c + c = 2c`。半透明窗口后面
+     那层底整整亮一倍。改成 `(sum + u_add) / 13.0`。实测见「Kawase 背景模糊」一节：
+     亮度比 1.905 → 0.995
+
+101. 升采样链的目标尺寸写反（模糊糊成一团）：`up[i]` 按 `w >> (levels-1-i)` 分配，于是
+     循环第一个算出来的 `up[levels-2]` 才是被采样的那张，后面两级白算、`u_texel` 也对
+     不上。改成 `up[i]` 与 `down[i]` 同尺寸、最终取 `up[0]`
+
+102. 开窗动画和位移补间抢同一组 `anim_off_x/y`：新窗口 map 的同一帧里 arrange 先跑过
+     一遍（带着列偏移的变化），位移补间就起来了；入场动画随后开始却没撤掉它 → 两个
+     动画每帧互相覆盖，上滑被抹成 0、还横着挪几像素，看着就是「闪一下再弹一下」。
+     修法：入场动画开始时撤掉位移补间并接管 offset，`vidow_place_view` 在入场动画
+     期间只更新 `geom`。实测见「动画与自定义 shader」一节
 
 ## 尚未实现（原型边界）
 

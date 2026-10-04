@@ -15,8 +15,11 @@ static int gap_clamp(int px) {
 }
 
 /* 屏幕边 → 窗口的距离 = niri 的两个外间距之和（vidow 没有可见的工作区背景，
- * 所以分开存、加起来用）。 */
-static int gap_outer(const struct vidow_config *cfg) {
+ * 所以分开存、加起来用）。side 是四边单独设置的值：-1 = 没设，跟随统一值。 */
+static int gap_outer(const struct vidow_config *cfg, int side) {
+	if (side >= 0) {
+		return side;
+	}
 	return gap_clamp(cfg->workspace_gaps_outer) +
 		gap_clamp(cfg->window_gaps_outer);
 }
@@ -916,6 +919,13 @@ void vidow_view_open_anim(struct vidow_view *view) {
 	}
 
 	view->anim_alpha = cfg->open_alpha_from;
+	/* 入场动画接管位置：把可能刚起的位移补间撤掉。新窗口 map 的同一帧里
+	 * arrange 已经先跑过一遍（带着列偏移的变化），那会儿还没有入场动画，
+	 * 位移补间就起来了 —— 两个动画抢同一组 anim_off、每帧互相覆盖，看着就是
+	 * 「闪一下再弹一下」（上滑被抹成 0，还横着挪几像素）。 */
+	vidow_anim_cancel(view->anim_move);
+	view->anim_move = NULL;
+	view->anim_off_x = 0.0;
 	view->anim_off_y = cfg->open_slide_px;
 
 	vidow_fx_begin(view->server, &view->fx, view->scene_tree, cfg->shader_open);
@@ -993,6 +1003,18 @@ void vidow_place_view(struct vidow_view *view, int x, int y, int w, int h) {
 		return;
 	}
 
+	/* 入场动画正跑着：位置归它管。新窗口 map 的同一帧里 arrange 会跑好几遍
+	 * （建列、抢焦点、视口滚动各一次），第二遍起就满足 moved 了 —— 于是位移
+	 * 补间和入场动画抢同一组 anim_off，每帧互相覆盖：上滑被抹成 0、还横着挪
+	 * 几像素，看着就是「闪一下再弹一下」。这里只更新 geom，offset 一个字都不碰
+	 * （淡入那点时间差里看不出这几像素的位移）。 */
+	if (view->anim_open != NULL) {
+		vidow_anim_cancel(view->anim_move);
+		view->anim_move = NULL;
+		vidow_view_apply_anim(view);
+		return;
+	}
+
 	/* 弹出物不做移动补间：它是「跟着手指出现」的一块图，滑动会显慢半拍
 	 * （Wayland 的 xdg_popup 同样不走任何动画）。 */
 	if (view->popup || !moved || cfg->window_move_ms <= 0) {
@@ -1036,13 +1058,24 @@ struct wlr_box vidow_work_area(struct vidow_server *server,
 		wlr_output_layout_get_box(server->output_layout, output, &area);
 	}
 
-	/* 缩进可用区：窗口不贴屏幕边、也不贴状态栏。
-	 * 距离 = workspace_gaps_outer + window_gaps_outer（niri 的 gap 模型）。 */
-	int outer = gap_outer(&server->config);
-	area.x += outer;
-	area.y += outer;
-	area.width -= 2 * outer;
-	area.height -= 2 * outer;
+	/* 缩进可用区：窗口不贴屏幕边、也不贴状态栏。四边可以分别设
+	 * （gaps_top/bottom/left/right），没设就一起用
+	 * workspace_gaps_outer + window_gaps_outer。 */
+	int top = gap_outer(&server->config, server->config.gaps_top);
+	int bottom = gap_outer(&server->config, server->config.gaps_bottom);
+	int left = gap_outer(&server->config, server->config.gaps_left);
+	int right = gap_outer(&server->config, server->config.gaps_right);
+	area.x += left;
+	area.y += top;
+	area.width -= left + right;
+	area.height -= top + bottom;
+	/* 四边加起来超过屏幕就退化成 1px：宁可挤扁，也别给布局一个负的框。 */
+	if (area.width < 1) {
+		area.width = 1;
+	}
+	if (area.height < 1) {
+		area.height = 1;
+	}
 	return area;
 }
 
