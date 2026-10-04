@@ -29,6 +29,16 @@ struct entry {
 #define SZ(field) sizeof(((struct vidow_config *)0)->field)
 
 static const struct entry entries[] = {
+	/* gap：niri 的四个值 + `gaps <n>` 简写（简写在 apply() 里特殊处理）。 */
+	{ "gaps",                K_INT, OFF(gaps),                SZ(gaps) },
+	{ "workspace_gaps_inner", K_INT, OFF(workspace_gaps_inner),
+		SZ(workspace_gaps_inner) },
+	{ "workspace_gaps_outer", K_INT, OFF(workspace_gaps_outer),
+		SZ(workspace_gaps_outer) },
+	{ "window_gaps_inner",   K_INT, OFF(window_gaps_inner),
+		SZ(window_gaps_inner) },
+	{ "window_gaps_outer",   K_INT, OFF(window_gaps_outer),
+		SZ(window_gaps_outer) },
 	{ "decor_enabled",   K_BOOL,   OFF(decor_enabled),   SZ(decor_enabled) },
 	{ "corner_radius",   K_DOUBLE, OFF(corner_radius),   SZ(corner_radius) },
 	{ "border_width",    K_DOUBLE, OFF(border_width),    SZ(border_width) },
@@ -99,7 +109,21 @@ static bool parse_easing(const char *value, enum vidow_easing *out) {
 }
 
 /* Returns false if the key is unknown or the value cannot be parsed. */
-static bool apply(struct vidow_config *cfg, const char *key, const char *value) {	for (size_t i = 0; i < sizeof(entries) / sizeof(entries[0]); i++) {
+static bool apply(struct vidow_config *cfg, const char *key, const char *value) {
+	/* niri 的 `gaps <n>` 简写：一次把四个值都设成 n。 */
+	if (strcmp(key, "gaps") == 0) {
+		int n = atoi(value);
+		if (n < 0) {
+			n = 0;
+		}
+		cfg->gaps = n;
+		cfg->workspace_gaps_inner = n;
+		cfg->workspace_gaps_outer = n;
+		cfg->window_gaps_inner = n;
+		cfg->window_gaps_outer = n;
+		return true;
+	}
+	for (size_t i = 0; i < sizeof(entries) / sizeof(entries[0]); i++) {
 		const struct entry *e = &entries[i];
 		if (strcmp(e->key, key) != 0) {
 			continue;
@@ -159,6 +183,14 @@ static void defaults(struct vidow_config *cfg) {
 	 * 几分钟 —— 令牌过期了 wlroots 直接把激活请求丢掉，我们连信号都收不到
 	 * （点了通知窗口不动，看着像客户端坏了）。 */
 	cfg->activation_token_timeout = 0;
+	/* gap 默认保持原型原来的样子：离屏幕边 6px、窗口之间 6px。
+	 * 屏幕边那 6px 记在 window_gaps_outer 上（workspace_gaps_outer = 0），
+	 * 这样 `window_gaps_outer` 一项就能直接调「窗口离屏幕多远」。 */
+	cfg->gaps = 6;
+	cfg->workspace_gaps_inner = 6;
+	cfg->workspace_gaps_outer = 0;
+	cfg->window_gaps_inner = 6;
+	cfg->window_gaps_outer = 6;
 	/* serial 校验不通过的激活请求默认不理（= wlroots 一直以来的行为）。 */
 	cfg->honor_xdg_activation_with_invalid_serial = false;
 	/* IPC 默认开着：socket 只有自己这个用户能连（0600），而状态栏 / 脚本全靠它。
@@ -347,6 +379,13 @@ void vidow_config_log(const struct vidow_config *cfg) {
 		cfg->blur_levels, cfg->blur_strength, cfg->blur_alpha_min);
 	wlr_log(WLR_INFO, "config: force_render_hz=%d（视口外补帧的节流，0 = 不限）",
 		cfg->force_render_hz);
+	wlr_log(WLR_INFO, "config: gap 工作区 %d/%d 窗口 %d/%d（内/外）→ "
+		"屏幕边到窗口 %dpx，窗口之间 %dpx",
+		cfg->workspace_gaps_inner, cfg->workspace_gaps_outer,
+		cfg->window_gaps_inner, cfg->window_gaps_outer,
+		(cfg->workspace_gaps_outer > 0 ? cfg->workspace_gaps_outer : 0) +
+			(cfg->window_gaps_outer > 0 ? cfg->window_gaps_outer : 0),
+		cfg->window_gaps_inner > 0 ? cfg->window_gaps_inner : 0);
 	wlr_log(WLR_INFO, "config: activation_token_timeout=%d 秒（激活令牌多久作废，"
 		"0 = 不过期）", cfg->activation_token_timeout);
 	wlr_log(WLR_INFO, "config: honor_xdg_activation_with_invalid_serial=%s"

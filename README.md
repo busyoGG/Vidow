@@ -57,6 +57,49 @@
 - 列宽默认占工作区 50%，可按列循环切换 1/3 → 1/2 → 2/3
 - 窗口在列内纵向均分高度
 
+### 间距（gap）：照 niri 那套四个值
+
+niri 把间距拆成「工作区」和「窗口」两组、各有内/外，vidow 直接照抄（键名一样，
+niri 的配置能整段搬过来）：
+
+| 键 | niri 里的含义 | vidow 里落在哪 |
+| --- | --- | --- |
+| `workspace_gaps_outer` | 屏幕边 → 工作区 | 「离屏幕边」的一半 |
+| `window_gaps_outer` | 工作区 → 窗口 | 「离屏幕边」的另一半 |
+| `window_gaps_inner` | 窗口 ↔ 窗口 | 列与列之间、同列上下之间 |
+| `workspace_gaps_inner` | 工作区 ↔ 工作区 | **暂时不生效**（一块屏同时只显示一个工作区） |
+| `gaps` | 简写：一次设满四个 | 同 niri |
+
+- 眼睛看到的「屏幕边到窗口」= `workspace_gaps_outer + window_gaps_outer`：
+  vidow 没有可见的工作区背景，所以两个外间距加起来才是那圈留白
+- 默认 `gaps 6` 的效果 = 离屏幕边 6px、窗口之间 6px（**和加 gap 之前一模一样**，
+  所以老配置和回归测试都不受影响）：`workspace_gaps_outer = 0`、
+  `window_gaps_outer = 6`、`window_gaps_inner = 6`
+- 负值一律当 0（负 gap 会让工作区比屏幕还大）
+- 浮动窗口的活动范围、overview 的相机框、`set-window-size` 的夹取都走同一个
+  `vidow_work_area`，所以它们跟着一起变
+
+```bash
+vidowmsg set-config gaps 16                 # 一次设满四个
+vidowmsg set-config window_gaps_inner 20    # 只改窗口之间
+vidowmsg set-config window_gaps_outer 0     # 离屏幕边 40px
+vidowmsg set-config workspace_gaps_outer 40
+```
+
+实测（headless 1280×720、两个 `tools/pattern.py`，读 IPC `state` 的 `geometry`；
+列宽 = (1280 − 2×离屏幕边) × 0.5，所以列宽直接反推出离屏幕边）：
+
+| 配置 | 列宽 | 离屏幕边 | 列间距 |
+| --- | --- | --- | --- |
+| `gaps 6`（默认） | 634 | 6 | 6 |
+| `window_gaps_inner 20` | 634 | 6 | 20 |
+| `gaps 16` | 608 | 32 | 16 |
+| `workspace_gaps_outer 40` + `window_gaps_outer 0` | 600 | 40 | 16 |
+
+同列两个窗口（`move-window-direction -1` 并进一列后）纵向间距跟着
+`window_gaps_inner` 走：6 → 每格高 345 / 起点 y=12；20 → 338；-50（当 0）→ 348。
+回归脚本：`./test-gap.sh`（22 条断言，全走 IPC，不截屏）。
+
 ### 浮动窗口
 
 两种模式，都不占列位：

@@ -57,6 +57,22 @@ end
 vidow.log(string.format("config.lua: accent=%q power=%q width=%s",
 	tostring(accent), tostring(power), tostring(width)))
 
+-- ---------------------------------------------------------------- 间距（gap）
+
+-- 照 niri 那套四个值：
+--   屏幕边 → 窗口 = workspace_gaps_outer + window_gaps_outer
+--   窗口 ↔ 窗口   = window_gaps_inner（列与列之间、同列上下之间）
+-- `gaps <n>` 是简写，一次把四个都设成 n。默认（gaps 6）= 离屏幕边 6px、
+-- 窗口之间 6px，和没有 gap 配置的时候长得一模一样。
+-- workspace_gaps_inner（niri 里是「两块工作区之间」）暂时不生效：vidow 一块屏
+-- 同时只显示一个工作区。留着是为了 niri 的配置能整段抄过来。
+-- 负值一律当 0（负 gap 会让工作区比屏幕还大）。
+--
+-- gaps = 16                        -- 一次设满四个（niri 的默认值）
+-- window_gaps_inner = 20           -- 只改窗口之间
+-- window_gaps_outer = 0
+-- workspace_gaps_outer = 40        -- 离屏幕边 40px
+
 -- ---------------------------------------------------------- 工作区与窗口规则
 
 -- 工作区由你自己建、自己绑键（合成器不预设任何工作区键位）。

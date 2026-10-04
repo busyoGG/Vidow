@@ -7,8 +7,19 @@
 #include <wlr/types/wlr_buffer.h>
 #include <wlr/util/log.h>
 
-#define GAP VIDOW_GAP
 #define DEFAULT_COLUMN_WIDTH 0.5
+
+/* gap 一律按「不小于 0」用：负 gap 会让工作区比屏幕还大，布局直接散架。 */
+static int gap_clamp(int px) {
+	return px > 0 ? px : 0;
+}
+
+/* 屏幕边 → 窗口的距离 = niri 的两个外间距之和（vidow 没有可见的工作区背景，
+ * 所以分开存、加起来用）。 */
+static int gap_outer(const struct vidow_config *cfg) {
+	return gap_clamp(cfg->workspace_gaps_outer) +
+		gap_clamp(cfg->window_gaps_outer);
+}
 
 void vidow_place_view(struct vidow_view *view, int x, int y, int w, int h);
 static void view_ensure_column(struct vidow_server *server,
@@ -1025,11 +1036,13 @@ struct wlr_box vidow_work_area(struct vidow_server *server,
 		wlr_output_layout_get_box(server->output_layout, output, &area);
 	}
 
-	/* Inset the usable area so windows do not touch the screen edge or the bar. */
-	area.x += GAP;
-	area.y += GAP;
-	area.width -= 2 * GAP;
-	area.height -= 2 * GAP;
+	/* 缩进可用区：窗口不贴屏幕边、也不贴状态栏。
+	 * 距离 = workspace_gaps_outer + window_gaps_outer（niri 的 gap 模型）。 */
+	int outer = gap_outer(&server->config);
+	area.x += outer;
+	area.y += outer;
+	area.width -= 2 * outer;
+	area.height -= 2 * outer;
 	return area;
 }
 
@@ -1039,6 +1052,9 @@ static void output_arrange(struct vidow_server *server,
 	if (work.width < 1 || work.height < 1) {
 		return;
 	}
+
+	/* 窗口之间（列与列、同列上下）的间距 = window_gaps_inner。 */
+	int inner = gap_clamp(server->config.window_gaps_inner);
 
 	/* Pass 1: column widths and offsets, measured from the work area. */
 	struct wl_list *shown = output_shown_columns(server, output->wlr_output);
@@ -1051,9 +1067,9 @@ static void output_arrange(struct vidow_server *server,
 		}
 		col->width = width;
 		col->offset = cursor;
-		cursor += width + GAP;
+		cursor += width + inner;
 	}
-	int total_width = cursor > 0 ? cursor - GAP : 0;
+	int total_width = cursor > 0 ? cursor - inner : 0;
 
 	/* Pass 2: scroll the minimum amount that makes the focused column fully
 	 * visible. Focus moves, the view follows. */
@@ -1111,9 +1127,9 @@ static void output_arrange(struct vidow_server *server,
 			if (view->fullscreen && view->mapped) {
 				continue;
 			}
-			int h = (work.height - (n - 1) * GAP) / n;
+			int h = (work.height - (n - 1) * inner) / n;
 			vidow_place_view(view, x, y, col->width, h);
-			y += h + GAP;
+			y += h + inner;
 		}
 	}
 

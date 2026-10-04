@@ -43,7 +43,6 @@
 #include <wlr/xwayland.h>
 
 #define VIDOW_VIEW_TAG_MAGIC 0x50574d56u /* "PWMV" */
-#define VIDOW_GAP 6
 
 struct vidow_server;
 
@@ -82,6 +81,17 @@ enum vidow_easing {
 };
 
 struct vidow_config {
+	/* ---- gap（照 niri 那套四个值 + `gaps <n>` 简写）----
+	 *   屏幕边 → 窗口 = workspace_gaps_outer + window_gaps_outer
+	 *   窗口 ↔ 窗口   = window_gaps_inner（列与列之间、同列上下之间）
+	 * vidow 一块屏同时只显示一个工作区，所以 workspace_gaps_inner（niri 里是
+	 * 「两块工作区之间」）目前无处可施，留着是为了配置能照抄 niri。
+	 * 都按逻辑像素算；负值一律当 0（负 gap 会让工作区比屏幕还大）。 */
+	int gaps;                 /* 简写：一次设满四个，只作记录 */
+	int workspace_gaps_inner;
+	int workspace_gaps_outer;
+	int window_gaps_inner;
+	int window_gaps_outer;
 	/* Durations are wall-clock milliseconds. A slow compositor drops frames;
 	 * it never stretches an animation. */
 	/* 视口外强制渲染（窗口规则 / 录屏预览）每秒补多少帧，0 = 不限。
