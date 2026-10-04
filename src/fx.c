@@ -141,7 +141,6 @@ static const char *decor_fragment_src =
 	"uniform vec2 u_origin;\n"
 	"uniform vec2 u_output_size;\n"
 	"uniform float u_flip_y;\n"
-	"uniform float u_blur_alpha_min;\n"
 	"uniform float u_blur_strength;\n"
 	/* ext-background-effect：客户端指定的模糊区域（窗口局部坐标）。
 	 * on <= 0.5 时表示没限制，整个窗口都模糊。 */
@@ -318,7 +317,6 @@ static void load_decor_program(struct vidow_server *server) {
 	LOC(u_origin, "u_origin");
 	LOC(u_output_size, "u_output_size");
 	LOC(u_flip_y, "u_flip_y");
-	LOC(u_blur_alpha_min, "u_blur_alpha_min");
 	LOC(u_blur_strength, "u_blur_strength");
 	LOC(u_blur_region, "u_blur_region");
 	LOC(u_blur_region_on, "u_blur_region_on");
@@ -1429,7 +1427,6 @@ static void decor_draw(struct vidow_server *server,
 	glUniform2f(d->u_output_size, (float)server->output_w,
 		(float)server->output_h);
 	glUniform1f(d->u_flip_y, cfg->shader_flip_y ? 1.0f : 0.0f);
-	glUniform1f(d->u_blur_alpha_min, (float)cfg->blur_alpha_min);
 	float strength = fx->blur && fx->blur_tex != NULL ?
 		(float)cfg->blur_strength : 0.0f;
 	glUniform1f(d->u_blur_strength, strength);
