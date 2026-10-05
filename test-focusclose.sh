@@ -13,8 +13,10 @@
 #   2) 关掉中间的 b（焦点在 b 上）→ 焦点是**右边**的 c，不是最左边的 a  ← 主靶子
 #   3) 关掉最右边的 c（焦点在 c 上）→ 焦点是左边的 a（右边没人了才往左）
 #   4) 列里叠两个（d 上 e 下）：关掉上面的 d → 焦点是下面的 e（列内往下顶）
-#   5) 关掉最后一个 → 焦点清空（focused.window 是 null）
-#   6) 全程 vidow 不崩（关窗口走 unmap / destroy 两条路，两条都测）
+#   5) 浮窗（不在列里）：关掉它 → 焦点是右边最近的那个（按位置算）；平铺关完了
+#      还剩浮窗 → 焦点落到浮窗上，不是把键盘清空
+#   6) 关掉最后一个 → 焦点清空（focused.window 是 null）
+#   7) 全程 vidow 不崩（关窗口走 unmap / destroy 两条路，两条都测）
 #
 # 用法：./test-focusclose.sh    （VIDOW_TEST_KEEP=1 保留运行目录）
 set -u
@@ -116,7 +118,7 @@ expect_focus() { # <期望标题> <说明>
 	fi
 }
 
-mark "1/4 三个窗口排成 a | b | c"
+mark "1/5 三个窗口排成 a | b | c"
 open_win a
 open_win b
 open_win c
@@ -128,18 +130,18 @@ else
 fi
 expect_focus c "新窗口开在右边，焦点跟着它"
 
-mark "2/4 关掉中间的 b：焦点该落到右边的 c（不是最左边的 a）"
+mark "2/5 关掉中间的 b：焦点该落到右边的 c（不是最左边的 a）"
 msg focus-window-direction -1 >/dev/null # c → b
 expect_focus b "焦点先挪到中间的 b"
 msg close-window --title b >/dev/null
 expect_focus c "关掉 b 之后焦点是右边的 c（旧代码会蹦到最左边的 a）"
 
-mark "3/4 关掉最右边的 c：右边没人了才往左找"
+mark "3/5 关掉最右边的 c：右边没人了才往左找"
 # 这条走 destroy 路（客户端被 kill），上面那条走 unmap 路（客户端自己退）
 CPID=""
 for p in $CLIENT_PIDS; do
 	[ -r "/proc/$p/cmdline" ] || continue
-	tr '\0' ' ' < "/proc/$p/cmdline" | grep -q "pattern.py c" && CPID=$p
+	{ tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null || true; } | grep -q "pattern.py c" && CPID=$p
 done
 if [ -n "$CPID" ]; then
 	kill "$CPID" 2>/dev/null
@@ -149,7 +151,7 @@ else
 fi
 expect_focus a "关掉最右边的 c 之后焦点是左边的 a"
 
-mark "4/4 列里叠两个：关掉下面那个 d，焦点往上顶到 e"
+mark "4/5 列里叠两个：关掉下面那个 d，焦点往上顶到 e"
 open_win d
 open_win e
 expect_focus e "e 开在右边，焦点在 e 上"
@@ -168,7 +170,30 @@ msg close-window --title d >/dev/null
 expect_focus e "关掉下面的 d，焦点往上顶到同列的 e（旧代码会蹦到最左边的 a）"
 msg close-window --title e >/dev/null
 expect_focus a "e 也没了，焦点落到左边剩下的 a"
+
+mark "5/5 浮窗：不在列里，但「往右」这条规矩一样算"
+open_win f1
+open_win f2
+expect_focus f2 "f2 开在右边，焦点在 f2 上"
+msg toggle-floating --title f1 >/dev/null # f1 变浮窗，停在自己原来的位置上
+sleep 0.6
+msg focus-window --title f1 >/dev/null
+expect_focus f1 "焦点挪到浮窗 f1 上"
+XF1=$(win_x f1); XF2=$(win_x f2)
+if [ "$XF1" -lt "$XF2" ]; then
+	pass "浮窗 f1($XF1) 在 f2($XF2) 左边"
+else
+	fail "浮窗 f1($XF1) 不在 f2($XF2) 左边：这条测不到「右边最近」"
+fi
+msg close-window --title f1 >/dev/null
+expect_focus f2 "关掉浮窗 f1，焦点是右边最近的 f2（旧代码会蹦到最左边的 a）"
+msg toggle-floating --title f2 >/dev/null # 现在只剩 a 一个平铺 + f2 一个浮窗
+sleep 0.6
+msg focus-window --title a >/dev/null
+expect_focus a "焦点挪到平铺的 a 上"
 msg close-window --title a >/dev/null
+expect_focus f2 "平铺关完了，焦点落到剩下的浮窗 f2 上（旧代码会把键盘清空）"
+msg close-window --title f2 >/dev/null
 sleep 0.8
 LAST=$(focused_title)
 if [ "$LAST" = "(none)" ]; then

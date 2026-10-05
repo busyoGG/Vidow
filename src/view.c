@@ -1667,14 +1667,53 @@ static void focus_nearest_column(struct vidow_server *server,
 	vidow_arrange(server);
 }
 
+/* 按屏幕位置挑「右边最近的那个窗口」。浮窗（和「列都空了、只剩浮窗」）用这条：
+ * 它们不在列里，没有列序可看，只能量位置 —— x 比它大的里面取最小的（右边最近的），
+ * 右边没有了取 x 最大的（左边最近的）。平铺窗口取它所在列**最上面**那个（列里没有
+ * 「当前窗口」这个概念，别处（focus_nearest_column）也是这么认的）。 */
+static struct vidow_view *focus_nearest_by_x(struct vidow_server *server,
+		struct vidow_view *dying, struct wlr_output *output) {
+	struct vidow_workspace *ws = dying->ws;
+	struct vidow_view *v;
+	struct vidow_view *right = NULL;
+	struct vidow_view *left = NULL;
+	struct vidow_view *next;
+
+	if (ws == NULL || vidow_workspace_shown_for(server, output) != ws) {
+		return NULL;
+	}
+
+	wl_list_for_each(v, &server->views, link) {
+		if (v == dying || !v->mapped || v->popup || v->ws != ws ||
+				v->output != output || v->geom.width <= 0) {
+			continue;
+		}
+		if (v->geom.x > dying->geom.x) {
+			if (right == NULL || v->geom.x < right->geom.x) {
+				right = v;
+			}
+		} else if (left == NULL || v->geom.x > left->geom.x) {
+			left = v;
+		}
+	}
+
+	next = right != NULL ? right : left;
+	if (next != NULL && next->column != NULL) {
+		next = column_first_view(next->column);
+	}
+	return next;
+}
+
 /* 关掉一个窗口之后焦点落谁身上（niri 的规矩：**位置不动**，谁滑到空出来的位置上
  * 就是谁）：
  *   1) 列里还有窗口 —— 关掉那个的位置由它下面那个顶上；关的本来就是最下面那个，
  *      就往上找一个（列里只剩它一个的情况不算，见 2）；
  *   2) 整列没了 —— 右边最近的那一列顶上（右边那列滑到空出来的位置上）；
- *   3) 右边没有了 —— 才往左找最近的一列（关掉最右边那列时，niri 也是落到左边那个）。
+ *   3) 右边没有了 —— 才往左找最近的一列（关掉最右边那列时，niri 也是落到左边那个）；
+ *   4) 不在列里（浮窗）/ 这块工作区上只剩浮窗 —— 按屏幕位置找右边最近的那个窗口
+ *      （见 focus_nearest_by_x）：浮窗没有列序可看，但「往右」这条规矩一样成立。
  * 以前这里只做 1 的一半（只看下面），剩下全丢给 focus_nearest_column() —— 那个是
- * 「从左往右找第一个」，于是关掉右边一个窗口，焦点蹦到最左边那列去了。
+ * 「从左往右找第一个」，于是关掉右边一个窗口（浮窗更是），焦点蹦到最左边那列去了。
  *
  * 必须**在 view_leave_column() 之前**调：列一摘空就自己 free 了，邻居得趁它还挂在
  * 工作区链表上才找得到。返回 NULL = 这块工作区上一个窗口都不剩（或者它压根没摆出来，
@@ -1687,7 +1726,8 @@ static struct vidow_view *focus_after_close(struct vidow_server *server,
 	struct wl_list *node;
 
 	if (col == NULL) {
-		return NULL;
+		/* 浮窗：不在列里，按位置挑。 */
+		return focus_nearest_by_x(server, view, output);
 	}
 
 	if (view->column_link.next != &col->views) {
@@ -1720,7 +1760,9 @@ static struct vidow_view *focus_after_close(struct vidow_server *server,
 		}
 	}
 
-	return NULL;
+	/* 这块工作区上没有别的列了：可能还剩浮窗 —— 它们照样该接住键盘（niri 的
+	 * 「平铺关完落到浮窗上」）。挑不到就返回 NULL，调用方走兜底。 */
+	return focus_nearest_by_x(server, view, output);
 }
 
 void vidow_focus_column(struct vidow_server *server, int direction) {
