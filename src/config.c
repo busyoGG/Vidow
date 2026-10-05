@@ -81,6 +81,9 @@ static const struct entry entries[] = {
 
 	{ "decor_enabled",   K_BOOL,   OFF(decor_enabled),   SZ(decor_enabled), 1,
 		"圆角/边框/阴影这套装饰的总开关" },
+	{ "prefer_no_csd",   K_BOOL,   OFF(prefer_no_csd),   SZ(prefer_no_csd), 1,
+		"让客户端别画自己的装饰（CSD）：开启后连只认 KDE 老协议的客户端"
+		"（GTK3）也听得见 —— 客户端把标题栏一起收回去，窗口只剩 vidow 的边框" },
 	{ "corner_radius",   K_DOUBLE, OFF(corner_radius),   SZ(corner_radius), 1,
 		"圆角半径（逻辑像素，0 = 直角）" },
 	{ "border_width",    K_DOUBLE, OFF(border_width),    SZ(border_width), 1,
@@ -534,6 +537,9 @@ static void defaults(struct vidow_config *cfg) {
 	cfg->close_slide_px = 14;
 
 	cfg->decor_enabled = true;
+	/* 关着：客户端自己画的装饰（CSD）不动它。开了就告诉客户端「别画了」，
+	 * 见 decoration.c —— GTK3 只有这条老协议听得见。 */
+	cfg->prefer_no_csd = false;
 	cfg->corner_radius = 12.0;
 	cfg->border_width = 2.0;
 	cfg->border_color[0] = 0.30f; /* unfocused: dim */
@@ -690,10 +696,11 @@ void vidow_config_each(const struct vidow_config *cfg,
 
 void vidow_config_log(const struct vidow_config *cfg) {
 	wlr_log(WLR_INFO,
-		"config: decor=%s radius=%.1f border=%.1f shadow=%.1f/%.1f,%d "
-		"opacity=%.2f noise=%.2f blur=%s all=%s levels=%d strength=%.2f "
-		"alpha_min=%.2f",
-		cfg->decor_enabled ? "on" : "off", cfg->corner_radius,
+		"config: decor=%s prefer_no_csd=%s radius=%.1f border=%.1f "
+		"shadow=%.1f/%.1f,%d opacity=%.2f noise=%.2f blur=%s all=%s "
+		"levels=%d strength=%.2f alpha_min=%.2f",
+		cfg->decor_enabled ? "on" : "off",
+		cfg->prefer_no_csd ? "on" : "off", cfg->corner_radius,
 		cfg->border_width, cfg->shadow_radius, cfg->shadow_color[3] * 255.0,
 		cfg->shadow_offset_y, cfg->window_opacity, cfg->noise,
 		cfg->blur_enabled ? "on" : "off", cfg->blur_all ? "on" : "off",

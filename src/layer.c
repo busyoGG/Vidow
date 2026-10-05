@@ -225,8 +225,17 @@ static void layer_snapshot_close(struct vidow_layer_surface *ls) {
 	layer_slide_dir(ls, &dx, &dy);
 	int slide = cfg->close_slide_px;
 
+	/* layer surface 没有「窗口几何」和表面之分：整块就是内容。 */
+	struct vidow_fx_geo geo = {
+		.off_x = 0,
+		.off_y = 0,
+		.w = ls->geom.width,
+		.h = ls->geom.height,
+		.src_w = ls->geom.width,
+		.src_h = ls->geom.height,
+	};
 	vidow_closing_start(server, layer_tree(server, ls->layer), ls->last_buffer,
-		ls->geom.x + (int)lround(ls->anim_off_x),
+		&geo, ls->geom.x + (int)lround(ls->anim_off_x),
 		ls->geom.y + (int)lround(ls->anim_off_y),
 		ls->geom.width, ls->geom.height, cfg->layer_close_ms,
 		dy * slide, NULL,

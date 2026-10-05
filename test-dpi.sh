@@ -265,8 +265,11 @@ if hits:
           "（预期 %.0f,%.0f = (光标-原点)x%.2f）"
           % (lx, ly, ox, oy, sx, sy, exp_x, exp_y, final_x))
 # 6) SSD 对齐：X11 与 Wayland 的窗口都走同一条装饰管线 —— 装饰缓冲尺寸必须等于
-#    (逻辑尺寸 + 2×内边距) × 输出缩放，两边各自成立（zenity 的自然尺寸在两种
-#    后端上会差几十像素，那是 GTK 的事，不是装饰的事）
+#    (窗口尺寸 + 2×内边距) × 输出缩放，两边各自成立（zenity 的自然尺寸在两种
+#    后端上会差几十像素，那是 GTK 的事，不是装饰的事）。
+#    「窗口尺寸」= xdg_surface.set_window_geometry：自己画装饰的客户端表面比窗口
+#    大一圈（那圈是它的阴影），装饰缓冲按窗口算 —— 所以 Wayland 这边取 place 的
+#    w/h（布局用的就是窗口几何），不是 commit 那行里的表面尺寸。
 def slice_log(path):
     try:
         return open(path, "rb").read().decode("utf-8", "replace")
@@ -299,15 +302,40 @@ def decorated(txt, pat, label):
           % (label, logical[0], logical[1], PAD, scale, want[0], want[1],
              "" if ok else "（没找到，装饰没走到这条管线）"))
 
+def decorated_wayland(txt):
+    """Wayland 那一路：表面尺寸来自客户端 commit，窗口尺寸来自 place。
+
+    两者差一圈 CSD 留白（客户端自己画的阴影）时，装饰缓冲按窗口算 —— 断言用
+    place 的 w/h，就是窗口几何。"""
+    last = None
+    for m in re.finditer(r"surface (\S+): 缓冲 \d+x\d+ 声明 \d+ 倍 -> "
+                         r"逻辑 (\d+)x(\d+)（输出 ([\d.]+)x", txt):
+        if int(m.group(2)) > 8:
+            last = m
+    if last is None:
+        print("  SKIP  Wayland：样本不足")
+        return
+    title, scale = last.group(1), float(last.group(4))
+    rects = [(int(a), int(b)) for a, b in
+             re.findall(r"place %s -> -?\d+,-?\d+ (\d+)x(\d+)"
+                        % re.escape(title), txt) if int(a) > 8]
+    if not rects:
+        print("  SKIP  Wayland：没有 place 记录")
+        return
+    logical = rects[-1]
+    want = want_target(logical, scale, PAD)
+    ok = want in targets(txt)
+    check(ok, "Wayland 的装饰缓冲 = (窗口 %dx%d + 2×%d) × %.2f = %dx%d%s"
+          % (logical[0], logical[1], PAD, scale, want[0], want[1],
+             "" if ok else "（没找到，装饰没走到这条管线）"))
+
 x11txt = slice_log(sys.argv[2]) if len(sys.argv) > 2 else ""
 wltxt = slice_log(sys.argv[3]) if len(sys.argv) > 3 else ""
 if x11txt and wltxt:
     decorated(x11txt,
               r"x11: \S+ 缓冲 \d+x\d+ 按 \d+ 倍声明 -> 场景 (\d+)x(\d+)"
               r"（输出 ([\d.]+)x", "X11")
-    decorated(wltxt,
-              r"surface \S+: 缓冲 \d+x\d+ 声明 \d+ 倍 -> 逻辑 (\d+)x(\d+)"
-              r"（输出 ([\d.]+)x", "Wayland")
+    decorated_wayland(wltxt)
 
 # 7) 没有崩溃
 check("Assertion" not in log and "abort" not in log.lower(),

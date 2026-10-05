@@ -144,6 +144,10 @@ static const char *decor_fragment_src =
 	 * on <= 0.5 时表示没限制，整个窗口都模糊。 */
 	"uniform vec4 u_blur_region;\n"
 	"uniform float u_blur_region_on;\n"
+	/* 内容贴图在装饰矩形里的采样映射：uv = xy + 内容坐标 * zw（归一化）。
+	 * 客户端自己画装饰时源缓冲比可见窗口大一圈（CSD 阴影留白），内容就得偏着采；
+	 * 没留白时 xy = 0、zw = 1。 */
+	"uniform vec4 u_tex_map;\n"
 	/* 元素自己的 alpha（「透明度剔除」）：模糊只画在元素真的有内容的地方。
 	 * u_mask_on > 0.5 时取 u_mask，否则取 u_texture。u_mask_min 是阈值（硬 step，
 	 * 跟 niri 的 blur_finish 一样；0 = 不剔）。 */
@@ -165,7 +169,8 @@ static const char *decor_fragment_src =
 	"	float d = sd_round_box(wp - half_size, half_size, r);\n"
 	"	float inside = 1.0 - smoothstep(-1.0, 1.0, d);\n"
 	"\n"
-	"	vec2 uv = clamp(wp / u_size, 0.0, 1.0);\n"
+	"	vec2 cuv = clamp(wp / u_size, 0.0, 1.0);\n"
+	"	vec2 uv = clamp(u_tex_map.xy + cuv * u_tex_map.zw, 0.0, 1.0);\n"
 	"	vec4 content = texture2D(u_texture, uv) * u_opacity * inside;\n"
 	"\n"
 	"	float bw = min(u_border_width, min(half_size.x, half_size.y));\n"
@@ -186,7 +191,9 @@ static const char *decor_fragment_src =
 	 * 内容由 u_mask 传进来。用的是**内容自己的 alpha**，不含 u_opacity：剔除管的是
 	 * 形状，半透明窗口该透出来的模糊不能因为 window_opacity 低就整个没了。 */
 	"	float elem_a = u_mask_on > 0.5 ?\n"
-	"		texture2D(u_mask, uv).a : texture2D(u_texture, uv).a;\n"
+	/* mask 是元素**自己**那张缓冲，采样坐标用元素局部（恒等映射）：窗口那层
+	 * CSD 留白偏移只属于内容贴图，不能带到 mask 上，否则剔除会看错地方。 */
+	"		texture2D(u_mask, cuv).a : texture2D(u_texture, uv).a;\n"
 	"	float cover = 1.0;\n"
 	"	if (u_blur_region_on > 0.5) {\n"
 	"		vec2 lo = u_blur_region.xy;\n"
@@ -333,6 +340,7 @@ static void load_decor_program(struct vidow_server *server) {
 	LOC(u_blur_strength, "u_blur_strength");
 	LOC(u_blur_region, "u_blur_region");
 	LOC(u_blur_region_on, "u_blur_region_on");
+	LOC(u_tex_map, "u_tex_map");
 	LOC(u_mask, "u_mask");
 	LOC(u_mask_on, "u_mask_on");
 	LOC(u_mask_min, "u_mask_min");
@@ -1496,6 +1504,10 @@ static void decor_draw(struct vidow_server *server,
 		(float)(fx->blur_region[1] * scale),
 		(float)(fx->blur_region[2] * scale),
 		(float)(fx->blur_region[3] * scale));
+	/* 内容贴图里哪一块是可见窗口（归一化）。没留白的元素是 0 / 1 —— layer 底衬、
+	 * X11、以及不自己画装饰的客户端都走这一支，和以前逐像素一样。 */
+	glUniform4f(d->u_tex_map, fx->tex_off_x, fx->tex_off_y,
+		fx->tex_scale_x, fx->tex_scale_y);
 
 	if (fx->blur_only) {
 		/* 只要那一层模糊：内容、阴影、边框、圆角、噪点全关（layer surface 的
@@ -1594,6 +1606,11 @@ bool vidow_fx_begin(struct vidow_server *server, struct vidow_fx_target *fx,
 	wlr_scene_node_set_enabled(&fx->node->node, true);
 	fx->active = true;
 	fx->blur = server->config.blur_enabled;
+	/* 默认恒等：内容贴图就是整块元素。窗口那一路每帧按窗口几何覆盖它。 */
+	fx->tex_off_x = 0.0f;
+	fx->tex_off_y = 0.0f;
+	fx->tex_scale_x = 1.0f;
+	fx->tex_scale_y = 1.0f;
 	if (animated) {
 		vidow_fx_set_shader(server, fx, shader_name, VIDOW_SHADER_OPEN);
 	}
@@ -1601,18 +1618,27 @@ bool vidow_fx_begin(struct vidow_server *server, struct vidow_fx_target *fx,
 }
 
 bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
-		struct wlr_scene_buffer *src, int x, int y, int ox, int oy,
+		struct wlr_scene_buffer *src, const struct vidow_fx_geo *geo,
+		int x, int y, int ox, int oy,
 		double alpha, bool focused, double scale, double ov) {
 	if (!fx->active || fx->node == NULL || src == NULL || src->buffer == NULL) {
 		return false;
 	}
-
-	/* dst_width 是场景里的逻辑尺寸（X11 的缓冲区已经被声明成 scale 倍了）。 */
-	int cw = src->dst_width > 0 ? src->dst_width : src->buffer->width;
-	int ch = src->dst_height > 0 ? src->dst_height : src->buffer->height;
-	if (cw <= 0 || ch <= 0) {
+	if (geo == NULL || geo->w <= 0 || geo->h <= 0) {
 		return false;
 	}
+
+	/* 内容尺寸 = **可见窗口**，不是整块表面：客户端自己画装饰时（GTK 那套 CSD
+	 * 阴影）缓冲比窗口大一圈，边框/圆角/阴影围着缓冲画就离窗口差出那圈留白 ——
+	 * 屏幕上正是「边框 / 一圈背景 / 窗口」。niri 的 LayoutElement::size() 用的
+	 * 也是窗口几何，原因一样（见 struct vidow_fx_geo）。 */
+	int cw = geo->w, ch = geo->h;
+	/* 源缓冲里「可见窗口」在哪（归一化）。窗口几何 == 表面时是 0 / 1，采出来的
+	 * 内容和以前逐像素一样。 */
+	fx->tex_off_x = geo->src_w > 0 ? (float)geo->off_x / (float)geo->src_w : 0.0f;
+	fx->tex_off_y = geo->src_h > 0 ? (float)geo->off_y / (float)geo->src_h : 0.0f;
+	fx->tex_scale_x = geo->src_w > 0 ? (float)geo->w / (float)geo->src_w : 1.0f;
+	fx->tex_scale_y = geo->src_h > 0 ? (float)geo->h / (float)geo->src_h : 1.0f;
 	int pad = vidow_fx_pad(server);
 	double px_w = ((double)cw + 2.0 * pad) * (scale > 0.0 ? scale : 1.0);
 	double px_h = ((double)ch + 2.0 * pad) * (scale > 0.0 ? scale : 1.0);
@@ -1937,6 +1963,14 @@ static bool layer_blur_frame(struct vidow_server *server,
 	if (ls->scene == NULL) {
 		return false;
 	}
+
+	/* 恒等映射：layer 的元素就是整块缓冲，没有「窗口几何」那层偏移（窗口那一
+	 * 路走 vidow_fx_frame，每帧按可见窗口覆盖这几个字段）。这一路不经过
+	 * vidow_fx_begin，字段默认是 0 —— 不设就是拿 texel (0,0) 当整块用。 */
+	fx->tex_off_x = 0.0f;
+	fx->tex_off_y = 0.0f;
+	fx->tex_scale_x = 1.0f;
+	fx->tex_scale_y = 1.0f;
 	blur_mask_min_changed(fx, server->config.blur_alpha_min);
 	/* bottom 层先于窗口画，它底下没有窗口：共享的那张底衬就是它要的全部。top /
 	 * overlay 层底下有窗口，得自己抓一小块（见 layer_region_build）。 */
@@ -2154,12 +2188,15 @@ static void closing_update(void *data, double t) {
 	int y = closing->y + (int)lround(closing->off_y);
 	if (closing->fx.active) {
 		vidow_fx_frame(closing->server, &closing->fx, closing->node,
-			closing->x, y, closing->x, y, closing->alpha, false,
-			closing->scale, 1.0);
+			&closing->geo, closing->x, y, closing->x, y, closing->alpha,
+			false, closing->scale, 1.0);
 		return;
 	}
 	if (closing->node != NULL) {
-		wlr_scene_node_set_position(&closing->node->node, closing->x, y);
+		/* 没画装饰：快照自己上屏。它是一整块源缓冲，可见窗口在里面偏着 ——
+		 * 偏移不进位置，CSD 窗口的关闭动画就整个斜出那圈留白。 */
+		wlr_scene_node_set_position(&closing->node->node,
+			closing->x - closing->geo.off_x, y - closing->geo.off_y);
 		wlr_scene_buffer_set_opacity(closing->node, (float)closing->alpha);
 	}
 }
@@ -2185,9 +2222,9 @@ static void closing_done(void *data, bool cancelled) {
 }
 
 void vidow_closing_start(struct vidow_server *server,
-		struct wlr_scene_tree *parent, struct wlr_buffer *snapshot, int x, int y,
-		int w, int h, int duration_ms, int slide_px, const char *shader_name,
-		double scale) {
+		struct wlr_scene_tree *parent, struct wlr_buffer *snapshot,
+		const struct vidow_fx_geo *geo, int x, int y, int w, int h,
+		int duration_ms, int slide_px, const char *shader_name, double scale) {
 	struct vidow_config *cfg = &server->config;
 	if (snapshot == NULL || duration_ms <= 0 || w <= 0 || h <= 0) {
 		return;
@@ -2206,6 +2243,17 @@ void vidow_closing_start(struct vidow_server *server,
 	closing->alpha = 1.0;
 	closing->slide_px = slide_px;
 	closing->scale = scale > 0.0 ? scale : 1.0;
+	closing->geo = (struct vidow_fx_geo){0};
+	if (geo != NULL) {
+		closing->geo = *geo;
+	}
+	if (closing->geo.w <= 0 || closing->geo.h <= 0) {
+		/* 没给几何（layer surface 之类）：整块快照就是窗口。 */
+		closing->geo.w = w;
+		closing->geo.h = h;
+		closing->geo.src_w = w;
+		closing->geo.src_h = h;
+	}
 	wl_list_insert(&server->closing, &closing->link);
 
 	closing->node = wlr_scene_buffer_create(parent, closing->buffer);
@@ -2215,7 +2263,8 @@ void vidow_closing_start(struct vidow_server *server,
 		free(closing);
 		return;
 	}
-	wlr_scene_node_set_position(&closing->node->node, x, y);
+	wlr_scene_node_set_position(&closing->node->node,
+		x - closing->geo.off_x, y - closing->geo.off_y);
 	wlr_scene_buffer_set_dest_size(closing->node, w, h);
 
 	/* Decorate the outgoing window too, but never blur behind it: the scene it

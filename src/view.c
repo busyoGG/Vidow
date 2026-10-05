@@ -137,6 +137,50 @@ struct wlr_box vidow_view_geometry(const struct vidow_view *view) {
 	return view->xdg_toplevel->base->geometry;
 }
 
+/* 可见窗口在源缓冲里的位置/尺寸，逻辑单位（见 struct vidow_fx_geo）。
+ *
+ * 客户端用 xdg_surface.set_window_geometry 告诉我们「表面里哪一块是窗口」：
+ * 自己画装饰的客户端（GTK / kitty）把表面做大一圈画阴影，窗口尺寸和偏移就是
+ * 那圈留白。装饰、模糊区域、输入法候选框全都按可见窗口定位，留白永远在窗口
+ * 外面 —— 这是 niri 的 LayoutElement::size() / buf_loc() 那一套。
+ *
+ * X11 没有这个区别：整块就是内容。 */
+struct vidow_fx_geo vidow_view_fx_geo(const struct vidow_view *view) {
+	struct vidow_fx_geo geo = {0};
+	struct wlr_box g = vidow_view_geometry(view);
+	if (view->kind == VIDOW_VIEW_X11) {
+		geo.w = g.width;
+		geo.h = g.height;
+		geo.src_w = g.width;
+		geo.src_h = g.height;
+		return geo;
+	}
+	struct wlr_surface *surface = vidow_view_surface(view);
+	int sw = surface != NULL ? surface->current.width : 0;
+	int sh = surface != NULL ? surface->current.height : 0;
+	if (g.width <= 0 || g.height <= 0) {
+		/* 客户端没声明窗口几何：wlroots 会给「整块表面」这个默认值，但万一
+		 * 拿到个空的，就当整块表面是窗口（老行为）。 */
+		geo.w = sw;
+		geo.h = sh;
+		geo.src_w = sw;
+		geo.src_h = sh;
+		return geo;
+	}
+	if (sw <= 0 || sh <= 0) {
+		/* 表面尺寸还没来（第一帧）：留白那圈按几何推断，别采到缓冲外面。 */
+		sw = g.x + g.width;
+		sh = g.y + g.height;
+	}
+	geo.off_x = g.x;
+	geo.off_y = g.y;
+	geo.w = g.width;
+	geo.h = g.height;
+	geo.src_w = sw;
+	geo.src_h = sh;
+	return geo;
+}
+
 /* X11 的像素 = 「参考设备像素」，也就是逻辑坐标乘 xwayland_scale。给客户端的
  * 一切都按这个换算：告诉它窗口多大、在哪，读回来的位置尺寸再除回来。 */
 static int x11_scale_int(const struct vidow_server *server) {
@@ -784,14 +828,16 @@ void vidow_view_apply_anim(struct vidow_view *view) {
 	view->fx_dx = sx - vx;
 	view->fx_dy = sy - vy;
 
+	struct vidow_fx_geo geo = vidow_view_fx_geo(view);
+
 	/* ext-background-effect：客户端要的那块才模糊。区域是 surface 局部坐标，
-	 * 正好等于着色器里的窗口局部坐标。 */
+	 * 着色器里比的是窗口局部坐标 —— 两者差一个 CSD 留白偏移（没留白就是 0）。 */
 	struct wlr_box region;
 	if (vidow_bgeffect_blur_box(view->server,
 			vidow_view_surface(view), &region)) {
 		view->fx.blur_region_on = true;
-		view->fx.blur_region[0] = (float)region.x;
-		view->fx.blur_region[1] = (float)region.y;
+		view->fx.blur_region[0] = (float)(region.x - geo.off_x);
+		view->fx.blur_region[1] = (float)(region.y - geo.off_y);
 		view->fx.blur_region[2] = (float)region.width;
 		view->fx.blur_region[3] = (float)region.height;
 	} else {
@@ -800,8 +846,10 @@ void vidow_view_apply_anim(struct vidow_view *view) {
 
 	/* The decoration shader applies the fade itself, so the node stays opaque
 	 * and the real surface is only kept alive for hit-testing. */
-	bool fx_drawn = vidow_fx_frame(view->server, &view->fx, src, view->fx_dx,
-		view->fx_dy, x, y, alpha, view->server->focused == view,
+	/* 装饰节点摆在「可见窗口」左上角（视图树的原点就是它，见 vidow_fx_geo），
+	 * 不在源缓冲的原点上：源缓冲多出来的那圈 CSD 留白落在装饰矩形外面。 */
+	bool fx_drawn = vidow_fx_frame(view->server, &view->fx, src, &geo, 0, 0,
+		x, y, alpha, view->server->focused == view,
 		view_scale(view) * ov, ov);
 	/* 装饰图真的画上屏了才把真实表面藏起来（只留给命中测试）。没画出来
 	 * 还藏就是窗口整个消失 —— 关掉 decor/shader 时踩过，屏幕一片黑。 */
@@ -936,18 +984,33 @@ static void view_snapshot_close(struct vidow_view *view) {
 			server->config.window_close_ms <= 0) {
 		return;
 	}
-	int w = view->geom.width, h = view->geom.height;
-	if (view->scene_surface != NULL && view->scene_surface->buffer != NULL) {
-		struct wlr_scene_buffer *sb = view->scene_surface->buffer;
-		if (sb->dst_width > 0) {
-			w = sb->dst_width;
+	/* 快照是整块源缓冲（表面），可见窗口在里面偏着 —— 把偏移一起交给关闭动画，
+	 * 否则 CSD 窗口淡出的时候会整体斜出去那圈留白。 */
+	struct vidow_fx_geo geo = vidow_view_fx_geo(view);
+	if (geo.w <= 0 || geo.h <= 0 || geo.src_w <= 0 || geo.src_h <= 0) {
+		/* 已经拆干净了（X11 的 surface 没了 / 还没 commit）：整块就是窗口。 */
+		geo = (struct vidow_fx_geo){0};
+		if (view->scene_surface != NULL && view->scene_surface->buffer != NULL) {
+			struct wlr_scene_buffer *sb = view->scene_surface->buffer;
+			if (sb->dst_width > 0) {
+				geo.src_w = sb->dst_width;
+			}
+			if (sb->dst_height > 0) {
+				geo.src_h = sb->dst_height;
+			}
 		}
-		if (sb->dst_height > 0) {
-			h = sb->dst_height;
+		if (geo.src_w <= 0) {
+			geo.src_w = view->geom.width;
 		}
+		if (geo.src_h <= 0) {
+			geo.src_h = view->geom.height;
+		}
+		geo.w = geo.src_w;
+		geo.h = geo.src_h;
 	}
+	int w = geo.src_w, h = geo.src_h;
 	vidow_closing_start(server, server->layer_toplevels, view->last_buffer,
-		view->geom.x + (int)lround(view->anim_off_x),
+		&geo, view->geom.x + (int)lround(view->anim_off_x),
 		view->geom.y + (int)lround(view->anim_off_y), w, h,
 		server->config.window_close_ms, server->config.close_slide_px,
 		server->config.shader_close, view_scale(view));

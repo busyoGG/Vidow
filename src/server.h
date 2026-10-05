@@ -27,6 +27,7 @@
 #include <wlr/types/wlr_primary_selection.h>
 #include <wlr/types/wlr_primary_selection_v1.h>
 #include <wlr/types/wlr_scene.h>
+#include <wlr/types/wlr_server_decoration.h>
 #include <wlr/types/wlr_screencopy_v1.h>
 #include <wlr/types/wlr_seat.h>
 #include <wlr/types/wlr_subcompositor.h>
@@ -122,6 +123,10 @@ struct vidow_config {
 
 	/* server-side decorations */
 	bool decor_enabled;
+	/* 让客户端别画自己的装饰（CSD）：装饰协商一律回 SERVER_SIDE，并且建
+	 * org_kde_kwin_server_decoration_manager 让只认老协议的客户端（GTK3）也
+	 * 听得见 —— 见 decoration.c。*/
+	bool prefer_no_csd;
 	double corner_radius;
 	double border_width;
 	float border_color[4];       /* straight (non-premultiplied) rgba */
@@ -260,6 +265,8 @@ struct vidow_decor_prog {
 	int u_origin, u_output_size, u_flip_y;
 	int u_blur_strength;
 	int u_blur_region, u_blur_region_on;
+	/* 内容贴图在装饰矩形里的采样映射（见 fx.c 的 decor_fragment_src）。 */
+	int u_tex_map;
 	/* 元素自己的 alpha（「透明度剔除」，见 fx.c 的 decor_fragment_src）。 */
 	int u_mask, u_mask_on, u_mask_min;
 };
@@ -309,6 +316,22 @@ struct vidow_overview {
 /* A window's content rendered through the decoration (and optionally an
  * animation shader) into offscreen buffers, then shown as a scene node.
  * Buffers are ping-ponged so we never draw into one the scene still holds. */
+/* 「可见窗口」在源缓冲里的位置和尺寸，逻辑单位 —— 就是 niri 的
+ * LayoutElement::size() / buf_loc() 那一对：
+ *
+ *   off_x/off_y  可见窗口左上角在源缓冲里的偏移（客户端自己画装饰时留的阴影边，
+ *                没有留白就是 0）
+ *   w/h          可见窗口尺寸（= xdg_surface.set_window_geometry 那块）
+ *   src_w/src_h  整块源缓冲的尺寸
+ *
+ * 布局、边框、圆角、阴影一律按「可见窗口」算，源缓冲按 -off 反向偏移渲染。客户端
+ * 的留白永远落在窗口外面，边框紧贴窗口，中间不可能再有缝。 */
+struct vidow_fx_geo {
+	int off_x, off_y;
+	int w, h;
+	int src_w, src_h;
+};
+
 struct vidow_fx_target {
 	struct wlr_scene_buffer *node;
 	/* decoration pass */
@@ -354,6 +377,11 @@ struct vidow_fx_target {
 	bool blur_region_on;
 	float blur_region[4]; /* x, y, w, h */
 
+	/* 内容贴图在装饰矩形里的采样映射（归一化）：uv = tex_off + 内容坐标 *
+	 * tex_scale。窗口几何比表面小一圈时（客户端 CSD 留白），内容就按这份偏移
+	 * 采；没留白时 0 / 1（layer 底衬、X11 永远是这个）。 */
+	float tex_off_x, tex_off_y, tex_scale_x, tex_scale_y;
+
 	/* 只画「背后的模糊」：layer surface 的底衬用它。内容和阴影/边框/圆角/噪点
 	 * 全部关掉，输出就是一层模糊，垫在 layer surface 自己的节点下面。 */
 	bool blur_only;
@@ -387,6 +415,7 @@ struct vidow_closing {
 	double off_y;
 	int slide_px;
 	int x, y, w, h;
+	struct vidow_fx_geo geo; /* 快照里哪一块是「可见窗口」（见上） */
 	double scale;
 };
 
@@ -930,6 +959,11 @@ struct vidow_server {
 	 * 不给这个全局，kitty / GTK / Qt 就自己画标题栏，跟我们的圆角打架。 */
 	struct wlr_xdg_decoration_manager_v1 *decoration_manager;
 	struct wl_listener new_decoration;
+	/* org_kde_kwin_server_decoration_manager：GTK3 只认这个老协议（libgdk-3
+	 * 里根本没有 zxdg_decoration_manager_v1），没有它 GTK3 永远自己画 CSD，
+	 * 带一圈阴影留白。见 decoration.c。 */
+	struct wlr_server_decoration_manager *kde_decoration_manager;
+	struct wl_listener new_kde_decoration;
 	struct wlr_screencopy_manager_v1 *screencopy;
 	struct wl_global *bgeffect; /* ext_background_effect_manager_v1 */
 	struct wlr_virtual_keyboard_manager_v1 *virtual_keyboard;
@@ -1201,8 +1235,12 @@ bool vidow_fx_begin(struct vidow_server *server, struct vidow_fx_target *fx,
 /* scale = 窗口所在输出的缩放：离屏缓冲按它分配，装饰才是按设备像素画的
  * （不然整块窗口在 HiDPI 屏上会被放大一遍，糊）。ox/oy 是窗口在输出上的位置，
  * 逻辑坐标。 */
+/* geo = 可见窗口在源缓冲里的位置/尺寸（见 struct vidow_fx_geo）；x/y 是可见窗口
+ * 左上角在 fx 节点父坐标系里的位置（视图里就是 0,0：场景树节点的原点就是窗口
+ * 原点），装饰矩形会摆在它外面一圈 pad 的地方。 */
 bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
-		struct wlr_scene_buffer *src, int x, int y, int ox, int oy,
+		struct wlr_scene_buffer *src, const struct vidow_fx_geo *geo,
+		int x, int y, int ox, int oy,
 		double alpha, bool focused, double scale, double ov);
 void vidow_fx_end(struct vidow_server *server, struct vidow_fx_target *fx);
 void vidow_fx_release(struct vidow_fx_target *fx);
@@ -1273,10 +1311,16 @@ void vidow_popup_place(struct vidow_view *view);
  * 有些客户端映射之前窗口还是 1x1，但已经声明了它想要多大 —— 这里能拿到。 */
 bool vidow_view_fixed_size_hint(const struct vidow_view *view, int *w, int *h);
 void vidow_view_open_anim(struct vidow_view *view);
+/* 可见窗口在源缓冲里的位置/尺寸（客户端 CSD 留白就跑这儿出去，见 struct
+ * vidow_fx_geo）：装饰、模糊区域、输入法候选框都拿它定位。 */
+struct vidow_fx_geo vidow_view_fx_geo(const struct vidow_view *view);
+/* snapshot 是一份源缓冲（表面）快照，w/h 是它的逻辑尺寸；geo 说明里面哪一块是
+ * 「可见窗口」（x/y 是窗口左上角在 parent 坐标系里的位置）—— 客户端 CSD 留白
+ * 靠它从快照里对齐。 */
 void vidow_closing_start(struct vidow_server *server,
 		struct wlr_scene_tree *parent, struct wlr_buffer *snapshot,
-		int x, int y, int w, int h, int duration_ms, int slide_px,
-		const char *shader_name, double scale);
+		const struct vidow_fx_geo *geo, int x, int y, int w, int h,
+		int duration_ms, int slide_px, const char *shader_name, double scale);
 
 /* ------------------------------------------------------------------ layout */
 

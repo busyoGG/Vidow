@@ -514,6 +514,7 @@ python3 test-float.py        # 三个真实 GTK 窗口，验证浮动模式自�
 ./test-layerwin.sh                   # top 层模糊里含窗口（纯蓝窗口 + 压在它上面的面板，4 项断言）
 ./test-layermask.sh                  # 按元素自己的 alpha 剔除（透明内边距里的亮点不糊，3 项断言）
 ./test-openanim.sh                   # 开窗动画画的是装饰后的窗口本身（不是一块更大的矩形，4 项断言）
+./test-dpi.sh                        # 混合 DPI + XWayland：装饰缓冲按**窗口几何**算（见 SSD 那节）
 ./build/jsontest                     # 只看 JSON 写出/读入（离线，30 项）
 ./build/scaletest                    # 只看缩放计算（24 项）
 ```
@@ -1129,7 +1130,53 @@ vidowmsg clipboard-clear
 
 配置在 `~/.config/vidow/config.lua`：`decor_enabled` / `corner_radius` / `border_width` /
 `border_color` / `border_color_focus` / `shadow_radius` / `shadow_color` /
-`shadow_offset_x,y` / `window_opacity` / `noise`。
+`shadow_offset_x,y` / `window_opacity` / `noise` / `prefer_no_csd`。
+
+### 装饰按「可见窗口」画，不按表面（niri 的 `size()` / `buf_loc()`）
+
+客户端可以用 `xdg_surface.set_window_geometry` 说「表面里哪一块才是窗口」。自己画装饰的
+客户端（GTK / kitty）会把表面做大一圈来画自己的阴影：实测 GTK3 报
+`表面 680x755 / 窗口 634x708 / 留白偏移 23,21`。装饰矩形以前取的是**整块表面**，于是边框
+画在表面边上、真正画出来的窗口往里缩一圈，中间那圈露的是屏幕背景 —— 「边框和窗口之间有缝」。
+
+现在照 niri 的做法（那边 `LayoutElement::size()` = `window.geometry().size`、
+`buf_loc()` = `-geometry().loc`）：
+
+| 谁 | 按什么算 |
+| --- | --- |
+| 布局（列宽、高度、`place`） | 窗口几何（本来就是这样） |
+| 装饰矩形（圆角 / 边框 / 阴影 / 离屏缓冲尺寸） | 窗口几何 |
+| 内容贴图采样 | 按 `(geometry.x, geometry.y)` 偏移 —— 归一化后交给着色器（`u_tex_map`） |
+| `ext-background-effect` 的模糊区域 | 减掉留白偏移（客户端给的是表面局部坐标） |
+| 关闭动画的快照 | 同一份几何：快照节点按 `-偏移` 摆，装饰矩形还是窗口 |
+
+留白那圈（客户端自己的阴影）落在装饰矩形**外面**，vidow 不画它（内容被圆角矩形裁掉）。
+没留白的客户端（X11、不画装饰的 Wayland 客户端、`prefer_no_csd` 打开之后）留白是 0，
+这条路径逐像素等于以前。
+
+- 顺带修掉一个时机坑：装饰节点的位置原来是从场景坐标里算的（`sx - vx`），而 wlroots 要等
+  客户端 commit 才把表面子节点挪到 `-geometry`。map 那一瞬间算出来是 0，于是第一帧的装饰
+  摆在视图原点而不是表面原点 —— **录屏里看到的那条缝就是这个**（grim 截图是之后重绘的，
+  所以同一时刻看不到）。现在定位只依赖 `xdg_surface.geometry`，不看场景坐标。
+- 量法：`place` 给出的窗口矩形是 `6,6 634x708`，连拍 12 张 grim，从窗口出现的**第一张**
+  起都是 `x0..4 壁纸 | x6..7 边框 | x8.. 内容`（`VIDOW_FX_DUMP` 里装饰缓冲 642x716 =
+  (634+708) + 2×4 padding ✓ 按窗口算）。
+
+### `prefer_no_csd`：让客户端别画 CSD
+
+默认 `false`。打开后 vidow 明确告诉客户端「装饰由合成器画」：`zxdg_decoration_manager_v1`
+回 `SERVER_SIDE`，并且新建 `org_kde_kwin_server_decoration_manager`（默认模式 `Server`）。
+
+为什么非要建那个老协议：**GTK3 只认它** —— libgdk-3 里根本没有
+`zxdg_decoration_manager_v1`，只有 `org_kde_kwin_server_decoration_manager` 和那句
+"Compositor prefers decoration mode"。没有它，GTK3 永远自己画 CSD、带一圈 20px 阴影留白：
+默认配置下实测 `表面 680x755 / 窗口 634x708`；`prefer_no_csd = true` 之后同一个窗口报
+`表面 634x708 / 偏移 0,0`（CSD 整个收回去了）。wlroots 头文件里写着这个协议 obsolete，
+但客户端还在用，所以照给（建不出来只报一句，别的客户端不受影响）。
+
+代价：GTK3 窗口连**标题栏一起**收回去，只剩 vidow 的边框（半屏 / 关闭走快捷键）。这个键
+只对**之后**才连上的客户端彻底生效 —— KDE 老协议的默认模式是客户端绑定的时候发一次的
+事件，已经在跑的窗口要重启客户端，和 niri 的 `prefer-no-csd` 一样。
 
 ## Kawase 背景模糊
 
@@ -2472,6 +2519,23 @@ protocols/     wlr-layer-shell / wlr-virtual-pointer / input-method-v2 /
      （老二进制）→ 三帧都 ≤ 窗口 640x687 / 28。新增 `./test-openanim.sh`（老二进制连跑
      3 次都挂 2 条）。关闭动画（genie）走同一条路，一起好了（原来压下去的是没装饰的原始
      快照）。
+
+118. **装饰按「可见窗口」画（niri 的 `size()` / `buf_loc()`），新增 `prefer_no_csd`**。
+     客户端用 `xdg_surface.set_window_geometry` 声明的那块才是窗口：装饰矩形 / 离屏缓冲
+     尺寸 / 模糊区域 / 关闭动画快照全按它算，内容贴图按留白偏移采样（着色器加 `u_tex_map`，
+     归一化所以和倍率无关；mask 剔除仍用元素局部坐标，layer 那一路走恒等映射）。
+     以前装饰按整块表面画 —— GTK3 报 `表面 680x755 / 窗口 634x708 / 偏移 23,21` 的时候，
+     边框画在表面边上、窗口往里缩 20px，中间那圈露屏幕背景，就是「边框和窗口有缝」。
+     顺带修掉真凶之一：装饰节点的位置原来从场景坐标算（`sx - vx`），而 wlroots 要等 commit
+     才把表面子节点挪到 `-geometry` —— map 那一瞬间算出 0，第一帧装饰摆在视图原点，**录屏
+     里那条缝**就是这么来的（grim 之后重绘所以看不到）。现在只看 `xdg_surface.geometry`。
+     新增 `prefer_no_csd`（默认 `false`）：打开后额外建 `org_kde_kwin_server_decoration_manager`
+     并回 `Server` —— GTK3 只认这个老协议（libgdk-3 里没有 zxdg_decoration_manager_v1），
+     实测同一个 GTK3 窗口从 `表面 680x755` 变成 `表面 634x708`（CSD 收回去，代价是连标题栏
+     一起收）。`test-dpi.sh` 的 Wayland 断言改成按窗口几何算（取 `place` 的 w/h，不是 commit
+     那行的表面尺寸）。回归：`test-gap.sh` / `test-defaultconfig.sh` / `test-openanim.sh` /
+     `test-dpi.sh` / `test-layermask.sh`（这条抓到了 layer 那一路没走 `vidow_fx_begin`、
+     恒等映射没设，mask 被采成 texel (0,0)）全过。
 
 117. **配置面收敛：`gaps` 一个数管全部（外加单边 / 内间距覆盖），一族配置可以写成一张表；
      新增 `vidow --default-config`**。gap 原来是照 niri 抄的四个值（`workspace_gaps_inner/outer`

@@ -50,6 +50,9 @@ static void server_finish(struct vidow_server *server) {
 	wl_list_remove(&server->new_popup.link);
 	wl_list_remove(&server->new_layer_surface.link);
 	wl_list_remove(&server->new_decoration.link);
+	if (server->kde_decoration_manager != NULL) {
+		wl_list_remove(&server->new_kde_decoration.link);
+	}
 	wl_list_remove(&server->new_text_input.link);
 	wl_list_remove(&server->new_input_method.link);
 	if (server->ftl_capture != NULL) {
