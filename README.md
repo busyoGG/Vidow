@@ -537,6 +537,7 @@ python3 test-float.py        # 三个真实 GTK 窗口，验证浮动模式自�
 ./test-openanim.sh                   # 开窗动画画的是装饰后的窗口本身（不是一块更大的矩形，4 项断言）
 ./test-bounce.sh                     # 入场过冲 / 关闭回弹（q 弹曲线真的落到屏幕上了，5 项断言）
 ./test-closeanim.sh                  # 关闭动画：默认曲线下还看得见 + 不带窗口装饰（12 项断言）
+./test-focusclose.sh                 # 关窗口后焦点落谁身上：右边最近的顶上（14 项断言）
 ./test-drag.sh                       # 拖窗口：拖得动 / 跨屏改归属 / 平铺按落点插入（11 项）
 ./test-ws-dynamic.sh                 # 动态工作区：栈底空位 / 空了就收 / 序号夹住 / 具名永存（9 项）
 ./test-dpi.sh                        # 混合 DPI + XWayland：装饰缓冲按**窗口几何**算（见 SSD 那节）
@@ -2595,6 +2596,22 @@ protocols/     wlr-layer-shell / wlr-virtual-pointer / input-method-v2 /
      默认配置里给了 `Mod+1..9` 直跳的绑定（可删）。`test-workspace.sh` 的日志断言跟着新格式
      改；`test-ipc.sh`/`test-focus.sh` 同步。回归：defaultconfig / gap / config / workspace /
      ipc / focus / overview / hotplug / clipboard / layerwin / xwayland-popup 全过。
+
+126. **关掉一个窗口之后，焦点落到「右边最近的那个」**（niri 的规矩：位置不动，谁滑到空出来
+     的位置上就是谁）。原来只处理了一半：列里还有窗口时看**下面**那个（`column_link.next`），
+     其余情况全丢给 `focus_nearest_column()` —— 而那个函数是「从左往右找第一个**有窗口的
+     列**」，于是关掉中间那个窗口，焦点直接蹦到最左边那列去了（屏幕滚动位置也跟着跳）。
+     修法：`focus_after_close()`（`src/view.c`）按三步挑人 —— ①列里还留着窗口：关掉那个
+     的位置由它下面那个顶上；关的是最下面那个就往上找一个。②整列没了：右边最近的那一列
+     顶上。③右边没有了才往左找最近的一列（关掉最右边那列时 niri 也这样）。要**在
+     `view_leave_column()` 之前**算：列一摘空就自己 free 了，邻居得趁它还挂在工作区链表
+     上才找得到（`view_unmap` / `view_destroy` / `x11_destroy_view` 三条路都改成先算人、
+     再摘列 / free）。另外跨列找只在「它那块工作区正摆在这块屏上」时才做 —— 藏着的
+     工作区里的窗口不该拿到键盘，那种情况照旧走兜底（挑块看得见的）。
+     新增 `./test-focusclose.sh`（14 项）：a|b|c 三列关中间的 b → 焦点是 c（不是最左的 a，
+     这条拿修之前的二进制跑必挂）；关最右边的 c → 焦点是左边的 a；列里叠两个（e 上 d 下）
+     关下面的 d → 焦点往上顶到 e；关最后一个 → `focused.window` 变 null。关窗口的两条路
+     都测到了（客户端自己退 = unmap，客户端被 kill = destroy）。
 
 125. **关闭动画的两条底线：看得见、不带窗口装饰**。
      ① 窗口「没有关闭动画」：默认的关闭曲线是 `out_elastic`（q 弹），它冲过 1（t≈0.26

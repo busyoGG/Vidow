@@ -1667,6 +1667,62 @@ static void focus_nearest_column(struct vidow_server *server,
 	vidow_arrange(server);
 }
 
+/* 关掉一个窗口之后焦点落谁身上（niri 的规矩：**位置不动**，谁滑到空出来的位置上
+ * 就是谁）：
+ *   1) 列里还有窗口 —— 关掉那个的位置由它下面那个顶上；关的本来就是最下面那个，
+ *      就往上找一个（列里只剩它一个的情况不算，见 2）；
+ *   2) 整列没了 —— 右边最近的那一列顶上（右边那列滑到空出来的位置上）；
+ *   3) 右边没有了 —— 才往左找最近的一列（关掉最右边那列时，niri 也是落到左边那个）。
+ * 以前这里只做 1 的一半（只看下面），剩下全丢给 focus_nearest_column() —— 那个是
+ * 「从左往右找第一个」，于是关掉右边一个窗口，焦点蹦到最左边那列去了。
+ *
+ * 必须**在 view_leave_column() 之前**调：列一摘空就自己 free 了，邻居得趁它还挂在
+ * 工作区链表上才找得到。返回 NULL = 这块工作区上一个窗口都不剩（或者它压根没摆出来，
+ * 那就不该往这儿塞焦点）—— 交给调用方走 focus_nearest_column() 兜底。 */
+static struct vidow_view *focus_after_close(struct vidow_server *server,
+		struct vidow_view *view, struct wlr_output *output) {
+	struct vidow_column *col = view->column;
+	struct vidow_column *c;
+	struct vidow_view *next;
+	struct wl_list *node;
+
+	if (col == NULL) {
+		return NULL;
+	}
+
+	if (view->column_link.next != &col->views) {
+		next = wl_container_of(view->column_link.next, next, column_link);
+		return next;
+	}
+	if (view->column_link.prev != &col->views) {
+		next = wl_container_of(view->column_link.prev, next, column_link);
+		return next;
+	}
+
+	/* 列里就它一个：跨列找，但只在它那块工作区正摆在这块屏上时找 —— 藏着的
+	 * 工作区里的窗口不该拿到键盘（那种情况走兜底，跟以前一样挑块看得见的）。 */
+	if (col->ws == NULL || vidow_workspace_shown_for(server, output) != col->ws) {
+		return NULL;
+	}
+
+	for (node = col->link.next; node != &col->ws->columns; node = node->next) {
+		c = wl_container_of(node, c, link);
+		next = column_first_view(c);
+		if (next != NULL) {
+			return next;
+		}
+	}
+	for (node = col->link.prev; node != &col->ws->columns; node = node->prev) {
+		c = wl_container_of(node, c, link);
+		next = column_first_view(c);
+		if (next != NULL) {
+			return next;
+		}
+	}
+
+	return NULL;
+}
+
 void vidow_focus_column(struct vidow_server *server, int direction) {
 	struct vidow_column *col =
 		server->focused != NULL ? server->focused->column : NULL;
@@ -1985,11 +2041,8 @@ static void view_unmap(struct wl_listener *listener, void *data) {
 	}
 
 	if (server->focused == view) {
-		struct vidow_view *next = NULL;
-		if (view->column != NULL &&
-				view->column_link.next != &view->column->views) {
-			next = wl_container_of(view->column_link.next, next, column_link);
-		}
+		/* 邻居要在摘列之前找（见 focus_after_close）。 */
+		struct vidow_view *next = focus_after_close(server, view, output);
 		view_leave_column(view);
 		server->focused = NULL;
 		if (next != NULL) {
@@ -2167,6 +2220,9 @@ static void view_destroy(struct wl_listener *listener, void *data) {
 	view->anim_open = NULL;
 
 	bool was_focused = server->focused == view;
+	/* 邻居要在摘列（和 free(view)）之前找（见 focus_after_close）。 */
+	struct vidow_view *next = was_focused ?
+		focus_after_close(server, view, output) : NULL;
 	if (was_focused) {
 		server->focused = NULL;
 	}
@@ -2176,7 +2232,11 @@ static void view_destroy(struct wl_listener *listener, void *data) {
 	free(view);
 
 	if (was_focused) {
-		focus_nearest_column(server, output);
+		if (next != NULL) {
+			vidow_focus_view(next);
+		} else {
+			focus_nearest_column(server, output);
+		}
 	} else {
 		vidow_arrange(server);
 	}
@@ -2776,6 +2836,9 @@ static void x11_destroy_view(struct wl_listener *listener, void *data) {
 	view->anim_open = NULL;
 
 	bool was_focused = server->focused == view;
+	/* 邻居要在摘列（和 free(view)）之前找（见 focus_after_close）。 */
+	struct vidow_view *next = was_focused ?
+		focus_after_close(server, view, output) : NULL;
 	if (was_focused) {
 		server->focused = NULL;
 	}
@@ -2785,7 +2848,11 @@ static void x11_destroy_view(struct wl_listener *listener, void *data) {
 	free(view);
 
 	if (was_focused) {
-		focus_nearest_column(server, output);
+		if (next != NULL) {
+			vidow_focus_view(next);
+		} else {
+			focus_nearest_column(server, output);
+		}
 	} else {
 		vidow_arrange(server);
 	}
