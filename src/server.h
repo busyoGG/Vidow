@@ -11,6 +11,7 @@
 #include <wlr/backend.h>
 #include <wlr/backend/session.h>
 #include "scale.h"
+#include "outputconf.h"
 #include "hotplug.h"
 #include "clipboard.h"
 #include <wlr/render/allocator.h>
@@ -168,14 +169,10 @@ struct vidow_config {
 	bool shader_flip_y;   /* sample the source texture bottom-up */
 
 	/* 缩放（见 scale.c）。scale 是所有输出的默认策略："auto" = 按 EDID 的 ppi
-	 * 推，让同一个逻辑尺寸在两块不同 DPI 的屏上是同一个物理尺寸；outputs 按
-	 * 输出名覆盖，写法 "DP-1:2 HDMI-A-1:1.25"。 */
+	 * 推，让同一个逻辑尺寸在两块不同 DPI 的屏上是同一个物理尺寸。单块屏要
+	 * 点名，用配置里的 vidow.output{ name = "DP-1", scale = 2 }（见
+	 * outputconf.c）—— 缩放和摆在哪是同一块屏的两件事，写在一组里。 */
 	char scale[16];
-	char outputs[256];
-	/* 哪块屏摆在布局的哪个位置："DP-3:0,0; DP-2:1920,0"（逻辑坐标）。
-	 * 留空 = 按输出到达顺序自动排（wlr_output_layout_add_auto）—— 那个顺序是
-	 * 后端说了算，所以「哪块在左边」要确定就得写这里。 */
-	char output_positions[256];
 
 	/* XWayland。xwayland=false 干脆不起 X 服务；xwayland_scale="auto" = 取所有
 	 * 输出缩放的最大值（X 只有一套坐标，只能按最密的那块屏来）；"off" = 1:1。
@@ -996,6 +993,14 @@ struct vidow_server {
 	struct wl_listener xwayland_destroy;
 	/* X11 客户端被告知的缩放。X 只有一套坐标，所以只能是一个全局值。 */
 	double xwayland_scale;
+
+	/* 这台 Xwayland 认不认 _XWAYLAND_GLOBAL_OUTPUT_SCALE（补丁版才认）。认了
+	 * X 屏幕才是设备像素；不认就得把 xwayland_scale 夹到 1（几何对、2 倍屏上
+	 * 糊）。判据是量 X 屏幕的尺寸，见 xwayland.c 的探测。 */
+	bool xwayland_scale_ok;
+	bool xwayland_scale_probed;
+	struct wl_event_source *xwayland_probe; /* 量 X 屏幕尺寸的定时器 */
+	unsigned xwayland_probe_tries;
 	/* 剪贴板桥（见 clipboard.c）：X11(Xwayland) <-> Wayland */
 	struct vidow_clipboard clipboard;
 	struct wlr_layer_shell_v1 *layer_shell;
@@ -1069,6 +1074,7 @@ struct vidow_server {
 	struct wl_list workspaces; /* vidow_workspace.link */
 	struct wl_list keybinds;   /* vidow_keybind.link */
 	struct wl_list rules;      /* vidow_rule.link（窗口规则） */
+	struct wl_list output_confs; /* vidow_output_conf.link（每块屏一组配置） */
 	struct wl_list test_actions; /* vidow_test_action.link（VIDOW_TEST_ACTION） */
 	struct wl_event_source *test_pipe; /* 一次性定时表 / 动作 FIFO 的 fd 源 */
 	/* 见过的每一块屏都留一条记忆（拔了也不删），热插拔按它还原工作区。 */
@@ -1131,14 +1137,16 @@ struct vidow_server {
 /* -------------------------------------------------------------------- init */
 
 bool vidow_output_init(struct vidow_server *server);
-/* 按配置（scale / outputs）算并设一个输出的缩放；SIGHUP 后整套重来。 */
+/* 按配置（全局 scale + vidow.output{ name = … } 里那块屏的 scale）算并设一个
+ * 输出的缩放；SIGHUP 后整套重来。 */
 void vidow_output_apply_scale(struct vidow_server *server,
 		struct vidow_output *output);
 void vidow_output_apply_scale_all(struct vidow_server *server);
 /* 每块屏立刻画一帧（走 1ms 定时器）。会话切回来、输出刚建出来的时候用：这时候
  * 没有任何 damage，后端也不会主动送 frame 事件，不主动画就一直是黑的。 */
 void vidow_output_kick_all(struct vidow_server *server);
-/* 按配置（output_positions）把每块屏摆到它该在的位置；SIGHUP 后对一次账。 */
+/* 按配置（vidow.output{ name = …, x = …, y = … }）把每块屏摆到它该在的位置；
+ * SIGHUP 后对一次账。 */
 void vidow_output_apply_positions_all(struct vidow_server *server);
 /* 输出的运行时改动（IPC 用）。都会 commit 一次并把跟着变的东西（布局、背景
  * 缓存、光标、可用区域）重做一遍。why 只进日志。 */

@@ -55,7 +55,7 @@ BIN=${VIDOW_BIN:-./build/vidow}
 PW=400 PH=300
 
 cat > "$CFG" <<'CFGEOF'
-outputs = "HEADLESS-1:1"
+vidow.output{ name = "HEADLESS-1", scale = 1 }
 blur_enabled = true
 blur_levels = 4
 blur_offset = 2

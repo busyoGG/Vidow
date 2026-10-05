@@ -19,7 +19,8 @@
  * 应用同样占 L/S 个逻辑单位。两块屏的 scale ∝ ppi 时，物理尺寸就一样；清晰度
  * 上最密那块屏是 1:1，其余是缩小。xwayland_scale=off 则反过来：X 按 1:1 画
  * （不认 GDK_SCALE 的老程序会和 Wayland 应用一样大），但 HiDPI 屏上是放大糊的。 */
-void vidow_xwayland_scale_recompute(struct vidow_server *server) {
+/* 想要多少倍（配置 + 输出算出来的那个数，不考虑 Xwayland 认不认）。 */
+static double xwayland_scale_want(struct vidow_server *server) {
 	double scale = 1.0;
 	struct vidow_scale_spec spec;
 
@@ -46,6 +47,23 @@ void vidow_xwayland_scale_recompute(struct vidow_server *server) {
 	}
 	if (scale > 8.0) {
 		scale = 8.0;
+	}
+	return scale;
+}
+
+/* 落地的那个倍数：这台 Xwayland 认不认 _XWAYLAND_GLOBAL_OUTPUT_SCALE（补丁版才
+ * 认，见下面的探测）也管着它。
+ *
+ * 不认的时候必须退回 1 倍：X 屏幕只有逻辑尺寸（实测 640x360 而不是 1280x720），
+ * 而 vidow 的换算处处假设「X 像素 = 逻辑 × 倍数」。硬按 2 倍算，按屏幕尺寸算
+ * 布局的客户端（GTK）会把整屏当成一半，最大化的窗口只占 1/4 面积 —— 这就是
+ * 「X 的逻辑分辨率和面板对不上」。退回 1 倍之后：X 屏幕 = 逻辑尺寸、vidow 不除、
+ * 客户端按 1 倍画，几何全对，代价是 2 倍屏上 X 客户端糊一点（想清晰就得装打过
+ * HiDPI 补丁的 Xwayland，或者把这块屏的 scale 设成 1）。 */
+void vidow_xwayland_scale_recompute(struct vidow_server *server) {
+	double scale = xwayland_scale_want(server);
+	if (!server->xwayland_scale_ok && scale > 1.0) {
+		scale = 1.0;
 	}
 	server->xwayland_scale = scale;
 }
@@ -124,22 +142,31 @@ static xcb_window_t x11_root(xcb_connection_t *conn) {
  *
  * 不写的后果（实测）：X 屏幕只有**逻辑**尺寸，GTK 那类按屏幕大小算布局的客户端
  * 会把整屏当成一半大小 —— 最大化的窗口只占 1/4 面积，微信登录窗那种固定尺寸的
- * 窗口也会和面板对不上。没打补丁的 Xwayland 里这个原子不存在，那就什么都不写
- * （它本来就会按逻辑尺寸报屏幕，vidow 的换算照旧自洽）。 */
+ * 窗口也会和面板对不上。没打补丁的 Xwayland 里这个原子不存在，那就什么都不写，
+ * 然后由 xwayland_probe_cb 量 X 屏幕、发现它没跟着缩放、把 X 退回 1 倍
+ * （vidow 不要求装哪个 Xwayland）。 */
 static void x11_set_global_scale(struct vidow_server *server,
 		xcb_connection_t *conn, int scale) {
-	xcb_intern_atom_cookie_t cookie = xcb_intern_atom(conn, 1,
-		sizeof("_XWAYLAND_GLOBAL_OUTPUT_SCALE") - 1,
-		"_XWAYLAND_GLOBAL_OUTPUT_SCALE");
-	xcb_intern_atom_reply_t *reply = xcb_intern_atom_reply(conn, cookie, NULL);
-	if (reply == NULL || reply->atom == XCB_ATOM_NONE) {
-		free(reply);
+	/* 测试钩子：本机装的正好是补丁版，没法验「没打补丁的 Xwayland」那条路
+	 * （见 xwayland_probe_cb 的退回 1 倍）。设了它就当这个原子不存在。 */
+	xcb_atom_t atom = XCB_ATOM_NONE;
+	if (getenv("VIDOW_TEST_XWAYLAND_UNPATCHED") == NULL) {
+		xcb_intern_atom_cookie_t cookie = xcb_intern_atom(conn, 1,
+			sizeof("_XWAYLAND_GLOBAL_OUTPUT_SCALE") - 1,
+			"_XWAYLAND_GLOBAL_OUTPUT_SCALE");
+		xcb_intern_atom_reply_t *reply =
+			xcb_intern_atom_reply(conn, cookie, NULL);
+		if (reply != NULL) {
+			atom = reply->atom;
+			free(reply);
+		}
+	}
+	if (atom == XCB_ATOM_NONE) {
 		wlr_log(WLR_INFO, "xwayland: X 这边没有 _XWAYLAND_GLOBAL_OUTPUT_SCALE"
-			"（没打 HiDPI 补丁的 Xwayland）→ X 屏幕按逻辑尺寸报，vidow 照旧除");
+			"（没打 HiDPI 补丁的 Xwayland）→ X 屏幕只有逻辑尺寸，vidow 量一次"
+			"屏幕尺寸，量到它确实没跟着缩放就退回 1 倍");
 		return;
 	}
-	xcb_atom_t atom = reply->atom;
-	free(reply);
 
 	uint32_t value = (uint32_t)(scale > 0 ? scale : 1);
 	xcb_change_property(conn, XCB_PROP_MODE_REPLACE, x11_root(conn), atom,
@@ -218,9 +245,15 @@ static void x11_set_xft_dpi(xcb_connection_t *conn, int dpi) {
 		dpi);
 }
 
-/* 把「X 这边的缩放」告诉 X 服务：属性 + Xft.dpi。缩放变了要重来一遍。 */
+/* 把「X 这边的缩放」告诉 X 服务：属性 + Xft.dpi。缩放变了要重来一遍。
+ *
+ * 这两件事不受 xwayland_env 管：那个开关是「要不要给客户端设 GDK_SCALE /
+ * QT_SCALE_FACTOR 这类环境变量」。而 X 屏幕的坐标空间（属性）和 X 的 DPI
+ * （Xft.dpi）是 X 服务自己的事实 —— vidow 内部一律按「X 像素 = 逻辑 × 倍数」
+ * 换算，不告诉 X 那边，屏幕尺寸就对不上（按屏幕算布局的客户端把整屏当一半，
+ * 最大化的窗口只占 1/4）。所以跟环境变量开关无关，只要 X 活着就得说。 */
 static void x11_apply_scale_props(struct vidow_server *server) {
-	if (server->xwayland == NULL || !server->config.xwayland_env) {
+	if (server->xwayland == NULL) {
 		return;
 	}
 	xcb_connection_t *conn = wlr_xwayland_get_xwm_connection(server->xwayland);
@@ -235,30 +268,150 @@ static void x11_apply_scale_props(struct vidow_server *server) {
 	x11_set_xft_dpi(conn, 96 * scale);
 }
 
+/* ---------------------------------------------------- 量 X 屏幕，认不认属性
+ *
+ * 补丁版 Xwayland 收到属性才把 X 屏幕按设备像素报；没打补丁的（或者别的实现）
+ * 只报逻辑尺寸 —— 而属性本身是写得进去的（原子不存在就算了，存在的话谁都能写），
+ * 所以「写成功」不代表「它认」。唯一的判据是量：X 屏幕的尺寸对不对得上
+ * 「布局逻辑尺寸 × 倍数」。
+ *
+ * 量到不对就退回 1 倍（见 vidow_xwayland_scale_recompute），几何至少是对的。
+ *
+ * 「只有逻辑尺寸」这个判据有个陷阱：Xwayland 收到属性**之前**屏幕也是逻辑尺寸，
+ * 而它是在自己的事件循环里处理这个属性的 —— 忙的时候要等一会儿。量早了就会把
+ * 补丁版当成没补丁，白白退回 1 倍（2 倍屏上糊，还改不回来）。所以这个判据要
+ * 反复量、给足时间（0.12 / 0.25 / 0.5 / 1 秒，共约 1.9 秒）才敢下结论；量到
+ * 「设备像素」则立刻收工。 */
+static const int probe_delays_ms[] = { 120, 250, 500, 1000 };
+
+static int xwayland_probe_cb(void *data);
+
+static void xwayland_probe_stop(struct vidow_server *server) {
+	if (server->xwayland_probe != NULL) {
+		wl_event_source_remove(server->xwayland_probe);
+		server->xwayland_probe = NULL;
+	}
+}
+
+static void xwayland_probe_schedule(struct vidow_server *server) {
+	if (server->xwayland == NULL || server->xwayland_scale_probed ||
+			server->xwayland_probe != NULL) {
+		return;
+	}
+	if (xwayland_scale_want(server) <= 1.0) {
+		return; /* X 本来就该按 1 倍，没什么可量的 */
+	}
+	if (server->xwayland_probe == NULL) {
+		server->xwayland_probe = wl_event_loop_add_timer(
+			wl_display_get_event_loop(server->display), xwayland_probe_cb,
+			server);
+		if (server->xwayland_probe == NULL) {
+			return;
+		}
+	}
+	server->xwayland_probe_tries = 1;
+	wl_event_source_timer_update(server->xwayland_probe, probe_delays_ms[0]);
+}
+
+/* X 屏幕现在多大（root window 的 geometry —— xcb_get_setup() 那份是连接建立时
+ * 的快照，属性改了它不更新）。 */
+static void x11_screen_size(xcb_connection_t *conn, int *w, int *h) {
+	*w = 0;
+	*h = 0;
+	xcb_window_t root = x11_root(conn);
+	if (root == XCB_NONE) {
+		return;
+	}
+	xcb_get_geometry_reply_t *geo = xcb_get_geometry_reply(conn,
+		xcb_get_geometry(conn, root), NULL);
+	if (geo != NULL) {
+		*w = (int)geo->width;
+		*h = (int)geo->height;
+		free(geo);
+	}
+}
+
+static int xwayland_probe_cb(void *data) {
+	struct vidow_server *server = data;
+	xcb_connection_t *conn = server->xwayland != NULL ?
+		wlr_xwayland_get_xwm_connection(server->xwayland) : NULL;
+	if (conn == NULL) {
+		xwayland_probe_stop(server);
+		return 0;
+	}
+
+	int xw = 0, xh = 0;
+	x11_screen_size(conn, &xw, &xh);
+	struct wlr_box layout = {0};
+	wlr_output_layout_get_box(server->output_layout, NULL, &layout);
+	double want = xwayland_scale_want(server);
+	enum vidow_x11_fit fit = vidow_scale_x11_fit(xw, xh, layout.width,
+		layout.height, want);
+
+	if (fit != VIDOW_X11_FIT_DEVICE_PX &&
+			server->xwayland_probe_tries <
+			(int)(sizeof(probe_delays_ms) / sizeof(probe_delays_ms[0]))) {
+		/* 还没法下结论（或者只是它还没跟上）：等下一档再量。 */
+		int delay = probe_delays_ms[server->xwayland_probe_tries];
+		server->xwayland_probe_tries++;
+		wl_event_source_timer_update(server->xwayland_probe, delay);
+		return 0;
+	}
+
+	xwayland_probe_stop(server);
+	if (fit == VIDOW_X11_FIT_LOGICAL_PX) {
+		server->xwayland_scale_probed = true;
+		server->xwayland_scale_ok = false;
+		wlr_log(WLR_ERROR, "xwayland: 这台 Xwayland 不认"
+			" _XWAYLAND_GLOBAL_OUTPUT_SCALE（X 屏幕 %dx%d 只有逻辑尺寸，"
+			"该是 %dx%d）→ X 一律按 1 倍：几何是对的，2 倍屏上 X 客户端会糊。"
+			"要清晰就装打过 HiDPI 补丁的 Xwayland（Arch：xorg-xwayland-lily"
+			" / hyprland-hidpi-xprop 那一套），或者把这屏的 scale 设成 1",
+			xw, xh, (int)lround(layout.width * want),
+			(int)lround(layout.height * want));
+		/* 现在退回 1 倍：重算 + 重写属性 / 环境变量 + 已经开着的 X 窗口
+		 * 重新声明一遍缓冲区比例。 */
+		vidow_xwayland_scale_apply(server);
+	} else if (fit == VIDOW_X11_FIT_DEVICE_PX) {
+		server->xwayland_scale_probed = true;
+		server->xwayland_scale_ok = true;
+		wlr_log(WLR_INFO, "xwayland: 这台 Xwayland 认这个属性（X 屏幕 %dx%d "
+			"= 布局 %dx%d ×%.2f 设备像素）", xw, xh, layout.width, layout.height,
+			want);
+	} else {
+		/* 量不出来（比如一块屏都没有）：不下结论，下次输出有变化再量。 */
+		wlr_log(WLR_INFO, "xwayland: X 屏幕 %dx%d 和「布局 %dx%d ×%.2f」对不上账"
+			"（量不出来），先按原样", xw, xh, layout.width, layout.height, want);
+	}
+	return 0;
+}
+
 void vidow_xwayland_scale_apply(struct vidow_server *server) {
 	double before = server->xwayland_scale;
 	vidow_xwayland_scale_recompute(server);
 	if (server->xwayland == NULL) {
 		return;
 	}
-	if (fabs(before - server->xwayland_scale) < 1e-3) {
-		return;
-	}
+	if (fabs(before - server->xwayland_scale) >= 1e-3) {
+		wlr_log(WLR_INFO,
+			"xwayland: 全局缩放 %.2f -> %.2f（逻辑尺寸要除以它才是 X 像素）",
+			before, server->xwayland_scale);
 
-	wlr_log(WLR_INFO, "xwayland: 全局缩放 %.2f -> %.2f（逻辑尺寸要除以它才是 X 像素）",
-		before, server->xwayland_scale);
+		vidow_xwayland_env(server);
+		/* X 那边也要知道：屏幕尺寸、RandR 模式、Xft.dpi 都跟着变。 */
+		x11_apply_scale_props(server);
 
-	vidow_xwayland_env(server);
-	/* X 那边也要知道：屏幕尺寸、RandR 模式、Xft.dpi 都跟着变。 */
-	x11_apply_scale_props(server);
-
-	/* 已经存在的 X11 窗口要按新缩放重新声明一遍缓冲区比例。 */
-	struct vidow_view *view;
-	wl_list_for_each(view, &server->views, link) {
-		if (view->kind == VIDOW_VIEW_X11) {
-			vidow_view_x11_scale(view);
+		/* 已经存在的 X11 窗口要按新缩放重新声明一遍缓冲区比例。 */
+		struct vidow_view *view;
+		wl_list_for_each(view, &server->views, link) {
+			if (view->kind == VIDOW_VIEW_X11) {
+				vidow_view_x11_scale(view);
+			}
 		}
 	}
+	/* 倍数变了 X 屏幕也该跟着变：顺便量一次（没量过、且想要 1 倍以上时才量）。
+	 * 放在变化分支外面：X 服务刚起来、或者布局刚从空变成有屏，都得能量到。 */
+	xwayland_probe_schedule(server);
 }
 
 /* X 那边真的活了：这时候才能写 root window 的属性。 */
@@ -266,10 +419,17 @@ static void xwayland_ready(struct wl_listener *listener, void *data) {
 	(void)data;
 	struct vidow_server *server = wl_container_of(listener, server, xwayland_ready);
 
+	/* 新起来的 Xwayland 还不认识我们，重新判一次它认不认那个属性（换过
+	 * Xwayland 二进制 / 重启过 X 服务的话，上一次的结论就不算数了）。 */
+	server->xwayland_scale_ok = true;
+	server->xwayland_scale_probed = false;
+	server->xwayland_probe_tries = 0;
+
 	/* 先把 X 那边的缩放告诉它（_XWAYLAND_GLOBAL_OUTPUT_SCALE + Xft.dpi）：
 	 * 打过补丁的 Xwayland 收到之后会立刻把 X 屏幕和 RandR 模式改成设备像素。
 	 * 必须赶在第一个客户端连上之前 —— 客户端一进来就会按当时的屏幕尺寸算布局。 */
 	x11_apply_scale_props(server);
+	xwayland_probe_schedule(server);
 
 	/* 诊断用：X 看到的屏幕多大，和我们以为的（逻辑 × 缩放）对不对得上。
 	 * 这条日志是排查「X 窗口位置偏移 / 菜单跑到别的屏上」的第一现场。
@@ -295,7 +455,9 @@ static void xwayland_ready(struct wl_listener *listener, void *data) {
 			(layout.width > 0 && xw == (unsigned)want_w &&
 				xh == (unsigned)want_h) ? "" :
 			" —— 对不上：X 那边没按设备像素报屏幕（没打 HiDPI 补丁的 Xwayland "
-			"就是这样），按屏幕尺寸算布局的客户端会把整屏当成一半大小");
+			"就是这样）。vidow 会在 0.1 秒内量一次，量到它确实没跟着缩放就"
+			"自动退回 1 倍（几何对、2 倍屏上糊）；补丁版的话这一行会显示"
+			"设备像素的尺寸");
 		if (layout.width < 1 || layout.height < 1) {
 			/* X 屏幕的大小 = 输出的并集：一块屏都没有时它就是 0x0，X11 客户端
 			 * 会看不见、点不动（用户看到的就是「XWayland 点不动」，见
@@ -325,6 +487,7 @@ static void xwayland_ready(struct wl_listener *listener, void *data) {
 static void xwayland_destroy(struct wl_listener *listener, void *data) {
 	(void)data;
 	struct vidow_server *server = wl_container_of(listener, server, xwayland_destroy);
+	xwayland_probe_stop(server);
 	wl_list_remove(&server->xwayland_ready.link);
 	wl_list_remove(&server->xwayland_destroy.link);
 	wl_list_remove(&server->new_xwayland_surface.link);
@@ -376,6 +539,7 @@ bool vidow_xwayland_apply_config(struct vidow_server *server) {
 			return true;
 		}
 		wlr_log(WLR_INFO, "xwayland: 配置里关了，拆掉 X 服务");
+		xwayland_probe_stop(server);
 		/* destroy 的信号处理里会把监听摘掉、把 server->xwayland 置空；
 		 * global_filter 那时就成了直通车，不用再动。 */
 		wlr_xwayland_destroy(server->xwayland);

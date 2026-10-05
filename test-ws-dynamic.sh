@@ -47,7 +47,7 @@ chmod 700 "$RUNDIR/run"
 run_case() {
 	# $1 = 配置里的具名工作区声明（可空）
 	cat > "$CFGDIR/.config/vidow/config.lua" <<CFG
-outputs = "HEADLESS-1:1"
+vidow.output{ name = "HEADLESS-1", scale = 1 }
 scale = "1"
 gaps = 10
 window_move_ms = 0

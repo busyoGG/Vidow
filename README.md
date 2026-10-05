@@ -88,6 +88,12 @@ anim   = { open_ms = 220, easing = "out_quint" }
 | `xwayland` | `enabled` `scale` `env` | `xwayland = false` |
 | `portal` | `conf_sync` `desktop` | — |
 
+显示器（输出）是另一种写法：**一块屏一组**，用 `vidow.output{…}` 声明，因为「哪块屏、
+按几倍、摆在哪」是同一件事 —— 摊成平铺键（老的 `outputs` + `output_positions`）要在
+两处各写一遍屏的名字，改一块屏改两行、只改一行还看不出来。写法见
+[混合 DPI 与 XWayland](#混合-dpi-与-xwayland)；`outputs` / `output_positions` 这两个
+老键名会在日志里喊一声「现在用 vidow.output{…}」，不静默失效。
+
 一个 Lua 那边的坑：**同一个键在一个文件里写两遍，只有第一遍生效** —— 第一遍之后它就是个
 普通的全局变量了，第二遍不再经过配置层（`vidow.set("gaps", 12)` 每次都能用）。
 
@@ -576,7 +582,7 @@ python3 test-float.py        # 三个真实 GTK 窗口，验证浮动模式自�
 ./test-ws-dynamic.sh                 # 动态工作区：栈底空位 / 空了就收 / 序号夹住 / 具名永存（9 项）
 ./test-dpi.sh                        # 混合 DPI + XWayland：装饰缓冲按**窗口几何**算（见 SSD 那节）
 ./build/jsontest                     # 只看 JSON 写出/读入（离线，30 项）
-./build/scaletest                    # 只看缩放计算（24 项）
+./build/scaletest                    # 只看缩放计算（31 项）
 ```
 
 无头冒烟测试（不弹窗口）：
@@ -641,19 +647,33 @@ overview 里：左键点窗口 = 选中它并缩回去，点空白 = 取消，`E
 
 ```lua
 -- ~/.config/vidow/config.lua
-scale = "auto"                      -- 缩放 = ppi / 96
-outputs = "DP-1:2 HDMI-A-1:1.25"    -- 按输出名覆盖（也可以写 auto / off）
-output_positions = "DP-3:0,0; DP-2:1920,0"  -- 哪块屏摆在哪（逻辑坐标，分号分隔）
+scale = "auto"                      -- 所有输出的默认缩放 = ppi / 96
+
+-- 显示器：一块屏一组，缩放和摆在哪写在一起（逻辑坐标）
+vidow.output{ name = "DP-3", scale = 2, x = 0,    y = 0 }    -- 左边那块 4K
+vidow.output{ name = "DP-2", scale = 2, x = 1920, y = 0 }    -- 右边那块 4K
+vidow.output{ name = "HDMI-A-1", scale = 1.25 }              -- 只改缩放，位置自动排
+
 xwayland = true                     -- 起 XWayland（懒启动：真有人连 X 才 fork）
 xwayland_scale = "auto"             -- X 的全局缩放 = ceil(最密那块屏的缩放)
 xwayland_env = true                 -- 给 X11 客户端下发 GDK_SCALE / QT_SCALE_FACTOR
 ```
 
+`vidow.output{}` 每写一行就是一块屏，只写要管的字段（`name` 必须有）：
+
+| 字段 | 作用 |
+| --- | --- |
+| `name` | 哪块屏（连接器名，`vidowmsg outputs` 能看到） |
+| `scale` | 这块屏的缩放：`auto` / `off` / 一个数，不写就用全局 `scale` |
+| `x` / `y` | 摆在布局的哪里，**逻辑**坐标；不写 = 按输出到达顺序自动排（那个顺序是后端说了算，所以「哪块在左边」要确定就得写） |
+
+名字写错了（`scalee = 2`）会当场报错并列出能写什么；同一块屏写两行也报错。
+
 `scale = auto` 按 EDID 的物理尺寸算 `ppi / 96`：4K 27 寸 ≈ 1.70、1440p 27 寸 ≈ 1.15、
 1080p 24 寸 ≈ 0.96（夹到 1.0）。量化到 0.05 再夹进 1.0～8.0 —— `ppi/96` 会算出
 1.7037037 这种值，直接拿去当缩放每帧取整都不一样。
 
-`./build/scaletest` 是不启动合成器的离线自检（24 项），其中一项就是实算「同一个逻辑
+`./build/scaletest` 是不启动合成器的离线自检（31 项），其中一项就是实算「同一个逻辑
 尺寸在两块屏上的物理尺寸差多少」：
 
 | 两块屏 | 200 逻辑像素的物理尺寸 | 差 |
@@ -663,12 +683,10 @@ xwayland_env = true                 -- 给 X11 客户端下发 GDK_SCALE / QT_SC
 
 | 键 | 默认 | 作用 |
 | --- | --- | --- |
-| `scale` | `auto` | 所有输出的默认策略：`auto` = 按 ppi 推，或者写一个数（`1.75`） |
-| `outputs` | 空 | 按输出名覆盖：`outputs = DP-1:2 HDMI-A-1:1.25 eDP-1:auto` |
-| `output_positions` | 空 | 哪块屏摆在布局的哪：`DP-3:0,0; DP-2:1920,0`（**逻辑**坐标，分号分隔；留空 = 按输出到达顺序自动排） |
+| `scale` | `auto` | 所有输出的默认策略：`auto` = 按 ppi 推，或者写一个数（`1.75`）；单块屏点名用 `vidow.output{ name = …, scale = … }` |
 | `xwayland` | `true` | 起不起 XWayland（`0` = 完全不碰 X 那一摊） |
 | `xwayland_scale` | `auto` | `auto` = `ceil(最密那块屏的缩放)`；`off` = 一律 1:1；也可以写死一个数 |
-| `xwayland_env` | `true` | 给 X11 客户端下发 `GDK_SCALE` / `QT_SCALE_FACTOR` / `XCURSOR_SIZE`（用户自己显式设过的不抢） |
+| `xwayland_env` | `true` | 给 X11 客户端下发 `GDK_SCALE` / `QT_SCALE_FACTOR` / `XCURSOR_SIZE`（用户自己显式设过的不抢）。**不管** `_XWAYLAND_GLOBAL_OUTPUT_SCALE` 和 `Xft.dpi` —— 那两个是 X 服务自己的事实，vidow 总是自己写（见下） |
 
 ### 一条链：从输出缩放到清晰的像素
 
@@ -702,8 +720,20 @@ X11 没有 per-window 的缓冲区缩放，所以：
    （`xorg-xwayland-lily` / xorg 的 MR!733）收到之后才会把 X 屏幕和 RandR 模式也
    乘上 S —— 这正是上面第 2 条假设的「X 像素 = 逻辑 × S」。**不写它的后果**：X 屏幕
    只有逻辑尺寸，按屏幕尺寸算布局的客户端（GTK）会把整屏当成一半大小，最大化的窗口
-   只占 1/4 面积、固定尺寸的登录窗也和面板对不上。没打补丁的 Xwayland 里这个原子
-   不存在，vidow 就不写（行为跟以前一样），日志里会直说。
+   只占 1/4 面积、固定尺寸的登录窗也和面板对不上。
+
+   回归判据里的「没打补丁」那条路用测试钩子 `VIDOW_TEST_XWAYLAND_UNPATCHED=1` 模拟
+   （本机装的正好是补丁版，否则没法验）。
+
+   **这台 Xwayland 认不认？vidow 量一次**：写完属性之后读 root window 的尺寸，跟
+   「布局逻辑尺寸 × S」对账。为什么不是量一次就完事：Xwayland 处理属性**之前**屏幕
+   也是逻辑尺寸（它就是那样报的），而它是在自己的事件循环里处理 —— 忙的时候要等一会
+   儿。所以按 0.12 / 0.25 / 0.5 / 1 秒（共约 1.9 秒）反复量，量到「设备像素」立刻收工。
+   对得上 = 补丁版，日志说「这台 Xwayland 认这个属性」；只有逻辑尺寸 = 不认 ——
+   这时**自动退回 1 倍**：
+   X 屏幕 = 逻辑尺寸、`Xft.dpi = 96`、`GDK_SCALE = 1`，几何全对（不会出现 1/4 的窗口），
+   代价是 2 倍屏上 X 客户端糊一点。也就是说 **vidow 不要求你装哪个 Xwayland**：装了
+   补丁版就有清晰的 X 客户端，没装也不会摆错。要强制 1 倍就写 `xwayland_scale = off`。
 6. **Xft.dpi = 96 × S**（写进 `RESOURCE_MANAGER`，保留别人的资源项）。`GDK_SCALE` /
    `QT_SCALE_FACTOR` 只覆盖 GTK / Qt；Chromium/CEF（微信登录窗就是）、Electron、
    Java、Wine 只认 Xft.dpi。不给，它们按 1 倍画，而 vidow 按 S 除 —— 窗口只剩该有的
@@ -795,7 +825,7 @@ X11 窗口走的是**同一条装饰管线**：同一个圆角/边框/阴影着�
 
 ```bash
 ./test-dpi.sh       # 全 headless：1x + 2x 两块屏 + X11 + Wayland 客户端，20 项断言
-./build/scaletest   # 24 项纯计算断言
+./build/scaletest   # 31 项纯计算断言
 ```
 
 `test-dpi.sh` 从日志里量出来的（每次 commit 记一行缓冲区 / 落屏像素）：
@@ -1613,7 +1643,8 @@ layer 的模糊底衬把 layer surface 自己的缓冲当 mask 传进去，窗�
 border_width = 2
 corner_radius = 12
 scale = "auto"
-outputs = "DP-1:2 HDMI-A-1:1.25"
+vidow.output{ name = "DP-1", scale = 2 }
+vidow.output{ name = "HDMI-A-1", scale = 1.25, x = 3840, y = 0 }
 
 -- 需要 shell 结果时用 vidow.exec()：看起来是同步的，实际不阻塞渲染
 local accent = vidow.exec("theme.sh accent")   -- 拿到 stdout
@@ -2004,7 +2035,8 @@ tools/vdrag.c  虚拟指针拖拽测试工具
 tools/xpopup.c 按绝对坐标造 X11 窗口（owner / or / tooltip / menu / combo / utility），
                可指定 WM_TRANSIENT_FOR、晚设窗口类型、自声明固定尺寸、延后自己挪位 ——
                弹出物分类与定位的测试客户端
-tools/scaletest.c  缩放计算的离线自检（解析 / ppi 推算 / 量化 / 优先级 / 物理尺寸差）
+tools/scaletest.c  缩放计算的离线自检（解析 / ppi 推算 / 量化 / 优先级 / 物理尺寸差 /
+                   X 屏幕对账）
 tools/hotplugtest.c 热插拔纯逻辑的离线自检（身份 / 记忆 / 挑接收的屏 / 稳定重排）
 tools/jsontest.c  JSON 写出 / 读入的离线自检（转义 / 嵌套 / 代理对 / 各种拒绝路径）
 tools/vidowmsg.c  IPC 客户端：把命令行参数拼成一行 JSON、把应答排版打出来；
@@ -2044,11 +2076,13 @@ test-x11scale.sh  固定尺寸的 X11 窗口（WM_NORMAL_HINTS min==max）在 2 
 test-scrollcull.sh  两块并排的屏 + 三列装不下：滚出视口的列被摘出场景（修之前它的
                   坐标落进隔壁屏的框里，就画在隔壁显示器上），再滚回来又显示，
                   浮动 / 拖拽不受这条规则管，藏起来的窗口按规则照旧补帧
-test-outputpos.sh  输出布局位置：`output_positions` 按名字摆（自动排的顺序是后端给的，
-                  headless 上实测是反的）、逗号写法也认、拔插后回到配置说的位置、
+test-outputpos.sh  显示器配置（`vidow.output{ name = …, scale = …, x = …, y = … }`）
+                   按名字摆（自动排的顺序是后端给的，headless 上实测是反的）、
+                  只写 x 不写 y 也认、项名写错当场报错、拔插后回到配置说的位置、
                   SIGHUP 改配置立刻生效
 test-xwayland-hidpi.sh  XWayland 的 HiDPI 告知：`_XWAYLAND_GLOBAL_OUTPUT_SCALE`
                   让 X 屏幕 / RandR 变成设备像素（补丁生效时），`Xft.dpi = 96×S`，
+                  以及没打补丁时量到屏幕没跟着缩放、自动退回 1 倍（钩子模拟），
                   端到端点一下 xev 收到的 root 坐标 = 布局坐标 × S，改缩放跟着变
 test-vt.sh        tty 的 VT 切换：headless 下验「认得 Ctrl+Alt+F2（F1..F12 + Ctrl+Alt
                   就是 VT 键）、不接管、不吃键」，`switch-vt` 动作 / 越界号优雅失败，
@@ -2206,12 +2240,15 @@ protocols/     wlr-layer-shell / wlr-virtual-pointer / input-method-v2 /
     2 倍屏上 `border_width=2` 的边框 = 4 个设备像素、`corner_radius=12` 的圆角 = 24 个
     设备像素、内边距 = 64 设备像素，都是逻辑值 ×2；离屏缓冲 756×824 = 客户端缓冲
     628×696 + 上下左右各 64，与场景节点尺寸 378×412 正好是 2 倍关系
-50. 缩放计算离线自检 24 项（`./build/scaletest`）：`auto` 反推 1.7016 / 1.1344 / 0.9564，
-    量化 1.7037037→1.70、0.956→夹到 1.0、上限 8.0，每输出覆盖压过全局，
-    `1.5x` / `abc` / `0` 被拒，`off` → 1.0
+50. 缩放计算离线自检 31 项（`./build/scaletest`）：`auto` 反推 1.7016 / 1.1344 / 0.9564，
+    量化 1.7037037→1.70、0.956→夹到 1.0、上限 8.0，这块屏自己点名的压过全局，
+    `1.5x` / `abc` / `0` / `2x` 被拒，`off` → 1.0，X 屏幕对账（设备像素 / 只有逻辑
+    尺寸 / 量不出来）三种判据
 51. 配置边界：`xwayland=0` → `配置里关了，不注册 X 服务`，合成器照常跑；
     `xwayland_scale=off` → `GDK_SCALE=1`、不再升到 2、X11 窗口按 1 倍声明（HiDPI 屏上
-    是放大糊的那个取舍）；`xwayland_env=0` → 一个环境变量都不碰
+    是放大糊的那个取舍）；`xwayland_env=0` → GDK_SCALE / QT_SCALE_FACTOR 这类环境变量
+    一个都不碰（`_XWAYLAND_GLOBAL_OUTPUT_SCALE` 和 `Xft.dpi` 照旧写：那是 X 服务自己的
+    事实，不是给客户端的环境变量）
 52. 修掉一个把点击吃光的真 bug：装饰画面的场景节点是普通 buffer，默认接受输入，盖在
     客户端表面上，于是开着装饰的窗口点不着。给它一个恒返回 false 的
     `point_accepts_input` 后，`./build/vdrag` 把光标移进 X11 窗口能正常命中并算出局部坐标
@@ -2901,9 +2938,9 @@ protocols/     wlr-layer-shell / wlr-virtual-pointer / input-method-v2 /
      但按屏幕边缘做裁剪的客户端会算错
    - 分数缩放下 GTK3 不认 fractional-scale，会按 `ceil` 渲染再被我们缩小（仍然清晰，
      只是多花像素）；GTK4 / Qt6 认 fractional-scale，按 1.70 精确渲染
-   - Xft 系（GTK2、老 Motif）不认 `GDK_SCALE`：保持 1:1（清晰但相对偏小）。要它们也变大
-     就自己在 config.lua 里跑 `xrdb -merge` 写 `Xft.dpi` —— 但别和 `GDK_SCALE` 一起用，
-     会叠成 4 倍字号
+   - Xft 系（GTK2、老 Motif）不认 `GDK_SCALE`：保持 1:1（清晰但相对偏小）。`Xft.dpi`
+     vidow 已经写了（= 96 × S），GTK2 这类会按它放大字号；要自己接管就在 config.lua 里
+     跑 `xrdb -merge` —— 但别和 `GDK_SCALE` 一起用，会叠成 4 倍字号
    - 没接 `wlr_xwayland_surface_offer_focus`（ICCCM 的 GLOBAL 输入模型），只发 activate
 3. 热插拔的边界：
    - 记忆在进程里（`vidow_output_memories`），**重启不保留**；要「重启之后还把应用放回

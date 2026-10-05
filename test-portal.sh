@@ -22,6 +22,12 @@ mkdir -p "$RUNDIR" "$LOG"
 export LOG RUNDIR CFG
 rm -f "$RUNDIR"/wayland-*
 
+# 跑完自己收干净（/tmp 不该攒测试残留）；VIDOW_TEST_KEEP=1 留着看现场。
+cleanup() {
+	[ -n "${VIDOW_TEST_KEEP:-}" ] || rm -rf "$RUNDIR" "$CFG" "$LOG"
+}
+trap cleanup EXIT
+
 case "$MODE" in
 switch-*)
 	WANT="${MODE#switch-}"

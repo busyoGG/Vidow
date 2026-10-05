@@ -64,7 +64,7 @@ run_case() { # <标签> <额外配置>
 	local log="$RUNDIR/log-$name"
 	cat > "$CFGDIR/.config/vidow/config.lua" <<CFG
 -- 一块 2 倍屏：X 的全局缩放（auto）会取 ceil(2) = 2
-outputs = "HEADLESS-1:2"
+vidow.output{ name = "HEADLESS-1", scale = 2 }
 scale = "auto"
 xwayland = true
 $extra

@@ -37,7 +37,7 @@ cleanup() {
 		sleep 0.4
 		kill -KILL -- "-$VIDOW_PGID" 2>/dev/null
 	fi
-	rm -rf "$RUNDIR"
+	[ -n "${VIDOW_TEST_KEEP:-}" ] || rm -rf "$RUNDIR"
 }
 trap cleanup EXIT
 
@@ -338,7 +338,8 @@ kill -TERM -- "-$VIDOW_PGID" 2>/dev/null
 sleep 0.6
 cat > "$CFGDIR/.config/vidow/config.lua" <<'EOF'
 scale = "auto"
-outputs = "HEADLESS-1:1 HEADLESS-2:2"
+vidow.output{ name = "HEADLESS-1", scale = 1 }
+vidow.output{ name = "HEADLESS-2", scale = 2 }
 xwayland = true
 window_open_ms = 2500
 window_close_ms = 2500

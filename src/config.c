@@ -183,11 +183,8 @@ static const struct entry entries[] = {
 		"socket 路径，留空 = 按 WAYLAND_DISPLAY 自动取" },
 
 	{ "scale",           K_STRING, OFF(scale),           SZ(scale), 8,
-		"缩放：auto = 按 EDID 的 ppi 推，也可以写死 \"1\" / \"1.5\"" },
-	{ "outputs",         K_STRING, OFF(outputs),         SZ(outputs), 8,
-		"按输出名覆盖缩放（如 \"DP-1:1.5,HDMI-A-1:1\"），留空 = 用 scale" },
-	{ "output_positions", K_STRING, OFF(output_positions), SZ(output_positions), 8,
-		"哪块屏摆在哪（如 \"DP-3:0,0; DP-2:1920,0\"，逻辑坐标），留空 = 自动排" },
+		"所有输出的默认缩放：auto = 按 EDID 的 ppi 推，也可以写死 \"1\" / \"1.5\""
+		"；单块屏点名用 vidow.output{ name = …, scale = … }" },
 
 	{ "xwayland",        K_BOOL,   OFF(xwayland),        SZ(xwayland), 9,
 		"开 XWayland（有人连 X 才启动服务）" },
@@ -366,6 +363,10 @@ static const struct {
 	{ "workspace_gaps_outer", "gaps 或 gaps = { top/bottom/left/right = … }" },
 	{ "window_gaps_inner",    "gaps_inner 或 gaps = { inner = … }" },
 	{ "window_gaps_outer",    "gaps 或 gaps = { top/bottom/left/right = … }" },
+	{ "outputs",              "vidow.output{ name = \"DP-3\", scale = 2 }"
+		"（一块屏一组，缩放和位置写在一起）" },
+	{ "output_positions",     "vidow.output{ name = \"DP-3\", x = 0, y = 0 }"
+		"（一块屏一组，缩放和位置写在一起）" },
 };
 
 bool vidow_config_legacy_hint(const char *key, const char **hint) {
@@ -604,10 +605,9 @@ static void defaults(struct vidow_config *cfg) {
 	cfg->shader_flip_y = false;
 
 	/* 缩放：默认按 EDID 的 ppi 推，让同一个逻辑尺寸在两块不同 DPI 的屏上是
-	 * 同一个物理尺寸；outputs 里可以按输出名覆盖。 */
+	 * 同一个物理尺寸。单块屏要点名（缩放 / 摆在哪）写在配置的
+	 * vidow.output{ name = … } 里，见 outputconf.c。 */
 	snprintf(cfg->scale, sizeof(cfg->scale), "auto");
-	cfg->outputs[0] = '\0';
-	cfg->output_positions[0] = '\0';
 
 	/* XWayland：默认懒启动（有人连 X 才起服务）。xwayland_scale=auto 取所有
 	 * 输出缩放的最大值 —— X 只有一套坐标，只能按最密的那块屏来，低了就是放大糊。 */
@@ -753,10 +753,9 @@ void vidow_config_log(const struct vidow_config *cfg) {
 		cfg->clipboard ? "on" : "off",
 		cfg->clipboard_primary ? "on" : "off", cfg->clipboard_max_bytes);
 	wlr_log(WLR_INFO,
-		"config: scale=%s outputs=%s positions=%s xwayland=%s xscale=%s xenv=%s",
-		cfg->scale, cfg->outputs[0] != '\0' ? cfg->outputs : "-",
-		cfg->output_positions[0] != '\0' ? cfg->output_positions : "-",
-		cfg->xwayland ? "on" : "off", cfg->xwayland_scale,
+		"config: scale=%s xwayland=%s xscale=%s xenv=%s（每块屏的缩放 / 位置见"
+		"上面的 output 配置行）",
+		cfg->scale, cfg->xwayland ? "on" : "off", cfg->xwayland_scale,
 		cfg->xwayland_env ? "on" : "off");
 	wlr_log(WLR_INFO,
 		"config: open=%dms(%s %.2f) close=%dms(%s %.2f) move=%dms "
@@ -905,6 +904,10 @@ void vidow_config_default_lua(FILE *out) {
 "--     gaps   = 10\n"
 "--     gaps   = { top = 30, inner = 20 }       -- 上边距 30、窗口之间 20、其余 6\n"
 "--     border = { width = 0, color = \"#2a2e3aff\" }\n"
+"--\n"
+"-- 显示器（输出）是一块屏一组，缩放和摆在哪写在一起（写几行就是几块屏）：\n"
+"--     vidow.output{ name = \"DP-3\", scale = 2, x = 0,    y = 0 }\n"
+"--     vidow.output{ name = \"DP-2\", scale = 2, x = 1920, y = 0 }\n"
 "-- 表里的项名写在下面每一节里；平铺键（gaps_inner = 20）和表写法是一回事。\n"
 "--\n"
 "-- 优先级：环境变量 VIDOW_<键名大写> > 这个文件 > 内置默认值。\n"

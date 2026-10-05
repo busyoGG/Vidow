@@ -44,7 +44,7 @@ command -v wtype >/dev/null || { echo "test-vt.sh: 需要 wtype"; exit 1; }
 mkdir -p "$CFGDIR/.config/vidow" "$RUNDIR/run"
 chmod 700 "$RUNDIR/run"
 cat > "$CFGDIR/.config/vidow/config.lua" <<'CFG'
-outputs = "HEADLESS-1:1"
+vidow.output{ name = "HEADLESS-1", scale = 1 }
 -- 真机上生效的就是这条（headless 没有会话，只会记一行「没有会话」）
 vidow.bind("Ctrl+Alt+P", "switch-vt 3")
 CFG

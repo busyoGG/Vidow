@@ -58,7 +58,7 @@ mkdir -p "$CFGDIR/.config/vidow" "$RUNDIR/run" "$FRAMES"
 chmod 700 "$RUNDIR/run"
 
 cat > "$CFG" <<'CFGEOF'
-outputs = "HEADLESS-1:1"
+vidow.output{ name = "HEADLESS-1", scale = 1 }
 scale = "1"
 gaps = 10
 window_open_ms = 4000

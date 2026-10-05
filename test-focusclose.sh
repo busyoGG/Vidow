@@ -55,7 +55,7 @@ export HOME="$CFGDIR" VIDOW_LOG=debug
 export DISPLAY= WAYLAND_DISPLAY=
 
 cat > "$CFGDIR/.config/vidow/config.lua" <<'CFG'
-outputs = "HEADLESS-1:1"
+vidow.output{ name = "HEADLESS-1", scale = 1 }
 window_close_ms = 0
 CFG
 

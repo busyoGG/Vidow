@@ -30,7 +30,7 @@ cleanup() {
 		sleep 0.4
 		kill -KILL -- "-$VIDOW_PGID" 2>/dev/null
 	fi
-	rm -rf "$RUNDIR"
+	rm -rf "$RUNDIR" "$RUNDIR-scaletest.txt"
 }
 trap cleanup EXIT
 
@@ -49,7 +49,8 @@ chmod 700 "$RUNDIR/run"
 cat > "$CFGDIR/.config/vidow/config.lua" <<'EOF'
 -- HEADLESS-2 是 2 倍屏，HEADLESS-1 是 1 倍屏：模拟一块 4K 一块 1080p
 scale = "auto"
-outputs = "HEADLESS-1:1 HEADLESS-2:2"
+vidow.output{ name = "HEADLESS-1", scale = 1 }
+vidow.output{ name = "HEADLESS-2", scale = 2 }
 xwayland = true
 EOF
 

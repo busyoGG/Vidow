@@ -59,7 +59,7 @@ chmod 700 "$RUNDIR/run"
 cp shaders/zoom.frag "$CFGDIR/.config/vidow/shaders/zoom.frag"
 
 cat > "$CFG" <<'CFGEOF'
-outputs = "HEADLESS-1:1"
+vidow.output{ name = "HEADLESS-1", scale = 1 }
 scale = "1"
 gaps = 10
 window_opacity = 0.5

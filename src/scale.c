@@ -87,66 +87,39 @@ double vidow_scale_quantize(double scale, double min, double max) {
 	return stepped;
 }
 
-/* 一个 token 形如 NAME:SCALE。名字里不会有空格或逗号，缩放在最后一段。 */
-static bool lookup_token(const char *token, size_t len, const char *name,
-		struct vidow_scale_spec *out) {
-	if (len == 0) {
-		return false;
+/* X 屏幕的尺寸对不对得上「布局逻辑尺寸 × want」：对得上 = 这台 Xwayland 认
+ * _XWAYLAND_GLOBAL_OUTPUT_SCALE（补丁版），只有逻辑尺寸 = 它不认（那就得退回
+ * 1 倍，见 xwayland.c 的 vidow_xwayland_scale_recompute）。
+ *
+ * 差 1 像素以内算对得上：Xwayland 自己会取整，缩放不是整数时凑不出刚好相等。 */
+enum vidow_x11_fit vidow_scale_x11_fit(int screen_w, int screen_h,
+		int layout_w, int layout_h, double want) {
+	if (screen_w <= 0 || screen_h <= 0 || layout_w <= 0 || layout_h <= 0 ||
+			!(want >= 1.0)) {
+		return VIDOW_X11_FIT_UNKNOWN; /* 没屏幕 / 布局空 / 倍数没意义 */
 	}
-	const char *colon = NULL;
-	for (size_t i = 0; i < len; i++) {
-		if (token[i] == ':') {
-			colon = token + i;
-		}
+	int want_w = (int)lround((double)layout_w * want);
+	int want_h = (int)lround((double)layout_h * want);
+	if (abs(screen_w - want_w) <= 1 && abs(screen_h - want_h) <= 1) {
+		return VIDOW_X11_FIT_DEVICE_PX;
 	}
-	if (colon == NULL) {
-		return false;
+	if (want > 1.0 && abs(screen_w - layout_w) <= 1 &&
+			abs(screen_h - layout_h) <= 1) {
+		return VIDOW_X11_FIT_LOGICAL_PX;
 	}
-	size_t name_len = (size_t)(colon - token);
-	if (strlen(name) != name_len || strncmp(token, name, name_len) != 0) {
-		return false;
-	}
-	char value[48];
-	size_t value_len = len - name_len - 1;
-	if (value_len == 0 || value_len >= sizeof(value)) {
-		return false;
-	}
-	memcpy(value, colon + 1, value_len);
-	value[value_len] = '\0';
-	return vidow_scale_parse(value, out);
+	return VIDOW_X11_FIT_UNKNOWN;
 }
 
-bool vidow_scale_lookup(const char *outputs, const char *name,
-		struct vidow_scale_spec *out) {
-	if (outputs == NULL || name == NULL || out == NULL) {
-		return false;
-	}
-	const char *p = outputs;
-	while (*p != '\0') {
-		while (*p != '\0' && (isspace((unsigned char)*p) || *p == ',' ||
-				*p == ';')) {
-			p++;
-		}
-		const char *start = p;
-		while (*p != '\0' && !isspace((unsigned char)*p) && *p != ',' &&
-				*p != ';') {
-			p++;
-		}
-		if (p != start && lookup_token(start, (size_t)(p - start), name, out)) {
-			return true;
-		}
-	}
-	return false;
-}
-
-double vidow_scale_resolve(const char *name, const char *global,
-		const char *outputs, int w, int h, int mm_w, int mm_h) {
+/* 一个输出的最终缩放，优先级：这块屏自己的（override，见 outputconf.c）>
+ * 全局 scale > auto。override 为 NULL = 这块屏没被点名。 */
+double vidow_scale_resolve(const struct vidow_scale_spec *override,
+		const char *global, int w, int h, int mm_w, int mm_h) {
 	struct vidow_scale_spec spec = { .kind = VIDOW_SCALE_AUTO, .value = 0.0 };
 
-	if (name != NULL && !vidow_scale_lookup(outputs, name, &spec)) {
-		if (global == NULL || !vidow_scale_parse(global, &spec)) {
-			spec.kind = VIDOW_SCALE_AUTO;
-		}
+	if (override != NULL) {
+		spec = *override; /* 这块屏自己写了 scale（vidow.output{…}） */
+	} else if (global == NULL || !vidow_scale_parse(global, &spec)) {
+		spec.kind = VIDOW_SCALE_AUTO;
 	}
 
 	switch (spec.kind) {

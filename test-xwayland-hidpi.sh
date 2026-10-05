@@ -9,7 +9,8 @@
 #      xwayland_scale」的假设。不写它，X 屏幕只有逻辑尺寸：按屏幕尺寸算布局的
 #      客户端（GTK）会把整屏当成一半大小，最大化的窗口只占 1/4 面积，固定尺寸的
 #      登录窗也和面板对不上。（没打补丁的 Xwayland 里这个原子不存在，vidow 就
-#      不写它，行为跟以前一样。）
+#      不写它，然后**量一次 X 屏幕**：量到它确实没跟着缩放，就退回 1 倍 ——
+#      几何全对，代价是 2 倍屏上 X 客户端糊一点。vidow 不要求你装哪个 Xwayland。）
 #
 #   2) Xft.dpi = 96 × 缩放：GDK_SCALE / QT_SCALE_FACTOR 覆盖不到的客户端
 #      （Chromium/CEF = 微信登录窗、Electron、Java、Wine）只认它。不给，它们按
@@ -20,7 +21,9 @@
 #   2) X 屏幕 = 布局逻辑尺寸 × 2（1280x720）—— 补丁生效的证据
 #   3) 端到端点一下：X 客户端（xev）收到的 root 坐标 = 布局坐标 × 2
 #   4) 缩放改成 1：两个属性、X 屏幕都跟着变（640x360）
-#   5) 日志里没有 assert / abort
+#   5) 没打补丁的 Xwayland（钩子模拟）：量到 X 屏幕没跟着缩放 -> 自动退回 1 倍
+#      （X 屏幕 640x360、Xft.dpi 96、vidowmsg xwayland 报 1）
+#   6) 日志里没有 assert / abort
 #
 # 用法：./test-xwayland-hidpi.sh   （VIDOW_TEST_KEEP=1 保留运行目录）
 set -u
@@ -59,7 +62,7 @@ export DISPLAY= WAYLAND_DISPLAY=
 
 # 一块 2 倍屏：物理 1280x720，逻辑 640x360
 cat > "$CFGDIR/.config/vidow/config.lua" <<'CFG'
-outputs = "HEADLESS-1:2"
+vidow.output{ name = "HEADLESS-1", scale = 2 }
 scale = "auto"
 xwayland = true
 CFG
@@ -129,7 +132,32 @@ sleep 0.8
 xenv "改成 1 倍" > "$RUNDIR/xenv-1x.txt" 2>&1
 cat "$RUNDIR/xenv-1x.txt"
 
-mark "3) 断言"
+mark "3) 没打补丁的 Xwayland（钩子模拟）：量到屏幕没跟着缩放，自动退回 1 倍"
+# 本机装的正好是补丁版，验不了「不认这个属性」那条路；VIDOW_TEST_XWAYLAND_UNPATCHED
+# 让 vidow 当那个原子不存在（见 xwayland.c 的 x11_set_global_scale），别的都照旧。
+kill -TERM -- "-$VIDOW_PGID" 2>/dev/null; sleep 0.6
+VIDOW_TEST_XWAYLAND_UNPATCHED=1 setsid ./build/vidow \
+	> "$RUNDIR/vidow-unpatched.log" 2>&1 &
+VIDOW_PGID=$!
+for _ in $(seq 1 60); do grep -aq "vidow ready" "$RUNDIR/vidow-unpatched.log" && break; sleep 0.25; done
+export WAYLAND_DISPLAY=$(grep -ao "WAYLAND_DISPLAY=[a-z0-9-]*" "$RUNDIR/vidow-unpatched.log" | tail -1 | cut -d= -f2)
+export DISPLAY=$(grep -ao "DISPLAY=:[0-9]*" "$RUNDIR/vidow-unpatched.log" | tail -1 | cut -d= -f2)
+
+# Xwayland 是懒启动的：得先有个 X 客户端连进去，它才起来，vidow 才会写属性 / 量屏幕
+setsid nohup xev -name xevnopatch > "$RUNDIR/xev-unpatched.log" 2>&1 &
+XEV_PID=$!
+# vidow 要量几次才敢下结论（Xwayland 处理属性之前屏幕也是逻辑尺寸，见 xwayland.c
+# 的探测：0.12 / 0.25 / 0.5 / 1 秒），所以这里等够
+sleep 3.0
+xenv "没打补丁的 Xwayland" > "$RUNDIR/xenv-unpatched.txt" 2>&1
+cat "$RUNDIR/xenv-unpatched.txt"
+./build/vidowmsg xwayland > "$RUNDIR/xwayland-unpatched.json" 2>&1
+grep -a "全局缩放\|不认 _XWAYLAND" "$RUNDIR/vidow-unpatched.log" | sed 's/^/  /'
+kill "$XEV_PID" 2>/dev/null
+wait "$XEV_PID" 2>/dev/null
+XEV_PID=""
+
+mark "4) 断言"
 python3 - "$RUNDIR" "$CX" "$CY" "$LX" "$LY" "$LW" "$LH" <<'PY'
 import json, os, re, sys
 
@@ -149,6 +177,10 @@ def read(name):
 log = read("vidow.log")
 start = read("xenv-start.txt")
 one = read("xenv-1x.txt")
+unp = read("xenv-unpatched.txt")
+ulog = read("vidow-unpatched.log")
+uxw = json.loads(read("xwayland-unpatched.json"))
+uxw = uxw["result"] if isinstance(uxw, dict) and "result" in uxw else uxw
 
 # 1) vidow 自己写了两个属性
 check("_XWAYLAND_GLOBAL_OUTPUT_SCALE(CARDINAL) = 2" in start,
@@ -191,9 +223,26 @@ check(m1 is not None and (int(m1.group(1)), int(m1.group(2))) == (640, 360),
       % (m1.group(0) if m1 else "?"))
 check("xwayland: 全局缩放 2.00 -> 1.00" in log, "日志里有「全局缩放 2.00 -> 1.00」")
 
-# 5) 没有崩溃
-check("Assertion" not in log and "abort" not in log.lower(),
-      "日志里没有 assert / abort")
+# 5) 没打补丁的 Xwayland：量到 X 屏幕没跟着缩放 -> 自动退回 1 倍
+check("_XWAYLAND_GLOBAL_OUTPUT_SCALE" not in unp,
+      "没打补丁：root 上没有那个属性（原子不存在，vidow 没写）")
+check(re.search(r'RESOURCE_MANAGER\(STRING\) = ".*Xft\.dpi:\\t96', unp) is not None,
+      "没打补丁：Xft.dpi = 96（退回 1 倍）")
+mu = re.search(r"dimensions:\s+(\d+)x(\d+) pixels", unp)
+check(mu is not None and (int(mu.group(1)), int(mu.group(2))) == (640, 360),
+      "没打补丁：X 屏幕 %s = 布局 640x360 × 1（而不是硬按 2 倍）"
+      % (mu.group(0) if mu else "?"))
+check("这台 Xwayland 不认 _XWAYLAND_GLOBAL_OUTPUT_SCALE" in ulog,
+      "没打补丁：日志说了它不认这个属性")
+check("xwayland: 全局缩放 2.00 -> 1.00" in ulog,
+      "没打补丁：日志里全局缩放从 2.00 退回 1.00")
+check(abs(float(uxw["scale"]) - 1.0) < 1e-6,
+      "没打补丁：vidowmsg xwayland 报的缩放是 1（%s）" % uxw["scale"])
+
+# 6) 没有崩溃
+for name, text in (("补丁版", log), ("没打补丁", ulog)):
+    check("Assertion" not in text and "abort" not in text.lower(),
+          "%s：日志里没有 assert / abort" % name)
 
 print()
 if failed:

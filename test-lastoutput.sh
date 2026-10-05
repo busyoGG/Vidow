@@ -97,7 +97,7 @@ print(" ".join(bad) if bad else "ok")'
 
 # ---------------------------------------------------------------- 1) 两块屏
 mark "1/2 两块屏：拔掉其中一块，挪过来的窗口不能指着那块已经释放的屏"
-printf 'outputs = "HEADLESS-1:1 HEADLESS-2:1"\nwindow_close_ms = 0\n' \
+printf 'vidow.output{ name = "HEADLESS-1", scale = 1 }\nvidow.output{ name = "HEADLESS-2", scale = 1 }\nwindow_close_ms = 0\n' \
 	> "$CFGDIR/.config/vidow/config.lua"
 
 BIN=${VIDOW_BIN:-./build/vidow}
@@ -179,11 +179,10 @@ sleep 0.5
 # ------------------------------------------------- 2) 嵌套会话：最后一块屏没了
 mark "2/2 嵌套会话：外层窗口被关掉（最后一块屏没了）—— 不许留野指针"
 cat > "$RUNDIR/nest-home/.config/vidow/config.lua" <<'CFG'
-outputs = "-"
 window_close_ms = 0
 xwayland = true
 CFG
-printf 'outputs = "HEADLESS-1:1"\nwindow_close_ms = 0\n' \
+printf 'vidow.output{ name = "HEADLESS-1", scale = 1 }\nwindow_close_ms = 0\n' \
 	> "$CFGDIR/.config/vidow/config.lua"
 
 VIDOW_LOG=debug WLR_BACKENDS=headless WLR_HEADLESS_OUTPUTS=1 \

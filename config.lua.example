@@ -8,6 +8,10 @@
 --     gaps   = 10
 --     gaps   = { top = 30, inner = 20 }       -- 上边距 30、窗口之间 20、其余 6
 --     border = { width = 0, color = "#2a2e3aff" }
+--
+-- 显示器（输出）是一块屏一组，缩放和摆在哪写在一起（写几行就是几块屏）：
+--     vidow.output{ name = "DP-3", scale = 2, x = 0,    y = 0 }
+--     vidow.output{ name = "DP-2", scale = 2, x = 1920, y = 0 }
 -- 表里的项名写在下面每一节里；平铺键（gaps_inner = 20）和表写法是一回事。
 --
 -- 优先级：环境变量 VIDOW_<键名大写> > 这个文件 > 内置默认值。
@@ -148,12 +152,8 @@ ipc_socket = ""
 --     不写表也行：ipc = true（一个值管全部）
 
 -- ================== 缩放与输出
--- 缩放：auto = 按 EDID 的 ppi 推，也可以写死 "1" / "1.5"
+-- 所有输出的默认缩放：auto = 按 EDID 的 ppi 推，也可以写死 "1" / "1.5"；单块屏点名用 vidow.output{ name = …, scale = … }
 scale = "auto"
--- 按输出名覆盖缩放（如 "DP-1:1.5,HDMI-A-1:1"），留空 = 用 scale
-outputs = ""
--- 哪块屏摆在哪（如 "DP-3:0,0; DP-2:1920,0"，逻辑坐标），留空 = 自动排
-output_positions = ""
 
 -- ================== XWayland
 -- 开 XWayland（有人连 X 才启动服务）

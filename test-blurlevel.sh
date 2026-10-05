@@ -54,7 +54,7 @@ BIN=${VIDOW_BIN:-./build/vidow}
 run_once() {
 	local levels="$1"
 	cat > "$CFGDIR/.config/vidow/config.lua" <<CFG
-outputs = "HEADLESS-1:1"
+vidow.output{ name = "HEADLESS-1", scale = 1 }
 blur_enabled = true
 blur_levels = $levels
 blur_offset = 1.5

@@ -66,7 +66,7 @@ export DISPLAY= WAYLAND_DISPLAY=
 # 关闭曲线 / 缩放 / 位移 / 透明度全是**默认值**，只有时长拉长了好量（快门有几十
 # 毫秒延迟，140ms 的动画量不准）。拉长不改判据：回归点是「曲线和透明度怎么配」。
 cat > "$CFGDIR/.config/vidow/config.lua" <<'CFG'
-outputs = "HEADLESS-1:1"
+vidow.output{ name = "HEADLESS-1", scale = 1 }
 decor_enabled = true
 blur_enabled = true
 window_close_ms = 2000

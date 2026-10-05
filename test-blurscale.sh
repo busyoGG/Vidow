@@ -73,7 +73,7 @@ run_once() {
 	local pw=$(python3 -c "print(round($PANEL_W/$scale))")
 	local ph=$(python3 -c "print(round($PANEL_H/$scale))")
 	cat > "$CFGDIR/.config/vidow/config.lua" <<EOF
-outputs = "HEADLESS-1:$scale"
+vidow.output{ name = "HEADLESS-1", scale = $scale }
 blur_enabled = true
 blur_levels = 4
 blur_offset = 1.5

@@ -425,6 +425,80 @@ static int l_rules(lua_State *L) {
 	return 1;
 }
 
+/* vidow.output{ name = "DP-3", scale = 2, x = 0, y = 0 }
+ *
+ * 一块屏一组：缩放（scale，同全局 scale 的写法：auto / off / 一个数）和摆在
+ * 布局的哪个位置（x / y，逻辑坐标）写在一起。没写的字段 = 不管这块屏的这一项
+ * （scale 不写就用全局 scale，位置不写就按输出到达顺序自动排）。
+ *
+ * 见 outputconf.c：为什么不是两个平铺键。 */
+static int l_output(lua_State *L) {
+	struct vidow_script *s = script_of(L);
+	if (!lua_istable(L, 1)) {
+		return luaL_error(L, "vidow.output 要一个表，比如 "
+			"vidow.output{ name = \"DP-3\", scale = 2, x = 0, y = 0 }");
+	}
+	struct vidow_output_spec spec = { 0 };
+	spec.name = table_string(L, 1, "name");
+
+	char scale_text[32];
+	lua_getfield(L, 1, "scale");
+	if (!lua_isnil(L, -1)) {
+		struct vidow_scale_spec parsed;
+		if (!value_as_text(L, -1, scale_text, sizeof(scale_text)) ||
+				!vidow_scale_parse(scale_text, &parsed)) {
+			lua_pop(L, 1);
+			return luaL_error(L, "vidow.output{ name = \"%s\" }: scale 认不出来"
+				"（写 auto / off / 一个正数，比如 2）",
+				spec.name != NULL ? spec.name : "?");
+		}
+		spec.has_scale = true;
+		spec.scale = scale_text;
+	}
+	lua_pop(L, 1);
+
+	/* 位置：x / y 写哪个算哪个（只写 x = 0 就是摆在最左边那一行的 0 位）。 */
+	const struct { const char *key; int *slot; } coords[] = {
+		{ "x", &spec.x }, { "y", &spec.y },
+	};
+	for (size_t i = 0; i < sizeof(coords) / sizeof(coords[0]); i++) {
+		lua_getfield(L, 1, coords[i].key);
+		if (!lua_isnil(L, -1)) {
+			if (!lua_isnumber(L, -1)) {
+				lua_pop(L, 1);
+				return luaL_error(L, "vidow.output{ name = \"%s\" }: %s 得是"
+					"个数（逻辑坐标，整数）",
+					spec.name != NULL ? spec.name : "?", coords[i].key);
+			}
+			*coords[i].slot = (int)lua_tointeger(L, -1);
+			spec.has_pos = true;
+		}
+		lua_pop(L, 1);
+	}
+
+	/* 项名写错（scalee / pos）不该悄悄不生效：列一遍能写什么。 */
+	lua_pushnil(L);
+	while (lua_next(L, 1) != 0) {
+		const char *field = lua_type(L, -2) == LUA_TSTRING ?
+			lua_tostring(L, -2) : NULL;
+		if (field == NULL || (strcmp(field, "name") != 0 &&
+				strcmp(field, "scale") != 0 && strcmp(field, "x") != 0 &&
+				strcmp(field, "y") != 0)) {
+			lua_pop(L, 2);
+			return luaL_error(L, "vidow.output{…}: 没有 '%s' 这一项"
+				"（能写：name / scale / x / y）", field != NULL ? field : "?");
+		}
+		lua_pop(L, 1);
+	}
+
+	char err[160];
+	if (vidow_output_conf_add(s->server, &spec, err, sizeof(err)) == NULL) {
+		return luaL_error(L, "%s", err);
+	}
+	lua_pushboolean(L, 1);
+	return 1;
+}
+
 static int l_workspace_create(lua_State *L) {
 	struct vidow_script *s = script_of(L);
 	const char *name = luaL_optstring(L, 1, NULL);
@@ -564,6 +638,7 @@ static void register_api(struct vidow_script *s) {
 		{ "ipc_path", l_ipc_path },
 		{ "rule", l_rule },
 		{ "rules", l_rules },
+		{ "output", l_output },
 	};
 	for (size_t i = 0; i < sizeof(fns) / sizeof(fns[0]); i++) {
 		lua_pushlightuserdata(L, s);
@@ -599,8 +674,9 @@ static void register_api(struct vidow_script *s) {
 void vidow_config_sync(struct vidow_server *server) {
 	vidow_ipc_apply_config(server);
 	vidow_xwayland_apply_config(server);
-	/* 配置可能改了 scale / outputs / xwayland_scale：改到的输出立刻换缩放，
-	 * XWayland 的全局缩放也跟着重算。布局位置（output_positions）同理。 */
+	/* 配置可能改了 scale / xwayland_scale，或者给某块屏写了新的一组
+	 * vidow.output{…}：改到的输出立刻换缩放，XWayland 的全局缩放也跟着重算。
+	 * 布局位置同理。 */
 	vidow_output_apply_scale_all(server);
 	vidow_output_apply_positions_all(server);
 	vidow_xwayland_scale_apply(server);
@@ -886,9 +962,11 @@ void vidow_script_finish(struct vidow_server *server) {
 bool vidow_script_load(struct vidow_server *server) {
 	vidow_script_finish(server);
 	test_actions_clear(server);
-	/* 重载 = 重新声明一遍键位和窗口规则：清掉旧的，免得 SIGHUP 之后越攒越多。 */
+	/* 重载 = 重新声明一遍键位、窗口规则和每块屏的配置：清掉旧的，免得 SIGHUP
+	 * 之后越攒越多（删掉的 vidow.output 行要真的消失）。 */
 	vidow_keybind_clear(server);
 	vidow_rule_clear(server);
+	vidow_output_conf_clear(server);
 	/* 重载 = 重新读一遍配置：先回到默认值（再压上环境变量）。配置文件里删掉的
 	 * 行才会真的消失 —— 不然改完配置重载，被删的键还留着旧值。 */
 	vidow_config_reset(&server->config);

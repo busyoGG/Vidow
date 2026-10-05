@@ -192,15 +192,19 @@ static double output_pick_scale(struct vidow_server *server,
 	int h = mode != NULL ? mode->height : wlr_output->height;
 	struct vidow_config *cfg = &server->config;
 
+	/* 这块屏自己那一组（vidow.output{ name = … }）里写了 scale 就按它来，
+	 * 没写才用全局的 scale。 */
+	const struct vidow_output_conf *conf =
+		vidow_output_conf_for(server, wlr_output->name);
 	struct vidow_scale_spec spec;
-	if (vidow_scale_lookup(cfg->outputs, wlr_output->name, &spec)) {
-		/* 输入名点了这个输出，按它说的来 */
-	} else if (!vidow_scale_parse(cfg->scale, &spec)) {
+	bool named = conf != NULL && conf->has_scale &&
+		vidow_scale_parse(conf->scale, &spec);
+	if (!named && !vidow_scale_parse(cfg->scale, &spec)) {
 		spec.kind = VIDOW_SCALE_AUTO;
 	}
 
-	double scale = vidow_scale_resolve(wlr_output->name, cfg->scale,
-		cfg->outputs, w, h, wlr_output->phys_width, wlr_output->phys_height);
+	double scale = vidow_scale_resolve(named ? &spec : NULL, cfg->scale, w, h,
+		wlr_output->phys_width, wlr_output->phys_height);
 
 	double ppi = 0.0;
 	if (wlr_output->phys_width > 0 && wlr_output->phys_height > 0) {
@@ -212,7 +216,12 @@ static double output_pick_scale(struct vidow_server *server,
 	}
 
 	if (spec.kind == VIDOW_SCALE_FIXED) {
-		snprintf(why, why_len, "outputs= 里点名");
+		if (named) {
+			snprintf(why, why_len, "vidow.output{ %s } scale=%s",
+				conf->name, conf->scale);
+		} else {
+			snprintf(why, why_len, "scale=%s", cfg->scale);
+		}
 	} else if (spec.kind == VIDOW_SCALE_OFF) {
 		snprintf(why, why_len, "xwayland_scale=off（1:1）");
 	} else if (ppi > 0.0) {
@@ -456,71 +465,21 @@ bool vidow_output_set_position(struct vidow_server *server,
 	return true;
 }
 
-/* 配置里给这块屏指定的布局位置，写法 "DP-3:0,0; DP-2:1920,0"（逻辑坐标）。
- * 分隔符是分号 / 空格 / 换行，也容忍逗号 —— 隔壁的 outputs 键就是逗号分隔的，
- * 手滑写成 "DP-3:0,0,DP-2:1920,0" 也得认。没写 / 没点名就返回 false。 */
+/* 配置里给这块屏指定的布局位置（vidow.output{ name = …, x = 0, y = 0 }，逻辑
+ * 坐标）。没写 / 没点名就返回 false = 不摆，按后端给的顺序自动排。 */
 static bool config_position_for(struct vidow_server *server, const char *name,
 		int *x, int *y) {
-	const char *p = server->config.output_positions;
-	if (p == NULL || p[0] == '\0' || name == NULL) {
+	const struct vidow_output_conf *conf =
+		vidow_output_conf_for(server, name);
+	if (conf == NULL || !conf->has_pos) {
 		return false;
 	}
-	size_t name_len = strlen(name);
-	while (*p != '\0') {
-		while (*p == ';' || *p == ',' || *p == ' ' || *p == '\t' ||
-				*p == '\n') {
-			p++;
-		}
-		if (*p == '\0') {
-			break;
-		}
-		/* 名字到冒号（或这一项的末尾）为止。 */
-		const char *name_end = p;
-		while (*name_end != '\0' && *name_end != ':' && *name_end != ';' &&
-				*name_end != ',' && *name_end != ' ' && *name_end != '\t' &&
-				*name_end != '\n') {
-			name_end++;
-		}
-		if (*name_end != ':') {
-			/* 这一项没有冒号，不是 NAME:X,Y：跳过。 */
-			p = *name_end != '\0' ? name_end + 1 : name_end;
-			continue;
-		}
-		const char *name_start = p; /* 值解析会把 p 往前推，名字要留一份 */
-		size_t token_len = (size_t)(name_end - name_start);
-		char *end = NULL;
-		long px = strtol(name_end + 1, &end, 10);
-		long py = 0;
-		bool value_ok = false;
-		if (end != name_end + 1 && *end == ',') {
-			char *end2 = NULL;
-			py = strtol(end + 1, &end2, 10);
-			if (end2 != end + 1) {
-				value_ok = true;
-				p = end2; /* 值之后继续（逗号分隔的写法靠这个往下走） */
-			}
-		}
-		if (!value_ok) {
-			wlr_log(WLR_ERROR, "output_positions: 有一项的坐标看不懂"
-				"（要 NAME:X,Y），跳过它");
-			p = name_end + 1;
-			while (*p != '\0' && *p != ';' && *p != ',' && *p != ' ' &&
-					*p != '\t' && *p != '\n') {
-				p++;
-			}
-			continue;
-		}
-		if (token_len == name_len &&
-				strncmp(name_start, name, name_len) == 0) {
-			*x = (int)px;
-			*y = (int)py;
-			return true;
-		}
-	}
-	return false;
+	*x = conf->x;
+	*y = conf->y;
+	return true;
 }
 
-/* 配置里 output_positions 改过（SIGHUP / 配置刚跑完）：按新配置把每块屏再摆一次。
+/* 配置里那块屏的位置改过（SIGHUP / 配置刚跑完）：按新配置把每块屏再摆一次。
  * 位置没变的什么都不做（vidow_output_set_position 会把布局、背景、光标重做一遍，
  * 白做一次没必要）。 */
 void vidow_output_apply_positions_all(struct vidow_server *server) {
@@ -533,8 +492,9 @@ void vidow_output_apply_positions_all(struct vidow_server *server) {
 		if (output->box.x == x && output->box.y == y) {
 			continue;
 		}
-		wlr_log(WLR_INFO, "output %s: 按 output_positions 摆到 %d,%d（现在 %d,%d）",
-			output->wlr_output->name, x, y, output->box.x, output->box.y);
+		wlr_log(WLR_INFO, "output %s: 按配置（vidow.output）摆到 %d,%d"
+			"（现在 %d,%d）", output->wlr_output->name, x, y, output->box.x,
+			output->box.y);
 		vidow_output_set_position(server, output->wlr_output, x, y);
 	}
 }
@@ -687,7 +647,7 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 	output->scene_output = wlr_scene_output_create(server->scene, wlr_output);
 	/* 配置里点了名的屏摆在它说的位置；没点名就按到达顺序自动排。
 	 * 「哪块在左边」不能靠自动排 —— 那个顺序是后端给的（headless 上实测是
-	 * 反的），所以确定布局必须写在 output_positions 里。 */
+	 * 反的），所以确定布局必须写在配置里（vidow.output{ name = …, x = … }）。 */
 	int pos_x = 0, pos_y = 0;
 	bool placed = config_position_for(server, wlr_output->name, &pos_x, &pos_y);
 	if (placed) {
@@ -742,7 +702,7 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 		(int)lround(wlr_output->width / wlr_output->scale),
 		(int)lround(wlr_output->height / wlr_output->scale),
 		output->box.x, output->box.y,
-		placed ? "output_positions 指定" : "自动排");
+		placed ? "配置指定（vidow.output）" : "自动排");
 
 	/* 热插拔：这块屏以前见过的话，把归属它的列 / 窗口 / layer surface 认领回来
 	 * （列宽、滚动位置、焦点都留着）。它自己会 arrange。 */

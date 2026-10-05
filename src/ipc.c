@@ -1126,7 +1126,7 @@ static bool cmd_output_scale(struct vidow_server *server, struct jval *req,
 	const char *text = jtext(req, "scale", scale_buf, sizeof(scale_buf));
 	if (text != NULL) {
 		if (strcasecmp(text, "auto") == 0) {
-			/* "auto" = 按配置（scale / outputs）重算一遍。 */
+			/* "auto" = 按配置（scale + 每块屏那组）重算一遍。 */
 			vidow_output_apply_scale(server, output);
 			jb_obj(out);
 			jb_key(out, "output");
@@ -1306,7 +1306,7 @@ static bool cmd_set_config(struct vidow_server *server, struct jval *req,
 		key, value);
 	/* 改了外观类的东西：把缓存的背景 / 布局都刷新一遍。缩放类还要重算输出。 */
 	vidow_backdrop_damage(server, true);
-	if (strcmp(key, "scale") == 0 || strcmp(key, "outputs") == 0 ||
+	if (strcmp(key, "scale") == 0 ||
 			strcmp(key, "xwayland_scale") == 0) {
 		vidow_output_apply_scale_all(server);
 		vidow_xwayland_scale_apply(server);

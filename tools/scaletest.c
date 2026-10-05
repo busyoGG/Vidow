@@ -23,7 +23,7 @@ static bool near(double a, double b, double eps) {
 }
 
 struct panel {
-	const char *name;  /* 输出名，就是 outputs= 里写的那个 */
+	const char *name;  /* 输出名，就是 vidow.output{ name = … } 里写的那个 */
 	const char *label; /* 人看的 */
 	int w, h, mm_w, mm_h;
 };
@@ -36,11 +36,10 @@ static const struct panel panels[] = {
 };
 
 static void report_physical_size(const struct panel *a, const struct panel *b,
-		const char *global, const char *outputs) {
-	double sa = vidow_scale_resolve(a->name, global, outputs,
-		a->w, a->h, a->mm_w, a->mm_h);
-	double sb = vidow_scale_resolve(b->name, global, outputs,
-		b->w, b->h, b->mm_w, b->mm_h);
+		const char *global, const struct vidow_scale_spec *named_a,
+		const struct vidow_scale_spec *named_b) {
+	double sa = vidow_scale_resolve(named_a, global, a->w, a->h, a->mm_w, a->mm_h);
+	double sb = vidow_scale_resolve(named_b, global, b->w, b->h, b->mm_w, b->mm_h);
 
 	double diag_a = sqrt((double)a->mm_w * a->mm_w + (double)a->mm_h * a->mm_h);
 	double diag_b = sqrt((double)b->mm_w * b->mm_w + (double)b->mm_h * b->mm_h);
@@ -74,16 +73,15 @@ int main(void) {
 	check(!vidow_scale_parse("abc", &spec), "\"abc\" 拒绝");
 	check(!vidow_scale_parse("0", &spec), "\"0\" 拒绝");
 
-	printf("== 每输出覆盖 ==\n");
-	const char *outputs = "DP-1:2 HDMI-A-1:1.25 , eDP-1:auto";
-	check(vidow_scale_lookup(outputs, "DP-1", &spec) &&
-		near(spec.value, 2.0, 1e-9), "DP-1 -> 2");
-	check(vidow_scale_lookup(outputs, "HDMI-A-1", &spec) &&
-		near(spec.value, 1.25, 1e-9), "HDMI-A-1 -> 1.25");
-	check(vidow_scale_lookup(outputs, "eDP-1", &spec) &&
-		spec.kind == VIDOW_SCALE_AUTO, "eDP-1 -> auto");
-	check(!vidow_scale_lookup(outputs, "DP-2", &spec), "DP-2 没被点名");
-	check(!vidow_scale_lookup(outputs, "DP", &spec), "名字要精确匹配，前缀不算");
+	printf("== 每块屏点名（vidow.output{ name = …, scale = … }）==\n");
+	/* 每块屏那一组里的 scale 就是这段文本，解析规则和全局 scale 一模一样。 */
+	check(vidow_scale_parse("2", &spec) && near(spec.value, 2.0, 1e-9),
+		"scale = 2 -> 2");
+	check(vidow_scale_parse("1.25", &spec) && near(spec.value, 1.25, 1e-9),
+		"scale = \"1.25\" -> 1.25");
+	check(vidow_scale_parse("auto", &spec) && spec.kind == VIDOW_SCALE_AUTO,
+		"scale = \"auto\" -> auto");
+	check(!vidow_scale_parse("2x", &spec), "scale = \"2x\" 拒绝（vidow.output 报错）");
 
 	printf("== DPI 推算 ==\n");
 	double s4k = vidow_scale_from_dpi(3840, 2160, 597, 336);
@@ -105,23 +103,44 @@ int main(void) {
 	check(near(vidow_scale_quantize(20.0, 1.0, 8.0), 8.0, 1e-9), "上限 8.0");
 
 	printf("== 端到端：同一个逻辑尺寸在两块屏上的物理尺寸 ==\n");
+	struct vidow_scale_spec named2 = { .kind = VIDOW_SCALE_FIXED, .value = 2.0 };
+	struct vidow_scale_spec named1 = { .kind = VIDOW_SCALE_FIXED, .value = 1.0 };
 	printf("  全局 scale=auto：\n");
-	report_physical_size(&panels[0], &panels[1], "auto", "");
-	report_physical_size(&panels[2], &panels[1], "auto", "");
-	printf("  手写覆盖 4K:2 1080p:1：\n");
-	report_physical_size(&panels[0], &panels[1], "auto", "DP-1:2 HDMI-A-1:1");
+	report_physical_size(&panels[0], &panels[1], "auto", NULL, NULL);
+	report_physical_size(&panels[2], &panels[1], "auto", NULL, NULL);
+	printf("  两块屏各自点名 4K:2 1080p:1：\n");
+	report_physical_size(&panels[0], &panels[1], "auto", &named2, &named1);
 
 	printf("== 优先级 ==\n");
-	check(near(vidow_scale_resolve("DP-1", "1.5", "DP-1:2", 3840, 2160, 597, 336),
-		2.0, 1e-9), "每输出覆盖压过全局 scale");
-	check(near(vidow_scale_resolve("DP-9", "1.5", "DP-1:2", 3840, 2160, 597, 336),
-		1.5, 1e-9), "没点名的输出用全局 scale");
-	check(near(vidow_scale_resolve("DP-9", "", "", 3840, 2160, 597, 336),
+	check(near(vidow_scale_resolve(&named2, "1.5", 3840, 2160, 597, 336),
+		2.0, 1e-9), "这块屏自己点名的压过全局 scale");
+	check(near(vidow_scale_resolve(NULL, "1.5", 3840, 2160, 597, 336),
+		1.5, 1e-9), "没点名用全局 scale");
+	check(near(vidow_scale_resolve(NULL, "", 3840, 2160, 597, 336),
 		1.70, 1e-9), "两个都没写 -> auto");
-	check(near(vidow_scale_resolve("DP-9", "", "", 3840, 2160, 0, 0),
+	check(near(vidow_scale_resolve(NULL, "", 3840, 2160, 0, 0),
 		1.0, 1e-9), "auto 但没 EDID -> 1.0");
-	check(near(vidow_scale_resolve("DP-9", "off", "", 3840, 2160, 597, 336),
+	check(near(vidow_scale_resolve(NULL, "off", 3840, 2160, 597, 336),
 		1.0, 1e-9), "\"off\" -> 1.0");
+
+	printf("== X 屏幕对账（这台 Xwayland 认不认那个属性）==\n");
+	/* 一块 2 倍屏 1280x720：布局逻辑 640x360，认属性的话 X 屏幕该是 1280x720 */
+	check(vidow_scale_x11_fit(1280, 720, 640, 360, 2.0) ==
+		VIDOW_X11_FIT_DEVICE_PX, "1280x720 = 640x360 × 2 -> 认");
+	check(vidow_scale_x11_fit(640, 360, 640, 360, 2.0) ==
+		VIDOW_X11_FIT_LOGICAL_PX, "640x360 只有逻辑尺寸 -> 不认（要退回 1 倍）");
+	check(vidow_scale_x11_fit(639, 359, 640, 360, 2.0) ==
+		VIDOW_X11_FIT_LOGICAL_PX, "差 1 像素也算逻辑尺寸（Xwayland 会取整）");
+	check(vidow_scale_x11_fit(1281, 721, 640, 360, 2.0) ==
+		VIDOW_X11_FIT_DEVICE_PX, "差 1 像素也算设备像素");
+	check(vidow_scale_x11_fit(1920, 1080, 640, 360, 2.0) ==
+		VIDOW_X11_FIT_UNKNOWN, "对不上账（两块屏还没摆好）-> 不下结论");
+	check(vidow_scale_x11_fit(0, 0, 640, 360, 2.0) ==
+		VIDOW_X11_FIT_UNKNOWN, "X 屏幕 0x0（一块屏都没有）-> 不下结论");
+	check(vidow_scale_x11_fit(1280, 720, 0, 0, 2.0) ==
+		VIDOW_X11_FIT_UNKNOWN, "布局还是空的 -> 不下结论");
+	check(vidow_scale_x11_fit(640, 360, 640, 360, 1.0) ==
+		VIDOW_X11_FIT_DEVICE_PX, "想要 1 倍时逻辑尺寸就是对的（没什么可量的）");
 
 	printf("\n%s（%d 项失败）\n", failures == 0 ? "全部通过" : "有失败", failures);
 	return failures == 0 ? 0 : 1;

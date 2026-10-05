@@ -66,6 +66,7 @@ xa_server_code = custom_target('xdg-activation-v1-server-protocol.c',
 sources = files(
   'src/main.c',
   'src/output.c',
+  'src/outputconf.c',
   'src/view.c',
   'src/input.c',
   'src/layer.c',

@@ -67,7 +67,8 @@ mkdir -p "$CFGDIR/.config/vidow" "$RUNDIR/run"
 chmod 700 "$RUNDIR/run"
 cat > "$CFGDIR/.config/vidow/config.lua" <<'EOF'
 scale = "1"
-outputs = "HEADLESS-1:1 HEADLESS-2:1"
+vidow.output{ name = "HEADLESS-1", scale = 1 }
+vidow.output{ name = "HEADLESS-2", scale = 1 }
 xwayland = false
 window_open_ms = 150
 window_close_ms = 150

@@ -27,12 +27,22 @@ double vidow_scale_from_dpi(int w, int h, int mm_w, int mm_h);
  * 直接拿去当缩放会让每一帧的取整都不一样。 */
 double vidow_scale_quantize(double scale, double min, double max);
 
-/* 在 "NAME:SCALE NAME:SCALE" 里查 NAME。返回 false = 这个输出没被点名。 */
-bool vidow_scale_lookup(const char *outputs, const char *name,
-		struct vidow_scale_spec *out);
+/* X 屏幕量出来的尺寸说明了什么（见 xwayland.c 的探测）：补丁版 Xwayland 收到
+ * _XWAYLAND_GLOBAL_OUTPUT_SCALE 才把 X 屏幕按设备像素报。 */
+enum vidow_x11_fit {
+	VIDOW_X11_FIT_UNKNOWN = 0, /* 对不上账：还没量到，或者布局刚变它还没跟上 */
+	VIDOW_X11_FIT_DEVICE_PX,   /* X 屏幕 = 逻辑 × want：属性生效了 */
+	VIDOW_X11_FIT_LOGICAL_PX,  /* X 屏幕只有逻辑尺寸：它不认那个属性 */
+};
 
-/* 一个输出的最终缩放，优先级：每输出覆盖 > 全局 scale > auto。 */
-double vidow_scale_resolve(const char *name, const char *global,
-		const char *outputs, int w, int h, int mm_w, int mm_h);
+/* screen_w/h = X 屏幕的尺寸（像素），layout_w/h = 布局的逻辑尺寸，want = 想让它
+ * 是逻辑的几倍。 */
+enum vidow_x11_fit vidow_scale_x11_fit(int screen_w, int screen_h,
+		int layout_w, int layout_h, double want);
+
+/* 一个输出的最终缩放，优先级：这块屏自己的（override，见 outputconf.c）>
+ * 全局 scale > auto。override 为 NULL = 这块屏没被点名。 */
+double vidow_scale_resolve(const struct vidow_scale_spec *override,
+		const char *global, int w, int h, int mm_w, int mm_h);
 
 #endif /* VIDOW_SCALE_H */

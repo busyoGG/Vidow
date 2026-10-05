@@ -46,7 +46,8 @@ mkdir -p "$CFGDIR/.config/vidow" "$RUNDIR/run"
 chmod 700 "$RUNDIR/run"
 cat > "$CFGDIR/.config/vidow/config.lua" <<'CFG'
 -- 两块 1280 宽的屏，列宽 0.5：三列（634+6+634+6+634）装不下，必然有列越界
-outputs = "HEADLESS-1:1 HEADLESS-2:1"
+vidow.output{ name = "HEADLESS-1", scale = 1 }
+vidow.output{ name = "HEADLESS-2", scale = 1 }
 gaps = 6
 scale = "1"
 -- 补帧是「规则要求保活」才做的事（默认不补：滚出视口的窗口本来就该歇着）。

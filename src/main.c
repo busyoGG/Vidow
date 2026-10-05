@@ -260,6 +260,9 @@ int main(int argc, char *argv[]) {
 	vidow_workspace_init(&server);
 	vidow_keybind_init(&server);
 	vidow_rule_init(&server);
+	vidow_output_conf_init(&server);
+	/* 没量过 X 屏幕之前先当它认这个属性（不夹缩放）：量到了再说，见 xwayland.c */
+	server.xwayland_scale_ok = true;
 	vidow_script_init(&server);
 
 	server.allocator = wlr_allocator_autocreate(server.backend, server.renderer);
