@@ -1,16 +1,18 @@
 #!/bin/bash
-# 透明度剔除**只在最后一趟做一次**，不能撒在每一趟的抽样里。
+# blur_alpha_min = 「低于这个不透明度的底衬不糊」，硬阈值，只在最后一趟做一次。
 #
-# 靶子：tools/soft.py 一整屏均匀 alpha=0.45 的背景层（底衬里没别的东西，
-# 所以 dump 出来的 alpha 就等于 0.45）。把 blur_alpha_min 设成 0.5（阈值在
-# 0.45 上面），剔除就该只是「稍微压一点」，而不是把整块糊没 —— 撒在每一趟里
-# 的话 alpha 会逐趟相乘，0.45 一路掉到 0.02 左右，颜色也一起没了（「越糊越透
-# 明」的真身）。
+# 靶子：tools/soft.py 一整屏均匀半透明的背景层。底衬里没别的东西，所以模糊金字塔
+# （up[0]）dump 出来的 alpha 就等于那个客户端的 alpha —— 阈值管不管用一眼看得出。
 #
 # 判据：
-#   1) 阈值关着（0）时，模糊金字塔的 alpha ≈ 0.45
-#   2) 阈值 0.5 时仍然是同一量级（> 0.35）—— 老代码这儿是 ~0.02
-#   3) 两次差得不多（剔除没有把整块抹掉）
+#   1) 阈值关着（0）：0.45 的底衬原样糊（alpha ≈ 0.45）
+#   2) 阈值 0.5 > 0.45：底衬低于阈值 ⇒ **完全不糊**（alpha ≈ 0）
+#      —— 软过渡那版（smoothstep(min*0.5, min)）在这儿还剩 90%（实测 0.4039），
+#      看着就是「这个键没用」；撒在每一趟抽样里那版则是 0.02 上下（「越糊越透明」）
+#   3) 阈值 0.5 < 0.9：高于阈值的底衬**一点都不许衰减**（alpha ≈ 0.9）
+#      —— 挡的是「顺手乘个系数」那种实现（那会把 0.9 也压下去）
+#
+# 用法：./test-blurcull.sh    （VIDOW_TEST_KEEP=1 保留运行目录）
 set -u
 cd "$(dirname "$0")"
 
@@ -35,6 +37,7 @@ trap cleanup EXIT
 
 python3 -c "import gi; gi.require_version('GtkLayerShell','0.1')" 2>/dev/null ||
 	{ echo "test-blurcull.sh: 需要 python3-gobject + gtk-layer-shell"; exit 1; }
+command -v grim >/dev/null || { echo "test-blurcull.sh: 需要 grim"; exit 1; }
 
 mkdir -p "$CFGDIR/.config/vidow" "$RUNDIR/run"
 chmod 700 "$RUNDIR/run"
@@ -57,8 +60,17 @@ window_opacity = 0.5
 CFG
 }
 
-# 拿最新一份模糊金字塔 dump，存到 $2
-grab() {
+# 逼一帧出来（截图那套有看门狗，会把渲染推起来），然后等这份新的金字塔 dump
+trigger() {
+	for _ in $(seq 1 8); do
+		timeout 15 grim -o HEADLESS-1 "$RUNDIR/trigger.png" > /dev/null 2>&1
+		ls /tmp/vidow-blur-*.raw > /dev/null 2>&1 && return 0
+		sleep 0.4
+	done
+	return 1
+}
+
+grab() { # $1 = tag
 	local last=$(ls /tmp/vidow-blur-*.raw 2>/dev/null |
 		sed 's/.*-\([0-9]*\)\.raw/\1/' | sort -n | tail -1)
 	if [ -z "${last:-}" ]; then
@@ -77,21 +89,34 @@ for _ in $(seq 1 60); do grep -aq "vidow ready" "$LOG" && break; sleep 0.25; don
 grep -aq "vidow ready" "$LOG" || { echo "test-blurcull.sh: vidow 没起来"; tail -5 "$LOG"; exit 1; }
 export WAYLAND_DISPLAY=$(grep -ao "WAYLAND_DISPLAY=[a-z0-9-]*" "$LOG" | tail -1 | cut -d= -f2)
 
-setsid nohup python3 ./tools/soft.py 0.45 > "$RUNDIR/soft.log" 2>&1 </dev/null &
-CLIENT_PIDS="$CLIENT_PIDS $!"
-for _ in $(seq 1 40); do grep -aq "layer map soft" "$LOG" && break; sleep 0.25; done
+start_soft() { # $1 = alpha
+	setsid nohup python3 ./tools/soft.py "$1" > "$RUNDIR/soft-$1.log" 2>&1 </dev/null &
+	CLIENT_PIDS="$CLIENT_PIDS $!"
+	for _ in $(seq 1 40); do grep -aq "layer map soft" "$LOG" && break; sleep 0.25; done
+}
+
+# 1) 阈值关着：0.45 的底衬原样
+start_soft 0.45
 grep -aq "layer map soft" "$LOG" || fail "半透明背景层没上屏"
 sleep 1.2
 grab off
 
-# 换阈值：SIGHUP 重载配置，金字塔会按新参数重建
+# 2) 阈值 0.5：底衬 0.45 低于阈值 ⇒ 不糊
+# 先把旧 dump 清掉再改配置：改完那次重建就是我们要量的那一版
+rm -f /tmp/vidow-blur-*.raw /tmp/vidow-blur-*.txt
 write_cfg 0.5
 kill -HUP "$VIDOW_PID"
+sleep 0.5
+trigger && grab ign || fail "阈值 0.5 时没等到新的金字塔 dump"
+sleep 0.5
+
+# 3) 底衬换成 0.9（阈值还是 0.5）⇒ 高于阈值，一点都不许衰减
+pkill -f "tools/soft.py" 2>/dev/null
 sleep 0.6
-# 触发一次重绘（重建发生在 blur_update 里），再等它落定
-pkill -HUP -f "tools/soft.py" 2>/dev/null
-sleep 1.4
-grab on
+rm -f /tmp/vidow-blur-*.raw /tmp/vidow-blur-*.txt
+start_soft 0.9
+sleep 0.6
+trigger && grab keep || fail "底衬 0.9 时没等到新的金字塔 dump"
 
 python3 - "$RUNDIR" <<'PY'
 import sys
@@ -106,29 +131,40 @@ def say(good, msg):
 	ok = ok and good
 
 def load(tag):
-	with open('%s/blur-%s.txt' % (rundir, tag)) as f:
-		w, h, fmt = f.read().split()
+	try:
+		with open('%s/blur-%s.txt' % (rundir, tag)) as f:
+			w, h, fmt = f.read().split()
+	except OSError:
+		return None
 	w, h = int(w), int(h)
 	a = np.fromfile('%s/blur-%s.raw' % (rundir, tag), dtype=np.uint8)
 	if a.size < w * h * 4:
-		return None, fmt
+		return None
 	a = a[:w * h * 4].reshape(h, w, 4).astype(np.float32) / 255.0
 	# 取中间那块，躲开边缘（边缘上本来就有 alpha 渐变）
-	return a[h // 4:h * 3 // 4, w // 4:w * 3 // 4], fmt
+	return a[h // 4:h * 3 // 4, w // 4:w * 3 // 4]
 
-off, _ = load('off')
-on, _ = load('on')
-if off is None or on is None:
-	say(False, '模糊金字塔 dump 读不出来')
+off, ign, keep = load('off'), load('ign'), load('keep')
+if off is None or ign is None or keep is None:
+	say(False, '模糊金字塔 dump 读不出来（off=%s ign=%s keep=%s）'
+		% (off is not None, ign is not None, keep is not None))
 	sys.exit(1)
 
 a_off = float(off[..., 3].mean())
-a_on = float(on[..., 3].mean())
-print('  alpha: 阈值关=%0.4f  阈值 0.5=%0.4f（底色 rgb %.3f/%.3f）' %
-	(a_off, a_on, float(off[..., 2].mean()), float(on[..., 2].mean())))
-say(abs(a_off - 0.45) < 0.05, '阈值关着时 alpha 就是 0.45（实测 %.4f）' % a_off)
-say(a_on > 0.35, '阈值 0.5 时没被抹掉（实测 %.4f，老代码 ~0.02）' % a_on)
-say(a_on > 0.7 * a_off, '剔除只是压一点，没抹掉整块（%.4f vs %.4f）' % (a_on, a_off))
+a_ign = float(ign[..., 3].mean())
+a_keep = float(keep[..., 3].mean())
+c_ign = float(ign[..., :3].mean())
+c_keep = float(keep[..., :3].mean())
+print('  alpha: 阈值关=%0.4f  0.45 底衬+阈值 0.5=%0.4f  0.9 底衬+阈值 0.5=%0.4f'
+	% (a_off, a_ign, a_keep))
+print('  颜色:  0.45 底衬+阈值 0.5 的 rgb 均值 %0.4f（预乘，该跟 alpha 一起归零）'
+	% c_ign)
+say(abs(a_off - 0.45) < 0.05, '阈值关着时 alpha 就是底衬的 0.45（实测 %.4f）' % a_off)
+say(a_ign < 0.05, '低于阈值的底衬完全不糊（实测 %.4f，软过渡那版 0.4039）' % a_ign)
+say(c_ign < 0.05, '颜色跟着一起归零，没留下「半透明黑」（rgb 均值 %.4f）' % c_ign)
+say(a_keep > 0.85, '高于阈值的底衬一点都不衰减（实测 %.4f，0.9 底衬）' % a_keep)
+say(abs(c_keep - 0.9 * 0.6) < 0.06,
+	'颜色也没被顺手压过（rgb 均值 %.4f，期望 0.54）' % c_keep)
 sys.exit(0 if ok else 1)
 PY
 rc=$?

@@ -257,13 +257,18 @@ static const char *kawase_up_src =
 	"}\n";
 
 /* 最后一趟（写 up[0]，也就是装饰着色器采样的那张）多干一件事：把底衬本来就透明
- * 的地方剔掉。u_alpha_min = 0 时这行等于不干活（a > 0 一律放过）。阈值上下仍然
- * 平滑过渡 —— 硬 step 会在等值线上留一道看得见的边。 */
+ * 的地方剔掉 —— 「低于这个不透明度的底衬像素不糊」。u_alpha_min = 0 时连完全透明
+ * 的像素也放过（那儿的颜色本来就是 0，无所谓）。
+ *
+ * 这里是**硬阈值**（`step`，跟 niri 的 blur_finish 一样）。之前用过一段软过渡
+ * `smoothstep(min * 0.5, min, a)`，本意是别在等值线上留边，代价是**有效阈值掉到了
+ * min / 2**：设 0.5 的时候 alpha 0.45 的底衬还剩 90% 的模糊（实测 0.4510 →
+ * 0.4039），看着就是「这个键没用」。要软过渡可以再把带宽收窄，但语义得先对：
+ * 低于阈值就是不糊。 */
 static const char *kawase_final_src =
 	"void main() {\n" KAWASE_UP_TAPS
 	"	gl_FragColor = sum / 12.0;\n"
-	"	gl_FragColor *= smoothstep(u_alpha_min * 0.5,"
-	" max(u_alpha_min, 1e-4), gl_FragColor.a);\n"
+	"	gl_FragColor *= step(u_alpha_min, gl_FragColor.a);\n"
 	"}\n";
 
 /* --------------------------------------------------------- program build */
