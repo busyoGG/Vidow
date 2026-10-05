@@ -212,54 +212,55 @@ static bool parse_number(const char *arg, int *out) {
 	return true;
 }
 
-static struct vidow_workspace *adjacent_workspace(struct vidow_server *server,
-		int direction) {
-	/* 只在同一块屏的工作区之间转（工作区归屏管，跨屏是另一回事）。 */
-	struct vidow_workspace *active = vidow_workspace_active(server);
-	if (active == NULL) {
-		return NULL;
-	}
-	struct wl_list *node = direction > 0 ? active->link.next :
-		active->link.prev;
-	while (node != &server->workspaces) {
-		struct vidow_workspace *ws = wl_container_of(node, ws, link);
-		if (!ws->special && ws->output == active->output) {
-			return ws;
-		}
-		node = direction > 0 ? node->next : node->prev;
-	}
-	return NULL;
-}
-
+/* `workspace <序号>` / `workspace <名字>` / `workspace up|down|previous`。
+ *
+ * 序号 = **这块屏上从上往下第几块**（niri：序号是位置，不是身份），越界夹到最后
+ * 一块；名字 = 具名工作区（配置里建的、set-workspace-name 给的）。 */
 static bool action_workspace_switch(struct vidow_server *server,
 		const char *arg) {
 	int n = 0;
-	struct vidow_workspace *ws = NULL;
 	if (arg == NULL || arg[0] == '\0') {
 		return false;
 	}
-	if (strcasecmp(arg, "prev") == 0 || strcasecmp(arg, "left") == 0) {
-		ws = adjacent_workspace(server, -1);
-	} else if (strcasecmp(arg, "next") == 0 ||
-			strcasecmp(arg, "right") == 0) {
-		ws = adjacent_workspace(server, 1);
-	} else if (parse_number(arg, &n)) {
-		char name[16];
-		snprintf(name, sizeof(name), "%d", n);
-		ws = vidow_workspace_create(server, name, server->focused_output);
-	} else {
-		ws = vidow_workspace_lookup(server, arg);
-		if (ws == NULL) {
-			wlr_log(WLR_ERROR, "workspace: 没有叫 %s 的工作区", arg);
-			return false;
-		}
+	if (strcasecmp(arg, "prev") == 0 || strcasecmp(arg, "up") == 0) {
+		return vidow_workspace_focus_step(server, -1);
 	}
+	if (strcasecmp(arg, "next") == 0 || strcasecmp(arg, "down") == 0) {
+		return vidow_workspace_focus_step(server, 1);
+	}
+	if (strcasecmp(arg, "previous") == 0 ||
+			strcasecmp(arg, "last") == 0) {
+		return vidow_workspace_focus_previous(server);
+	}
+	if (parse_number(arg, &n)) {
+		return vidow_workspace_focus_index(server, server->focused_output,
+			n);
+	}
+	struct vidow_workspace *ws = vidow_workspace_lookup(server, arg);
 	if (ws == NULL) {
-		wlr_log(WLR_INFO, "workspace: 那边没有工作区了（%s）",
-			arg != NULL ? arg : "");
+		wlr_log(WLR_ERROR, "workspace: 没有叫 %s 的工作区（具名工作区要先在"
+			"配置里 vidow.workspace_create() 建）", arg);
 		return false;
 	}
 	return vidow_workspace_activate(server, ws);
+}
+
+/* 焦点窗口搬到相邻的那块工作区（`move up` / `move down`）。 */
+static bool action_move_step(struct vidow_server *server, int direction) {
+	struct vidow_view *view = server->focused;
+	if (view == NULL || view->ws == NULL || view->ws->special ||
+			view->ws->output == NULL) {
+		return false;
+	}
+	int idx = vidow_workspace_index(view->ws) + direction;
+	int n = vidow_workspace_count(server, view->ws->output);
+	if (idx < 1 || idx > n) {
+		wlr_log(WLR_INFO, "move: 那边没有工作区了");
+		return false;
+	}
+	struct vidow_workspace *target =
+		vidow_workspace_at(server, view->ws->output, idx);
+	return target != NULL && vidow_workspace_move_view(server, view, target);
 }
 
 static void log_action(const char *action, const char *what) {
@@ -289,10 +290,43 @@ bool vidow_action_run(struct vidow_server *server, const char *action) {
 	}
 	if (strcmp(name, "move") == 0) {
 		if (arg == NULL || arg[0] == '\0') {
-			wlr_log(WLR_ERROR, "move 要带参数（move 1 / move scratch）");
+			wlr_log(WLR_ERROR, "move 要带参数（move 2 / move chat / move up）");
 			return false;
 		}
+		if (strcasecmp(arg, "up") == 0) {
+			return action_move_step(server, -1);
+		}
+		if (strcasecmp(arg, "down") == 0) {
+			return action_move_step(server, 1);
+		}
 		return vidow_workspace_move_focused(server, arg);
+	}
+	if (strcmp(name, "move-workspace") == 0 ||
+			strcmp(name, "movews") == 0) {
+		/* 整块工作区在这块屏上上/下移一位（niri 的 move-workspace-up/down：
+		 * 「往中间塞一块新工作区」就是先搬到栈底那块空的、再往上挪）。 */
+		int dir = 1;
+		int n = 0;
+		if (arg != NULL && strcasecmp(arg, "up") == 0) {
+			dir = -1;
+		} else if (arg != NULL && strcasecmp(arg, "down") != 0 &&
+				parse_number(arg, &n) && n != 0) {
+			dir = n;
+		}
+		struct vidow_workspace *active = vidow_workspace_active(server);
+		if (active == NULL) {
+			return false;
+		}
+		return vidow_workspace_move_step(server, active, dir);
+	}
+	if (strcmp(name, "workspace-name") == 0 ||
+			strcmp(name, "rename-workspace") == 0) {
+		struct vidow_workspace *active = vidow_workspace_active(server);
+		if (active == NULL) {
+			return false;
+		}
+		const char *want = arg != NULL && arg[0] != '\0' ? arg : NULL;
+		return vidow_workspace_set_name(server, active, want);
 	}
 	if (strcmp(name, "special") == 0 || strcmp(name, "scratch") == 0) {
 		const char *want = arg != NULL && arg[0] != '\0' ? arg : "special";

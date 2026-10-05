@@ -331,18 +331,41 @@ static struct vidow_output *req_output(struct vidow_server *server,
 	return output;
 }
 
-/* 要动哪块工作区：workspace 名字（"next" / "prev" 也认）> index（0 起）。 */
+/* 要动哪块工作区：
+ *   纯数字      —— 聚焦那块屏上的第几块（1 起，越界夹到最后一块；niri 的序号语义）
+ *   名字        —— 具名工作区 / 特殊工作区
+ *   next / prev / up / down / previous —— 相对切换（就地做掉，返回 NULL）
+ *   index = N   —— 老写法（0 起），同样按聚焦那块屏算 */
 static struct vidow_workspace *req_workspace(struct vidow_server *server,
 		struct jval *req, char *err, size_t errlen) {
 	char text[256];
 	const char *name = jtext(req, "workspace", text, sizeof(text));
 	if (name != NULL) {
-		if (strcasecmp(name, "next") == 0 || strcasecmp(name, "prev") == 0) {
+		if (strcasecmp(name, "next") == 0 || strcasecmp(name, "prev") == 0 ||
+				strcasecmp(name, "up") == 0 ||
+				strcasecmp(name, "down") == 0 ||
+				strcasecmp(name, "previous") == 0) {
 			/* 相对切换交给 action 那条路（它知道「同屏相邻」的规矩）。 */
 			char action[64];
 			snprintf(action, sizeof(action), "workspace %s", name);
 			vidow_action_run(server, action);
 			return NULL; /* 已经做了，调用者按「特殊路径」处理 */
+		}
+		if (is_number(name)) {
+			int n = atoi(name);
+			int cnt = vidow_workspace_count(server,
+				server->focused_output);
+			if (cnt == 0) {
+				snprintf(err, errlen, "这块屏上一块工作区都没有");
+				return NULL;
+			}
+			if (n < 1) {
+				n = 1;
+			}
+			if (n > cnt) {
+				n = cnt; /* niri：序号越界夹到最后一 块 */
+			}
+			return vidow_workspace_at(server, server->focused_output, n);
 		}
 		struct vidow_workspace *ws = vidow_workspace_lookup(server, name);
 		if (ws == NULL) {
@@ -353,33 +376,25 @@ static struct vidow_workspace *req_workspace(struct vidow_server *server,
 				}
 			}
 		}
-		if (ws == NULL && is_number(name)) {
-			/* "2" 这种纯数字：跟键位绑定里 `workspace 2` 一个待遇 —— 没建过
-			 * 就建一块，不然用户得先去 config.lua 里声明才能切过去。 */
-			ws = vidow_workspace_create(server, name, server->focused_output);
-		}
 		if (ws == NULL) {
-			snprintf(err, errlen, "没有叫 '%s' 的工作区", name);
+			snprintf(err, errlen, "没有叫 '%s' 的工作区（具名工作区要先在配置里"
+				" vidow.workspace_create() 建）", name);
 		}
 		return ws;
 	}
 	long long index = 0;
 	if (jget_int(req, "index", &index)) {
-		long long i = 0;
-		struct vidow_workspace *ws;
-		wl_list_for_each(ws, &server->workspaces, link) {
-			if (ws->special) {
-				continue;
-			}
-			if (i == index) {
-				return ws;
-			}
-			i++;
+		int cnt = vidow_workspace_count(server, server->focused_output);
+		if (index < 0 || index >= cnt) {
+			snprintf(err, errlen, "工作区序号 %lld 不存在（0 起，这块屏上 %d 块）",
+				index, cnt);
+			return NULL;
 		}
-		snprintf(err, errlen, "工作区序号 %lld 不存在（0 起）", index);
-		return NULL;
+		return vidow_workspace_at(server, server->focused_output,
+			(int)index + 1);
 	}
-	snprintf(err, errlen, "要哪块工作区？（workspace = 名字 / index = 序号）");
+	snprintf(err, errlen, "要哪块工作区？（workspace = 序号 / 名字，"
+		"index = 序号 0 起）");
 	return NULL;
 }
 
@@ -868,6 +883,116 @@ static bool cmd_focus_workspace(struct vidow_server *server, struct jval *req,
 	return true;
 }
 
+static bool cmd_focus_workspace_previous(struct vidow_server *server,
+		struct jval *req, struct jbuf *out, char *err, size_t errlen) {
+	(void)req;
+	if (!vidow_workspace_focus_previous(server)) {
+		snprintf(err, errlen, "没有上一块工作区（还没切过 / 那块已经没了）");
+		return false;
+	}
+	jb_obj(out);
+	jb_key(out, "workspace");
+	vidow_ipc_json_workspace(out, server, vidow_workspace_shown(server));
+	jb_obj_end(out);
+	return true;
+}
+
+/* 整块工作区在这块屏上上/下移一位（niri 的 move-workspace-up/down）。 */
+static bool cmd_move_workspace_step(struct vidow_server *server,
+		struct jval *req, struct jbuf *out, char *err, size_t errlen,
+		int direction) {
+	char text[256];
+	long long index = 0;
+	bool given = jtext(req, "workspace", text, sizeof(text)) != NULL ||
+		jget_int(req, "index", &index);
+	struct vidow_workspace *ws = given ?
+		req_workspace(server, req, err, errlen) :
+		vidow_workspace_active(server);
+	if (ws == NULL) {
+		if (err[0] != '\0') {
+			return false;
+		}
+		snprintf(err, errlen, "没有可以重排的工作区");
+		return false;
+	}
+	if (ws == NULL || ws->special) {
+		snprintf(err, errlen, "特殊工作区不能重排");
+		return false;
+	}
+	if (!vidow_workspace_move_step(server, ws, direction)) {
+		snprintf(err, errlen, "已经在%s了", direction < 0 ? "最上面" : "最下面");
+		return false;
+	}
+	jb_obj(out);
+	jb_key(out, "workspace");
+	vidow_ipc_json_workspace(out, server, ws);
+	jb_obj_end(out);
+	return true;
+}
+
+/* 给工作区起名 / 去掉名字（niri 的 set-workspace-name / unset-workspace-name）。 */
+static bool cmd_set_workspace_name(struct vidow_server *server,
+		struct jval *req, struct jbuf *out, char *err, size_t errlen) {
+	char ws_text[256];
+	long long index = 0;
+	bool given = jtext(req, "workspace", ws_text, sizeof(ws_text)) != NULL ||
+		jget_int(req, "index", &index);
+	struct vidow_workspace *ws = given ?
+		req_workspace(server, req, err, errlen) :
+		vidow_workspace_active(server);
+	if (ws == NULL) {
+		if (err[0] != '\0') {
+			return false;
+		}
+		snprintf(err, errlen, "没有可以改名的工作区");
+		return false;
+	}
+	if (ws == NULL || ws->special) {
+		snprintf(err, errlen, "特殊工作区不能在运行时改名");
+		return false;
+	}
+	char text[256];
+	const char *name = jtext(req, "name", text, sizeof(text));
+	if (!vidow_workspace_set_name(server, ws, name)) {
+		snprintf(err, errlen, "改不了名字（重名？）");
+		return false;
+	}
+	jb_obj(out);
+	jb_key(out, "workspace");
+	vidow_ipc_json_workspace(out, server, ws);
+	jb_obj_end(out);
+	return true;
+}
+
+/* 把窗口搬到相邻的那块工作区（niri 的 move-window-to-workspace-up/down）。 */
+static bool cmd_move_window_to_workspace_step(struct vidow_server *server,
+		struct jval *req, struct jbuf *out, char *err, size_t errlen,
+		int direction) {
+	struct vidow_view *view = req_view(server, req, err, errlen);
+	if (view == NULL) {
+		return false;
+	}
+	struct vidow_workspace *from = view->ws;
+	if (from == NULL || from->special || from->output == NULL) {
+		snprintf(err, errlen, "这个窗口现在不在普通工作区上");
+		return false;
+	}
+	int idx = vidow_workspace_index(from) + direction;
+	int cnt = vidow_workspace_count(server, from->output);
+	if (idx < 1 || idx > cnt) {
+		snprintf(err, errlen, "那边没有工作区了");
+		return false;
+	}
+	struct vidow_workspace *target =
+		vidow_workspace_at(server, from->output, idx);
+	if (target == NULL || !vidow_workspace_move_view(server, view, target)) {
+		snprintf(err, errlen, "搬不动");
+		return false;
+	}
+	changed_window(out, server, view);
+	return true;
+}
+
 static bool cmd_toggle_special(struct vidow_server *server, struct jval *req,
 		struct jbuf *out, char *err, size_t errlen) {
 	char text[256];
@@ -930,8 +1055,17 @@ static bool cmd_create_workspace(struct vidow_server *server, struct jval *req,
 	} else if (server->focused_output != NULL) {
 		output = output_from_wlr(server, server->focused_output);
 	}
-	struct vidow_workspace *ws = vidow_workspace_create(server, name,
-		output != NULL ? output->wlr_output : NULL);
+	struct wlr_output *wlr_output =
+		output != NULL ? output->wlr_output : server->focused_output;
+	struct vidow_workspace *ws;
+	if (name == NULL || name[0] == '\0') {
+		/* 没给名字：返回那块「新工作区」位（栈底那块空的；它不空了就补一块） */
+		vidow_workspace_ensure_bottom(server, wlr_output);
+		int cnt = vidow_workspace_count(server, wlr_output);
+		ws = vidow_workspace_at(server, wlr_output, cnt);
+	} else {
+		ws = vidow_workspace_create(server, name, wlr_output);
+	}
 	if (ws == NULL) {
 		snprintf(err, errlen, "建不出来");
 		return false;
@@ -1720,6 +1854,32 @@ static bool ipc_run(struct vidow_server *server, struct ipc_client *c,
 	}
 
 	/* 工作区 */
+	if (strcmp(cmd, "focus_workspace_previous") == 0 ||
+			strcmp(cmd, "focus_workspace_last") == 0) {
+		return cmd_focus_workspace_previous(server, req, out, err, errlen);
+	}
+	if (strcmp(cmd, "move_workspace_up") == 0) {
+		return cmd_move_workspace_step(server, req, out, err, errlen, -1);
+	}
+	if (strcmp(cmd, "move_workspace_down") == 0) {
+		return cmd_move_workspace_step(server, req, out, err, errlen, 1);
+	}
+	if (strcmp(cmd, "set_workspace_name") == 0 ||
+			strcmp(cmd, "unset_workspace_name") == 0) {
+		return cmd_set_workspace_name(server, req, out, err, errlen);
+	}
+	if (strcmp(cmd, "move_window_to_workspace_up") == 0) {
+		return cmd_move_window_to_workspace_step(server, req, out, err,
+			errlen, -1);
+	}
+	if (strcmp(cmd, "move_window_to_workspace_down") == 0) {
+		return cmd_move_window_to_workspace_step(server, req, out, err,
+			errlen, 1);
+	}
+	if (strcmp(cmd, "move_column_to_workspace") == 0) {
+		/* niri 的名字。vidow 的列是单窗口的，所以和 move_window_* 一回事。 */
+		return cmd_move_window_to_workspace(server, req, out, err, errlen);
+	}
 	if (strcmp(cmd, "focus_workspace") == 0) {
 		return cmd_focus_workspace(server, req, out, err, errlen);
 	}

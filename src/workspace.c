@@ -20,48 +20,177 @@ static struct vidow_workspace *find_by_name(struct vidow_server *server,
 		const char *name, bool special);
 static void ws_set_output(struct vidow_server *server,
 		struct vidow_workspace *ws, struct wlr_output *output);
+static bool ws_empty(const struct vidow_workspace *ws);
+static void ws_destroy(struct vidow_server *server, struct vidow_workspace *ws);
 
-/* 空名字的工作区自动编号。**名字必须全局唯一**：名字是身份，重名会让「按名字建」
- * 找回另一块屏上那块工作区，于是每次 arrange 都把它在两块屏之间拽来拽去
- * （真踩过：一块工作区在两个输出之间反复横跳，窗口在两边轮流画一遍）。 */
-static void auto_name(struct vidow_server *server, struct wlr_output *output,
-		char *buf, size_t len) {
-	(void)output;
-	for (int n = 1; n < 10000; n++) {
-		snprintf(buf, len, "%d", n);
-		if (find_by_name(server, buf, false) == NULL) {
-			return;
-		}
-	}
-	buf[0] = '\0';
-}
-
+/* 按名字找（具名工作区 / 特殊工作区）。没名字的动态工作区不在这里 —— 它们靠
+ * 「那块屏上的第几块」寻址，名字只是显示用的（niri：无名工作区没有名字）。 */
 static struct vidow_workspace *find_by_name(struct vidow_server *server,
 		const char *name, bool special) {
+	if (name == NULL || name[0] == '\0') {
+		return NULL;
+	}
 	struct vidow_workspace *ws;
 	wl_list_for_each(ws, &server->workspaces, link) {
-		if (ws->special == special && strcmp(ws->name, name) == 0) {
+		if (ws->special == special && ws->name[0] != '\0' &&
+				strcmp(ws->name, name) == 0) {
 			return ws;
 		}
 	}
 	return NULL;
 }
 
+/* 把还没挂进链表的工作区插到 output 那块屏的第 idx0 位（0 起；越界 = 那组的最后）。
+ * 同屏工作区之间的先后就是序号，所以只要保证组内相对顺序对就行。 */
+static void ws_splice(struct vidow_workspace *ws, struct wlr_output *output,
+		int idx0) {
+	struct vidow_server *server = ws->server;
+	struct vidow_workspace *it;
+	struct wl_list *before = NULL; /* 插在它前面；NULL = 追加到那组后面 */
+	int seen = 0;
+	wl_list_for_each(it, &server->workspaces, link) {
+		if (it->special) {
+			break; /* 普通工作区到这儿就结束了 */
+		}
+		if (it->output != output) {
+			continue;
+		}
+		if (before == NULL && seen == idx0) {
+			before = &it->link;
+		}
+		seen++;
+	}
+	/* 注意 wl_list_insert(pos, elm) 是「插在 pos **之后**」，所以插到 before
+	 * 前面要写 wl_list_insert(before->prev, elm)。 */
+	if (before != NULL) {
+		wl_list_insert(before->prev, &ws->link);
+	} else {
+		struct wl_list *special = NULL;
+		wl_list_for_each(it, &server->workspaces, link) {
+			if (it->special) {
+				special = &it->link;
+				break;
+			}
+		}
+		if (special != NULL) {
+			wl_list_insert(special->prev, &ws->link); /* 普通工作区之后 */
+		} else {
+			wl_list_insert(server->workspaces.prev, &ws->link); /* 追加 */
+		}
+	}
+	ws->output = output;
+}
+
+/* ------------------------------------------------- 按屏的纵向工作区栈（序号）
+
+ * 序号 = 它在**自己那块屏**上的位置（1 起）—— 就是 niri 的
+ * `focus-workspace N` 里的 N：位置，不是身份。具名工作区靠名字认，动态的靠位置认。 */
+
+static bool ws_on_output(const struct vidow_workspace *ws,
+		struct wlr_output *output) {
+	return ws != NULL && !ws->special && ws->output == output;
+}
+
+int vidow_workspace_count(struct vidow_server *server,
+		struct wlr_output *output) {
+	int n = 0;
+	struct vidow_workspace *ws;
+	wl_list_for_each(ws, &server->workspaces, link) {
+		if (ws_on_output(ws, output)) {
+			n++;
+		}
+	}
+	return n;
+}
+
+struct vidow_workspace *vidow_workspace_at(struct vidow_server *server,
+		struct wlr_output *output, int idx) {
+	if (server == NULL || output == NULL || idx < 1) {
+		return NULL;
+	}
+	int i = 0;
+	struct vidow_workspace *ws;
+	wl_list_for_each(ws, &server->workspaces, link) {
+		if (!ws_on_output(ws, output)) {
+			continue;
+		}
+		if (++i == idx) {
+			return ws;
+		}
+	}
+	return NULL;
+}
+
+int vidow_workspace_index(const struct vidow_workspace *ws) {
+	if (ws == NULL || ws->special || ws->output == NULL || ws->server == NULL) {
+		return 0;
+	}
+	int i = 0;
+	struct vidow_workspace *it;
+	wl_list_for_each(it, &ws->server->workspaces, link) {
+		if (!ws_on_output(it, ws->output)) {
+			continue;
+		}
+		i++;
+		if (it == ws) {
+			return i;
+		}
+	}
+	return 0;
+}
+
+static uint64_t next_ws_id = 1;
+/* 用户手动切过工作区没有 —— 「栈顶那块该不该亮着」只在这之前才自动纠正。 */
+static bool ws_switched_by_user = false;
+
+/* 启动时那块自动建出来的空工作区先占了 active；配置里声明的具名工作区插到它上面
+ * 之后要把 active 让回去（niri 的 active_workspace_idx 一开始就是 0）。只在用户
+ * 还没手动切过工作区的时候做，免得把人从当前工作区弹走。 */
+static void ws_promote_first(struct vidow_server *server,
+		struct wlr_output *output) {
+	if (ws_switched_by_user || server == NULL || output == NULL) {
+		return;
+	}
+	struct vidow_workspace *active =
+		vidow_workspace_active_for(server, output);
+	if (active == NULL || active->named || !ws_empty(active)) {
+		return;
+	}
+	struct vidow_workspace *first = vidow_workspace_at(server, output, 1);
+	if (first == NULL || first == active) {
+		return;
+	}
+	active->active = false;
+	first->active = true;
+	wlr_log(WLR_DEBUG, "workspace: %s 上让栈顶那块（%s）亮着",
+		output->name, first->named ? first->name : "(没名字)");
+}
+
 static struct vidow_workspace *workspace_new(struct vidow_server *server,
-		const char *name, struct wlr_output *output, bool special) {
+		const char *name, struct wlr_output *output, int idx0, bool special) {
 	struct vidow_workspace *ws = calloc(1, sizeof(*ws));
 	if (ws == NULL) {
 		return NULL;
 	}
-	snprintf(ws->name, sizeof(ws->name), "%s", name);
+	ws->server = server;
+	ws->id = next_ws_id++;
+	ws->named = name != NULL && name[0] != '\0';
+	snprintf(ws->name, sizeof(ws->name), "%s",
+		name != NULL ? name : "");
 	ws->special = special;
-	ws->output = output;
 	if (!special && output != NULL) {
 		ws->home = vidow_output_memory_for(&server->output_memories,
 			output->name);
 	}
 	wl_list_init(&ws->columns);
-	wl_list_insert(server->workspaces.prev, &ws->link);
+	wl_list_init(&ws->link);
+	if (special) {
+		/* 特殊工作区不进普通工作区那串（它的 output 只是「现在显示在哪块屏上」） */
+		ws->output = output;
+		wl_list_insert(server->workspaces.prev, &ws->link);
+	} else {
+		ws_splice(ws, output, idx0);
+	}
 	vidow_ipc_emit_workspace(server, "workspace-created", ws);
 	return ws;
 }
@@ -71,31 +200,38 @@ struct vidow_workspace *vidow_workspace_create(struct vidow_server *server,
 	if (server == NULL) {
 		return NULL;
 	}
-	/* 没有名字 = 「随便给我一块」：编号保证唯一，直接建新的（不去按名字找，
-	 * 否则会跟别的屏上那块同名工作区撞上）。 */
+	/* 没名字 = 动态工作区（niri 的无名工作区）：插在那块屏的栈尾，就是底部那个
+	 * 「新工作区」位。 */
 	if (name == NULL || name[0] == '\0') {
-		char auto_buf[sizeof(((struct vidow_workspace *)0)->name)];
-		auto_name(server, output, auto_buf, sizeof(auto_buf));
-		struct vidow_workspace *fresh = workspace_new(server, auto_buf, output,
-			false);
+		int n = vidow_workspace_count(server, output);
+		struct vidow_workspace *fresh = workspace_new(server, NULL, output,
+			n, false);
 		if (fresh != NULL) {
-			wlr_log(WLR_INFO, "workspace: 自动建工作区 %s（%s）", auto_buf,
-				output != NULL ? output->name : "(还没屏)");
+			wlr_log(WLR_DEBUG, "workspace: 在 %s 的栈尾建一块没名字的工作区"
+				"（现在 %d 块）",
+				output != NULL ? output->name : "(还没屏)", n + 1);
 		}
 		return fresh;
 	}
 	struct vidow_workspace *ws = find_by_name(server, name, false);
 	if (ws != NULL) {
-		if (output != NULL && ws->output != output) {
-			/* 配置里重新指派了这块工作区：整块搬过去（列的输出也跟着改） */
+		/* 已经在了：只有它还没归属过屏时才认领（配置重载不该把用户手动挪到
+		 * 别的屏上的具名工作区拽回来 —— niri 的具名工作区就是「钉」在原屏上）。 */
+		if (ws->output == NULL && output != NULL) {
 			ws_set_output(server, ws, output);
 		}
 		return ws;
 	}
-	ws = workspace_new(server, name, output, false);
+	/* 新建的具名工作区插在**底部那块空工作区之前**：niri 里具名工作区按声明顺序
+	 * 排在上面，底部那块空的永远是最后一块。 */
+	int n = vidow_workspace_count(server, output);
+	int idx0 = n > 0 ? n - 1 : 0;
+	ws = workspace_new(server, name, output, idx0, false);
 	if (ws != NULL) {
-		wlr_log(WLR_INFO, "workspace: 建工作区 %s（%s）", name,
-			output != NULL ? output->name : "(还没屏)");
+		wlr_log(WLR_INFO, "workspace: 建具名工作区 %s（%s，第 %d 块）", name,
+			output != NULL ? output->name : "(还没屏)",
+			vidow_workspace_index(ws));
+		ws_promote_first(server, output);
 	}
 	return ws;
 }
@@ -112,7 +248,7 @@ struct vidow_workspace *vidow_workspace_create_special(
 	if (ws != NULL) {
 		return ws;
 	}
-	ws = workspace_new(server, name, NULL, true);
+	ws = workspace_new(server, name, NULL, 0, true);
 	if (ws != NULL) {
 		wlr_log(WLR_INFO, "workspace: 建特殊工作区 %s（不进列表，跟随激活的屏）",
 			name);
@@ -148,7 +284,22 @@ static void ws_set_output_full(struct vidow_server *server,
 	if (ws == NULL) {
 		return;
 	}
-	ws->output = output;
+	if (ws->special) {
+		ws->output = output; /* 特殊工作区不绑屏：home 一直是 NULL */
+	} else if (ws->output != output) {
+		/* 换屏 = 在新屏的栈里重新排位：插到底部那块空工作区**之前**
+		 * （niri 的 append_workspaces 就是这个位置）。 */
+		struct wlr_output *old = ws->output;
+		if (!wl_list_empty(&ws->link)) {
+			wl_list_remove(&ws->link);
+		}
+		int n = vidow_workspace_count(server, output);
+		ws_splice(ws, output, n > 0 ? n - 1 : 0);
+		if (old != NULL) {
+			/* 老屏上要是没工作区了，给它补一块空的（不然那块屏没东西可显示） */
+			vidow_workspace_ensure_bottom(server, old);
+		}
+	}
 	if (deliberate && !ws->special && output != NULL) {
 		ws->home = vidow_output_memory_for(&server->output_memories,
 			output->name);
@@ -185,43 +336,272 @@ static bool ws_empty(const struct vidow_workspace *ws) {
 	return wl_list_empty(&ws->columns);
 }
 
-struct vidow_workspace *vidow_workspace_active_for(struct vidow_server *server,
+/* niri 的 has_windows_or_name()：有窗口或者有名字的工作区不会被自动收掉。 */
+static bool ws_keeps(const struct vidow_workspace *ws) {
+	return ws->named || !ws_empty(ws);
+}
+
+void vidow_workspace_adopt_homeless(struct vidow_server *server,
 		struct wlr_output *output) {
-	/* 「这块屏上的活动工作区」：
-	 *   ① 已经在这块屏上亮着的（active）那块；
-	 *   ② 这块屏上有别的（不亮的）工作区 —— 挑一块亮起来；
-	 *   ③ 别的屏上有空着的工作区 —— 整块挪过来（窗口开在哪儿，工作区就跟到哪儿）；
-	 *   ④ 都没有就现建一块。
-	 * 「空的」那条是关键：不许把别的屏上还开着窗口的工作区拽过来（那是抢东西）。
-	 * 每块屏各自有一块亮着的：active 是「在这块屏上亮着」，不是全局唯一。 */
-	struct vidow_workspace *ws;
-	struct vidow_workspace *mine = NULL, *spare = NULL;
-	wl_list_for_each(ws, &server->workspaces, link) {
-		if (ws->special) {
+	if (server == NULL || output == NULL) {
+		return;
+	}
+	/* 配置在屏出现之前就跑完了：那时候声明的具名工作区还没归属。按声明顺序
+	 * 认领到这块屏上（niri：具名工作区按声明顺序出现）。 */
+	int k = 0;
+	struct vidow_workspace *ws, *tmp;
+	wl_list_for_each_safe(ws, tmp, &server->workspaces, link) {
+		if (ws->special || ws->output != NULL) {
 			continue;
 		}
-		if (ws->output == output) {
-			if (ws->active) {
-				return ws;
-			}
-			if (mine == NULL) {
-				mine = ws;
-			}
-		} else if (spare == NULL && !ws->active && ws_empty(ws)) {
-			spare = ws;
+		ws_splice(ws, output, k++);
+		if (ws->home == NULL) {
+			ws->home = vidow_output_memory_for(&server->output_memories,
+				output->name);
 		}
 	}
-	ws = mine != NULL ? mine : spare;
+	if (k > 0) {
+		wlr_log(WLR_INFO, "workspace: %s 认领了 %d 块还没归属的具名工作区"
+			"（按声明顺序排在上面）", output->name, k);
+	}
+}
+
+void vidow_workspace_normalize(struct vidow_server *server) {
+	/* 配置跑完之后调：认领还没归属的具名工作区、每块屏补上底部空位、收掉
+	 * 中间那些空的没名字的工作区。 */
+	if (server == NULL) {
+		return;
+	}
+	struct vidow_output *out;
+	if (!wl_list_empty(&server->outputs)) {
+		struct vidow_output *first =
+			wl_container_of(server->outputs.next, first, link);
+		vidow_workspace_adopt_homeless(server, first->wlr_output);
+	}
+	wl_list_for_each(out, &server->outputs, link) {
+		vidow_workspace_ensure_bottom(server, out->wlr_output);
+	}
+	vidow_workspace_cleanup(server);
+
+	/* 第一次跑完配置：让每块屏的**第一块**亮着（niri 的 active_workspace_idx
+	 * 一开始就是 0）。启动时那块自动建出来的空工作区先占了 active，配置里声明的
+	 * 具名工作区插到它上面之后得把 active 让回去，不然一上来站在一块没名字的
+	 * 空工作区上。只在第一次做，免得配置重载把人从当前工作区弹走。 */
+	wl_list_for_each(out, &server->outputs, link) {
+		ws_promote_first(server, out->wlr_output);
+	}
+}
+
+void vidow_workspace_ensure_bottom(struct vidow_server *server,
+		struct wlr_output *output) {
+	if (server == NULL || output == NULL) {
+		return;
+	}
+	int n = vidow_workspace_count(server, output);
+	if (n > 0 && ws_empty(vidow_workspace_at(server, output, n))) {
+		return; /* 底部那块还空着 */
+	}
+	if (vidow_workspace_create(server, NULL, output) != NULL) {
+		wlr_log(WLR_DEBUG, "workspace: %s 的栈尾补一块空的（现在 %d 块）",
+			output->name, vidow_workspace_count(server, output));
+	}
+}
+
+static void ws_destroy(struct vidow_server *server,
+		struct vidow_workspace *ws) {
+	wlr_log(WLR_INFO, "workspace: 收掉空工作区（%s 上第 %d 块%s）",
+		ws->output != NULL ? ws->output->name : "-",
+		vidow_workspace_index(ws), ws->named ? "，具名的不该走到这儿" : "");
+	vidow_ipc_emit_workspace(server, "workspace-removed", ws);
+	/* 空工作区不该还有窗口指着它，但指针是裸的：清一遍再 free，免得谁拿着
+	 * 悬空指针接着用（关窗那条路上 view->ws 还留着）。 */
+	struct vidow_view *view;
+	wl_list_for_each(view, &server->views, link) {
+		if (view->ws == ws) {
+			view->ws = NULL;
+		}
+	}
+	wl_list_remove(&ws->link);
+	free(ws);
+}
+
+void vidow_workspace_cleanup(struct vidow_server *server) {
+	/* niri 的 clean_up_workspaces()：中间那些**空的、没名字的**工作区（不是当前
+	 * 亮着的那块、也不是栈底那块）→ 收掉。「切走就消失」说的就是这里。 */
+	if (server == NULL) {
+		return;
+	}
+	struct vidow_workspace *ws, *tmp;
+	wl_list_for_each_safe(ws, tmp, &server->workspaces, link) {
+		if (ws->special || ws->active || ws->output == NULL || ws_keeps(ws)) {
+			continue;
+		}
+		if (vidow_workspace_index(ws) ==
+				vidow_workspace_count(server, ws->output)) {
+			continue; /* 栈底那块留着：那是「新工作区」位 */
+		}
+		ws_destroy(server, ws);
+	}
+}
+
+bool vidow_workspace_set_name(struct vidow_server *server,
+		struct vidow_workspace *ws, const char *name) {
+	if (server == NULL || ws == NULL || ws->special) {
+		return false;
+	}
+	if (name != NULL && name[0] != '\0') {
+		struct vidow_workspace *other = find_by_name(server, name, false);
+		if (other != NULL && other != ws) {
+			wlr_log(WLR_ERROR, "workspace: 已经有叫 %s 的工作区了", name);
+			return false;
+		}
+	}
+	snprintf(ws->name, sizeof(ws->name), "%s", name != NULL ? name : "");
+	ws->named = ws->name[0] != '\0';
+	wlr_log(WLR_INFO, "workspace: %s 上的第 %d 块工作区%s%s",
+		ws->output != NULL ? ws->output->name : "-",
+		vidow_workspace_index(ws),
+		ws->named ? "起名 " : "去掉名字",
+		ws->named ? ws->name : "");
+	vidow_ipc_emit_workspace(server, "workspace-changed", ws);
+	vidow_workspace_cleanup(server); /* 去掉名字之后可能就该消失了 */
+	return true;
+}
+
+bool vidow_workspace_focus_index(struct vidow_server *server,
+		struct wlr_output *output, int idx) {
+	if (output == NULL) {
+		output = server->focused_output;
+	}
+	if (output == NULL) {
+		return false;
+	}
+	int n = vidow_workspace_count(server, output);
+	if (n == 0) {
+		return false;
+	}
+	/* niri：序号越界就夹到最后一 块（不是「现建一块」）。 */
+	if (idx < 1) {
+		idx = 1;
+	}
+	if (idx > n) {
+		idx = n;
+	}
+	struct vidow_workspace *ws = vidow_workspace_at(server, output, idx);
 	if (ws == NULL) {
-		ws = vidow_workspace_create(server, NULL, output);
-		if (ws == NULL) {
+		return false;
+	}
+	if (server->focused_output != output) {
+		server->focused_output = output; /* 人跟着工作区走：切到别的屏上的那块 */
+	}
+	return vidow_workspace_activate(server, ws);
+}
+
+bool vidow_workspace_focus_step(struct vidow_server *server, int direction) {
+	if (server == NULL || direction == 0) {
+		return false;
+	}
+	struct wlr_output *output = server->focused_output;
+	if (output == NULL) {
+		return false;
+	}
+	struct vidow_workspace *active = vidow_workspace_active_for(server, output);
+	int idx = vidow_workspace_index(active);
+	if (idx == 0) {
+		return false;
+	}
+	return vidow_workspace_focus_index(server, output, idx + direction);
+}
+
+bool vidow_workspace_focus_previous(struct vidow_server *server) {
+	if (server == NULL) {
+		return false;
+	}
+	struct vidow_output *out = NULL;
+	struct vidow_output *it;
+	wl_list_for_each(it, &server->outputs, link) {
+		if (it->wlr_output == server->focused_output) {
+			out = it;
+			break;
+		}
+	}
+	if (out == NULL || out->prev_ws_id == 0) {
+		return false;
+	}
+	uint64_t id = out->prev_ws_id;
+	struct vidow_workspace *ws;
+	wl_list_for_each(ws, &server->workspaces, link) {
+		if (!ws->special && ws->id == id && ws->output == out->wlr_output) {
+			return vidow_workspace_activate(server, ws);
+		}
+	}
+	return false;
+}
+
+bool vidow_workspace_move_step(struct vidow_server *server,
+		struct vidow_workspace *ws, int direction) {
+	if (server == NULL || ws == NULL || ws->special || direction == 0 ||
+			ws->output == NULL) {
+		return false;
+	}
+	int idx = vidow_workspace_index(ws);
+	int n = vidow_workspace_count(server, ws->output);
+	int want = idx + direction;
+	if (idx == 0 || want < 1 || want > n) {
+		return false;
+	}
+	wl_list_remove(&ws->link);
+	wl_list_init(&ws->link);
+	ws_splice(ws, ws->output, want - 1);
+	wlr_log(WLR_INFO, "workspace: %s 上的工作区 %d ⇄ %d",
+		ws->output->name, idx, want);
+	vidow_ipc_emit_workspace(server, "workspace-changed", ws);
+	vidow_arrange(server);
+	return true;
+}
+
+struct vidow_workspace *vidow_workspace_active_for(struct vidow_server *server,
+		struct wlr_output *output) {
+	/* 每块屏各自一份工作区栈（niri），所以这块屏上：
+	 *   ① 已经亮着的那块 → 就是它；
+	 *   ② 有工作区但没亮的（刚插上屏 / 刚搬过来）→ 第一块亮起来（niri 的
+	 *      active_workspace_idx = 0）；
+	 *   ③ 一块都没有 → 建一块空的，并保证底部还有一个空位。 */
+	if (server == NULL || output == NULL) {
+		return NULL;
+	}
+	struct vidow_workspace *ws;
+	struct vidow_workspace *first = NULL;
+	wl_list_for_each(ws, &server->workspaces, link) {
+		if (!ws_on_output(ws, output)) {
+			continue;
+		}
+		if (ws->active) {
+			return ws;
+		}
+		if (first == NULL) {
+			first = ws;
+		}
+	}
+	if (first == NULL) {
+		/* 还没归属过屏的具名工作区（配置先跑、屏后到）：认领过来。 */
+		vidow_workspace_adopt_homeless(server, output);
+		wl_list_for_each(ws, &server->workspaces, link) {
+			if (ws_on_output(ws, output)) {
+				first = ws;
+				break;
+			}
+		}
+	}
+	if (first == NULL) {
+		first = vidow_workspace_create(server, NULL, output);
+		if (first == NULL) {
 			return NULL;
 		}
-	} else if (ws->output != output) {
-		ws_set_output(server, ws, output);
 	}
-	ws->active = true;
-	return ws;
+	first->active = true;
+	vidow_workspace_ensure_bottom(server, output);
+	return first;
 }
 
 struct vidow_workspace *vidow_workspace_active(struct vidow_server *server) {
@@ -420,10 +800,32 @@ bool vidow_workspace_activate(struct vidow_server *server,
 		special->output = NULL;
 	}
 
-	struct vidow_workspace *prev = vidow_workspace_active(server);
-	if (prev == ws && ws->output == server->focused_output) {
-		if (ws->output != NULL) {
-			server->focused_output = ws->output;
+	/* 切哪块屏：工作区住在哪块屏就切哪块屏（人跟着工作区走）—— niri 里工作区
+	 * 是「某块屏上的一层」，不跨屏搬。 */
+	struct wlr_output *target = ws->output;
+	if (target == NULL) {
+		target = server->focused_output;
+		if (target == NULL) {
+			return false;
+		}
+		ws_set_output(server, ws, target);
+	}
+	server->focused_output = target;
+	ws_switched_by_user = true;
+	struct vidow_output *out = output_of(server, target);
+
+	/* 这块屏上原来亮着的那块让位（每块屏只有一块亮的）。 */
+	struct vidow_workspace *prev = NULL;
+	struct vidow_workspace *it;
+	wl_list_for_each(it, &server->workspaces, link) {
+		if (!it->special && it->output == target && it->active) {
+			prev = it;
+			break;
+		}
+	}
+	if (prev == ws) {
+		if (out != NULL) {
+			out->viewport_x = ws->viewport_x;
 		}
 		vidow_workspace_apply_visibility(server);
 		vidow_arrange(server);
@@ -431,46 +833,18 @@ bool vidow_workspace_activate(struct vidow_server *server,
 		return true;
 	}
 	if (prev != NULL) {
-		struct vidow_output *prev_output = output_of(server, prev->output);
-		if (prev_output != NULL) {
-			prev->viewport_x = prev_output->viewport_x;
+		prev->active = false;
+		if (out != NULL) {
+			prev->viewport_x = out->viewport_x;
+			out->prev_ws_id = prev->id; /* focus-workspace-previous 用 */
 		}
 		if (server->focused != NULL && server->focused->ws == prev) {
 			prev->focused = server->focused;
 		}
-		prev->active = false;
-	}
-
-	struct wlr_output *target_output = server->focused_output;
-	if (target_output == NULL && server->focused != NULL) {
-		target_output = server->focused->output;
-	}
-	if (ws->active && ws->output != NULL && ws->output != target_output) {
-		/* 它已经在**别的屏**上亮着：那就把焦点挪过去（人跟着工作区走），
-		 * 而不是把它从那块屏上拽过来 —— 那块屏上还有它自己的窗口。 */
-		target_output = ws->output;
-		server->focused_output = target_output;
-		/* 那块屏上原来亮着的（如果有）让位 */
-		struct vidow_workspace *other;
-		wl_list_for_each(other, &server->workspaces, link) {
-			if (!other->special && other != ws && other->active &&
-					other->output == target_output) {
-				other->active = false;
-			}
-		}
-	} else {
-		/* 没在别的屏上亮着：切到哪块屏就让它住哪块屏（整块工作区一起挪）。 */
-		if (target_output != NULL) {
-			ws_set_output(server, ws, target_output);
-		}
 	}
 	ws->active = true;
-	if (ws->output != NULL) {
-		server->focused_output = ws->output;
-		struct vidow_output *out = output_of(server, ws->output);
-		if (out != NULL) {
-			out->viewport_x = ws->viewport_x;
-		}
+	if (out != NULL) {
+		out->viewport_x = ws->viewport_x;
 	}
 
 	int shown = vidow_workspace_apply_visibility(server);
@@ -484,14 +858,16 @@ bool vidow_workspace_activate(struct vidow_server *server,
 	wl_list_for_each(col, &ws->columns, link) {
 		columns++;
 	}
-	wlr_log(WLR_INFO, "workspace: 切到 %s（%s，本区 %d 列 / %d 个窗口，"
-		"全屏 %d 个可见）", ws->name,
-		ws->output != NULL ? ws->output->name : "(没屏)", columns,
+	wlr_log(WLR_INFO, "workspace: 切到 %s 上的第 %d 块%s（本区 %d 列 / %d 个窗口，"
+		"全屏 %d 个可见）", target->name, vidow_workspace_index(ws),
+		ws->named ? ws->name : "(没名字)", columns,
 		vidow_workspace_view_count(ws), shown);
 
 	focus_workspace(server, ws);
 	vidow_arrange(server);
 	vidow_ipc_emit_workspace(server, "workspace-activated", ws);
+	/* 刚离开的那块要是空的、没名字的、又在栈中间 —— 收掉（niri：切走就消失）。 */
+	vidow_workspace_cleanup(server);
 	return true;
 }
 
@@ -599,9 +975,22 @@ bool vidow_workspace_move_view(struct vidow_server *server,
 		ws_adopt_view(target, view);
 	}
 
-	wlr_log(WLR_INFO, "workspace: 把 %s 搬到 %s%s",
-		vidow_view_title(view) != NULL ? vidow_view_title(view) : "(无题)",
-		target->name, target->special ? "（特殊工作区）" : "");
+	if (target->special) {
+		wlr_log(WLR_INFO, "workspace: 把 %s 搬到 %s（特殊工作区）",
+			vidow_view_title(view) != NULL ?
+				vidow_view_title(view) : "(无题)", target->name);
+	} else {
+		wlr_log(WLR_INFO, "workspace: 把 %s 搬到 %s 上的第 %d 块%s",
+			vidow_view_title(view) != NULL ?
+				vidow_view_title(view) : "(无题)",
+			target->output != NULL ? target->output->name : "-",
+			vidow_workspace_index(target),
+			target->named ? target->name : "(没名字)");
+	}
+	if (!target->special && target->output != NULL) {
+		/* 搬到的是栈底那块空的 → 它就是「新工作区」了，底下再补一块 */
+		vidow_workspace_ensure_bottom(server, target->output);
+	}
 	vidow_ipc_emit_window(server, "window-workspace-changed", view);
 
 	/* 搬走了就看不见了：焦点交给现在显示着的那块工作区里还在的东西。 */
@@ -617,21 +1006,37 @@ bool vidow_workspace_move_view(struct vidow_server *server,
 		focus_workspace(server, back);
 	}
 	vidow_arrange(server);
+	/* 搬空了的那块（如果它只是栈中间的一块）收掉 */
+	vidow_workspace_cleanup(server);
 	return true;
 }
 
-/* 按名字搬：特殊工作区按名字找，找不到就当普通工作区建一块。 */
+/* 按「名字」或「序号」搬（niri：纯数字 = 那块屏上的第几块，越界夹到最后一 块；
+ * 其它 = 具名工作区 / 特殊工作区的名字）。找不到就是找不到 —— 不现建。 */
 bool vidow_workspace_move_view_to_name(struct vidow_server *server,
 		struct vidow_view *view, const char *name) {
-	if (view == NULL || name == NULL) {
+	if (view == NULL || name == NULL || name[0] == '\0') {
 		return false;
 	}
-	struct vidow_workspace *target = find_by_name(server, name, true);
-	if (target == NULL) {
-		target = vidow_workspace_create(server, name,
-			view->output != NULL ? view->output : server->focused_output);
+	char *end = NULL;
+	long n = strtol(name, &end, 10);
+	if (end != name && *end == '\0' && n > 0) {
+		/* 窗口在哪块屏上就按哪块屏的序号算（人在那块屏上操作），窗口不在聚焦
+		 * 的屏上时也一样。 */
+		struct wlr_output *output = server->focused_output;
+		if (view->output != NULL && view->output != output) {
+			output = view->output;
+		}
+		int cnt = vidow_workspace_count(server, output);
+		if (cnt == 0) {
+			return false;
+		}
+		int idx = n > cnt ? cnt : (int)n;
+		struct vidow_workspace *ws = vidow_workspace_at(server, output, idx);
+		return ws != NULL && vidow_workspace_move_view(server, view, ws);
 	}
-	return vidow_workspace_move_view(server, view, target);
+	struct vidow_workspace *target = find_by_name(server, name, true);
+	return target != NULL && vidow_workspace_move_view(server, view, target);
 }
 
 bool vidow_workspace_move_focused(struct vidow_server *server,
@@ -649,21 +1054,56 @@ bool vidow_workspace_move_to_output(struct vidow_server *server,
 			ws->output == output) {
 		return false;
 	}
+	bool was_active = ws->active;
+	struct wlr_output *from = ws->output;
 	ws_set_output_full(server, ws, output, true);
-	wlr_log(WLR_INFO, "workspace: 把 %s 整块搬到 %s 上（%d 个窗口）", ws->name,
-		output->name, vidow_workspace_view_count(ws));
+	/* niri：插到那块屏**活动工作区后面**（move_workspace_to_output 里是
+	 * `insert_workspace(ws, active_workspace_idx + 1, activate)`）。 */
+	struct vidow_workspace *target_active =
+		vidow_workspace_active_for(server, output);
+	if (target_active != NULL && target_active != ws) {
+		int at = vidow_workspace_index(target_active); /* 插在它后面 */
+		wl_list_remove(&ws->link);
+		wl_list_init(&ws->link);
+		ws_splice(ws, output, at);
+	}
+	{
+		/* 搬过去的那块在新屏上亮着（niri 的 move-workspace-to-monitor 搬的就是
+		 * 当前那块，所以那边也是「搬过去就看着它」），新屏原来亮着的那块让位，
+		 * 老屏自己再挑一块亮起来。 */
+		(void)was_active;
+		struct vidow_workspace *it;
+		wl_list_for_each(it, &server->workspaces, link) {
+			if (!it->special && it->active && it->output == output &&
+					it != ws) {
+				it->active = false;
+			}
+		}
+		ws->active = true;
+		server->focused_output = output;
+		if (from != NULL) {
+			vidow_workspace_active_for(server, from);
+		}
+	}
+	vidow_workspace_ensure_bottom(server, output);
+	wlr_log(WLR_INFO, "workspace: 把工作区（%s，%d 个窗口）整块搬到 %s 上，现在是"
+		"那边的第 %d 块", ws->named ? ws->name : "没名字",
+		vidow_workspace_view_count(ws), output->name,
+		vidow_workspace_index(ws));
 	vidow_workspace_apply_visibility(server);
 	vidow_arrange(server);
 	vidow_ipc_emit_workspace(server, "workspace-changed", ws);
+	vidow_workspace_cleanup(server);
 	return true;
 }
 
 void vidow_workspace_output_gone(struct vidow_server *server,
 		struct wlr_output *dead, struct wlr_output *to) {
-	struct vidow_workspace *ws;
+	struct vidow_workspace *ws, *tmp;
 	int moved = 0;
 	bool took_over = false;
-	wl_list_for_each(ws, &server->workspaces, link) {
+	/* 遍历时会把这些工作区搬进别的屏的栈里（链表位置会变）→ 必须 _safe */
+	wl_list_for_each_safe(ws, tmp, &server->workspaces, link) {
 		if (ws->output != dead) {
 			continue;
 		}
@@ -689,14 +1129,16 @@ void vidow_workspace_output_gone(struct vidow_server *server,
 		wlr_log(WLR_INFO, "workspace: %s 上 %d 块工作区跟着列挪到 %s 上住",
 			dead != NULL ? dead->name : "?", moved,
 			to != NULL ? to->name : "(暂时没屏)");
+		vidow_workspace_ensure_bottom(server, to);
+		vidow_workspace_cleanup(server);
 	}
 }
 
 void vidow_workspace_output_added(struct vidow_server *server,
 		struct vidow_output_memory *memory, struct wlr_output *back) {
 	int home = 0;
-	struct vidow_workspace *ws;
-	wl_list_for_each(ws, &server->workspaces, link) {
+	struct vidow_workspace *ws, *tmp;
+	wl_list_for_each_safe(ws, tmp, &server->workspaces, link) {
 		if (ws->special || ws->home != memory || ws->output == back) {
 			continue;
 		}
@@ -708,6 +1150,9 @@ void vidow_workspace_output_added(struct vidow_server *server,
 			"（列、列宽、滚动位置都还在）",
 			memory != NULL ? memory->key : "?", home);
 	}
+	vidow_workspace_adopt_homeless(server, back);
+	vidow_workspace_ensure_bottom(server, back);
+	vidow_workspace_cleanup(server);
 }
 
 void vidow_workspace_track(struct vidow_workspace *ws,
@@ -716,6 +1161,10 @@ void vidow_workspace_track(struct vidow_workspace *ws,
 		return; /* 列里的窗口不算浮窗 */
 	}
 	ws->floats += enter ? 1 : -1;
+	if (enter && !ws->special && ws->output != NULL) {
+		/* 浮窗落在栈底那块空的上了：底下再补一块（记完账再判「空不空」） */
+		vidow_workspace_ensure_bottom(ws->server, ws->output);
+	}
 	if (ws->floats < 0) {
 		ws->floats = 0;
 	}

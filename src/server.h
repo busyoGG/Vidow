@@ -452,6 +452,8 @@ struct vidow_output {
 	 * 拔线时 wlroots 已经把 wlr_output->name 收走了，那时候再按名字找就晚了。 */
 	struct vidow_output_memory *memory;
 	double viewport_x;          /* horizontal scroll offset of the column strip */
+	/* 上一次在这块屏上亮着的工作区（focus-workspace-previous / auto-back-and-forth） */
+	uint64_t prev_ws_id;
 	int64_t last_frame_ns;      /* last frame event, for the animation watchdog */
 
 

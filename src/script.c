@@ -454,8 +454,15 @@ static int l_workspace_list(lua_State *L) {
 		n++;
 		lua_pushinteger(L, n);
 		lua_newtable(L);
+		/* 没名字的动态工作区：name 是空串，序号（idx）才是它的「门牌」 */
 		lua_pushstring(L, vidow_workspace_name(ws));
 		lua_setfield(L, -2, "name");
+		lua_pushinteger(L, vidow_workspace_index(ws));
+		lua_setfield(L, -2, "idx");
+		lua_pushinteger(L, (lua_Integer)ws->id);
+		lua_setfield(L, -2, "id");
+		lua_pushboolean(L, ws->named);
+		lua_setfield(L, -2, "named");
 		lua_pushboolean(L, vidow_workspace_is_active(ws));
 		lua_setfield(L, -2, "active");
 		lua_pushboolean(L, vidow_workspace_is_visible(ws));
@@ -591,6 +598,9 @@ void vidow_config_sync(struct vidow_server *server) {
 	 * portals.conf 重新算一遍（内容没变的话什么都不做，不会白重启 portal）。 */
 	vidow_portal_desktop_env(&server->config);
 	vidow_portal_conf_sync(&server->config);
+	/* 配置里 vidow.workspace_create() 声明的具名工作区可能是在还没有屏的时候
+	 * 建的（output == NULL）：现在认领到第一块屏上，按声明顺序排在栈顶。 */
+	vidow_workspace_normalize(server);
 }
 
 static void script_apply(struct vidow_script *s) {

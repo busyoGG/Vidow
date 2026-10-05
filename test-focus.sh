@@ -537,7 +537,8 @@ check(re.search(r"activate serial [1-9]\d*（点击事件）", out("act-3.txt"))
 check("activation: 激活 演示" in b, "合成器收到了激活请求（xdg-activation）")
 check(re.search(r"激活: 演示 在藏起来的 2 上，先把它端出来", b) is not None,
 	"先把窗口那块工作区端出来")
-check(re.search(r"workspace: 切到 2", b) is not None, "工作区真的切过去了")
+check(re.search(r"workspace: 切到 \S+ 上的第 2 块", b) is not None,
+	"工作区真的切过去了")
 check(re.search(r"焦点: .* -> 演示", b) is not None, "焦点给了它")
 p = point_of("point-3.txt")
 check(near(pixel("s3-hidden", p), BLACK),

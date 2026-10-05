@@ -347,9 +347,9 @@ for n in ("1", "2", "3", "4"):
 check(re.search(r"config\.lua: active=1", wsA) is not None,
 	"起来之后活动工作区是 1")
 check("workspace: 建特殊工作区 scratch" in wsA, "特殊工作区是配置建的")
-check("workspace: 建工作区 4" in wsA and
-	("workspace: 建工作区 2" in wsA or "workspace: 自动建工作区 2" in wsA),
-	"四个普通工作区都建出来了（配置里的 1–4）")
+check("workspace: 建具名工作区 4（" in wsA and
+	"workspace: 建具名工作区 2（" in wsA,
+	"四个普通工作区都建出来了（配置里的 1–4，全是具名的）")
 for key in ("Mod+1", "Mod+2", "Mod+Shift+1", "Mod+grave", "Mod+Shift+grave",
 		"Mod+Tab"):
 	check(("keybind: %s ->" % key) in wsA,
@@ -357,10 +357,10 @@ for key in ("Mod+1", "Mod+2", "Mod+Shift+1", "Mod+grave", "Mod+Shift+grave",
 
 print()
 print("== 切工作区：只显示那一块 ==")
-check(re.search(r"workspace: 切到 2（\S+，本区 \d+ 列", wsB) is not None,
+check(re.search(r"workspace: 切到 \S+ 上的第 2 块\S*（本区 \d+ 列", wsB) is not None,
 	"切到工作区 2（动作走的是和键位同一个入口）")
 m = [x for x in re.finditer(
-	r"workspace: 切到 (\d+)（\S+，本区 (\d+) 列 / (\d+) 个窗口，全屏 (\d+) 个可见）",
+	r"workspace: 切到 \S+ 上的第 (\d+) 块\S*（本区 (\d+) 列 / (\d+) 个窗口，全屏 (\d+) 个可见）",
 	wsD) if x.group(1) == "2"]
 m = m[-1] if m else None
 check(m is not None, "再切回工作区 2")
@@ -369,7 +369,7 @@ if m:
 	check(int(m.group(3)) == 2, "工作区 2 里 2 个窗口都在（%s）" % m.group(3))
 	check(int(m.group(4)) == 2, "切过去之后全屏只有它那 %s 个可见" % m.group(4))
 m = [x for x in re.finditer(
-	r"workspace: 切到 (\d+)（\S+，本区 (\d+) 列 / (\d+) 个窗口，全屏 (\d+) 个可见）",
+	r"workspace: 切到 \S+ 上的第 (\d+) 块\S*（本区 (\d+) 列 / (\d+) 个窗口，全屏 (\d+) 个可见）",
 	wsC) if x.group(1) == "1"]
 m = m[-1] if m else None
 check(m is not None, "又切回了工作区 1")
@@ -398,7 +398,7 @@ if second is not None:
 	check(drawn(im_b, second) is True, "工作区 2 上 b2 画在第 2 列")
 	check(drawn(im_c, second) is False, "切回工作区 1 后 b2 不画（它属于 2）")
 # 再切回 2 时它的两列还在
-check(len([x for x in re.finditer(r"workspace: 切到 2（\S+，本区 2 列", wsD)]) >= 1,
+check(len([x for x in re.finditer(r"workspace: 切到 \S+ 上的第 2 块\S*（本区 2 列", wsD)]) >= 1,
 	"再切回工作区 2：两列都还在")
 
 print()
@@ -463,7 +463,7 @@ check(keep is not None and drawn(im_back, keep) is True,
 check(blank(im_back, second_half) is True,
 	"切回工作区 1 后第 2 列还是空的（搬过来的那块藏起来了）")
 m = [x for x in re.finditer(
-	r"workspace: 切到 1（\S+，本区 (\d+) 列 / (\d+) 个窗口，全屏 (\d+) 个可见）",
+	r"workspace: 切到 \S+ 上的第 1 块\S*（本区 (\d+) 列 / (\d+) 个窗口，全屏 (\d+) 个可见）",
 	hot2)]
 m = m[-1] if m else None
 check(m is not None and int(m.group(3)) == 1,

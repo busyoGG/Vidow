@@ -27,7 +27,9 @@ static void spawn(const char *cmd) {
 /* `shift` comes from the modifier mask: some input paths (virtual keyboards)
  * report the unshifted keysym even while Shift is held. */
 static bool handle_keybinding(struct vidow_server *server, xkb_keysym_t sym,
-		bool shift) {
+		uint32_t mods) {
+	bool shift = (mods & WLR_MODIFIER_SHIFT) != 0;
+	bool ctrl = (mods & WLR_MODIFIER_CTRL) != 0;
 	sym = xkb_keysym_to_lower(sym);
 	switch (sym) {
 	case XKB_KEY_Escape:
@@ -86,6 +88,17 @@ static bool handle_keybinding(struct vidow_server *server, xkb_keysym_t sym,
 	case XKB_KEY_o: /* niri 风格的全景：整条列带缩小铺满这块屏 */
 		vidow_overview_toggle(server);
 		return true;
+	/* 工作区（niri 的默认键位）：Mod+U/I 上下切、Mod+Shift+U/I 把窗口搬过去、
+	 * Mod+Ctrl+U/I 整块工作区重排。工作区是「每块屏一份、栈底永远空一块」，
+	 * 所以上下切就是最常用的操作；数字键直跳写在默认配置里（可删）。 */
+	case XKB_KEY_u:
+		vidow_action_run(server, ctrl ? "move-workspace down" :
+			(shift ? "move down" : "workspace down"));
+		return true;
+	case XKB_KEY_i:
+		vidow_action_run(server, ctrl ? "move-workspace up" :
+			(shift ? "move up" : "workspace up"));
+		return true;
 	case XKB_KEY_f:
 		if (server->focused != NULL) {
 			vidow_view_toggle_fullscreen(server->focused);
@@ -129,8 +142,7 @@ static void keyboard_key(struct wl_listener *listener, void *data) {
 	/* 1) 内置键位：进 overview、退出合成器、关窗、丢给布局的那些。 */
 	if ((mods & MOD_KEY) && event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
 		for (int i = 0; i < nsyms; i++) {
-			handled = handle_keybinding(server, syms[i],
-				(mods & WLR_MODIFIER_SHIFT) != 0) || handled;
+			handled = handle_keybinding(server, syms[i], mods) || handled;
 		}
 	}
 	/* 2) config.lua 里 vidow.bind() 声明的键位：工作区切换 / 特殊工作区 / 搬家。

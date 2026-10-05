@@ -515,6 +515,12 @@ static void view_ensure_column(struct vidow_server *server,
 
 	view->column = col;
 	wl_list_insert(col->views.prev, &view->column_link);
+	/* 落在栈底那块空的上了：它就是「新工作区」，底下再补一块（niri 的「窗口开
+	 * 在最后一块空工作区上时，下面立刻出现一块新的」）。要在列真的挂进工作区
+	 * 之后再判 —— 不然这时候它还是「空的」。 */
+	if (!ws->special && ws->output != NULL) {
+		vidow_workspace_ensure_bottom(server, ws->output);
+	}
 }
 
 static void view_leave_column(struct vidow_view *view) {
@@ -1938,6 +1944,8 @@ static void view_unmap(struct wl_listener *listener, void *data) {
 		/* 浮窗离开工作区；列里的窗口跟着列，不用记账。 */
 		vidow_workspace_track(view->ws, view, false);
 	}
+	/* 窗口没了，它那块工作区可能就空了 —— 栈中间的空工作区该收掉（niri）。 */
+	vidow_workspace_cleanup(server);
 	view_snapshot_close(view);
 	wlr_scene_node_set_enabled(&view->scene_tree->node, false);
 	vidow_backdrop_damage(server, false);

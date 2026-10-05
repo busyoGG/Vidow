@@ -178,14 +178,27 @@ vidowmsg set-config gaps_left -1            # 左边界回到「跟随统一值�
 特殊工作区：**不进工作区列表**，打开时显示在聚焦的那块屏上，独占那块屏。
 ```
 
+**每块屏各自一份工作区栈**（niri 的模型）：序号 = 在这块屏上从上往下第几块，序号是
+**位置**不是身份（搬走一块，后面的序号跟着变）。三条不变量：
+
+* **栈底永远留着一块空的**：窗口开在它上面，底下立刻再补一块；
+* 中间那些**空的、没名字的**工作区，切走就自动消失；
+* **具名工作区**（配置里 `vidow.workspace_create("chat")`，或 `set-workspace-name`）永远
+  存在，空了也不消失，按声明顺序排在栈顶。
+
+所以一般**不用预先建工作区**：`Mod+U/I` 上下切、`Mod+3` 直接跳（序号越界夹到最后一块），
+用着用着就长出来了。想「往中间塞一块新的」：先在栈底那块空的上面开个窗口，再
+`Mod+Ctrl+I`（整块工作区往上挪）。
+
 | 概念 | 语义 |
 | --- | --- |
-| 普通工作区 | 配置里建（`vidow.workspace_create("1")`）。工作区是**全局**的一叠；`output` 字段只是「它现在住在哪块屏」 |
-| 新窗口落点 | 落在**现在显示着**的那块工作区。某块屏上还没有工作区时，先挑一块**空着**的挪过来（不抢别的屏上开着窗口的工作区）；都没有就现场建一块 |
-| 切换 | 藏旧的、亮新的，还原这块工作区的滚动位置和离开时的焦点 |
+| 序号寻址 | `workspace 3` = 这块屏上第 3 块（1 起，越界夹到最后一块）。**不按名字建**：具名工作区只在配置里建 |
+| 新窗口落点 | 落在**现在显示着**的那块工作区；落的是栈底那块空的，就再补一块空的 |
+| 切换 | 藏旧的、亮新的，还原这块工作区的滚动位置和离开时的焦点；离开的那块空了就收掉 |
 | 搬窗口 | 整条列（或浮窗）搬过去；搬进没显示的工作区 = 它不见了（还在跑），切过去才看得见 |
-| 每块屏各亮一块 | 两块屏可以同时亮着两块不同的工作区。拔掉一块屏时，它亮着的那块会跟过去接管剩下的屏（人跟着屏走） |
-| 特殊工作区 | 不绑屏、不进列表：打开时显示在**聚焦的那块屏**上（别的屏照旧显示各自的普通工作区）；再开一次收起，窗口留在里面，下次打开还在 |
+| 每块屏各亮一块 | 两块屏可以同时亮着两块不同的工作区，各有各的栈。拔掉一块屏时，它名下的工作区整块挪到剩下的屏上（追加在栈底那块空的前面），插回来再按归属认领回去 |
+| 整块换屏 | `move-workspace-to-output`：插到目标屏活动工作区后面，并在那边亮起来 |
+| 特殊工作区 | 不绑屏、不进列表、不进序号：打开时显示在**聚焦的那块屏**上（别的屏照旧显示各自的普通工作区）；再开一次收起，窗口留在里面，下次打开还在 |
 | 弹出物 | 不进工作区，跟父窗口走：父窗口所在的工作区被切走（或换成特殊工作区），菜单 / 候选框跟着收起来 |
 
 ### 配置怎么写
@@ -195,19 +208,21 @@ vidowmsg set-config gaps_left -1            # 左边界回到「跟随统一值�
 
 ```lua
 -- ~/.config/vidow/config.lua
-for i = 1, 9 do vidow.workspace_create(tostring(i)) end
+-- 具名工作区（想建才建：它们永远在，不会自己消失）
+vidow.workspace_create("chat")
 vidow.workspace_special("scratch")
 
-vidow.bind("Mod+1", "workspace 1")        -- 切过去
-vidow.bind("Mod+Shift+1", "move 1")       -- 把当前窗口搬过去
+for i = 1, 9 do
+  vidow.bind("Mod+" .. i, "workspace " .. i)       -- 切到这块屏上第 i 块（越界夹住）
+  vidow.bind("Mod+Shift+" .. i, "move " .. i)      -- 把当前窗口搬过去
+end
+vidow.bind("Mod+C", "workspace chat")      -- 按名字切
 vidow.bind("Mod+grave", "special scratch")       -- 开/关特殊工作区
 vidow.bind("Mod+Shift+grave", "move scratch")    -- 把当前窗口搬进特殊工作区
-vidow.bind("Mod+Tab", "workspace next")   -- 轮换
-vidow.bind("Mod+less", "workspace prev")
 
--- 状态栏 / 自己的选择器：只列普通工作区
+-- 状态栏 / 自己的选择器：只列普通工作区（没名字的动态工作区 name 是空串，用 idx）
 for _, ws in ipairs(vidow.workspace_list()) do
-  print(ws.name, ws.active, ws.visible, ws.views, ws.output)
+  print(ws.idx, ws.name, ws.named, ws.active, ws.views, ws.output)
 end
 ```
 
@@ -215,9 +230,14 @@ end
 
 | 动作 | 意思 |
 | --- | --- |
-| `workspace <名字>` / `workspace <n>` | 切到名字为 `<名字>`（或 `"<n>"`）的工作区，没有就给这块屏建一块 |
-| `workspace next` / `workspace prev` | 在这块屏的工作区之间轮换（按配置里的创建顺序） |
-| `move <名字>` | 把焦点窗口（列 / 浮窗）搬到那个工作区 |
+| `workspace <n>` | 切到这块屏上的第 `<n>` 块（1 起，越界夹到最后一块） |
+| `workspace <名字>` | 切到那块具名工作区（没建过就报错，不现建） |
+| `workspace up` / `down`（`next` / `prev` 同义） | 上/下切一块（到头就停住） |
+| `workspace previous` | 回到上一块切过的工作区 |
+| `move <n>` / `move <名字>` | 把焦点窗口（列 / 浮窗）搬到那块工作区 |
+| `move up` / `move down` | 搬到相邻的那块工作区 |
+| `move-workspace up` / `down` | 整块工作区在这块屏上上/下移一位 |
+| `workspace-name <名字>` | 给当前这块工作区起名（之后它就不会被自动收掉；不带参数 = 去掉名字） |
 | `special <名字>` | 开/关那个特殊工作区（名字没建过就现建） |
 | `focus <-1\|1>` | 焦点左/右移一列 |
 | `mousemove` | 把光标所在的那块屏当作「聚焦的屏」（特殊工作区跟的就是它） |
@@ -561,7 +581,11 @@ WLR_BACKENDS=headless WLR_HEADLESS_OUTPUTS=1 WLR_LIBINPUT_NO_DEVICES=1 ./build/v
 | `Mod+Enter` | 启动终端 |
 | `Mod+滚轮` | 焦点左/右移一列 |
 | `Mod+Escape` | 退出合成器 |
-| — | **工作区 / 特殊工作区的键位不预设**，由 `config.lua` 里 `vidow.bind()` 自己绑（见「工作区与特殊工作区」） |
+| `Mod+U` / `Mod+I` | 工作区上/下切一块（niri 的默认键位） |
+| `Mod+Shift+U` / `Mod+Shift+I` | 把当前窗口搬到上/下一块工作区 |
+| `Mod+Ctrl+U` / `Mod+Ctrl+I` | 整块工作区上/下移一位（重排） |
+| `Mod+1`…`Mod+9` | 切到这块屏上第 n 块（默认配置里给的绑定，可删；越界夹到最后一块） |
+| — | 特殊工作区 / 具名工作区的键位不预设，由 `config.lua` 里 `vidow.bind()` 自己绑 |
 
 鼠标左键点击窗口即聚焦并滚动到该列；点击 layer 表面（启动器）时按需交出键盘焦点。
 
@@ -2549,6 +2573,23 @@ protocols/     wlr-layer-shell / wlr-virtual-pointer / input-method-v2 /
      快门几十毫秒的延迟才不至于吃掉判据）。`test-openanim.sh` 锁 `open_easing = "linear"`
      + `open_scale_from = 1.0`：它测的是「动画期间画的是什么」，曲线一过冲，`u_progress`
      一上来就是 1.0，中段那帧就测不出「缩着」了。回归：21 个测试全过。
+
+120. **工作区换成 niri 那套：每块屏各自一份纵向工作区栈，动态增删**。序号 = 在那块屏上的
+     位置（1 起，`focus-workspace N` 越界夹到最后一块，**不再按名字现建**）；栈底永远留着
+     一块空的（窗口开在它上面就再补一块，`ensure_bottom`）；中间那些空的、没名字的工作区
+     切走就收掉（`cleanup`，niri 的 `clean_up_workspaces`）；具名工作区（配置里
+     `vidow.workspace_create()` / `set-workspace-name`）永远在、按声明顺序排栈顶。全局链表
+     按屏分组、组内按序号排（`ws_splice`：注意 `wl_list_insert(pos, elm)` 是插在 pos **之后**，
+     第一版搞反了，具名工作区跑到空工作区下面去了）。工作区还多了 `id`（稳定编号，IPC 用）
+     和 `idx`/`named` 字段；`name` 对动态工作区是空的（不再自动编号 —— 名字是身份，位置是
+     序号，两者不能混）。热插拔：拔线整块挪到剩下的屏、追加在栈底空位前面（`_safe` 遍历，
+     因为遍历时链表位置会变），插回来按 `home` 认领。新增 `move-workspace-up/down`（重排）、
+     `set-workspace-name`/`unset-workspace-name`、`focus-workspace-previous`、
+     `move-window-to-workspace-up/down`、`move-column-to-workspace`（niri 的名字）；
+     默认键位补上 niri 的 `Mod+U/I`（切）、`Mod+Shift+U/I`（搬窗口）、`Mod+Ctrl+U/I`（重排），
+     默认配置里给了 `Mod+1..9` 直跳的绑定（可删）。`test-workspace.sh` 的日志断言跟着新格式
+     改；`test-ipc.sh`/`test-focus.sh` 同步。回归：defaultconfig / gap / config / workspace /
+     ipc / focus / overview / hotplug / clipboard / layerwin / xwayland-popup 全过。
 
 118. **装饰按「可见窗口」画（niri 的 `size()` / `buf_loc()`），新增 `prefer_no_csd`**。
      客户端用 `xdg_surface.set_window_geometry` 声明的那块才是窗口：装饰矩形 / 离屏缓冲

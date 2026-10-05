@@ -28,7 +28,14 @@ struct wlr_output;
 
 struct vidow_workspace {
 	struct wl_list link;  /* vidow_server.workspaces */
+	struct vidow_server *server;
+	/* 稳定编号：工作区在屏上换位置、换屏都不变（niri 的 Workspace.id）。IPC 和
+	 * 「上一块工作区」都认它。 */
+	uint64_t id;
+	/* 名字：空 = 没名字（动态工作区）。有名字的（配置里 vidow.workspace_create()
+	 * 建的、或者 set-workspace-name 给的）空了也不消失 —— 这是 niri 的具名工作区。 */
 	char name[32];
+	bool named;
 
 	/* 特殊工作区：不进列表、不绑屏、跟随当前聚焦的屏。 */
 	bool special;
@@ -52,8 +59,12 @@ struct vidow_workspace {
 	int floats;
 };
 
-/* 建（或取）名字为 name 的普通工作区，归到 output 那块屏上；已经存在就原样返回。
- * name 为空时按屏自动编个号（"1"、"2"…）。 */
+/* 建（或取）一块普通工作区：
+ *   name 非空 —— 具名工作区（niri 的 named workspace）：永远存在，空了也不消失。
+ *                已经存在就返回它（**不搬家**：配置重载不该把用户手动挪到别的屏上
+ *                的工作区拽回来），只有它还没归属过屏时才认领 output。
+ *   name 为空 —— 没名字的动态工作区，插到那块屏的栈尾（底部那块「新工作区」位）。
+ * 配置声明顺序 = 在屏上的先后顺序（niri：具名工作区按声明顺序出现）。 */
 struct vidow_workspace *vidow_workspace_create(struct vidow_server *server,
 		const char *name, struct wlr_output *output);
 
@@ -140,6 +151,53 @@ bool vidow_workspace_is_special(const struct vidow_workspace *ws);
 bool vidow_workspace_is_active(const struct vidow_workspace *ws);
 bool vidow_workspace_is_visible(const struct vidow_workspace *ws);
 int vidow_workspace_view_count(const struct vidow_workspace *ws);
+
+/* --------------------------------------------------- 按屏的纵向工作区栈
+
+ * niri 的模型：**每块屏各自一份工作区栈**，序号 = 它在自己那块屏上的位置（1 起）。
+ * 不变量：
+ *   I1 每块屏上最多一块 active（普通）工作区；
+ *   I2 每块屏的最后一块永远是空的（「新工作区」位）—— 窗口落到它上面就再补一块；
+ *   I3 中间那些**空的、没名字的**工作区，切走以后自动消失（niri 的
+ *      clean_up_workspaces），具名工作区永远留着；
+ *   I4 全局链表按屏分组、组内按序号排列（这样遍历一遍就等于按屏看序号）。 */
+
+/* 这块屏上有几块普通工作区 / 第 idx 块（1 起，越界返回 NULL —— 调用方按 niri
+ * 的语义夹到最后一 块）。 */
+int vidow_workspace_count(struct vidow_server *server,
+		struct wlr_output *output);
+struct vidow_workspace *vidow_workspace_at(struct vidow_server *server,
+		struct wlr_output *output, int idx);
+/* 它在自己那块屏上的序号（1 起）；没屏 / 特殊工作区 = 0。 */
+int vidow_workspace_index(const struct vidow_workspace *ws);
+/* 这块屏上现在亮着的那块（没有就挑第一块亮起来，一块都没有就建一块）。 */
+struct vidow_workspace *vidow_workspace_active_for(struct vidow_server *server,
+		struct wlr_output *output);
+
+/* 切到「那块屏上的第 idx 块」（夹到最后一 块，niri 的 focus-workspace N）。 */
+bool vidow_workspace_focus_index(struct vidow_server *server,
+		struct wlr_output *output, int idx);
+/* 上下切一块（±1，夹住）。 */
+bool vidow_workspace_focus_step(struct vidow_server *server, int direction);
+/* 回到上一块工作区（focus-workspace-previous）。 */
+bool vidow_workspace_focus_previous(struct vidow_server *server);
+/* 整块工作区在它那块屏上上/下移一位（niri 的 move-workspace-up/down）。 */
+bool vidow_workspace_move_step(struct vidow_server *server,
+		struct vidow_workspace *ws, int direction);
+/* 给工作区起名 / 去掉名字（set-workspace-name / unset-workspace-name）。 */
+bool vidow_workspace_set_name(struct vidow_server *server,
+		struct vidow_workspace *ws, const char *name);
+
+/* 底部那块「新工作区」位：最后一块不空了就再补一块没名字的空工作区（I2）。 */
+void vidow_workspace_ensure_bottom(struct vidow_server *server,
+		struct wlr_output *output);
+/* 中间那些空的、没名字的、不是当前亮着的工作区 → 删掉（I3）。 */
+void vidow_workspace_cleanup(struct vidow_server *server);
+/* 把还没归属过屏的具名工作区认领到这块屏上（配置先跑、屏后到的情形）。 */
+void vidow_workspace_adopt_homeless(struct vidow_server *server,
+		struct wlr_output *output);
+/* 配置跑完之后调一遍：认领没归属的、每块屏补底部空位、收掉中间空块。 */
+void vidow_workspace_normalize(struct vidow_server *server);
 
 bool vidow_workspace_init(struct vidow_server *server);
 

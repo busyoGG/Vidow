@@ -336,7 +336,12 @@ void vidow_ipc_json_workspace(struct jbuf *b, struct vidow_server *server,
 		return;
 	}
 	jb_obj(b);
-	jb_kv_str(b, "name", ws->name);
+	jb_kv_int(b, "id", (long long)ws->id);
+	/* 序号 = 它在自己那块屏上的位置（1 起）—— 就是 `focus-workspace N` 里的 N。
+	 * 特殊工作区没有位置，报 0。 */
+	jb_kv_int(b, "idx", vidow_workspace_index(ws));
+	jb_kv_bool(b, "named", ws->named);
+	jb_kv_str(b, "name", ws->name[0] != '\0' ? ws->name : NULL);
 	jb_kv_bool(b, "special", ws->special);
 	jb_kv_bool(b, "active", ws->active);
 	jb_kv_bool(b, "visible", ws->visible);

@@ -929,4 +929,27 @@ void vidow_config_default_lua(FILE *out) {
 	if (section >= 0) {
 		print_section_groups(f, &cfg, section);
 	}
+
+	fputs(
+"\n"
+"-- ================== 工作区（niri 那套：动态、按屏、按序号）\n"
+"--\n"
+"-- 每块屏各自一份纵向的工作区栈，序号 = 在这块屏上从上往下第几块。栈底永远是\n"
+"-- 一块空的：窗口开在它上面，底下立刻再补一块；中间那些空的、没名字的，切走就\n"
+"-- 自动消失。所以**不用预先建工作区**，直接切就行（序号越界会夹到最后一块）。\n"
+"--\n"
+"-- 想要「永远在、空了也不消失」的工作区，就用具名工作区（niri 的 named\n"
+"-- workspace），它在屏上的位置按声明顺序排，底部那块空的永远在最后：\n"
+"--\n"
+"--     vidow.workspace_create(\"chat\")             -- 建一块叫 chat 的（永远在）\n"
+"--     vidow.bind(\"Mod+C\", \"workspace chat\")      -- 切过去\n"
+"--     vidow.bind(\"Mod+Shift+C\", \"move chat\")     -- 把当前窗口搬进去\n"
+"--\n"
+"-- 内置键位：Mod+U / Mod+I 上下切工作区，Mod+Shift+U/I 把窗口搬到上/下一块，\n"
+"-- Mod+Ctrl+U/I 整块工作区上下重排。下面 18 行是「数字键直跳」的绑定，不想要\n"
+"-- 就删掉（工作区是动态的，Mod+3 会夹到当前最后一块，用着用着就长出来了）。\n"
+"for i = 1, 9 do\n"
+"\tvidow.bind(\"Mod+\" .. i, \"workspace \" .. i)\n"
+"\tvidow.bind(\"Mod+Shift+\" .. i, \"move \" .. i)\n"
+"end\n", f);
 }

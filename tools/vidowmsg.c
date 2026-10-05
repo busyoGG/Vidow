@@ -57,8 +57,11 @@ static void usage(void) {
 "      focus-window-direction -1|1 / move-window-direction -1|1\n"
 "列：  focus-column -1|1 / move-column -1|1 / cycle-column-width /\n"
 "      set-column-width 0.5 / expand-column-to-available-width / center-column\n"
-"工作区：focus-workspace 名字|next|prev / toggle-special [名字] /\n"
-"      move-workspace-to-output 工作区 输出 / create-workspace [名字]\n"
+"工作区：focus-workspace 序号|名字|next|prev|previous / focus-workspace-previous /\n"
+"      toggle-special [名字] / create-workspace [名字] /\n"
+"      move-workspace-up|down [序号|名字] / set-workspace-name 名字 [序号|名字] /\n"
+"      unset-workspace-name [序号|名字] / move-window-to-workspace-up|down /\n"
+"      move-column-to-workspace 序号|名字 / move-workspace-to-output 工作区 输出\n"
 "输出：output-power 输出 on|off|toggle / output-scale 输出 1.5|auto /\n"
 "      output-transform 输出 normal|90|… / output-mode 输出 宽 高 [刷新率] /\n"
 "      output-position 输出 x y / output-focus 输出\n"
@@ -131,6 +134,13 @@ static const char *positional_key(const char *cmd, int index) {
 		{ "move-window-to-special", { "name", NULL } },
 		{ "move-window-to-output", { "output", NULL } },
 		{ "move-workspace-to-output", { "workspace", "output", NULL } },
+		{ "move-workspace-up", { "workspace", NULL } },
+		{ "move-workspace-down", { "workspace", NULL } },
+		{ "set-workspace-name", { "name", "workspace", NULL } },
+		{ "unset-workspace-name", { "workspace", NULL } },
+		{ "move-window-to-workspace-up", { NULL } },
+		{ "move-window-to-workspace-down", { NULL } },
+		{ "move-column-to-workspace", { "workspace", NULL } },
 		{ "set-window-size", { "width", "height", NULL } },
 		{ "set-window-position", { "x", "y", NULL } },
 		{ "set-window-force-render", { "on", NULL } },
