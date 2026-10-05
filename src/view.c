@@ -1426,6 +1426,14 @@ void vidow_view_output_gone(struct vidow_server *server,
 		struct vidow_output *fallback) {
 	struct wlr_output *to = fallback != NULL ? fallback->wlr_output : NULL;
 
+	/* overview 是锁着一块屏的（每帧都按那块屏的工作区算缩放和相机）：它锁的
+	 * 那块屏没了就把 overview 收掉，不然下一帧就在读已经释放的屏。先把 output
+	 * 清掉再收 —— 收的过程里那几帧走 overview_apply() 的 output == NULL 分支。 */
+	if (server->overview.output == dead) {
+		server->overview.output = NULL;
+		vidow_overview_exit(server);
+	}
+
 	size_t on_screen_cols = 0, on_screen_views = 0;
 	count_output_columns(server, dead, &on_screen_cols, &on_screen_views);
 

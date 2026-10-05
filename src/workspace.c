@@ -326,12 +326,18 @@ static void ws_set_output_full(struct vidow_server *server,
 		ws->home = vidow_output_memory_for(&server->output_memories,
 			output->name);
 	}
-	if (output == NULL) {
-		return;
-	}
+	/* 列 / 列里的窗口跟着工作区换屏 —— **output == NULL 时也要清**。
+	 * 以前这里提前 return，于是「最后一块屏也没了」的时候（关掉嵌套会话的窗口、
+	 * 拔掉唯一一块显示器），列和列里的窗口继续指着那块已经被释放的屏：IPC 里
+	 * 输出名是一串乱码，之后谁读 view->output / col->output 谁拿到垃圾，XWayland
+	 * 的 X 屏幕也跟着变成 0x0 —— X11 客户端看不见也点不动（用户报的
+	 * 「xwayland 无法点击交互」就是这条路）。清成 NULL：那块屏回来时按 home 认领。 */
 	struct vidow_column *col;
 	wl_list_for_each(col, &ws->columns, link) {
 		column_set_output(col, output);
+	}
+	if (output == NULL) {
+		return; /* 没屏了：下面浮窗那段要按新屏原点算平移，没屏没什么可算的 */
 	}
 	/* 浮窗（不在列里）跟着工作区走：换屏时按两块屏原点的差平移，别让它留在
 	 * 上一块屏的坐标上（工作区换屏不该把它弄丢或者甩到屏外）。 */

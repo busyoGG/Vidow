@@ -151,6 +151,16 @@ static void xwayland_ready(struct wl_listener *listener, void *data) {
 			layout.width, layout.height, server->xwayland_scale,
 			(int)lround(layout.width * server->xwayland_scale),
 			(int)lround(layout.height * server->xwayland_scale));
+		if (layout.width < 1 || layout.height < 1) {
+			/* X 屏幕的大小 = 输出的并集：一块屏都没有时它就是 0x0，X11 客户端
+			 * 会看不见、点不动（用户看到的就是「XWayland 点不动」，见
+			 * README「X 屏幕 0x0」那条）。这里必须明说，不然人只会去查
+			 * 输入，查半天是会话里一块屏都没有。 */
+			wlr_log(WLR_ERROR,
+				"xwayland: 现在一块屏都没有（布局 0x0）→ X 屏幕 0x0，X11 客户端"
+				"看不见也点不动。先给 vidow 一块屏：嵌套跑的话别把它的窗口关了；"
+				"真机上就是显示器全拔了。");
+		}
 	}
 
 	struct vidow_output *output;

@@ -538,6 +538,7 @@ python3 test-float.py        # 三个真实 GTK 窗口，验证浮动模式自�
 ./test-bounce.sh                     # 入场过冲 / 关闭回弹（q 弹曲线真的落到屏幕上了，5 项断言）
 ./test-closeanim.sh                  # 关闭动画：默认曲线下还看得见 + 不带窗口装饰（12 项断言）
 ./test-focusclose.sh                 # 关窗口后焦点落谁身上：右边最近的顶上（21 项断言）
+./test-lastoutput.sh                  # 屏没了不许留野指针（拔一块 / 最后一块没了，15 项断言）
 ./test-drag.sh                       # 拖窗口：拖得动 / 跨屏改归属 / 平铺按落点插入（11 项）
 ./test-ws-dynamic.sh                 # 动态工作区：栈底空位 / 空了就收 / 序号夹住 / 具名永存（9 项）
 ./test-dpi.sh                        # 混合 DPI + XWayland：装饰缓冲按**窗口几何**算（见 SSD 那节）
@@ -2596,6 +2597,32 @@ protocols/     wlr-layer-shell / wlr-virtual-pointer / input-method-v2 /
      默认配置里给了 `Mod+1..9` 直跳的绑定（可删）。`test-workspace.sh` 的日志断言跟着新格式
      改；`test-ipc.sh`/`test-focus.sh` 同步。回归：defaultconfig / gap / config / workspace /
      ipc / focus / overview / hotplug / clipboard / layerwin / xwayland-popup 全过。
+
+127. **屏没了（尤其是「最后一块也没了」）之后，列和列里的窗口留着野指针** —— 用户报的
+     「xwayland 无法点击交互，但 CSD 区域可以拖拽（测试的是微信）」就是这条路。
+     他们的 vidow 是嵌套跑的（WLR_BACKENDS=wayland）：把 vidow 那个窗口关掉 = 外层那块
+     wl_output 没了 = vidow 唯一的屏没了。日志里只有一句
+     `hotplug: 拔掉 WL-1（3 列 / 3 个窗口 / 0 个浮动窗口），先挪到 (没有屏了) 上住`，
+     之后布局就是 0x0，XWayland 的 X 屏幕跟着变成 **0x0** —— X11 客户端看不见也点不动
+     （X 屏幕多大 = 输出的并集，一块屏都没有时就是 0x0）。这不是输入路径的 bug：
+     拿 xev 量过，健康的 vidow 里 X11 客户端在 1 倍 / 2 倍输出下都能收到点击、局部坐标
+     也对（(布局-原点)×xwayland_scale）。
+     真正的 bug 在 `ws_set_output_full()`（`src/workspace.c`）：
+         if (output == NULL) return;                      ← 提前返回
+         wl_list_for_each(col, &ws->columns, link) column_set_output(col, output);
+     工作区「现在没有屏」的时候直接 return 了，于是列和列里的窗口的 output 继续指着那块
+     **已经被释放**的 wlr_output：`vidowmsg windows` 的 output 字段是一串乱码
+     （用户那边是 `p\xc4ş\x04V`，我们的复现里每次都不同 —— 典型的野指针），工作区列表
+     里也一样，之后谁读 `view->output` / `col->output` 谁拿到垃圾。修法：先让列跟着
+     工作区换屏（NULL 也要清），浮窗那段（要按新屏原点算平移）才 return。
+     另外两处顺手补上：① overview 锁着的那块屏没了就把它收掉（不然下一帧在读已经释放的
+     屏）② XWayland 起来时要是布局是 0x0，明确报一行「一块屏都没有 → X11 客户端看不见也
+     点不动」—— 不然人只会去查输入路径。
+     新增 `./test-lastoutput.sh`（15 项）：①两块屏各一个窗口，真 `wlr_output_destroy` 拔掉
+     一块 → 挪过来的窗口 output 必须是活着的那个名字（不是乱码）、插回来再认领回去
+     ②嵌套会话：外层窗口关掉（最后一块屏没了）→ 每个窗口 output 是 null、工作区 output 是
+     null 但 home 还记得那块屏、记忆里 present=false、日志明说 X 屏幕 0x0，全程不崩。
+     第②组的「output 是乱码」那条拿修之前的二进制跑必挂。
 
 126. **关掉一个窗口之后，焦点落到「右边最近的那个」**（niri 的规矩：位置不动，谁滑到空出来
      的位置上就是谁）。原来只处理了一半：列里还有窗口时看**下面**那个（`column_link.next`），
