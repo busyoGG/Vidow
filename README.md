@@ -539,6 +539,7 @@ python3 test-float.py        # 三个真实 GTK 窗口，验证浮动模式自�
 ./test-closeanim.sh                  # 关闭动画：默认曲线下还看得见 + 不带窗口装饰（12 项断言）
 ./test-focusclose.sh                 # 关窗口后焦点落谁身上：右边最近的顶上（21 项断言）
 ./test-lastoutput.sh                  # 屏没了不许留野指针（拔一块 / 最后一块没了，15 项断言）
+./test-actsurface.sh                  # 激活令牌攥着的 surface 先没了也不能崩（8 项断言）
 ./test-drag.sh                       # 拖窗口：拖得动 / 跨屏改归属 / 平铺按落点插入（11 项）
 ./test-ws-dynamic.sh                 # 动态工作区：栈底空位 / 空了就收 / 序号夹住 / 具名永存（9 项）
 ./test-dpi.sh                        # 混合 DPI + XWayland：装饰缓冲按**窗口几何**算（见 SSD 那节）
@@ -2597,6 +2598,23 @@ protocols/     wlr-layer-shell / wlr-virtual-pointer / input-method-v2 /
      默认配置里给了 `Mod+1..9` 直跳的绑定（可删）。`test-workspace.sh` 的日志断言跟着新格式
      改；`test-ipc.sh`/`test-focus.sh` 同步。回归：defaultconfig / gap / config / workspace /
      ipc / focus / overview / hotplug / clipboard / layerwin / xwayland-popup 全过。
+
+128. **激活令牌攥着的 surface 先没了 → wlroots 断言 → SIGABRT**（用户的会话就这么被带走的：
+     `vidow: types/wlr_compositor.c:736: surface_handle_resource_destroy: Assertion
+     \`wl_list_empty(&surface->events.destroy.listener_list)' failed.`）。
+     `src/activation.c` 里两处把监听器挂到客户端 `wlr_surface->events.destroy` 上
+     （造令牌的 `build_handle_set_surface`、令牌本身的 `build_handle_commit`），回调
+     `token_surface_gone()` / `build_surface_gone()` 只把 surface 清成 NULL、把「挂过监听」
+     的标志清成 false，**没把自己从那条信号上摘下来**。wlroots 在 surface 资源销毁时是先
+     `wl_signal_emit_mutable(&surface->events.destroy)` 再断言链表已空 —— 于是 emit 完
+     我们的 link 还在，直接 abort。修法：两个回调里都 `wl_list_remove(&...->surface_destroy.link)`
+     （在信号回调里摘自己那条 link 是 libwayland 明确支持的用法）。
+     用户那边触发它的正是微信：启动时请求激活（令牌上 set_surface 指着自己的登录窗，
+     日志里 `焦点: wm-b -> 微信` 就是它被兑现了），随后登录窗销毁 → 断言炸。
+     新增 `./test-actsurface.sh`（8 项）：给 `tools/activate.c` 加了 `--drop-surface=<秒>`
+     （用令牌请求激活之后把窗口表面销毁、客户端**不断开连接**）→ 断言合成器不崩、日志里
+     没有那条断言、IPC 还通、之后还能开窗口、客户端断开也不崩。拿修之前的二进制跑，
+     复现出的是**一模一样**的那行断言。
 
 127. **屏没了（尤其是「最后一块也没了」）之后，列和列里的窗口留着野指针** —— 用户报的
      「xwayland 无法点击交互，但 CSD 区域可以拖拽（测试的是微信）」就是这条路。

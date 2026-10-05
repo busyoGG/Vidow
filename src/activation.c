@@ -107,11 +107,18 @@ static void token_client_gone(struct wl_listener *listener, void *data) {
 	token_free(token);
 }
 
-/* set_surface 那个 surface 没了：兜底路径没了而已，令牌照旧有效。 */
+/* set_surface 那个 surface 没了：兜底路径没了而已，令牌照旧有效。
+ *
+ * 必须**把自己从这条信号上摘掉**：wlroots 在 wlr_surface 的资源销毁时是先
+ * `wl_signal_emit_mutable(&surface->events.destroy)` 再断言「监听器链表已经空了」
+ * （wlr_compositor.c 的 surface_handle_resource_destroy）。回调里不摘 link 就
+ * 直接 SIGABRT —— 微信那个登录窗转主窗的时候就是这么把合成器带走的：
+ * 它先请求了激活（令牌攥着登录窗的 surface），随后登录窗销毁 → 断言炸。 */
 static void token_surface_gone(struct wl_listener *listener, void *data) {
 	struct vidow_activation_token *token =
 		wl_container_of(listener, token, surface_destroy);
 	(void)data;
+	wl_list_remove(&token->surface_destroy.link);
 	token->surface = NULL;
 	token->surface_listener_added = false;
 }
@@ -142,10 +149,14 @@ static void token_surface_gone(struct wl_listener *listener, void *data) {
 
 /* ------------------------------------------------- 令牌：客户端那个对象 */
 
+/* 令牌还在造（set_surface 之后、commit 之前）surface 就没了：清掉兜底路径。
+ * 和 token_surface_gone 一样，link 得自己摘 —— 不摘就是 wlroots 那条断言
+ * （surface 资源销毁时监听器链表必须为空）。 */
 static void build_surface_gone(struct wl_listener *listener, void *data) {
 	struct vidow_token_build *build =
 		wl_container_of(listener, build, surface_destroy);
 	(void)data;
+	wl_list_remove(&build->surface_destroy.link);
 	build->surface = NULL;
 	build->surface_listener_added = false;
 }

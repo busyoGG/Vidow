@@ -13,6 +13,9 @@
  *   --serial=none   根本不调 set_serial（协议允许，wlroots 放行）
  *   --before-map    窗口还没上屏就先请求激活（客户端 commit 出表面、还没交第一帧
  *                   就请求 —— 合成器得把这个请求记着，等窗口出来再兑现）
+ *   --drop-surface=<秒>  用令牌之后，把这个窗口的表面销毁掉（客户端还活着）：
+ *                   令牌上 set_surface 指的 surface 先没了，合成器不能崩
+ *                   （wlroots 在 surface 资源销毁时会断言 destroy 监听器链表为空）
  *
  * 输出（一行一条，方便断言）：
  *   activate ready <毫秒>                    窗口上屏了
@@ -77,6 +80,9 @@ static bool before_map;
 /* 令牌上不带 set_surface —— 真实的通知守护进程就是这么干的：它只是把令牌塞进
  * 子进程的环境变量，被激活的 surface 由应用自己在 activate 里给。 */
 static bool no_token_surface;
+/* 用令牌之后过几毫秒把这个窗口的表面销毁掉（-1 = 不销毁）。客户端不断开连接。 */
+static int drop_ms = -1;
+static bool dropped;
 static char token_saved[64];
 static struct timespec start;
 
@@ -205,6 +211,26 @@ static void make_token(void) {
 		fflush(stdout);
 	}
 	xdg_activation_token_v1_commit(token);
+}
+
+/* 把窗口的表面销毁掉，客户端**不断开连接**：令牌上 set_surface 指的就是它，
+ * 合成器得受得住「令牌还在、它指的 surface 没了」。 */
+static void drop_surface(void) {
+	dropped = true;
+	if (toplevel != NULL) {
+		xdg_toplevel_destroy(toplevel);
+		toplevel = NULL;
+	}
+	if (xdg_surface != NULL) {
+		xdg_surface_destroy(xdg_surface);
+		xdg_surface = NULL;
+	}
+	if (surface != NULL) {
+		wl_surface_destroy(surface);
+		surface = NULL;
+	}
+	printf("activate surface-dropped %d\n", ms_since_start());
+	fflush(stdout);
 }
 
 /* ------------------------------------------------------------- 指针事件 */
@@ -414,6 +440,8 @@ int main(int argc, char *argv[]) {
 			before_map = true;
 		} else if (strcmp(argv[argi], "--no-token-surface") == 0) {
 			no_token_surface = true;
+		} else if (strncmp(argv[argi], "--drop-surface=", 15) == 0) {
+			drop_ms = atoi(argv[argi] + 15) * 1000;
 		}
 	}
 	clock_gettime(CLOCK_MONOTONIC, &start);
@@ -508,6 +536,10 @@ int main(int argc, char *argv[]) {
 		if (ready && token_ready && !activated &&
 				ms_since_start() >= delay_ms) {
 			use_token();    /* 到点：拿令牌去请求激活（相当于「点了通知」） */
+			wl_display_flush(display);
+		}
+		if (drop_ms >= 0 && !dropped && ms_since_start() >= drop_ms) {
+			drop_surface();
 			wl_display_flush(display);
 		}
 	}
