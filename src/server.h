@@ -233,7 +233,8 @@ struct vidow_anim {
 	int64_t duration_ns;
 	const char *tag; /* for logs */
 	enum vidow_easing easing;
-	void (*update)(void *data, double t);
+	/* t = 曲线值（可能过冲，位移/缩放用它），linear = 线性进度（单调，透明度用它）*/
+	void (*update)(void *data, double t, double linear);
 	void (*done)(void *data, bool cancelled);
 	void *data;
 	int ticks;      /* update() calls so far */
@@ -1232,7 +1233,7 @@ void vidow_configwatch_finish(struct vidow_server *server);
 int64_t vidow_now_ns(void);
 struct vidow_anim *vidow_anim_start(struct vidow_server *server,
 		const char *tag, int duration_ms, enum vidow_easing easing,
-		void (*update)(void *data, double t),
+		void (*update)(void *data, double t, double linear),
 		void (*done)(void *data, bool cancelled), void *data);
 void vidow_anim_cancel(struct vidow_anim *anim);
 void vidow_anim_tick(struct vidow_server *server);
@@ -1359,8 +1360,8 @@ struct vidow_fx_geo vidow_view_fx_geo(const struct vidow_view *view);
 void vidow_closing_start(struct vidow_server *server,
 		struct wlr_scene_tree *parent, struct wlr_buffer *snapshot,
 		const struct vidow_fx_geo *geo, int x, int y, int w, int h,
-		int duration_ms, int slide_px, const char *shader_name, double scale,
-		enum vidow_easing easing, double anim_scale_to);
+		int duration_ms, int slide_px, bool decorate, const char *shader_name,
+		double scale, enum vidow_easing easing, double anim_scale_to);
 
 /* ------------------------------------------------------------------ layout */
 

@@ -2200,18 +2200,22 @@ void vidow_layer_blur_release(struct vidow_layer_surface *ls) {
 	}
 }
 
-static void closing_update(void *data, double t) {
+static void closing_update(void *data, double t, double linear) {
 	struct vidow_closing *closing = data;
 	struct vidow_config *cfg = &closing->server->config;
 
-	/* 回弹的曲线让 t 稍微越过 1：位移和缩放跟着过冲（那才是回弹），透明度
-	 * 不行 —— 负的 alpha 在场景节点上没定义。 */
-	closing->alpha = 1.0 + (cfg->close_alpha_to - 1.0) * t;
+	/* 透明度走**线性进度**，不走曲线：过冲的曲线（out_elastic 在 t≈0.26 就
+	 * 到 1、t≈0.45 冲到 1.09）喂给「1 → close_alpha_to」这条斜坡，透明度在动画
+	 * 头 1/4 就掉到 0 并夹住 —— 剩下的 3/4 只在动位移和缩放，屏幕上什么都没有，
+	 * 看起来就是「没有关闭动画」（默认配置 close_easing = out_elastic、140ms，
+	 * 实际可见时间只有 35ms）。位移和缩放照旧用曲线，q 弹还在。 */
+	closing->alpha = 1.0 + (cfg->close_alpha_to - 1.0) * linear;
 	if (closing->alpha < 0.0) {
 		closing->alpha = 0.0;
 	} else if (closing->alpha > 1.0) {
 		closing->alpha = 1.0;
 	}
+	/* 回弹的曲线让 t 稍微越过 1：位移和缩放跟着过冲（那才是回弹）。 */
 	closing->off_y = (double)closing->slide_px * t;
 	closing->fx.anim_scale = 1.0 + (closing->anim_scale_to - 1.0) * t;
 	closing->fx.progress = t;
@@ -2256,8 +2260,8 @@ static void closing_done(void *data, bool cancelled) {
 void vidow_closing_start(struct vidow_server *server,
 		struct wlr_scene_tree *parent, struct wlr_buffer *snapshot,
 		const struct vidow_fx_geo *geo, int x, int y, int w, int h,
-		int duration_ms, int slide_px, const char *shader_name, double scale,
-		enum vidow_easing easing, double anim_scale_to) {
+		int duration_ms, int slide_px, bool decorate, const char *shader_name,
+		double scale, enum vidow_easing easing, double anim_scale_to) {
 	if (snapshot == NULL || duration_ms <= 0 || w <= 0 || h <= 0) {
 		return;
 	}
@@ -2302,8 +2306,15 @@ void vidow_closing_start(struct vidow_server *server,
 	wlr_scene_buffer_set_dest_size(closing->node, w, h);
 
 	/* Decorate the outgoing window too, but never blur behind it: the scene it
-	 * would sample is already changing underneath. */
-	if (vidow_fx_begin(server, &closing->fx, parent, shader_name)) {
+	 * would sample is already changing underneath.
+	 *
+	 * layer surface 的快照不装饰（decorate = false）：装饰是**窗口**才有的东西
+	 * （vidow 给窗口画边框 / 阴影 / 圆角），layer 自己就是内容、形状由客户端画。
+	 * 给面板的快照套上窗口装饰，淡出的尾巴上就剩一圈「比面板大一点的空心矩形」
+	 * —— 面板自己那点半透明在模糊底衬上本来就没什么对比，先看不见了；边框和阴影
+	 * 压在没糊过的壁纸上反而更显眼（阴影还往面板外扩 shadow_radius 那圈）。开
+	 * 动画那边本来就没装饰，这样两边也一致。 */
+	if (decorate && vidow_fx_begin(server, &closing->fx, parent, shader_name)) {
 		closing->fx.blur = false;
 		if (shader_name != NULL && shader_name[0] != '\0') {
 			closing->fx.phase = VIDOW_SHADER_CLOSE;

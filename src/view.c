@@ -880,7 +880,8 @@ struct vidow_view *vidow_view_from_surface(struct vidow_server *server,
 	return NULL;
 }
 
-static void view_move_update(void *data, double t) {
+static void view_move_update(void *data, double t, double linear) {
+	(void)linear;
 	struct vidow_view *view = data;
 	view->anim_off_x = view->anim_from_x * (1.0 - t);
 	view->anim_off_y = view->anim_from_y * (1.0 - t);
@@ -898,11 +899,16 @@ static void view_move_done(void *data, bool cancelled) {
 	vidow_view_apply_anim(view);
 }
 
-static void view_open_update(void *data, double t) {
+static void view_open_update(void *data, double t, double linear) {
+	(void)linear;
 	struct vidow_view *view = data;
 	struct vidow_config *cfg = &view->server->config;
 	/* 回弹的曲线会过冲（t 稍微越过 1）：位移和缩放跟着过冲才是回弹，透明度
-	 * 不行 —— 负的 alpha 在场景节点上没定义。 */
+	 * 不行 —— 负的 alpha 在场景节点上没定义。
+	 *
+	 * 入场这里透明度**照旧跟曲线走**：过冲只会让它提前到 1（早点变成不透明），
+	 * 没有「提前结束」的问题。关闭那边正好反过来 —— 斜坡是 1 → close_alpha_to，
+	 * 过冲等于提前结束，所以那边必须用线性进度（见 fx.c 的 closing_update）。 */
 	view->anim_alpha = cfg->open_alpha_from +
 		(1.0 - cfg->open_alpha_from) * t;
 	if (view->anim_alpha < 0.0) {
@@ -1033,7 +1039,7 @@ static void view_snapshot_close(struct vidow_view *view) {
 		&geo, view->geom.x + (int)lround(view->anim_off_x),
 		view->geom.y + (int)lround(view->anim_off_y), w, h,
 		server->config.window_close_ms, server->config.close_slide_px,
-		server->config.shader_close, view_scale(view),
+		true, server->config.shader_close, view_scale(view),
 		server->config.close_easing, server->config.close_scale_to);
 }
 

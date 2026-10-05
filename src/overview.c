@@ -163,7 +163,8 @@ static void overview_apply(struct vidow_server *server) {
 
 /* ------------------------------------------------------------- 进出 */
 
-static void overview_update(void *data, double t) {
+static void overview_update(void *data, double t, double linear) {
+	(void)linear;
 	struct vidow_server *server = data;
 	server->overview.t = t;
 	overview_apply(server);

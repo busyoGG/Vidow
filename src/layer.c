@@ -165,7 +165,8 @@ static void layer_slide_dir(struct vidow_layer_surface *ls, int *dx, int *dy) {
 	}
 }
 
-static void layer_anim_update(void *data, double t) {
+static void layer_anim_update(void *data, double t, double linear) {
+	(void)linear;
 	struct vidow_layer_surface *ls = data;
 	struct vidow_config *cfg = &ls->server->config;
 	double k = 1.0 - t;
@@ -238,7 +239,7 @@ static void layer_snapshot_close(struct vidow_layer_surface *ls) {
 		&geo, ls->geom.x + (int)lround(ls->anim_off_x),
 		ls->geom.y + (int)lround(ls->anim_off_y),
 		ls->geom.width, ls->geom.height, cfg->layer_close_ms,
-		dy * slide, NULL,
+		dy * slide, false /* 不套窗口装饰：layer 自己就是内容 */, NULL,
 		ls->output != NULL && ls->output->wlr_output != NULL ?
 			(double)ls->output->wlr_output->scale : 1.0,
 		/* layer 的关闭沿用全局 easing、也不缩放：状态栏「缩着淡出」很怪。 */

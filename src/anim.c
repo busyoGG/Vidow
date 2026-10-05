@@ -54,7 +54,7 @@ static double ease(enum vidow_easing easing, double t) {
 
 struct vidow_anim *vidow_anim_start(struct vidow_server *server,
 		const char *tag, int duration_ms, enum vidow_easing easing,
-		void (*update)(void *data, double t),
+		void (*update)(void *data, double t, double linear),
 		void (*done)(void *data, bool cancelled), void *data) {
 	struct vidow_anim *anim = calloc(1, sizeof(*anim));
 	if (anim == NULL) {
@@ -120,7 +120,7 @@ void vidow_anim_tick(struct vidow_server *server) {
 		anim->ticks++;
 		anim->running = true;
 		if (anim->update != NULL) {
-			anim->update(anim->data, ease(anim->easing, raw));
+			anim->update(anim->data, ease(anim->easing, raw), raw);
 		}
 		anim->running = false;
 
