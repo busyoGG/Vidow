@@ -96,6 +96,18 @@ void vidow_float_set_mode(struct vidow_view *view,
 		memset(&view->float_geom, 0, sizeof(view->float_geom));
 	} else if (view->mapped && view->geom.width > 0 && view->geom.height > 0) {
 		view->float_geom = view->geom;
+		/* 位置是「相对自己那块屏」记的（见本文件顶上那段注释）：种子也要一起
+		 * 给 home_dx/home_dy，不然第一次摆放就被 float_place_recursive() 按
+		 * 0 偏移覆盖成屏幕左上角 —— 平铺转浮动会「跳」到角落。 */
+		struct wlr_box out_box = {0};
+		if (view->output != NULL) {
+			wlr_output_layout_get_box(server->output_layout, view->output,
+				&out_box);
+		}
+		if (out_box.width > 0) {
+			view->home_dx = view->float_geom.x - out_box.x;
+			view->home_dy = view->float_geom.y - out_box.y;
+		}
 		/* the tile may be scrolled off-screen: pull the float back in */
 		struct wlr_box work = vidow_work_area(server, view->output);
 		if (work.width > 0 && work.height > 0) {
@@ -456,27 +468,40 @@ void vidow_float_grab_update(struct vidow_server *server, double lx,
 		int x = server->grab_geom.x + dx;
 		int y = server->grab_geom.y + dy;
 
-		if (view->float_mode == VIDOW_FLOAT_FIXED) {
-			/* keep an independent float inside the work area */
-			struct wlr_box work = vidow_work_area(server, view->output);
-			if (work.width > 0 && work.height > 0) {
-				if (x + server->grab_geom.width > work.x + work.width) {
-					x = work.x + work.width - server->grab_geom.width;
-				}
-				if (y + server->grab_geom.height > work.y + work.height) {
-					y = work.y + work.height - server->grab_geom.height;
-				}
-				if (x < work.x) {
-					x = work.x;
-				}
-				if (y < work.y) {
-					y = work.y;
-				}
+		/* 夹在「所有输出的包围盒」里，而不是当前这块屏的工作区里 —— 夹工作区
+		 * 的话窗口永远拖不到另一块屏上（跨屏拖拽就是要能拖出去）。完全拖出屏
+		 * 之外还是拦住：看不见的窗口找不回来。 */
+		struct wlr_box all = {0};
+		wlr_output_layout_get_box(server->output_layout, NULL, &all);
+		if (all.width > 0 && all.height > 0) {
+			if (x + server->grab_geom.width > all.x + all.width) {
+				x = all.x + all.width - server->grab_geom.width;
+			}
+			if (y + server->grab_geom.height > all.y + all.height) {
+				y = all.y + all.height - server->grab_geom.height;
+			}
+			if (x < all.x) {
+				x = all.x;
+			}
+			if (y < all.y) {
+				y = all.y;
 			}
 		}
 
 		view->float_geom.x = x;
 		view->float_geom.y = y;
+		/* 位置是「相对自己那块屏」记的（见本文件顶上那段注释）：只改绝对盒、
+		 * 不刷新 home_dx/home_dy，下一次 arrange 的 float_place_recursive()
+		 * 会按旧偏移把它摆回去 —— 拖了等于没拖。 */
+		struct wlr_box box = {0};
+		if (view->output != NULL) {
+			wlr_output_layout_get_box(server->output_layout, view->output,
+				&box);
+		}
+		if (box.width > 0) {
+			view->home_dx = x - box.x;
+			view->home_dy = y - box.y;
+		}
 	} else {
 		int w = server->grab_geom.width + dx;
 		int h = server->grab_geom.height + dy;
@@ -497,8 +522,41 @@ void vidow_float_end_grab(struct vidow_server *server) {
 	if (server->grab_mode == VIDOW_GRAB_NONE) {
 		return;
 	}
-	wlr_log(WLR_INFO, "grab end");
+	struct vidow_view *view = server->grab_view;
 	server->grab_mode = VIDOW_GRAB_NONE;
 	server->grab_view = NULL;
 	wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "left_ptr");
+
+	/* 松手时光标落在**另一块屏**上：这块浮窗改归那块屏显示着的工作区（跨屏
+	 * 拖拽）。位置保持绝对坐标不变，改完按新屏原点刷新相对偏移 —— 不刷新的话
+	 * 下一次 arrange 会把它按旧偏移摆到新屏的别处去。 */
+	if (view == NULL || view->popup ||
+			view->float_mode == VIDOW_FLOAT_NONE) {
+		return;
+	}
+	struct wlr_output *under = wlr_output_layout_output_at(
+		server->output_layout, server->cursor->x, server->cursor->y);
+	if (under == NULL || under == view->output) {
+		return;
+	}
+	struct vidow_workspace *target =
+		vidow_workspace_shown_for(server, under);
+	if (target == NULL) {
+		return;
+	}
+	/* 先按新屏刷新相对偏移，**再**搬 —— 搬那一步会 arrange，而摆放是按
+	 * `box + home_dx` 算的：用旧偏移配新屏的 box，窗口会整块平移一块屏的宽度
+	 * （实测拖过去落在 x=2490，本来该在 1210）。 */
+	struct wlr_box box = {0};
+	wlr_output_layout_get_box(server->output_layout, under, &box);
+	if (box.width > 0) {
+		view->home_dx = view->float_geom.x - box.x;
+		view->home_dy = view->float_geom.y - box.y;
+	}
+	if (!vidow_workspace_move_view(server, view, target)) {
+		return;
+	}
+	wlr_log(WLR_INFO, "grab: 浮窗拖到 %s 上 → 归到那块屏第 %d 块工作区",
+		under->name, vidow_workspace_index(target));
+	vidow_arrange(server);
 }

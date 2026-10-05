@@ -535,6 +535,7 @@ python3 test-float.py        # 三个真实 GTK 窗口，验证浮动模式自�
 ./test-layermask.sh                  # 按元素自己的 alpha 剔除（透明内边距里的亮点不糊，3 项断言）
 ./test-openanim.sh                   # 开窗动画画的是装饰后的窗口本身（不是一块更大的矩形，4 项断言）
 ./test-bounce.sh                     # 入场过冲 / 关闭回弹（q 弹曲线真的落到屏幕上了，5 项断言）
+./test-drag.sh                       # 拖窗口：拖得动 / 跨屏改归属 / 平铺按落点插入（11 项）
 ./test-dpi.sh                        # 混合 DPI + XWayland：装饰缓冲按**窗口几何**算（见 SSD 那节）
 ./build/jsontest                     # 只看 JSON 写出/读入（离线，30 项）
 ./build/scaletest                    # 只看缩放计算（24 项）
@@ -573,7 +574,8 @@ WLR_BACKENDS=headless WLR_HEADLESS_OUTPUTS=1 WLR_LIBINPUT_NO_DEVICES=1 ./build/v
 | `Mod+Shift+H` / `Mod+Shift+L` | 当前列左/右移一位 |
 | `Mod+Shift+J` / `Mod+Shift+K` | 列内窗口下/上移；单窗口列则塞进下/上一列 |
 | `Mod+V` / `Mod+Shift+Space` | 当前窗口 平铺 ⇄ 浮动 |
-| `Mod+左键拖动` / `Mod+右键拖动` | 移动 / 缩放浮动窗口 |
+| `Mod+左键拖动` | 拖窗口：浮动窗口跟着走（松手在哪块屏上就归那块屏的工作区）；平铺窗口整条列飘起来，松手按**落点**插到那块屏工作区的列带里（拖到别的屏上 = 跨屏搬过去） |
+| `Mod+右键拖动` | 缩放浮动窗口 |
 | `Mod+R` | 列宽循环 1/3 → 1/2 → 2/3 |
 | `Mod+F` | 当前窗口全屏切换 |
 | `Mod+O` | niri 风格全景（overview）：整条列带缩小铺满这块屏，点谁去谁 |
@@ -2590,6 +2592,24 @@ protocols/     wlr-layer-shell / wlr-virtual-pointer / input-method-v2 /
      默认配置里给了 `Mod+1..9` 直跳的绑定（可删）。`test-workspace.sh` 的日志断言跟着新格式
      改；`test-ipc.sh`/`test-focus.sh` 同步。回归：defaultconfig / gap / config / workspace /
      ipc / focus / overview / hotplug / clipboard / layerwin / xwayland-popup 全过。
+
+121. **鼠标拖窗口：浮动跨屏改归属，平铺新增 Mod+左键拖拽**（niri 的 interactive move）。
+     平铺拖拽只动场景节点（`anim_off` 跟着光标，`vidow_place_view` 在 `view->dragging`
+     期间让位），布局一行都不重排；松手才结算：光标在哪块屏上就归那块屏**显示着**的
+     工作区（跨屏走 `vidow_workspace_move_view`，整条列搬），并按落点在列带里的位置
+     重排（列的位置是 arrange 算的 `offset`，从可用区左边算起，所以加回可用区原点才
+     是屏幕坐标）。顺带修掉两个真 bug：① `vidow_float_grab_update()` 只改绝对盒、不刷
+     `home_dx/home_dy`，下一次 arrange 的 `float_place_recursive()` 按旧偏移把它摆回去
+     —— 浮动窗口**拖了等于没拖**（同文件 138 行的注释早就写明了这条规矩）；② 平铺转
+     浮动时种子只给了 `float_geom` 没给 `home_dx/home_dy`，第一次摆放就被按 0 偏移覆盖
+     成屏幕左上角（`float mode w1: 0 -> 1` 之后 `place w1 -> 0,0`）。跨屏落点那一步
+     还要**先**按新屏刷新偏移再搬：搬那步会 arrange，用旧偏移配新屏的 box 会整块平移
+     一个屏宽（实测落在 x=2490，本该 1210）。测试：新增 `./test-drag.sh`（11 项）——
+     headless 里没有真鼠标，给 `VIDOW_TEST_ACTION` 加了 `pointer-motion x y` 和
+     `pointer-button left|right|middle|数字 press|release [mod]` 两个动作，走的是和真实
+     输入完全同一条路（`vidow_pointer_motion` / `vidow_pointer_button`；`mod` = 假装按着
+     Mod）。`test-ipc.sh` 那条 `window-moved` 断言原来靠的是 ② 那个「跳角落」的 bug 才
+     触发的，现在改成显式 `set-window-position` 挪一下。回归：21 个测试全过。
 
 118. **装饰按「可见窗口」画（niri 的 `size()` / `buf_loc()`），新增 `prefer_no_csd`**。
      客户端用 `xdg_surface.set_window_geometry` 声明的那块才是窗口：装饰矩形 / 离屏缓冲

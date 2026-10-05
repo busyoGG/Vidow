@@ -11,6 +11,8 @@
 #include <wlr/util/log.h>
 
 #include "server.h"
+
+#include <linux/input-event-codes.h>
 #include "workspace.h"
 
 /* 键位表：名字 -> keysym。字母和数字是「同一个键」的两种写法（大小写都收），
@@ -356,6 +358,54 @@ bool vidow_action_run(struct vidow_server *server, const char *action) {
 	}
 	if (strcmp(name, "none") == 0) {
 		return true; /* 空绑定，用来屏蔽某个键 */
+	}
+	/* 测试用：注入口/指针事件。走的是和真实鼠标完全同一条路
+	 * （vidow_pointer_button / wlr_cursor_warp），不另开捷径 —— 拖拽这种
+	 * 「按着不放 + 一路移动 + 松手」的行为只有这样才测得出来。
+	 *
+	 *   pointer-motion <x> <y>
+	 *   pointer-button <键> press|release [mod]
+	 *
+	 * `mod` = 假装按着 Mod（拖拽要求按着 Mod，而 headless 测试里没有真键盘）。 */
+	if (strcmp(name, "pointer-motion") == 0) {
+		int x = 0, y = 0;
+		if (arg == NULL || sscanf(arg, "%d %d", &x, &y) != 2) {
+			wlr_log(WLR_ERROR, "pointer-motion 要 x y");
+			return false;
+		}
+		wlr_cursor_warp(server->cursor, NULL, (double)x, (double)y);
+		/* wlr_cursor_warp 不一定发 motion 事件（它只是挪位置），所以显式走一遍
+		 * 处理：拖拽靠的就是这条路上的 grab 分支。 */
+		vidow_pointer_motion(server,
+			(uint32_t)(vidow_now_ns() / 1000000LL));
+		return true;
+	}
+	if (strcmp(name, "pointer-button") == 0) {
+		char key[16] = "";
+		char state[16] = "";
+		char extra[16] = "";
+		if (arg == NULL ||
+				sscanf(arg, "%15s %15s %15s", key, state, extra) < 2) {
+			wlr_log(WLR_ERROR, "pointer-button 要 <left|right|middle|数字> "
+				"press|release [mod]");
+			return false;
+		}
+		/* 认名字也认数字（BTN_LEFT = 272 这种数字写在测试里没人记得住） */
+		uint32_t btn;
+		if (strcmp(key, "left") == 0) {
+			btn = BTN_LEFT;
+		} else if (strcmp(key, "right") == 0) {
+			btn = BTN_RIGHT;
+		} else if (strcmp(key, "middle") == 0) {
+			btn = BTN_MIDDLE;
+		} else {
+			btn = (uint32_t)atoi(key);
+		}
+		bool pressed = strcmp(state, "press") == 0;
+		vidow_pointer_button(server, btn, pressed,
+			(uint32_t)(vidow_now_ns() / 1000000LL),
+			strcmp(extra, "mod") == 0);
+		return true;
 	}
 
 	wlr_log(WLR_ERROR, "action: 不认识的动作 '%s'", action);

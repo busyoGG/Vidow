@@ -1067,6 +1067,15 @@ void vidow_place_view(struct vidow_view *view, int x, int y, int w, int h) {
 	vidow_view_set_size(view, w, h);
 	vidow_view_set_tiled(view, true);
 
+	/* 正被鼠标拖着：位置归 drag.c 管（apply_anim 用 anim_off 把它摆在光标下面），
+	 * 这里别起补间、也别把偏移清零，不然拖到一半会被 arrange 拽回去。 */
+	if (view->dragging) {
+		vidow_anim_cancel(view->anim_move);
+		view->anim_move = NULL;
+		vidow_view_apply_anim(view);
+		return;
+	}
+
 	if (!view->placed) {
 		view->placed = true;
 		view->anim_off_x = 0.0;
@@ -1946,6 +1955,16 @@ static void view_unmap(struct wl_listener *listener, void *data) {
 	}
 	/* 窗口没了，它那块工作区可能就空了 —— 栈中间的空工作区该收掉（niri）。 */
 	vidow_workspace_cleanup(server);
+	if (view->dragging) {
+		/* 拖着的时候窗口没了：撤掉 grab，别让指针还挂在一个已经没了的窗口上。 */
+		view->dragging = false;
+		if (server->grab_view == view) {
+			server->grab_mode = VIDOW_GRAB_NONE;
+			server->grab_view = NULL;
+			wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr,
+				"left_ptr");
+		}
+	}
 	view_snapshot_close(view);
 	wlr_scene_node_set_enabled(&view->scene_tree->node, false);
 	vidow_backdrop_damage(server, false);

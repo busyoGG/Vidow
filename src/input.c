@@ -289,8 +289,22 @@ static void server_new_input(struct wl_listener *listener, void *data) {
 
 /* --------------------------------------------------------------- pointer */
 
-static void process_cursor_motion(struct vidow_server *server,
-		uint32_t time_msec) {
+/* 拖着东西的时候指针事件全归 grab：平铺拖拽走 drag.c，浮动窗口走 float.c。 */
+static void pointer_grab_update(struct vidow_server *server) {
+	if (server->grab_mode == VIDOW_GRAB_TILE) {
+		vidow_tile_grab_update(server, server->cursor->x, server->cursor->y);
+		return;
+	}
+	vidow_float_grab_update(server, server->cursor->x, server->cursor->y);
+}
+
+void vidow_pointer_motion(struct vidow_server *server, uint32_t time_msec) {
+	/* 拖着东西的时候指针事件全归 grab：平铺拖拽走 drag.c，浮动窗口走 float.c。
+	 * 测试注入（pointer-motion 动作）也走这里，和真实鼠标同一条路。 */
+	if (server->grab_mode != VIDOW_GRAB_NONE) {
+		pointer_grab_update(server);
+		return;
+	}
 	struct wlr_output *output = wlr_output_layout_output_at(
 		server->output_layout, server->cursor->x, server->cursor->y);
 	if (output != NULL) {
@@ -333,11 +347,7 @@ static void server_cursor_motion(struct wl_listener *listener, void *data) {
 	wlr_cursor_move(server->cursor, &event->pointer->base, event->delta_x,
 		event->delta_y);
 
-	if (server->grab_mode != VIDOW_GRAB_NONE) {
-		vidow_float_grab_update(server, server->cursor->x, server->cursor->y);
-		return;
-	}
-	process_cursor_motion(server, event->time_msec);
+	vidow_pointer_motion(server, event->time_msec);
 }
 
 static void server_cursor_motion_absolute(struct wl_listener *listener,
@@ -349,21 +359,30 @@ static void server_cursor_motion_absolute(struct wl_listener *listener,
 	wlr_cursor_warp_absolute(server->cursor, &event->pointer->base, event->x,
 		event->y);
 
-	if (server->grab_mode != VIDOW_GRAB_NONE) {
-		vidow_float_grab_update(server, server->cursor->x, server->cursor->y);
-		return;
-	}
-	process_cursor_motion(server, event->time_msec);
+	vidow_pointer_motion(server, event->time_msec);
 }
 
 static void server_cursor_button(struct wl_listener *listener, void *data) {
 	struct vidow_server *server = wl_container_of(listener, server, cursor_button);
 	struct wlr_pointer_button_event *event = data;
 
+	vidow_pointer_button(server, event->button,
+		event->state == WL_POINTER_BUTTON_STATE_PRESSED, event->time_msec,
+		false);
+}
+
+/* 指针按下 / 松开。测试注入（VIDOW_TEST_ACTION 里的 pointer-button）也走这里，
+ * 和真实鼠标完全同一条路。 */
+void vidow_pointer_button(struct vidow_server *server, uint32_t button,
+		bool pressed, uint32_t time_msec, bool force_mod) {
 	if (server->grab_mode != VIDOW_GRAB_NONE) {
 		/* the grab owns the pointer: swallow everything until release */
-		if (event->state == WL_POINTER_BUTTON_STATE_RELEASED) {
-			vidow_float_end_grab(server);
+		if (!pressed) {
+			if (server->grab_mode == VIDOW_GRAB_TILE) {
+				vidow_tile_grab_end(server);
+			} else {
+				vidow_float_end_grab(server);
+			}
 		}
 		return;
 	}
@@ -371,19 +390,19 @@ static void server_cursor_button(struct wl_listener *listener, void *data) {
 	if (vidow_overview_active(server) || server->overview.swallow_release) {
 		/* 点一下 = 选中那个窗口（然后缩回去）；点空白 = 取消。
 		 * 点选那次按下已经被吃掉了，它对应的松手也一起吃掉。 */
-		if (event->state == WL_POINTER_BUTTON_STATE_PRESSED &&
-				event->button == BTN_LEFT && vidow_overview_active(server)) {
+		if (pressed && button == BTN_LEFT &&
+				vidow_overview_active(server)) {
 			vidow_overview_click(server, server->cursor->x, server->cursor->y);
 		}
-		if (event->state == WL_POINTER_BUTTON_STATE_RELEASED) {
+		if (!pressed) {
 			server->overview.swallow_release = false;
 		}
 		return;
 	}
 
-	if (event->state == WL_POINTER_BUTTON_STATE_RELEASED) {
-		wlr_seat_pointer_notify_button(server->seat, event->time_msec,
-			event->button, event->state);
+	if (!pressed) {
+		wlr_seat_pointer_notify_button(server->seat, time_msec, button,
+			WL_POINTER_BUTTON_STATE_RELEASED);
 		return;
 	}
 
@@ -397,7 +416,7 @@ static void server_cursor_button(struct wl_listener *listener, void *data) {
 	struct wlr_surface *pfocus = server->seat->pointer_state.focused_surface;
 	struct vidow_view *pfocus_view = vidow_view_from_surface(server, pfocus);
 	wlr_log(WLR_DEBUG, "点击 button %u 在 %.0f,%.0f：命中 %s（局部 %.0f,%.0f），"
-		"指针焦点在 %s", event->button, server->cursor->x, server->cursor->y,
+		"指针焦点在 %s", button, server->cursor->x, server->cursor->y,
 		view != NULL ? vidow_view_title(view) : "(没有窗口)", sx, sy,
 		pfocus == NULL ? "(无)" :
 			(pfocus_view != NULL ? vidow_view_title(pfocus_view) :
@@ -405,25 +424,34 @@ static void server_cursor_button(struct wl_listener *listener, void *data) {
 
 	/* A layer surface asking for keyboard focus (ON_DEMAND launcher) wins. */
 	if (vidow_layer_focus_surface(server, surface)) {
-		wlr_seat_pointer_notify_button(server->seat, event->time_msec,
-			event->button, event->state);
+		wlr_seat_pointer_notify_button(server->seat, time_msec, button,
+			WL_POINTER_BUTTON_STATE_PRESSED);
 		return;
 	}
 
 	struct wlr_keyboard *kb = wlr_seat_get_keyboard(server->seat);
-	bool mod = kb != NULL && (wlr_keyboard_get_modifiers(kb) & MOD_KEY);
+	bool mod = force_mod || (kb != NULL &&
+		(wlr_keyboard_get_modifiers(kb) & MOD_KEY));
 
 	/* Mod+left drag moves a float, Mod+right drag resizes it. */
 	if (mod && view != NULL && view->float_mode != VIDOW_FLOAT_NONE) {
-		vidow_float_begin_grab(server, view, event->button == BTN_RIGHT);
+		vidow_float_begin_grab(server, view, button == BTN_RIGHT);
 		if (view != server->focused) {
 			vidow_focus_view(view);
 		}
 		return;
 	}
 
-	wlr_seat_pointer_notify_button(server->seat, event->time_msec, event->button,
-		event->state);
+	/* Mod+左键按住**平铺**窗口 = 拖它（niri 的 interactive move）：窗口跟着光标
+	 * 飘起来，松手按落点决定归哪块屏的工作区、插在列带第几位。 */
+	if (mod && button == BTN_LEFT && view != NULL && !view->popup &&
+			view->float_mode == VIDOW_FLOAT_NONE && view->column != NULL) {
+		vidow_tile_grab_begin(server, view);
+		return;
+	}
+
+	wlr_seat_pointer_notify_button(server->seat, time_msec, button,
+		WL_POINTER_BUTTON_STATE_PRESSED);
 
 	if (view != NULL && view != server->focused) {
 		vidow_focus_view(view);

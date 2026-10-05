@@ -504,6 +504,8 @@ enum vidow_grab_mode {
 	VIDOW_GRAB_NONE = 0,
 	VIDOW_GRAB_MOVE,
 	VIDOW_GRAB_RESIZE,
+	/* 平铺窗口的 Mod+左键拖拽（src/drag.c）：位置只动场景节点，松手才决定归哪 */
+	VIDOW_GRAB_TILE,
 };
 
 /* niri-style column: a vertical stack of windows, columns are laid out left
@@ -633,6 +635,8 @@ struct vidow_view {
 	double anim_off_x, anim_off_y;  /* added to geom.x/y while animating */
 	double anim_alpha;              /* 0..1, applied to every buffer */
 	double anim_scale;              /* 动画缩放，围绕窗口中心；1.0 = 原尺寸 */
+	bool dragging;                  /* 正被鼠标拖着（位置归 drag.c 管） */
+	int drag_dx, drag_dy;           /* 抓点在窗口里的位置 */
 	double anim_from_x, anim_from_y; /* move tween start offsets */
 	bool placed;                     /* laid out at least once */
 
@@ -1279,6 +1283,22 @@ void vidow_backdrop_damage(struct vidow_server *server, bool layers);
 void vidow_blur_output_finish(struct vidow_output *output);
 
 void vidow_view_apply_anim(struct vidow_view *view);
+
+/* ------------------------------------------------------- 鼠标拖窗口（drag.c） */
+
+/* 平铺窗口的 Mod+左键拖拽：开始 / 跟手 / 松手落位（跨屏就归那块屏的工作区）。 */
+void vidow_tile_grab_begin(struct vidow_server *server,
+		struct vidow_view *view);
+void vidow_tile_grab_update(struct vidow_server *server, double lx, double ly);
+void vidow_tile_grab_end(struct vidow_server *server);
+
+/* 指针按键（真实输入和测试注入走同一条路，见 input.c）。 */
+/* force_mod：假装按着 Mod（测试注入用 —— 拖拽要求按着 Mod，而测试环境里没有
+ * 真键盘，见 VIDOW_TEST_ACTION 的 pointer-button 动作）。 */
+void vidow_pointer_button(struct vidow_server *server, uint32_t button,
+		bool pressed, uint32_t time_msec, bool force_mod);
+/* 指针移动（测试注入也走这里）。 */
+void vidow_pointer_motion(struct vidow_server *server, uint32_t time_msec);
 /* 区域变了要重画一次：贴图身份没变，不主动失效帧循环不会动。 */
 void vidow_view_blur_invalidate(struct vidow_view *view);
 /* 从 wlr_surface（含子表面）找回它的窗口，找不到返回 NULL。 */

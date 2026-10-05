@@ -70,6 +70,7 @@ sources = files(
   'src/input.c',
   'src/layer.c',
   'src/float.c',
+  'src/drag.c',
   'src/config.c',
   'src/scale.c',
   'src/hotplug.c',

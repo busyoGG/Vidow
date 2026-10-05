@@ -554,6 +554,11 @@ open_pattern 丙
 NID=$(jf '{"cmd":"windows"}' '[w["id"] for w in resp["result"] if w["title"]=="丙"][0]')
 jf "{\"cmd\":\"toggle-floating\",\"id\":$NID}" 'resp["ok"]' >/dev/null
 sleep 0.4
+# 再真的挪一下它：浮动窗口的位置是「相对自己那块屏」记的，平铺转浮动**不会**
+# 把它挪到别处（早先会跳到屏幕左上角，那是 bug，已经修了）—— 不主动挪一下，
+# 这一节就收不到 window-moved 事件了。
+jf "{\"cmd\":\"set-window-position\",\"id\":$NID,\"x\":300,\"y\":200}" 'resp["ok"]' >/dev/null
+sleep 0.4
 jf '{"cmd":"focus-workspace","workspace":"2"}' 'resp["ok"]' >/dev/null
 jf '{"cmd":"output-scale","output":"HEADLESS-1","scale":1.25}' 'resp["ok"]' >/dev/null
 jf '{"cmd":"output-scale","output":"HEADLESS-1","scale":"auto"}' 'resp["ok"]' >/dev/null
