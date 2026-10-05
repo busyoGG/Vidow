@@ -37,6 +37,12 @@ cleanup() {
 	[ -n "$VIDOW_PID" ] && kill -KILL -- "-$VIDOW_PID" 2>/dev/null
 	rm -f /tmp/vidow-bd-*.raw /tmp/vidow-blur-*.raw /tmp/vidow-bd-*.txt /tmp/vidow-blur-*.txt
 	[ -n "${VIDOW_TEST_KEEP:-}" ] || rm -rf "$RUNDIR"
+	# vidow 的调试转储写死在 /tmp（vidow-blur-N.raw 那些）：它们是我们自己丢的，
+	# 收尾一起带走，别在 /tmp 里堆着。
+	rm -f /tmp/vidow-blur-*.raw /tmp/vidow-blur-*.txt \
+		/tmp/vidow-bd-*.raw /tmp/vidow-bd-*.txt \
+		/tmp/vidow-lblur-*.raw /tmp/vidow-lblur-*.txt \
+		/tmp/vidow-lbd-*.raw /tmp/vidow-lbd-*.txt
 }
 trap cleanup EXIT
 
