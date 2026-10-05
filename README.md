@@ -478,6 +478,7 @@ python3 test-float.py        # 三个真实 GTK 窗口，验证浮动模式自�
 ./test-blurlevel.sh                  # 半径随级数扩展（2/4/6 级各跑一轮，3 项断言）
 ./test-blurcull.sh                   # 透明度剔除只在最后一趟做一次（3 项断言）
 ./test-layerghost.sh                 # 会被模糊的 layer surface 不进自己的底衬（3 项断言）
+./test-layerwin.sh                   # top 层模糊里含窗口（纯蓝窗口 + 压在它上面的面板，4 项断言）
 ./build/jsontest                     # 只看 JSON 写出/读入（离线，30 项）
 ./build/scaletest                    # 只看缩放计算（24 项）
 ```
@@ -1181,17 +1182,29 @@ surface 的内容渲染归 wlroots 的 scene 管（subsurface 树、buffer scale
 场景节点，用同一个装饰着色器画，但把内容 / 阴影 / 边框 / 圆角 / 噪点全关掉
 （`fx->blur_only`），只留模糊。半透明的地方透出来，不透明的地方盖住，等于没画。
 
-- 用的是**共享的那份底衬**（壁纸 + background/bottom 层，窗口被藏起来），所以
-  状态栏不会随窗口重画而重画
+- 抓的是**这个 layer 盖住的东西**（跟 niri 一致：它就地抓 framebuffer 里已经画好的
+  那部分）：
+  - `bottom` 层的 surface 先于窗口画，它底下只有壁纸和 background 层 —— 正好就是共享
+    的那张底衬，直接拿来用，一次抓取都不用
+  - `top` / `overlay` 层反过来：**窗口就在它底下，模糊里必须有窗口**（压在窗口上的
+    半透明面板透出来的是窗口的模糊）。这时按它自己那一小块区域重抓一份：基座是从共享
+    底衬上 1:1 拷过来的那块（壁纸 + background / bottom 层），窗口连它的弹出物一起
+    再画上去。代价跟**区域面积**成正比而不是整屏
+  - 缓存键 = 区域 + `gen_scene` / `gen_layer` + 级数 + `blur_offset` / `blur_alpha_min`：
+    屏幕不动一次都不重抓（实测空转 3 秒 0 次），窗口每出一帧重抓一次（实测 3 秒 173
+    帧 → 173 次，区域是一块 400x200 的面板那么大）
+  - `overview` 里 `top` / `overlay` 那几棵树整体关着、这层模糊没人看得见，直接跳过
 - `background` 层（壁纸自己）跳过：模糊的底衬里就有它，垫一层等于画重
-- 抓底衬的时候这些节点要先藏起来（bottom 层的那个就在被抓的场景里，不藏就是
-  「模糊结果里混进上一帧的模糊」）
-- **会被模糊的那个 surface 本身**也要藏：bottom 层的面板（dock 这类）自己就在被抓的
-  那几棵树里，它要的那份底衬要是含它自己，模糊里就会浮出一个自己的影子（半透明的地方
-  透出「自己的糊版」）。实测 bottom 层 50% 红面板（`tools/bpanel.py`）在底衬 dump 里
-  占 100% 的红像素 → 修后 0%，见 `./test-layerghost.sh`
+- 抓**共享底衬**（壁纸那份）的时候这些节点要先藏起来（bottom 层的那个就在被抓的场景里，
+  不藏就是「模糊结果里混进上一帧的模糊」）
+- 同理，**会被模糊的那个 surface 本身**也要从共享底衬里藏掉：bottom 层的面板（dock 这类）
+  自己就在被抓的那几棵树里，它要的那份底衬要是含它自己，模糊里就会浮出一个自己的影子
+  （半透明的地方透出「自己的糊版」）。实测 bottom 层 50% 红面板（`tools/bpanel.py`）在
+  底衬 dump 里占 100% 的红像素 → 修后 0%，见 `./test-layerghost.sh`（区域抓取那条路不
+  用藏：它只画共享底衬 + 窗口，layer 自己本来就不在里面）
 - 位置 / 尺寸变了要作废重画（采样坐标在着色器里，节点动了就得重算），见
-  `vidow_layer_blur_invalidate()`
+  `vidow_layer_blur_invalidate()`。区域抓取那张贴图只盖住这一小块，所以采样坐标要减掉
+  区域原点（`fx->blur_tex_x/y/w/h`）—— 不减就是整块错位
 
 实测（`tools/wall.py` 壁纸 + `tools/bar.py`：一块 50% 透明的 top 层状态栏，量状态栏
 那 40px 里的最大梯度；壁纸本身的硬边是 107.7）：
@@ -1199,13 +1212,12 @@ surface 的内容渲染归 wlroots 的 scene 管（subsurface 树、buffer scale
 | | 状态栏内最大梯度 |
 | --- | --- |
 | `blur_enabled = false` | 74.0（透出来的是硬边，只是被 50% 黑压暗了） |
-| `blur_levels = 2` | 6.33 |
-| `blur_levels = 4` | 1.67 |
+| `blur_levels = 2` | 5.33 |
+| `blur_levels = 4` | 2.67 |
 
-代价（说清楚）：压在窗口上的 overlay 面板透出来的是**壁纸**的模糊，不是窗口的模糊
-（用的是共享底衬）。niri / Hyprland 对 layer 的模糊也是这个语义。
-
-`./test-layerblur.sh` 就是这个靶子（4 项断言）。
+`./test-layerblur.sh` 就是这个靶子（4 项断言）。`./test-layerwin.sh`（4 项）专门盯
+「面板底下的模糊里有没有窗口」：`tools/bluewin.py` 一个纯蓝窗口 + `tools/panel.py` 一块
+top 层面板压在它上面 —— 面板那块截屏的 B-R 均值 0.445（老代码 0.027，那是壁纸的灰）。
 
 ### 顺手修掉的真 bug（模糊）
 
@@ -1277,6 +1289,15 @@ layer 背后的亮斑 σ 16.0 → 23.5、对位偏差 ≤ 0.6 像素（`./test-b
 看着就是「半径不跟着降采样扩展」。现在照 niri 重写（去掉 `add`、升采样半步、除以 12、
 上限放到 6）：σ = 3.3 / 6.9 / 14 / 28 / 56，端上硬边最大梯度 0.127 / 0.027 / 0.0039
 （2 / 4 / 6 级）。新增 `./test-blurlevel.sh`（拿老二进制跑挂 3 条）。
+
+**⑧ layer 的模糊底下没有窗口**：原来所有 layer surface 都拿共享底衬（窗口被藏起来），
+于是压在窗口上的半透明面板透出来的是**壁纸**的模糊，不是窗口的模糊。niri 不是这么做的：
+它就地在 framebuffer 里抓「已经画在它底下」的那部分，对 `top` / `overlay` 层来说里面
+**有窗口**。现在照这个语义来：`top` / `overlay` 层按自己那块区域重抓一份（基座 = 共享
+底衬里对应的那块 + 窗口），`bottom` 层保持不变（它先于窗口画，底下本来就没窗口）。
+实测（`tools/bluewin.py` 纯蓝窗口 + `tools/panel.py` 一块 top 层面板压在它上面）：面板那块
+截屏的 B-R 均值 **0.027 → 0.445**，面板底下的区域抓取里 85.6% 是窗口的蓝。新增
+`./test-layerwin.sh`（拿老二进制跑挂 3 条）。缓存按区域 + 世界代次：空转 3 秒 0 次重抓。
 
 ## 动画与自定义 shader
 
@@ -1744,6 +1765,10 @@ tools/pattern.py  四象限测试窗口（验证 shader 管线方向与颜色）
 tools/glass.py    半透明定尺寸窗口（验证窗口透明度与背景模糊）
                    VIDOW_TEST_EMPTY=1 时不画内容，只剩装饰 + 模糊
 tools/wall.py     layer-shell 背景（渐变 + 硬边方块），给模糊测试提供可模糊的内容
+tools/bluewin.py  一个纯蓝的普通窗口：跟 tools/panel.py 一起验证「top 层模糊里含不
+                  含窗口」（壁纸是灰的，蓝得扎眼，量 B-R 就行）
+tools/soft.py     背景层一整屏均匀半透明灰：量透明度剔除会不会在链里逐趟相乘
+tools/bpanel.py   一块 bottom 层 50% 红面板：盯「被模糊的 layer 自己进了底衬」
 tools/fakeim.c    假输入法（连 input-method-v2，抢键盘，每个按键 commit 一段文字），
                   用来验证中继链路，不依赖 fcitx5 的配置
 tools/bgblur.c    半透明窗口 + 指定模糊区域，用来验证 ext-background-effect
@@ -1760,6 +1785,8 @@ test-clipboard.sh 剪贴板桥：接管、X11->Wayland、Wayland->X11、PRIMARY�
                   错误路径与事件、配置热切换（关掉退回 wlroots 那套）、退出与清理
 test-hotplug.sh   真拔一块 headless 输出再以同名插回来：列 / 浮动窗口 / layer surface
                   的归属与还原（顺序、列宽、滚动位置、平移量、四象限像素）
+test-layerwin.sh  top / overlay 层的模糊里必须含窗口（纯蓝窗口 + 压在它上面的面板，
+                  量面板那块截屏的 B-R 与区域底衬 dump）
 test-overview.sh  Mod+O 全景：缩放比例/位置/顺序、四象限像素、遮罩只压背景不压窗口、
                   Esc 退出后画面还原、点选、两块屏时只看当前那块
 portals.conf.example  拷成 ~/.config/vidow/portals.conf
@@ -2294,6 +2321,14 @@ protocols/     wlr-layer-shell / wlr-virtual-pointer / input-method-v2 /
      红像素，模糊里浮出它自己的影子）。新增 `./test-layerghost.sh`、`tools/bpanel.py`
      （`MAX_BLUR_LEVELS` 也顺手从 fx.c 挪到 server.h —— 改级数上限时忘了改
      `vidow_blur_set` 里写死的 `down[4]`，数组越界直接段错误）
+112. layer 的模糊改成含窗口（niri 语义：抓的是它盖住的东西）。`top` / `overlay` 层按自己
+     那块区域重抓一份：基座是共享底衬上对应的一小块（1:1 拷贴图，壁纸不用重传）+ 窗口
+     （连窗口弹出物）画上去，再走 kawase；`bottom` 层不变（先于窗口画，底下本来就没窗口）。
+     缓存键 = 区域 + `gen_scene` / `gen_layer` + 级数 + offset / alpha_min（空转 3 秒 0 次
+     重抓；窗口每出一帧重抓一次，3 秒 173 帧 = 173 次，区域只有面板那么大）；采样坐标
+     减掉区域原点（`fx->blur_tex_x/y/w/h`）。实测面板底下的 B-R 均值 0.027 → 0.445。
+     新增 `./test-layerwin.sh`、`tools/bluewin.py`（`tools/panel.py` 加了第三个参数 `tl`：
+     贴左上角 —— 缩放布局里一个窗口只占左边一条，右下角多半是空的）
 
 ## 尚未实现（原型边界）
 

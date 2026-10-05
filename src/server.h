@@ -324,6 +324,11 @@ struct vidow_fx_target {
 	uint64_t blur_own_id;             /* identity of blur_own_tex */
 	struct vidow_blur_set blur_set; /* private pyramid, allocated on demand */
 
+	/* 这张模糊贴图盖住输出的哪一块（设备像素，相对输出原点）。窗口用的永远是整屏
+	 * 那张（blur_tex_w == 0 就按整屏算）；会被窗口遮住的 layer surface 用的是
+	 * **它自己那一小块区域**的抓取，采样坐标得减掉区域原点，否则整块错位。 */
+	int blur_tex_x, blur_tex_y, blur_tex_w, blur_tex_h;
+
 	/* ext-background-effect 的模糊区域（窗口局部坐标）。blur_region_on 为
 	 * true 时着色器只在这个盒子里画模糊；-1 表示不限制。 */
 	bool blur_region_on;
@@ -389,6 +394,10 @@ struct vidow_output {
 	 * source for the kawase chain. */
 	struct wlr_buffer *backdrop;
 	int backdrop_w, backdrop_h;
+	/* backdrop 的贴图版本。被窗口遮住的 layer surface 要给它自己那一小块区域
+	 * 拼底衬（基座 + 窗口），基座就是从这上面 1:1 拷过去的一块 —— 比每次重抓
+	 * 一遍壁纸便宜太多。跟着 backdrop 一起重建。 */
+	struct wlr_texture *backdrop_tex;
 
 	/* Wallpaper-only blurred backdrop for this output: the scene below the
 	 * toplevels with every window hidden, so it survives client repaints,
@@ -631,6 +640,14 @@ struct vidow_layer_surface {
 	struct vidow_fx_target fx;
 	/* 抓底衬时这个 surface 被我们临时藏起来过（抓完要还原，见 fx.c）。 */
 	bool capture_hidden;
+
+	/* 它自己那一小块区域的底衬抓取（含窗口）：基座是共享底衬里对应的那块，窗口
+	 * 另外画上去（见 fx.c 的 layer_region_build）。只有会被窗口遮住的层（top /
+	 * overlay）才需要 —— bottom 层的下面根本没有窗口。 */
+	struct wlr_buffer *bd;
+	int bd_w, bd_h;      /* 设备像素 */
+	int bd_x, bd_y;      /* 相对输出原点的位置，设备像素 */
+	uint64_t bd_gen_scene, bd_gen_layer; /* 抓的时候的世界代次 */
 };
 
 /* ---------------------------------------------------------------- keyboard */

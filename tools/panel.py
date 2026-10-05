@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
-"""右下角一块 50% 透明的 top 层面板（不是贴着 (0,0) 的，专治对位问题）。
+"""一块 50% 透明的 top 层面板。
 
-用法：python3 tools/panel.py [宽] [高]
+默认贴右下角（不是贴着 (0,0) 的，专治对位问题）；第三个参数给 `tl` 就改成贴左上角
+（要它压在窗口上时用这个 —— 缩放布局里一个窗口只占左边一条，右下角多半是空的）。
+
+用法：python3 tools/panel.py [宽] [高] [tl]
 """
 import sys
 
@@ -13,6 +16,7 @@ from gi.repository import Gtk, GtkLayerShell  # noqa: E402
 
 W = int(sys.argv[1]) if len(sys.argv) > 1 else 400
 H = int(sys.argv[2]) if len(sys.argv) > 2 else 200
+TL = len(sys.argv) > 3 and sys.argv[3] == 'tl'
 
 
 class Panel(Gtk.Window):
@@ -26,7 +30,9 @@ class Panel(Gtk.Window):
         GtkLayerShell.init_for_window(self)
         GtkLayerShell.set_layer(self, GtkLayerShell.Layer.TOP)
         GtkLayerShell.set_namespace(self, 'testpanel')
-        for edge in (GtkLayerShell.Edge.RIGHT, GtkLayerShell.Edge.BOTTOM):
+        edges = (GtkLayerShell.Edge.LEFT, GtkLayerShell.Edge.TOP) if TL else \
+            (GtkLayerShell.Edge.RIGHT, GtkLayerShell.Edge.BOTTOM)
+        for edge in edges:
             GtkLayerShell.set_anchor(self, edge, True)
         self.set_size_request(W, H)
 
