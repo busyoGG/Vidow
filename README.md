@@ -479,6 +479,7 @@ python3 test-float.py        # 三个真实 GTK 窗口，验证浮动模式自�
 ./test-layerghost.sh                 # 会被模糊的 layer surface 不进自己的底衬（3 项断言）
 ./test-layerwin.sh                   # top 层模糊里含窗口（纯蓝窗口 + 压在它上面的面板，4 项断言）
 ./test-layermask.sh                  # 按元素自己的 alpha 剔除（透明内边距里的亮点不糊，3 项断言）
+./test-openanim.sh                   # 开窗动画画的是装饰后的窗口本身（不是一块更大的矩形，4 项断言）
 ./build/jsontest                     # 只看 JSON 写出/读入（离线，30 项）
 ./build/scaletest                    # 只看缩放计算（24 项）
 ```
@@ -1721,7 +1722,7 @@ $ wlrctl toplevel close title:zen-two   # request_close → 只剩 zen-one
 片段着色器自己写 `main()`，可用的 uniform：
 
 ```glsl
-uniform sampler2D u_texture;    // 窗口内容（预乘 alpha）
+uniform sampler2D u_texture;    // **整个窗口**（含边框/圆角/模糊底衬，预乘 alpha）
 uniform float u_progress;       // 0 = 动画开始，1 = 结束
 uniform int   u_phase;          // 1 打开 / 2 关闭 / 3 常驻
 uniform vec2  u_size;           // 窗口像素尺寸
@@ -1732,8 +1733,12 @@ uniform float u_time;           // 效果开始至今的秒数（墙钟）
 varying vec2  v_uv;             // 0..1，左上为原点
 ```
 
-输出必须是**预乘 alpha**。管线是：把窗口内容采样进离屏缓冲 → 用你的 shader 画到第二个
-离屏缓冲 → 作为 scene buffer 合成，所以 shader 可以任意改写几何（缩放、挤压、抖动）。
+输出必须是**预乘 alpha**。管线是：先把窗口连装饰（边框 / 圆角 / 模糊底衬 / 阴影）画进一块
+离屏缓冲 → 把**这块装饰结果**当 `u_texture` 喂给你的 shader 画到第二块离屏缓冲 → 作为
+scene buffer 合成，所以 shader 可以任意改写几何（缩放、挤压、抖动）。注意 `u_texture` 是
+「整个窗口」而不是「光秃秃的内容」：缩放/挤压时边框、圆角和模糊跟着一起动，收尾正好落在
+窗口自己该在的位置上；`u_alpha` 由这一段统一乘（装饰那趟按满 alpha 画），两边各乘一次就成
+了 alpha²、淡得比设定的快。
 
 自带 4 个示例（`shaders/`）：`zoom`（缩放淡入）、`genie`（关闭时压成底边窄带）、
 `wave`（正弦抖动）、`round`（圆角，适合做 `shader_idle` 常驻）、`passthru`（恒等，用于验证管线）。
@@ -1742,7 +1747,8 @@ varying vec2  v_uv;             // 0..1，左上为原点
 - 只作用于 **xdg-toplevel 的表面本身**，子表面/弹出菜单不参与变形（弹出菜单仍正常显示，不被扭曲）
 - 需要 GLES2 渲染器（启动时会强制 `WLR_RENDERER=gles2`，除非你自己设了别的）
 - 窗口关闭时表面已经没了，动画用的是最后一次 commit 的**快照**（我们持锁保住那份像素）
-- 每帧要从客户端缓冲建一次纹理，比内置效果贵；`shader_idle` 只在布局变化时重绘
+- 每帧要多一次离屏往返（装饰 → 动画）+ 把装饰结果再当贴图导入一次，比内置效果贵；
+  `shader_idle` 只在布局变化时重绘
 
 ## 代码结构
 
@@ -2417,6 +2423,21 @@ protocols/     wlr-layer-shell / wlr-virtual-pointer / input-method-v2 /
      照样立刻重画 —— 不然运行时改配置会看着「没反应」（⓪ 那类）。相关探针与测试
      （`./test-blurcull.sh`、`tools/soft.py`、`tools/ramp.py`）一起删了：上面几条历史里
      提到的这三个名字都指它们。
+
+116. **入场 / 关闭动画的着色器喂「装饰结果」，不是原始内容**（治「开窗动画一上来冒出一块
+     比窗口大的大矩形」）。动画那一趟原来把**原始内容贴图**铺在「窗口 + 阴影留白」那么大
+     一块渲染目标上：内容被拉伸到整块画布（每边多出 shadow_radius 那么宽的留白），而且那
+     一趟根本不走装饰着色器 —— 没圆角、没边框、没模糊，也不吃 `window_opacity`（半透明
+     窗口在动画期间是一块**不透明的纯色**大矩形）。改成先画装饰、再把装饰结果当贴图喂给
+     动画着色器：整块带边框/圆角/模糊的窗口跟着缩放淡入淡出，1:1 落在窗口该在的位置上。
+     顺带修掉一个老毛病：`anim_buf` 只分配了一块，而正在上屏的那块被场景锁着 → 动画着色器
+     **隔一帧才跑得起来**，屏幕上就是「跑过着色器的窗口」和「只跑了装饰淡入的窗口」交替
+     闪，看着正好像大矩形一闪一闪；现在两块都分配。实测（`tools/wall.py` + `bluewin.py` +
+     zoom + `window_opacity = 0.5` + `shadow_radius = 24` 且阴影全透明，按日志里的
+     `anim open start` 对时取样）：动画后段三帧的可见窗口 / 中心红通道 = 662x704 / 1
+     （老二进制）→ 三帧都 ≤ 窗口 640x687 / 28。新增 `./test-openanim.sh`（老二进制连跑
+     3 次都挂 2 条）。关闭动画（genie）走同一条路，一起好了（原来压下去的是没装饰的原始
+     快照）。
 
 ## 尚未实现（原型边界）
 

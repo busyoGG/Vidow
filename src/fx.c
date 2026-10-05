@@ -1512,7 +1512,7 @@ static void decor_draw(struct vidow_server *server,
 	end_pass(egl);
 }
 
-static void anim_draw(struct vidow_server *server,
+static bool anim_draw(struct vidow_server *server,
 		struct vidow_fx_target *fx, struct wlr_buffer *dst,
 		struct wlr_texture *src, int ox, int oy, double alpha, double scale) {
 	struct vidow_shader *sh = fx->shader;
@@ -1521,7 +1521,7 @@ static void anim_draw(struct vidow_server *server,
 
 	struct wlr_egl *egl = NULL;
 	if (begin_pass(server, dst, fx->w, fx->h, &egl) == 0) {
-		return;
+		return false;
 	}
 
 	glUseProgram(sh->program);
@@ -1544,6 +1544,7 @@ static void anim_draw(struct vidow_server *server,
 	draw_quad(sh->program);
 	glUseProgram(0);
 	end_pass(egl);
+	return true;
 }
 
 /* -------------------------------------------------------------- debugging */
@@ -1628,29 +1629,71 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 		return false;
 	}
 
-	struct wlr_buffer *displayed = NULL;
-	if (server->config.decor_enabled && server->decor.program != 0) {
-		struct wlr_buffer *target = pick_free(fx->buf);
-		if (target == NULL) {
-			wlr_texture_destroy(tex);
-			return false; /* both targets still in flight, skip this frame */
+	/* 动画那一趟要的缓冲先占好：它决定了装饰那趟要不要自己乘 alpha（见下）。
+	 * 占不到就只画装饰，这一帧照旧自己淡出，不会白闪一下。
+	 *
+	 * 两块都得要：上屏的那块被场景锁着，只有一块的话动画着色器隔一帧才跑得起来
+	 * —— 屏幕上就是「缩放过的窗口」和「没缩放只有淡入的窗口」交替闪，看着正
+	 * 好像一块大矩形一闪一闪。 */
+	struct wlr_buffer *anim = NULL;
+	if (fx->shader != NULL) {
+		for (int i = 0; i < 2; i++) {
+			if (fx->anim_buf[i] == NULL) {
+				fx->anim_buf[i] = alloc_target(server, fx->w, fx->h);
+			}
 		}
-		const float *border = focused ? server->config.border_color_focus :
-			server->config.border_color;
-		decor_draw(server, fx, target, tex, NULL, border, ox, oy, alpha, scale);
-		displayed = target;
+		anim = pick_free(fx->anim_buf);
 	}
 
-	/* Optional animation shader runs on the decorated result. */
-	if (fx->shader != NULL) {
-		struct wlr_buffer *anim = pick_free(fx->anim_buf);
-		if (anim == NULL && fx->anim_buf[0] == NULL) {
-			fx->anim_buf[0] = alloc_target(server, fx->w, fx->h);
-			anim = pick_free(fx->anim_buf);
+	struct wlr_buffer *displayed = NULL;
+	struct wlr_buffer *decorated = NULL;
+	const float *border = NULL; /* 重画装饰用（动画那趟失败时） */
+	if (server->config.decor_enabled && server->decor.program != 0) {
+		struct wlr_buffer *target = pick_free(fx->buf);
+		if (target != NULL) {
+			border = focused ? server->config.border_color_focus :
+				server->config.border_color;
+			/* 有动画那趟时装饰按满 alpha 画：整块的淡入淡出由动画着色器统一乘
+			 * 一次，两边各乘一次就成了 alpha²（淡得比设定的快）。 */
+			double decor_alpha = anim != NULL ? 1.0 : alpha;
+			decor_draw(server, fx, target, tex, NULL, border, ox, oy,
+				decor_alpha, scale);
+			displayed = target;
+			decorated = target;
+		} else {
+			/* 两块装饰目标都还在飞（上一两帧还没上完屏）：这一帧干脆不画，
+			 * 让上帧的画面多停一帧，别拿没装饰的内容顶上去。 */
+			wlr_texture_destroy(tex);
+			return false;
 		}
-		if (anim != NULL) {
-			anim_draw(server, fx, anim, tex, ox, oy, alpha, scale);
+	}
+
+	/* 动画着色器跑在**装饰结果**上，不是原始内容：渲染目标是「窗口 + 阴影留白」
+	 * 那么大一块画布，而内容贴图只占中间那块 —— 直接把它铺满整张画布，放大缩小
+	 * 的就是一张被拉伸、没有圆角没有边框没有模糊的硬边大矩形，比窗口大一圈，动
+	 * 画一结束装饰才接上，看着就是「先冒出一块大矩形再缩回窗口」。喂装饰结果
+	 * 才是 1:1：整块带边框/圆角/模糊的窗口跟着缩放淡入淡出，收尾正好落在窗口
+	 * 自己该在的位置上。 */
+	if (anim != NULL) {
+		struct wlr_texture *atex = NULL;
+		if (decorated != NULL) {
+			atex = wlr_texture_from_buffer(server->renderer, decorated);
+		}
+		if (atex == NULL) {
+			/* 装饰结果当不成贴图（导入失败）：退回原始内容。装饰那趟已经是按满
+			 * alpha 画的，这一帧要是不跑动画，窗口就会「啪」地全亮一下。 */
+			atex = tex;
+		}
+		if (anim_draw(server, fx, anim, atex, ox, oy, alpha, scale)) {
 			displayed = anim;
+		} else if (decorated != NULL) {
+			/* 动画那趟没画成（FBO 拿到就没了）：装饰还在，把它按真正的 alpha
+			 * 重画一遍补上淡入淡出，别让窗口整块亮一帧。 */
+			decor_draw(server, fx, decorated, tex, NULL, border, ox, oy,
+				alpha, scale);
+		}
+		if (atex != tex) {
+			wlr_texture_destroy(atex);
 		}
 	}
 	wlr_texture_destroy(tex);
