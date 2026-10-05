@@ -2178,6 +2178,10 @@ void vidow_layer_blur_release(struct vidow_layer_surface *ls) {
 		return;
 	}
 	if (ls->fx.node != NULL) {
+		/* 这行是给 test-layerdestroy.sh 数数用的：layer 没了，垫在它下面的
+		 * 模糊节点得当场收掉（不收就是每次面板重建漏一张整块大小的缓冲）。 */
+		wlr_log(WLR_DEBUG, "layer blur release %dx%d",
+			ls->geom.width, ls->geom.height);
 		wlr_scene_node_destroy(&ls->fx.node->node);
 		ls->fx.node = NULL;
 	}

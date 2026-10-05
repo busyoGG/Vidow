@@ -316,6 +316,8 @@ static void layer_surface_destroy(struct wl_listener *listener, void *data) {
 	struct vidow_layer_surface *ls = wl_container_of(listener, ls, destroy);
 	struct vidow_server *server = ls->server;
 
+	wlr_log(WLR_DEBUG, "layer closed %s layer=%u",
+		ls->layer_surface->namespace ?: "?", ls->layer);
 	vidow_ipc_emit_layer(server, "layer-closed", ls);
 	layer_unfocus(ls);
 	vidow_layer_blur_release(ls);
@@ -450,9 +452,21 @@ static void server_new_layer_surface(struct wl_listener *listener, void *data) {
 		layer_surface->output->name);
 
 	ls->anim_alpha = 1.0;
+	/* destroy 监听**必须挂在 wlr_scene_layer_surface_v1_create 之前**：
+	 * create 里 wlroots 自己也往 events.destroy 上挂了一个（销毁 ls->scene 那棵树
+	 * 连同整棵子树，再释放 scene_layer_surface 本身），而 wl_signal_emit 是按挂的
+	 * 顺序回调的。挂在后面，轮到我们的时候那棵树和垫在树里的模糊节点（见 fx.c 的
+	 * layer_blur_frame）都已经是释放过的内存了 —— vidow_layer_blur_release 拿着
+	 * 野指针调 wlr_scene_node_destroy，它顺着野 parent 往上走就段错误（noctalia
+	 * 重建一次面板必崩）。挂前面我们就是第一个：先把自己的东西收干净，再让
+	 * wlroots 拆树。 */
+	ls->destroy.notify = layer_surface_destroy;
+	wl_signal_add(&layer_surface->events.destroy, &ls->destroy);
+
 	ls->scene = wlr_scene_layer_surface_v1_create(
 		layer_tree(server, ls->layer), layer_surface);
 	if (ls->scene == NULL) {
+		wl_list_remove(&ls->destroy.link);
 		free(ls);
 		return;
 	}
@@ -465,8 +479,6 @@ static void server_new_layer_surface(struct wl_listener *listener, void *data) {
 	wl_signal_add(&layer_surface->surface->events.unmap, &ls->unmap);
 	ls->commit.notify = layer_surface_commit;
 	wl_signal_add(&layer_surface->surface->events.commit, &ls->commit);
-	ls->destroy.notify = layer_surface_destroy;
-	wl_signal_add(&layer_surface->events.destroy, &ls->destroy);
 	ls->new_popup.notify = layer_surface_new_popup;
 	wl_signal_add(&layer_surface->events.new_popup, &ls->new_popup);
 }

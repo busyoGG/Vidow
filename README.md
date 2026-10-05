@@ -533,6 +533,7 @@ python3 test-float.py        # 三个真实 GTK 窗口，验证浮动模式自�
 ./test-layerghost.sh                 # 会被模糊的 layer surface 不进自己的底衬（3 项断言）
 ./test-layerwin.sh                   # top 层模糊里含窗口（纯蓝窗口 + 压在它上面的面板，4 项断言）
 ./test-layermask.sh                  # 按元素自己的 alpha 剔除（透明内边距里的亮点不糊，3 项断言）
+./test-layerdestroy.sh               # layer 没了要收干净它的模糊节点（反复重建不崩不漏，9 项断言）
 ./test-openanim.sh                   # 开窗动画画的是装饰后的窗口本身（不是一块更大的矩形，4 项断言）
 ./test-bounce.sh                     # 入场过冲 / 关闭回弹（q 弹曲线真的落到屏幕上了，5 项断言）
 ./test-drag.sh                       # 拖窗口：拖得动 / 跨屏改归属 / 平铺按落点插入（11 项）
@@ -2593,6 +2594,22 @@ protocols/     wlr-layer-shell / wlr-virtual-pointer / input-method-v2 /
      默认配置里给了 `Mod+1..9` 直跳的绑定（可删）。`test-workspace.sh` 的日志断言跟着新格式
      改；`test-ipc.sh`/`test-focus.sh` 同步。回归：defaultconfig / gap / config / workspace /
      ipc / focus / overview / hotplug / clipboard / layerwin / xwayland-popup 全过。
+
+123. **layer surface 被销毁时的段错误（noctalia 重建面板必崩）**。垫在 layer 背后的那份
+     模糊（`ls->fx.node`）是挂在 wlroots 自己的场景树 `ls->scene->tree` 里的，而
+     `wlr_scene_layer_surface_v1_create()` **内部也**往 `layer_surface->events.destroy` 上挂了
+     一个监听：销毁整棵树（连子树）、再释放 `scene_layer_surface` 结构本身。`wl_signal_emit`
+     按挂的顺序回调，我们的 destroy 监听挂在它后面 —— 轮到时 `ls->scene` 和 `ls->fx.node` 都
+     已经是释放过的内存，`vidow_layer_blur_release()` 拿着野指针调 `wlr_scene_node_destroy()`，
+     后者先顺着 `node->parent` 往上找 scene，读到的正是 glibc tcache 的 key（coredump 2853800：
+     `rax=0xaa7f5cd93dea7ef1`，非规范地址）→ SIGSEGV。崩不崩还得看运气：释放过的块里 parent
+     那个字由分配器决定，所以表现是「用着用着崩」而不是「每次都崩」。修法：把 `ls->destroy` 的
+     注册**挪到 `wlr_scene_layer_surface_v1_create()` 之前**（create 失败的路径要
+     `wl_list_remove` 摘掉），我们就成了第一个回调 —— 先收自己的模糊节点，再让 wlroots 拆树。
+     顺带加两行 DEBUG 日志（`layer closed` / `layer blur release`）。新增
+     `./test-layerdestroy.sh`（9 项）：状态栏上屏 → 画模糊 → 退出，反复重建 5 轮，每轮都断言
+     vidow 还活着、模糊节点被收掉，最后量 RSS 确认没漏缓冲；拿修之前的二进制跑，第 1 轮常常
+     侥幸活下来、第 2 轮必崩（所以测试要跑 5 轮）。
 
 122. **动态工作区的收编时机 + `./test-ws-dynamic.sh`**。`cleanup` 原来挂在 unmap 里，
      但那时候列还没摘掉 —— 工作区还不算空，于是「关掉窗口后那块空的、没名字的工作区」
