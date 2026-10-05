@@ -240,8 +240,10 @@ struct vidow_decor_prog {
 	int u_radius, u_border_width, u_border_color, u_shadow_color;
 	int u_shadow_offset, u_shadow_radius, u_opacity, u_noise, u_alpha;
 	int u_origin, u_output_size, u_flip_y;
-	int u_blur_alpha_min, u_blur_strength;
+	int u_blur_strength;
 	int u_blur_region, u_blur_region_on;
+	/* 元素自己的 alpha（「透明度剔除」，见 fx.c 的 decor_fragment_src）。 */
+	int u_mask, u_mask_on, u_mask_min;
 };
 
 /* One kawase pyramid. The compositor keeps a shared one for the wallpaper

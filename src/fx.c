@@ -144,6 +144,12 @@ static const char *decor_fragment_src =
 	 * on <= 0.5 时表示没限制，整个窗口都模糊。 */
 	"uniform vec4 u_blur_region;\n"
 	"uniform float u_blur_region_on;\n"
+	/* 元素自己的 alpha（「透明度剔除」）：模糊只画在元素真的有内容的地方。
+	 * u_mask_on > 0.5 时取 u_mask，否则取 u_texture。u_mask_min 是阈值（硬 step，
+	 * 跟 niri 的 blur_finish 一样；0 = 不剔）。 */
+	"uniform sampler2D u_mask;\n"
+	"uniform float u_mask_on;\n"
+	"uniform float u_mask_min;\n"
 	"varying vec2 v_uv;\n"
 	"\n"
 	"float sd_round_box(vec2 p, vec2 half_size, float r) {\n"
@@ -174,6 +180,13 @@ static const char *decor_fragment_src =
 	"\n"
 	"	vec2 o = (u_origin - u_pad + p) / u_output_size;\n"
 	"	vec4 blurred = texture2D(u_blur, clamp(o, 0.0, 1.0));\n"
+	/* 元素自己的 alpha（「透明度剔除」）：模糊只画在元素真的有内容的地方 —— 透明
+	 * 内边距、圆角外面、弹窗自带的半透明阴影边都不再透出一圈模糊。窗口 / 弹窗那条
+	 * 路内容贴图就是元素自己（u_texture）；layer surface 的模糊底衬不画内容，元素
+	 * 内容由 u_mask 传进来。用的是**内容自己的 alpha**，不含 u_opacity：剔除管的是
+	 * 形状，半透明窗口该透出来的模糊不能因为 window_opacity 低就整个没了。 */
+	"	float elem_a = u_mask_on > 0.5 ?\n"
+	"		texture2D(u_mask, uv).a : texture2D(u_texture, uv).a;\n"
 	"	float cover = 1.0;\n"
 	"	if (u_blur_region_on > 0.5) {\n"
 	"		vec2 lo = u_blur_region.xy;\n"
@@ -182,7 +195,8 @@ static const char *decor_fragment_src =
 	"		vec2 b = 1.0 - smoothstep(hi - 1.0, hi + 1.0, wp);\n"
 	"		cover = a.x * a.y * b.x * b.y;\n"
 	"	}\n"
-	"	vec4 out_px = blurred * u_blur_strength * inside * cover;\n"
+	"	vec4 out_px = blurred * u_blur_strength * inside * cover *\n"
+	"		step(u_mask_min, elem_a);\n"
 	"\n"
 	/* mediump 只有约 16 位有效范围：大窗口上 dot(p, vec2(12.99, 78.23)) 会
 	 * 直接溢出成 Inf，sin(Inf) = NaN，而 NaN * u_noise（哪怕 u_noise = 0）
@@ -332,6 +346,9 @@ static void load_decor_program(struct vidow_server *server) {
 	LOC(u_blur_strength, "u_blur_strength");
 	LOC(u_blur_region, "u_blur_region");
 	LOC(u_blur_region_on, "u_blur_region_on");
+	LOC(u_mask, "u_mask");
+	LOC(u_mask_on, "u_mask_on");
+	LOC(u_mask_min, "u_mask_min");
 #undef LOC
 }
 
@@ -1393,7 +1410,8 @@ void vidow_blur_update(struct vidow_output *output) {
 
 static void decor_draw(struct vidow_server *server,
 		struct vidow_fx_target *fx, struct wlr_buffer *dst,
-		struct wlr_texture *src, const float border[4], int ox, int oy,
+		struct wlr_texture *src, struct wlr_texture *mask,
+		const float border[4], int ox, int oy,
 		double alpha, double scale) {
 	struct vidow_decor_prog *d = &server->decor;
 	struct vidow_config *cfg = &server->config;
@@ -1418,6 +1436,26 @@ static void decor_draw(struct vidow_server *server,
 		bind_tex(1, ba.target, ba.tex);
 	}
 	glUniform1i(d->u_blur, 1);
+
+	/* 元素自己的内容（透明度剔除用）。mask == NULL 时用 u_texture 那张内容贴图
+	 * （窗口 / 弹窗：内容贴图就是元素自己）；layer surface 的模糊底衬不画内容，
+	 * 调用方把 layer 自己的缓冲当 mask 递进来。采样器不能空着，配上 empty_tex
+	 * 也无所谓：u_mask_on = 0 时着色器根本不采它。 */
+	struct wlr_texture *mtex = mask != NULL ? mask : server->empty_tex;
+	struct wlr_gles2_texture_attribs ma;
+	wlr_gles2_texture_get_attribs(mtex, &ma);
+	bind_tex(2, ma.target, ma.tex);
+	glUniform1i(d->u_mask, 2);
+	glUniform1f(d->u_mask_on, mask != NULL ? 1.0f : 0.0f);
+	/* 阈值：客户端用 ext-background-effect 自己要了区域就不按元素 alpha 剔 ——
+	 * 那块区域就是它画出来的边界（niri 的 need_ignore_alpha 同一个判断）。layer
+	 * 底衬拿不到元素内容时也不能剔，不然整块模糊都没了。0 = step(0, a) 恒为 1，
+	 * 也就是不剔。 */
+	float mask_min = (float)cfg->blur_alpha_min;
+	if (fx->blur_region_on || (mask == NULL && fx->blur_only)) {
+		mask_min = 0.0f;
+	}
+	glUniform1f(d->u_mask_min, mask_min);
 
 	/* 着色器全程在「渲染目标的物理像素」里算：配置里的圆角、边框、阴影都是
 	 * 逻辑单位，乘上倍率才是像素。 */
@@ -1607,7 +1645,7 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 		}
 		const float *border = focused ? server->config.border_color_focus :
 			server->config.border_color;
-		decor_draw(server, fx, target, tex, border, ox, oy, alpha, scale);
+		decor_draw(server, fx, target, tex, NULL, border, ox, oy, alpha, scale);
 		displayed = target;
 	}
 
@@ -1968,8 +2006,38 @@ static bool layer_blur_frame(struct vidow_server *server,
 		return false;
 	}
 	static const float no_border[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-	decor_draw(server, fx, target, server->empty_tex, no_border,
+	/* 元素自己的内容，给透明度剔除当 mask：模糊只画在 layer surface 真的有内容的
+	 * 地方，它自己透明的内边距 / 圆角外不再透出一圈模糊。取的是 surface 当前的
+	 * 缓冲；层的 geom 就是 surface 的尺寸（layer.c 的 arrange 就那么算的），所以
+	 * uv 跟内容那趟完全一致，不用另算映射。拿不到（还没 commit 过）就让 mask_min
+	 * 归零 —— 也就是整块都糊，退回老行为而不是把模糊整块剔没。
+	 *
+	 * 代价：这是 surface 的**主**缓冲，不含子表面 —— 一个用子表面画内容的层，那
+	 * 部分会被剔掉（少见；要精确就得像 niri 那样把整棵子树离屏渲一张 alpha 纹理）。 */
+	struct wlr_texture *mask = NULL;
+	struct wlr_client_buffer *cbuf = ls->layer_surface->surface->buffer;
+	if (cbuf != NULL) {
+		mask = wlr_texture_from_buffer(server->renderer,
+			render_source(&cbuf->base));
+	}
+	/* VIDOW_MASK_DUMP=N：把前 N 份 mask（就是下面递给着色器的这张 layer 自己的
+	 * 内容）dump 成裸数据，用来量「元素自己透明的地方到底剔没剔」。 */
+	static int mask_dumped = 0;
+	static int mask_limit = -1;
+	if (mask_limit < 0) {
+		const char *env = getenv("VIDOW_MASK_DUMP");
+		mask_limit = env != NULL ? atoi(env) : 0;
+	}
+	if (mask != NULL && mask_dumped < mask_limit) {
+		dump_buffer(server, &cbuf->base, px_w, px_h, "vidow-mask",
+			mask_dumped);
+		mask_dumped++;
+	}
+	decor_draw(server, fx, target, server->empty_tex, mask, no_border,
 		ls->geom.x, ls->geom.y, 1.0, scale);
+	if (mask != NULL) {
+		wlr_texture_destroy(mask);
+	}
 
 	wlr_scene_node_set_position(&fx->node->node, 0, 0);
 	wlr_scene_buffer_set_dest_size(fx->node, logical_w, logical_h);

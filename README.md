@@ -479,6 +479,7 @@ python3 test-float.py        # 三个真实 GTK 窗口，验证浮动模式自�
 ./test-blurcull.sh                   # 透明度剔除：低于阈值的底衬一点不糊（5 项断言）
 ./test-layerghost.sh                 # 会被模糊的 layer surface 不进自己的底衬（3 项断言）
 ./test-layerwin.sh                   # top 层模糊里含窗口（纯蓝窗口 + 压在它上面的面板，4 项断言）
+./test-layermask.sh                  # 按元素自己的 alpha 剔除（透明内边距里的亮点不糊，3 项断言）
 ./build/jsontest                     # 只看 JSON 写出/读入（离线，30 项）
 ./build/scaletest                    # 只看缩放计算（24 项）
 ```
@@ -501,6 +502,9 @@ WLR_BACKENDS=headless WLR_HEADLESS_OUTPUTS=1 WLR_LIBINPUT_NO_DEVICES=1 ./build/v
 | --- | --- |
 | `VIDOW_LOG` | `info`（默认）/ `debug` / `error` |
 | `VIDOW_TERMINAL` | `Super+Enter` 启动的命令，默认 `kitty` |
+| `VIDOW_BLUR_DUMP=N` | 前 N 份底衬 / 模糊图 / layer 区域抓取 dump 成 `/tmp/vidow-{bd,blur,lbd,lblur}-*`（裸 ARGB，测试用） |
+| `VIDOW_FX_DUMP=N` | 前 N 份装饰离屏缓冲 dump 成 `/tmp/vidow-fx-*` |
+| `VIDOW_MASK_DUMP=N` | 前 N 份透明度剔除的 mask（layer 自己的内容）dump 成 `/tmp/vidow-mask-*` |
 
 ## 快捷键
 
@@ -1151,10 +1155,39 @@ vidowmsg clipboard-clear
 | 0.45 | 0.5 | **0.0000 / 0.0000**（低于阈值 ⇒ 一点不糊；软过渡那版 0.4039） |
 | 0.9 | 0.5 | 0.9020 / 0.5412（高于阈值 ⇒ 一点不衰减） |
 
-注意它管的是**底衬**的 alpha（字段注释在 `src/server.h`）：背景层、或者底下那个窗口
-本身半透明到阈值以下时，那块地方就不糊。niri 的 `ignore-alpha` 还多一层 —— 按**元素
-自己的** alpha 掐模糊（面板的透明内边距 / 圆角外面、半透明窗口整体），vidow 目前没有
-这条路。
+注意这个阈值同时管**两件事**：
+
+1. **底衬**的 alpha（字段注释在 `src/server.h`）：背景层、或者底下那个窗口本身半透明到
+   阈值以下时，那块地方就不糊。
+2. **元素自己**的 alpha（niri 的 `ignore-alpha` 本意，跟 niri 的 `blur_finish` 一样是
+   `step(u_mask_min, texture2D(u_mask, uv).a)`）：模糊只画在元素真的有内容的地方。没有
+   这一层的话，模糊是垫在元素下面的一整块矩形，元素自己透明的内边距 / 圆角外面 / 自带
+   半透明阴影边那圈会透出一圈糊 —— 实测（`tools/padpanel.py` 留 40px 全透明内边距 +
+   `tools/dot.py` 的亮点）峰值 **1.000 → 0.322**。
+
+元素 alpha 从哪来：窗口 / 弹窗那条路，装饰着色器手里的内容贴图就是元素自己
+（`u_texture`），直接取它的 alpha；layer surface 的模糊底衬那条路不画内容（`u_texture`
+是空贴图），调用方把 layer surface 自己的缓冲当 mask 递进来（`u_mask`；层表面的 geom
+就等于 surface 尺寸，所以 uv 跟内容那趟完全一致）。两条路用的都是**内容自己的 alpha，
+不含 `window_opacity`** —— 剔除管的是「形状」，半透明窗口该透出来的模糊不能因为
+`window_opacity` 调低就整个没了。
+
+客户端自己用 ext-background-effect 要了模糊区域时**不剔**（那块区域就是它画出来的边界，
+niri 的 `need_ignore_alpha = !blur_region.is_some_and(|r| !r.is_empty())` 同一个判断）；
+拿不到元素内容（surface 还没 commit 过）时也不剔（`mask_min = 0` ⇒ `step(0, a) ≡ 1`），
+退回老行为而不是把模糊整块剔没。
+
+端上实测（`./test-layermask.sh`：一块留 40px 透明内边距的 top 层面板 + 两个亮点，一个
+落在内边距里、一个落在面板 50% 那块底下）：
+
+| | 内边距里的亮点 | 面板块底下的亮点 |
+| --- | --- | --- |
+| `blur_alpha_min = 0.15` | **1.000**（原样，不糊） | 0.167（块 alpha 0.5 > 0.15，照糊） |
+| `blur_alpha_min = 0`（不剔） | 0.322（被糊平） | 0.167 |
+
+局限：mask 取的是 surface 的**主**缓冲，不含子表面 —— 一个用子表面画内容的层，那部分
+会被剔掉（要精确得像 niri 那样把整棵子树离屏渲一张 alpha 纹理）。输入法候选框
+（`layer_im`）vidow 现在根本没有模糊，所以那边没有可剔的东西。
 
 配置：`blur_enabled` / `blur_all` / `blur_levels`(2..6) / `blur_strength` / `blur_offset` /
 `blur_alpha_min`。默认 `blur_all = true`，平铺窗口也模糊。
@@ -1315,9 +1348,11 @@ layer 背后的亮斑 σ 16.0 → 23.5、对位偏差 ≤ 0.6 像素（`./test-b
 （`tools/padpanel.py`：留 40px 全透明内边距的 top 层面板 + `tools/dot.py` 在 (20,150)
 放一个亮点）：没面板时亮点峰值 **1.000**，有面板时同一处只剩 **0.285**（被糊平了）。
 niri 的 `ignore-alpha` 就是治这个的：`blur_finish` 拿**元素自己**渲染出来的 alpha 纹理做
-`step(ignore_alpha, alpha)`，元素自己透明的地方不糊。vidow 目前**没有这条路**（它管的是
-底衬的 alpha，见上面的透明度剔除那节）—— 要做需要把 layer 自己的内容离屏渲染一张 alpha
-纹理（窗口那条路几乎免费：装饰着色器手里就有内容 alpha）。
+`step(ignore_alpha, alpha)`，元素自己透明的地方不糊。vidow 原来没有这条路（只按底衬的
+alpha 剔），**已修**：装饰着色器多了一个 mask 采样器（`u_mask`，见上面透明度剔除那节），
+layer 的模糊底衬把 layer surface 自己的缓冲当 mask 传进去，窗口 / 弹窗那条路直接用内容
+贴图的 alpha。修后同一处的峰值 **0.322 → 1.000**（原样显示背景），面板 50% 那块底下照糊
+（0.167）。新增 `./test-layermask.sh`（3 项判据，拿老二进制跑挂 1 条）。
 
 **⑧ layer 的模糊底下没有窗口**：原来所有 layer surface 都拿共享底衬（窗口被藏起来），
 于是压在窗口上的半透明面板透出来的是**壁纸**的模糊，不是窗口的模糊。niri 不是这么做的：
@@ -1799,7 +1834,7 @@ tools/bluewin.py  一个纯蓝的普通窗口：跟 tools/panel.py 一起验证�
 tools/soft.py     背景层一整屏均匀半透明灰：量透明度剔除会不会在链里逐趟相乘
 tools/bpanel.py   一块 bottom 层 50% 红面板：盯「被模糊的 layer 自己进了底衬」
 tools/padpanel.py top 层「面板」，向外留 40px 全透明内边距：盯模糊会不会漏进元素自己
-                  透明的部分（vidow 现在会；niri 的 ignore-alpha 不会）
+                  透明的部分（`test-layermask.sh`：修前 1.000 → 0.322，修后原样 1.000）
 tools/fakeim.c    假输入法（连 input-method-v2，抢键盘，每个按键 commit 一段文字），
                   用来验证中继链路，不依赖 fcitx5 的配置
 tools/bgblur.c    半透明窗口 + 指定模糊区域，用来验证 ext-background-effect
@@ -2368,6 +2403,17 @@ protocols/     wlr-layer-shell / wlr-virtual-pointer / input-method-v2 /
      另查明「按元素自己的 alpha 掐模糊」（niri 的 ignore-alpha 本意）vidow 根本没有：
      layer 的模糊是一整块矩形，会漏进面板自己透明的内边距里（亮点峰值 1.000 → 0.285，
      探针 `tools/padpanel.py`）。
+114. 按**元素自己的 alpha** 剔除模糊（niri 的 `ignore-alpha` 本意，治「一圈透明模糊」）。
+     装饰着色器多了一个 mask 采样器：窗口 / 弹窗那条路直接用内容贴图的 alpha，layer 的
+     模糊底衬那条路由调用方把 layer surface 自己的缓冲递进来（层表面的 geom 就等于
+     surface 尺寸，uv 跟内容那趟一致）；两条路都用**内容自己的 alpha、不含
+     `window_opacity`**（否则 `window_opacity` 一调低模糊就整个没了）。客户端用
+     ext-background-effect 要了区域就不剔（niri 的 `need_ignore_alpha` 同一个判断），
+     拿不到 mask 时也不剔（退回老行为）。实测（`tools/padpanel.py` 40px 透明内边距 +
+     亮点）：阈值 0.15 时内边距里的亮点峰值 **0.322 → 1.000**（原样），面板 50% 那块底下
+     照糊（0.167）→ 修后 0.322。新增 `./test-layermask.sh`（3 项，拿老二进制跑挂 1 条）、
+     `VIDOW_MASK_DUMP`。`./test-layerblur.sh` 的第 2 条判据改用最大梯度（窗口自带的那圈
+     半透明边框也被剔了，平均梯度会跟着动，原来的 0.9 比值太脆）。
 
 ## 尚未实现（原型边界）
 
