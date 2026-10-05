@@ -600,8 +600,9 @@ void vidow_config_sync(struct vidow_server *server) {
 	vidow_ipc_apply_config(server);
 	vidow_xwayland_apply_config(server);
 	/* 配置可能改了 scale / outputs / xwayland_scale：改到的输出立刻换缩放，
-	 * XWayland 的全局缩放也跟着重算。 */
+	 * XWayland 的全局缩放也跟着重算。布局位置（output_positions）同理。 */
 	vidow_output_apply_scale_all(server);
+	vidow_output_apply_positions_all(server);
 	vidow_xwayland_scale_apply(server);
 	/* clipboard / clipboard_primary 可能被改过：重新评估接不接管 */
 	vidow_clipboard_apply_config(server);

@@ -172,6 +172,10 @@ struct vidow_config {
 	 * 输出名覆盖，写法 "DP-1:2 HDMI-A-1:1.25"。 */
 	char scale[16];
 	char outputs[256];
+	/* 哪块屏摆在布局的哪个位置："DP-3:0,0; DP-2:1920,0"（逻辑坐标）。
+	 * 留空 = 按输出到达顺序自动排（wlr_output_layout_add_auto）—— 那个顺序是
+	 * 后端说了算，所以「哪块在左边」要确定就得写这里。 */
+	char output_positions[256];
 
 	/* XWayland。xwayland=false 干脆不起 X 服务；xwayland_scale="auto" = 取所有
 	 * 输出缩放的最大值（X 只有一套坐标，只能按最密的那块屏来）；"off" = 1:1。
@@ -962,6 +966,11 @@ struct vidow_server {
 	 * （events.active，见 main.c 的 session_active）。 */
 	struct wlr_session *session;
 	struct wl_listener session_active;
+	/* 要切的 tty 号 + 干这件事的 idle 源。切 VT 不能从键盘事件处理里直接做
+	 * （那一进去就会拆掉所有输出、挂起输入设备），所以挂个 idle 延到这一轮
+	 * 派发结束（见 keybind.c 的 vidow_vt_switch）。 */
+	unsigned vt_pending;
+	struct wl_event_source *vt_idle;
 	struct wlr_renderer *renderer;
 	struct wlr_allocator *allocator;
 
@@ -1114,6 +1123,9 @@ struct vidow_server {
 	/* Fallback clock: advances animations when the backend stops delivering
 	 * frame events (a nested Wayland output stalls while the host is idle). */
 	struct wl_event_source *anim_timer;
+	/* 会话切回来（或输出刚建好）之后主动画一帧的一次性闹钟，见
+	 * vidow_output_kick_all()。 */
+	struct wl_event_source *kick_timer;
 };
 
 /* -------------------------------------------------------------------- init */
@@ -1123,6 +1135,11 @@ bool vidow_output_init(struct vidow_server *server);
 void vidow_output_apply_scale(struct vidow_server *server,
 		struct vidow_output *output);
 void vidow_output_apply_scale_all(struct vidow_server *server);
+/* 每块屏立刻画一帧（走 1ms 定时器）。会话切回来、输出刚建出来的时候用：这时候
+ * 没有任何 damage，后端也不会主动送 frame 事件，不主动画就一直是黑的。 */
+void vidow_output_kick_all(struct vidow_server *server);
+/* 按配置（output_positions）把每块屏摆到它该在的位置；SIGHUP 后对一次账。 */
+void vidow_output_apply_positions_all(struct vidow_server *server);
 /* 输出的运行时改动（IPC 用）。都会 commit 一次并把跟着变的东西（布局、背景
  * 缓存、光标、可用区域）重做一遍。why 只进日志。 */
 bool vidow_output_set_scale(struct vidow_server *server,

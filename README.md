@@ -529,8 +529,13 @@ WLR_BACKENDS=wayland ./build/vidow
 vidow.bind("Ctrl+Alt+P", "switch-vt 3")
 ```
 
-命令行也行：`vidowmsg action switch-vt 3`。会话不活动时 wlroots 的 DRM 后端自己会停
-往 DRM 上画，vidow 这边只在切回来的时候整屏重画一遍。**嵌套 / headless 里没有会话**，
+命令行也行：`vidowmsg action switch-vt 3`。切换本身**延后一轮事件派发**再做
+（`wlr_session_change_vt()` 是同步的，一进去 wlroots 就把所有输出销毁、输入设备挂起 ——
+在键盘事件处理中途拆掉半个会话，正是「切走再切回来卡死」最容易踩的那一脚）。
+会话不活动时 wlroots 的 DRM 后端自己会停往 DRM 上画；切回来时 DRM 后端会把所有输出
+**销毁再重建**，而这时候场景里一点 damage 都没有、后端也不欠我们 frame 事件 ——
+所以 vidow 在会话恢复时主动催一帧（`vidow_output_kick_all()`），不然就是「切回来
+卡死」。**嵌套 / headless 里没有会话**，
 这条动作会明确失败（日志：`VT: 没有会话（嵌套 / headless），切 VT 交给宿主`），而且
 Ctrl+Alt+F2 不会被吃掉（那是宿主 Hyprland 的）。回归判据 `test-vt.sh`。
 
@@ -638,6 +643,7 @@ overview 里：左键点窗口 = 选中它并缩回去，点空白 = 取消，`E
 -- ~/.config/vidow/config.lua
 scale = "auto"                      -- 缩放 = ppi / 96
 outputs = "DP-1:2 HDMI-A-1:1.25"    -- 按输出名覆盖（也可以写 auto / off）
+output_positions = "DP-3:0,0; DP-2:1920,0"  -- 哪块屏摆在哪（逻辑坐标，分号分隔）
 xwayland = true                     -- 起 XWayland（懒启动：真有人连 X 才 fork）
 xwayland_scale = "auto"             -- X 的全局缩放 = ceil(最密那块屏的缩放)
 xwayland_env = true                 -- 给 X11 客户端下发 GDK_SCALE / QT_SCALE_FACTOR
@@ -659,6 +665,7 @@ xwayland_env = true                 -- 给 X11 客户端下发 GDK_SCALE / QT_SC
 | --- | --- | --- |
 | `scale` | `auto` | 所有输出的默认策略：`auto` = 按 ppi 推，或者写一个数（`1.75`） |
 | `outputs` | 空 | 按输出名覆盖：`outputs = DP-1:2 HDMI-A-1:1.25 eDP-1:auto` |
+| `output_positions` | 空 | 哪块屏摆在布局的哪：`DP-3:0,0; DP-2:1920,0`（**逻辑**坐标，分号分隔；留空 = 按输出到达顺序自动排） |
 | `xwayland` | `true` | 起不起 XWayland（`0` = 完全不碰 X 那一摊） |
 | `xwayland_scale` | `auto` | `auto` = `ceil(最密那块屏的缩放)`；`off` = 一律 1:1；也可以写死一个数 |
 | `xwayland_env` | `true` | 给 X11 客户端下发 `GDK_SCALE` / `QT_SCALE_FACTOR` / `XCURSOR_SIZE`（用户自己显式设过的不抢） |
@@ -690,6 +697,18 @@ X11 没有 per-window 的缓冲区缩放，所以：
    - 低 DPI 的屏（`s < S`）：落屏像素 = `逻辑 × s` < 缓冲区 → **缩小，不糊**
    - 两块屏上的物理尺寸一样（逻辑尺寸一样，而 scale ∝ ppi）
 4. 命中坐标按同一比例换回来：`局部 = (布局坐标 - 窗口原点) × S`，点哪儿就是哪儿。
+5. **告诉 X 服务它该按设备像素报屏幕**：往 root window 写
+   `_XWAYLAND_GLOBAL_OUTPUT_SCALE = S`（CARDINAL）。打过 HiDPI 补丁的 Xwayland
+   （`xorg-xwayland-lily` / xorg 的 MR!733）收到之后才会把 X 屏幕和 RandR 模式也
+   乘上 S —— 这正是上面第 2 条假设的「X 像素 = 逻辑 × S」。**不写它的后果**：X 屏幕
+   只有逻辑尺寸，按屏幕尺寸算布局的客户端（GTK）会把整屏当成一半大小，最大化的窗口
+   只占 1/4 面积、固定尺寸的登录窗也和面板对不上。没打补丁的 Xwayland 里这个原子
+   不存在，vidow 就不写（行为跟以前一样），日志里会直说。
+6. **Xft.dpi = 96 × S**（写进 `RESOURCE_MANAGER`，保留别人的资源项）。`GDK_SCALE` /
+   `QT_SCALE_FACTOR` 只覆盖 GTK / Qt；Chromium/CEF（微信登录窗就是）、Electron、
+   Java、Wine 只认 Xft.dpi。不给，它们按 1 倍画，而 vidow 按 S 除 —— 窗口只剩该有的
+   1/4。回归判据见 `test-xwayland-hidpi.sh`（属性、Xft.dpi、X 屏幕 = 逻辑 × S，
+   以及端到端：点一下 xev 收到的 root 坐标 = 布局坐标 × S）。
 
 `GDK_SCALE` / `QT_SCALE_FACTOR = S` 发给 X11 客户端：认这两个变量的 GTK/Qt 按 S 倍
 绘制（于是和 Wayland 程序一样大）；不认的老程序（xterm、xeyes）保持 1:1 绘制 ——
@@ -712,6 +731,12 @@ vidow.rule{ class = "WeChat", x11_scale = 1 }   -- 按 WM_CLASS
 着渲染走（`局部 = (布局 - 原点) × 实际倍数`），两种设置下都是点哪儿就哪儿。
 `vidowmsg rules` 能把 `x11_scale` 查回来；回归判据见 `test-x11scale.sh`（同一个
 300×300 的固定尺寸 X11 窗口跑两遍：150×150 vs 300×300）。
+
+改过缩放的窗口还有一个坑（实测撞出来的）：场景的命中判定会问表面自己的输入区域，
+而那个区域按「表面声明的逻辑尺寸」卡边界 —— 我们把它画成 2 倍大之后，右边和下边一大片
+就成了「看得见、点不着」。所以尺寸和表面声明对不上的时候，vidow 把命中区域交给节点
+自己的盒子（`point_accepts_input = NULL`，代价是这类窗口不再遵守 X 的 shape；默认
+尺寸一致时照旧）。`test-x11scale.sh` 里两种设置都扫过命中区域。
 
 ### X11 的 SSD 和 Wayland 一样
 
@@ -2019,6 +2044,12 @@ test-x11scale.sh  固定尺寸的 X11 窗口（WM_NORMAL_HINTS min==max）在 2 
 test-scrollcull.sh  两块并排的屏 + 三列装不下：滚出视口的列被摘出场景（修之前它的
                   坐标落进隔壁屏的框里，就画在隔壁显示器上），再滚回来又显示，
                   浮动 / 拖拽不受这条规则管，藏起来的窗口按规则照旧补帧
+test-outputpos.sh  输出布局位置：`output_positions` 按名字摆（自动排的顺序是后端给的，
+                  headless 上实测是反的）、逗号写法也认、拔插后回到配置说的位置、
+                  SIGHUP 改配置立刻生效
+test-xwayland-hidpi.sh  XWayland 的 HiDPI 告知：`_XWAYLAND_GLOBAL_OUTPUT_SCALE`
+                  让 X 屏幕 / RandR 变成设备像素（补丁生效时），`Xft.dpi = 96×S`，
+                  端到端点一下 xev 收到的 root 坐标 = 布局坐标 × S，改缩放跟着变
 test-vt.sh        tty 的 VT 切换：headless 下验「认得 Ctrl+Alt+F2（F1..F12 + Ctrl+Alt
                   就是 VT 键）、不接管、不吃键」，`switch-vt` 动作 / 越界号优雅失败，
                   config 里绑的 switch-vt 走同一条路（真机上生效的就是它）

@@ -82,11 +82,25 @@ CFG
 		tail -1 | cut -d= -f2)
 	export DISPLAY=$(grep -ao "DISPLAY=:[0-9]*" "$log" | tail -1 | cut -d= -f2)
 
-	# 固定尺寸（WM_NORMAL_HINTS min == max）的普通 X11 窗口 = 微信登录窗那种
-	setsid nohup ./build/xpopup popup normal 100 100 300 300 fixed \
-		> "$RUNDIR/xp-$name.log" 2>&1 &
-	XP_PID=$!
-	for _ in $(seq 1 60); do grep -aq "place xp-popup -> " "$log" && break; sleep 0.2; done
+	# 固定尺寸（WM_NORMAL_HINTS min == max）的普通 X11 窗口 = 微信登录窗那种。
+	# 客户端偶尔会卡在「窗口建了但没 map」上（Xwayland 懒启动那一下的时序），
+	# 起两次就好 —— 这个测试验的是缩放桥，不是客户端自己靠不靠谱。
+	for attempt in 1 2; do
+		setsid nohup ./build/xpopup popup normal 100 100 300 300 fixed \
+			> "$RUNDIR/xp-$name.log" 2>&1 &
+		XP_PID=$!
+		for _ in $(seq 1 30); do
+			grep -aq "place xp-popup -> " "$log" && break
+			sleep 0.2
+		done
+		grep -aq "place xp-popup -> " "$log" && break
+		if [ "$attempt" = 1 ]; then
+			echo "  （第 1 次客户端没 map 上，重起一次）"
+			kill "$XP_PID" 2>/dev/null
+			XP_PID=""
+			sleep 0.5
+		fi
+	done
 	sleep 0.8
 
 	# 指针移进窗口（vdrag 的两次坐标一样 = 落在那儿）
@@ -142,9 +156,11 @@ def place(txt, title):
     return tuple(int(g) for g in m.groups()) if m else None
 
 def buf(txt):
+    """缓冲尺寸、vidow 这边的缩放桥、场景尺寸、以及 Xwayland 在表面上声明的
+    buffer scale（写了 _XWAYLAND_GLOBAL_OUTPUT_SCALE 之后它是 2）。"""
     m = None
     for m in re.finditer(r"x11: xp-popup 缓冲 (\d+)x(\d+) 按 (\d+) 倍声明 -> "
-                         r"场景 (\d+)x(\d+)", txt):
+                         r"场景 (\d+)x(\d+)（表面 (\d+) 倍", txt):
         pass
     return tuple(int(g) for g in m.groups()) if m else None
 
@@ -161,7 +177,7 @@ plain, rule = log("plain"), log("rule")
 pb = buf(plain)
 check(pb is not None, "不带规则：日志里有「缓冲 → 场景」那行")
 if pb:
-    bw, bh, scale, dw, dh = pb
+    bw, bh, scale, dw, dh, _sface = pb
     check(scale == 2, "不带规则：缓冲区按全局缩放 2 倍声明（%d）" % scale)
     check((dw, dh) == (bw // 2, bh // 2),
           "不带规则：缓冲 %dx%d 被除 2 → 场景 %dx%d" % (bw, bh, dw, dh))
@@ -176,7 +192,7 @@ check(p is not None and (p[2], p[3]) == (150, 150),
 rb = buf(rule)
 check(rb is not None, "带规则：日志里有「缓冲 → 场景」那行")
 if rb:
-    bw, bh, scale, dw, dh = rb
+    bw, bh, scale, dw, dh, _sface = rb
     check(scale == 1, "带规则：缓冲区按 1 倍声明（不除，%d）" % scale)
     check((dw, dh) == (bw, bh),
           "带规则：缓冲 %dx%d 原样 → 场景 %dx%d" % (bw, bh, dw, dh))
@@ -188,17 +204,30 @@ check(p2 is not None and (p2[2], p2[3]) == (300, 300),
 check("rule: xp-popup 的 X11 缩放桥" in rule,
       "规则真的作用到这个窗口上了（日志有「X11 缩放桥」那行）")
 
-# 3) 命中坐标：和各自的渲染一致
-for name, txt, p, want in (("不带规则", plain, p, 2.0), ("带规则", rule, p2, 1.0)):
+# 3) 命中坐标：局部坐标在「表面自己的逻辑坐标系」里，客户端再乘它声明的
+#    buffer scale 就是 X 坐标。所以恒等式是
+#        局部 × 表面缩放 == (布局 - 原点) × 缩放桥
+#   两边都从日志 / windows dump 里量，不写死数字。
+for name, txt, p in (("不带规则", plain, p), ("带规则", rule, p2)):
     h = hit(txt)
-    if h is None or p is None:
-        check(False, "%s：没拿到命中坐标（%s）" % (name, h))
+    b = buf(txt)
+    if h is None or p is None or b is None:
+        check(False, "%s：没拿到命中坐标 / 缓冲行（%s）" % (name, h))
         continue
+    bridge = float(b[2])
+    sscale = float(b[5])
     lx, ly, sx, sy = h
-    ex, ey = (lx - p[0]) * want, (ly - p[1]) * want
+    ex, ey = (lx - p[0]) * bridge / sscale, (ly - p[1]) * bridge / sscale
     check(abs(sx - ex) <= 1.5 and abs(sy - ey) <= 1.5,
-          "%s：光标 %g,%g 在窗口原点 %d,%d 上 → 局部 %g,%g（预期 %g,%g = ×%g）"
-          % (name, lx, ly, p[0], p[1], sx, sy, ex, ey, want))
+          "%s：光标 %g,%g 在窗口原点 %d,%d 上 → 局部 %g,%g（预期 %g,%g = "
+          "×%g/表面%d）" % (name, lx, ly, p[0], p[1], sx, sy, ex, ey, bridge,
+                            int(sscale)))
+    # 客户端那侧：局部 × 表面缩放 应该等于「布局偏移 × 桥」——点哪儿就是哪儿
+    cx, cy = sx * sscale, sy * sscale
+    wx, wy = (lx - p[0]) * bridge, (ly - p[1]) * bridge
+    check(abs(cx - wx) <= 1.5 and abs(cy - wy) <= 1.5,
+          "%s：X 客户端拿到的坐标 %g,%g = 布局偏移 %d,%d × %g（一致）"
+          % (name, cx, cy, int(lx - p[0]), int(ly - p[1]), bridge))
 
 # 4) IPC 里查得回规则
 try:

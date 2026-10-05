@@ -108,6 +108,133 @@ void vidow_xwayland_env(struct vidow_server *server) {
 		scale);
 }
 
+/* X 的 root window（写属性用）。 */
+static xcb_window_t x11_root(xcb_connection_t *conn) {
+	xcb_screen_iterator_t it = xcb_setup_roots_iterator(xcb_get_setup(conn));
+	return it.data != NULL ? it.data->root : XCB_NONE;
+}
+
+/* 告诉打过 HiDPI 补丁的 Xwayland（xorg-xwayland-lily / xorg 的 MR!733）「X 这边
+ * 全局缩放是 N」。
+ *
+ * 它收到之后做两件事：X 屏幕和 RandR 模式都乘 N（于是 X 客户端看到的是**设备
+ * 像素**的屏幕 —— 正是 vidow 内部「X 像素 = 逻辑 × xwayland_scale」那个假设），
+ * 并且在每个窗口表面上声明同样的 buffer scale（vidow 那边按同一个倍数缩小，
+ * 两边正好抵消，窗口尺寸不变）。
+ *
+ * 不写的后果（实测）：X 屏幕只有**逻辑**尺寸，GTK 那类按屏幕大小算布局的客户端
+ * 会把整屏当成一半大小 —— 最大化的窗口只占 1/4 面积，微信登录窗那种固定尺寸的
+ * 窗口也会和面板对不上。没打补丁的 Xwayland 里这个原子不存在，那就什么都不写
+ * （它本来就会按逻辑尺寸报屏幕，vidow 的换算照旧自洽）。 */
+static void x11_set_global_scale(struct vidow_server *server,
+		xcb_connection_t *conn, int scale) {
+	xcb_intern_atom_cookie_t cookie = xcb_intern_atom(conn, 1,
+		sizeof("_XWAYLAND_GLOBAL_OUTPUT_SCALE") - 1,
+		"_XWAYLAND_GLOBAL_OUTPUT_SCALE");
+	xcb_intern_atom_reply_t *reply = xcb_intern_atom_reply(conn, cookie, NULL);
+	if (reply == NULL || reply->atom == XCB_ATOM_NONE) {
+		free(reply);
+		wlr_log(WLR_INFO, "xwayland: X 这边没有 _XWAYLAND_GLOBAL_OUTPUT_SCALE"
+			"（没打 HiDPI 补丁的 Xwayland）→ X 屏幕按逻辑尺寸报，vidow 照旧除");
+		return;
+	}
+	xcb_atom_t atom = reply->atom;
+	free(reply);
+
+	uint32_t value = (uint32_t)(scale > 0 ? scale : 1);
+	xcb_change_property(conn, XCB_PROP_MODE_REPLACE, x11_root(conn), atom,
+		XCB_ATOM_CARDINAL, 32, 1, &value);
+	xcb_flush(conn);
+	wlr_log(WLR_INFO, "xwayland: _XWAYLAND_GLOBAL_OUTPUT_SCALE = %u"
+		"（X 屏幕和 RandR 模式按它放大成设备像素）", value);
+	(void)server;
+}
+
+/* RESOURCE_MANAGER 里的 Xft.dpi = 96 × 缩放。
+ *
+ * GDK_SCALE / QT_SCALE_FACTOR 只覆盖 GTK / Qt；Chromium 系（微信的登录窗就是
+ * CEF）、Electron、Java、Wine 这些只认 Xft.dpi。不写它，它们按 1 倍画，而 vidow
+ * 按 xwayland_scale 除 —— 窗口就只剩该有的 1/4（「只有面板的 1/4 大」）。
+ *
+ * 写法上要保住别人的资源项：把现有的 RESOURCE_MANAGER 读出来，删掉旧的 Xft.dpi
+ * 行再补一行新的（就是 xrdb -merge 干的事，只不过不依赖 xrdb 在不在）。 */
+static void x11_set_xft_dpi(xcb_connection_t *conn, int dpi) {
+	xcb_window_t root = x11_root(conn);
+	if (root == XCB_NONE) {
+		return;
+	}
+	xcb_intern_atom_cookie_t cookie = xcb_intern_atom(conn, 0,
+		sizeof("RESOURCE_MANAGER") - 1, "RESOURCE_MANAGER");
+	xcb_intern_atom_reply_t *reply = xcb_intern_atom_reply(conn, cookie, NULL);
+	if (reply == NULL) {
+		return;
+	}
+	xcb_atom_t atom = reply->atom;
+	free(reply);
+
+	char *old = NULL;
+	size_t old_len = 0;
+	xcb_get_property_cookie_t get = xcb_get_property(conn, 0, root, atom,
+		XCB_ATOM_STRING, 0, 1 << 20);
+	xcb_get_property_reply_t *got = xcb_get_property_reply(conn, get, NULL);
+	if (got != NULL) {
+		if (got->type == XCB_ATOM_STRING && got->format == 8 &&
+				got->value_len > 0) {
+			old = xcb_get_property_value(got);
+			old_len = xcb_get_property_value_length(got);
+		}
+	}
+
+	char buf[4096];
+	size_t n = 0;
+	n += (size_t)snprintf(buf + n, sizeof(buf) - n, "Xft.dpi:\t%d\n", dpi);
+	/* 抄旧的内容，跳过原有的 Xft.dpi 行。 */
+	for (size_t i = 0; old != NULL && i < old_len && n + 1 < sizeof(buf); ) {
+		size_t line_end = i;
+		while (line_end < old_len && old[line_end] != '\n') {
+			line_end++;
+		}
+		size_t line_len = line_end - i;
+		if (!(line_len >= 8 && strncmp(old + i, "Xft.dpi:", 8) == 0)) {
+			size_t copy = line_len < sizeof(buf) - n - 2 ? line_len :
+				sizeof(buf) - n - 2;
+			memcpy(buf + n, old + i, copy);
+			n += copy;
+			if (line_end < old_len) {
+				buf[n++] = '\n';
+			}
+		}
+		i = line_end < old_len ? line_end + 1 : old_len;
+	}
+	buf[n] = '\0';
+
+	xcb_change_property(conn, XCB_PROP_MODE_REPLACE, root, atom,
+		XCB_ATOM_STRING, 8, (uint32_t)n, buf);
+	xcb_flush(conn);
+	if (got != NULL) {
+		free(got);
+	}
+	wlr_log(WLR_INFO, "xwayland: Xft.dpi = %d（Chromium/CEF、Java、Wine 靠它）",
+		dpi);
+}
+
+/* 把「X 这边的缩放」告诉 X 服务：属性 + Xft.dpi。缩放变了要重来一遍。 */
+static void x11_apply_scale_props(struct vidow_server *server) {
+	if (server->xwayland == NULL || !server->config.xwayland_env) {
+		return;
+	}
+	xcb_connection_t *conn = wlr_xwayland_get_xwm_connection(server->xwayland);
+	if (conn == NULL) {
+		return; /* X 还没起来（懒启动），ready 的时候再来 */
+	}
+	int scale = (int)lround(server->xwayland_scale);
+	if (scale < 1) {
+		scale = 1;
+	}
+	x11_set_global_scale(server, conn, scale);
+	x11_set_xft_dpi(conn, 96 * scale);
+}
+
 void vidow_xwayland_scale_apply(struct vidow_server *server) {
 	double before = server->xwayland_scale;
 	vidow_xwayland_scale_recompute(server);
@@ -122,6 +249,8 @@ void vidow_xwayland_scale_apply(struct vidow_server *server) {
 		before, server->xwayland_scale);
 
 	vidow_xwayland_env(server);
+	/* X 那边也要知道：屏幕尺寸、RandR 模式、Xft.dpi 都跟着变。 */
+	x11_apply_scale_props(server);
 
 	/* 已经存在的 X11 窗口要按新缩放重新声明一遍缓冲区比例。 */
 	struct vidow_view *view;
@@ -137,20 +266,36 @@ static void xwayland_ready(struct wl_listener *listener, void *data) {
 	(void)data;
 	struct vidow_server *server = wl_container_of(listener, server, xwayland_ready);
 
+	/* 先把 X 那边的缩放告诉它（_XWAYLAND_GLOBAL_OUTPUT_SCALE + Xft.dpi）：
+	 * 打过补丁的 Xwayland 收到之后会立刻把 X 屏幕和 RandR 模式改成设备像素。
+	 * 必须赶在第一个客户端连上之前 —— 客户端一进来就会按当时的屏幕尺寸算布局。 */
+	x11_apply_scale_props(server);
+
 	/* 诊断用：X 看到的屏幕多大，和我们以为的（逻辑 × 缩放）对不对得上。
-	 * 这条日志是排查「X 窗口位置偏移 / 菜单跑到别的屏上」的第一现场。 */
+	 * 这条日志是排查「X 窗口位置偏移 / 菜单跑到别的屏上」的第一现场。
+	 * 注意不能用 xcb_get_setup() 里的屏幕尺寸 —— 那是连接建立时的那一份，属性
+	 * 改了它也不会更新；root window 的 geometry 才是「现在」的。 */
 	xcb_connection_t *conn = wlr_xwayland_get_xwm_connection(server->xwayland);
 	if (conn != NULL) {
-		xcb_screen_iterator_t it = xcb_setup_roots_iterator(xcb_get_setup(conn));
+		xcb_window_t root = x11_root(conn);
+		xcb_get_geometry_reply_t *geo = root != XCB_NONE ?
+			xcb_get_geometry_reply(conn, xcb_get_geometry(conn, root), NULL) :
+			NULL;
+		unsigned xw = geo != NULL ? (unsigned)geo->width : 0;
+		unsigned xh = geo != NULL ? (unsigned)geo->height : 0;
+		free(geo);
 		struct wlr_box layout = {0};
 		wlr_output_layout_get_box(server->output_layout, NULL, &layout);
+		int want_w = (int)lround(layout.width * server->xwayland_scale);
+		int want_h = (int)lround(layout.height * server->xwayland_scale);
 		wlr_log(WLR_INFO,
-			"xwayland: X 屏幕 %ux%u，布局 %dx%d 逻辑坐标 ×%.2f = %dx%d 设备像素",
-			it.data != NULL ? it.data->width_in_pixels : 0,
-			it.data != NULL ? it.data->height_in_pixels : 0,
-			layout.width, layout.height, server->xwayland_scale,
-			(int)lround(layout.width * server->xwayland_scale),
-			(int)lround(layout.height * server->xwayland_scale));
+			"xwayland: X 屏幕 %ux%u（布局 %dx%d 逻辑 ×%.2f = %dx%d 设备像素）%s",
+			xw, xh, layout.width, layout.height, server->xwayland_scale,
+			want_w, want_h,
+			(layout.width > 0 && xw == (unsigned)want_w &&
+				xh == (unsigned)want_h) ? "" :
+			" —— 对不上：X 那边没按设备像素报屏幕（没打 HiDPI 补丁的 Xwayland "
+			"就是这样），按屏幕尺寸算布局的客户端会把整屏当成一半大小");
 		if (layout.width < 1 || layout.height < 1) {
 			/* X 屏幕的大小 = 输出的并集：一块屏都没有时它就是 0x0，X11 客户端
 			 * 会看不见、点不动（用户看到的就是「XWayland 点不动」，见

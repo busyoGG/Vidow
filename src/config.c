@@ -186,6 +186,8 @@ static const struct entry entries[] = {
 		"缩放：auto = 按 EDID 的 ppi 推，也可以写死 \"1\" / \"1.5\"" },
 	{ "outputs",         K_STRING, OFF(outputs),         SZ(outputs), 8,
 		"按输出名覆盖缩放（如 \"DP-1:1.5,HDMI-A-1:1\"），留空 = 用 scale" },
+	{ "output_positions", K_STRING, OFF(output_positions), SZ(output_positions), 8,
+		"哪块屏摆在哪（如 \"DP-3:0,0; DP-2:1920,0\"，逻辑坐标），留空 = 自动排" },
 
 	{ "xwayland",        K_BOOL,   OFF(xwayland),        SZ(xwayland), 9,
 		"开 XWayland（有人连 X 才启动服务）" },
@@ -605,6 +607,7 @@ static void defaults(struct vidow_config *cfg) {
 	 * 同一个物理尺寸；outputs 里可以按输出名覆盖。 */
 	snprintf(cfg->scale, sizeof(cfg->scale), "auto");
 	cfg->outputs[0] = '\0';
+	cfg->output_positions[0] = '\0';
 
 	/* XWayland：默认懒启动（有人连 X 才起服务）。xwayland_scale=auto 取所有
 	 * 输出缩放的最大值 —— X 只有一套坐标，只能按最密的那块屏来，低了就是放大糊。 */
@@ -750,8 +753,9 @@ void vidow_config_log(const struct vidow_config *cfg) {
 		cfg->clipboard ? "on" : "off",
 		cfg->clipboard_primary ? "on" : "off", cfg->clipboard_max_bytes);
 	wlr_log(WLR_INFO,
-		"config: scale=%s outputs=%s xwayland=%s xscale=%s xenv=%s",
+		"config: scale=%s outputs=%s positions=%s xwayland=%s xscale=%s xenv=%s",
 		cfg->scale, cfg->outputs[0] != '\0' ? cfg->outputs : "-",
+		cfg->output_positions[0] != '\0' ? cfg->output_positions : "-",
 		cfg->xwayland ? "on" : "off", cfg->xwayland_scale,
 		cfg->xwayland_env ? "on" : "off");
 	wlr_log(WLR_INFO,

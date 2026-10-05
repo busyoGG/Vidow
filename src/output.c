@@ -133,6 +133,28 @@ void vidow_output_kick_watchdog(struct vidow_server *server) {
 	}
 }
 
+/* 立刻给每块屏画一帧。切 tty 切回来的路上（DRM 后端会把所有输出销毁再重建）
+ * 和输出刚建出来的时候，场景里没有任何 damage，后端也不欠我们 frame 事件 ——
+ * 不主动画一次，屏幕就一直停在上一帧（用户看到的「卡死」）。
+ * 走 1ms 定时器而不是当场画：调用点在 wlroots 的会话处理里面，等这一轮派发
+ * 结束再画干净。 */
+static int kick_timer_cb(void *data) {
+	struct vidow_server *server = data;
+	struct vidow_output *output;
+	wl_list_for_each(output, &server->outputs, link) {
+		vidow_output_render(output);
+	}
+	return 0;
+}
+
+void vidow_output_kick_all(struct vidow_server *server) {
+	if (server->kick_timer == NULL) {
+		kick_timer_cb(server); /* 没有定时器（极早期）就当场画 */
+		return;
+	}
+	wl_event_source_timer_update(server->kick_timer, 1);
+}
+
 static void output_frame(struct wl_listener *listener, void *data) {
 	(void)data;
 	struct vidow_output *output = wl_container_of(listener, output, frame);
@@ -244,6 +266,10 @@ static void output_state_applied(struct vidow_server *server,
 	vidow_backdrop_damage(server, true);
 	vidow_arrange_layers(server);
 	vidow_arrange(server);
+	/* 这块屏的缩放可能变了（IPC output_scale / 配置 SIGHUP）：X 那边的全局缩放
+	 * 是「所有屏里最大的那个」，跟着重算一遍 —— 它是 X 屏幕尺寸、RandR 模式和
+	 * Xft.dpi 的依据。没变的话这个调用自己就返回了。 */
+	vidow_xwayland_scale_apply(server);
 	vidow_ipc_emit_output(server, "output-changed", output->wlr_output);
 }
 
@@ -430,6 +456,89 @@ bool vidow_output_set_position(struct vidow_server *server,
 	return true;
 }
 
+/* 配置里给这块屏指定的布局位置，写法 "DP-3:0,0; DP-2:1920,0"（逻辑坐标）。
+ * 分隔符是分号 / 空格 / 换行，也容忍逗号 —— 隔壁的 outputs 键就是逗号分隔的，
+ * 手滑写成 "DP-3:0,0,DP-2:1920,0" 也得认。没写 / 没点名就返回 false。 */
+static bool config_position_for(struct vidow_server *server, const char *name,
+		int *x, int *y) {
+	const char *p = server->config.output_positions;
+	if (p == NULL || p[0] == '\0' || name == NULL) {
+		return false;
+	}
+	size_t name_len = strlen(name);
+	while (*p != '\0') {
+		while (*p == ';' || *p == ',' || *p == ' ' || *p == '\t' ||
+				*p == '\n') {
+			p++;
+		}
+		if (*p == '\0') {
+			break;
+		}
+		/* 名字到冒号（或这一项的末尾）为止。 */
+		const char *name_end = p;
+		while (*name_end != '\0' && *name_end != ':' && *name_end != ';' &&
+				*name_end != ',' && *name_end != ' ' && *name_end != '\t' &&
+				*name_end != '\n') {
+			name_end++;
+		}
+		if (*name_end != ':') {
+			/* 这一项没有冒号，不是 NAME:X,Y：跳过。 */
+			p = *name_end != '\0' ? name_end + 1 : name_end;
+			continue;
+		}
+		const char *name_start = p; /* 值解析会把 p 往前推，名字要留一份 */
+		size_t token_len = (size_t)(name_end - name_start);
+		char *end = NULL;
+		long px = strtol(name_end + 1, &end, 10);
+		long py = 0;
+		bool value_ok = false;
+		if (end != name_end + 1 && *end == ',') {
+			char *end2 = NULL;
+			py = strtol(end + 1, &end2, 10);
+			if (end2 != end + 1) {
+				value_ok = true;
+				p = end2; /* 值之后继续（逗号分隔的写法靠这个往下走） */
+			}
+		}
+		if (!value_ok) {
+			wlr_log(WLR_ERROR, "output_positions: 有一项的坐标看不懂"
+				"（要 NAME:X,Y），跳过它");
+			p = name_end + 1;
+			while (*p != '\0' && *p != ';' && *p != ',' && *p != ' ' &&
+					*p != '\t' && *p != '\n') {
+				p++;
+			}
+			continue;
+		}
+		if (token_len == name_len &&
+				strncmp(name_start, name, name_len) == 0) {
+			*x = (int)px;
+			*y = (int)py;
+			return true;
+		}
+	}
+	return false;
+}
+
+/* 配置里 output_positions 改过（SIGHUP / 配置刚跑完）：按新配置把每块屏再摆一次。
+ * 位置没变的什么都不做（vidow_output_set_position 会把布局、背景、光标重做一遍，
+ * 白做一次没必要）。 */
+void vidow_output_apply_positions_all(struct vidow_server *server) {
+	struct vidow_output *output;
+	wl_list_for_each(output, &server->outputs, link) {
+		int x = 0, y = 0;
+		if (!config_position_for(server, output->wlr_output->name, &x, &y)) {
+			continue;
+		}
+		if (output->box.x == x && output->box.y == y) {
+			continue;
+		}
+		wlr_log(WLR_INFO, "output %s: 按 output_positions 摆到 %d,%d（现在 %d,%d）",
+			output->wlr_output->name, x, y, output->box.x, output->box.y);
+		vidow_output_set_position(server, output->wlr_output, x, y);
+	}
+}
+
 /* 一块屏的「记忆」：热插拔按输出名认人（详见 hotplug.h）。 */
 static struct vidow_output_memory *output_memory(struct vidow_server *server,
 		struct wlr_output *wlr_output) {
@@ -576,8 +685,24 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 	output->server = server;
 	output->wlr_output = wlr_output;
 	output->scene_output = wlr_scene_output_create(server->scene, wlr_output);
-	output->layout_output =
-		wlr_output_layout_add_auto(server->output_layout, wlr_output);
+	/* 配置里点了名的屏摆在它说的位置；没点名就按到达顺序自动排。
+	 * 「哪块在左边」不能靠自动排 —— 那个顺序是后端给的（headless 上实测是
+	 * 反的），所以确定布局必须写在 output_positions 里。 */
+	int pos_x = 0, pos_y = 0;
+	bool placed = config_position_for(server, wlr_output->name, &pos_x, &pos_y);
+	if (placed) {
+		output->layout_output = wlr_output_layout_add(server->output_layout,
+			wlr_output, pos_x, pos_y);
+		if (output->layout_output == NULL) {
+			wlr_log(WLR_ERROR, "output %s: 摆到 %d,%d 失败，改成自动排",
+				wlr_output->name, pos_x, pos_y);
+			placed = false;
+		}
+	}
+	if (!placed) {
+		output->layout_output =
+			wlr_output_layout_add_auto(server->output_layout, wlr_output);
+	}
 	wlr_output_layout_get_box(server->output_layout, wlr_output, &output->box);
 	output->memory = output_memory(server, wlr_output);
 	wlr_scene_output_layout_add_output(server->scene_layout,
@@ -611,12 +736,13 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 
 	/* 布局原点也打出来：多屏 / 热插拔时「谁在左边」直接看日志，测试也不用猜。 */
 	wlr_log(WLR_INFO, "output %s: %dx%d @ %.3fHz scale %.2f（%s），逻辑 %dx%d，"
-		"布局 %d,%d",
+		"布局 %d,%d（%s）",
 		wlr_output->name, wlr_output->width, wlr_output->height,
 		(float)wlr_output->refresh / 1000.0f, wlr_output->scale, why,
 		(int)lround(wlr_output->width / wlr_output->scale),
 		(int)lround(wlr_output->height / wlr_output->scale),
-		output->box.x, output->box.y);
+		output->box.x, output->box.y,
+		placed ? "output_positions 指定" : "自动排");
 
 	/* 热插拔：这块屏以前见过的话，把归属它的列 / 窗口 / layer surface 认领回来
 	 * （列宽、滚动位置、焦点都留着）。它自己会 arrange。 */
@@ -919,6 +1045,11 @@ bool vidow_output_init(struct vidow_server *server) {
 		wlr_log(WLR_ERROR, "failed to create the capture watchdog");
 	} else {
 		wl_event_source_timer_update(server->capture_timer, 50);
+	}
+	server->kick_timer = wl_event_loop_add_timer(
+		wl_display_get_event_loop(server->display), kick_timer_cb, server);
+	if (server->kick_timer == NULL) {
+		wlr_log(WLR_ERROR, "failed to create the resume kick timer");
 	}
 	server->new_output.notify = server_new_output;
 	wl_signal_add(&server->backend->events.new_output, &server->new_output);

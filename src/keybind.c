@@ -269,16 +269,62 @@ static void log_action(const char *action, const char *what) {
 	wlr_log(WLR_INFO, "action: %s -> %s", action, what);
 }
 
-bool vidow_vt_switch(struct vidow_server *server, unsigned vt) {
-	if (server->session == NULL) {
-		wlr_log(WLR_DEBUG, "VT: 没有会话（嵌套 / headless），切 VT 交给宿主");
-		return false;
-	}
+/* 真正去切：这一步是同步的，而且一进去 wlroots 就会把**所有输出销毁**（DRM 后端
+ * 在会话不活动时 wlr_output_destroy 每一块屏）、输入设备挂起。所以只能在没有别人
+ * 的事件处理栈上做 —— 见下面的 vt_switch_idle。 */
+static bool vt_switch_now(struct vidow_server *server, unsigned vt) {
 	wlr_log(WLR_INFO, "VT: 切到 %u 号 tty", vt);
 	if (!wlr_session_change_vt(server->session, vt)) {
 		wlr_log(WLR_ERROR, "VT: 切到 %u 号 tty 失败", vt);
 		return false;
 	}
+	return true;
+}
+
+/* idle 回调：这一轮事件派发（很可能就是键盘按键那一次）走完了，才动会话。 */
+static void vt_switch_idle(void *data) {
+	struct vidow_server *server = data;
+	unsigned vt = server->vt_pending;
+	server->vt_pending = 0;
+	if (server->vt_idle != NULL) {
+		wl_event_source_remove(server->vt_idle);
+		server->vt_idle = NULL;
+	}
+	if (vt == 0) {
+		return;
+	}
+	vt_switch_now(server, vt);
+}
+
+/* 切 tty。
+ *
+ * 延后到 idle 里做，理由：调用点在键盘事件处理里（Ctrl+Alt+F1..F12），而
+ * wlr_session_change_vt() 一进去就会让 wlroots 把所有输出销毁、把输入设备挂起 ——
+ * 在「正拿着键盘对象派发按键」的时候拆掉半个会话，是「切走再切回来卡死」最容易踩
+ * 的那一脚。延后一轮就没有这个交叠了。
+ *
+ * 按键重复（Ctrl+Alt+F1 还按着）会被合并：排队里只留最后那一个目标 tty。
+ * （libseat 没有「现在在哪块 tty」的接口，所以不做「已经在目标 tty 上」的去重。） */
+bool vidow_vt_switch(struct vidow_server *server, unsigned vt) {
+	if (server->session == NULL) {
+		wlr_log(WLR_DEBUG, "VT: 没有会话（嵌套 / headless），切 VT 交给宿主");
+		return false;
+	}
+	if (vt < 1 || vt > 12) {
+		wlr_log(WLR_ERROR, "VT: %u 不是有效的 tty 号（1..12）", vt);
+		return false;
+	}
+	server->vt_pending = vt;
+	if (server->vt_idle == NULL) {
+		server->vt_idle = wl_event_loop_add_idle(
+			wl_display_get_event_loop(server->display), vt_switch_idle, server);
+		if (server->vt_idle == NULL) {
+			/* 建不出 idle 源：直接切（宁可同步，也别按了没反应） */
+			server->vt_pending = 0;
+			return vt_switch_now(server, vt);
+		}
+	}
+	wlr_log(WLR_INFO, "VT: %u 号 tty 排队（这一轮事件处理完就切）", vt);
 	return true;
 }
 

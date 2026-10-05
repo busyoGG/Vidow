@@ -152,6 +152,8 @@ ipc_socket = ""
 scale = "auto"
 -- 按输出名覆盖缩放（如 "DP-1:1.5,HDMI-A-1:1"），留空 = 用 scale
 outputs = ""
+-- 哪块屏摆在哪（如 "DP-3:0,0; DP-2:1920,0"，逻辑坐标），留空 = 自动排
+output_positions = ""
 
 -- ================== XWayland
 -- 开 XWayland（有人连 X 才启动服务）

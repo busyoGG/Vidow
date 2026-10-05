@@ -42,17 +42,30 @@ static enum wlr_log_importance log_level_from_env(void) {
 /* 会话从「切走了」回到「回来了」：VT 切回来（Ctrl+Alt+F3 再切回来）时，屏幕上的
  * framebuffer 已经是别人的了，场景里的东西一个像素都没变，但必须整屏重画一遍 ——
  * 不然切回来看到的是一张旧图 / 花屏。wlroots 的 DRM 后端自己管「不活动时别往 DRM
- * 上画」，这里只管「回来了重画」。 */
+ * 上画」，这里只管「回来了重画」。
+ *
+ * 还有一件事只有这里能做：DRM 后端切走时会把**所有输出销毁**，切回来再重新建
+ * （handle_session_active → scan_drm_connectors）。新建的输出要等一次 commit 才
+ * 有画面，而这时候场景里一点 damage 都没有、后端也不欠我们 frame 事件 —— 光靠
+ * 等 frame 就是「切回来卡死」。所以这里主动催一帧（vidow_output_kick_all）。 */
 static void session_active(struct wl_listener *listener, void *data) {
 	(void)data;
 	struct vidow_server *server =
 		wl_container_of(listener, server, session_active);
 	bool active = server->session != NULL && server->session->active;
-	wlr_log(WLR_INFO, "会话: %s（%s）", active ? "回来了" : "被切走了",
-		active ? "整屏重画一遍" : "wlroots 会停止往 DRM 上画，等切回来");
+	int n_outputs = 0;
+	struct vidow_output *output;
+	wl_list_for_each(output, &server->outputs, link) {
+		n_outputs++;
+	}
+	wlr_log(WLR_INFO, "会话: %s（%s；现在 %d 块屏）",
+		active ? "回来了" : "被切走了",
+		active ? "整屏重画一遍" : "wlroots 会停止往 DRM 上画，等切回来",
+		n_outputs);
 	if (active) {
 		vidow_backdrop_damage(server, true);
 		vidow_arrange(server);
+		vidow_output_kick_all(server);
 	}
 }
 
@@ -61,6 +74,13 @@ static void server_finish(struct vidow_server *server) {
 		/* 会话销毁时会断言「没人还挂在我的 events.active 上」（和退出时那条
 		 * xdg_shell 断言同一类，见文件头的说明）。 */
 		wl_list_remove(&server->session_active.link);
+	}
+	if (server->vt_idle != NULL) {
+		/* 排着队还没切的那个 VT 请求：退出时取消掉（不然回调会去碰已经拆了
+		 * 一半的会话）。 */
+		wl_event_source_remove(server->vt_idle);
+		server->vt_idle = NULL;
+		server->vt_pending = 0;
 	}
 	wl_list_remove(&server->new_output.link);
 	wl_list_remove(&server->new_input.link);

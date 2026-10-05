@@ -375,12 +375,30 @@ echo "$SINCE" | grep -aq "fx: target $(((100 + 64) * 2))x$(((60 + 64) * 2))" &&
 # 所以逻辑 (1400,200)+100x60 在图上就是 (2800,400)+200x120
 probe rect "$RUNDIR/dpi.png" 2804 404 192 112 192 0 0 8
 probe empty "$RUNDIR/dpi.png" 2760 360 36 36 192 0 0 8
-# 命中：光标到逻辑 (1420,220) -> 表面局部 ((1420-1400)*2, (220-200)*2) = 40,40
+# 命中：光标到逻辑 (1420,220)。
+#   局部坐标是**表面自己的逻辑坐标系**里的数（Xwayland 声明了 buffer scale = 2，
+#   所以 (1420-1400) / 2 = 10 … 见下面：vidow 给的局部 × 表面倍数 = X 坐标），
+#   X 客户端那侧看到的是「布局偏移 × 全局缩放」= 40,40 —— 点哪儿就是哪儿。
 ./build/vdrag 7396 3056 7396 3056 >/dev/null 2>&1
 sleep 0.4
-grep -a "x11: 指针 .* -> xp-popup 局部 40,40" "$LOG" | tail -1 | grep -q . &&
-	pass "命中坐标 = (布局 - 原点) × 2" ||
-	fail "命中坐标不对：$(grep -a 'x11: 指针' "$LOG" | tail -1 | sed 's/.*\[DEBUG\] //')"
+HIT=$(grep -a "x11: 指针 .* -> xp-popup 局部" "$LOG" | tail -1)
+SFACE=$(grep -a "x11: xp-popup 缓冲 .*（表面 \([0-9]*\) 倍" "$LOG" | tail -1 |
+	sed 's/.*（表面 \([0-9]*\) 倍.*/\1/')
+[ -n "$SFACE" ] || SFACE=1
+echo "  命中行：$(echo "$HIT" | sed 's/.*\[DEBUG\] //')  表面倍数：$SFACE"
+echo "$HIT" | grep -aq "局部 $((20 * 2 / SFACE)),$((20 * 2 / SFACE))" &&
+	pass "命中局部坐标 = 布局偏移 20,20 × 2 / 表面倍数 $SFACE" ||
+	fail "命中坐标不对：$(echo "$HIT" | sed 's/.*\[DEBUG\] //')"
+LOC=$(echo "$HIT" | sed 's/.*局部 //')
+python3 -c "
+import sys
+lx, ly = [float(v) for v in '$LOC'.split(',')]
+s = float('$SFACE')
+ok = abs(lx * s - 40) <= 1 and abs(ly * s - 40) <= 1
+print('  PASS  X 客户端拿到的坐标 %g,%g = 布局偏移 20,20 × 2' % (lx * s, ly * s)
+      if ok else '  FAIL  X 客户端坐标 %g,%g 不是 40,40' % (lx * s, ly * s))
+sys.exit(0 if ok else 1)
+" || FAILED=1
 kill "$POPUP_PID" 2>/dev/null; POPUP_PID=""
 
 pgrep -x vidow >/dev/null && pass "合成器还活着" || fail "合成器挂了"

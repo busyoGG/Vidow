@@ -384,15 +384,31 @@ void vidow_view_x11_scale(struct vidow_view *view) {
 	struct wlr_scene_buffer *node = view->scene_surface->buffer;
 	bool changed = node->dst_width != dst_w || node->dst_height != dst_h;
 	wlr_scene_buffer_set_dest_size(node, dst_w, dst_h);
+	/* 逐窗口规则把桥改小（x11_scale = 1）的时候，我们画得比「表面自己声明的
+	 * 逻辑尺寸」大 —— 而场景的命中判定会问表面自己的输入区域（wlr_scene_surface
+	 * 的 point_accepts_input 按 surface->current.width 卡边界），于是右边和下边
+	 * 那一大片「看得见、点不着」。尺寸对不上的时候就别问它了：命中区域交给
+	 * 节点自己的盒子（= 我们画出来的那块）。
+	 *
+	 * 代价是这类窗口不再遵守 X 的 shape（输入区域）—— 只有被规则改过缩放的
+	 * 窗口走这条路，默认情况下尺寸一致，输入区域照旧生效。 */
+	if (dst_w != surface->current.width || dst_h != surface->current.height) {
+		node->point_accepts_input = NULL;
+	}
 	/* 每帧都会走到这里（每个 commit）：只在真的变了的时候说话。 */
 	if (changed || view->logged_scale != scale) {
 		view->logged_scale = scale;
 		view->logged_buf_w = bw;
+		/* 「表面 N 倍」= Xwayland 在 wl_surface 上声明的 buffer scale
+		 * （vidow 写了 _XWAYLAND_GLOBAL_OUTPUT_SCALE 之后它就是那个全局缩放）。
+		 * 它决定了 surface 自己的逻辑坐标系，输入坐标换算按它走 —— 和 vidow
+		 * 这边「按 N 倍声明」是两回事，排查点击 / 尺寸问题时两个都要看。 */
 		wlr_log(WLR_INFO,
-			"x11: %s 缓冲 %dx%d 按 %d 倍声明 -> 场景 %dx%d（输出 %.2fx，"
-			"落到设备像素 %dx%d）",
+			"x11: %s 缓冲 %dx%d 按 %d 倍声明 -> 场景 %dx%d（表面 %d 倍，"
+			"输出 %.2fx，落到设备像素 %dx%d）",
 			vidow_view_title(view) != NULL ? vidow_view_title(view) : "(无题)",
 			bw, bh, scale, dst_w, dst_h,
+			surface->current.scale > 0 ? surface->current.scale : 1,
 			(double)(view->output != NULL ? view->output->scale : 1.0),
 			(int)lround(dst_w * (view->output != NULL ?
 				(double)view->output->scale : 1.0)),
