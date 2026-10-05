@@ -81,7 +81,7 @@ anim   = { open_ms = 220, easing = "out_quint" }
 | `border` | `width` `color` `color_focus` | —（光写一个值没法解释） |
 | `shadow` | `radius` `color` `offset_x` `offset_y` | — |
 | `blur` | `enabled` `all` `levels` `strength` `alpha_min` `offset` | `blur = false` |
-| `anim` | `open_ms` `close_ms` `move_ms` `layer_open_ms` `layer_close_ms` `easing` `open_alpha_from` `open_slide_px` `close_alpha_to` `close_slide_px` | — |
+| `anim` | `open_ms` `close_ms` `move_ms` `layer_open_ms` `layer_close_ms` `easing` `open_easing` `close_easing` `open_alpha_from` `open_slide_px` `open_scale_from` `close_alpha_to` `close_slide_px` `close_scale_to` | — |
 | `shader` | `enabled` `dir` `flip_y` `open` `close` `idle` | `shader = false` |
 | `clipboard` | `enabled` `primary` `max_bytes` | `clipboard = false` |
 | `ipc` | `enabled` `socket` | `ipc = true` |
@@ -514,6 +514,7 @@ python3 test-float.py        # 三个真实 GTK 窗口，验证浮动模式自�
 ./test-layerwin.sh                   # top 层模糊里含窗口（纯蓝窗口 + 压在它上面的面板，4 项断言）
 ./test-layermask.sh                  # 按元素自己的 alpha 剔除（透明内边距里的亮点不糊，3 项断言）
 ./test-openanim.sh                   # 开窗动画画的是装饰后的窗口本身（不是一块更大的矩形，4 项断言）
+./test-bounce.sh                     # 入场过冲 / 关闭回弹（q 弹曲线真的落到屏幕上了，5 项断言）
 ./test-dpi.sh                        # 混合 DPI + XWayland：装饰缓冲按**窗口几何**算（见 SSD 那节）
 ./build/jsontest                     # 只看 JSON 写出/读入（离线，30 项）
 ./build/scaletest                    # 只看缩放计算（24 项）
@@ -1793,9 +1794,21 @@ $ wlrctl toplevel close title:zen-two   # request_close → 只剩 zen-one
 
 ### 内置效果
 
-不写 shader 时的默认效果：淡入淡出 + 垂直滑动（`open_alpha_from` / `open_slide_px` /
-`close_alpha_to` / `close_slide_px`），缓动可选
-`linear` / `out_cubic` / `out_quint` / `in_out_cubic` / `out_back`。
+不写 shader 时的默认效果：淡入淡出 + 垂直滑动 + 缩放弹跳（`open_alpha_from` /
+`open_slide_px` / `open_scale_from` / `close_alpha_to` / `close_slide_px` /
+`close_scale_to`），缓动可选
+`linear` / `out_cubic` / `out_quint` / `in_out_cubic` / `out_back` / `out_elastic`。
+
+**默认是「q 弹」的**：入场从 0.82 弹到 1.0（`open_easing = "out_elastic"`，冲到
+1.02 再收住），关闭缩到 0.82 之前先缩过头一点再涨回来。`out_elastic` 是阻尼余弦
+`1 - e^(-5.5t)·cos(7t)`：t = 0 处正好是 0（曲线必须从起点出发），t≈0.2 到终点、
+t≈0.35 冲过头 11%（乘上 `open_scale_from` 到 1.0 那 0.18 的区间就是 2%）、之后单调
+收敛。缩放作用在**场景节点**上、围绕窗口中心，离屏缓冲照旧按原尺寸画（为几个百分点
+的过冲每帧重分配缓冲不值）；几何量跟着过冲，透明度和 shader 的 `u_progress` 夹在
+0..1（负 alpha 在场景节点上没定义，进度 > 1 会让 `zoom` 这类 shader 采到贴图外面）。
+
+`easing` 仍然只管位移补间 / layer surface / overview：布局重排要的是「快而稳」，
+过冲反而晃眼。入场和关闭各有自己的曲线（`open_easing` / `close_easing`）。
 
 ### 自定义 shader
 
@@ -2519,6 +2532,23 @@ protocols/     wlr-layer-shell / wlr-virtual-pointer / input-method-v2 /
      （老二进制）→ 三帧都 ≤ 窗口 640x687 / 28。新增 `./test-openanim.sh`（老二进制连跑
      3 次都挂 2 条）。关闭动画（genie）走同一条路，一起好了（原来压下去的是没装饰的原始
      快照）。
+
+119. **窗口动画「q 弹」：入场过冲、关闭回弹**。新增缓动 `out_elastic`（阻尼余弦
+     `1 - e^(-5.5t)·cos(7t)`：t≈0.35 冲过头 11% 再单调收敛；t = 0 处正好是 0，曲线
+     必须从起点出发）和两个缩放键 `open_scale_from` / `close_scale_to`（默认 0.82），
+     入场/关闭各用自己的曲线 `open_easing` / `close_easing`（默认 `out_elastic`）。
+     `easing` 保持 `out_cubic` 只管位移补间 / layer / overview —— 布局重排过冲晃眼。
+     缩放作用在场景节点上、围绕窗口中心（`anim_scale` 在 `vidow_fx_frame` 里乘到目标
+     尺寸上，位置补回一半差值；静止时恒为 1，一个像素都不动），离屏缓冲照旧按原尺寸
+     画。几何量跟着过冲，透明度和 `u_progress` 夹在 0..1（负 alpha 在场景节点上没定义；
+     进度 > 1 会让 `zoom` 这类 shader 采到贴图外面）。layer 的关闭沿用 `easing` 且不缩放
+     （状态栏「缩着淡出」很怪），所以 `vidow_closing_start()` 多了 `easing` /
+     `anim_scale_to` 两个参数。新增 `./test-bounce.sh`：按日志里的 `anim open start` /
+     `anim close start` 对时，在曲线上几个特征时刻连拍量蓝色窗口的包围盒 ——
+     起步 62%、过冲 104%、关闭低点 46%、回弹 +28px（配置里把缩放拉到 0.5、动画拉到 4s，
+     快门几十毫秒的延迟才不至于吃掉判据）。`test-openanim.sh` 锁 `open_easing = "linear"`
+     + `open_scale_from = 1.0`：它测的是「动画期间画的是什么」，曲线一过冲，`u_progress`
+     一上来就是 1.0，中段那帧就测不出「缩着」了。回归：21 个测试全过。
 
 118. **装饰按「可见窗口」画（niri 的 `size()` / `buf_loc()`），新增 `prefer_no_csd`**。
      客户端用 `xdg_surface.set_window_geometry` 声明的那块才是窗口：装饰矩形 / 离屏缓冲

@@ -129,7 +129,8 @@ static const struct entry entries[] = {
 	{ "layer_close_ms",  K_INT,    OFF(layer_close_ms),  SZ(layer_close_ms), 3,
 		"layer-shell 消失的动画时长" },
 	{ "easing",          K_EASING, OFF(easing),          SZ(easing), 3,
-		"缓动曲线：linear / out_cubic / out_quint / in_out_cubic / out_back" },
+		"缓动曲线：linear / out_cubic / out_quint / in_out_cubic / out_back / "
+		"out_elastic" },
 	{ "open_alpha_from", K_DOUBLE, OFF(open_alpha_from), SZ(open_alpha_from), 3,
 		"打开动画的起始透明度" },
 	{ "open_slide_px",   K_INT,    OFF(open_slide_px),   SZ(open_slide_px), 3,
@@ -138,6 +139,14 @@ static const struct entry entries[] = {
 		"关闭动画的结束透明度" },
 	{ "close_slide_px",  K_INT,    OFF(close_slide_px),  SZ(close_slide_px), 3,
 		"关闭动画的结束位移（像素）" },
+	{ "open_easing",     K_EASING, OFF(open_easing),     SZ(open_easing), 3,
+		"打开动画的缓动曲线（默认 out_elastic：过冲一下再收住）" },
+	{ "close_easing",    K_EASING, OFF(close_easing),    SZ(close_easing), 3,
+		"关闭动画的缓动曲线" },
+	{ "open_scale_from", K_DOUBLE, OFF(open_scale_from), SZ(open_scale_from), 3,
+		"打开动画的起始缩放（1.0 = 不缩；0.82 = 弹一下）" },
+	{ "close_scale_to",  K_DOUBLE, OFF(close_scale_to),  SZ(close_scale_to), 3,
+		"关闭动画的结束缩放（1.0 = 不缩）" },
 
 	{ "shader_enabled",  K_BOOL,   OFF(shader_enabled),  SZ(shader_enabled), 4,
 		"自定义 shader 总开关（需要 GLES2 渲染器）" },
@@ -261,6 +270,10 @@ static const struct group_field anim_fields[] = {
 	{ "open_slide_px",  "open_slide_px" },
 	{ "close_alpha_to", "close_alpha_to" },
 	{ "close_slide_px", "close_slide_px" },
+	{ "open_easing",    "open_easing" },
+	{ "close_easing",   "close_easing" },
+	{ "open_scale_from", "open_scale_from" },
+	{ "close_scale_to", "close_scale_to" },
 };
 static const struct group_field shader_fields[] = {
 	{ "enabled", "shader_enabled" },
@@ -380,10 +393,11 @@ bool vidow_config_group_has(const char *name) {
 
 static const char *easing_names[] = {
 	"linear", "out_cubic", "out_quint", "in_out_cubic", "out_back",
+	"out_elastic",
 };
 
 static bool parse_easing(const char *value, enum vidow_easing *out) {
-	for (size_t i = 0; i < VIDOW_EASE_OUT_BACK + 1; i++) {
+	for (size_t i = 0; i < VIDOW_EASE_OUT_ELASTIC + 1; i++) {
 		if (strcmp(value, easing_names[i]) == 0) {
 			*out = (enum vidow_easing)i;
 			return true;
@@ -535,6 +549,12 @@ static void defaults(struct vidow_config *cfg) {
 	cfg->open_slide_px = 22;
 	cfg->close_alpha_to = 0.0;
 	cfg->close_slide_px = 14;
+	/* 入场/关闭默认回弹：从 0.82 弹到 1.0，冲到 1.5% 再收住。上面的 easing
+	 * 保持 out_cubic —— 布局重排不该过冲。 */
+	cfg->open_easing = VIDOW_EASE_OUT_ELASTIC;
+	cfg->close_easing = VIDOW_EASE_OUT_ELASTIC;
+	cfg->open_scale_from = 0.82;
+	cfg->close_scale_to = 0.82;
 
 	cfg->decor_enabled = true;
 	/* 关着：客户端自己画的装饰（CSD）不动它。开了就告诉客户端「别画了」，
@@ -730,9 +750,13 @@ void vidow_config_log(const struct vidow_config *cfg) {
 		cfg->xwayland ? "on" : "off", cfg->xwayland_scale,
 		cfg->xwayland_env ? "on" : "off");
 	wlr_log(WLR_INFO,
-		"config: open=%dms close=%dms move=%dms layer=%d/%dms easing=%s "
-		"shader=%s open=%s close=%s idle=%s",
-		cfg->window_open_ms, cfg->window_close_ms, cfg->window_move_ms,
+		"config: open=%dms(%s %.2f) close=%dms(%s %.2f) move=%dms "
+		"layer=%d/%dms easing=%s shader=%s open=%s close=%s idle=%s",
+		cfg->window_open_ms, easing_names[cfg->open_easing],
+		cfg->open_scale_from,
+		cfg->window_close_ms, easing_names[cfg->close_easing],
+		cfg->close_scale_to,
+		cfg->window_move_ms,
 		cfg->layer_open_ms, cfg->layer_close_ms, easing_names[cfg->easing],
 		cfg->shader_enabled ? "on" : "off",
 		cfg->shader_open[0] ? cfg->shader_open : "-",

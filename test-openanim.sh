@@ -15,7 +15,7 @@
 # 一圈看得见），阴影不要（不然软阴影会把包围盒撑大，量不准）。
 #
 # 取样时刻按日志里的 `anim open start` 对齐：客户端 map 要多久、快门要多久都不
-# 影响判据落在动画的哪个进度上。
+# 影响判据落在动画的哪个进度上。（「q 弹」那套曲线由 test-bounce.sh 单独测。）
 #
 # 判据：
 #   1) 窗口真的上屏了
@@ -69,6 +69,14 @@ window_close_ms = 200
 open_alpha_from = 0.0
 open_slide_px = 0
 easing = "linear"
+-- 这条测的是「动画期间画出来的**是什么**」（装饰过的那个窗口，不是一块大矩形），
+-- 跟曲线无关：入场/关闭的默认曲线是 out_elastic、还会从 0.82 弹到 1.0，而
+-- zoom.frag 拿的是动画进度 u_progress —— 曲线一过冲，进度一上来就是 1.0，
+-- 中段那帧就测不出「缩着」了。所以这里把两条都锁成直线 / 不缩放。
+open_easing = "linear"
+close_easing = "linear"
+open_scale_from = 1.0
+close_scale_to = 1.0
 decor_enabled = true
 corner_radius = 12
 border_width = 2

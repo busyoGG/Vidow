@@ -1539,7 +1539,16 @@ static bool anim_draw(struct vidow_server *server,
 	glUseProgram(sh->program);
 	bind_tex(0, sa.target, sa.tex);
 	glUniform1i(sh->u_texture, 0);
-	glUniform1f(sh->u_progress, (float)fx->progress);
+	/* 过冲的曲线（out_elastic / out_back）让 t 稍微越过 1：几何量过冲是我
+	 * 们要的，着色器的 u_progress 不是 —— 它的契约是 0..1，> 1 的进度会让
+	 * zoom 这类 shader 采到贴图外面去。这里夹住。 */
+	double progress = fx->progress;
+	if (!(progress > 0.0)) {
+		progress = 0.0;
+	} else if (progress > 1.0) {
+		progress = 1.0;
+	}
+	glUniform1f(sh->u_progress, (float)progress);
 	glUniform1i(sh->u_phase, (int)fx->phase);
 	glUniform2f(sh->u_size, (float)fx->w, (float)fx->h);
 	glUniform2f(glGetUniformLocation(sh->program, "u_target_size"),
@@ -1611,6 +1620,7 @@ bool vidow_fx_begin(struct vidow_server *server, struct vidow_fx_target *fx,
 	fx->tex_off_y = 0.0f;
 	fx->tex_scale_x = 1.0f;
 	fx->tex_scale_y = 1.0f;
+	fx->anim_scale = 1.0;
 	if (animated) {
 		vidow_fx_set_shader(server, fx, shader_name, VIDOW_SHADER_OPEN);
 	}
@@ -1733,16 +1743,24 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 	if (!(ov > 0.0)) {
 		ov = 1.0;
 	}
-	int pad_ov = (int)lround((double)pad * ov);
-	int dst_w = (int)lround((double)fx->dst_w * ov);
-	int dst_h = (int)lround((double)fx->dst_h * ov);
+	/* 动画缩放：整块（连内边距）按 anim_scale 缩，围绕窗口中心 —— 所以位置
+	 * 要挪回一半的差值，不然看着是从左上角往右下缩。静止时 anim_scale 恒为
+	 * 1，这两项正好是 0，一个像素都不动。 */
+	double as = fx->anim_scale > 0.0 ? fx->anim_scale : 1.0;
+	int dst_w0 = (int)lround((double)fx->dst_w * ov);
+	int dst_h0 = (int)lround((double)fx->dst_h * ov);
+	int pad_ov = (int)lround((double)pad * ov * as);
+	int dst_w = (int)lround((double)dst_w0 * as);
+	int dst_h = (int)lround((double)dst_h0 * as);
 	if (dst_w < 1) {
 		dst_w = 1;
 	}
 	if (dst_h < 1) {
 		dst_h = 1;
 	}
-	wlr_scene_node_set_position(&fx->node->node, x - pad_ov, y - pad_ov);
+	wlr_scene_node_set_position(&fx->node->node,
+		x - pad_ov + (dst_w0 - dst_w) / 2,
+		y - pad_ov + (dst_h0 - dst_h) / 2);
 	wlr_scene_buffer_set_dest_size(fx->node, dst_w, dst_h);
 	wlr_scene_buffer_set_opacity(fx->node, 1.0f);
 
@@ -1782,6 +1800,7 @@ void vidow_fx_end(struct vidow_server *server, struct vidow_fx_target *fx) {
 	fx->shader = NULL;
 	fx->phase = VIDOW_SHADER_NONE;
 	fx->active = false;
+	fx->anim_scale = 1.0;
 	blur_target_release(fx);
 	drop_targets(fx);
 }
@@ -1794,6 +1813,7 @@ void vidow_fx_release(struct vidow_fx_target *fx) {
 	fx->shader = NULL;
 	fx->phase = VIDOW_SHADER_NONE;
 	fx->active = false;
+	fx->anim_scale = 1.0;
 	fx->node = NULL;
 }
 
@@ -2180,8 +2200,16 @@ static void closing_update(void *data, double t) {
 	struct vidow_closing *closing = data;
 	struct vidow_config *cfg = &closing->server->config;
 
+	/* 回弹的曲线让 t 稍微越过 1：位移和缩放跟着过冲（那才是回弹），透明度
+	 * 不行 —— 负的 alpha 在场景节点上没定义。 */
 	closing->alpha = 1.0 + (cfg->close_alpha_to - 1.0) * t;
+	if (closing->alpha < 0.0) {
+		closing->alpha = 0.0;
+	} else if (closing->alpha > 1.0) {
+		closing->alpha = 1.0;
+	}
 	closing->off_y = (double)closing->slide_px * t;
+	closing->fx.anim_scale = 1.0 + (closing->anim_scale_to - 1.0) * t;
 	closing->fx.progress = t;
 	vidow_backdrop_damage(closing->server, false);
 
@@ -2224,8 +2252,8 @@ static void closing_done(void *data, bool cancelled) {
 void vidow_closing_start(struct vidow_server *server,
 		struct wlr_scene_tree *parent, struct wlr_buffer *snapshot,
 		const struct vidow_fx_geo *geo, int x, int y, int w, int h,
-		int duration_ms, int slide_px, const char *shader_name, double scale) {
-	struct vidow_config *cfg = &server->config;
+		int duration_ms, int slide_px, const char *shader_name, double scale,
+		enum vidow_easing easing, double anim_scale_to) {
 	if (snapshot == NULL || duration_ms <= 0 || w <= 0 || h <= 0) {
 		return;
 	}
@@ -2242,6 +2270,8 @@ void vidow_closing_start(struct vidow_server *server,
 	closing->h = h;
 	closing->alpha = 1.0;
 	closing->slide_px = slide_px;
+	closing->anim_scale_to = anim_scale_to > 0.0 ? anim_scale_to : 1.0;
+	closing->easing = easing;
 	closing->scale = scale > 0.0 ? scale : 1.0;
 	closing->geo = (struct vidow_fx_geo){0};
 	if (geo != NULL) {
@@ -2277,7 +2307,7 @@ void vidow_closing_start(struct vidow_server *server,
 		wlr_scene_node_set_enabled(&closing->node->node, false);
 	}
 
-	closing->anim = vidow_anim_start(server, "close", duration_ms, cfg->easing,
+	closing->anim = vidow_anim_start(server, "close", duration_ms, easing,
 		closing_update, closing_done, closing);
 	if (closing->anim == NULL) {
 		closing_done(closing, true);

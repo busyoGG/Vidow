@@ -848,6 +848,7 @@ void vidow_view_apply_anim(struct vidow_view *view) {
 	 * and the real surface is only kept alive for hit-testing. */
 	/* 装饰节点摆在「可见窗口」左上角（视图树的原点就是它，见 vidow_fx_geo），
 	 * 不在源缓冲的原点上：源缓冲多出来的那圈 CSD 留白落在装饰矩形外面。 */
+	view->fx.anim_scale = view->anim_scale;
 	bool fx_drawn = vidow_fx_frame(view->server, &view->fx, src, &geo, 0, 0,
 		x, y, alpha, view->server->focused == view,
 		view_scale(view) * ov, ov);
@@ -894,9 +895,18 @@ static void view_move_done(void *data, bool cancelled) {
 static void view_open_update(void *data, double t) {
 	struct vidow_view *view = data;
 	struct vidow_config *cfg = &view->server->config;
+	/* 回弹的曲线会过冲（t 稍微越过 1）：位移和缩放跟着过冲才是回弹，透明度
+	 * 不行 —— 负的 alpha 在场景节点上没定义。 */
 	view->anim_alpha = cfg->open_alpha_from +
 		(1.0 - cfg->open_alpha_from) * t;
+	if (view->anim_alpha < 0.0) {
+		view->anim_alpha = 0.0;
+	} else if (view->anim_alpha > 1.0) {
+		view->anim_alpha = 1.0;
+	}
 	view->anim_off_y = cfg->open_slide_px * (1.0 - t);
+	view->anim_scale = cfg->open_scale_from +
+		(1.0 - cfg->open_scale_from) * t;
 	view->fx.progress = t;
 	vidow_backdrop_damage(view->server, false);
 	vidow_view_apply_anim(view);
@@ -911,6 +921,7 @@ static void view_open_done(void *data, bool cancelled) {
 	view->anim_open = NULL;
 	view->anim_alpha = 1.0;
 	view->anim_off_y = 0.0;
+	view->anim_scale = 1.0;
 	wlr_log(WLR_DEBUG, "open done %s",
 		vidow_view_title(view) != NULL ? vidow_view_title(view) : "?");
 
@@ -942,6 +953,7 @@ void vidow_view_open_anim(struct vidow_view *view) {
 		view->anim_alpha = 1.0;
 		view->anim_off_x = 0.0;
 		view->anim_off_y = 0.0;
+		view->anim_scale = 1.0;
 		vidow_view_apply_anim(view);
 		return;
 	}
@@ -955,6 +967,7 @@ void vidow_view_open_anim(struct vidow_view *view) {
 	}
 
 	view->anim_alpha = cfg->open_alpha_from;
+	view->anim_scale = cfg->open_scale_from;
 	/* 入场动画接管位置：把可能刚起的位移补间撤掉。新窗口 map 的同一帧里
 	 * arrange 已经先跑过一遍（带着列偏移的变化），那会儿还没有入场动画，
 	 * 位移补间就起来了 —— 两个动画抢同一组 anim_off、每帧互相覆盖，看着就是
@@ -968,7 +981,8 @@ void vidow_view_open_anim(struct vidow_view *view) {
 
 	vidow_anim_cancel(view->anim_open);
 	view->anim_open = vidow_anim_start(view->server, "open",
-		cfg->window_open_ms, cfg->easing, view_open_update, view_open_done, view);
+		cfg->window_open_ms, cfg->open_easing, view_open_update,
+		view_open_done, view);
 	if (view->anim_open == NULL) {
 		view_open_done(view, true);
 	}
@@ -1013,7 +1027,8 @@ static void view_snapshot_close(struct vidow_view *view) {
 		&geo, view->geom.x + (int)lround(view->anim_off_x),
 		view->geom.y + (int)lround(view->anim_off_y), w, h,
 		server->config.window_close_ms, server->config.close_slide_px,
-		server->config.shader_close, view_scale(view));
+		server->config.shader_close, view_scale(view),
+		server->config.close_easing, server->config.close_scale_to);
 }
 
 void vidow_place_view(struct vidow_view *view, int x, int y, int w, int h) {
@@ -2375,6 +2390,7 @@ static void view_swap_decor(struct vidow_view *view) {
 	view->anim_alpha = 1.0;
 	view->anim_off_x = 0.0;
 	view->anim_off_y = 0.0;
+	view->anim_scale = 1.0;
 	vidow_fx_end(view->server, &view->fx);
 	if (view->scene_surface != NULL && view->scene_surface->buffer != NULL) {
 		wlr_scene_buffer_set_opacity(view->scene_surface->buffer, 1.0f);
@@ -2763,6 +2779,7 @@ void vidow_view_new_x11(struct vidow_server *server,
 	view->tag.magic = VIDOW_VIEW_TAG_MAGIC;
 	view->tag.view = view;
 	view->anim_alpha = 1.0;
+	view->anim_scale = 1.0;
 	view->popup = x11_is_popup(xsurface);
 	view->focus_on_open = true;
 	view->focus_on_activate = true;
@@ -2861,6 +2878,7 @@ static void server_new_toplevel(struct wl_listener *listener, void *data) {
 	view->scene_tree->node.data = &view->tag;
 	wlr_scene_node_set_enabled(&view->scene_tree->node, false);
 	view->anim_alpha = 1.0;
+	view->anim_scale = 1.0;
 
 	/* wlr_scene_xdg_surface_create() returns a tree holding the surface. */
 	view->scene_surface = find_scene_surface(&view->scene_tree->node,

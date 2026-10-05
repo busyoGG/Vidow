@@ -80,6 +80,8 @@ enum vidow_easing {
 	VIDOW_EASE_OUT_QUINT,
 	VIDOW_EASE_IN_OUT_CUBIC,
 	VIDOW_EASE_OUT_BACK,
+	/* 阻尼振荡：冲过终点再回摆一下收住（见 anim.c）。窗口的「q 弹」就是它。 */
+	VIDOW_EASE_OUT_ELASTIC,
 };
 
 struct vidow_config {
@@ -120,6 +122,15 @@ struct vidow_config {
 	int open_slide_px;      /* slide-in distance while opening */
 	double close_alpha_to;  /* opacity at t=1 while closing */
 	int close_slide_px;     /* slide-out distance while closing */
+
+	/* 每个阶段自己的缓动曲线：默认 out_elastic —— 入场和关闭会过冲一下再
+	 * 收住。上面那个 easing 只管位移补间、layer surface 和 overview：布局重排
+	 * 要的是「快而稳」，过冲反而晃眼。 */
+	enum vidow_easing open_easing;
+	enum vidow_easing close_easing;
+	/* 入场从多小弹出来 / 关闭缩到多小（1.0 = 不缩放）。 */
+	double open_scale_from;
+	double close_scale_to;
 
 	/* server-side decorations */
 	bool decor_enabled;
@@ -342,6 +353,9 @@ struct vidow_fx_target {
 	int dst_w, dst_h;         /* 场景节点尺寸（逻辑单位）= w/h 除以 scale */
 	int px_pad;               /* 内边距，物理像素 */
 	double scale;             /* 渲染倍率：窗口所在输出的缩放 */
+	/* 动画缩放，围绕窗口中心（1.0 = 原尺寸）。缩放只作用在场景节点上，离屏
+	 * 缓冲照旧按原尺寸画 —— 为了几个百分点的过冲每帧重分配一块缓冲不值。 */
+	double anim_scale;
 	/* animation pass, only used when a shader is configured */
 	struct wlr_buffer *anim_buf[2];
 	int anim_index;
@@ -414,6 +428,8 @@ struct vidow_closing {
 	double alpha;
 	double off_y;
 	int slide_px;
+	double anim_scale_to;   /* 关闭动画结束时的缩放（1.0 = 不缩） */
+	enum vidow_easing easing;
 	int x, y, w, h;
 	struct vidow_fx_geo geo; /* 快照里哪一块是「可见窗口」（见上） */
 	double scale;
@@ -614,6 +630,7 @@ struct vidow_view {
 	struct vidow_anim *anim_open; /* open tween */
 	double anim_off_x, anim_off_y;  /* added to geom.x/y while animating */
 	double anim_alpha;              /* 0..1, applied to every buffer */
+	double anim_scale;              /* 动画缩放，围绕窗口中心；1.0 = 原尺寸 */
 	double anim_from_x, anim_from_y; /* move tween start offsets */
 	bool placed;                     /* laid out at least once */
 
@@ -1320,7 +1337,8 @@ struct vidow_fx_geo vidow_view_fx_geo(const struct vidow_view *view);
 void vidow_closing_start(struct vidow_server *server,
 		struct wlr_scene_tree *parent, struct wlr_buffer *snapshot,
 		const struct vidow_fx_geo *geo, int x, int y, int w, int h,
-		int duration_ms, int slide_px, const char *shader_name, double scale);
+		int duration_ms, int slide_px, const char *shader_name, double scale,
+		enum vidow_easing easing, double anim_scale_to);
 
 /* ------------------------------------------------------------------ layout */
 

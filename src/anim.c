@@ -40,6 +40,14 @@ static double ease(enum vidow_easing easing, double t) {
 		u = t - 1.0;
 		return 1.0 + c3 * u * u * u + c1 * u * u;
 	}
+	case VIDOW_EASE_OUT_ELASTIC:
+		/* 阻尼余弦：1 - e^(-k t) * cos(w t)，k = 5.5、w = 7。
+		 *
+		 * t = 0 正好是 0（曲线必须从起点出发，不能一上来就跳到终点），t≈0.26
+		 * 到终点、t≈0.45 冲过头 8.5%、之后单调收敛回去 —— 那一下过冲和一下
+		 * 回摆就是「q 弹」。k 再小回摆更明显，但尾巴拖得长：窗口不是果冻，
+		 * 收住比晃得欢重要。 */
+		return 1.0 - exp(-5.5 * t) * cos(7.0 * t);
 	}
 	return t;
 }
