@@ -39,7 +39,29 @@ static enum wlr_log_importance log_level_from_env(void) {
  *
  * 这里只摘「挂在 wlroots 对象上、由我们自己加的」那些：对象内部的监听器
  * （窗口 / 输出 / layer 的）各自在 destroy 回调里已经摘干净了。 */
+/* 会话从「切走了」回到「回来了」：VT 切回来（Ctrl+Alt+F3 再切回来）时，屏幕上的
+ * framebuffer 已经是别人的了，场景里的东西一个像素都没变，但必须整屏重画一遍 ——
+ * 不然切回来看到的是一张旧图 / 花屏。wlroots 的 DRM 后端自己管「不活动时别往 DRM
+ * 上画」，这里只管「回来了重画」。 */
+static void session_active(struct wl_listener *listener, void *data) {
+	(void)data;
+	struct vidow_server *server =
+		wl_container_of(listener, server, session_active);
+	bool active = server->session != NULL && server->session->active;
+	wlr_log(WLR_INFO, "会话: %s（%s）", active ? "回来了" : "被切走了",
+		active ? "整屏重画一遍" : "wlroots 会停止往 DRM 上画，等切回来");
+	if (active) {
+		vidow_backdrop_damage(server, true);
+		vidow_arrange(server);
+	}
+}
+
 static void server_finish(struct vidow_server *server) {
+	if (server->session != NULL) {
+		/* 会话销毁时会断言「没人还挂在我的 events.active 上」（和退出时那条
+		 * xdg_shell 断言同一类，见文件头的说明）。 */
+		wl_list_remove(&server->session_active.link);
+	}
 	wl_list_remove(&server->new_output.link);
 	wl_list_remove(&server->new_input.link);
 	wl_list_remove(&server->new_virtual_keyboard.link);
@@ -183,12 +205,23 @@ int main(int argc, char *argv[]) {
 		return 1;
 	}
 
+	/* 要会话指针（真机 tty 上 wlroots 会建一个，嵌套 / headless 是 NULL）：
+	 * 切 VT 的键位要用它调 wlr_session_change_vt，不活动 / 回来也要有事件可听。 */
 	server.backend = wlr_backend_autocreate(
-		wl_display_get_event_loop(server.display), NULL);
+		wl_display_get_event_loop(server.display), &server.session);
 	if (server.backend == NULL) {
 		wlr_log(WLR_ERROR, "failed to create backend");
 		wl_display_destroy(server.display);
 		return 1;
+	}
+	if (server.session != NULL) {
+		server.session_active.notify = session_active;
+		wl_signal_add(&server.session->events.active, &server.session_active);
+		wlr_log(WLR_INFO, "会话: seat=%s %s（切 VT 用 Ctrl+Alt+F1..F12）",
+			server.session->seat,
+			server.session->active ? "现在是活动的" : "现在不活动");
+	} else {
+		wlr_log(WLR_INFO, "会话: 没有（嵌套 / headless 后端），切 VT 的键位不接管");
 	}
 
 	server.renderer = wlr_renderer_autocreate(server.backend);

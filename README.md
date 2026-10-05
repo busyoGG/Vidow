@@ -329,6 +329,14 @@ end
 
 - **只在没画到的时候补**：窗口在画面上时场景那边已经给过回调，再补一次会让客户端白画一遍
   （判断用「所在工作区显示着」+「矩形和这块屏有交集」）。
+- **滚出视口的列会被摘出场景**（同一个「矩形和这块屏有交集」的判据）：`wlr_scene` 是
+  一张**全局坐标**的场景图，每块屏的场景输出画的是「落在自己那块坐标里的所有节点」——
+  列往右滚出屏宽之后坐标正好落进右边那块屏的框里，不摘掉就画到隔壁显示器上了
+  （niri 不会：它每块屏各渲染自己那棵）。摘掉的是场景节点（`enabled = false`），
+  客户端该出帧还出帧（见上一条的补帧）。三种情况**不摘**：浮动窗口、正被拖的窗口
+  （它们本来就允许跨屏）、overview（所有窗口都要缩进画面）。第四种：**有人正录屏 /
+  预览它**（窗口截图源读的就是场景节点，摘了就抓不到帧）。回归判据 `test-scrollcull.sh`
+  + `test-force-render.sh` 的录屏那节 + `test-overview.sh`。
 - **节流可配**（`force_render_hz`，规则可逐窗口覆盖 `hz`；0 = 不限速）：补帧会自己排
   下一帧，不节流的话在没 vsync 的后端（headless、嵌套）上会空转到几千 fps —— 一个
   「保活」把 CPU 跑满就没意义了。到点的唤醒用一个**闹钟**（`wl_event_source` 定时器）
@@ -511,6 +519,21 @@ ninja -C build
 WLR_BACKENDS=wayland ./build/vidow
 ```
 
+真机（tty，DRM 后端，不带 `WLR_BACKENDS`）上 **Ctrl+Alt+F1..F12 切 tty**：内核一般
+自己就把这个键处理掉了（合成器不 `EVIOCGRAB`，控制台键盘那一侧也收得到），所以这条
+通常是空转 —— 但 vidow 自己也接一遍（X 服务器就是自己实现的：它抓了设备，内核收不到
+这个键），两种情况下都能用：
+
+```lua
+-- 想换别的键（比如 F 键被别的东西占了）：
+vidow.bind("Ctrl+Alt+P", "switch-vt 3")
+```
+
+命令行也行：`vidowmsg action switch-vt 3`。会话不活动时 wlroots 的 DRM 后端自己会停
+往 DRM 上画，vidow 这边只在切回来的时候整屏重画一遍。**嵌套 / headless 里没有会话**，
+这条动作会明确失败（日志：`VT: 没有会话（嵌套 / headless），切 VT 交给宿主`），而且
+Ctrl+Alt+F2 不会被吃掉（那是宿主 Hyprland 的）。回归判据 `test-vt.sh`。
+
 一键验证（嵌套启动 + 3 个客户端 + waybar 顶栏）：
 
 ```bash
@@ -525,10 +548,11 @@ python3 test-float.py        # 三个真实 GTK 窗口，验证浮动模式自�
 ./test-dpi.sh                        # 混合 DPI + XWayland（全 headless，15 项断言）
 ./test-x11scale.sh                   # X11 逐窗口缩放桥 x11_scale=1（全 headless，16 项断言）
 ./test-scrollcull.sh                 # 滚出视口的列不画到隔壁显示器（全 headless，11 项断言）
+./test-vt.sh                         # tty 的 VT 切换（Ctrl+Alt+F1..F12 / switch-vt 动作）（全 headless，11 项断言）
 ./test-focus.sh                      # 焦点规则 + 激活请求（全 headless，61 项断言）
 ./test-ipc.sh                        # IPC：状态输出 / 命令 / 事件 / 多屏（全 headless，162 项断言）
 ./test-config.sh                     # 配置系统：一个 Lua 文件 + 改了就自动重载（全 headless，15 项断言）
-./test-defaultconfig.sh              # 完整默认配置（--default-config）+ 配置族的表写法（全 headless，20 项断言）
+./test-defaultconfig.sh              # 完整默认配置（--default-config / --write-config）+ 配置族的表写法（全 headless，29 项断言）
 ./test-gap.sh                        # 间距：一个数管全部 + 单边/内间距覆盖（全 headless，33 项断言）
 ./test-layerblur.sh                  # 半透明状态栏背后的模糊（全 headless，4 项断言）
 ./test-blurscale.sh                  # 模糊在高 DPI 倍率下的底衬覆盖 + 对位（1/1.7/2 倍，7 项断言）
@@ -1201,6 +1225,7 @@ vidowmsg clipboard-clear
 | 内容贴图采样 | 按 `(geometry.x, geometry.y)` 偏移 —— 归一化后交给着色器（`u_tex_map`） |
 | `ext-background-effect` 的模糊区域 | 减掉留白偏移（客户端给的是表面局部坐标） |
 | 关闭动画的快照 | 同一份几何：快照节点按 `-偏移` 摆，装饰矩形还是窗口 |
+| 关闭动画「怎么没有」 | 三条路都能让它不出现，`VIDOW_LOG=debug` 下会明说是哪条：`关闭动画跳过 <窗口>：弹出物（菜单 / 提示 / 下拉框）不做关闭动画` / `手里没有最后一帧快照` / `window_close_ms = 0（配置里关了）`。窗口是不是被当成了弹出物，`vidowmsg windows` 里查 `popup` / `float_mode` |
 
 留白那圈（客户端自己的阴影）落在装饰矩形**外面**，vidow 不画它（内容被圆角矩形裁掉）。
 没留白的客户端（X11、不画装饰的 Wayland 客户端、`prefer_no_csd` 打开之后）留白是 0，
@@ -1994,6 +2019,9 @@ test-x11scale.sh  固定尺寸的 X11 窗口（WM_NORMAL_HINTS min==max）在 2 
 test-scrollcull.sh  两块并排的屏 + 三列装不下：滚出视口的列被摘出场景（修之前它的
                   坐标落进隔壁屏的框里，就画在隔壁显示器上），再滚回来又显示，
                   浮动 / 拖拽不受这条规则管，藏起来的窗口按规则照旧补帧
+test-vt.sh        tty 的 VT 切换：headless 下验「认得 Ctrl+Alt+F2（F1..F12 + Ctrl+Alt
+                  就是 VT 键）、不接管、不吃键」，`switch-vt` 动作 / 越界号优雅失败，
+                  config 里绑的 switch-vt 走同一条路（真机上生效的就是它）
 test-clipboard.sh 剪贴板桥：接管、X11->Wayland、Wayland->X11、PRIMARY、INCR（大块）、
                   错误路径与事件、配置热切换（关掉退回 wlroots 那套）、退出与清理
 test-hotplug.sh   真拔一块 headless 输出再以同名插回来：列 / 浮动窗口 / layer surface

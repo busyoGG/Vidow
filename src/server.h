@@ -9,6 +9,7 @@
 
 #include <wayland-server-core.h>
 #include <wlr/backend.h>
+#include <wlr/backend/session.h>
 #include "scale.h"
 #include "hotplug.h"
 #include "clipboard.h"
@@ -956,6 +957,11 @@ struct vidow_clipboard {
 struct vidow_server {
 	struct wl_display *display;
 	struct wlr_backend *backend;
+	/* 真机（tty）上才有：wlr_backend_autocreate() 建出来的会话。嵌套 / headless
+	 * 是 NULL。切 VT 要它（wlr_session_change_vt），「现在轮到我画了吗」也看它
+	 * （events.active，见 main.c 的 session_active）。 */
+	struct wlr_session *session;
+	struct wl_listener session_active;
 	struct wlr_renderer *renderer;
 	struct wlr_allocator *allocator;
 
@@ -1379,6 +1385,9 @@ void vidow_closing_start(struct vidow_server *server,
 /* ------------------------------------------------------------------ layout */
 
 void vidow_arrange(struct vidow_server *server);
+/* 有人正拿着这个窗口的画面吗（窗口截图源 / 录屏 / 预览）：拿着的时候不剔除它 ——
+ * 剔除是把场景节点关掉，抓画面那条路读的就是场景节点，关了就抓不到帧（见 view.c）。 */
+bool vidow_view_capture_held(const struct vidow_view *view);
 /* 这个窗口的矩形和它自己那块屏有交集吗（滚出视口的列要按它剔除，见 view.c）。 */
 bool vidow_view_in_output_box(struct vidow_server *server,
 		const struct vidow_view *view);

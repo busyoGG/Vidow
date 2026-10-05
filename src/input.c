@@ -126,6 +126,35 @@ static void keyboard_modifiers(struct wl_listener *listener, void *data) {
 		&kb->wlr_keyboard->modifiers);
 }
 
+/* Ctrl+Alt+F1..F12：切 tty（真机上内核多半自己就切了，见 vidow_vt_switch）。
+ *
+ * 判据是「F1..F12 + Ctrl+Alt」而不是 XF86Switch_VT_n 那个 keysym：默认键位表里
+ * FK01..FK12 的第 5 个符号才是 XF86Switch_VT_n，而 CTRL+ALT 这个 type 把 Control
+ * 映射回第 1 层（preserve Control）—— 真按 Ctrl+Alt+F2 拿到的是 **F2** 这个 keysym
+ * 加上 ctrl|alt 修饰（`xkbcli how-to-type --keysym XF86Switch_VT_2` 一个 keycode
+ * 都找不到，就是这个原因）。两个都认：键位表把 keysym 配上时那条也能用。 */
+static bool vt_switch_key(struct vidow_server *server, xkb_keysym_t sym,
+		uint32_t mods) {
+	unsigned vt;
+	if (sym >= XKB_KEY_F1 && sym <= XKB_KEY_F12 &&
+			(mods & (WLR_MODIFIER_CTRL | WLR_MODIFIER_ALT)) ==
+				(WLR_MODIFIER_CTRL | WLR_MODIFIER_ALT)) {
+		vt = (unsigned)(sym - XKB_KEY_F1) + 1;
+	} else if (sym >= XKB_KEY_XF86Switch_VT_1 &&
+			sym <= XKB_KEY_XF86Switch_VT_12) {
+		vt = (unsigned)(sym - XKB_KEY_XF86Switch_VT_1) + 1;
+	} else {
+		return false;
+	}
+	/* 没有会话就别吃这个键：嵌套里那是宿主（Hyprland）的 Ctrl+Alt+F2。 */
+	if (server->session == NULL) {
+		wlr_log(WLR_DEBUG, "VT: 没有会话（嵌套 / headless），Ctrl+Alt+F%u 交给宿主",
+			vt);
+		return false;
+	}
+	return vidow_vt_switch(server, vt);
+}
+
 static void keyboard_key(struct wl_listener *listener, void *data) {
 	struct vidow_keyboard *kb = wl_container_of(listener, kb, key);
 	struct vidow_server *server = kb->server;
@@ -139,6 +168,12 @@ static void keyboard_key(struct wl_listener *listener, void *data) {
 
 	bool handled = false;
 	uint32_t mods = wlr_keyboard_get_modifiers(kb->wlr_keyboard);
+	/* 0) 切 tty 的键（Ctrl+Alt+F1..F12）：只有真机（有会话）才接管。 */
+	if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+		for (int i = 0; i < nsyms; i++) {
+			handled = vt_switch_key(server, syms[i], mods) || handled;
+		}
+	}
 	/* 1) 内置键位：进 overview、退出合成器、关窗、丢给布局的那些。 */
 	if ((mods & MOD_KEY) && event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
 		for (int i = 0; i < nsyms; i++) {

@@ -180,6 +180,10 @@ static void overview_done(void *data, bool cancelled) {
 		server->overview.output = NULL;
 		server->overview.pan = 0.0;
 	}
+	/* 进 / 出都重判一次「谁该出现在场景里」：overview 里**所有**窗口都要画
+	 * （缩到画面里），所以滚出视口被剔除的那些得先放回来；退出之后又要按框剔除
+	 * 一次（不然它们会一直显示着，串到隔壁屏上）。 */
+	vidow_workspace_apply_visibility(server);
 }
 
 static void overview_start(struct vidow_server *server) {

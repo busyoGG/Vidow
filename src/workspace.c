@@ -732,7 +732,8 @@ int vidow_workspace_apply_visibility(struct vidow_server *server) {
 			 * 窗口本来就允许跨屏（拖过去就是要跨），overview 里所有窗口都被
 			 * 缩进画面 —— 这三种照旧显示。 */
 			if (want && view->float_mode == VIDOW_FLOAT_NONE &&
-					!view->dragging && !vidow_overview_active(server)) {
+					!view->dragging && !vidow_overview_active(server) &&
+					!vidow_view_capture_held(view)) {
 				want = vidow_view_in_output_box(server, view);
 			}
 		}

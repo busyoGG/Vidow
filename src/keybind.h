@@ -47,4 +47,7 @@ bool vidow_keybind_key(struct vidow_server *server, xkb_keysym_t sym,
 /* 执行一个动作字符串（键位绑定和 VIDOW_TEST_ACTION 测试钩子共用）。 */
 bool vidow_action_run(struct vidow_server *server, const char *action);
 
+/* 切 tty（真机才有会话）。键位（Ctrl+Alt+F1..F12）和 `switch-vt n` 动作都走这里。 */
+bool vidow_vt_switch(struct vidow_server *server, unsigned vt);
+
 #endif

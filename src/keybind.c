@@ -269,6 +269,19 @@ static void log_action(const char *action, const char *what) {
 	wlr_log(WLR_INFO, "action: %s -> %s", action, what);
 }
 
+bool vidow_vt_switch(struct vidow_server *server, unsigned vt) {
+	if (server->session == NULL) {
+		wlr_log(WLR_DEBUG, "VT: 没有会话（嵌套 / headless），切 VT 交给宿主");
+		return false;
+	}
+	wlr_log(WLR_INFO, "VT: 切到 %u 号 tty", vt);
+	if (!wlr_session_change_vt(server->session, vt)) {
+		wlr_log(WLR_ERROR, "VT: 切到 %u 号 tty 失败", vt);
+		return false;
+	}
+	return true;
+}
+
 bool vidow_action_run(struct vidow_server *server, const char *action) {
 	if (server == NULL || action == NULL || action[0] == '\0') {
 		return false;
@@ -358,6 +371,23 @@ bool vidow_action_run(struct vidow_server *server, const char *action) {
 	}
 	if (strcmp(name, "none") == 0) {
 		return true; /* 空绑定，用来屏蔽某个键 */
+	}
+	/* 切 tty：
+	 *
+	 *   vidow.bind("Ctrl+Alt+F2", "switch-vt 2")
+	 *   vidowmsg action switch-vt 2
+	 *
+	 * 内核一般自己就把 Ctrl+Alt+Fn 处理掉了（合成器不 EVIOCGRAB，控制台键盘那
+	 * 一侧也收得到），所以真机上这条通常是空转 —— 但「切不走 tty」是收到过的
+	 * 报告，而 X 服务器就是自己实现的（它抓了设备，内核收不到这个键）。两种
+	 * 情况下都能用，最省事。没有会话（嵌套 / headless）时不动：那是宿主的事。 */
+	if (strcmp(name, "switch-vt") == 0) {
+		int vt = arg != NULL ? atoi(arg) : 0;
+		if (vt < 1 || vt > 12) {
+			wlr_log(WLR_ERROR, "switch-vt 要 1..12 号 tty");
+			return false;
+		}
+		return vidow_vt_switch(server, (unsigned)vt);
 	}
 	/* 测试用：注入口/指针事件。走的是和真实鼠标完全同一条路
 	 * （vidow_pointer_button / wlr_cursor_warp），不另开捷径 —— 拖拽这种

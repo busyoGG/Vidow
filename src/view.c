@@ -595,7 +595,7 @@ static double view_scale(const struct vidow_view *view) {
  * final size, so a tween can never race a resize. */
 /* ------------------------------------------------ 视口外强制渲染（补帧回调） */
 
-static bool view_capture_held(struct vidow_view *view);
+
 static bool view_alive(struct vidow_server *server, struct vidow_view *want);
 
 /* 窗口的整棵表面树（含子表面 / 弹窗）都补一份帧回调。 */
@@ -679,7 +679,7 @@ void vidow_view_render_pump(struct vidow_server *server,
 	wl_list_for_each(view, &server->views, link) {
 		bool want = view->mapped && !view->popup && view->output ==
 			output->wlr_output &&
-			(view->force_render || view_capture_held(view));
+			(view->force_render || vidow_view_capture_held(view));
 		if (!want) {
 			if (view->render_pumping) {
 				view->render_pumping = false;
@@ -732,7 +732,7 @@ void vidow_view_render_pump(struct vidow_server *server,
 			wlr_log(WLR_INFO, "强制渲染: %s 在视口外/藏起来，照样补帧回调"
 				"（%s，%s）", vidow_view_title(view) != NULL ?
 					vidow_view_title(view) : "(无题)",
-				view_capture_held(view) ? "有人正在录屏 / 预览它" :
+				vidow_view_capture_held(view) ? "有人正在录屏 / 预览它" :
 					"窗口规则要求", rate);
 		}
 	}
@@ -759,7 +759,7 @@ void vidow_view_render_pump(struct vidow_server *server,
 }
 
 /* 有人正拿着这个窗口的画面吗（有一条持有记录就算）。 */
-static bool view_capture_held(struct vidow_view *view) {
+bool vidow_view_capture_held(const struct vidow_view *view) {
 	return !wl_list_empty(&view->capture_sources);
 }
 
@@ -1048,6 +1048,14 @@ static void view_snapshot_close(struct vidow_view *view) {
 	 * 重开或换成另一个菜单，淡出的残影会串到下一个菜单上）。 */
 	if (view->popup || view->last_buffer == NULL ||
 			server->config.window_close_ms <= 0) {
+		/* 「怎么没有关闭动画」是收到过的反馈，而这里有三条不同的路都能让它
+		 * 不出现（弹出物 / 没有最后一帧快照 / 时长是 0）。日志里说清楚是哪条，
+		 * 不然只能靠猜（`vidowmsg windows` 里能查回 popup / float_mode）。 */
+		wlr_log(WLR_DEBUG, "关闭动画跳过 %s：%s",
+			vidow_view_title(view) != NULL ? vidow_view_title(view) : "(无题)",
+			view->popup ? "弹出物（菜单 / 提示 / 下拉框）不做关闭动画" :
+			view->last_buffer == NULL ? "手里没有最后一帧快照" :
+			"window_close_ms = 0（配置里关了）");
 		return;
 	}
 	/* 快照是整块源缓冲（表面），可见窗口在里面偏着 —— 把偏移一起交给关闭动画，
