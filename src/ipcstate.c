@@ -636,6 +636,12 @@ void vidow_ipc_json_rules(struct jbuf *b, struct vidow_server *server) {
 		} else {
 			jb_null(b);
 		}
+		jb_key(b, "x11_scale");
+		if (rule->has_scale) {
+			jb_double(b, rule->scale);
+		} else {
+			jb_null(b);
+		}
 		jb_obj_end(b);
 	}
 	jb_arr_end(b);

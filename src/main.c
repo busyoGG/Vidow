@@ -100,25 +100,51 @@ static void server_finish(struct vidow_server *server) {
 }
 
 int main(int argc, char *argv[]) {
-	/* 只有一个参数：打印完整默认配置。不需要合成器起得来 —— 它是给
-	 * 「第一次写配置」和「想看看都有哪些键」用的。 */
+	/* 只有参数，不需要合成器起得来：它们是给「第一次写配置」和「想看看都有
+	 * 哪些键」用的。 */
+	bool write_config = false;
+	bool force = false;
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "--default-config") == 0) {
 			vidow_config_default_lua(stdout);
 			return 0;
 		}
+		if (strcmp(argv[i], "--write-config") == 0) {
+			write_config = true;
+			continue;
+		}
+		if (strcmp(argv[i], "--force") == 0) {
+			force = true;
+			continue;
+		}
 		if (strcmp(argv[i], "--help") == 0 ||
 				strcmp(argv[i], "-h") == 0) {
 			fprintf(stderr,
 				"用法: vidow [选项]\n"
-				"  --default-config  打印一份完整的默认配置（Lua），"
-				"抄进 ~/.config/vidow/config.lua 即用\n"
+				"  --default-config  打印一份完整的默认配置（Lua）\n"
+				"  --write-config    把那份默认配置写进配置目录"
+				"（$XDG_CONFIG_HOME/vidow/config.lua，"
+				"已存在则不动它）\n"
+				"  --force           配合 --write-config："
+				"覆盖已有的那份\n"
 				"  --help            这个\n");
 			return 0;
 		}
 		fprintf(stderr, "vidow: 不认识的参数 '%s'（--help 看用法）\n",
 			argv[i]);
 		return 2;
+	}
+
+	if (write_config) {
+		char path[PATH_MAX];
+		vidow_config_path(path, sizeof(path));
+		char err[512];
+		if (vidow_config_write_default(path, force, err, sizeof(err)) != 0) {
+			fprintf(stderr, "vidow: %s\n", err);
+			return 1;
+		}
+		printf("%s\n", path);
+		return 0;
 	}
 
 	wlr_log_init(log_level_from_env(), NULL);

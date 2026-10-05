@@ -727,6 +727,14 @@ int vidow_workspace_apply_visibility(struct vidow_server *server) {
 				vidow_workspace_view_visible(server, view->parent);
 		} else {
 			want = view->mapped && vidow_workspace_view_visible(server, view);
+			/* 滚出自己那块屏的列不画：场景图是全局坐标，它的坐标会落进隔壁
+			 * 那块屏的框里 —— 于是就画到隔壁显示器上了。浮动窗口、正被拖的
+			 * 窗口本来就允许跨屏（拖过去就是要跨），overview 里所有窗口都被
+			 * 缩进画面 —— 这三种照旧显示。 */
+			if (want && view->float_mode == VIDOW_FLOAT_NONE &&
+					!view->dragging && !vidow_overview_active(server)) {
+				want = vidow_view_in_output_box(server, view);
+			}
 		}
 		if (want) {
 			shown++;

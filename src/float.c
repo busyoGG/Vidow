@@ -249,8 +249,7 @@ void vidow_float_on_commit(struct vidow_view *view) {
 			h = hh;
 		} else if (view->kind == VIDOW_VIEW_X11 && view->x11_want_w > 1 &&
 				view->x11_want_h > 1) {
-			int scale = view->server->xwayland_scale > 0 ?
-				(int)lround(view->server->xwayland_scale) : 1;
+			int scale = vidow_view_x11_scale_int(view);
 			w = view->x11_want_w / scale;
 			h = view->x11_want_h / scale;
 		} else {

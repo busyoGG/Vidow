@@ -15,11 +15,15 @@
 #include "server.h"
 
 #include <ctype.h>
+#include <errno.h>
+#include <limits.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include <wlr/util/log.h>
 
@@ -953,4 +957,68 @@ void vidow_config_default_lua(FILE *out) {
 "\tvidow.bind(\"Mod+\" .. i, \"workspace \" .. i)\n"
 "\tvidow.bind(\"Mod+Shift+\" .. i, \"move \" .. i)\n"
 "end\n", f);
+}
+
+/* mkdir -p：配置目录第一次用的时候通常整条路径都不在（~/.config 也在）。
+ * 逐级建，已经存在的那几级不算错。 */
+static int mkdir_parents(const char *dir) {
+	char buf[PATH_MAX];
+	snprintf(buf, sizeof(buf), "%s", dir);
+	for (char *p = buf + 1; *p != '\0'; p++) {
+		if (*p != '/') {
+			continue;
+		}
+		*p = '\0';
+		if (mkdir(buf, 0755) != 0 && errno != EEXIST) {
+			return -1;
+		}
+		*p = '/';
+	}
+	if (mkdir(buf, 0755) != 0 && errno != EEXIST) {
+		return -1;
+	}
+	return 0;
+}
+
+/* 把上面那份默认配置落到磁盘（`vidow --write-config`）。
+ *
+ * 为什么要有：默认值只有 `--default-config` 打在屏幕上，想改一格就得先把整份
+ * 重定向进文件（还得自己 mkdir 配置目录）。这里一步到位，并且**不覆盖已有的**
+ * —— 配置目录里那份是用户改过的东西，覆盖它等于把人家的设置扔了。 */
+int vidow_config_write_default(const char *path, bool force, char *err,
+		size_t err_len) {
+	if (path == NULL || path[0] == '\0') {
+		snprintf(err, err_len, "配置路径是空的");
+		return -1;
+	}
+
+	/* 父目录不存在就建（配置目录第一次用的时候通常还没有）。 */
+	char dir[PATH_MAX];
+	snprintf(dir, sizeof(dir), "%s", path);
+	char *slash = strrchr(dir, '/');
+	if (slash != NULL && slash != dir) {
+		*slash = '\0';
+		if (mkdir_parents(dir) != 0) {
+			snprintf(err, err_len, "建不了目录 %s：%s", dir,
+				strerror(errno));
+			return -1;
+		}
+	}
+
+	if (!force && access(path, F_OK) == 0) {
+		snprintf(err, err_len, "%s 已经有一份了（要覆盖就加 --force）", path);
+		return -1;
+	}
+
+	FILE *f = fopen(path, "w");
+	if (f == NULL) {
+		snprintf(err, err_len, "写不了 %s：%s", path, strerror(errno));
+		return -1;
+	}
+	vidow_config_default_lua(f);
+	if (fclose(f) != 0) {
+		snprintf(err, err_len, "写 %s 时出错：%s", path, strerror(errno));
+		return -1;
+	}
+	return 0;
 }

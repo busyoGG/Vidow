@@ -124,8 +124,7 @@ struct wlr_box vidow_view_geometry(const struct vidow_view *view) {
 		/* X11 窗口没有「窗口几何」和「表面」的区别：整块就是内容。 */
 		struct wlr_box box = {0};
 		if (view->x11 != NULL) {
-			int scale = (int)lround(view->server->xwayland_scale);
-			scale = scale > 0 ? scale : 1;
+			int scale = vidow_view_x11_scale_int(view);
 			box.width = view->x11->width / scale;
 			box.height = view->x11->height / scale;
 		}
@@ -182,10 +181,25 @@ struct vidow_fx_geo vidow_view_fx_geo(const struct vidow_view *view) {
 }
 
 /* X11 的像素 = 「参考设备像素」，也就是逻辑坐标乘 xwayland_scale。给客户端的
- * 一切都按这个换算：告诉它窗口多大、在哪，读回来的位置尺寸再除回来。 */
-static int x11_scale_int(const struct vidow_server *server) {
-	int scale = (int)lround(server->xwayland_scale);
-	return scale > 0 ? scale : 1;
+ * 一切都按这个换算：告诉它窗口多大、在哪，读回来的位置尺寸再除回来。
+ *
+ * 全局那个倍数（server->xwayland_scale）是「假设 X 客户端都按 GDK_SCALE /
+ * QT_SCALE_FACTOR 画了 N 倍」。不认这套 env 的客户端（微信的登录窗、CEF 系）
+ * 画的还是 1 倍，除下去就小了 N 倍（N=2 时面积只剩 1/4）—— 这种窗口用
+ * 窗口规则 x11_scale = 1 逐窗口改，见 rule.c。 */
+int vidow_view_x11_scale_int(const struct vidow_view *view) {
+	double scale = view->x11_scale;
+	if (!(scale > 0.0)) {
+		scale = view->server->xwayland_scale;
+	}
+	int n = (int)lround(scale);
+	return n > 0 ? n : 1;
+}
+
+/* 这个窗口是不是被逐窗口规则改了缩放桥（用来在日志里说清楚为什么它和别的
+ * X11 窗口不一样大）。 */
+bool vidow_view_x11_scale_overridden(const struct vidow_view *view) {
+	return view->x11_scale > 0.0;
 }
 
 /* X 像素 -> 逻辑坐标。C 的整数除法是向零取整，屏幕左边/上边（负坐标）会算偏
@@ -216,7 +230,7 @@ void vidow_view_client_size(const struct vidow_view *view, int *w, int *h) {
 	if (view->kind == VIDOW_VIEW_X11) {
 		if (view->x11 != NULL && view->x11->width > 0 &&
 				view->x11->height > 0) {
-			int scale = x11_scale_int(view->server);
+			int scale = vidow_view_x11_scale_int(view);
 			width = view->x11->width / scale;
 			height = view->x11->height / scale;
 		}
@@ -254,7 +268,7 @@ void vidow_view_set_size(struct vidow_view *view, int w, int h) {
 			 * 之后 arrange 会带着真实尺寸再 configure 一次位置。 */
 			return;
 		}
-		int scale = x11_scale_int(view->server);
+		int scale = vidow_view_x11_scale_int(view);
 		int cw = w * scale;
 		int ch = h * scale;
 		if (cw < 1) {
@@ -358,7 +372,7 @@ void vidow_view_x11_scale(struct vidow_view *view) {
 	if (bw <= 0 || bh <= 0) {
 		return; /* 还没提交过缓冲区 */
 	}
-	int scale = x11_scale_int(view->server);
+	int scale = vidow_view_x11_scale_int(view);
 	int dst_w = (bw + scale / 2) / scale;
 	int dst_h = (bh + scale / 2) / scale;
 	if (dst_w < 1) {
@@ -596,6 +610,32 @@ static void pump_surface(struct wlr_surface *surface, int sx, int sy, void *data
 	struct pump_ctx *ctx = data;
 	wlr_surface_send_frame_done(surface, ctx->now);
 	ctx->surfaces++;
+}
+
+/* 这个窗口的矩形和它自己那块屏有交集吗（都是布局坐标）。
+ *
+ * 为什么要问：wlr_scene 是一张**全局坐标**的场景图，每块屏的场景输出会画「落在
+ * 自己那块坐标里的所有节点」。列往右滚出屏宽之后，它的坐标正好落进右边那块屏的
+ * 框里 —— 于是就画到隔壁显示器上了（niri 不会：它每块屏各渲染自己那棵，屏外的
+ * 自然被 framebuffer 裁掉）。所以这里按框判一次，越界的干脆不画。
+ *
+ * 还没摆放（几何是空的）和不知道归哪块屏的都当「画得到」：宁可多画一帧，也别把
+ * 一个刚 map 的窗口藏没了。 */
+bool vidow_view_in_output_box(struct vidow_server *server,
+		const struct vidow_view *view) {
+	if (view->output == NULL || view->geom.width <= 0 ||
+			view->geom.height <= 0) {
+		return true;
+	}
+	struct wlr_box box = {0};
+	wlr_output_layout_get_box(server->output_layout, view->output, &box);
+	if (box.width < 1 || box.height < 1) {
+		return true;
+	}
+	return view->geom.x < box.x + box.width &&
+		view->geom.x + view->geom.width > box.x &&
+		view->geom.y < box.y + box.height &&
+		view->geom.y + view->geom.height > box.y;
 }
 
 /* 这个窗口现在画得到吗：所在工作区显示着 **而且** 它的矩形和这块屏有交集。
@@ -1272,6 +1312,11 @@ void vidow_arrange(struct vidow_server *server) {
 	/* 弹出物不进布局（它们的位置尺寸由客户端给死），所以放在所有输出之后单独
 	 * 摆一遍 —— 也正因为不看输出，菜单能开在任意一块屏上。 */
 	vidow_popup_place_all(server);
+
+	/* 位置变了就要重判一次「谁该出现在场景里」：滚动把一列推出视口之后，它得
+	 * 立刻从场景里摘掉，不然它的坐标落进隔壁屏的框里，就画到隔壁显示器上了
+	 * （见 vidow_view_in_output_box）。 */
+	vidow_workspace_apply_visibility(server);
 }
 
 /* ------------------------------------------------------------- 热插拔 */
@@ -2412,8 +2457,7 @@ bool vidow_view_fixed_size_hint(const struct vidow_view *view, int *w, int *h) {
 				hints->min_width < 2 || hints->min_height < 2) {
 			return false;
 		}
-		int scale = (int)lround(view->server->xwayland_scale);
-		scale = scale > 0 ? scale : 1;
+		int scale = vidow_view_x11_scale_int(view);
 		*w = hints->min_width / scale;
 		*h = hints->min_height / scale;
 		return true;
@@ -2482,7 +2526,7 @@ static void x11_track_output(struct vidow_view *view) {
 	if (view->x11 == NULL) {
 		return;
 	}
-	int scale = x11_scale_int(server);
+	int scale = vidow_view_x11_scale_int(view);
 	double lx = (double)view->x11->x / scale;
 	double ly = (double)view->x11->y / scale;
 	struct wlr_output *output =
@@ -2506,7 +2550,7 @@ bool vidow_view_x11_popup_box(struct vidow_view *view, struct wlr_box *box) {
 	if (view->x11->width <= 0 || view->x11->height <= 0) {
 		return false; /* 还没定尺寸，等它自己说 */
 	}
-	int scale = x11_scale_int(view->server);
+	int scale = vidow_view_x11_scale_int(view);
 	box->x = x11_floor_div(view->x11->x, scale);
 	box->y = x11_floor_div(view->x11->y, scale);
 	box->width = view->x11->width / scale;
@@ -2767,7 +2811,7 @@ static void x11_request_configure(struct wl_listener *listener, void *data) {
 	 * 正常途径）。位置仍按我们的规则（居中 / 跟随父窗口）。 */
 	if (view->float_mode != VIDOW_FLOAT_NONE && event->width > 1 &&
 			event->height > 1) {
-		int scale = x11_scale_int(view->server);
+		int scale = vidow_view_x11_scale_int(view);
 		view->float_geom.width = event->width / scale;
 		view->float_geom.height = event->height / scale;
 		vidow_arrange(view->server);

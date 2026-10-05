@@ -1,5 +1,6 @@
 #include "rule.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -57,6 +58,8 @@ struct vidow_rule *vidow_rule_add(struct vidow_server *server,
 	rule->focus_on_activate = spec->focus_on_activate;
 	rule->has_honor_invalid_serial = spec->has_honor_invalid_serial;
 	rule->honor_invalid_serial = spec->honor_invalid_serial;
+	rule->has_scale = spec->has_scale;
+	rule->scale = spec->scale;
 	wl_list_insert(server->rules.prev, &rule->link);
 
 	char hz_text[32];
@@ -67,8 +70,14 @@ struct vidow_rule *vidow_rule_add(struct vidow_server *server,
 	} else {
 		snprintf(hz_text, sizeof(hz_text), "%dHz", spec->hz);
 	}
+	char scale_text[32];
+	if (!spec->has_scale) {
+		snprintf(scale_text, sizeof(scale_text), "配置默认");
+	} else {
+		snprintf(scale_text, sizeof(scale_text), "X11 按 %.2g 倍除", spec->scale);
+	}
 	wlr_log(WLR_INFO, "rule: app_id=%s title=%s class=%s -> force_render=%s "
-		"补帧=%s 开窗口抢焦点=%s 激活理它=%s 无效serial也理=%s",
+		"补帧=%s 开窗口抢焦点=%s 激活理它=%s 无效serial也理=%s X11缩放=%s",
 		rule->app_id[0] != '\0' ? rule->app_id : "*",
 		rule->title[0] != '\0' ? rule->title : "*",
 		rule->klass[0] != '\0' ? rule->klass : "*",
@@ -80,7 +89,8 @@ struct vidow_rule *vidow_rule_add(struct vidow_server *server,
 		spec->has_focus_on_activate ?
 			(spec->focus_on_activate ? "on" : "off") : "不变",
 		spec->has_honor_invalid_serial ?
-			(spec->honor_invalid_serial ? "on" : "off") : "不变");
+			(spec->honor_invalid_serial ? "on" : "off") : "不变",
+		scale_text);
 	return rule;
 }
 
@@ -126,6 +136,8 @@ bool vidow_rule_apply(struct vidow_server *server, struct vidow_view *view) {
 	bool focus_on_activate = true;
 	/* 这个的默认值是 false（不理）：规则没写就是不理。 */
 	bool honor_invalid_serial = false;
+	/* X11 缩放桥：0 = 跟随全局 xwayland_scale（规则没写就是这个）。 */
+	double x11_scale = 0.0;
 	struct vidow_rule *rule;
 	wl_list_for_each(rule, &server->rules, link) {
 		if (!vidow_rule_matches(rule, view)) {
@@ -148,6 +160,9 @@ bool vidow_rule_apply(struct vidow_server *server, struct vidow_view *view) {
 		if (rule->has_honor_invalid_serial) {
 			honor_invalid_serial = rule->honor_invalid_serial;
 		}
+		if (rule->has_scale) {
+			x11_scale = rule->scale;
+		}
 	}
 	/* 没写 hz 就用全局的 force_render_hz（0 = 不限）。 */
 	if (!has_hz) {
@@ -164,6 +179,20 @@ bool vidow_rule_apply(struct vidow_server *server, struct vidow_view *view) {
 	view->focus_on_open = focus_on_open;
 	view->focus_on_activate = focus_on_activate;
 	view->honor_invalid_serial = honor_invalid_serial;
+
+	/* X11 缩放桥变了：缓冲区按新倍数重新声明一遍（逻辑尺寸跟着变），布局也要
+	 * 重摆 —— 规则是 SIGHUP 重载时整体重放的，所以「改了配置没重启」也能生效。 */
+	if (view->kind == VIDOW_VIEW_X11 &&
+			fabs(view->x11_scale - x11_scale) > 1e-6) {
+		view->x11_scale = x11_scale;
+		wlr_log(WLR_INFO, "rule: %s 的 X11 缩放桥 = %s（%s）",
+			vidow_view_title(view) != NULL ? vidow_view_title(view) : "(无题)",
+			x11_scale > 0.0 ? "规则写的" : "跟随全局",
+			x11_scale > 0.0 ? "客户端没按 GDK_SCALE 画，缓冲区不再除" :
+				"按全局 xwayland_scale 除");
+		vidow_view_x11_scale(view);
+		vidow_arrange(server);
+	}
 
 	bool changed = view->force_render != want;
 	view->force_render = want;

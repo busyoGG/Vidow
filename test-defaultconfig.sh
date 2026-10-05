@@ -90,8 +90,35 @@ fi
 mark "3) --help 和不认识的参数"
 "$VIDOW" --help 2>&1 | grep -q "default-config" && pass "--help 提到了 --default-config" ||
 	fail "--help 没提 --default-config"
+"$VIDOW" --help 2>&1 | grep -q "write-config" && pass "--help 提到了 --write-config" ||
+	fail "--help 没提 --write-config"
 "$VIDOW" --nope >/dev/null 2>&1 && fail "不认识的参数居然返回 0" ||
 	pass "不认识的参数非 0 退出"
+
+mark "3b) --write-config：把默认配置写进配置目录"
+# 全新的 HOME：连 ~/.config 都没有，父目录得自己建出来
+WCHOME="$RUNDIR/wchome"
+mkdir -p "$WCHOME"
+HOME="$WCHOME" "$VIDOW" --write-config > "$RUNDIR/wc.out" 2> "$RUNDIR/wc.err"
+WCPATH=$(cat "$RUNDIR/wc.out")
+[ "$WCPATH" = "$WCHOME/.config/vidow/config.lua" ] &&
+	pass "写到了配置目录：$WCPATH" || fail "路径不对：'$WCPATH'"
+[ -s "$WCPATH" ] && pass "文件有了（$(wc -l < "$WCPATH") 行）" || fail "文件是空的"
+diff -q "$RUNDIR/default.lua" "$WCPATH" >/dev/null 2>&1 &&
+	pass "内容 == --default-config 打出来的那份" || fail "内容和 --default-config 不一致"
+
+# 已经有一份了：不动它（配置目录里那份是用户改过的）
+echo "-- 我自己改的一行" >> "$WCPATH"
+HOME="$WCHOME" "$VIDOW" --write-config >/dev/null 2> "$RUNDIR/wc2.err"
+[ $? -ne 0 ] && pass "第二遍拒绝覆盖（非 0 退出）" || fail "第二遍居然覆盖了"
+grep -q "已经有一份了" "$RUNDIR/wc2.err" &&
+	pass "并且说清楚了原因：$(head -1 "$RUNDIR/wc2.err")" || fail "没给原因"
+grep -q "我自己改的一行" "$WCPATH" && pass "原来那份一个字没动" ||
+	fail "原来那份被改掉了"
+HOME="$WCHOME" "$VIDOW" --write-config --force >/dev/null 2>&1 &&
+	pass "--force 才覆盖" || fail "--force 没能覆盖"
+grep -q "我自己改的一行" "$WCPATH" && fail "--force 之后还是老内容" ||
+	pass "--force 之后是新的一份默认配置"
 
 mark "4) 什么都不配 vs 完整默认配置"
 mkdir -p "$RUNDIR/empty"

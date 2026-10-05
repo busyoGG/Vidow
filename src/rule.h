@@ -61,6 +61,15 @@ struct vidow_rule {
 	/* 无效 serial 的激活请求理不理（默认 false = 不理） */
 	bool has_honor_invalid_serial;
 	bool honor_invalid_serial;
+
+	/* 这个窗口的 X11 缩放桥（0 = 跟随全局 xwayland_scale）。
+	 *
+	 * 全局那套假设「X 客户端按 GDK_SCALE / QT_SCALE_FACTOR 画了 2 倍」，于是把
+	 * 缓冲区除以 2 —— 认这套 env 的客户端（GTK / Qt）刚好和 Wayland 应用一样大，
+	 * 不认的老程序（微信登录窗、CEF 系）就被缩掉一半（面积 1/4）。逐窗口写 1
+	 * 就是「这个客户端没按 2 倍画，别除」。 */
+	bool has_scale;
+	double scale;
 };
 
 /* 一条规则的内容。字段多，用结构体传：全是「有没有写 / 写的什么」成对的开关，
@@ -82,13 +91,16 @@ struct vidow_rule_spec {
 
 	bool has_honor_invalid_serial;
 	bool honor_invalid_serial;
+
+	bool has_scale;
+	double scale;
 };
 
 bool vidow_rule_init(struct vidow_server *server);
 
 /* 加一条规则（Lua 那边解析完表之后调）。至少要写一个作用（force_render / hz /
- * focus_on_open / focus_on_activate / honor_invalid_serial），不然这条规则什么也不做
- * （调用方负责报错）。 */
+ * focus_on_open / focus_on_activate / honor_invalid_serial / x11_scale），不然这条
+ * 规则什么也不做（调用方负责报错）。 */
 struct vidow_rule *vidow_rule_add(struct vidow_server *server,
 		const struct vidow_rule_spec *spec);
 

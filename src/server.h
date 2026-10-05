@@ -611,6 +611,11 @@ struct vidow_view {
 	 * 客户端常常在 map 之前就发这个请求，那时候它自己的窗口还是 1x1、我们也
 	 * 还不知道它是个对话框 —— 记下来，等尺寸真的要用的时候再取。 */
 	int x11_want_w, x11_want_h;
+	/* 这个窗口的 X11 缩放桥（窗口规则 x11_scale 给的，0 = 跟随全局
+	 * xwayland_scale）。缓冲区按它除才是布局里的逻辑尺寸，命中坐标也按它乘回去
+	 * —— 认 GDK_SCALE 的客户端要除、不认的不能除，只有用户知道是哪种，所以逐
+	 * 窗口可写。见 vidow_view_x11_scale_int()。 */
+	double x11_scale;
 	struct wl_listener x11_associate;
 	struct wl_listener x11_dissociate;
 	struct wl_listener x11_set_title;
@@ -1193,6 +1198,10 @@ bool vidow_config_legacy_hint(const char *key, const char **hint);
 /* 把内置默认值打印成一份完整的 Lua 配置（`vidow --default-config`）。环境变量
  * 不参与 —— 打出来的是「什么都没配」时的样子。 */
 void vidow_config_default_lua(FILE *out);
+/* 把上面那份写进配置目录（`vidow --write-config`），父目录不存在就建。已经有
+ * 一份了就不动它（除非 force），原因写进 err。成功返回 0。 */
+int vidow_config_write_default(const char *path, bool force, char *err,
+		size_t err_len);
 
 /* -------------------------------------------------------------- async exec */
 
@@ -1350,6 +1359,10 @@ void vidow_popup_place(struct vidow_view *view);
 /* 客户端声明的「固定尺寸」（xdg 的 min==max，X11 的 WM_NORMAL_HINTS），逻辑单位。
  * 有些客户端映射之前窗口还是 1x1，但已经声明了它想要多大 —— 这里能拿到。 */
 bool vidow_view_fixed_size_hint(const struct vidow_view *view, int *w, int *h);
+/* 这个窗口的 X11 缩放桥（整数倍）：逐窗口规则 x11_scale 优先，没写就用全局
+ * xwayland_scale。X11 的「缓冲区像素 → 逻辑坐标」处处按它除（见 view.c）。 */
+int vidow_view_x11_scale_int(const struct vidow_view *view);
+bool vidow_view_x11_scale_overridden(const struct vidow_view *view);
 void vidow_view_open_anim(struct vidow_view *view);
 /* 可见窗口在源缓冲里的位置/尺寸（客户端 CSD 留白就跑这儿出去，见 struct
  * vidow_fx_geo）：装饰、模糊区域、输入法候选框都拿它定位。 */
@@ -1366,6 +1379,9 @@ void vidow_closing_start(struct vidow_server *server,
 /* ------------------------------------------------------------------ layout */
 
 void vidow_arrange(struct vidow_server *server);
+/* 这个窗口的矩形和它自己那块屏有交集吗（滚出视口的列要按它剔除，见 view.c）。 */
+bool vidow_view_in_output_box(struct vidow_server *server,
+		const struct vidow_view *view);
 /* 视口外强制渲染：这一帧给「不在画面上但要保活」的窗口补帧回调（详见 view.c）。 */
 void vidow_view_render_pump(struct vidow_server *server,
 		struct vidow_output *output, uint32_t msec);

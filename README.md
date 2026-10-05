@@ -302,7 +302,7 @@ vidow.rule{ title = "预览", force_render = true, hz = 15 }     -- 这个窗口
 vidow.rule{ class = "Steam", force_render = false }            -- 后面的覆盖前面的
 vidow.rule{ app_id = "vlc", hz = 0 }                           -- 只调节流：不限速
 
--- 一条规则至少写一个作用（force_render / hz），都不写会在配置那一行报错。
+-- 一条规则至少写一个作用（force_render / hz / x11_scale），都不写会在配置那一行报错。
 
 -- 查回来（状态栏 / 自检用；空字段按 * 显示是调用方的事）
 local function star(v) return (v == nil or v == "") and "*" or v end
@@ -319,6 +319,7 @@ end
 | 覆盖顺序 | 按配置里的先后逐条套用，**后面的覆盖前面的**（同一个窗口命中多条时以最后一条为准） |
 | 生效时机 | 建窗口时判一次；标题 / class 变了再判一次；`SIGHUP` 重载规则后把已经开着的窗口全部重判 |
 | 节流 | `force_render_hz = <每秒几帧>`（默认 60，`0` = 不限速）；规则里写 `hz = <n>` 可以逐窗口覆盖。补帧要主动排下一帧，不限速时会一直出帧（headless 后端上量到过 2500fps），所以默认按刷新率给 |
+| X11 缩放桥 | `x11_scale = <n>`：这个 X11 窗口的缓冲区按 `n` 倍声明（逻辑尺寸 = 缓冲 / `n`）。`x11_scale = 1` = 「这个客户端没按 `GDK_SCALE` 画，别除」—— 微信登录窗那类固定尺寸、不认 env 的程序在 2 倍屏上就不会只剩 1/4 面积。见「X11 的 HiDPI」那节，回归判据 `test-x11scale.sh` |
 | ② 录屏 / 窗口预览 | **自动**：有人为某个窗口建了截图源（xdg-desktop-portal 的窗口录制、预览缩略图走的就是这条路），那个窗口立刻进入强制渲染；截图源没了、或者录屏客户端断开（崩了 / 被关掉）就自动退出，不会一直补帧 |
 
 机制（`src/view.c` 的 `vidow_view_render_pump`）：每帧在场景补帧之后，把「规则要求保活」
@@ -522,6 +523,8 @@ python3 test-float.py        # 三个真实 GTK 窗口，验证浮动模式自�
 ./test-portal.sh raw-gtk             # vidow 不碰 portal 配置，手写一份单独验证协议
 ./test-portal.sh raw-kde             # 同上，换成 KDE
 ./test-dpi.sh                        # 混合 DPI + XWayland（全 headless，15 项断言）
+./test-x11scale.sh                   # X11 逐窗口缩放桥 x11_scale=1（全 headless，16 项断言）
+./test-scrollcull.sh                 # 滚出视口的列不画到隔壁显示器（全 headless，11 项断言）
 ./test-focus.sh                      # 焦点规则 + 激活请求（全 headless，61 项断言）
 ./test-ipc.sh                        # IPC：状态输出 / 命令 / 事件 / 多屏（全 headless，162 项断言）
 ./test-config.sh                     # 配置系统：一个 Lua 文件 + 改了就自动重载（全 headless，15 项断言）
@@ -669,6 +672,22 @@ X11 没有 per-window 的缓冲区缩放，所以：
 **物理尺寸在两块屏上依然一致、依然清晰，但相对 Wayland 程序偏小**。这是 X11 的硬限制：
 要么放大（一样大但糊），要么不放大（清晰但小）。想要后一种取舍就把 `xwayland_scale`
 设成 `off`。
+
+**逐窗口改**：`off` 是全体的取舍，可有些程序（微信登录窗、CEF 系那一类）自己不肯按
+`S` 倍画，混在认这套的 GTK/Qt 程序里，全局怎么设都不对。窗口规则可以只给它们改缩放
+桥 —— `x11_scale = 1` 就是「这个客户端没按 `S` 倍画，缓冲区别除」：
+
+```lua
+vidow.rule{ title = "微信", x11_scale = 1 }     -- 按标题（WM_NAME / 窗口标题）
+vidow.rule{ class = "WeChat", x11_scale = 1 }   -- 按 WM_CLASS
+```
+
+效果：固定尺寸 300×300 的 X11 窗口在 2 倍屏上，默认（除 2）布局里只剩 150×150 ——
+面积是该有的 1/4，看着就是「小得不对劲」；写了 `x11_scale = 1` 之后是 300×300，和同
+尺寸的 Wayland 窗口一样大（内容是放大 2 倍，略糊，这是 X11 的代价）。命中坐标一直跟
+着渲染走（`局部 = (布局 - 原点) × 实际倍数`），两种设置下都是点哪儿就哪儿。
+`vidowmsg rules` 能把 `x11_scale` 查回来；回归判据见 `test-x11scale.sh`（同一个
+300×300 的固定尺寸 X11 窗口跑两遍：150×150 vs 300×300）。
 
 ### X11 的 SSD 和 Wayland 一样
 
@@ -1969,6 +1988,12 @@ test-dpi.sh       1x + 2x 两块 headless 屏，量 X11 / Wayland 客户端的�
                   落屏设备像素（只准缩小不准放大）、X 全局缩放、指针命中坐标
 test-xwayland-popup.sh  弹出物：识别（含属性晚到）、绝对定位、不套 toplevel 样式
                   （装饰缓冲 / 像素级无阴影 / 无动画）、不抢焦点、层级、混合 DPI
+test-x11scale.sh  固定尺寸的 X11 窗口（WM_NORMAL_HINTS min==max）在 2 倍屏上的
+                  逐窗口缩放桥：不带规则 300x300 → 150x150（面积 1/4），
+                  vidow.rule{ x11_scale = 1 } → 300x300；命中坐标两边各自对得上
+test-scrollcull.sh  两块并排的屏 + 三列装不下：滚出视口的列被摘出场景（修之前它的
+                  坐标落进隔壁屏的框里，就画在隔壁显示器上），再滚回来又显示，
+                  浮动 / 拖拽不受这条规则管，藏起来的窗口按规则照旧补帧
 test-clipboard.sh 剪贴板桥：接管、X11->Wayland、Wayland->X11、PRIMARY、INCR（大块）、
                   错误路径与事件、配置热切换（关掉退回 wlroots 那套）、退出与清理
 test-hotplug.sh   真拔一块 headless 输出再以同名插回来：列 / 浮动窗口 / layer surface

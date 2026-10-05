@@ -340,11 +340,20 @@ static int l_rule(lua_State *L) {
 	spec.has_honor_invalid_serial = table_bool(L, 1, "honor_invalid_serial",
 		&spec.honor_invalid_serial);
 
+	/* 这个窗口的 X11 缩放桥（1 = 客户端没按 GDK_SCALE 画，别除）。只对 X11
+	 * 窗口有意义：Wayland 客户端自己声明 buffer_scale。 */
+	lua_getfield(L, 1, "x11_scale");
+	spec.has_scale = !lua_isnil(L, -1);
+	spec.scale = spec.has_scale ? lua_tonumber(L, -1) : 0.0;
+	lua_pop(L, 1);
+
 	if (!spec.has_force_render && !spec.has_hz && !spec.has_focus_on_open &&
-			!spec.has_focus_on_activate && !spec.has_honor_invalid_serial) {
+			!spec.has_focus_on_activate && !spec.has_honor_invalid_serial &&
+			!spec.has_scale) {
 		return luaL_error(L, "vidow.rule 至少写一个作用：force_render = true / "
 			"hz = <每秒补几帧，0 = 不限> / focus_on_open = false / "
-			"focus_on_activate = false / honor_invalid_serial = true"
+			"focus_on_activate = false / honor_invalid_serial = true / "
+			"x11_scale = <X11 缩放桥，1 = 不除>"
 			"（匹配字段：app_id / title / class）");
 	}
 
@@ -405,6 +414,12 @@ static int l_rules(lua_State *L) {
 			"focus_on_activate");
 		push_rule_bool(L, rule->has_honor_invalid_serial,
 			rule->honor_invalid_serial, "honor_invalid_serial");
+		if (rule->has_scale) {
+			lua_pushnumber(L, rule->scale);
+		} else {
+			lua_pushnil(L);
+		}
+		lua_setfield(L, -2, "x11_scale");
 		lua_settable(L, -3);
 	}
 	return 1;
