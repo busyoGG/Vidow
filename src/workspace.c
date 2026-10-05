@@ -274,6 +274,22 @@ static void column_set_output(struct vidow_column *col,
 	}
 }
 
+/* 这块屏还在不在（还在 server->outputs 里 = 还插着）。
+ *
+ * 热插拔的先后顺序是「先从 server->outputs 摘掉，再把东西挪走」（见 output.c 的
+ * output_destroy），所以拔线过程中 ws->output 有可能指着一块已经摘掉、马上要
+ * 释放的屏。这种时候只能比指针，不能碰它。 */
+static bool output_present(struct vidow_server *server,
+		struct wlr_output *output) {
+	struct vidow_output *o;
+	wl_list_for_each(o, &server->outputs, link) {
+		if (o->wlr_output == output) {
+			return true;
+		}
+	}
+	return false;
+}
+
 /* 工作区换屏：整块工作区（列 + 浮窗）跟着挪过去。
  *
  * deliberate = 这是「人做的决定」（切换工作区、在某块屏上开了新窗口），于是 home 也
@@ -296,8 +312,14 @@ static void ws_set_output_full(struct vidow_server *server,
 		int n = vidow_workspace_count(server, output);
 		ws_splice(ws, output, n > 0 ? n - 1 : 0);
 		if (old != NULL) {
-			/* 老屏上要是没工作区了，给它补一块空的（不然那块屏没东西可显示） */
-			vidow_workspace_ensure_bottom(server, old);
+			/* 老屏上要是没工作区了，给它补一块空的（不然那块屏没东西可显示）。
+			 * 但老屏**已经没了**的时候（拔线：这块屏正在被释放）绝不能补 ——
+			 * 补出来的那块工作区 output 指着马上要释放的 wlr_output，屏插回来
+			 * 按 home 认领它的时候就是读野指针（coredump 3062966：workspace_new
+			 * 里 output->name 已经是 0x60）。 */
+			if (output_present(server, old)) {
+				vidow_workspace_ensure_bottom(server, old);
+			}
 		}
 	}
 	if (deliberate && !ws->special && output != NULL) {

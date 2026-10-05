@@ -2595,6 +2595,17 @@ protocols/     wlr-layer-shell / wlr-virtual-pointer / input-method-v2 /
      改；`test-ipc.sh`/`test-focus.sh` 同步。回归：defaultconfig / gap / config / workspace /
      ipc / focus / overview / hotplug / clipboard / layerwin / xwayland-popup 全过。
 
+124. **拔线后插回来必崩：给「已经不在了的那块屏」补空工作区**。`ws_set_output_full()` 换屏时
+     会给老屏补一块空的（不然那块屏没东西可显示），但拔线那一路老屏**已经没了** ——
+     `output_destroy()` 是先 `wl_list_remove(&output->link)` 再调 `vidow_view_output_gone()`，
+     于是这一步在正在被释放的 wlr_output 上建了一块工作区（`ws->output` 指着马上要 free 的
+     结构，`home` 还记着那块屏的名字）。屏插回来时 `vidow_workspace_output_added()` 按 home
+     认领它，`old = ws->output` 已经是野指针，`vidow_workspace_ensure_bottom(old)` 里
+     `workspace_new()` 读 `output->name` 就是 `0x60` → SIGSEGV（coredump 3062966，和 19:39
+     那次同一个签名）。修法：补空工作区之前先确认那块屏还在（`output_present()` 扫
+     `server->outputs`，只比指针不解引用）。`./test-hotplug.sh` 之前是「偶尔挂」，其实是这条
+     野指针在拼运气（释放过的块里那个字由分配器决定），现在连跑 3 遍 24 项全过。
+
 123. **layer surface 被销毁时的段错误（noctalia 重建面板必崩）**。垫在 layer 背后的那份
      模糊（`ls->fx.node`）是挂在 wlroots 自己的场景树 `ls->scene->tree` 里的，而
      `wlr_scene_layer_surface_v1_create()` **内部也**往 `layer_surface->events.destroy` 上挂了
