@@ -143,7 +143,9 @@ struct vidow_config {
 	bool blur_all;        /* also blur behind tiled windows */
 	int blur_levels;      /* 2..4 downsample steps */
 	double blur_strength; /* 0 = sharp, 1 = fully blurred */
-	double blur_alpha_min; /* cull: only blur backdrop pixels at least this opaque */
+	/* 透明度剔除（见 fx.c 的 decor_fragment_src）：元素**自己**的 alpha 低于这个
+	 * 就不糊。管的是模糊的**范围**（哪儿该糊），不碰糊出来的像素 —— 底衬不做剔除。 */
+	double blur_alpha_min;
 	double blur_offset;    /* kawase tap scale */
 
 	bool shader_enabled;
@@ -229,7 +231,7 @@ struct vidow_shader {
 /* A tiny GLSL program plus its uniform locations. */
 struct vidow_gl_prog {
 	unsigned int program;
-	int u_tex, u_texel, u_offset, u_alpha_min;
+	int u_tex, u_texel, u_offset;
 };
 
 /* The built-in decoration program: rounded corners, border, drop shadow,
@@ -261,7 +263,6 @@ struct vidow_blur_set {
 	int w, h, levels;
 	uint64_t gen;  /* scene generation this pyramid was built for */
 	double offset; /* kawase 采样步长，建这张金字塔时用的 */
-	double alpha_min;
 	bool valid;
 };
 
@@ -322,6 +323,7 @@ struct vidow_fx_target {
 	uint64_t blur_tex_id;             /* identity of blur_tex, 0 = none */
 	uint64_t blur_ver;                /* bumped whenever blur_tex changes */
 	uint64_t blur_drawn;              /* version baked into the current buffer */
+	float mask_min_used;              /* 当前缓冲是按哪个剔除阈值画的 */
 	struct wlr_texture *blur_own_tex; /* texture of the private pyramid */
 	uint64_t blur_own_id;             /* identity of blur_own_tex */
 	struct vidow_blur_set blur_set; /* private pyramid, allocated on demand */
@@ -409,10 +411,10 @@ struct vidow_output {
 	uint64_t blur_id;   /* identity of blur_tex, 0 = none */
 	uint64_t blur_gen;  /* gen_layer the pyramid was captured at */
 	int blur_levels;
-	/* 建这张金字塔时用的是哪套参数：改 blur_offset / blur_alpha_min 也得重算
-	 * （它们是在 kawase 的着色器里作为 uniform 用的，缓存的贴图不会跟着变）。 */
+	/* 建这张金字塔时用的采样步长：改 blur_offset 也得重算（它是 kawase 着色器的
+	 * uniform，缓存的贴图不会跟着变）。blur_alpha_min 现在只进装饰着色器、不进
+	 * 金字塔，改它由 vidow_fx 那边直接让帧循环重画（见 blur_mask_min_changed）。 */
 	double blur_offset;
-	double blur_alpha_min;
 
 	/* 视口外补帧的到点闹钟：节流到 30Hz / 15Hz 的时候，光靠客户端提交来推进
 	 * 是不行的（提交一次之后就没人再推了，链子断在半路）—— 到点了由它叫醒一次。 */
@@ -946,8 +948,7 @@ struct vidow_server {
 
 	struct vidow_config config;
 	struct vidow_decor_prog decor;
-	/* kawase_final = 最后一趟上升 + 透明度剔除（见 fx.c 的着色器注释）。 */
-	struct vidow_gl_prog kawase_down, kawase_up, kawase_final;
+	struct vidow_gl_prog kawase_down, kawase_up;
 	struct wlr_texture *empty_tex; /* 1x1 transparent, for disabled samplers */
 	uint64_t blur_serial;          /* hands out blur texture identities */
 

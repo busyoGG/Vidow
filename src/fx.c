@@ -222,13 +222,15 @@ static const char *kawase_prefix =
 	"uniform sampler2D u_tex;\n"
 	"uniform vec2 u_texel;\n" /* 1 / source size */
 	"uniform float u_offset;\n" /* 半径，单位：源 texel */
-	"uniform float u_alpha_min;\n" /* 只有最后一趟（kawase_final）会用 */
 	"varying vec2 v_uv;\n"
 	"\n"
-	/* 抽样就是抽样：**不在里面做透明度剔除**。剔除放进每一趟的抽样里会逐趟相乘，
-	 * 越糊越透明（实测 alpha 0.45 的均匀底衬过完整条链只剩 0.0246，颜色也一起没
-	 * 了）—— 级数越多掉得越狠，看起来就像「半径没变大，只是变淡了」。剔除挪到
-	 * 最后一趟做一次（kawase_final），底衬本身是预乘的，直接糊就行。 */
+	/* 抽样就是抽样：链上不做任何透明度剔除。底衬本身就是预乘的，直接糊就行 ——
+	 * 它透明的地方 alpha 跟着一起淡出，合成的时候自然透出真实背景。
+	 *
+	 * 曾经在最后一趟（kawase_final）按底衬的 alpha 做过一次剔除，**撤了**（见
+	 * README 的 115）：透明度剔除是用来**约束模糊的范围**的（哪儿该糊），不是用来
+	 * 改糊出来的像素；底衬该不该糊已经由「谁在它上面、它自己透不透」决定了。现在
+	 * 剔除只有一处 —— 装饰着色器里按**元素自己**的 alpha 剔（decor_fragment_src）。 */
 	"vec4 tap(vec2 uv, float weight) {\n"
 	"	return texture2D(u_tex, uv) * weight;\n"
 	"}\n"
@@ -268,21 +270,6 @@ static const char *kawase_down_src =
 static const char *kawase_up_src =
 	"void main() {\n" KAWASE_UP_TAPS
 	"	gl_FragColor = sum / 12.0;\n"
-	"}\n";
-
-/* 最后一趟（写 up[0]，也就是装饰着色器采样的那张）多干一件事：把底衬本来就透明
- * 的地方剔掉 —— 「低于这个不透明度的底衬像素不糊」。u_alpha_min = 0 时连完全透明
- * 的像素也放过（那儿的颜色本来就是 0，无所谓）。
- *
- * 这里是**硬阈值**（`step`，跟 niri 的 blur_finish 一样）。之前用过一段软过渡
- * `smoothstep(min * 0.5, min, a)`，本意是别在等值线上留边，代价是**有效阈值掉到了
- * min / 2**：设 0.5 的时候 alpha 0.45 的底衬还剩 90% 的模糊（实测 0.4510 →
- * 0.4039），看着就是「这个键没用」。要软过渡可以再把带宽收窄，但语义得先对：
- * 低于阈值就是不糊。 */
-static const char *kawase_final_src =
-	"void main() {\n" KAWASE_UP_TAPS
-	"	gl_FragColor = sum / 12.0;\n"
-	"	gl_FragColor *= step(u_alpha_min, gl_FragColor.a);\n"
 	"}\n";
 
 /* --------------------------------------------------------- program build */
@@ -358,12 +345,11 @@ static void load_kawase_programs(struct vidow_server *server) {
 		struct vidow_gl_prog *prog;
 		const char *body;
 		const char *name;
-	} pass[3] = {
+	} pass[2] = {
 		{ &server->kawase_down, kawase_down_src, "kawase-down" },
 		{ &server->kawase_up, kawase_up_src, "kawase-up" },
-		{ &server->kawase_final, kawase_final_src, "kawase-final" },
 	};
-	for (size_t i = 0; i < 3; i++) {
+	for (size_t i = 0; i < 2; i++) {
 		snprintf(buf, sizeof(buf), "%s%s", kawase_prefix, pass[i].body);
 		unsigned int prog = 0;
 		if (!link_program(&prog, buf, pass[i].name)) {
@@ -373,7 +359,6 @@ static void load_kawase_programs(struct vidow_server *server) {
 		pass[i].prog->u_tex = glGetUniformLocation(prog, "u_tex");
 		pass[i].prog->u_texel = glGetUniformLocation(prog, "u_texel");
 		pass[i].prog->u_offset = glGetUniformLocation(prog, "u_offset");
-		pass[i].prog->u_alpha_min = glGetUniformLocation(prog, "u_alpha_min");
 	}
 }
 
@@ -828,7 +813,6 @@ static void blur_set_drop(struct vidow_blur_set *set) {
 	set->levels = 0;
 	set->gen = 0;
 	set->offset = 0.0;
-	set->alpha_min = 0.0;
 	set->valid = false;
 }
 
@@ -856,7 +840,6 @@ static bool blur_set_alloc(struct vidow_server *server,
 	set->h = h;
 	set->levels = levels;
 	set->offset = server->config.blur_offset;
-	set->alpha_min = server->config.blur_alpha_min;
 	return true;
 }
 
@@ -878,7 +861,6 @@ static void kawase_pass(struct vidow_server *server,
 	glUniform1i(prog->u_tex, 0);
 	glUniform2f(prog->u_texel, 1.0f / (float)src_w, 1.0f / (float)src_h);
 	glUniform1f(prog->u_offset, (float)server->config.blur_offset);
-	glUniform1f(prog->u_alpha_min, (float)server->config.blur_alpha_min);
 	draw_quad(prog->program);
 	glUseProgram(0);
 	end_pass(egl);
@@ -904,13 +886,12 @@ static void blur_chain(struct vidow_server *server, struct vidow_blur_set *set,
 	}
 
 	/* 往上走：每一级只把上一级的结果放大一圈（niri 的 blur_up）。目标必须比源大一
-	 * 倍，u_texel 传的是**源**的尺寸 —— 放大倍数全靠它算。最后一趟（写 up[0]）换成
-	 * kawase_final：多一道透明度剔除，且只在这儿做一次。 */
+	 * 倍，u_texel 传的是**源**的尺寸 —— 放大倍数全靠它算。每一级都是同一趟着色器，
+	 * 写 up[0]（半分辨率、给装饰着色器采样的那张）也不例外。 */
 	struct wlr_texture *lower =
 		wlr_texture_from_buffer(server->renderer, set->down[levels - 1]);
 	for (int i = levels - 2; i >= 0 && lower != NULL; i--) {
-		kawase_pass(server,
-			i == 0 ? &server->kawase_final : &server->kawase_up,
+		kawase_pass(server, &server->kawase_up,
 			set->up[i], w >> (i + 1), h >> (i + 1), lower,
 			w >> (i + 2), h >> (i + 2));
 		wlr_texture_destroy(lower);
@@ -1106,6 +1087,16 @@ static void blur_assign(struct vidow_fx_target *fx, struct wlr_texture *tex,
 	fx->blur_ver++;
 }
 
+/* 剔除阈值（blur_alpha_min）只进装饰着色器，不进模糊金字塔：它变了得让帧循环知道
+ * 「已经烘进那张缓冲里的那一版」过期了，否则运行时改配置（重载 / set-config）看着
+ * 就是「没反应」（这条坑的底衬版本在 README 的 ⓪ 里）。 */
+static void blur_mask_min_changed(struct vidow_fx_target *fx, double alpha_min) {
+	if (fabs((double)fx->mask_min_used - alpha_min) > 1e-6) {
+		fx->mask_min_used = (float)alpha_min;
+		fx->blur_ver++;
+	}
+}
+
 /* Release an owned texture before its pyramid buffer is reused. */
 static void blur_own_drop(struct vidow_fx_target *fx) {
 	blur_assign(fx, NULL, false, 0);
@@ -1221,7 +1212,6 @@ static bool shared_blur_rebuild(struct vidow_server *server,
 	output->blur_gen = server->gen_layer;
 	output->blur_levels = levels;
 	output->blur_offset = server->config.blur_offset;
-	output->blur_alpha_min = server->config.blur_alpha_min;
 	wlr_log(WLR_DEBUG, "blur: shared rebuild %dx%d levels=%d offset=%.2f", w, h,
 		levels, output->blur_offset);
 	return true;
@@ -1320,14 +1310,14 @@ void vidow_blur_update(struct vidow_output *output) {
 		output->backdrop_h = h;
 	}
 
-	/* 缓存键必须把所有影响结果的参数都算上：级数、采样步长、剔除阈值。
-	 * 漏了 blur_offset / blur_alpha_min 的时候，运行时改这两个键看着「没反应」
-	 * —— 贴图是旧参数算的，谁也没让它重算。 */
+	/* 缓存键必须把所有影响这张贴图的参数都算上：级数、采样步长。
+	 * 漏了 blur_offset 的时候，运行时改它看着「没反应」—— 贴图是旧参数算的，谁也
+	 * 没让它重算。（blur_alpha_min 原来也在这儿，现在它只进装饰着色器、不进金字塔，
+	 * 改它由 blur_mask_min_changed() 直接让帧循环重画。） */
 	bool shared_ok = output->blur_tex != NULL &&
 		output->blur_gen == server->gen_layer &&
 		output->blur_levels == levels &&
 		fabs(output->blur_offset - server->config.blur_offset) < 1e-6 &&
-		fabs(output->blur_alpha_min - server->config.blur_alpha_min) < 1e-6 &&
 		output->blur_set.w == w && output->blur_set.h == h;
 	if (!shared_ok) {
 		shared_ok = shared_blur_rebuild(server, output, w, h, levels);
@@ -1342,6 +1332,8 @@ void vidow_blur_update(struct vidow_output *output) {
 			blur_assign(&view->fx, NULL, false, 0);
 			continue;
 		}
+
+		blur_mask_min_changed(&view->fx, server->config.blur_alpha_min);
 
 		if (!view_overlaps_other(view)) {
 			/* Tiled and non-overlapping floating windows all share the
@@ -1902,6 +1894,7 @@ static bool layer_blur_frame(struct vidow_server *server,
 	if (ls->scene == NULL) {
 		return false;
 	}
+	blur_mask_min_changed(fx, server->config.blur_alpha_min);
 	/* bottom 层先于窗口画，它底下没有窗口：共享的那张底衬就是它要的全部。top /
 	 * overlay 层底下有窗口，得自己抓一小块（见 layer_region_build）。 */
 	bool with_windows = ls->layer != ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM;
@@ -1968,8 +1961,7 @@ static bool layer_blur_frame(struct vidow_server *server,
 			ls->bd_gen_layer == server->gen_layer &&
 			fx->blur_set.w == px_w && fx->blur_set.h == px_h &&
 			fx->blur_set.levels == levels &&
-			fabs(fx->blur_set.offset - server->config.blur_offset) < 1e-6 &&
-			fabs(fx->blur_set.alpha_min - server->config.blur_alpha_min) < 1e-6;
+			fabs(fx->blur_set.offset - server->config.blur_offset) < 1e-6;
 		if (!fresh && !layer_region_build(server, output, ls, rx, ry, px_w,
 				px_h, levels)) {
 			return false; /* 抓不出来就留着上一帧那张，别闪 */

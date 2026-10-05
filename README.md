@@ -476,7 +476,6 @@ python3 test-float.py        # 三个真实 GTK 窗口，验证浮动模式自�
 ./test-layerblur.sh                  # 半透明状态栏背后的模糊（全 headless，4 项断言）
 ./test-blurscale.sh                  # 模糊在高 DPI 倍率下的底衬覆盖 + 对位（1/1.7/2 倍，7 项断言）
 ./test-blurlevel.sh                  # 半径随级数扩展（2/4/6 级各跑一轮，3 项断言）
-./test-blurcull.sh                   # 透明度剔除：低于阈值的底衬一点不糊（5 项断言）
 ./test-layerghost.sh                 # 会被模糊的 layer surface 不进自己的底衬（3 项断言）
 ./test-layerwin.sh                   # top 层模糊里含窗口（纯蓝窗口 + 压在它上面的面板，4 项断言）
 ./test-layermask.sh                  # 按元素自己的 alpha 剔除（透明内边距里的亮点不糊，3 项断言）
@@ -1106,8 +1105,8 @@ vidowmsg clipboard-clear
    抽样半径是 `blur_offset` 个**源** texel —— 源每降一级尺寸减半，所以同一个 offset
    换算回原始像素**每级翻倍**：半径就是这么跟着降采样扩展的
 3. 升采样链：每级 12 抽样（轴线 ±2 半步各 1 份、斜角 ±1 半步各 2 份，除以 12），
-   半步 = **源 texel 的一半**（跟 niri 的 blur_up 一致）。最后写 `up[0]` 的那一趟换成
-   `kawase_final`，多一道透明度剔除（见下）
+   半步 = **源 texel 的一半**（跟 niri 的 blur_up 一致）。写 `up[0]` 的那一趟也是同一个
+   着色器，链上不做任何透明度剔除（见下）
 4. 装饰着色器按输出坐标采样最终结果，只画在窗口圆角矩形**内部**，其余地方让真实场景透出来
 
 这一版的降采样 / 升采样抽样形状与步长照搬 niri 的 `blur_down` / `blur_up`（它那边是
@@ -1136,46 +1135,26 @@ vidowmsg clipboard-clear
 私有 backdrop 捕获时会把该窗口藏起来，所以它自己的位置不影响结果 —— 缓存键里**不含**该窗口的
 几何，拖动浮动窗口不会反复重算它自己那一份。
 
-**透明度剔除只在最后一趟做一次**：底衬本身是预乘的，链上直接糊（空的地方 alpha 跟着
-一起淡出，合成的时候自然透出真实背景）。剔除是 `kawase_final`（写 `up[0]` 的那一趟）
-末尾乘的一次遮罩 —— 而且是个**硬阈值** `step(u_alpha_min, a)`：低于这个不透明度的
-底衬像素**完全不糊**（跟 niri 的 `blur_finish` / `step(ignore_alpha, a)` 一样）。放在
-每一趟的每个抽样里会**逐趟相乘**：均匀 alpha 0.45 的底衬、`blur_alpha_min = 0.5`，过完
-整条链只剩 0.0000，颜色也一起没了，级数越多掉得越狠（看起来就像「半径没变大、只是变淡
-了」）。`blur_alpha_min = 0` 的含义是「不剔」（完全透明的像素本来就是 0，无所谓）。
+**透明度剔除只干一件事：约束模糊的范围（哪儿该糊）**。它按**元素自己**的 alpha 剔，底衬
+完全不剔。
 
-中间有过一版软过渡 `smoothstep(α_min/2, α_min, a)`，本意是别在等值线上留边，代价是
-**有效阈值掉到了 α_min/2**：设 0.5 时 alpha 0.45 的底衬还剩 90% 的模糊（实测 0.4510 →
-0.4039），看着就是「这个键没用」。实测（`./test-blurcull.sh`，一整屏均匀半透明的背景层
-`tools/soft.py`）：
+元素自己透明的地方不糊 —— 这是治「一圈透明模糊」的：模糊是垫在元素节点下面的一整块
+矩形，没有这一层的话，面板留的透明内边距、圆角外面、弹窗 / 窗口自带的那圈半透明阴影边
+也会透出糊来（实测：面板留 40px 全透明内边距时，背后亮点的峰值 **1.000 → 0.322**）。
 
-| 底衬 alpha | `blur_alpha_min` | 糊完的 alpha / rgb |
-| --- | --- | --- |
-| 0.45 | 0（不剔） | 0.4510 / 0.271 |
-| 0.45 | 0.5 | **0.0000 / 0.0000**（低于阈值 ⇒ 一点不糊；软过渡那版 0.4039） |
-| 0.9 | 0.5 | 0.9020 / 0.5412（高于阈值 ⇒ 一点不衰减） |
+实现在装饰着色器里（`decor_fragment_src`），跟 niri 的 `blur_finish` 一样是**硬阈值**
+`step(u_mask_min, texture2D(u_mask, uv).a)`：
 
-注意这个阈值同时管**两件事**：
-
-1. **底衬**的 alpha（字段注释在 `src/server.h`）：背景层、或者底下那个窗口本身半透明到
-   阈值以下时，那块地方就不糊。
-2. **元素自己**的 alpha（niri 的 `ignore-alpha` 本意，跟 niri 的 `blur_finish` 一样是
-   `step(u_mask_min, texture2D(u_mask, uv).a)`）：模糊只画在元素真的有内容的地方。没有
-   这一层的话，模糊是垫在元素下面的一整块矩形，元素自己透明的内边距 / 圆角外面 / 自带
-   半透明阴影边那圈会透出一圈糊 —— 实测（`tools/padpanel.py` 留 40px 全透明内边距 +
-   `tools/dot.py` 的亮点）峰值 **1.000 → 0.322**。
-
-元素 alpha 从哪来：窗口 / 弹窗那条路，装饰着色器手里的内容贴图就是元素自己
-（`u_texture`），直接取它的 alpha；layer surface 的模糊底衬那条路不画内容（`u_texture`
-是空贴图），调用方把 layer surface 自己的缓冲当 mask 递进来（`u_mask`；层表面的 geom
-就等于 surface 尺寸，所以 uv 跟内容那趟完全一致）。两条路用的都是**内容自己的 alpha，
-不含 `window_opacity`** —— 剔除管的是「形状」，半透明窗口该透出来的模糊不能因为
-`window_opacity` 调低就整个没了。
-
-客户端自己用 ext-background-effect 要了模糊区域时**不剔**（那块区域就是它画出来的边界，
-niri 的 `need_ignore_alpha = !blur_region.is_some_and(|r| !r.is_empty())` 同一个判断）；
-拿不到元素内容（surface 还没 commit 过）时也不剔（`mask_min = 0` ⇒ `step(0, a) ≡ 1`），
-退回老行为而不是把模糊整块剔没。
+- 窗口 / 弹窗那条路：内容贴图就是元素自己（`u_texture`），直接取它的 alpha
+- layer surface 的模糊底衬那条路：那条路不画内容（`u_texture` 是空贴图），调用方把
+  layer surface 自己的缓冲当 mask 递进来（`u_mask`；层表面的 geom 就等于 surface 尺寸，
+  所以 uv 跟内容那趟完全一致）
+- 两条路用的都是**内容自己的 alpha、不含 `window_opacity`** —— 剔除管的是「形状」，
+  半透明窗口该透出来的模糊不能因为 `window_opacity` 调低就整个没了
+- 客户端用 ext-background-effect 要了模糊区域时**不剔**（那块区域就是它画出来的边界，
+  niri 的 `need_ignore_alpha = !blur_region.is_some_and(|r| !r.is_empty())` 同一个判断）；
+  拿不到 mask（surface 还没 commit 过）时也不剔（`mask_min = 0` ⇒ `step(0, a) ≡ 1`），
+  退回老行为而不是把模糊整块剔没
 
 端上实测（`./test-layermask.sh`：一块留 40px 透明内边距的 top 层面板 + 两个亮点，一个
 落在内边距里、一个落在面板 50% 那块底下）：
@@ -1188,6 +1167,14 @@ niri 的 `need_ignore_alpha = !blur_region.is_some_and(|r| !r.is_empty())` 同�
 局限：mask 取的是 surface 的**主**缓冲，不含子表面 —— 一个用子表面画内容的层，那部分
 会被剔掉（要精确得像 niri 那样把整棵子树离屏渲一张 alpha 纹理）。输入法候选框
 （`layer_im`）vidow 现在根本没有模糊，所以那边没有可剔的东西。
+
+**底衬不做剔除**（曾经有，撤了）：原来在最后一趟上升里按底衬的 alpha 做过一次
+`step` 遮罩（那个程序叫 `kawase_final`），现在整个撤掉 —— 剔除是用来约束**范围**的，
+不是用来改糊出来的像素；底衬本身就是预乘的，它透明的地方 alpha 跟着一起淡出，合成的
+时候自然透出真实背景。`kawase_final` 这个程序随之消失，最后一趟就是同一个 `kawase_up`。
+
+`blur_alpha_min` 只进装饰着色器、不进模糊金字塔：改它由 `blur_mask_min_changed()`
+（`src/fx.c`）把 `blur_ver` 顶一下，帧循环自然重画 —— 不然运行时改配置会看着「没反应」。
 
 配置：`blur_enabled` / `blur_all` / `blur_levels`(2..6) / `blur_strength` / `blur_offset` /
 `blur_alpha_min`。默认 `blur_all = true`，平铺窗口也模糊。
@@ -1312,15 +1299,18 @@ layer 背后的模糊采样位置对不上、整块错位；以及「`blur_level
 layer 背后的亮斑 σ 16.0 → 23.5、对位偏差 ≤ 0.6 像素（`./test-blurscale.sh` 在
 1 / 1.7 / 2 三档倍率上都有断言，用老二进制跑会挂 6 条）。
 
+**④⑤⑨ 这一簇都是「按底衬 alpha 剔」的坑 —— 那个特性整个撤了**（见 115：剔除只该约束
+范围，不该改糊出来的像素），留着当记录。
+
 **④ 透明度剔除是一刀切**：`step()` 在阈值等值线上留一道硬边，低于阈值的整块背景直接
-消失（`tools/ramp.py` 的 alpha 斜坡实测逐像素跳变 0.102）—— 这条后来被 ⑤ 换成软阈值。
+消失（用一个 alpha 斜坡背景层实测逐像素跳变 0.102）—— 这条后来被 ⑤ 换成软阈值。
 但软阈值这条路后来又被撤了：它的**有效阈值掉到了 α_min/2**，见 ⑨。
 
 **⑤ 透明度剔除撒在每一趟抽样里（越糊越透明）**：剔除原来写在 `tap()` 里 —— 每一趟的
 每个抽样都乘一次，逐趟相乘等于按趟数取幂。实测（均匀 alpha 0.45 的底衬、
 `blur_alpha_min = 0.5`）过完整条链 alpha 只剩 **0.0000**、颜色也一起没了；级数越多掉得
 越狠，看起来就是「级数调大了半径也没变大，只是更淡了」。改成只在 `kawase_final` 做一次
-遮罩。新增 `./test-blurcull.sh`（拿老二进制跑，这条判据挂）。
+遮罩。当时新增的 `./test-blurcull.sh`（拿老二进制跑，这条判据挂）已随底衬剔除一起删了。
 
 **⑥ 会被模糊的 layer surface 自己进了自己的底衬**：底衬抓的是 `background` / `bottom` /
 窗口三棵树，而 `bottom` 层的面板自己也要模糊 —— 那份底衬里就含它自己，于是模糊里浮出
@@ -1341,7 +1331,7 @@ layer 背后的亮斑 σ 16.0 → 23.5、对位偏差 ≤ 0.6 像素（`./test-b
 （实测 0.4510 → **0.4039**）。要它真的「低于阈值就不糊」就得是硬阈值 —— 现在跟 niri 的
 `blur_finish` 一样是 `step(u_alpha_min, a)`：0.45 的底衬 + 阈值 0.5 → **0.0000**（颜色
 一起归零，不留半透明黑），0.9 的底衬 + 阈值 0.5 → 0.9020 一点不衰减。
-`./test-blurcull.sh` 现在三条判据量这三件事（拿软过渡那版二进制跑挂 2 条）。
+（当时的三条判据量这三件事，拿软过渡那版二进制跑挂 2 条；那个测试已随底衬剔除一起删了。）
 
 **⑩ 模糊会漏进 layer surface 自己透明的部分**：模糊是垫在 layer surface 节点下面的**一整
 块矩形**，所以面板留透明内边距 / 圆角外面那圈也会透出模糊 —— 本该原样显示背景。实测
@@ -1831,7 +1821,6 @@ tools/glass.py    半透明定尺寸窗口（验证窗口透明度与背景模�
 tools/wall.py     layer-shell 背景（渐变 + 硬边方块），给模糊测试提供可模糊的内容
 tools/bluewin.py  一个纯蓝的普通窗口：跟 tools/panel.py 一起验证「top 层模糊里含不
                   含窗口」（壁纸是灰的，蓝得扎眼，量 B-R 就行）
-tools/soft.py     背景层一整屏均匀半透明灰：量透明度剔除会不会在链里逐趟相乘
 tools/bpanel.py   一块 bottom 层 50% 红面板：盯「被模糊的 layer 自己进了底衬」
 tools/padpanel.py top 层「面板」，向外留 40px 全透明内边距：盯模糊会不会漏进元素自己
                   透明的部分（`test-layermask.sh`：修前 1.000 → 0.322，修后原样 1.000）
@@ -1896,7 +1885,9 @@ protocols/     wlr-layer-shell / wlr-virtual-pointer / input-method-v2 /
     - 透明角落 alpha 0
 16. kawase 模糊：直接读回模糊缓冲，边缘最大梯度从锐利的 `182` 降到 `28`（4 级 + offset 1.5）
 17. 透明度剔除：背景窗口不透明度 0.3 时，`blur_alpha_min=0.15`（不剔除）与 `0.50`
-    （剔除）两版装饰缓冲有 **60.4% 的像素不同** —— 阈值确实在起作用
+    （剔除）两版装饰缓冲有 **60.4% 的像素不同** —— 阈值确实在起作用（这是当时按**底衬**
+    alpha 剔的那版量的；那层剔除 115 撤了，现在阈值只按元素自己的 alpha 剔，见
+    `./test-layermask.sh`）
 18. 性能：headless 下 3 个 kitty + 1 个半透明模糊浮动窗，2000ms 动画跑出 125 帧（≈60fps），
     合成器 CPU 2.5%
 19. 模糊缓存：静置 4s，装饰缓冲重绘次数**增量为 0**，共享 backdrop 重建次数也不变；
@@ -2371,7 +2362,7 @@ protocols/     wlr-layer-shell / wlr-virtual-pointer / input-method-v2 /
      透明的面板，不是贴着 (0,0) 的，专治对位问题）
 
 109. 模糊的透明度剔除从硬阈值改成软阈值 + 整核归一化：`step(u_alpha_min, a)` 在阈值
-     等值线上是一刀切（`tools/ramp.py` 的 alpha 斜坡实测逐像素跳变 0.102，斜坡左半
+     等值线上是一刀切（用一个 alpha 斜坡背景层实测逐像素跳变 0.102，斜坡左半
      整块被吃掉）。先试了「按被采纳的那几份归一化」，反而在「刚好有一个抽样被采纳」
      的位置把那一份放大到满值、又造一道硬边（跳变 0.161）；最终是
      `smoothstep(α_min/2, α_min, α)` + 仍然除以整个核：0.027，斜坡在阈值以上与
@@ -2381,8 +2372,8 @@ protocols/     wlr-layer-shell / wlr-virtual-pointer / input-method-v2 /
      12 抽样、去掉 dual filter 的 `add`（它每级掺回一点锐度，σ 每级只涨 1.5 倍而不是
      niri 的 2 倍），`MAX_BLUR_LEVELS` 4 → 6；剔除从「每趟每个抽样」挪到 `kawase_final`
      的最后一次遮罩（每趟相乘的话，均匀 alpha 0.45 过完链只剩 0.0000）。实测硬边最大
-     梯度 2/4/6 级 = 0.127 / 0.027 / 0.0039。新增 `./test-blurlevel.sh`、`./test-blurcull.sh`、
-     `tools/soft.py`
+     梯度 2/4/6 级 = 0.127 / 0.027 / 0.0039。新增 `./test-blurlevel.sh`（`./test-blurcull.sh`
+     与 `tools/soft.py` 当时也是为这条路加的，后来随底衬剔除一起删了，见 115）
 111. 会被模糊的 layer surface 自己从底衬里藏掉（bottom 层面板原来在底衬 dump 里占 100%
      红像素，模糊里浮出它自己的影子）。新增 `./test-layerghost.sh`、`tools/bpanel.py`
      （`MAX_BLUR_LEVELS` 也顺手从 fx.c 挪到 server.h —— 改级数上限时忘了改
@@ -2399,7 +2390,8 @@ protocols/     wlr-layer-shell / wlr-virtual-pointer / input-method-v2 /
      软那版 `smoothstep(α_min/2, α_min, a)` 的**有效阈值在 α_min/2**，设 0.5 时 alpha
      0.45 的底衬还剩 90% 的模糊（0.4510 → 0.4039），看着就是「这个键没用」。现在
      0.45 底衬 + 阈值 0.5 → 0.0000（颜色一起归零），0.9 底衬 + 阈值 0.5 → 0.9020
-     一点不衰减。`./test-blurcull.sh` 重写成 3 个相位 5 条判据（拿软过渡那版跑挂 2 条）。
+     一点不衰减。`./test-blurcull.sh` 重写成 3 个相位 5 条判据（拿软过渡那版跑挂 2 条；
+     这个测试连同它量的那层底衬剔除在 115 里一起删了）。
      另查明「按元素自己的 alpha 掐模糊」（niri 的 ignore-alpha 本意）vidow 根本没有：
      layer 的模糊是一整块矩形，会漏进面板自己透明的内边距里（亮点峰值 1.000 → 0.285，
      探针 `tools/padpanel.py`）。
@@ -2414,6 +2406,16 @@ protocols/     wlr-layer-shell / wlr-virtual-pointer / input-method-v2 /
      照糊（0.167）→ 修后 0.322。新增 `./test-layermask.sh`（3 项，拿老二进制跑挂 1 条）、
      `VIDOW_MASK_DUMP`。`./test-layerblur.sh` 的第 2 条判据改用最大梯度（窗口自带的那圈
      半透明边框也被剔了，平均梯度会跟着动，原来的 0.9 比值太脆）。
+
+115. **底衬不做透明度剔除了**（撤掉 109 / 110 / 113 那条路）：剔除是用来**约束模糊的
+     范围**的（哪儿该糊），不是用来改糊出来的像素 —— 底衬该不该糊已经由「谁在它上面、
+     它自己透不透」决定了，再按它的 alpha 二次加工只会引入阈值边上的一刀、逐趟相乘、
+     软阈值有效值减半这一串坑（④⑤⑨）。`kawase_final` 这个程序整个删掉，最后一趟上升
+     跟其它趟是同一个 `kawase_up`；`blur_alpha_min` 也从金字塔的缓存键里拿掉（它现在只
+     进装饰着色器），改它由新加的 `blur_mask_min_changed()` 顶一下 `blur_ver`，帧循环
+     照样立刻重画 —— 不然运行时改配置会看着「没反应」（⓪ 那类）。相关探针与测试
+     （`./test-blurcull.sh`、`tools/soft.py`、`tools/ramp.py`）一起删了：上面几条历史里
+     提到的这三个名字都指它们。
 
 ## 尚未实现（原型边界）
 
