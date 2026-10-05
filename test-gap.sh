@@ -1,17 +1,18 @@
 #!/bin/bash
-# 间距（gap）：niri 那套四个值 + `gaps <n>` 简写。
+# 间距（gap）：一个统一值管全部 + 单边 / 窗口之间单独盖。
 #
 # 判据（全部读 IPC `state` 的 geometry，不截屏）：
-#   1) 默认和加 gap 之前一模一样：离屏幕边 6px、窗口之间 6px
-#   2) window_gaps_inner 只改窗口之间，不动离屏幕边
-#   3) gaps <n> 一次把四个都改掉
-#   4) workspace_gaps_outer + window_gaps_outer 相加才是「离屏幕边」的距离
-#   5) 同列两个窗口的纵向间距 = window_gaps_inner
+#   1) 默认（gaps 6）= 离屏幕边 6px、窗口之间 6px，跟没有 gap 之前的样子一样
+#   2) gaps_inner 只改窗口之间，不动离屏幕边
+#   3) gaps 一个数管全部：屏幕边和窗口之间一起变
+#   4) 单边（gaps_left / gaps_top…）只改那一边，-1 回到跟随统一值
+#   5) 同列两个窗口的纵向间距 = gaps_inner（单列时列宽还是 50%）
 #   6) 负值当 0（负 gap 会让工作区比屏幕还大）
-#   7) 四边单独设置：gaps_left/top 只改那一边，-1 回到跟随统一值
 #
-# 注意：geometry 是**滚动之后**的位置，所以断言只看「列间距」「y」「宽高」这些
-# 与滚动无关的量，不去猜滚动量。
+# 模型（输出 1280x720、scale=1、两列各 50%）：
+#   可用区 = 输出 - 四边 gap；列宽 = floor(可用宽 / 2)；列间距 = 列宽 + 内间距
+# 注意：geometry 是**滚动之后**的位置，所以断言只看列间距、y、宽高这些跟滚动无关
+# 的量，不去猜滚动量。
 set -u
 cd "$(dirname "$0")"
 
@@ -88,18 +89,18 @@ sleep 0.6
 snap "$RUNDIR/s-default.json"
 grep -a "config: gap" "$LOG" | head -1
 
-mark "window_gaps_inner 20（只改窗口之间）"
-setcfg window_gaps_inner 20
+mark "gaps_inner 20（只改窗口之间）"
+setcfg gaps_inner 20
 snap "$RUNDIR/s-inner20.json"
 
-mark "gaps 16（简写：一次设满四个）"
+mark "gaps 16（一个数管：屏幕边和窗口之间一起变）"
+setcfg gaps_inner -1          # 单独设过的项会盖住统一值，先放回 -1
 setcfg gaps 16
 snap "$RUNDIR/s-gaps16.json"
 
-mark "window_gaps_outer 0 + workspace_gaps_outer 40（离屏幕边 40）"
-setcfg window_gaps_outer 0
-setcfg workspace_gaps_outer 40
-snap "$RUNDIR/s-outer40.json"
+mark "gaps 40"
+setcfg gaps 40
+snap "$RUNDIR/s-gaps40.json"
 
 mark "堆叠：move-window-direction -1 把第二个窗口并进第一列"
 ./build/vidowmsg move-window-direction -1 >/dev/null 2>&1
@@ -108,23 +109,24 @@ setcfg gaps 6
 snap "$RUNDIR/s-stack6.json"
 
 mark "同列间距 20"
-setcfg window_gaps_inner 20
+setcfg gaps_inner 20
 snap "$RUNDIR/s-stack20.json"
 
 mark "负值当 0（-50）"
-setcfg window_gaps_inner -50
+setcfg gaps_inner -50
 snap "$RUNDIR/s-stackneg.json"
 
-mark "四边单独：gaps_left 40（其余仍跟随统一值 6）"
+mark "单边：gaps_left 40（其余仍跟随统一值 6）"
+setcfg gaps_inner -1
 setcfg gaps 6
 setcfg gaps_left 40
 snap "$RUNDIR/s-side-left.json"
 
-mark "四边单独：再加 gaps_top 30"
+mark "单边：再加 gaps_top 30"
 setcfg gaps_top 30
 snap "$RUNDIR/s-side-top.json"
 
-mark "四边单独：gaps_left -1 回到跟随"
+mark "单边：gaps_left -1 回到跟随"
 setcfg gaps_left -1
 snap "$RUNDIR/s-side-back.json"
 
@@ -149,98 +151,94 @@ def check(cond, msg):
 		print("  FAIL  " + msg)
 		failed.append(msg)
 
-def outer_of(g):
-	# 列宽 = (输出宽 - 2*离屏幕边) * 0.5，输出宽 1280
-	return 640 - g["width"]
-
-# --- 1) 默认：离屏幕边 6、窗口之间 6、列宽 634、列高 708
+# 统一值 6：可用宽 = 1280-12 = 1268 → 列宽 634；可用高 = 720-12 = 708
 w = load("s-default.json")
 check(set(w) == {"w1", "w2"}, "两个窗口都在（%s）" % sorted(w))
 a, b = w["w1"], w["w2"]
-check(outer_of(a) == 6, "默认离屏幕边 6px（列宽 %d）" % a["width"])
+# 两列时的 x 是滚动之后的位置，边距只能从宽高反推（640 = 1280/2 的列宽）
 check(a["y"] == 6 and a["height"] == 708,
-	"默认 y=6、列高 708（y=%d h=%d）" % (a["y"], a["height"]))
+	"默认离屏幕边 6px（列高 708 = 720-12、y=6）")
+check(a["width"] == 634, "默认列宽 634（= (1280-12)/2）")
 check((b["x"] - a["x"]) - a["width"] == 6,
 	"默认列间距 6px（相邻列 x 差 %d，列宽 %d）" % (b["x"] - a["x"], a["width"]))
 
-# --- 2) window_gaps_inner 20：只有列间距变
+# gaps_inner 20：只有列间距变，屏幕边不动
 w = load("s-inner20.json")
 a, b = w["w1"], w["w2"]
 check((b["x"] - a["x"]) - a["width"] == 20,
-	"window_gaps_inner 20 → 列间距 20px（%d）" % ((b["x"] - a["x"]) - a["width"]))
-check(outer_of(a) == 6 and a["y"] == 6,
-	"inner 不影响离屏幕边的距离（仍是 %dpx）" % outer_of(a))
+	"gaps_inner 20 → 列间距 20px（%d）" % ((b["x"] - a["x"]) - a["width"]))
+check(a["y"] == 6 and a["height"] == 708 and a["width"] == 634,
+	"gaps_inner 不影响离屏幕边（y=%d h=%d w=%d）"
+	% (a["y"], a["height"], a["width"]))
 
-# --- 3) gaps 16：四个一起变
+# gaps 16：一个数管全部 → 屏幕边 16、列间距 16；列宽 (1280-32)/2 = 624
 w = load("s-gaps16.json")
 a, b = w["w1"], w["w2"]
-check(outer_of(a) == 32, "gaps 16 → 离屏幕边 32px（= 16 + 16，列宽 %d）" % a["width"])
-check(a["y"] == 32 and a["height"] == 656,
-	"gaps 16 → y=32、列高 656（y=%d h=%d）" % (a["y"], a["height"]))
-check((b["x"] - a["x"]) - a["width"] == 16,
-	"gaps 16 → 列间距 16px（%d）" % ((b["x"] - a["x"]) - a["width"]))
+check(a["y"] == 16 and a["height"] == 688,
+	"gaps 16 → 离屏幕边 16px、列高 720-32 = 688（y=%d h=%d）"
+	% (a["y"], a["height"]))
+check(a["width"] == 624 and (b["x"] - a["x"]) - a["width"] == 16,
+	"gaps 16 → 列宽 624、列间距 16（w=%d 间距=%d）"
+	% (a["width"], (b["x"] - a["x"]) - a["width"]))
 
-# --- 4) outer 40 + window_outer 0：相加才是离屏幕边
-w = load("s-outer40.json")
+# gaps 40：列宽 (1280-80)/2 = 600、列高 640
+w = load("s-gaps40.json")
 a, b = w["w1"], w["w2"]
-check(outer_of(a) == 40, "workspace_outer 40 + window_outer 0 → 离屏幕边 40px（%d）"
-	% outer_of(a))
 check(a["y"] == 40 and a["height"] == 640,
-	"同上 y=40、列高 640（y=%d h=%d）" % (a["y"], a["height"]))
-check((b["x"] - a["x"]) - a["width"] == 16,
-	"只改了 outer，列间距还是 16px（%d）" % ((b["x"] - a["x"]) - a["width"]))
+	"gaps 40 → 离屏幕边 40、列高 640（y=%d h=%d）" % (a["y"], a["height"]))
+check(a["width"] == 600, "gaps 40 → 列宽 600（= (1280-80)/2）")
+check((b["x"] - a["x"]) - a["width"] == 40,
+	"gaps 40 → 列间距 40px（%d）" % ((b["x"] - a["x"]) - a["width"]))
 
-# --- 5) 同列两个窗口：纵向间距 = window_gaps_inner
+# 同列两个窗口：纵向间距 = gaps_inner
 def stacked(name):
 	w = load(name)
 	check(len(w) == 2, "%s：两个窗口还在" % name)
-	# 同一列：x 相同；上下两格
 	items = sorted(w.items(), key=lambda kv: kv[1]["y"])
-	(top, tg), (bot, bg) = items
-	return tg, bg
+	return items[0][1], items[1][1]
 
 tg, bg = stacked("s-stack6.json")
 check(tg["x"] == bg["x"], "并进同一列后 x 相同（%d / %d）" % (tg["x"], bg["x"]))
 check(bg["y"] - (tg["y"] + tg["height"]) == 6,
 	"同列纵向间距 6px（%d）" % (bg["y"] - (tg["y"] + tg["height"])))
-check(tg["height"] == 345 and tg["y"] == 12,
-	"gaps 6 → 每格高 345、起点 y=12（h=%d y=%d）" % (tg["height"], tg["y"]))
+check(tg["width"] == 634, "单列还是占一半（列宽 %d）" % tg["width"])
+check(tg["y"] == 6 and tg["height"] == 351,
+	"gaps 6 → 每格高 (708-6)/2 = 351、起点 y=6（h=%d y=%d）" % (tg["height"], tg["y"]))
 
 tg, bg = stacked("s-stack20.json")
 check(bg["y"] - (tg["y"] + tg["height"]) == 20,
 	"同列纵向间距 20px（%d）" % (bg["y"] - (tg["y"] + tg["height"])))
-check(tg["height"] == 338, "inner 20 → 每格高 338（%d）" % tg["height"])
+check(tg["height"] == 344, "gaps_inner 20 → 每格高 (708-20)/2 = 344（%d）" % tg["height"])
 
 tg, bg = stacked("s-stackneg.json")
 check(bg["y"] - (tg["y"] + tg["height"]) == 0,
 	"负值当 0：纵向间距 0px（%d）" % (bg["y"] - (tg["y"] + tg["height"])))
-check(tg["height"] == 348, "负值当 0：每格高 348（%d）" % tg["height"])
+check(tg["height"] == 354, "负值当 0：每格高 708/2 = 354（%d）" % tg["height"])
 
-# --- 6) 四边单独设置（此时是一个列里两个窗口：视口不滚动，x 就是左边距）
+# 单边设置（前置：gaps 6 + gaps_inner -1，可用高 708）
 def one_col(name):
 	w = load(name)
 	check(len(w) == 2, "%s：两个窗口还在" % name)
 	items = sorted(w.items(), key=lambda kv: kv[1]["y"])
 	return items[0][1], items[1][1]
 
-# 这几步的前置是 `gaps 6`：它把 workspace/window 的 outer 都设成 6，所以
-# 「离屏幕边」= 6 + 6 = 12（niri 的语义），列宽 = (1280 - 左 - 右) / 2。
 top, bot = one_col("s-side-left.json")
 check(top["x"] == 40, "gaps_left 40 → 窗口左边距 40px（%d）" % top["x"])
-check(top["width"] == 614,
-	"左边距 40 后列宽 = (1280-40-12)/2 = 614（%d）" % top["width"])
-check(top["y"] == 12 and top["height"] == 345,
-	"上/下没设，还是统一值 12（y=%d h=%d）" % (top["y"], top["height"]))
+check(top["width"] == 617,
+	"左边距 40 后列宽 = (1280-40-6)/2 = 617（%d）" % top["width"])
+check(top["y"] == 6 and top["height"] == 351,
+	"上下没设，还是统一值 6（y=%d h=%d）" % (top["y"], top["height"]))
 
 top, bot = one_col("s-side-top.json")
 check(top["y"] == 30, "gaps_top 30 → 窗口上边距 30px（%d）" % top["y"])
-check(top["height"] == 336, "上边距 30 后每格高 = (720-30-12-6)/2 = 336（%d）"
+check(top["height"] == 339, "上边距 30 后每格高 = (720-30-6-6)/2 = 339（%d）"
 	% top["height"])
-check(top["x"] == 40, "左边距 40 不受影响（%d）" % top["x"])
+check(top["x"] == 40 and top["width"] == 617,
+	"左边距 40、列宽 617 不受影响（x=%d w=%d）" % (top["x"], top["width"]))
 
 top, bot = one_col("s-side-back.json")
-check(top["x"] == 12 and top["width"] == 628,
-	"gaps_left -1 回到跟随统一值 → 左边距 12、列宽 628（x=%d w=%d）"
+check(top["x"] == 6 and top["width"] == 634,
+	"gaps_left -1 回到跟随统一值 → 左边距 6、列宽 634（x=%d w=%d）"
 	% (top["x"], top["width"]))
 check(top["y"] == 30, "gaps_top 30 仍然生效（y=%d）" % top["y"])
 

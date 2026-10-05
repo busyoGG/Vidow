@@ -4,6 +4,7 @@
 #include <limits.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <time.h>
 
 #include <wayland-server-core.h>
@@ -81,25 +82,18 @@ enum vidow_easing {
 };
 
 struct vidow_config {
-	/* ---- gap（照 niri 那套四个值 + `gaps <n>` 简写）----
-	 *   屏幕边 → 窗口 = workspace_gaps_outer + window_gaps_outer
-	 *   窗口 ↔ 窗口   = window_gaps_inner（列与列之间、同列上下之间）
-	 * vidow 一块屏同时只显示一个工作区，所以 workspace_gaps_inner（niri 里是
-	 * 「两块工作区之间」）目前无处可施，留着是为了配置能照抄 niri。
-	 * 都按逻辑像素算；负值一律当 0（负 gap 会让工作区比屏幕还大）。 */
-	int gaps;                 /* 简写：一次设满四个，只作记录 */
-	int workspace_gaps_inner;
-	int workspace_gaps_outer;
-	int window_gaps_inner;
-	int window_gaps_outer;
-	/* 四边单独设「离屏幕边」的距离（i3-gaps 的 gaps top|bottom|left|right 那套）。
-	 * -1 = 没设，跟着上面的统一值走；>= 0 就盖住那一边。
-	 * 只对「屏幕边 → 窗口」有意义：窗口之间的间距本来就是横向（列间距）和纵向
-	 * （同列上下）两个方向，没有第四边。 */
-	int gaps_top;
+	/* ---- gap ----
+	 * 一个统一值管全部：`gaps = 10` → 屏幕边 10px、窗口之间也是 10px。
+	 * 要分开写就 `gaps = { top=30, left=40, inner=20 }`（或者平铺键
+	 * gaps_top / gaps_inner…），没写的那几项跟着统一值走。
+	 * 都按逻辑像素算；统一值负的一律当 0（负 gap 会让工作区比屏幕还大），
+	 * 但单独设置的 -1 不是「负值」，是「跟随统一值」。 */
+	int gaps;                 /* 统一值：四边与窗口之间都用它 */
+	int gaps_top;             /* 四边单独设「屏幕边 → 窗口」，-1 = 跟随 */
 	int gaps_bottom;
 	int gaps_left;
 	int gaps_right;
+	int gaps_inner;           /* 窗口 ↔ 窗口（列与列、同列上下），-1 = 跟随 */
 	/* Durations are wall-clock milliseconds. A slow compositor drops frames;
 	 * it never stretches an animation. */
 	/* 视口外强制渲染（窗口规则 / 录屏预览）每秒补多少帧，0 = 不限。
@@ -190,6 +184,28 @@ struct vidow_config {
 	bool portal_conf_sync;
 	char portal_desktop[32];
 };
+
+/* gap 的唯一算法：单独设了就用它，没设（-1）跟随统一值 gaps；其余负值当 0
+ * （负 gap 会让工作区比屏幕还大，布局直接散架）。视图和日志都用这两个，别各写
+ * 一遍。 */
+#define VIDOW_GAP_FOLLOW (-1)
+
+static inline int vidow_gap_resolve(int value, int fallback) {
+	if (value == VIDOW_GAP_FOLLOW) {
+		value = fallback;
+	}
+	return value > 0 ? value : 0;
+}
+
+/* 屏幕边 → 窗口：side 是该边单独设的值（-1 = 跟随）。 */
+static inline int vidow_gap_side(const struct vidow_config *cfg, int side) {
+	return vidow_gap_resolve(side, cfg->gaps);
+}
+
+/* 窗口 ↔ 窗口（列与列、同列上下）。 */
+static inline int vidow_gap_inner(const struct vidow_config *cfg) {
+	return vidow_gap_resolve(cfg->gaps_inner, cfg->gaps);
+}
 
 /* --------------------------------------------------------------- animation */
 
@@ -1104,6 +1120,21 @@ bool vidow_config_set(struct vidow_config *cfg, const char *key,
 		const char *value);
 const char *vidow_config_get(const struct vidow_config *cfg,
 		const char *key);
+/* 配置「族」：一族的键既能一个值管全部，也能写成一张表只盖其中几项
+ * （`gaps = { top = 30, inner = 20 }`、`border = { width = 0 }`）。
+ * 解析表的地方在 script.c（Lua 那边），这里只回答「这个名字是不是族」、
+ * 「族名 = 一个值」落到哪个平铺键、表里的项名展开成哪个平铺键。 */
+bool vidow_config_group_has(const char *name);
+const char *vidow_config_group_scalar(const char *name);
+const char *vidow_config_group_field(const char *group, const char *field);
+size_t vidow_config_group_fields(const char *group, const char **out,
+		size_t max);
+/* 删掉的旧键名（gaps 那一家）：配置里再写就是普通全局变量、静默失效，所以让
+ * script.c 认出来喊一声。命中就给 true，并把「现在该写什么」放进 *hint。 */
+bool vidow_config_legacy_hint(const char *key, const char **hint);
+/* 把内置默认值打印成一份完整的 Lua 配置（`vidow --default-config`）。环境变量
+ * 不参与 —— 打出来的是「什么都没配」时的样子。 */
+void vidow_config_default_lua(FILE *out);
 
 /* -------------------------------------------------------------- async exec */
 

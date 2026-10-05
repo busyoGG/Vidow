@@ -63,27 +63,95 @@ static bool value_as_text(lua_State *L, int index, char *buf, size_t size) {
 	}
 }
 
+/* `gaps = { top = 30, inner = 20 }`：一张表按「配置族」展开成平铺键
+ * （gaps_top / gaps_inner）。表里的项名不认识就报错并列出能写哪些 —— 这类
+ * 拼写错误悄悄生效最难受。 */
+static int expand_group(lua_State *L, struct vidow_config *cfg,
+		const char *group, int table_index) {
+	table_index = lua_absindex(L, table_index);
+	lua_pushnil(L);
+	while (lua_next(L, table_index) != 0) {
+		/* 键在 -2、值在 -1 */
+		if (lua_type(L, -2) != LUA_TSTRING) {
+			return luaL_error(L, "%s = {…}: 项名得是字符串", group);
+		}
+		const char *field = lua_tostring(L, -2);
+		const char *flat = vidow_config_group_field(group, field);
+		if (flat == NULL) {
+			const char *names[16];
+			size_t n = vidow_config_group_fields(group, names, 16);
+			char list[192] = "";
+			for (size_t i = 0; i < n; i++) {
+				snprintf(list + strlen(list), sizeof(list) - strlen(list),
+					"%s%s", i > 0 ? " / " : "", names[i]);
+			}
+			return luaL_error(L, "%s = {…}: 没有 '%s' 这一项（能写：%s）",
+				group, field, list);
+		}
+		char buf[256];
+		if (!value_as_text(L, -1, buf, sizeof(buf))) {
+			return luaL_error(L, "%s = { %s = … }: 不能用 %s 当配置值",
+				group, field, lua_typename(L, lua_type(L, -1)));
+		}
+		if (!vidow_config_set(cfg, flat, buf)) {
+			return luaL_error(L, "%s = '%s' is not a valid value", flat, buf);
+		}
+		lua_pop(L, 1);
+	}
+	return 0;
+}
+
+/* 一个配置键的赋值。值是标量就照平铺键存；是表就说明这个名字是一个「族」，
+ * 表里每项展开成族里的平铺键（`border = { width = 0 }` → border_width = 0）。 */
+static int assign_config(lua_State *L, struct vidow_config *cfg,
+		const char *key, int value_index) {
+	if (lua_type(L, value_index) == LUA_TTABLE) {
+		if (!vidow_config_group_has(key)) {
+			return luaL_error(L, "%s = {…}: %s 不是一个「族」，这里不能写表",
+				key, key);
+		}
+		return expand_group(L, cfg, key, value_index);
+	}
+	/* `blur = false` 这种：族名本身也能当值用（落到族里指定的那个平铺键）。 */
+	const char *flat = vidow_config_has(key) ? key :
+		vidow_config_group_scalar(key);
+	if (flat == NULL) {
+		/* 只有表的族（border / shadow / anim / portal）：光一个值没法解释。 */
+		const char *names[16];
+		size_t n = vidow_config_group_fields(key, names, 16);
+		return luaL_error(L, "%s 得写成一张表，比如 %s = { %s = … }",
+			key, key, n > 0 ? names[0] : "…");
+	}
+	char buf[256];
+	if (!value_as_text(L, value_index, buf, sizeof(buf))) {
+		return luaL_error(L, "%s: cannot use a %s as a config value", key,
+			lua_typename(L, lua_type(L, value_index)));
+	}
+	if (!vidow_config_set(cfg, flat, buf)) {
+		return luaL_error(L, "%s = '%s' is not a valid value", flat, buf);
+	}
+	return 0;
+}
+
 /* `border_width = 2` in the config file. Unknown names stay ordinary globals,
  * so helpers and locals keep working. */
 static int script_newindex(lua_State *L) {
 	struct vidow_script *s = script_of(L);
 	const char *key = lua_type(L, 2) == LUA_TSTRING ? lua_tostring(L, 2) : NULL;
-	if (key == NULL || !vidow_config_has(key)) {
+	if (key == NULL ||
+			(!vidow_config_has(key) && !vidow_config_group_has(key))) {
+		const char *hint = NULL;
+		if (key != NULL && vidow_config_legacy_hint(key, &hint)) {
+			wlr_log(WLR_ERROR, "config.lua: %s 这个键没有了（现在用 %s），"
+				"这一行不生效", key, hint);
+		}
 		lua_rawset(L, 1);
 		return 0;
 	}
-	char buf[256];
-	if (!value_as_text(L, 3, buf, sizeof(buf))) {
-		return luaL_error(L, "%s: cannot use a %s as a config value", key,
-			lua_typename(L, lua_type(L, 3)));
-	}
-	if (!vidow_config_set(&s->server->config, key, buf)) {
-		return luaL_error(L, "%s = '%s' is not a valid value", key, buf);
-	}
+	(void)assign_config(L, &s->server->config, key, 3); /* 出错时 luaL_error 直接抛 */
 	lua_rawset(L, 1); /* keep the global readable afterwards */
 	return 0;
 }
-
 static int script_index(lua_State *L) {
 	struct vidow_script *s = script_of(L);
 	if (lua_type(L, 2) != LUA_TSTRING) {
@@ -145,28 +213,23 @@ static int l_exec_status(lua_State *L) {
 static int l_set(lua_State *L) {
 	struct vidow_script *s = script_of(L);
 	const char *key = luaL_checkstring(L, 1);
-	char buf[256];
-	if (!value_as_text(L, 2, buf, sizeof(buf))) {
-		return luaL_error(L, "%s: cannot use a %s as a config value", key,
-			lua_typename(L, lua_type(L, 2)));
-	}
-	if (!vidow_config_has(key)) {
+	if (!vidow_config_has(key) && !vidow_config_group_has(key)) {
 		return luaL_error(L, "unknown config key '%s'", key);
 	}
-	if (!vidow_config_set(&s->server->config, key, buf)) {
-		return luaL_error(L, "%s = '%s' is not a valid value", key, buf);
-	}
-	return 0;
+	/* 表也一样认：vidow.set("border", { width = 0 }) */
+	return assign_config(L, &s->server->config, key, 2);
 }
 
 static int l_get(lua_State *L) {
 	struct vidow_script *s = script_of(L);
 	const char *key = luaL_checkstring(L, 1);
-	if (!vidow_config_has(key)) {
+	const char *name = vidow_config_has(key) ? key :
+		vidow_config_group_scalar(key);
+	if (name == NULL) {
 		lua_pushnil(L);
 		return 1;
 	}
-	lua_pushstring(L, vidow_config_get(&s->server->config, key));
+	lua_pushstring(L, vidow_config_get(&s->server->config, name));
 	return 1;
 }
 

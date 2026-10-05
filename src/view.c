@@ -9,20 +9,8 @@
 
 #define DEFAULT_COLUMN_WIDTH 0.5
 
-/* gap 一律按「不小于 0」用：负 gap 会让工作区比屏幕还大，布局直接散架。 */
-static int gap_clamp(int px) {
-	return px > 0 ? px : 0;
-}
-
-/* 屏幕边 → 窗口的距离 = niri 的两个外间距之和（vidow 没有可见的工作区背景，
- * 所以分开存、加起来用）。side 是四边单独设置的值：-1 = 没设，跟随统一值。 */
-static int gap_outer(const struct vidow_config *cfg, int side) {
-	if (side >= 0) {
-		return side;
-	}
-	return gap_clamp(cfg->workspace_gaps_outer) +
-		gap_clamp(cfg->window_gaps_outer);
-}
+/* gap 的算法都在 server.h 里（vidow_gap_side / vidow_gap_inner）：统一值 gaps
+ * 管全部，单边设了就用单边的，-1 = 跟随。 */
 
 void vidow_place_view(struct vidow_view *view, int x, int y, int w, int h);
 static void view_ensure_column(struct vidow_server *server,
@@ -1059,12 +1047,13 @@ struct wlr_box vidow_work_area(struct vidow_server *server,
 	}
 
 	/* 缩进可用区：窗口不贴屏幕边、也不贴状态栏。四边可以分别设
-	 * （gaps_top/bottom/left/right），没设就一起用
-	 * workspace_gaps_outer + window_gaps_outer。 */
-	int top = gap_outer(&server->config, server->config.gaps_top);
-	int bottom = gap_outer(&server->config, server->config.gaps_bottom);
-	int left = gap_outer(&server->config, server->config.gaps_left);
-	int right = gap_outer(&server->config, server->config.gaps_right);
+	 * （gaps_top/bottom/left/right 或一张表 gaps = { top = … }），
+	 * 没设就一起用统一值 gaps。 */
+	const struct vidow_config *cfg = &server->config;
+	int top = vidow_gap_side(cfg, cfg->gaps_top);
+	int bottom = vidow_gap_side(cfg, cfg->gaps_bottom);
+	int left = vidow_gap_side(cfg, cfg->gaps_left);
+	int right = vidow_gap_side(cfg, cfg->gaps_right);
 	area.x += left;
 	area.y += top;
 	area.width -= left + right;
@@ -1086,8 +1075,8 @@ static void output_arrange(struct vidow_server *server,
 		return;
 	}
 
-	/* 窗口之间（列与列、同列上下）的间距 = window_gaps_inner。 */
-	int inner = gap_clamp(server->config.window_gaps_inner);
+	/* 窗口之间（列与列、同列上下）的间距 = gaps_inner，没设就跟 gaps 一样。 */
+	int inner = vidow_gap_inner(&server->config);
 
 	/* Pass 1: column widths and offsets, measured from the work area. */
 	struct wl_list *shown = output_shown_columns(server, output->wlr_output);

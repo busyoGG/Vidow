@@ -57,62 +57,94 @@
 - 列宽默认占工作区 50%，可按列循环切换 1/3 → 1/2 → 2/3
 - 窗口在列内纵向均分高度
 
-### 间距（gap）：照 niri 那套四个值
+### 配置键与配置族
 
-niri 把间距拆成「工作区」和「窗口」两组、各有内/外，vidow 直接照抄（键名一样，
-niri 的配置能整段搬过来）：
+一个概念一个键：键是平的（`gaps_inner` / `border_width`），但一族配置可以写成一个键 +
+一张表，表里只写要改的项：
 
-| 键 | niri 里的含义 | vidow 里落在哪 |
+```lua
+gaps   = 10                                  -- 一个值管全部
+gaps   = { top = 30, inner = 20 }            -- 只盖上边距和窗口之间，其余跟随
+border = { width = 0, color = "#2a2e3aff" }  -- 不用去写 border_width / border_color
+anim   = { open_ms = 220, easing = "out_quint" }
+```
+
+表写法和铺平是一个意思（表里每项展开成对应的平铺键），平铺键照旧能用 —— 环境变量
+`VIDOW_<键名大写>`、`vidowmsg set-config <键> <值>`、老配置都走平铺键。表里写错项名、
+或者给只认表的族（`border` / `shadow` / `anim` / `portal`）写一个光秃秃的值，都会在
+`config.lua` 那一行当场报错并列出能写哪些项 —— 不会静默生效。
+
+| 族 | 表里能写的项 | 一个值管全部 |
 | --- | --- | --- |
-| `workspace_gaps_outer` | 屏幕边 → 工作区 | 「离屏幕边」的一半 |
-| `window_gaps_outer` | 工作区 → 窗口 | 「离屏幕边」的另一半 |
-| `window_gaps_inner` | 窗口 ↔ 窗口 | 列与列之间、同列上下之间 |
-| `workspace_gaps_inner` | 工作区 ↔ 工作区 | **暂时不生效**（一块屏同时只显示一个工作区） |
-| `gaps` | 简写：一次设满四个 | 同 niri |
-| `gaps_top` / `gaps_bottom` / `gaps_left` / `gaps_right` | —（i3-gaps 那套） | 单独盖住那一边的「离屏幕边」 |
+| `gaps` | `top` `bottom` `left` `right` `inner` | `gaps = 10` |
+| `decor` | `enabled` `corner_radius` `opacity` `noise` | `decor = false` |
+| `border` | `width` `color` `color_focus` | —（光写一个值没法解释） |
+| `shadow` | `radius` `color` `offset_x` `offset_y` | — |
+| `blur` | `enabled` `all` `levels` `strength` `alpha_min` `offset` | `blur = false` |
+| `anim` | `open_ms` `close_ms` `move_ms` `layer_open_ms` `layer_close_ms` `easing` `open_alpha_from` `open_slide_px` `close_alpha_to` `close_slide_px` | — |
+| `shader` | `enabled` `dir` `flip_y` `open` `close` `idle` | `shader = false` |
+| `clipboard` | `enabled` `primary` `max_bytes` | `clipboard = false` |
+| `ipc` | `enabled` `socket` | `ipc = true` |
+| `xwayland` | `enabled` `scale` `env` | `xwayland = false` |
+| `portal` | `conf_sync` `desktop` | — |
 
-- 眼睛看到的「屏幕边到窗口」= `workspace_gaps_outer + window_gaps_outer`：
-  vidow 没有可见的工作区背景，所以两个外间距加起来才是那圈留白
-- 四边单独设置（`gaps_top` 等）盖的是**合计值**那一边：`-1`（默认）= 没设、跟随统一
-  值，`>= 0` 就用这个数。只对「屏幕边 → 窗口」有意义 —— 窗口之间的间距本来就是横向
-  （列间距）和纵向（同列上下）两个方向，没有第四边
-- `gaps <n>` 只改那四个统一值，**不动**四边单独设置（否则之后改 `window_gaps_outer`
-  会被这些「隐式设过」的值盖住，很反直觉）
+一个 Lua 那边的坑：**同一个键在一个文件里写两遍，只有第一遍生效** —— 第一遍之后它就是个
+普通的全局变量了，第二遍不再经过配置层（`vidow.set("gaps", 12)` 每次都能用）。
 
-- 眼睛看到的「屏幕边到窗口」= `workspace_gaps_outer + window_gaps_outer`：
-  vidow 没有可见的工作区背景，所以两个外间距加起来才是那圈留白
-- 默认 `gaps 6` 的效果 = 离屏幕边 6px、窗口之间 6px（**和加 gap 之前一模一样**，
-  所以老配置和回归测试都不受影响）：`workspace_gaps_outer = 0`、
-  `window_gaps_outer = 6`、`window_gaps_inner = 6`
-- 负值一律当 0（负 gap 会让工作区比屏幕还大）
-- 浮动窗口的活动范围、overview 的相机框、`set-window-size` 的夹取都走同一个
-  `vidow_work_area`，所以它们跟着一起变
+完整的默认配置（每个键都写着它自己的默认值，抄一份就能改）：
 
 ```bash
-vidowmsg set-config gaps 16                 # 一次设满四个
-vidowmsg set-config window_gaps_inner 20    # 只改窗口之间
-vidowmsg set-config window_gaps_outer 0     # 离屏幕边 40px
-vidowmsg set-config workspace_gaps_outer 40
-vidowmsg set-config gaps_top 30             # 只把上边距设成 30（其余跟随）
+./build/vidow --default-config > ~/.config/vidow/config.lua
+```
+
+仓库里的 `config.lua.example` 就是它的输出；`./test-defaultconfig.sh` 里有一条断言盯着
+「这份文件和 `--default-config` 打出来的一模一样」，所以它不会跟代码走散。
+
+### 间距（gap）：一个数管全部
+
+```lua
+gaps = 10                          -- 屏幕边到窗口 10px、窗口之间也是 10px
+gaps = { top = 30, inner = 20 }    -- 只盖这两项，其余跟着 gaps
+```
+
+| 键 | 作用 |
+| --- | --- |
+| `gaps` | 一个数管全部：屏幕边到窗口、以及窗口之间都用它 |
+| `gaps_top` / `gaps_bottom` / `gaps_left` / `gaps_right` | 单独盖某一边的边距，`-1` = 跟随 `gaps` |
+| `gaps_inner` | 单独盖「窗口 ↔ 窗口」（列间距、同列上下），`-1` = 跟随 `gaps` |
+
+- 以前是照 niri 抄的四个值（`workspace_gaps_inner/outer` + `window_gaps_inner/outer`）
+  再加一个 `gaps <n>` 简写一起设：九个键说一件「间距」的事，而且 `gaps = 10` 实际得到的
+  是**离屏幕边 20px**（内外两份相加）。现在一个数就是一个数
+- 单独设过的项盖住统一值（`gaps = 16` **不会**把 `gaps_inner = 20` 冲掉），写回 `-1`
+  才回到「跟随 `gaps`」
+- 负值一律当 0（负 gap 会让工作区比屏幕还大）；`-1` 是「没设」的哨兵，不当负值算
+- 浮动窗口的活动范围、overview 的相机框、`set-window-size` 的夹取都走同一个
+  `vidow_work_area`，所以它们跟着一起变
+- 默认 `gaps 6` 的效果 = 离屏幕边 6px、窗口之间 6px（**和加 gap 之前的样子一样**）
+
+```bash
+vidowmsg set-config gaps 16                 # 屏幕边和窗口之间一起变
+vidowmsg set-config gaps_inner 20           # 只改窗口之间
+vidowmsg set-config gaps_left 40            # 只把左边距设成 40（其余跟随）
 vidowmsg set-config gaps_left -1            # 左边界回到「跟随统一值」
 ```
 
 实测（headless 1280×720、两个 `tools/pattern.py`，读 IPC `state` 的 `geometry`；
-列宽 = (1280 − 2×离屏幕边) × 0.5，所以列宽直接反推出离屏幕边）：
+列宽 = (1280 − 左右边距) × 0.5，列间距 = 列宽 + 内间距）：
 
 | 配置 | 列宽 | 离屏幕边 | 列间距 |
 | --- | --- | --- | --- |
 | `gaps 6`（默认） | 634 | 6 | 6 |
-| `window_gaps_inner 20` | 634 | 6 | 20 |
-| `gaps 16` | 608 | 32 | 16 |
-| `workspace_gaps_outer 40` + `window_gaps_outer 0` | 600 | 40 | 16 |
+| `gaps_inner 20` | 634 | 6 | 20 |
+| `gaps 16` | 624 | 16 | 16 |
+| `gaps 40` | 600 | 40 | 40 |
 
-同列两个窗口（`move-window-direction -1` 并进一列后）纵向间距跟着
-`window_gaps_inner` 走：6 → 每格高 345 / 起点 y=12；20 → 338；-50（当 0）→ 348。
-四边单独（前置是 `gaps 6`，所以统一的外间距 = 6 + 6 = 12）：`gaps_left 40` → 左边距
-40、列宽 (1280-40-12)/2 = 614、上下仍是 12；再加 `gaps_top 30` → 上边距 30、每格高
-(720-30-12-6)/2 = 336；`gaps_left -1` → 左边距回到 12、列宽 628、`gaps_top 30` 仍然生效。
-回归脚本：`./test-gap.sh`（26 条断言，全走 IPC，不截屏）。
+同列两个窗口（`move-window-direction -1` 并进一列后）纵向间距跟着 `gaps_inner` 走：
+6 → 每格高 351 / 起点 y=6；20 → 344；-50（当 0）→ 354。单边（前置是 `gaps 6`）：
+`gaps_left 40` → 左边距 40、列宽 (1280-40-6)/2 = 617、上下仍是 6；再加 `gaps_top 30` →
+上边距 30、每格高 (720-30-6-6)/2 = 339；`gaps_left -1` → 左边距回到 6、列宽 634，
+`gaps_top 30` 仍然生效。回归脚本：`./test-gap.sh`（33 条断言，全走 IPC，不截屏）。
 
 ### 浮动窗口
 
@@ -473,6 +505,8 @@ python3 test-float.py        # 三个真实 GTK 窗口，验证浮动模式自�
 ./test-focus.sh                      # 焦点规则 + 激活请求（全 headless，61 项断言）
 ./test-ipc.sh                        # IPC：状态输出 / 命令 / 事件 / 多屏（全 headless，162 项断言）
 ./test-config.sh                     # 配置系统：一个 Lua 文件 + 改了就自动重载（全 headless，15 项断言）
+./test-defaultconfig.sh              # 完整默认配置（--default-config）+ 配置族的表写法（全 headless，20 项断言）
+./test-gap.sh                        # 间距：一个数管全部 + 单边/内间距覆盖（全 headless，33 项断言）
 ./test-layerblur.sh                  # 半透明状态栏背后的模糊（全 headless，4 项断言）
 ./test-blurscale.sh                  # 模糊在高 DPI 倍率下的底衬覆盖 + 对位（1/1.7/2 倍，7 项断言）
 ./test-blurlevel.sh                  # 半径随级数扩展（2/4/6 级各跑一轮，3 项断言）
@@ -2438,6 +2472,25 @@ protocols/     wlr-layer-shell / wlr-virtual-pointer / input-method-v2 /
      （老二进制）→ 三帧都 ≤ 窗口 640x687 / 28。新增 `./test-openanim.sh`（老二进制连跑
      3 次都挂 2 条）。关闭动画（genie）走同一条路，一起好了（原来压下去的是没装饰的原始
      快照）。
+
+117. **配置面收敛：`gaps` 一个数管全部（外加单边 / 内间距覆盖），一族配置可以写成一张表；
+     新增 `vidow --default-config`**。gap 原来是照 niri 抄的四个值（`workspace_gaps_inner/outer`
+     + `window_gaps_inner/outer`）再叠一个 `gaps <n>` 简写：九个键说一件「间距」的事，而且
+     `gaps = 10` 实际得到的是**离屏幕边 20px**（内外两份相加，跟 niri 的 `gaps` 语义也不符）。
+     现在只剩 `gaps`（一个数管全部：屏幕边和窗口之间都用它）+ `gaps_top/bottom/left/right/inner`
+     （`-1` = 跟随统一值，其它负值照旧当 0），`gaps = { top = 30, inner = 20 }` 和那两个平铺键
+     完全等价。同一个机制铺到别的族：`decor` / `border` / `shadow` / `blur` / `anim` / `shader` /
+     `clipboard` / `ipc` / `xwayland` / `portal` 都能写成一张表（表里只写要改的项，其余跟着默认
+     值），平铺键照旧能用（环境变量 `VIDOW_*`、`vidowmsg set-config`、老配置都走平铺键）。表里
+     项名拼错、给只认表的族（`border`/`shadow`/`anim`/`portal`）写一个光秃秃的值，都当场报错并
+     列出能写哪些项；删掉的那四个老键名会喊一声「这个键没有了，现在用 xxx」——「配置写了没反应」
+     最难查。`vidow --default-config` 打一份完整默认配置（每个键都写着自己的默认值），仓库里的
+     `config.lua.example` 就是它的输出，`./test-defaultconfig.sh` 里有一条断言盯着这两者一致，
+     所以文档不会跟代码走散（`shader_dir` 那种跟着配置目录走的默认值打的是注释，不把 HOME 写进去）。
+     实测：默认布局不变（离屏幕边 6 / 窗口之间 6、列宽 634）；`gaps 16` 从「离屏幕边 32 + 列宽 608」
+     变成「16 + 624」；`gaps 40` → 边距 40、列宽 600。`./test-gap.sh` 按新语义重写成 33 条断言，
+     新增 `./test-defaultconfig.sh`（20 条：默认配置回灌后逐键等于内置默认值 / 表写法只盖写了的项 /
+     报错信息 / 老键名提示 / `config.lua.example` 不漂移）。
 
 ## 尚未实现（原型边界）
 

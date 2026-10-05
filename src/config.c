@@ -37,80 +37,343 @@ struct entry {
 	enum kind kind;
 	size_t offset;
 	size_t size;
+	int section;      /* 打印默认配置时的分节，见 section_titles[] */
+	const char *doc;  /* 打印在那行配置上面的注释（不能有换行） */
 };
+
+/* 默认配置的分节标题。entries[] 按这个顺序排，打印时换节就插一个标题。 */
+static const char *section_titles[] = {
+	"间距（gap）",
+	"窗口装饰",
+	"背景模糊",
+	"开关动画",
+	"自定义着色器",
+	"刷新与补帧",
+	"剪贴板",
+	"IPC",
+	"缩放与输出",
+	"XWayland",
+	"窗口激活",
+	"xdg-desktop-portal",
+};
+#define N_SECTIONS (sizeof(section_titles) / sizeof(section_titles[0]))
 
 #define OFF(field) offsetof(struct vidow_config, field)
 #define SZ(field) sizeof(((struct vidow_config *)0)->field)
 
 static const struct entry entries[] = {
-	/* gap：niri 的四个值 + `gaps <n>` 简写（简写在 apply() 里特殊处理）。 */
-	{ "gaps",                K_INT, OFF(gaps),                SZ(gaps) },
-	{ "workspace_gaps_inner", K_INT, OFF(workspace_gaps_inner),
-		SZ(workspace_gaps_inner) },
-	{ "workspace_gaps_outer", K_INT, OFF(workspace_gaps_outer),
-		SZ(workspace_gaps_outer) },
-	{ "window_gaps_inner",   K_INT, OFF(window_gaps_inner),
-		SZ(window_gaps_inner) },
-	{ "window_gaps_outer",   K_INT, OFF(window_gaps_outer),
-		SZ(window_gaps_outer) },
-	{ "gaps_top",            K_INT, OFF(gaps_top),            SZ(gaps_top) },
-	{ "gaps_bottom",         K_INT, OFF(gaps_bottom),         SZ(gaps_bottom) },
-	{ "gaps_left",           K_INT, OFF(gaps_left),           SZ(gaps_left) },
-	{ "gaps_right",          K_INT, OFF(gaps_right),          SZ(gaps_right) },
-	{ "decor_enabled",   K_BOOL,   OFF(decor_enabled),   SZ(decor_enabled) },
-	{ "corner_radius",   K_DOUBLE, OFF(corner_radius),   SZ(corner_radius) },
-	{ "border_width",    K_DOUBLE, OFF(border_width),    SZ(border_width) },
-	{ "border_color",    K_COLOR,  OFF(border_color),    SZ(border_color) },
-	{ "border_color_focus", K_COLOR, OFF(border_color_focus), SZ(border_color_focus) },
-	{ "shadow_radius",   K_DOUBLE, OFF(shadow_radius),   SZ(shadow_radius) },
-	{ "shadow_color",    K_COLOR,  OFF(shadow_color),    SZ(shadow_color) },
-	{ "shadow_offset_x", K_INT,    OFF(shadow_offset_x), SZ(shadow_offset_x) },
-	{ "shadow_offset_y", K_INT,    OFF(shadow_offset_y), SZ(shadow_offset_y) },
-	{ "window_opacity",  K_DOUBLE, OFF(window_opacity),  SZ(window_opacity) },
-	{ "noise",           K_DOUBLE, OFF(noise),           SZ(noise) },
-	{ "blur_enabled",    K_BOOL,   OFF(blur_enabled),    SZ(blur_enabled) },
-	{ "blur_all",        K_BOOL,   OFF(blur_all),        SZ(blur_all) },
-	{ "blur_levels",     K_INT,    OFF(blur_levels),     SZ(blur_levels) },
-	{ "blur_strength",   K_DOUBLE, OFF(blur_strength),   SZ(blur_strength) },
-	{ "blur_alpha_min",  K_DOUBLE, OFF(blur_alpha_min),  SZ(blur_alpha_min) },
-	{ "blur_offset",     K_DOUBLE, OFF(blur_offset),     SZ(blur_offset) },
-	{ "force_render_hz", K_INT,    OFF(force_render_hz), SZ(force_render_hz) },
-	{ "ipc",             K_BOOL,   OFF(ipc),             SZ(ipc) },
-	{ "clipboard",       K_BOOL,   OFF(clipboard),       SZ(clipboard) },
+	/* gap：一个统一值管全部 + 四边（和窗口之间）单独盖。以前拆成
+	 * workspace_gaps_inner/outer + window_gaps_inner/outer 四个键，还要加
+	 * `gaps` 简写一起设 —— 九个键说一件「间距」的事，而且 `gaps = 10` 实际
+	 * 得到的是离屏幕边 20px（内外两份相加）。现在只剩一个数加几个覆盖项。 */
+	{ "gaps",             K_INT, OFF(gaps),             SZ(gaps), 0,
+		"屏幕边到窗口、以及窗口之间的间距（一个数全管）" },
+	{ "gaps_top",         K_INT, OFF(gaps_top),         SZ(gaps_top), 0,
+		"单设上边距，-1 = 跟随 gaps（其余负值当 0）" },
+	{ "gaps_bottom",      K_INT, OFF(gaps_bottom),      SZ(gaps_bottom), 0,
+		"单设下边距，-1 = 跟随 gaps（其余负值当 0）" },
+	{ "gaps_left",        K_INT, OFF(gaps_left),        SZ(gaps_left), 0,
+		"单设左边距，-1 = 跟随 gaps（其余负值当 0）" },
+	{ "gaps_right",       K_INT, OFF(gaps_right),       SZ(gaps_right), 0,
+		"单设右边距，-1 = 跟随 gaps（其余负值当 0）" },
+	{ "gaps_inner",       K_INT, OFF(gaps_inner),       SZ(gaps_inner), 0,
+		"单设窗口之间（列与列、同列上下）的间距，-1 = 跟随 gaps（其余负值当 0）" },
+
+	{ "decor_enabled",   K_BOOL,   OFF(decor_enabled),   SZ(decor_enabled), 1,
+		"圆角/边框/阴影这套装饰的总开关" },
+	{ "corner_radius",   K_DOUBLE, OFF(corner_radius),   SZ(corner_radius), 1,
+		"圆角半径（逻辑像素，0 = 直角）" },
+	{ "border_width",    K_DOUBLE, OFF(border_width),    SZ(border_width), 1,
+		"边框宽度（0 = 不画边框）" },
+	{ "border_color",    K_COLOR,  OFF(border_color),    SZ(border_color), 1,
+		"未聚焦窗口的边框颜色" },
+	{ "border_color_focus", K_COLOR, OFF(border_color_focus),
+		SZ(border_color_focus), 1, "聚焦窗口的边框颜色" },
+	{ "shadow_radius",   K_DOUBLE, OFF(shadow_radius),   SZ(shadow_radius), 1,
+		"阴影半径（0 = 不画阴影）" },
+	{ "shadow_color",    K_COLOR,  OFF(shadow_color),    SZ(shadow_color), 1,
+		"阴影颜色，alpha 管浓淡" },
+	{ "shadow_offset_x", K_INT,    OFF(shadow_offset_x), SZ(shadow_offset_x), 1,
+		"阴影横向偏移（像素）" },
+	{ "shadow_offset_y", K_INT,    OFF(shadow_offset_y), SZ(shadow_offset_y), 1,
+		"阴影纵向偏移（像素）" },
+	{ "window_opacity",  K_DOUBLE, OFF(window_opacity),  SZ(window_opacity), 1,
+		"窗口（含装饰）的不透明度，0.5 = 半透明" },
+	{ "noise",           K_DOUBLE, OFF(noise),           SZ(noise), 1,
+		"往装饰里掺的噪点强度，0 = 不加" },
+
+	{ "blur_enabled",    K_BOOL,   OFF(blur_enabled),    SZ(blur_enabled), 2,
+		"背景模糊总开关" },
+	{ "blur_all",        K_BOOL,   OFF(blur_all),        SZ(blur_all), 2,
+		"平铺窗口也模糊身后的壁纸；关掉只模糊浮动窗口后面" },
+	{ "blur_levels",     K_INT,    OFF(blur_levels),     SZ(blur_levels), 2,
+		"Kawase 模糊的层级数，越大越糊（也更费 GPU）" },
+	{ "blur_strength",   K_DOUBLE, OFF(blur_strength),   SZ(blur_strength), 2,
+		"模糊强度倍数" },
+	{ "blur_alpha_min",  K_DOUBLE, OFF(blur_alpha_min),  SZ(blur_alpha_min), 2,
+		"窗口内容透明度低于这个值的地方不参与模糊（省 GPU）" },
+	{ "blur_offset",     K_DOUBLE, OFF(blur_offset),     SZ(blur_offset), 2,
+		"模糊采样偏移，越大越散" },
+
+	{ "window_open_ms",  K_INT,    OFF(window_open_ms),  SZ(window_open_ms), 3,
+		"窗口打开动画时长（毫秒，0 = 不动画）" },
+	{ "window_close_ms", K_INT,    OFF(window_close_ms), SZ(window_close_ms), 3,
+		"窗口关闭动画时长" },
+	{ "window_move_ms",  K_INT,    OFF(window_move_ms),  SZ(window_move_ms), 3,
+		"窗口移动 / 布局重排的动画时长" },
+	{ "layer_open_ms",   K_INT,    OFF(layer_open_ms),   SZ(layer_open_ms), 3,
+		"layer-shell（状态栏、通知、挂件）出现的动画时长" },
+	{ "layer_close_ms",  K_INT,    OFF(layer_close_ms),  SZ(layer_close_ms), 3,
+		"layer-shell 消失的动画时长" },
+	{ "easing",          K_EASING, OFF(easing),          SZ(easing), 3,
+		"缓动曲线：linear / out_cubic / out_quint / in_out_cubic / out_back" },
+	{ "open_alpha_from", K_DOUBLE, OFF(open_alpha_from), SZ(open_alpha_from), 3,
+		"打开动画的起始透明度" },
+	{ "open_slide_px",   K_INT,    OFF(open_slide_px),   SZ(open_slide_px), 3,
+		"打开动画的起始位移（像素）" },
+	{ "close_alpha_to",  K_DOUBLE, OFF(close_alpha_to),  SZ(close_alpha_to), 3,
+		"关闭动画的结束透明度" },
+	{ "close_slide_px",  K_INT,    OFF(close_slide_px),  SZ(close_slide_px), 3,
+		"关闭动画的结束位移（像素）" },
+
+	{ "shader_enabled",  K_BOOL,   OFF(shader_enabled),  SZ(shader_enabled), 4,
+		"自定义 shader 总开关（需要 GLES2 渲染器）" },
+	{ "shader_dir",      K_STRING, OFF(shader_dir),      SZ(shader_dir), 4,
+		"shader 目录，加载 <目录>/<名字>.frag" },
+	{ "shader_flip_y",   K_BOOL,   OFF(shader_flip_y),   SZ(shader_flip_y), 4,
+		"采样时翻转 y（自己写的 shader 上下反了才需要）" },
+	{ "shader_open",     K_STRING, OFF(shader_open),     SZ(shader_open), 4,
+		"窗口打开时用的 shader 名字，留空 = 不用" },
+	{ "shader_close",    K_STRING, OFF(shader_close),    SZ(shader_close), 4,
+		"窗口关闭时用的 shader 名字，留空 = 不用" },
+	{ "shader_idle",     K_STRING, OFF(shader_idle),     SZ(shader_idle), 4,
+		"窗口空闲（一直开着不动画）时用的 shader 名字，留空 = 不用" },
+
+	{ "force_render_hz", K_INT,    OFF(force_render_hz), SZ(force_render_hz), 5,
+		"滚出视口的窗口每秒补多少帧（0 = 不限），配合窗口规则的 force_render" },
+
+	{ "clipboard",       K_BOOL,   OFF(clipboard),       SZ(clipboard), 6,
+		"接管 X11(XWayland) ↔ Wayland 的剪贴板同步" },
 	{ "clipboard_primary", K_BOOL, OFF(clipboard_primary),
-		SZ(clipboard_primary) },
+		SZ(clipboard_primary), 6, "PRIMARY（选中即复制）也一起同步" },
 	{ "clipboard_max_bytes", K_INT, OFF(clipboard_max_bytes),
-		SZ(clipboard_max_bytes) },
-	{ "ipc_socket",      K_STRING, OFF(ipc_socket),      SZ(ipc_socket) },
-	{ "activation_token_timeout", K_INT,
-		OFF(activation_token_timeout), SZ(activation_token_timeout) },
+		SZ(clipboard_max_bytes), 6,
+		"每种类型在内存里留的副本上限（字节），超了丢这个类型" },
+
+	{ "ipc",             K_BOOL,   OFF(ipc),             SZ(ipc), 7,
+		"开 IPC socket（vidowmsg、状态栏、脚本靠它）" },
+	{ "ipc_socket",      K_STRING, OFF(ipc_socket),      SZ(ipc_socket), 7,
+		"socket 路径，留空 = 按 WAYLAND_DISPLAY 自动取" },
+
+	{ "scale",           K_STRING, OFF(scale),           SZ(scale), 8,
+		"缩放：auto = 按 EDID 的 ppi 推，也可以写死 \"1\" / \"1.5\"" },
+	{ "outputs",         K_STRING, OFF(outputs),         SZ(outputs), 8,
+		"按输出名覆盖缩放（如 \"DP-1:1.5,HDMI-A-1:1\"），留空 = 用 scale" },
+
+	{ "xwayland",        K_BOOL,   OFF(xwayland),        SZ(xwayland), 9,
+		"开 XWayland（有人连 X 才启动服务）" },
+	{ "xwayland_scale",  K_STRING, OFF(xwayland_scale),  SZ(xwayland_scale), 9,
+		"XWayland 的缩放：auto = 所有输出里最大的那个" },
+	{ "xwayland_env",    K_BOOL,   OFF(xwayland_env),    SZ(xwayland_env), 9,
+		"给客户端设 XDG_SESSION_TYPE 这类 X11 环境变量" },
+
+	{ "activation_token_timeout", K_INT, OFF(activation_token_timeout),
+		SZ(activation_token_timeout), 10,
+		"激活令牌多久作废（秒），0 = 不过期" },
 	{ "honor_xdg_activation_with_invalid_serial", K_BOOL,
 		OFF(honor_xdg_activation_with_invalid_serial),
-		SZ(honor_xdg_activation_with_invalid_serial) },
-	{ "window_open_ms",  K_INT,    OFF(window_open_ms),  SZ(window_open_ms) },
-	{ "window_close_ms", K_INT,    OFF(window_close_ms), SZ(window_close_ms) },
-	{ "window_move_ms",  K_INT,    OFF(window_move_ms),  SZ(window_move_ms) },
-	{ "layer_open_ms",   K_INT,    OFF(layer_open_ms),   SZ(layer_open_ms) },
-	{ "layer_close_ms",  K_INT,    OFF(layer_close_ms),  SZ(layer_close_ms) },
-	{ "easing",          K_EASING, OFF(easing),          SZ(easing) },
-	{ "open_alpha_from", K_DOUBLE, OFF(open_alpha_from), SZ(open_alpha_from) },
-	{ "open_slide_px",   K_INT,    OFF(open_slide_px),   SZ(open_slide_px) },
-	{ "close_alpha_to",  K_DOUBLE, OFF(close_alpha_to),  SZ(close_alpha_to) },
-	{ "close_slide_px",  K_INT,    OFF(close_slide_px),  SZ(close_slide_px) },
-	{ "shader_enabled",  K_BOOL,   OFF(shader_enabled),  SZ(shader_enabled) },
-	{ "shader_open",     K_STRING, OFF(shader_open),     SZ(shader_open) },
-	{ "shader_close",    K_STRING, OFF(shader_close),    SZ(shader_close) },
-	{ "shader_idle",     K_STRING, OFF(shader_idle),     SZ(shader_idle) },
-	{ "shader_dir",      K_STRING, OFF(shader_dir),      SZ(shader_dir) },
-	{ "shader_flip_y",   K_BOOL,   OFF(shader_flip_y),   SZ(shader_flip_y) },
-	{ "scale",           K_STRING, OFF(scale),           SZ(scale) },
-	{ "outputs",         K_STRING, OFF(outputs),         SZ(outputs) },
-	{ "xwayland",        K_BOOL,   OFF(xwayland),        SZ(xwayland) },
-	{ "xwayland_scale",  K_STRING, OFF(xwayland_scale),  SZ(xwayland_scale) },
-	{ "xwayland_env",    K_BOOL,   OFF(xwayland_env),    SZ(xwayland_env) },
-	{ "portal_conf_sync", K_BOOL,  OFF(portal_conf_sync), SZ(portal_conf_sync) },
-	{ "portal_desktop",  K_STRING, OFF(portal_desktop),  SZ(portal_desktop) },
+		SZ(honor_xdg_activation_with_invalid_serial), 10,
+		"serial 校验不过的激活请求也理（默认不理）" },
+
+	{ "portal_conf_sync", K_BOOL,  OFF(portal_conf_sync), SZ(portal_conf_sync), 11,
+		"把 XDG_CURRENT_DESKTOP 设成下面这个名字" },
+	{ "portal_desktop",  K_STRING, OFF(portal_desktop),  SZ(portal_desktop), 11,
+		"XDG_CURRENT_DESKTOP 的值（xdg-desktop-portal 按它选 <名字>-portals.conf）" },
 };
+
+/* ------------------------------------------------------------ 配置组
+ *
+ * 一族配置既能「一个键管全部」，也能只写其中几项，而不会摊成一堆并列的顶层
+ * 键：
+ *     gaps   = 10                       -- 全部 10px
+ *     gaps   = { top = 30, inner = 20 } -- 只改上边距和窗口之间
+ *     border = { width = 0, color = "#2a2e3aff" }
+ * 表里每项展开成下面这张表里对应的平铺键 —— 平铺键照样能用（环境变量
+ * VIDOW_*、vidowmsg set-config、老配置都走平铺键）。
+ *
+ * scalar 是「组名 = 一个值」时落到哪个平铺键；NULL 表示这个组必须写表
+ * （组名本身不是配置键，一个光秃秃的值没法解释）。 */
+struct group_field {
+	const char *name; /* 表里的项名 */
+	const char *key;  /* 展开成哪个平铺键 */
+};
+
+struct group {
+	const char *name;
+	const char *scalar; /* 组名 = 标量时用哪个键，NULL = 只认表 */
+	const struct group_field *fields;
+	size_t n;
+};
+
+static const struct group_field gaps_fields[] = {
+	{ "top",    "gaps_top" },
+	{ "bottom", "gaps_bottom" },
+	{ "left",   "gaps_left" },
+	{ "right",  "gaps_right" },
+	{ "inner",  "gaps_inner" },
+};
+static const struct group_field decor_fields[] = {
+	{ "enabled",       "decor_enabled" },
+	{ "corner_radius", "corner_radius" },
+	{ "opacity",       "window_opacity" },
+	{ "noise",         "noise" },
+};
+static const struct group_field border_fields[] = {
+	{ "width",       "border_width" },
+	{ "color",       "border_color" },
+	{ "color_focus", "border_color_focus" },
+};
+static const struct group_field shadow_fields[] = {
+	{ "radius",   "shadow_radius" },
+	{ "color",    "shadow_color" },
+	{ "offset_x", "shadow_offset_x" },
+	{ "offset_y", "shadow_offset_y" },
+};
+static const struct group_field blur_fields[] = {
+	{ "enabled",   "blur_enabled" },
+	{ "all",       "blur_all" },
+	{ "levels",    "blur_levels" },
+	{ "strength",  "blur_strength" },
+	{ "alpha_min", "blur_alpha_min" },
+	{ "offset",    "blur_offset" },
+};
+static const struct group_field anim_fields[] = {
+	{ "open_ms",        "window_open_ms" },
+	{ "close_ms",       "window_close_ms" },
+	{ "move_ms",        "window_move_ms" },
+	{ "layer_open_ms",  "layer_open_ms" },
+	{ "layer_close_ms", "layer_close_ms" },
+	{ "easing",         "easing" },
+	{ "open_alpha_from", "open_alpha_from" },
+	{ "open_slide_px",  "open_slide_px" },
+	{ "close_alpha_to", "close_alpha_to" },
+	{ "close_slide_px", "close_slide_px" },
+};
+static const struct group_field shader_fields[] = {
+	{ "enabled", "shader_enabled" },
+	{ "dir",     "shader_dir" },
+	{ "flip_y",  "shader_flip_y" },
+	{ "open",    "shader_open" },
+	{ "close",   "shader_close" },
+	{ "idle",    "shader_idle" },
+};
+static const struct group_field clipboard_fields[] = {
+	{ "enabled",   "clipboard" },
+	{ "primary",   "clipboard_primary" },
+	{ "max_bytes", "clipboard_max_bytes" },
+};
+static const struct group_field ipc_fields[] = {
+	{ "enabled", "ipc" },
+	{ "socket",  "ipc_socket" },
+};
+static const struct group_field xwayland_fields[] = {
+	{ "enabled", "xwayland" },
+	{ "scale",   "xwayland_scale" },
+	{ "env",     "xwayland_env" },
+};
+static const struct group_field portal_fields[] = {
+	{ "conf_sync", "portal_conf_sync" },
+	{ "desktop",   "portal_desktop" },
+};
+
+#define GROUP(name, scalar, fields) \
+	{ name, scalar, fields, sizeof(fields) / sizeof(fields[0]) }
+
+static const struct group groups[] = {
+	GROUP("gaps",      "gaps",           gaps_fields),
+	GROUP("decor",     "decor_enabled",  decor_fields),
+	GROUP("border",    NULL,             border_fields),
+	GROUP("shadow",    NULL,             shadow_fields),
+	GROUP("blur",      "blur_enabled",   blur_fields),
+	GROUP("anim",      NULL,             anim_fields),
+	GROUP("shader",    "shader_enabled", shader_fields),
+	GROUP("clipboard", "clipboard",      clipboard_fields),
+	GROUP("ipc",       "ipc",            ipc_fields),
+	GROUP("xwayland",  "xwayland",       xwayland_fields),
+	GROUP("portal",    NULL,             portal_fields),
+};
+
+static const struct group *group_named(const char *name) {
+	for (size_t i = 0; i < sizeof(groups) / sizeof(groups[0]); i++) {
+		if (strcmp(groups[i].name, name) == 0) {
+			return &groups[i];
+		}
+	}
+	return NULL;
+}
+
+/* 组名 = 标量时落到哪个平铺键（`clipboard = false` → clipboard）。不是组、
+ * 或者这个组不认标量，返回 NULL。 */
+const char *vidow_config_group_scalar(const char *name) {
+	const struct group *g = group_named(name);
+	return g != NULL ? g->scalar : NULL;
+}
+
+/* 表里的项名 → 平铺键（`border` + `width` → border_width）。 */
+const char *vidow_config_group_field(const char *group, const char *field) {
+	const struct group *g = group_named(group);
+	if (g == NULL) {
+		return NULL;
+	}
+	for (size_t i = 0; i < g->n; i++) {
+		if (strcmp(g->fields[i].name, field) == 0) {
+			return g->fields[i].key;
+		}
+	}
+	return NULL;
+}
+
+/* 删掉的键名：配置里写了它们以前是生效的，现在只会变成普通全局变量（静默失效）。
+ * 认出来，让 script.c 喊一声 —— 「配置写了没反应」最难查。 */
+static const struct {
+	const char *key;
+	const char *hint;
+} legacy_keys[] = {
+	{ "workspace_gaps_inner", "gaps（一个数管全部）或 gaps = { inner = … }" },
+	{ "workspace_gaps_outer", "gaps 或 gaps = { top/bottom/left/right = … }" },
+	{ "window_gaps_inner",    "gaps_inner 或 gaps = { inner = … }" },
+	{ "window_gaps_outer",    "gaps 或 gaps = { top/bottom/left/right = … }" },
+};
+
+bool vidow_config_legacy_hint(const char *key, const char **hint) {
+	for (size_t i = 0; i < sizeof(legacy_keys) / sizeof(legacy_keys[0]); i++) {
+		if (strcmp(legacy_keys[i].key, key) == 0) {
+			if (hint != NULL) {
+				*hint = legacy_keys[i].hint;
+			}
+			return true;
+		}
+	}
+	return false;
+}
+
+/* 这个组认哪些项 —— 报错信息里列出来，别让人猜。 */
+size_t vidow_config_group_fields(const char *group, const char **out, size_t max) {
+	const struct group *g = group_named(group);
+	if (g == NULL) {
+		return 0;
+	}
+	size_t n = g->n < max ? g->n : max;
+	for (size_t i = 0; i < n; i++) {
+		out[i] = g->fields[i].name;
+	}
+	return n;
+}
+
+/* 是不是「族」的组名（gaps / border / blur …）。 */
+bool vidow_config_group_has(const char *name) {
+	return group_named(name) != NULL;
+}
 
 static const char *easing_names[] = {
 	"linear", "out_cubic", "out_quint", "in_out_cubic", "out_back",
@@ -128,19 +391,6 @@ static bool parse_easing(const char *value, enum vidow_easing *out) {
 
 /* Returns false if the key is unknown or the value cannot be parsed. */
 static bool apply(struct vidow_config *cfg, const char *key, const char *value) {
-	/* niri 的 `gaps <n>` 简写：一次把四个值都设成 n。 */
-	if (strcmp(key, "gaps") == 0) {
-		int n = atoi(value);
-		if (n < 0) {
-			n = 0;
-		}
-		cfg->gaps = n;
-		cfg->workspace_gaps_inner = n;
-		cfg->workspace_gaps_outer = n;
-		cfg->window_gaps_inner = n;
-		cfg->window_gaps_outer = n;
-		return true;
-	}
 	for (size_t i = 0; i < sizeof(entries) / sizeof(entries[0]); i++) {
 		const struct entry *e = &entries[i];
 		if (strcmp(e->key, key) != 0) {
@@ -250,20 +500,15 @@ static void defaults(struct vidow_config *cfg) {
 	 * 几分钟 —— 令牌过期了 wlroots 直接把激活请求丢掉，我们连信号都收不到
 	 * （点了通知窗口不动，看着像客户端坏了）。 */
 	cfg->activation_token_timeout = 0;
-	/* gap 默认保持原型原来的样子：离屏幕边 6px、窗口之间 6px。
-	 * 屏幕边那 6px 记在 window_gaps_outer 上（workspace_gaps_outer = 0），
-	 * 这样 `window_gaps_outer` 一项就能直接调「窗口离屏幕多远」。 */
+	/* gap 默认保持原型原来的样子：离屏幕边 6px、窗口之间 6px —— 现在就是一个
+	 * 数（以前拆成内外两份，`gaps 6` 会变成离屏幕边 12px）。 */
 	cfg->gaps = 6;
-	cfg->workspace_gaps_inner = 6;
-	cfg->workspace_gaps_outer = 0;
-	cfg->window_gaps_inner = 6;
-	cfg->window_gaps_outer = 6;
-	/* 四边单独设置：-1 = 没设，跟着统一值。`gaps <n>` 不动它们（不然之后改
-	 * window_gaps_outer 会被这些「隐式设过」的值盖住，很反直觉）。 */
+	/* 单边设置：-1 = 没设，跟着统一值走。 */
 	cfg->gaps_top = -1;
 	cfg->gaps_bottom = -1;
 	cfg->gaps_left = -1;
 	cfg->gaps_right = -1;
+	cfg->gaps_inner = -1;
 	/* serial 校验不通过的激活请求默认不理（= wlroots 一直以来的行为）。 */
 	cfg->honor_xdg_activation_with_invalid_serial = false;
 	/* IPC 默认开着：socket 只有自己这个用户能连（0600），而状态栏 / 脚本全靠它。
@@ -455,15 +700,12 @@ void vidow_config_log(const struct vidow_config *cfg) {
 		cfg->blur_levels, cfg->blur_strength, cfg->blur_alpha_min);
 	wlr_log(WLR_INFO, "config: force_render_hz=%d（视口外补帧的节流，0 = 不限）",
 		cfg->force_render_hz);
-	wlr_log(WLR_INFO, "config: gap 工作区 %d/%d 窗口 %d/%d（内/外）→ "
-		"屏幕边到窗口 %dpx，窗口之间 %dpx",
-		cfg->workspace_gaps_inner, cfg->workspace_gaps_outer,
-		cfg->window_gaps_inner, cfg->window_gaps_outer,
-		(cfg->workspace_gaps_outer > 0 ? cfg->workspace_gaps_outer : 0) +
-			(cfg->window_gaps_outer > 0 ? cfg->window_gaps_outer : 0),
-		cfg->window_gaps_inner > 0 ? cfg->window_gaps_inner : 0);
-	wlr_log(WLR_INFO, "config: gap 四边单独（-1 = 跟随统一值）上=%d 下=%d 左=%d 右=%d",
-		cfg->gaps_top, cfg->gaps_bottom, cfg->gaps_left, cfg->gaps_right);
+	wlr_log(WLR_INFO, "config: gap 统一 %d → 屏幕边到窗口 上%d 下%d 左%d 右%d、"
+		"窗口之间 %d（单边 -1 = 跟随统一值）",
+		cfg->gaps,
+		vidow_gap_side(cfg, cfg->gaps_top), vidow_gap_side(cfg, cfg->gaps_bottom),
+		vidow_gap_side(cfg, cfg->gaps_left), vidow_gap_side(cfg, cfg->gaps_right),
+		vidow_gap_inner(cfg));
 	wlr_log(WLR_INFO, "config: activation_token_timeout=%d 秒（激活令牌多久作废，"
 		"0 = 不过期）", cfg->activation_token_timeout);
 	wlr_log(WLR_INFO, "config: honor_xdg_activation_with_invalid_serial=%s"
@@ -498,4 +740,162 @@ void vidow_config_reset(struct vidow_config *cfg) {
 	vidow_config_apply_env(cfg);
 	warn_legacy_flat();
 	vidow_config_log(cfg);
+}
+
+/* ------------------------------------------------- 完整的默认配置（打印） */
+
+/* 哪个分节里有哪个「族」，打默认配置时附一句表写法。 */
+static const struct {
+	int section;
+	const char *group;
+} section_groups[] = {
+	{ 0, "gaps" },
+	{ 1, "decor" }, { 1, "border" }, { 1, "shadow" },
+	{ 2, "blur" },
+	{ 3, "anim" },
+	{ 4, "shader" },
+	{ 6, "clipboard" },
+	{ 7, "ipc" },
+	{ 9, "xwayland" },
+	{ 11, "portal" },
+};
+
+/* 少数默认值是「跟着本机配置目录走」的（现在是 shader_dir）：照绝对路径打出来，
+ * 这份默认配置就只在一台机器上成立（还会把 HOME 写进仓库）。这些键只打一行注释
+ * 说明默认值怎么来的。 */
+static const struct {
+	const char *key;
+	const char *note;
+} derived_defaults[] = {
+	{ "shader_dir",
+		"默认跟着配置目录走（<配置目录>/shaders，"
+		"$XDG_CONFIG_HOME/vidow/shaders 或 ~/.config/vidow/shaders）" },
+};
+
+static const char *derived_note(const char *key) {
+	for (size_t i = 0; i < sizeof(derived_defaults) / sizeof(derived_defaults[0]);
+			i++) {
+		if (strcmp(derived_defaults[i].key, key) == 0) {
+			return derived_defaults[i].note;
+		}
+	}
+	return NULL;
+}
+
+/* 把某个键当前的值按 Lua 语法打出来：字符串/颜色/缓动名字要带引号并转义，
+ * 数字和 true / false 原样。 */
+static void print_lua_value(FILE *f, const struct vidow_config *cfg,
+		const char *key, enum kind kind) {
+	const char *v = vidow_config_get(cfg, key);
+	if (v == NULL) {
+		v = "";
+	}
+	if (kind != K_STRING && kind != K_COLOR && kind != K_EASING) {
+		fputs(v, f);
+		return;
+	}
+	fputc('"', f);
+	for (const char *p = v; *p != '\0'; p++) {
+		if (*p == '"' || *p == '\\') {
+			fputc('\\', f);
+			fputc(*p, f);
+		} else if (*p == '\n') {
+			fputs("\\n", f);
+		} else {
+			fputc(*p, f);
+		}
+	}
+	fputc('"', f);
+}
+
+/* 一个族写成一张表长什么样 —— 直接给出能粘的默认值，省得去翻代码。 */
+static void print_group_hint(FILE *f, const struct vidow_config *cfg,
+		const char *name) {
+	const struct group *g = group_named(name);
+	if (g == NULL) {
+		return;
+	}
+	fprintf(f, "-- 这一族也能写成一张表，只写要改的项（%s = { ", g->name);
+	for (size_t i = 0; i < g->n; i++) {
+		fprintf(f, "%s%s = ", i > 0 ? ", " : "", g->fields[i].name);
+		const struct entry *e = entry_for(g->fields[i].key);
+		if (derived_note(g->fields[i].key) != NULL) {
+			/* 跟着本机路径走的默认值：这里也不写死路径。 */
+			fputs("\"<配置目录>/shaders\"", f);
+		} else {
+			print_lua_value(f, cfg, g->fields[i].key,
+				e != NULL ? e->kind : K_INT);
+		}
+	}
+	fputs(" }）\n", f);
+	if (g->scalar != NULL) {
+		fprintf(f, "--     不写表也行：%s = ", g->name);
+		const struct entry *e = entry_for(g->scalar);
+		print_lua_value(f, cfg, g->scalar, e != NULL ? e->kind : K_BOOL);
+		fputs("（一个值管全部）\n", f);
+	}
+}
+
+static void print_section_groups(FILE *f, const struct vidow_config *cfg,
+		int section) {
+	for (size_t i = 0; i < sizeof(section_groups) / sizeof(section_groups[0]);
+			i++) {
+		if (section_groups[i].section == section) {
+			print_group_hint(f, cfg, section_groups[i].group);
+		}
+	}
+}
+
+/* 打印一份完整的默认配置（`vidow --default-config`）。每个键都写着它的默认
+ * 值：抄下来就等于什么都没改，改哪行哪行才生效。不读环境变量 —— 打出来的
+ * 是「什么都没配」时的样子。 */
+void vidow_config_default_lua(FILE *out) {
+	struct vidow_config cfg;
+	defaults(&cfg);
+	FILE *f = out != NULL ? out : stdout;
+
+	fputs(
+"-- vidow 的完整默认配置（`vidow --default-config` 打印出来的一份）\n"
+"--\n"
+"-- 每行都是内置默认值：整份抄到 ~/.config/vidow/config.lua 就等于什么都没改。\n"
+"-- 文件里写了的键会一直盖住内置默认值 —— 想让 vidow 以后改进的默认值生效，\n"
+"-- 就把那一行删掉（或者注释掉）。\n"
+"--\n"
+"-- 一族配置可以写成一张表，只盖其中几项，比如：\n"
+"--     gaps   = 10\n"
+"--     gaps   = { top = 30, inner = 20 }       -- 上边距 30、窗口之间 20、其余 6\n"
+"--     border = { width = 0, color = \"#2a2e3aff\" }\n"
+"-- 表里的项名写在下面每一节里；平铺键（gaps_inner = 20）和表写法是一回事。\n"
+"--\n"
+"-- 优先级：环境变量 VIDOW_<键名大写> > 这个文件 > 内置默认值。\n"
+"-- 同一个键在文件里写两遍只有第一遍生效（第一遍之后它就是个普通全局变量了）。\n"
+"-- 运行时改：vidowmsg set-config <键> <值>（不落盘）。\n"
+"-- 改完这个文件不用重启：  kill -HUP $(pgrep -x vidow)\n", f);
+
+	int section = -1;
+	for (size_t i = 0; i < sizeof(entries) / sizeof(entries[0]); i++) {
+		const struct entry *e = &entries[i];
+		if (e->section != section) {
+			if (section >= 0) {
+				print_section_groups(f, &cfg, section);
+			}
+			section = e->section;
+			fprintf(f, "\n-- ================== %s\n",
+				section < (int)N_SECTIONS ? section_titles[section]
+					: "其他");
+		}
+		const char *derived = derived_note(e->key);
+		if (derived != NULL) {
+			fprintf(f, "-- %s\n-- %s\n-- %s = \"<配置目录>/shaders\""
+				"   ← 要写死就自己换成绝对路径\n",
+				e->doc != NULL ? e->doc : "", derived, e->key);
+			continue;
+		}
+		fprintf(f, "-- %s\n%s = ", e->doc != NULL ? e->doc : "", e->key);
+		print_lua_value(f, &cfg, e->key, e->kind);
+		fputc('\n', f);
+	}
+	if (section >= 0) {
+		print_section_groups(f, &cfg, section);
+	}
 }

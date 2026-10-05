@@ -1,159 +1,167 @@
--- vidow 配置（Lua 5.4）。放在 ~/.config/vidow/config.lua 即生效。
+-- vidow 的完整默认配置（`vidow --default-config` 打印出来的一份）
 --
--- 这是**唯一**的配置文件（旧的那个 key = value 文件已经不再读了）；
--- 环境变量 VIDOW_* 优先级最高（方便临时测试）。路径也能用 $VIDOW_CONFIG 指到别处。
--- 改完不用重启：  kill -HUP $(pgrep -x vidow)
+-- 每行都是内置默认值：整份抄到 ~/.config/vidow/config.lua 就等于什么都没改。
+-- 文件里写了的键会一直盖住内置默认值 —— 想让 vidow 以后改进的默认值生效，
+-- 就把那一行删掉（或者注释掉）。
 --
--- 全局名就是配置键，写起来像配置文件：
---     border_width = 2
---     corner_radius = 12
+-- 一族配置可以写成一张表，只盖其中几项，比如：
+--     gaps   = 10
+--     gaps   = { top = 30, inner = 20 }       -- 上边距 30、窗口之间 20、其余 6
+--     border = { width = 0, color = "#2a2e3aff" }
+-- 表里的项名写在下面每一节里；平铺键（gaps_inner = 20）和表写法是一回事。
 --
--- 需要 shell 结果时用 vidow.exec()。它看起来是同步的，实际不会阻塞渲染：
--- 整个文件在一个协程里跑，命令交给合成器自己的事件循环去执行。
---     local accent = vidow.exec("theme.sh accent")   -- stdout（末尾换行已去掉）
--- 退出码非 0 时返回 nil + 原因（原因优先用 stderr）：
---     local v, why = vidow.exec("cat /tmp/radius")
---     corner_radius = tonumber(v) or 12
--- 成功时只返回一个值，所以可以直接嵌进调用里：
---     corner_radius = tonumber(vidow.exec("echo 12")) or 12
--- 需要看退出码 / 保留 stderr 时用 exec_status（永远返回 3 个值）：
---     local out, code, err = vidow.exec_status("grim /tmp/shot.png")
---     if code ~= 0 then vidow.log("截图失败: " .. err) end
---
--- 其他 API：vidow.set(k, v) / vidow.get(k)（键名动态时用）、vidow.log(...)。
--- io、os.execute、os.exit、package.loadlib 已移除：会阻塞或杀掉合成器的东西
--- 不该出现在配置里。
---
--- 注意：这里的命令连的是 vidow 自己（WAYLAND_DISPLAY 已指向它），
--- 所以 grim / slurp / wf-recorder 截的是 vidow 的画面，不是宿主桌面。
+-- 优先级：环境变量 VIDOW_<键名大写> > 这个文件 > 内置默认值。
+-- 同一个键在文件里写两遍只有第一遍生效（第一遍之后它就是个普通全局变量了）。
+-- 运行时改：vidowmsg set-config <键> <值>（不落盘）。
+-- 改完这个文件不用重启：  kill -HUP $(pgrep -x vidow)
 
--- ---------------------------------------------------------------- 例子
+-- ================== 间距（gap）
+-- 屏幕边到窗口、以及窗口之间的间距（一个数全管）
+gaps = 6
+-- 单设上边距，-1 = 跟随 gaps（其余负值当 0）
+gaps_top = -1
+-- 单设下边距，-1 = 跟随 gaps（其余负值当 0）
+gaps_bottom = -1
+-- 单设左边距，-1 = 跟随 gaps（其余负值当 0）
+gaps_left = -1
+-- 单设右边距，-1 = 跟随 gaps（其余负值当 0）
+gaps_right = -1
+-- 单设窗口之间（列与列、同列上下）的间距，-1 = 跟随 gaps（其余负值当 0）
+gaps_inner = -1
+-- 这一族也能写成一张表，只写要改的项（gaps = { top = -1, bottom = -1, left = -1, right = -1, inner = -1 }）
+--     不写表也行：gaps = 6（一个值管全部）
 
--- 主题色：存在 ~/.config/vidow/accent 就用它（内容是 6 位十六进制）
-local accent = vidow.exec("cat ~/.config/vidow/accent 2>/dev/null")
-if accent ~= nil and accent ~= "" then
-	border_color_focus = "#" .. accent
-end
+-- ================== 窗口装饰
+-- 圆角/边框/阴影这套装饰的总开关
+decor_enabled = true
+-- 圆角半径（逻辑像素，0 = 直角）
+corner_radius = 12
+-- 边框宽度（0 = 不画边框）
+border_width = 2
+-- 未聚焦窗口的边框颜色
+border_color = "#4d546bff"
+-- 聚焦窗口的边框颜色
+border_color_focus = "#7aa6f7ff"
+-- 阴影半径（0 = 不画阴影）
+shadow_radius = 8
+-- 阴影颜色，alpha 管浓淡
+shadow_color = "#0000008c"
+-- 阴影横向偏移（像素）
+shadow_offset_x = 0
+-- 阴影纵向偏移（像素）
+shadow_offset_y = 2
+-- 窗口（含装饰）的不透明度，0.5 = 半透明
+window_opacity = 1
+-- 往装饰里掺的噪点强度，0 = 不加
+noise = 0
+-- 这一族也能写成一张表，只写要改的项（decor = { enabled = true, corner_radius = 12, opacity = 1, noise = 0 }）
+--     不写表也行：decor = true（一个值管全部）
+-- 这一族也能写成一张表，只写要改的项（border = { width = 2, color = "#4d546bff", color_focus = "#7aa6f7ff" }）
+-- 这一族也能写成一张表，只写要改的项（shadow = { radius = 8, color = "#0000008c", offset_x = 0, offset_y = 2 }）
 
--- 电池供电时省一点 GPU
-local power = vidow.exec("cat /sys/class/power_supply/BAT0/status 2>/dev/null")
-if power == "Discharging" then
-	blur_levels = 3
-	shadow_radius = 6
-end
+-- ================== 背景模糊
+-- 背景模糊总开关
+blur_enabled = true
+-- 平铺窗口也模糊身后的壁纸；关掉只模糊浮动窗口后面
+blur_all = true
+-- Kawase 模糊的层级数，越大越糊（也更费 GPU）
+blur_levels = 4
+-- 模糊强度倍数
+blur_strength = 1
+-- 窗口内容透明度低于这个值的地方不参与模糊（省 GPU）
+blur_alpha_min = 0.15
+-- 模糊采样偏移，越大越散
+blur_offset = 1.5
+-- 这一族也能写成一张表，只写要改的项（blur = { enabled = true, all = true, levels = 4, strength = 1, alpha_min = 0.15, offset = 1.5 }）
+--     不写表也行：blur = true（一个值管全部）
 
--- 高分辨率屏幕上圆角大一点
-local width = tonumber(vidow.exec("cat /sys/class/drm/card*-*/modes 2>/dev/null | head -1 | cut -dx -f1"))
-if width and width >= 2560 then
-	corner_radius = 16
-end
+-- ================== 开关动画
+-- 窗口打开动画时长（毫秒，0 = 不动画）
+window_open_ms = 180
+-- 窗口关闭动画时长
+window_close_ms = 140
+-- 窗口移动 / 布局重排的动画时长
+window_move_ms = 190
+-- layer-shell（状态栏、通知、挂件）出现的动画时长
+layer_open_ms = 200
+-- layer-shell 消失的动画时长
+layer_close_ms = 150
+-- 缓动曲线：linear / out_cubic / out_quint / in_out_cubic / out_back
+easing = "out_cubic"
+-- 打开动画的起始透明度
+open_alpha_from = 0
+-- 打开动画的起始位移（像素）
+open_slide_px = 22
+-- 关闭动画的结束透明度
+close_alpha_to = 0
+-- 关闭动画的结束位移（像素）
+close_slide_px = 14
+-- 这一族也能写成一张表，只写要改的项（anim = { open_ms = 180, close_ms = 140, move_ms = 190, layer_open_ms = 200, layer_close_ms = 150, easing = "out_cubic", open_alpha_from = 0, open_slide_px = 22, close_alpha_to = 0, close_slide_px = 14 }）
 
--- 启动时截一张图（会连到 vidow 自己）。
--- 注意：键位动作目前只有固定那几个（workspace / move / special / focus / mousemove /
--- none），**不能**在按键上跑 shell 命令 —— 跑命令的时机只有配置加载和 SIGHUP。
--- local _, code, err = vidow.exec_status("grim ~/vidow-$(date +%s).png")
--- if code ~= 0 then vidow.log("截图失败: " .. err) end
+-- ================== 自定义着色器
+-- 自定义 shader 总开关（需要 GLES2 渲染器）
+shader_enabled = true
+-- shader 目录，加载 <目录>/<名字>.frag
+-- 默认跟着配置目录走（<配置目录>/shaders，$XDG_CONFIG_HOME/vidow/shaders 或 ~/.config/vidow/shaders）
+-- shader_dir = "<配置目录>/shaders"   ← 要写死就自己换成绝对路径
+-- 采样时翻转 y（自己写的 shader 上下反了才需要）
+shader_flip_y = false
+-- 窗口打开时用的 shader 名字，留空 = 不用
+shader_open = ""
+-- 窗口关闭时用的 shader 名字，留空 = 不用
+shader_close = ""
+-- 窗口空闲（一直开着不动画）时用的 shader 名字，留空 = 不用
+shader_idle = ""
+-- 这一族也能写成一张表，只写要改的项（shader = { enabled = true, dir = "<配置目录>/shaders", flip_y = false, open = "", close = "", idle = "" }）
+--     不写表也行：shader = true（一个值管全部）
 
-vidow.log(string.format("config.lua: accent=%q power=%q width=%s",
-	tostring(accent), tostring(power), tostring(width)))
+-- ================== 刷新与补帧
+-- 滚出视口的窗口每秒补多少帧（0 = 不限），配合窗口规则的 force_render
+force_render_hz = 60
 
--- ---------------------------------------------------------------- 间距（gap）
+-- ================== 剪贴板
+-- 接管 X11(XWayland) ↔ Wayland 的剪贴板同步
+clipboard = true
+-- PRIMARY（选中即复制）也一起同步
+clipboard_primary = true
+-- 每种类型在内存里留的副本上限（字节），超了丢这个类型
+clipboard_max_bytes = 33554432
+-- 这一族也能写成一张表，只写要改的项（clipboard = { enabled = true, primary = true, max_bytes = 33554432 }）
+--     不写表也行：clipboard = true（一个值管全部）
 
--- 照 niri 那套四个值：
---   屏幕边 → 窗口 = workspace_gaps_outer + window_gaps_outer
---   窗口 ↔ 窗口   = window_gaps_inner（列与列之间、同列上下之间）
--- `gaps <n>` 是简写，一次把四个都设成 n。默认（gaps 6）= 离屏幕边 6px、
--- 窗口之间 6px，和没有 gap 配置的时候长得一模一样。
--- workspace_gaps_inner（niri 里是「两块工作区之间」）暂时不生效：vidow 一块屏
--- 同时只显示一个工作区。留着是为了 niri 的配置能整段抄过来。
--- 负值一律当 0（负 gap 会让工作区比屏幕还大）。
---
--- gaps = 16                        -- 一次设满四个（niri 的默认值）
--- window_gaps_inner = 20           -- 只改窗口之间
--- window_gaps_outer = 0
--- workspace_gaps_outer = 40        -- 离屏幕边 40px
---
--- 四边单独设「离屏幕边」（i3-gaps 那套；只对外边距有意义，窗口之间只有横向和
--- 纵向两个方向）：-1 = 没设、跟随上面的统一值，>= 0 就用这个数。
--- gaps_top = 30                     -- 上边距 30，其余照旧
--- gaps_bottom = 0
--- gaps_left = 40
--- gaps_right = -1                   -- 显式回到「跟随统一值」
+-- ================== IPC
+-- 开 IPC socket（vidowmsg、状态栏、脚本靠它）
+ipc = true
+-- socket 路径，留空 = 按 WAYLAND_DISPLAY 自动取
+ipc_socket = ""
+-- 这一族也能写成一张表，只写要改的项（ipc = { enabled = true, socket = "" }）
+--     不写表也行：ipc = true（一个值管全部）
 
--- ---------------------------------------------------------- 工作区与窗口规则
+-- ================== 缩放与输出
+-- 缩放：auto = 按 EDID 的 ppi 推，也可以写死 "1" / "1.5"
+scale = "auto"
+-- 按输出名覆盖缩放（如 "DP-1:1.5,HDMI-A-1:1"），留空 = 用 scale
+outputs = ""
 
--- 工作区由你自己建、自己绑键（合成器不预设任何工作区键位）。
--- 特殊工作区不绑屏、不进 vidow.workspace_list()，显示在**当前聚焦的那块屏**上。
-for i = 1, 4 do
-	vidow.workspace_create(tostring(i))   -- 第二个参数可以指定它住哪块屏（连接器名）
-end
-vidow.workspace_special("scratch")
+-- ================== XWayland
+-- 开 XWayland（有人连 X 才启动服务）
+xwayland = true
+-- XWayland 的缩放：auto = 所有输出里最大的那个
+xwayland_scale = "auto"
+-- 给客户端设 XDG_SESSION_TYPE 这类 X11 环境变量
+xwayland_env = true
+-- 这一族也能写成一张表，只写要改的项（xwayland = { enabled = true, scale = "auto", env = true }）
+--     不写表也行：xwayland = true（一个值管全部）
 
-vidow.bind("Mod+1", "workspace 1")
-vidow.bind("Mod+Shift+1", "move 1")
-vidow.bind("Mod+grave", "special scratch")
-vidow.bind("Mod+Shift+grave", "move scratch")
-
--- 窗口规则：按 app_id / title / class 子串匹配（大小写不敏感），后面的覆盖前面的。
--- 一条规则至少写一个作用，不然在配置这一行就报错。
---
---   force_render        窗口滚到视口外 / 所在工作区被藏起来时，照样给它补帧回调
---                       （录屏、窗口预览、切回来看到的是新画面而不是冻住的一张）
---   hz                  这种窗口每秒补多少帧（0 = 不限速）；不写用全局 force_render_hz
---   focus_on_open       这个应用开新窗口时抢不抢焦点（默认抢）
---   focus_on_activate   别人请求激活它（点通知 / 任务栏按钮 / portal 顶窗口）时理不理
---                       （默认理）
---   honor_invalid_serial 它的激活请求**即使令牌里的 serial 校验不过**也照样理
---                       （默认不理）。工具包偷懒写 set_serial(0, seat) 的应用默认
---                       顶不上来，给它单独开这个口子比全局开关安全（见文件末尾）
-vidow.rule{ app_id = "mpv", force_render = true, hz = 30 }
-vidow.rule{ app_id = "Slack", focus_on_open = false }      -- 通知辅助窗口别抢焦点
--- vidow.rule{ app_id = "weird-app", focus_on_activate = false }
--- vidow.rule{ app_id = "令牌不灵的应用", honor_invalid_serial = true }
-
--- 激活令牌多久作废（秒，0 = 不过期，默认）。wlroots 默认 30 秒，而通知常常是几十分钟
--- 前弹的、现在才点 —— 令牌过期请求就被丢掉了（点了通知窗口不动）。
+-- ================== 窗口激活
+-- 激活令牌多久作废（秒），0 = 不过期
 activation_token_timeout = 0
+-- serial 校验不过的激活请求也理（默认不理）
+honor_xdg_activation_with_invalid_serial = false
 
--- 令牌里 serial 校验不过的激活请求理不理（默认不理，跟 niri / wlroots 一样）。
--- 工具包偷懒写 set_serial(0, seat) 的应用（很常见）默认顶不上来；打开这个就**所有
--- 应用**都照样理（niri 配置 debug 段里的 honor-xdg-activation-with-invalid-serial，
--- vidow 同名）。代价：这个校验本来是防随便抢焦点的，开了之后任何拿到令牌串的客户端
--- 都能顶你的窗口。所以更推荐上面那条窗口规则：只给需要的应用开口子。
--- honor_xdg_activation_with_invalid_serial = 1
-
--- ------------------------------------------------------------------ 剪贴板
-
--- X11(XWayland) <-> Wayland 剪贴板 / PRIMARY 同步。vidow 自己接了一份，**不看焦点**
--- （wlroots 那份只有 X11 窗口聚焦时才同步），两边各留一份内存副本，源应用退出之后照样
--- 能粘贴。关掉就退回 wlroots 那套（只有 X 窗口聚焦时才同步）。
--- clipboard = 1
--- clipboard_primary = 1        -- 0 = 连 PRIMARY（选区）也不碰
--- clipboard_max_bytes = 33554432   -- 每种 mime 的内存副本上限（超了丢这个类型并记日志）
-
--- 小抄（也能用 vidowmsg，见上面的 IPC 小抄）：
---     vidowmsg clipboard                      -- 状态：来源 / X owner / 字节数 / 类型列表
---     vidowmsg clipboard-get                  -- 取（文本直接给，别的类型给 base64 + mime）
---     vidowmsg clipboard-get --selection primary
---     vidowmsg clipboard-set "hello"          -- 放（也能 --mime image/png --base64）
---     vidowmsg clipboard-clear
--- 运行时改：vidowmsg set-config clipboard 0（不落盘，SIGHUP 之后按配置文件重来）
-
--- ---------------------------------------------------------------------- IPC
-
--- unix socket 上的 JSON 请求/应答 + 事件订阅（默认开）。状态输出和操作都尽量全，
--- 客户端是 build/vidowmsg（vidowmsg help 有清单）。路径默认按 WAYLAND_DISPLAY 取：
---     $XDG_RUNTIME_DIR/vidow-<WAYLAND_DISPLAY>.sock
--- 起状态栏 / 脚本时用 vidow.ipc_path() 把路径喂给子进程，别让它自己猜：
---     vidow.exec("waybar -c ~/.config/waybar/vidow.toml")     -- 子进程里 $VIDOW_SOCKET
--- 也可以直接写死路径（两个键都能用环境变量 VIDOW_IPC / VIDOW_IPC_SOCKET 覆盖）：
--- ipc = 0
--- ipc_socket = "/run/user/1000/vidow.sock"
-
--- 小抄：
---     vidowmsg state                 -- 全量（窗口/工作区/输出/layer/配置/…）
---     vidowmsg windows --raw | jq .  -- 原样输出，自己解析
---     vidowmsg toggle-floating --app-id mpv
---     vidowmsg set-config window_open_ms 60
---     vidowmsg watch                 -- 订阅事件（窗口开关/移动/焦点、layer、输出、工作区）
-vidow.log("config.lua: ipc = " .. vidow.ipc_path())
+-- ================== xdg-desktop-portal
+-- 把 XDG_CURRENT_DESKTOP 设成下面这个名字
+portal_conf_sync = true
+-- XDG_CURRENT_DESKTOP 的值（xdg-desktop-portal 按它选 <名字>-portals.conf）
+portal_desktop = "Vidow"
+-- 这一族也能写成一张表，只写要改的项（portal = { conf_sync = true, desktop = "Vidow" }）

@@ -97,8 +97,26 @@ static void server_finish(struct vidow_server *server) {
 }
 
 int main(int argc, char *argv[]) {
-	(void)argc;
-	(void)argv;
+	/* 只有一个参数：打印完整默认配置。不需要合成器起得来 —— 它是给
+	 * 「第一次写配置」和「想看看都有哪些键」用的。 */
+	for (int i = 1; i < argc; i++) {
+		if (strcmp(argv[i], "--default-config") == 0) {
+			vidow_config_default_lua(stdout);
+			return 0;
+		}
+		if (strcmp(argv[i], "--help") == 0 ||
+				strcmp(argv[i], "-h") == 0) {
+			fprintf(stderr,
+				"用法: vidow [选项]\n"
+				"  --default-config  打印一份完整的默认配置（Lua），"
+				"抄进 ~/.config/vidow/config.lua 即用\n"
+				"  --help            这个\n");
+			return 0;
+		}
+		fprintf(stderr, "vidow: 不认识的参数 '%s'（--help 看用法）\n",
+			argv[i]);
+		return 2;
+	}
 
 	wlr_log_init(log_level_from_env(), NULL);
 
