@@ -1953,8 +1953,6 @@ static void view_unmap(struct wl_listener *listener, void *data) {
 		/* 浮窗离开工作区；列里的窗口跟着列，不用记账。 */
 		vidow_workspace_track(view->ws, view, false);
 	}
-	/* 窗口没了，它那块工作区可能就空了 —— 栈中间的空工作区该收掉（niri）。 */
-	vidow_workspace_cleanup(server);
 	if (view->dragging) {
 		/* 拖着的时候窗口没了：撤掉 grab，别让指针还挂在一个已经没了的窗口上。 */
 		view->dragging = false;
@@ -1997,6 +1995,9 @@ static void view_unmap(struct wl_listener *listener, void *data) {
 		view_leave_column(view);
 	}
 
+	/* 列真的摘掉了，它那块工作区才可能变空 —— 栈中间的空工作区该收掉（niri：
+	 * 切走 / 关掉之后那块就没了）。放在 leave_column 之后：之前它还不算空。 */
+	vidow_workspace_cleanup(server);
 	vidow_arrange(server);
 }
 
@@ -2164,6 +2165,7 @@ static void view_destroy(struct wl_listener *listener, void *data) {
 		server->focused = NULL;
 	}
 	view_leave_column(view);
+	vidow_workspace_cleanup(server);
 
 	free(view);
 
@@ -2772,6 +2774,7 @@ static void x11_destroy_view(struct wl_listener *listener, void *data) {
 		server->focused = NULL;
 	}
 	view_leave_column(view);
+	vidow_workspace_cleanup(server);
 
 	free(view);
 

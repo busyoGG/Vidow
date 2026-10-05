@@ -536,6 +536,7 @@ python3 test-float.py        # 三个真实 GTK 窗口，验证浮动模式自�
 ./test-openanim.sh                   # 开窗动画画的是装饰后的窗口本身（不是一块更大的矩形，4 项断言）
 ./test-bounce.sh                     # 入场过冲 / 关闭回弹（q 弹曲线真的落到屏幕上了，5 项断言）
 ./test-drag.sh                       # 拖窗口：拖得动 / 跨屏改归属 / 平铺按落点插入（11 项）
+./test-ws-dynamic.sh                 # 动态工作区：栈底空位 / 空了就收 / 序号夹住 / 具名永存（9 项）
 ./test-dpi.sh                        # 混合 DPI + XWayland：装饰缓冲按**窗口几何**算（见 SSD 那节）
 ./build/jsontest                     # 只看 JSON 写出/读入（离线，30 项）
 ./build/scaletest                    # 只看缩放计算（24 项）
@@ -2592,6 +2593,13 @@ protocols/     wlr-layer-shell / wlr-virtual-pointer / input-method-v2 /
      默认配置里给了 `Mod+1..9` 直跳的绑定（可删）。`test-workspace.sh` 的日志断言跟着新格式
      改；`test-ipc.sh`/`test-focus.sh` 同步。回归：defaultconfig / gap / config / workspace /
      ipc / focus / overview / hotplug / clipboard / layerwin / xwayland-popup 全过。
+
+122. **动态工作区的收编时机 + `./test-ws-dynamic.sh`**。`cleanup` 原来挂在 unmap 里，
+     但那时候列还没摘掉 —— 工作区还不算空，于是「关掉窗口后那块空的、没名字的工作区」
+     要等到下次切工作区才收。挪到 `view_leave_column()` 之后（unmap 和 destroy 两条路
+     都挪），关掉窗口当场就收、序号跟着往前挪（实测：`1:-(1) 2:-(1) 3:-*` 关掉第 1 块
+     的窗口 → `1:-(1) 2:-*`）。新增 `./test-ws-dynamic.sh`（9 项）：栈底空位什么时候冒
+     出来、越界夹住、空的中段当场收掉、具名工作区空了也不消失且按声明顺序排栈顶。
 
 121. **鼠标拖窗口：浮动跨屏改归属，平铺新增 Mod+左键拖拽**（niri 的 interactive move）。
      平铺拖拽只动场景节点（`anim_off` 跟着光标，`vidow_place_view` 在 `view->dragging`
