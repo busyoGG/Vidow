@@ -1224,7 +1224,8 @@ surface 的内容渲染归 wlroots 的 scene 管（subsurface 树、buffer scale
     半透明面板透出来的是窗口的模糊）。这时按它自己那一小块区域重抓一份：基座是从共享
     底衬上 1:1 拷过来的那块（壁纸 + background / bottom 层），窗口连它的弹出物一起
     再画上去。代价跟**区域面积**成正比而不是整屏
-  - 缓存键 = 区域 + `gen_scene` / `gen_layer` + 级数 + `blur_offset` / `blur_alpha_min`：
+  - 缓存键 = 区域 + `gen_scene` / `gen_layer` + 级数 + `blur_offset`（剔除阈值不进金字塔，
+    它只影响装饰着色器，由 `blur_mask_min_changed()` 单独顶 `blur_ver`）：
     屏幕不动一次都不重抓（实测空转 3 秒 0 次），窗口每出一帧重抓一次（实测 3 秒 173
     帧 → 173 次，区域是一块 400x200 的面板那么大）
   - `overview` 里 `top` / `overlay` 那几棵树整体关着、这层模糊没人看得见，直接跳过
