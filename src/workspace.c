@@ -290,6 +290,31 @@ static bool output_present(struct vidow_server *server,
 	return false;
 }
 
+/* 列 / 列里的窗口、跟着这块工作区走的浮窗，output 全部设成 output（NULL 也照设，
+ * 见下面 ws_set_output_full 里那段注释）。认领一块**现在没屏**的工作区时也要走一遍：
+ * 工作区认领了、里面的窗口还指着 NULL 的话，屏幕上什么都看不到。 */
+static void ws_propagate_output(struct vidow_server *server,
+		struct vidow_workspace *ws, struct wlr_output *output) {
+	struct vidow_column *col;
+	wl_list_for_each(col, &ws->columns, link) {
+		column_set_output(col, output);
+	}
+	if (output == NULL) {
+		return; /* 没屏了：下面浮窗那段要按新屏原点算平移，没屏没什么可算的 */
+	}
+	/* 浮窗（不在列里）跟着工作区走：换屏时按两块屏原点的差平移，别让它留在
+	 * 上一块屏的坐标上（工作区换屏不该把它弄丢或者甩到屏外）。 */
+	struct vidow_view *view;
+	wl_list_for_each(view, &server->views, link) {
+		if (view->ws != ws || view->column != NULL || view->popup) {
+			continue;
+		}
+		view->output = output;
+		/* 位置不用在这里算：float.c 的摆放统一把「相对偏移」换算成新屏上的
+		 * 绝对位置（见那里的注释）。 */
+	}
+}
+
 /* 工作区换屏：整块工作区（列 + 浮窗）跟着挪过去。
  *
  * deliberate = 这是「人做的决定」（切换工作区、在某块屏上开了新窗口），于是 home 也
@@ -332,24 +357,7 @@ static void ws_set_output_full(struct vidow_server *server,
 	 * 输出名是一串乱码，之后谁读 view->output / col->output 谁拿到垃圾，XWayland
 	 * 的 X 屏幕也跟着变成 0x0 —— X11 客户端看不见也点不动（用户报的
 	 * 「xwayland 无法点击交互」就是这条路）。清成 NULL：那块屏回来时按 home 认领。 */
-	struct vidow_column *col;
-	wl_list_for_each(col, &ws->columns, link) {
-		column_set_output(col, output);
-	}
-	if (output == NULL) {
-		return; /* 没屏了：下面浮窗那段要按新屏原点算平移，没屏没什么可算的 */
-	}
-	/* 浮窗（不在列里）跟着工作区走：换屏时按两块屏原点的差平移，别让它留在
-	 * 上一块屏的坐标上（工作区换屏不该把它弄丢或者甩到屏外）。 */
-	struct vidow_view *view;
-	wl_list_for_each(view, &server->views, link) {
-		if (view->ws != ws || view->column != NULL || view->popup) {
-			continue;
-		}
-		view->output = output;
-		/* 位置不用在这里算：float.c 的摆放统一把「相对偏移」换算成新屏上的
-		 * 绝对位置（见那里的注释）。 */
-	}
+	ws_propagate_output(server, ws, output);
 }
 
 static void ws_set_output(struct vidow_server *server,
@@ -383,6 +391,10 @@ void vidow_workspace_adopt_homeless(struct vidow_server *server,
 			continue;
 		}
 		ws_splice(ws, output, k++);
+		/* 列和列里的窗口的 output 也要跟上：这块工作区可能是在「一块屏都没有」
+		 * 的时候被新窗口占上的（view_ensure_column 的兜底），光认领工作区的话
+		 * 窗口还指着 NULL —— 屏回来了，屏幕上却什么都没有。 */
+		ws_propagate_output(server, ws, output);
 		if (ws->home == NULL) {
 			ws->home = vidow_output_memory_for(&server->output_memories,
 				output->name);
@@ -392,6 +404,28 @@ void vidow_workspace_adopt_homeless(struct vidow_server *server,
 		wlr_log(WLR_INFO, "workspace: %s 认领了 %d 块还没归属的具名工作区"
 			"（按声明顺序排在上面）", output->name, k);
 	}
+}
+
+/* 现在**没有屏**的工作区里挑一块。见 workspace.h 的说明。 */
+struct vidow_workspace *vidow_workspace_homeless(struct vidow_server *server,
+		struct vidow_output_memory *home) {
+	if (server == NULL) {
+		return NULL;
+	}
+	struct vidow_workspace *first = NULL;
+	struct vidow_workspace *ws;
+	wl_list_for_each(ws, &server->workspaces, link) {
+		if (ws->special || ws->output != NULL) {
+			continue;
+		}
+		if (home != NULL && ws->home == home) {
+			return ws;
+		}
+		if (first == NULL) {
+			first = ws;
+		}
+	}
+	return first;
 }
 
 void vidow_workspace_normalize(struct vidow_server *server) {

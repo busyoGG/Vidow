@@ -83,6 +83,12 @@ struct vidow_workspace *vidow_workspace_active(struct vidow_server *server);
 struct vidow_workspace *vidow_workspace_active_for(struct vidow_server *server,
 		struct wlr_output *output);
 
+/* 现在**没有屏**的工作区（屏拔了 / 嵌套会话的外层窗口关了）里挑一块：优先 home
+ * 就是这块屏的，其次第一块；一块都没有返回 NULL。新窗口在「一块屏都没有」的时候
+ * 得有个地方安置（见 view.c 的 view_ensure_column）。 */
+struct vidow_workspace *vidow_workspace_homeless(struct vidow_server *server,
+		struct vidow_output_memory *home);
+
 /* 现在真正显示的东西：有特殊工作区开着就是它，否则是普通活动工作区。
  * 视图可见性、新窗口落点、overview 都看这一个函数。 */
 struct vidow_workspace *vidow_workspace_shown(struct vidow_server *server);

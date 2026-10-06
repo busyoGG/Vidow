@@ -22,6 +22,10 @@
 #      —— vidow 还活着，且不崩
 #   4) 这种状态下有 X 客户端连上来：日志里明说「一块屏都没有 → X 屏幕 0x0，
 #      X11 客户端看不见也点不动」（不然用户只会去查输入，查半天是会话没屏）
+#   5) 这种状态下 map 上来的窗口照样要收下（挂在一条现在没屏的工作区上）——
+#      不许崩（原来这里解引用空工作区，一 map 就 SEGV）
+#   6) 屏回来的时候，没屏期间收下的窗口跟着那块工作区一起回来（output 认领
+#      回去、窗口重新上屏）
 #
 # 用法：./test-lastoutput.sh    （VIDOW_TEST_KEEP=1 保留运行目录）
 set -u
@@ -39,12 +43,43 @@ pass() { echo "  PASS  $1"; }
 fail() { echo "  FAIL  $1"; FAILED=1; }
 mark() { echo; echo "== $1 =="; }
 
+# 本测试起的 vidow：**环境里带着本测试 RUNDIR 的那些**。别只认 $! ——
+# `setsid … &` 那一支里 setsid 有可能 fork，$! 是已经退出的父进程，kill 它等于
+# 什么都没做（实测每跑一遍漏一个 vidow 在那儿）。
+our_vidow_pids() {
+	for p in /proc/[0-9]*; do
+		local pid=${p#/proc/}
+		[ "$pid" = "$$" ] && continue
+		[ -r "$p/cmdline" ] || continue
+		case "$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null)" in
+		*"build/vidow"*) ;;
+		*) continue ;;
+		esac
+		[ -r "$p/environ" ] || continue
+		case "$(tr '\0' '\n' < "$p/environ" 2>/dev/null)" in
+		*"$RUNDIR"*) echo "$pid" ;;
+		esac
+	done 2>/dev/null
+}
+
+kill_strays() {
+	local pid
+	for pid in $(our_vidow_pids); do
+		kill -TERM "$pid" 2>/dev/null
+	done
+	sleep 0.4
+	for pid in $(our_vidow_pids); do
+		kill -KILL "$pid" 2>/dev/null
+	done
+}
+
 cleanup() {
 	for p in $NEST_PID $VIDOW_PID; do
 		[ -n "$p" ] && kill -TERM -- "-$p" 2>/dev/null
 	done
 	for p in $CLIENT_PIDS; do kill "$p" 2>/dev/null; done
-	sleep 0.5
+	kill_strays
+	sleep 0.3
 	for p in $NEST_PID $VIDOW_PID; do
 		[ -n "$p" ] && kill -KILL -- "-$p" 2>/dev/null
 	done
@@ -174,6 +209,7 @@ kill -KILL -- "-$VIDOW_PID" 2>/dev/null
 for p in $CLIENT_PIDS; do kill "$p" 2>/dev/null; done
 CLIENT_PIDS=""
 VIDOW_PID=""
+kill_strays
 sleep 0.5
 
 # ------------------------------------------------- 2) 嵌套会话：最后一块屏没了
@@ -288,12 +324,118 @@ if [ -n "$NEST_DISPLAY" ]; then
 	else
 		fail "X 屏幕 0x0 的时候日志没说明白（用户查不到原因）"
 	fi
+	# 这块 X 客户端的窗口**照样会 map**（XWayland 还活着），vidow 必须收下它 ——
+	# 以前这里直接解引用空工作区（view.c 的 view_ensure_column），一 map 就
+	# SEGV：用户报的「打开 kate 直接崩」就是这条（嵌套会话的外层窗口关掉之后
+	# 再开任何窗口都撞得上）。这条断言就在那个当口查，别等收尾。
+	NWIN_BEFORE=1
+	for _ in $(seq 1 24); do
+		NWIN=$(HOME="$RUNDIR/nest-home" WAYLAND_DISPLAY="$NEST_WD" \
+			timeout 5 ./build/vidowmsg windows 2>/dev/null | python3 -c '
+import sys, json
+raw = sys.stdin.buffer.read().decode("utf-8", "replace")
+try:
+    print(len(json.loads(raw)))
+except Exception:
+    print(-1)')
+		[ "$NWIN" -gt "$NWIN_BEFORE" ] 2>/dev/null && break
+		sleep 0.25
+	done
+	if ! kill -0 "$NEST_PID" 2>/dev/null; then
+		fail "没屏的时候 X 客户端 map 上来，vidow 崩了（空工作区被解引用）"
+	elif [ "${NWIN:-0}" -gt "$NWIN_BEFORE" ] 2>/dev/null; then
+		pass "没屏的时候 map 上来的窗口被收下了（窗口数 $NWIN_BEFORE → $NWIN）"
+	else
+		fail "没屏时 map 上来的窗口没进列表（窗口数 $NWIN）"
+	fi
 else
 	fail "嵌套会话没有 DISPLAY，XWayland 没起来"
 fi
 kill -0 "$NEST_PID" 2>/dev/null &&
 	pass "XWayland 在这状态下起来又走了一遭，vidow 还在" ||
 	fail "XWayland 那条路把 vidow 带崩了"
+
+# ------------------------------------------------- 3/3 没屏时开窗 → 屏回来
+mark "3/3 一块屏都没有的时候开新窗口：屏回来窗口跟着回来"
+printf 'window_close_ms = 0\nxwayland = true\n' \
+	> "$CFGDIR/.config/vidow/config.lua"
+# 先 add 一块（headless 后端得先「认下来」，全拔光之后就没法再插了），
+# 再把三块全拔掉 —— 这时候 server->outputs 是空的；最后插回来一块
+# （名字用「上次拔掉那块」，模拟同一根线又插上了）。
+VIDOW_LOG=debug WLR_BACKENDS=headless WLR_HEADLESS_OUTPUTS=2 \
+	VIDOW_TEST_OUTPUTS="1000:add:1280x720:HEADLESS-3,9000:remove:HEADLESS-1,10000:remove:HEADLESS-2,11000:remove:HEADLESS-3,16000:add:1280x720:last" \
+	setsid "$BIN" > "$LOG" 2>&1 &
+VIDOW_PID=$!
+for _ in $(seq 1 80); do grep -aq "vidow ready" "$LOG" && break; sleep 0.25; done
+if ! grep -aq "vidow ready" "$LOG"; then
+	echo "test-lastoutput.sh: vidow 没起来"; grep -a "ERROR" "$LOG" | head -5
+	exit 1
+fi
+export WAYLAND_DISPLAY=$(grep -ao "WAYLAND_DISPLAY=[a-z0-9-]*" "$LOG" |
+	tail -1 | cut -d= -f2)
+sleep 2
+setsid nohup python3 ./tools/pattern.py w1 > "$RUNDIR/w1.log" 2>&1 </dev/null &
+CLIENT_PIDS="$CLIENT_PIDS $!"
+sleep 1.5
+for _ in $(seq 1 60); do grep -aq "拔掉输出 HEADLESS-3" "$LOG" && break; sleep 0.5; done
+sleep 1
+NOUT=$(timeout 5 ./build/vidowmsg outputs 2>/dev/null)
+if [ "$(echo "$NOUT" | tr -d ' \n')" = "[]" ]; then
+	pass "三块屏全拔光（输出列表空了）"
+else
+	fail "输出列表不是空的：$NOUT"
+fi
+# 没屏的时候开一个新窗口（Wayland 一个、X11 一个）
+setsid nohup python3 ./tools/pattern.py w2 > "$RUNDIR/w2.log" 2>&1 </dev/null &
+CLIENT_PIDS="$CLIENT_PIDS $!"
+if [ -n "${DISPLAY_NOW:-}" ]; then :; fi
+sleep 3
+if ! alive; then
+	fail "没屏的时候开新窗口把 vidow 带崩了"
+else
+	pass "没屏的时候开新窗口：vidow 还活着"
+fi
+NWIN=$(timeout 5 ./build/vidowmsg windows 2>/dev/null | python3 -c '
+import sys, json
+raw = sys.stdin.buffer.read().decode("utf-8", "replace")
+print(len(json.loads(raw)))')
+if [ "$NWIN" = "2" ]; then
+	pass "两个窗口都被收下了（挂在现在没屏的工作区上）"
+else
+	fail "没屏时开的新窗口没进列表（窗口数 $NWIN）"
+fi
+# 屏插回来：工作区按名字认领回去，窗口跟着回来（output 不再是 null）
+for _ in $(seq 1 60); do grep -aq "test: 插上" "$LOG" && break; sleep 0.5; done
+sleep 3
+if ! alive; then
+	fail "屏插回来之后 vidow 没了"
+else
+	pass "屏插回来之后 vidow 还活着"
+fi
+BACK=$(timeout 5 ./build/vidowmsg windows 2>/dev/null | python3 -c '
+import sys, json
+raw = sys.stdin.buffer.read().decode("utf-8", "replace")
+outs = sorted({w.get("output") for w in json.loads(raw)})
+print(",".join(str(o) for o in outs))')
+if [ "$BACK" = "HEADLESS-3" ]; then
+	pass "插回来之后每个窗口都归到 HEADLESS-3 上了（没屏期间收下的也在）"
+else
+	fail "插回来之后窗口的 output 是「$BACK」，期望 HEADLESS-3（窗口没跟着工作区回来）"
+fi
+kill -TERM -- "-$VIDOW_PID" 2>/dev/null
+sleep 0.6
+kill -KILL -- "-$VIDOW_PID" 2>/dev/null
+VIDOW_PID=""
+for p in $CLIENT_PIDS; do kill "$p" 2>/dev/null; done
+CLIENT_PIDS=""
+kill_strays
+sleep 0.5
+LEFT=$(our_vidow_pids | wc -l)
+if [ "$LEFT" = "0" ]; then
+	pass "收尾干净：本测试起的 vidow 一个不剩"
+else
+	fail "收尾还剩 $LEFT 个 vidow（$(our_vidow_pids | tr '\n' ' ')）"
+fi
 
 echo
 if [ "$FAILED" = 0 ]; then

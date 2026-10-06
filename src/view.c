@@ -543,6 +543,18 @@ static void view_ensure_column(struct vidow_server *server,
 	struct vidow_workspace *ws = view->ws;
 	if (ws == NULL) {
 		ws = vidow_workspace_active(server);
+		if (ws == NULL) {
+			/* **一块屏都没有**（嵌套会话的外层窗口关了 / 最后一块屏拔了）：
+			 * 这时候没有「当前工作区」这回事，但窗口照样会 map —— XWayland
+			 * 还活着，X 客户端一连上来就 map（用户报的「打开 kate 直接崩」
+			 * 就是这条：原来这里直接解引用 NULL，SEGV 在 view_map 里）。
+			 * 安置到一块现在没屏的工作区上：屏回来的时候那块工作区会被认领
+			 * 回去（vidow_workspace_adopt_homeless），窗口跟着一起回来。 */
+			ws = vidow_workspace_homeless(server, view->home);
+			if (ws == NULL) {
+				ws = vidow_workspace_create(server, NULL, NULL);
+			}
+		}
 		view->ws = ws;
 	}
 	if (ws != NULL) {
@@ -565,7 +577,7 @@ static void view_ensure_column(struct vidow_server *server,
 	/* 落在栈底那块空的上了：它就是「新工作区」，底下再补一块（niri 的「窗口开
 	 * 在最后一块空工作区上时，下面立刻出现一块新的」）。要在列真的挂进工作区
 	 * 之后再判 —— 不然这时候它还是「空的」。 */
-	if (!ws->special && ws->output != NULL) {
+	if (ws != NULL && !ws->special && ws->output != NULL) {
 		vidow_workspace_ensure_bottom(server, ws->output);
 	}
 }

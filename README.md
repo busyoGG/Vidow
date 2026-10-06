@@ -733,7 +733,7 @@ python3 test-float.py        # 三个真实 GTK 窗口，验证浮动模式自�
 ./test-bounce.sh                     # 入场过冲 / 关闭回弹（q 弹曲线真的落到屏幕上了，5 项断言）
 ./test-closeanim.sh                  # 关闭动画：默认曲线下还看得见 + 不带窗口装饰（12 项断言）
 ./test-focusclose.sh                 # 关窗口后焦点落谁身上：右边最近的顶上（21 项断言）
-./test-lastoutput.sh                  # 屏没了不许留野指针（拔一块 / 最后一块没了，15 项断言）
+./test-lastoutput.sh                  # 屏没了不许留野指针、没屏时开窗不许崩（拔一块 / 最后一块没了，22 项断言）
 ./test-actsurface.sh                  # 激活令牌攥着的 surface 先没了也不能崩（8 项断言）
 ./test-drag.sh                       # 拖窗口：拖得动 / 跨屏改归属 / 平铺按落点插入（11 项）
 ./test-ws-dynamic.sh                 # 动态工作区：栈底空位 / 空了就收 / 序号夹住 / 具名永存（9 项）
@@ -3336,6 +3336,27 @@ protocols/     wlr-layer-shell / wlr-virtual-pointer / input-method-v2 /
      之间）、缩回是补间（200ms 里密集采样，必须量到 1 和 2 之间的中间值）。
 
      回归：42 个测试脚本全过（`test-jelly.sh` 28 项、`test-cursor-shake.sh` 50 项）。
+
+132. **一块屏都没有的时候开窗口不再崩**（用户报的「vidow 打开 kate 直接崩」）。崩在
+     `view_ensure_column()`（`src/view.c`）：`ws = view->ws` 和 `vidow_workspace_active()`
+     都拿不到工作区的时候（`server->outputs` 空、`focused_output` 为 NULL —— 嵌套会话把
+     外层窗口关了、真机上最后一块屏拔了），后面那行 `if (!ws->special && …)` 直接解引用
+     NULL，SEGV 落在 `view_map` 里。**窗口照样会 map**：XWayland 还活着，X 客户端一连上
+     来就 map（`test-lastoutput.sh` 的 xev 就是；用户那边是 kate）。
+
+     修法：这种状态下给新窗口安置一块**现在没屏**的工作区 —— 先找一块现成的
+     （`vidow_workspace_homeless()`：优先 home 就是这块窗口归属的那块屏的），一块都没有
+     就现建一块（`output == NULL`）；`ensure_bottom` 那一行加 `ws != NULL` 的判据。屏回来
+     的时候这块工作区会被 `vidow_workspace_adopt_homeless()` 认领回去，窗口跟着一起回来
+     —— 为此把 `ws_set_output_full()` 里「列 / 列里的窗口 / 跟着这块工作区的浮窗的
+     output 全部改掉」那一段抽成 `ws_propagate_output()`，认领那条路也要走一遍：光认领
+     工作区的话窗口还指着 NULL，屏回来了屏幕上却什么都没有（实测：画面全黑）。
+
+     `test-lastoutput.sh` 补 7 项（15 → 22）：①没屏时 X 客户端 map 上来之后 vidow 必须
+     还活着、窗口必须进列表（原来这条**测不到**：崩发生在最后一次 `kill -0` 之前，判据
+     写晚了）；②新增一段「三块屏全拔光 → 开两个窗口 → 插回来一块」，断言每个窗口的
+     output 都变成插回来那块屏（没屏期间收下的窗口跟着工作区一起回来）。把修复回退掉
+     跑一遍，这两条都会红（`段错误（核心已转储）`）。
 
 129. **配置按类别拆开：入口 `config.lua` + `configs/` 下一类一份**（`vidow.include()`）。
      原来那份「一份两三百行、什么都写在一起」的默认配置，改一个圆角要先滚过间距、模糊、
