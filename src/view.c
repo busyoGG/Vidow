@@ -2377,6 +2377,21 @@ static void view_commit(struct wl_listener *listener, void *data) {
 	/* 帧追踪（VIDOW_TRACE_FRAMES=1）：客户端在这里交帧。只记「真画在这块屏上、
 	 * 还显示着」的那些 —— 视口外的窗口本来就没人给它出帧，记了就是误报。
 	 * 这块屏要是从此不再出帧，就是「客户端在画、屏幕不更新」。 */
+	/* 帧追踪：客户端到底有没有在交帧（限速 150ms 一行）。「窗口停在最后一帧」
+	 * 这种事，第一刀就切在这里：客户端不交帧（在等帧回调/自己卡住）和交了帧而
+	 * 画面没更新，是两个完全不同的问题。 */
+	if (view->server->trace_timer != NULL) {
+		int64_t now_ns = vidow_now_ns();
+		if (now_ns - view->trace_commit_ns > 150 * 1000000LL) {
+			view->trace_commit_ns = now_ns;
+			struct wlr_surface *s0 = vidow_view_surface(view);
+			wlr_log(WLR_DEBUG, "trace: commit %s（缓冲 %dx%d）",
+				vidow_view_title(view) != NULL ?
+					vidow_view_title(view) : "(无题)",
+				s0 != NULL ? s0->current.buffer_width : 0,
+				s0 != NULL ? s0->current.buffer_height : 0);
+		}
+	}
 	struct vidow_output *trace_out =
 		vidow_output_lookup(view->server, view->output);
 	if (trace_out != NULL && view_shows(view) &&

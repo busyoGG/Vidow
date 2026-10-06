@@ -668,6 +668,29 @@ static struct wlr_buffer *render_source(struct wlr_buffer *buffer) {
 	return buffer;
 }
 
+/* 采样「客户端自己的表面缓冲」用的贴图。
+ *
+ * **优先借 wlr_client_buffer 自己那张**（wlr_buffer.h：`texture` 就是这个缓冲的
+ * 贴图）—— 它是 wlroots 画场景时用的那张，跟着客户端每次 attach 走。以前的写法
+ * 为了「拿到的贴图可以 destroy」而绕开它、对 `client->source` 另建一张：对
+ * **dmabuf 客户端**（Qt/KDE 那类：每帧重画同一个 dmabuf、只 commit 不换缓冲）那
+ * 张家出来的贴图一直是第一次导入的那版内容 —— 客户端在画、装饰缓冲也在重烘，
+ * 里面却永远是旧画面，屏幕上就是「窗口停在最后一帧」（实测 kate：文档改了、标题
+ * 带 *、装饰缓冲 dump 出来的还是旧文本，打字前后一像素不差）。
+ *
+ * 借来的**不许 destroy**（wlroots 的说明就在上面），所以返回 owned 标记：
+ * 借不到才退回去自己建一张，那时候 owned = true，用完要 destroy。 */
+static struct wlr_texture *client_texture(struct wlr_renderer *renderer,
+		struct wlr_buffer *buffer, bool *owned) {
+	struct wlr_client_buffer *client = wlr_client_buffer_get(buffer);
+	if (client != NULL && client->texture != NULL) {
+		*owned = false;
+		return client->texture;
+	}
+	*owned = true;
+	return wlr_texture_from_buffer(renderer, render_source(buffer));
+}
+
 /* VIDOW_FX_DUMP=N writes the first N rendered targets to /tmp so the effect
  * can be eyeballed without a screenshot protocol. VIDOW_BLUR_DUMP does the
  * same for the backdrop and the blurred result. */
@@ -965,8 +988,11 @@ static void backdrop_iter(struct wlr_scene_buffer *sb, int sx, int sy,
 			 y1 >= ctx->clip_y + ctx->clip_h || y2 <= ctx->clip_y)) {
 		return; /* 整块都在区域外：省下一次建贴图 */
 	}
-	struct wlr_texture *tex = wlr_texture_from_buffer(ctx->server->renderer,
-		render_source(sb->buffer));
+	/* 也是客户端/别人的缓冲：同样借 wrapper 的贴图（见 client_texture 的说明，
+	 * dmabuf 客户端对 source 另建的那张会一直是旧内容）。 */
+	bool tex_owned = true;
+	struct wlr_texture *tex = client_texture(ctx->server->renderer, sb->buffer,
+		&tex_owned);
 	if (tex == NULL) {
 		return;
 	}
@@ -980,7 +1006,9 @@ static void backdrop_iter(struct wlr_scene_buffer *sb, int sx, int sy,
 		.blend_mode = WLR_RENDER_BLEND_MODE_PREMULTIPLIED,
 	};
 	wlr_render_pass_add_texture(ctx->pass, &opts);
-	wlr_texture_destroy(tex);
+	if (tex_owned) {
+		wlr_texture_destroy(tex);
+	}
 }
 
 static bool backdrop_render(struct vidow_server *server,
@@ -1659,8 +1687,9 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 		return false;
 	}
 
-	struct wlr_texture *tex = wlr_texture_from_buffer(server->renderer,
-		render_source(src->buffer));
+	bool tex_owned = true;
+	struct wlr_texture *tex = client_texture(server->renderer, src->buffer,
+		&tex_owned);
 	if (tex == NULL) {
 		return false;
 	}
@@ -1699,7 +1728,9 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 		} else {
 			/* 两块装饰目标都还在飞（上一两帧还没上完屏）：这一帧干脆不画，
 			 * 让上帧的画面多停一帧，别拿没装饰的内容顶上去。 */
-			wlr_texture_destroy(tex);
+			if (tex_owned) {
+				wlr_texture_destroy(tex);
+			}
 			return false;
 		}
 	}
@@ -1732,7 +1763,10 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 			wlr_texture_destroy(atex);
 		}
 	}
-	wlr_texture_destroy(tex);
+	if (tex_owned) {
+		wlr_texture_destroy(tex);
+	}
+	tex_owned = false; /* 借来的那张已经还了，后面别再碰 */
 
 	if (displayed == NULL) {
 		return false;

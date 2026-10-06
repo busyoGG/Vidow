@@ -165,9 +165,12 @@ run_case() { # <slug> <标题> <内容该上屏: yes|no> <该有追踪行: yes|n
 			pass "那行点名了是哪块屏（HEADLESS-1）" ||
 			fail "那行没点名屏"
 	else
-		grep -aq "trace:" "$LOG" &&
-			fail "不该有 trace 行：$(grep -a 'trace:' "$LOG" | tail -1)" ||
-			pass "没有 trace 行"
+		# 这一支给「健康 + 追踪开」和「追踪关」共用：两者都不许出现
+		# 「帧链断了」那条 ERROR（追踪开着时也不许误报）。追踪关掉那一档
+		# 另外在收尾里断言「一条 trace 日志都没有」。
+		grep -aqE "\[ERROR\].*trace:" "$LOG" &&
+			fail "不该有帧链断掉的 ERROR：$(grep -aE '\[ERROR\].*trace:' "$LOG" | tail -1)" ||
+			pass "没有「帧链断了」的 ERROR（不误报）"
 	fi
 	vidow_alive && pass "vidow 还活着" || fail "vidow 挂了"
 	stop_vidow
@@ -179,6 +182,9 @@ run_case healthy "1/3 健康 + 追踪开（不误报）" yes no VIDOW_TRACE_FRAM
 grep -aq "帧追踪: 开" "$LOG" &&
 	pass "启动时打了「帧追踪: 开」" ||
 	fail "没打启动行"
+grep -aq "trace: commit" "$LOG" &&
+	pass "客户端每次交帧都记一行（DEBUG）—— 帧链断没断就靠它和帧事件对账" ||
+	fail "没记到客户端交帧，追踪没在工作"
 
 # ---------------------------------------------------------------- 2) 掐断帧链
 

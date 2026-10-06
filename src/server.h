@@ -632,6 +632,8 @@ struct vidow_view {
 	 * minimized_seq：什么时候收起来的（单调递增），「放回最近收起来的那个」按它挑。 */
 	bool minimized;
 	uint64_t minimized_seq;
+	/* 帧追踪用：上一次记 commit 的时间（VIDOW_TRACE_FRAMES=1 才写） */
+	int64_t trace_commit_ns;
 
 	/* X11（XWayland）专用：popup = 菜单 / 提示 / 下拉框这类「弹出物」。对应
 	 * Wayland 的 xdg_popup：不装饰、不跑 shader、不做开关动画、不参与布局

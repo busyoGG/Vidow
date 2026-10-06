@@ -762,7 +762,8 @@ python3 test-float.py        # 三个真实 GTK 窗口，验证浮动模式自�
 ./test-focusclose.sh                 # 关窗口后焦点落谁身上：右边最近的顶上（21 项断言）
 ./test-lastoutput.sh                  # 屏没了不许留野指针、没屏时开窗不许崩（拔一块 / 最后一块没了，22 项断言）
 ./test-actsurface.sh                  # 激活令牌攥着的 surface 先没了也不能崩（8 项断言）
-./test-frametrace.sh                 # 帧追踪：某块屏的帧链断了（窗口停在最后一帧）要报出来（16 项断言）
+./test-frametrace.sh                 # 帧追踪：某块屏的帧链断了（窗口停在最后一帧）要报出来（17 项断言）
+./test-dmabuf-update.sh              # dmabuf 客户端（kate）的新画面必须真的上屏（5 项断言）
 ./test-preinit.sh                    # 状态请求抢在第一次 commit 之前（set_maximized /
                                      #   set_minimized / set_fullscreen）不许把合成器打死（22 项断言）
 ./test-drag.sh                       # 拖窗口：拖得动 / 跨屏改归属 / 平铺按落点插入（11 项）
@@ -1695,6 +1696,24 @@ vidowmsg clipboard-clear
 配置在 `~/.config/vidow/config.lua`：`decor_enabled` / `corner_radius` / `border_width` /
 `border_color` / `border_color_focus` / `shadow_radius` / `shadow_color` /
 `shadow_offset_x,y` / `window_opacity` / `noise` / `prefer_no_csd`。
+
+### 取客户端的贴图：借 `wlr_client_buffer` 自己那张，别对 `source` 另建
+
+装饰管线把窗口画进自己那块离屏缓冲（+边框/圆角/阴影/模糊），采样的是**客户端的表面
+缓冲**。这一步以前为了「拿到的贴图能 `destroy`」而绕开 wlrroots 给客户端缓冲包的那层
+（`wlr_client_buffer`）、对 `client->source` 再建一张 —— 对 **dmabuf 客户端**（Qt/KDE
+那类：每帧重画同一个 dmabuf、只 `commit` 不换缓冲）那张贴图**一直是第一次导入的那版
+内容**：客户端在画、装饰缓冲也在重烘，里面却永远是旧画面，屏幕上就是「窗口停在最后一
+帧」（kate / dolphin / konsole 都这样；拖到另一块屏会重新烘一次背衬，画面才跟上）。
+GTK 在我这儿走 shm，所以看不出问题 —— 用户报的正是「只有 KDE 系」。
+
+现在统一走 `client_texture()`（`src/fx.c`）：**优先借 `wlr_client_buffer->texture`**
+（wlroots 画场景用的就是它，跟着客户端每次 attach 走），借来的按 `owned = false` 处理、
+**不 destroy**；借不到才自己建一张（那时 `owned = true`）。装饰这条路（窗口 + layer 的
+背衬抓取）和 jelly 那几条都按同一套规矩来。
+
+回归判据：`./test-dmabuf-update.sh`（拿 kate 当 dmabuf 客户端，打字前后比屏幕像素：
+修之前 0，修之后 ~949；同时比装饰缓冲 dump 的前后两帧）。
 
 ### 装饰按「可见窗口」画，不按表面（niri 的 `size()` / `buf_loc()`）
 
@@ -2676,6 +2695,10 @@ test-outputpos.sh  显示器配置（`vidow.output{ name = …, scale = …, x =
                    按名字摆（自动排的顺序是后端给的，headless 上实测是反的）、
                   只写 x 不写 y 也认、项名写错当场报错、拔插后回到配置说的位置、
                   SIGHUP 改配置立刻生效
+test-dmabuf-update.sh
+                   dmabuf 客户端（Qt/KDE）的新画面必须上屏：装饰管线取客户端贴图要借
+                   wlr_client_buffer 自己那张，对 source 另建的那张对 dmabuf 客户端
+                   会一直是旧内容（kate 打字后屏幕 0 像素变化 → 现在 ~949）
 test-frametrace.sh  帧追踪：某块屏的帧链断了（page-flip 不回来）—— 那块屏上的窗口全停在
                    最后一帧、拖到另一块屏就活。headless 上用 VIDOW_TEST_STALL_OUTPUT
                    把帧事件按住复现，判据是 VIDOW_TRACE_FRAMES=1 的那行 ERROR（点名屏、
@@ -3497,6 +3520,43 @@ protocols/     wlr-layer-shell / wlr-virtual-pointer / input-method-v2 /
      没有**（不误报）；②掐断帧链 + 追踪开：客户端确实交过帧，追踪报出 ERROR 且点名
      HEADLESS-1、写明「客户端还在交帧，屏幕却不更新」；③掐断帧链 + 追踪**关**：一条 trace
      日志都没有、vidow 照样活着（诊断不改变行为）。
+
+136. **KDE 系（Qt/KDE）的窗口「不渲染新画面」**（用户报的：kate 停在最后一帧、dolphin
+     内容不出来，**其他软件正常、包括普通 Qt**）。真机追下来是**装饰管线取客户端贴图的
+     那一步**：
+
+     `vidow_fx_frame()` 把窗口画进自己的离屏缓冲（边框/圆角/阴影/模糊），采样的是客
+     户端的表面缓冲。原来那儿为了「拿到的贴图能 `destroy`」而绕开 wlroots 给客户端缓冲
+     包的那层 `wlr_client_buffer`、用 `render_source()` 对 `client->source` **另建**一张
+     （注释写着「在 wlr_client_buffer 上会拿到缓存好的贴图，不能销毁」）。问题就在这张
+     另建的贴图上：对 **dmabuf 客户端**（Qt/KDE：每帧重画同一个 dmabuf、只 `commit` 不
+     换缓冲）它一直是**第一次导入的那版内容** —— 客户端在画、装饰缓冲也在重烘，里面却
+     永远是旧画面，屏幕上就是「窗口停在最后一帧」；拖到另一块屏会重新烘一次背衬，画面
+     才跟上（用户描述的正是这个）。GTK（我这儿走 shm）看不出来。
+
+     证据链（全在 headless 上复现）：
+     ①kate：打字后标题变 `hotplug.c *`（文档真改了）而屏幕**0 像素变化**；同一套 vidow
+     里 nautilus（GTK）打字后变了 24696 像素 —— 和用户「只有 KDE 系」一致；
+     ②`VIDOW_FX_DUMP` 把装饰缓冲 dump 出来：打字之后重烘的那张里，编辑区还是**旧文本**
+     （没有打进去的字、标签栏也没有修改标记）；
+     ③把 `wlr_output_schedule_frame` 收口 + 每帧 commit 的 DEBUG 追踪（见 135）先证明
+     「客户端确实在交帧、输出也在出帧」—— 于是范围就缩到「烘进去的是旧贴图」这一处。
+
+     修法：统一走 `client_texture()`（`src/fx.c`）——**优先借 `wlr_client_buffer->texture`**
+     （wlroots 画场景用的就是它，跟着每次 attach 走），借来的 `owned = false`、**不
+     destroy**；借不到才自己建一张。窗口那条路、layer 背衬抓取那条路（同一份 trick）
+     都改过来。
+
+     新增 `./test-dmabuf-update.sh`（5 项，headless，没装 kate 就跳过）：拿 kate 当
+     dmabuf 客户端，打字前后比**屏幕像素**（修之前 0、修之后 ~949）+ 比**装饰缓冲 dump**
+     的前后两帧（把「谁没更新」钉在装饰管线那一层）+ vidow 全程活着 + 收尾干净。把
+     `src/fx.c` 的修复回退掉跑一遍：两条像素断言都红（0 像素）✓。
+
+     回归：`test-dmabuf-update.sh` 5/5、`test-layerblur.sh` 4/4、`test-layermask.sh` 3/3、
+     `test-layerwin.sh` 4/4、`test-blurlevel.sh` 3/3、`test-jelly.sh` 28/28、
+     `test-capture-hide.sh` 30/30、`test-openanim.sh` 5/5、`test-closeanim.sh` 13/13、
+     `test-dpi.sh` 15/15、`test-frametrace.sh` 17/17、`test-preinit.sh` 22/22、
+     `test-drag.sh` 11/11。
 
 129. **配置按类别拆开：入口 `config.lua` + `configs/` 下一类一份**（`vidow.include()`）。
      原来那份「一份两三百行、什么都写在一起」的默认配置，改一个圆角要先滚过间距、模糊、
