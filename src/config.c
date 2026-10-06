@@ -41,27 +41,49 @@ struct entry {
 	enum kind kind;
 	size_t offset;
 	size_t size;
-	int section;      /* 打印默认配置时的分节，见 section_titles[] */
+	int section;      /* 打印默认配置时的分节，见 sections[] */
 	const char *doc;  /* 打印在那行配置上面的注释（不能有换行） */
 };
 
-/* 默认配置的分节标题。entries[] 按这个顺序排，打印时换节就插一个标题。 */
-static const char *section_titles[] = {
-	"间距（gap）",
-	"窗口装饰",
-	"背景模糊",
-	"开关动画",
-	"自定义着色器",
-	"刷新与补帧",
-	"剪贴板",
-	"IPC",
-	"缩放与输出",
-	"XWayland",
-	"窗口激活",
-	"xdg-desktop-portal",
-	"指针",
+/* 配置的「类」。entries[] 按这个顺序排（section 就是这里的下标），一份默认配置
+ * 也按这个顺序拆成 configs/ 下的文件：一类一个文件，入口 config.lua 用
+ * vidow.include() 把它们读进来。
+ *
+ * 顺序是有意义的：include 的先后 = 键生效的先后（同一个键只有第一次写的算数），
+ * 文件名的数字前缀就是为了让这个顺序在文件管理器里也看得出来。 */
+struct section {
+	const char *title; /* 文件里的分节标题 */
+	const char *file;  /* configs/ 下的文件名 */
+	const char *doc;   /* 文件头多一句说明（可为 NULL） */
 };
-#define N_SECTIONS (sizeof(section_titles) / sizeof(section_titles[0]))
+
+static const struct section sections[] = {
+	{ "间距（gap）", "01-gaps.lua", NULL },
+	{ "窗口装饰", "02-decor.lua",
+		"圆角、边框、阴影、不透明度 —— 这一类的开关是 decor_enabled" },
+	{ "背景模糊", "03-blur.lua", NULL },
+	{ "开关动画", "04-anim.lua",
+		"窗口 / layer 的开关与移动动画，以及拖窗口时的果冻效果（jelly）" },
+	{ "自定义着色器", "05-shader.lua", NULL },
+	{ "刷新与补帧", "06-render.lua", NULL },
+	{ "剪贴板", "07-clipboard.lua", NULL },
+	{ "IPC", "08-ipc.lua", NULL },
+	{ "缩放与输出", "09-output.lua",
+		"缩放是一个键；每块屏的缩放 / 位置 / 模式用 vidow.output{…} 声明" },
+	{ "XWayland", "10-xwayland.lua", NULL },
+	{ "窗口激活", "11-activation.lua", NULL },
+	{ "xdg-desktop-portal", "12-portal.lua", NULL },
+	{ "指针", "13-cursor.lua", NULL },
+	/* 最后一份不是「键」，是 vidow.* 的调用（键位 / 工作区 / 窗口规则）。 */
+	{ "工作区 / 键位 / 规则", "14-keys.lua",
+		"这一份没有配置键，全是 vidow.bind() / vidow.workspace_create() / "
+		"vidow.rule() 这类调用" },
+};
+#define N_SECTIONS ((int)(sizeof(sections) / sizeof(sections[0])))
+/* 最后一份是「调用」不是「键」：entries[] 里没有它，打印也单独一套。 */
+#define SECTION_KEYS (N_SECTIONS - 1)
+/* 缩放与输出那一节多一段 vidow.output{…} 的写法（不是配置键）。 */
+#define SECTION_OUTPUT 8
 
 #define OFF(field) offsetof(struct vidow_config, field)
 #define SZ(field) sizeof(((struct vidow_config *)0)->field)
@@ -923,49 +945,37 @@ static void print_section_groups(FILE *f, const struct vidow_config *cfg,
 	}
 }
 
-/* 打印一份完整的默认配置（`vidow --default-config`）。每个键都写着它的默认
- * 值：抄下来就等于什么都没改，改哪行哪行才生效。不读环境变量 —— 打出来的
- * 是「什么都没配」时的样子。 */
-void vidow_config_default_lua(FILE *out) {
-	struct vidow_config cfg;
-	defaults(&cfg);
-	FILE *f = out != NULL ? out : stdout;
+/* ------------------------------------------------- 默认配置（打印 / 落盘）
+ *
+ * 默认配置不是一整份文件：按上面 sections[] 拆成一类一个文件（configs/），入口
+ * 只剩 include 行。打印和落盘都从同一张表出来 —— 「入口」「各类文件」「仓库里的
+ * 示例」三者不会走散。
+ *
+ * 每个键都写着它的默认值：抄下来就等于什么都没改，改哪行哪行才生效。不读环境
+ * 变量 —— 打出来的是「什么都没配」时的样子。 */
 
-	fputs(
-"-- vidow 的完整默认配置（`vidow --default-config` 打印出来的一份）\n"
-"--\n"
-"-- 每行都是内置默认值：整份抄到 ~/.config/vidow/config.lua 就等于什么都没改。\n"
-"-- 文件里写了的键会一直盖住内置默认值 —— 想让 vidow 以后改进的默认值生效，\n"
-"-- 就把那一行删掉（或者注释掉）。\n"
-"--\n"
-"-- 一族配置可以写成一张表，只盖其中几项，比如：\n"
-"--     gaps   = 10\n"
-"--     gaps   = { top = 30, inner = 20 }       -- 上边距 30、窗口之间 20、其余 6\n"
-"--     border = { width = 0, color = \"#2a2e3aff\" }\n"
-"--\n"
-"-- 显示器（输出）是一块屏一组：缩放、摆在哪儿、什么模式、开不开 VRR、几位色\n"
-"-- 都是这块屏的事，写在一行里（写几行就是几块屏；只写要管的字段）：\n"
-"--     vidow.output{ name = \"DP-3\", scale = 2, x = 0, y = 0, mode = \"3840x2160@144\" }\n"
-"--     vidow.output{ name = \"DP-2\", scale = 2, x = 1920, y = 0, vrr = true, depth = 10 }\n"
-"--     vidow.output{ name = \"HDMI-A-1\", enabled = false }\n"
-"-- 表里的项名写在下面每一节里；平铺键（gaps_inner = 20）和表写法是一回事。\n"
-"--\n"
-"-- 优先级：环境变量 VIDOW_<键名大写> > 这个文件 > 内置默认值。\n"
-"-- 同一个键在文件里写两遍只有第一遍生效（第一遍之后它就是个普通全局变量了）。\n"
-"-- 运行时改：vidowmsg set-config <键> <值>（不落盘）。\n"
-"-- 改完这个文件不用重启：  kill -HUP $(pgrep -x vidow)\n", f);
+/* 分类文件的文件头：说清楚它自己是怎么被读进来的。 */
+static void print_section_header(FILE *f, int section) {
+	fprintf(f,
+		"-- %s —— vidow 配置的一类，由入口 config.lua 读进来：\n"
+		"--     vidow.include(\"configs/%s\")\n"
+		"--\n"
+		"-- 下面每行都是内置默认值：改哪行哪行才生效，删掉那行就回到默认值。\n",
+		sections[section].title, sections[section].file);
+	if (sections[section].doc != NULL) {
+		fprintf(f, "-- %s\n", sections[section].doc);
+	}
+	fputc('\n', f);
+}
 
-	int section = -1;
+/* 一节的配置键：注释 + 键 = 默认值，末尾附上这一节的「族」写法提示。 */
+static void print_section_keys(FILE *f, const struct vidow_config *cfg,
+		int section) {
+	fprintf(f, "-- ================== %s\n", sections[section].title);
 	for (size_t i = 0; i < sizeof(entries) / sizeof(entries[0]); i++) {
 		const struct entry *e = &entries[i];
 		if (e->section != section) {
-			if (section >= 0) {
-				print_section_groups(f, &cfg, section);
-			}
-			section = e->section;
-			fprintf(f, "\n-- ================== %s\n",
-				section < (int)N_SECTIONS ? section_titles[section]
-					: "其他");
+			continue;
 		}
 		const char *derived = derived_note(e->key);
 		if (derived != NULL) {
@@ -975,15 +985,31 @@ void vidow_config_default_lua(FILE *out) {
 			continue;
 		}
 		fprintf(f, "-- %s\n%s = ", e->doc != NULL ? e->doc : "", e->key);
-		print_lua_value(f, &cfg, e->key, e->kind);
+		print_lua_value(f, cfg, e->key, e->kind);
 		fputc('\n', f);
 	}
-	if (section >= 0) {
-		print_section_groups(f, &cfg, section);
-	}
+	print_section_groups(f, cfg, section);
+}
 
+/* 缩放与输出那一节多一段：每块屏的声明写法（那不是配置键，是 vidow.output{}）。 */
+static void print_output_hint(FILE *f) {
 	fputs(
 "\n"
+"-- 显示器（输出）是另一类写法：**一块屏一组** —— 缩放、摆在哪儿（逻辑坐标）、\n"
+"-- 什么模式、开不开 VRR、几位色、方向、开不开，都是这块屏的事，写在一行里\n"
+"-- （写几行就是几块屏；只写要管的字段，没写的 vidow 一概不动）：\n"
+"--\n"
+"--     vidow.output{ name = \"DP-3\", scale = 2, x = 0, y = 0 }\n"
+"--     vidow.output{ name = \"DP-2\", scale = 2, x = 1920, y = 0, vrr = true, depth = 10 }\n"
+"--     vidow.output{ name = \"HDMI-A-1\", enabled = false }\n"
+"--\n"
+"-- 模式有哪些先看 `vidowmsg outputs`。老写法（outputs / output_positions）已经\n"
+"-- 没了，写了会在日志里喊一声。\n", f);
+}
+
+/* 14-keys.lua：键位 / 工作区 / 规则。没有配置键，全是 vidow.* 的调用。 */
+static void print_keys_lua(FILE *f) {
+	fputs(
 "-- ================== 工作区（niri 那套：动态、按屏、按序号）\n"
 "--\n"
 "-- 每块屏各自一份纵向的工作区栈，序号 = 在这块屏上从上往下第几块。栈底永远是\n"
@@ -1000,10 +1026,151 @@ void vidow_config_default_lua(FILE *out) {
 "-- 内置键位：Mod+U / Mod+I 上下切工作区，Mod+Shift+U/I 把窗口搬到上/下一块，\n"
 "-- Mod+Ctrl+U/I 整块工作区上下重排。下面 18 行是「数字键直跳」的绑定，不想要\n"
 "-- 就删掉（工作区是动态的，Mod+3 会夹到当前最后一块，用着用着就长出来了）。\n"
+"--\n"
+"-- 窗口规则 / 键位也写在这一份里：\n"
+"--     vidow.rule{ app_id = \"mpv\", title = \"预览\", force_render = true }\n"
+"--     vidow.bind(\"Mod+M\", \"minimize-window\")   -- 动作字符串见 README 的动作表\n"
 "for i = 1, 9 do\n"
 "\tvidow.bind(\"Mod+\" .. i, \"workspace \" .. i)\n"
 "\tvidow.bind(\"Mod+Shift+\" .. i, \"move \" .. i)\n"
 "end\n", f);
+}
+
+/* 一份分类文件的正文（不含文件头）。 */
+static void print_section_body(FILE *f, const struct vidow_config *cfg,
+		int section) {
+	if (section == SECTION_KEYS) {
+		print_keys_lua(f);
+		return;
+	}
+	print_section_keys(f, cfg, section);
+	if (section == SECTION_OUTPUT) {
+		print_output_hint(f);
+	}
+}
+
+/* 一份分类文件（`vidow --default-config 02-decor.lua` 打出来的那份）。 */
+static void print_section_file(FILE *f, const struct vidow_config *cfg,
+		int section) {
+	print_section_header(f, section);
+	print_section_body(f, cfg, section);
+}
+
+/* 入口 config.lua：只写「哪一类配置在哪个文件里」。 */
+void vidow_config_default_lua(FILE *out) {
+	FILE *f = out != NULL ? out : stdout;
+
+	fputs(
+"-- vidow 的配置入口 —— 下面每一行 include 把一类配置读进来，就这一件事。\n"
+"--\n"
+"-- 一类一个文件，都在 configs/ 下。相对路径按**这个文件所在目录**解析（跟 C 的\n"
+"-- #include \"…\" 一个意思），所以在 configs/ 里的文件互相 include 也一样好使。\n"
+"-- include 的先后 = 键生效的先后（同一个键只有第一次写的算数），别打乱。\n"
+"-- 想删掉某一类：把那一行 include 删掉就行（文件留着不碍事）。\n"
+"--\n"
+"-- 整份默认配置（每行都是内置默认值）：\n"
+"--     vidow --default-config                 这个入口\n"
+"--     vidow --default-config all             全部分类文件拼在一起（能当单文件配置用）\n"
+"--     vidow --default-config 02-decor.lua    其中一份（也认 --default-config decor）\n"
+"--     vidow --write-config                   一步写到配置目录（入口 + configs/）\n"
+"--\n"
+"-- 优先级：环境变量 VIDOW_<键名大写> > 配置文件 > 内置默认值。\n"
+"-- 改哪一份都行，改完不用重启（config.lua 和 include 进来的文件都盯着）：\n"
+"--     kill -HUP $(pgrep -x vidow)\n"
+"-- 运行时改：vidowmsg set-config <键> <值>（不落盘）。\n"
+"\n", f);
+
+	for (int i = 0; i < N_SECTIONS; i++) {
+		/* 注释对齐一列：最长的一行是 vidow.include("configs/07-clipboard.lua")
+		 * （41 个字符）。 */
+		char line[64];
+		snprintf(line, sizeof(line), "vidow.include(\"configs/%s\")",
+			sections[i].file);
+		fprintf(f, "%-43s-- %s\n", line, sections[i].title);
+	}
+}
+
+/* 全部分类文件拼在一起（`vidow --default-config all`）。include 就是就地展开，
+ * 所以这一份本身也是能直接用的单文件配置：
+ *     vidow --default-config all > ~/.config/vidow/config.lua */
+void vidow_config_default_all_lua(FILE *out) {
+	struct vidow_config cfg;
+	defaults(&cfg);
+	FILE *f = out != NULL ? out : stdout;
+
+	fputs(
+"-- vidow 的完整默认配置：入口 config.lua + configs/ 下的每一份拼在一起\n"
+"-- （vidow.include() 就是就地展开，所以这份能当单文件配置直接用）。\n"
+"-- 每个键都写着内置默认值：改哪行哪行才生效，删掉那行就回到默认值。\n"
+"-- 优先级：环境变量 VIDOW_<键名大写> > 配置文件 > 内置默认值。\n", f);
+
+	for (int i = 0; i < N_SECTIONS; i++) {
+		fprintf(f,
+			"\n-- ============================================================\n"
+			"-- configs/%s\n"
+			"-- ============================================================\n",
+			sections[i].file);
+		print_section_body(f, &cfg, i);
+	}
+}
+
+/* 分类文件有几个 / 第几个叫什么（--help 和报错时列名字用）。 */
+int vidow_config_section_count(void) {
+	return N_SECTIONS;
+}
+
+const char *vidow_config_section_file(int index) {
+	return index >= 0 && index < N_SECTIONS ? sections[index].file : NULL;
+}
+
+/* `--default-config <名字>`：认 "02-decor.lua"，也认 "decor"（省掉数字前缀和
+ * .lua 后缀）。认不出来返回 -1。 */
+int vidow_config_section_index(const char *name) {
+	if (name == NULL || name[0] == '\0') {
+		return -1;
+	}
+	for (int i = 0; i < N_SECTIONS; i++) {
+		if (strcmp(sections[i].file, name) == 0) {
+			return i;
+		}
+	}
+	/* 省掉数字前缀（01-）和 .lua 后缀的写法：--default-config decor 也认。 */
+	const char *base = name;
+	if (isdigit((unsigned char)base[0]) && isdigit((unsigned char)base[1]) &&
+			base[2] == '-') {
+		base += 3;
+	}
+	size_t len = strlen(base);
+	if (len > 4 && strcmp(base + len - 4, ".lua") == 0) {
+		len -= 4;
+	}
+	for (int i = 0; i < N_SECTIONS; i++) {
+		const char *f = sections[i].file;
+		if (isdigit((unsigned char)f[0]) && isdigit((unsigned char)f[1]) &&
+				f[2] == '-') {
+			f += 3;
+		}
+		size_t flen = strlen(f);
+		if (flen > 4 && strcmp(f + flen - 4, ".lua") == 0) {
+			flen -= 4;
+		}
+		if (flen == len && strncmp(f, base, len) == 0) {
+			return i;
+		}
+	}
+	return -1;
+}
+
+/* 打印一份分类文件（`vidow --default-config <名字>`）。名字不认识返回 false。 */
+bool vidow_config_default_section_lua(FILE *out, const char *name) {
+	int section = vidow_config_section_index(name);
+	if (section < 0) {
+		return false;
+	}
+	struct vidow_config cfg;
+	defaults(&cfg);
+	print_section_file(out != NULL ? out : stdout, &cfg, section);
+	return true;
 }
 
 /* mkdir -p：配置目录第一次用的时候通常整条路径都不在（~/.config 也在）。
@@ -1027,15 +1194,23 @@ static int mkdir_parents(const char *dir) {
 	return 0;
 }
 
-/* 把上面那份默认配置落到磁盘（`vidow --write-config`）。
+/* 把默认配置落到磁盘（`vidow --write-config`）：入口 + configs/ 下的每一份。
  *
- * 为什么要有：默认值只有 `--default-config` 打在屏幕上，想改一格就得先把整份
+ * 为什么要有：默认值只有 --default-config 打在屏幕上，想改一格就得先把整份
  * 重定向进文件（还得自己 mkdir 配置目录）。这里一步到位，并且**不覆盖已有的**
- * —— 配置目录里那份是用户改过的东西，覆盖它等于把人家的设置扔了。 */
-int vidow_config_write_default(const char *path, bool force, char *err,
-		size_t err_len) {
+ * —— 配置目录里那份是用户改过的东西，覆盖它等于把人家的设置扔了。
+ *
+ * 入口已经有一份就整个不写（非 0 退出）；configs/ 里已经有的那几份跳过、只补
+ * 缺的。要全部覆盖加 --force。写出来 / 跳过了哪些，都打在 report 上。 */
+int vidow_config_write_default(const char *path, bool force, FILE *report,
+		char *err, size_t err_len) {
 	if (path == NULL || path[0] == '\0') {
 		snprintf(err, err_len, "配置路径是空的");
+		return -1;
+	}
+
+	if (!force && access(path, F_OK) == 0) {
+		snprintf(err, err_len, "%s 已经有一份了（要覆盖就加 --force）", path);
 		return -1;
 	}
 
@@ -1050,12 +1225,19 @@ int vidow_config_write_default(const char *path, bool force, char *err,
 				strerror(errno));
 			return -1;
 		}
+	} else {
+		snprintf(dir, sizeof(dir), ".");
 	}
-
-	if (!force && access(path, F_OK) == 0) {
-		snprintf(err, err_len, "%s 已经有一份了（要覆盖就加 --force）", path);
+	char cfgdir[PATH_MAX + 8]; /* dir 最多 PATH_MAX-1 个字符 + "/configs" */
+	snprintf(cfgdir, sizeof(cfgdir), "%s/configs", dir);
+	if (mkdir_parents(cfgdir) != 0) {
+		snprintf(err, err_len, "建不了目录 %s：%s", cfgdir,
+			strerror(errno));
 		return -1;
 	}
+
+	struct vidow_config cfg;
+	defaults(&cfg);
 
 	FILE *f = fopen(path, "w");
 	if (f == NULL) {
@@ -1066,6 +1248,41 @@ int vidow_config_write_default(const char *path, bool force, char *err,
 	if (fclose(f) != 0) {
 		snprintf(err, err_len, "写 %s 时出错：%s", path, strerror(errno));
 		return -1;
+	}
+	if (report != NULL) {
+		fprintf(report, "%s\n", path);
+	}
+
+	char file[PATH_MAX + 8 + 32];
+	for (int i = 0; i < N_SECTIONS; i++) {
+		/* 文件名是这张表里写死的（最长 14 个字符），不会截断。 */
+		if (snprintf(file, sizeof(file), "%s/%s", cfgdir,
+				sections[i].file) >= (int)sizeof(file)) {
+			snprintf(err, err_len, "路径太长了：%s/%s", cfgdir,
+				sections[i].file);
+			return -1;
+		}
+		if (!force && access(file, F_OK) == 0) {
+			if (report != NULL) {
+				fprintf(report, "%s 已经有了，没动\n", file);
+			}
+			continue;
+		}
+		FILE *sf = fopen(file, "w");
+		if (sf == NULL) {
+			snprintf(err, err_len, "写不了 %s：%s", file,
+				strerror(errno));
+			return -1;
+		}
+		print_section_file(sf, &cfg, i);
+		if (fclose(sf) != 0) {
+			snprintf(err, err_len, "写 %s 时出错：%s", file,
+				strerror(errno));
+			return -1;
+		}
+		if (report != NULL) {
+			fprintf(report, "%s\n", file);
+		}
 	}
 	return 0;
 }

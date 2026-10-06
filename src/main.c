@@ -148,8 +148,28 @@ int main(int argc, char *argv[]) {
 	bool force = false;
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "--default-config") == 0) {
-			vidow_config_default_lua(stdout);
-			return 0;
+			/* 后面跟一个名字就是「打印那一份分类文件」；all = 全部拼一起
+			 * （能当单文件配置用）；什么都不跟 = 入口 config.lua。 */
+			const char *what = (i + 1 < argc && argv[i + 1][0] != '-')
+				? argv[++i] : NULL;
+			if (what == NULL) {
+				vidow_config_default_lua(stdout);
+				return 0;
+			}
+			if (strcmp(what, "all") == 0) {
+				vidow_config_default_all_lua(stdout);
+				return 0;
+			}
+			if (vidow_config_default_section_lua(stdout, what)) {
+				return 0;
+			}
+			fprintf(stderr, "vidow: 没有 '%s' 这一份配置（能写：", what);
+			for (int k = 0; k < vidow_config_section_count(); k++) {
+				fprintf(stderr, "%s%s", k > 0 ? " / " : "",
+					vidow_config_section_file(k));
+			}
+			fprintf(stderr, "；all = 全部拼一起）\n");
+			return 2;
 		}
 		if (strcmp(argv[i], "--write-config") == 0) {
 			write_config = true;
@@ -163,12 +183,13 @@ int main(int argc, char *argv[]) {
 				strcmp(argv[i], "-h") == 0) {
 			fprintf(stderr,
 				"用法: vidow [选项]\n"
-				"  --default-config  打印一份完整的默认配置（Lua）\n"
-				"  --write-config    把那份默认配置写进配置目录"
-				"（$XDG_CONFIG_HOME/vidow/config.lua，"
-				"已存在则不动它）\n"
-				"  --force           配合 --write-config："
-				"覆盖已有的那份\n"
+				"  --default-config [名字]  打印默认配置：不带名字 = 配置"
+				"入口（config.lua，只有 include 行）；all = 全部分类文件拼"
+				"一起；名字 = 其中一份（如 02-decor.lua）\n"
+				"  --write-config    把默认配置写进配置目录"
+				"（$XDG_CONFIG_HOME/vidow/config.lua + configs/，"
+				"已存在的不动）\n"
+				"  --force           配合 --write-config：覆盖已有的那几份\n"
 				"  --help            这个\n");
 			return 0;
 		}
@@ -181,11 +202,11 @@ int main(int argc, char *argv[]) {
 		char path[PATH_MAX];
 		vidow_config_path(path, sizeof(path));
 		char err[512];
-		if (vidow_config_write_default(path, force, err, sizeof(err)) != 0) {
+		if (vidow_config_write_default(path, force, stdout, err,
+				sizeof(err)) != 0) {
 			fprintf(stderr, "vidow: %s\n", err);
 			return 1;
 		}
-		printf("%s\n", path);
 		return 0;
 	}
 
@@ -367,16 +388,18 @@ int main(int argc, char *argv[]) {
 		return 1;
 	}
 
+	/* 改完文件自动重载（不用再 kill -HUP）。放在配置加载**之前**：配置里
+	 * vidow.include() 读进来的每一份（configs/ 下的那些文件）都要当场登记进来，改哪份
+	 * 都得自动重载 —— 配置加载完再起来就晚了，那一轮 include 已经过去了。
+	 * 初始化这一下记的是文件当前状态，不会被当成「变了」。 */
+	vidow_configwatch_init(&server);
+
 	/* 配置文件是 Lua，加载得最晚：它要能看见输出和 seat（配置里的
 	 * vidow.workspace_create(name, output) / workspace_list() / ipc_path() 都得
 	 * 有真东西可看），而配置里跑的命令（grim 之类）也要连得上我们自己。
 	 * 带 vidow.exec() 的配置是分几步跑完的 —— 这里返回时可能还没跑完，
 	 * 剩下的部分在合成器已经开始渲染之后落地。 */
 	vidow_script_load(&server);
-
-	/* 改完文件自动重载（不用再 kill -HUP）。放在配置加载之后：初始化那一下
-	 * 记的是文件当前状态，不该被当成「变了」。 */
-	vidow_configwatch_init(&server);
 
 	wl_display_run(server.display);
 

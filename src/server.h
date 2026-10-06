@@ -1335,13 +1335,25 @@ size_t vidow_config_group_fields(const char *group, const char **out,
 /* 删掉的旧键名（gaps 那一家）：配置里再写就是普通全局变量、静默失效，所以让
  * script.c 认出来喊一声。命中就给 true，并把「现在该写什么」放进 *hint。 */
 bool vidow_config_legacy_hint(const char *key, const char **hint);
-/* 把内置默认值打印成一份完整的 Lua 配置（`vidow --default-config`）。环境变量
- * 不参与 —— 打出来的是「什么都没配」时的样子。 */
+/* 把内置默认值打印成 Lua 配置。配置按类别拆成 configs/ 下的一类一个文件，入口
+ * config.lua 只留 vidow.include() 行，所以这里有三个口子：
+ *
+ *   vidow_config_default_lua()         —— 入口（只有 include 行）
+ *   vidow_config_default_all_lua()     —— 全部分类文件拼在一起（能当单文件配置用）
+ *   vidow_config_default_section_lua() —— 其中一份，名字不认识返回 false
+ *
+ * 环境变量不参与 —— 打出来的是「什么都没配」时的样子。 */
 void vidow_config_default_lua(FILE *out);
-/* 把上面那份写进配置目录（`vidow --write-config`），父目录不存在就建。已经有
- * 一份了就不动它（除非 force），原因写进 err。成功返回 0。 */
-int vidow_config_write_default(const char *path, bool force, char *err,
-		size_t err_len);
+void vidow_config_default_all_lua(FILE *out);
+bool vidow_config_default_section_lua(FILE *out, const char *name);
+int vidow_config_section_index(const char *name);
+int vidow_config_section_count(void);
+const char *vidow_config_section_file(int index);
+/* 把上面那套写进配置目录（`vidow --write-config`）：入口 + configs/ 下每一份，
+ * 父目录不存在就建。入口已经有一份就整个不写（除非 force）；分类文件已有的跳过、
+ * 只补缺的。写了哪些 / 跳过了哪些打在 report 上，原因写进 err。成功返回 0。 */
+int vidow_config_write_default(const char *path, bool force, FILE *report,
+		char *err, size_t err_len);
 
 /* -------------------------------------------------------------- async exec */
 
@@ -1373,9 +1385,16 @@ bool vidow_script_load(struct vidow_server *server);
 void vidow_script_finish(struct vidow_server *server);
 
 /* 配置文件一改就自动重载（inotify 盯目录 + stat 比对，见 configwatch.c）。
- * 失败只打日志：自动重载是锦上添花，SIGHUP 永远还在。 */
+ * 失败只打日志：自动重载是锦上添花，SIGHUP 永远还在。
+ *
+ * 盯的不只是 config.lua：vidow.include() 读进来的每一份（configs/ 下的每一份）都登记
+ * 进来，改哪一份都自动重载。 */
 bool vidow_configwatch_init(struct vidow_server *server);
 void vidow_configwatch_finish(struct vidow_server *server);
+/* 重新加载配置之前调一次：上一次 include 过的文件不算数了，重新登记。 */
+void vidow_configwatch_begin(struct vidow_server *server);
+/* vidow.include() 读了一份文件就登记一份（configwatch 没起来就是空操作）。 */
+void vidow_configwatch_add(struct vidow_server *server, const char *path);
 
 /* ------------------------------------------------------------- animation */
 

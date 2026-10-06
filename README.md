@@ -12,8 +12,10 @@
 - **xdg-activation 自己实现**（`src/activation.c`）：令牌过期时间可配、serial 校验不过的
   请求也能配成「照样理」（niri 的 `honor-xdg-activation-with-invalid-serial`，vidow 同名
   选项）—— wlroots 那份把这个校验写死了，配不动
-- **配置**：就是一个 Lua 5.4 文件（`~/.config/vidow/config.lua`）—— 全局名就是配置键，
-  需要环境信息时直接 `vidow.exec()` 跑 shell 拿返回值，不阻塞渲染；SIGHUP 热重载
+- **配置**：一个 Lua 5.4 入口（`~/.config/vidow/config.lua`）+ `configs/` 下按类别分的一份份
+  —— 全局名就是配置键，入口用 `vidow.include("configs/01-gaps.lua")` 把各类读进来（也能
+  全写在一份里）；需要环境信息时直接 `vidow.exec()` 跑 shell 拿返回值，不阻塞渲染；
+  SIGHUP 热重载，改哪一份都自动重载
 - **IPC**（`src/ipc.c` / `src/ipcstate.c`）：unix socket 上的一行一个 JSON 请求/应答。
   状态输出**尽量全**（窗口的标题/坐标/尺寸/列/工作区/输出/规则、layer surface、
   工作区、输出与模式、配置全量、键位、规则、激活令牌、动画、输入法、光标…），
@@ -100,11 +102,15 @@ anim   = { open_ms = 220, easing = "out_quint" }
 完整的默认配置（每个键都写着它自己的默认值，抄一份就能改）：
 
 ```bash
-./build/vidow --default-config > ~/.config/vidow/config.lua
+./build/vidow --write-config          # 入口 + configs/ 一整套写进 ~/.config/vidow（已有不动）
+./build/vidow --default-config        # 只打入口（只有 include 行）
+./build/vidow --default-config all    # 全部分类文件拼在一起（include 就是就地展开，能当单文件配置用）
+./build/vidow --default-config 02-decor.lua   # 其中一份（也认 --default-config decor）
 ```
 
-仓库里的 `config.lua.example` 就是它的输出；`./test-defaultconfig.sh` 里有一条断言盯着
-「这份文件和 `--default-config` 打出来的一模一样」，所以它不会跟代码走散。
+仓库里的 `config.example/` 就是 `--write-config` 写出来的那一套（`config.lua` + `configs/`）；
+`./test-defaultconfig.sh` 里有一组断言盯着「这套文件和 `--default-config` 打出来的一模一样，
+文件清单也得一致」，所以它不会跟代码走散。
 
 ### 间距（gap）：一个数管全部
 
@@ -700,7 +706,8 @@ python3 test-float.py        # 三个真实 GTK 窗口，验证浮动模式自�
 ./test-input-inject.sh               # 输入注入：鼠标 / 键盘合成事件到客户端（全 headless，54 项断言）
 ./test-cursor-shake.sh              # 摇晃找光标：晃一下大一倍、晃到屏幕那么大，截图里没有它（全 headless，46 项断言）
 ./test-config.sh                     # 配置系统：一个 Lua 文件 + 改了就自动重载（全 headless，15 项断言）
-./test-defaultconfig.sh              # 完整默认配置（--default-config / --write-config）+ 配置族的表写法（全 headless，29 项断言）
+./test-config-include.sh             # 配置拆成好几份：vidow.include() 的路径/顺序/报错 + 改哪份都自动重载（全 headless，25 项断言）
+./test-defaultconfig.sh              # 默认配置按类别拆成 configs/（--default-config / --write-config）+ 配置族的表写法（全 headless，41 项断言）
 ./test-gap.sh                        # 间距：一个数管全部 + 单边/内间距覆盖（全 headless，33 项断言）
 ./test-layerblur.sh                  # 半透明状态栏背后的模糊（全 headless，4 项断言）
 ./test-blurscale.sh                  # 模糊在高 DPI 倍率下的底衬覆盖 + 对位（1/1.7/2 倍，7 项断言）
@@ -1957,11 +1964,43 @@ layer 的模糊底衬把 layer surface 自己的缓冲当 mask 传进去，窗�
 
 （trace 里另一条 `move update` 是隔壁 w1 的：视口滚了 6px，它本来就该平滑跟过去。）
 
-### 配置：就是一个 Lua 文件
+### 配置：一个入口 + 一类一份
 
-`~/.config/vidow/config.lua`（Lua 5.4）是**唯一**的配置文件 —— 没有第二套语法、
-没有加载顺序要记。**改完保存就生效，什么都不用做**（也可以手动
-`kill -HUP $(pgrep -x vidow)`）。
+配置是 Lua 5.4。入口是 `~/.config/vidow/config.lua`，它通常只有 `vidow.include()` 行，
+把 `configs/` 下的各类读进来：
+
+```
+~/.config/vidow/
+├── config.lua                   入口：只有 include 行
+└── configs/
+    ├── 01-gaps.lua              间距
+    ├── 02-decor.lua             圆角 / 边框 / 阴影 / 不透明度
+    ├── 03-blur.lua              背景模糊
+    ├── 04-anim.lua              开关动画 + 果冻（jelly）
+    ├── 05-shader.lua            自定义着色器
+    ├── 06-render.lua            刷新与补帧
+    ├── 07-clipboard.lua         剪贴板
+    ├── 08-ipc.lua               IPC
+    ├── 09-output.lua            缩放 + 每块屏的 vidow.output{…}
+    ├── 10-xwayland.lua          XWayland
+    ├── 11-activation.lua        窗口激活
+    ├── 12-portal.lua            xdg-desktop-portal
+    ├── 13-cursor.lua            指针
+    └── 14-keys.lua              键位 / 工作区 / 窗口规则
+```
+
+`vidow.include("configs/01-gaps.lua")` 就是「把那份文件就地展开」，和抄在这里一个意思：
+
+- **相对路径按「正在 include 的那个文件所在目录」解析**（跟 C 的 `#include "…"` 一样），
+  所以 `configs/` 里的文件互相 include 写 `vidow.include("04-d.lua")` 就行；绝对路径照用
+- include 的先后 = 键生效的先后（同一个键只有第一次写的算数），文件名的数字前缀就是这个顺序
+- 文件不在 / 语法写错 / 自己 include 自己，都**当场报错**（带上写 include 那行的行号），
+  不静默；报错只带走它后面那些键，前面已经读进来的照样生效
+- 想删掉某一类：把入口里那一行 include 删掉就行（文件留着不碍事）
+- 不想要这一套也行：全写在一份 `config.lua` 里照样跑，`--default-config all > config.lua`
+  就是那个样子
+
+**改完保存就生效，什么都不用做**（也可以手动 `kill -HUP $(pgrep -x vidow)`）。
 
 - 文件不在 = 全用内置默认值（默认值本身是能用的配置）
 - 路径可以用 `$VIDOW_CONFIG` 指到别处；`$XDG_CONFIG_HOME` 也认
@@ -1975,13 +2014,20 @@ layer 的模糊底衬把 layer surface 自己的缓冲当 mask 传进去，窗�
 编辑器保存文件的方式不止一种，直接写进去（同 inode）和写临时文件再 rename 过来
 （换 inode）都得认；盯文件的话第二种会把 watch 留在那个已经被删掉的 inode 上，
 之后再也收不到事件。收到事件后自己 `stat()` 目标文件，比对 `(dev, ino, mtime, size)`
-真变了才重载，顺带把一次保存里的好几个事件合成一次（去抖 150ms）：
+真变了才重载，顺带把一次保存里的好几个事件合成一次（去抖 150ms）。
+
+盯的不是一个文件，而是**配置真正读了哪些文件**：入口 + 每一份 `vidow.include()` 进来的
+（读不成的也登记 —— 文件补上 / 改对的那一刻要能发现）。重载 = 重新读一遍，所以这一轮
+include 了哪些就盯哪些，从入口里删掉的 include 也就不再盯了。
 
 | 你怎么改 | 结果 |
 | --- | --- |
 | 编辑器里改完保存（原地写 / rename 覆盖） | 自动重载 |
+| 改 `configs/` 下任何一份（入口 include 进来的） | 自动重载，日志里点名是哪一份 |
 | 删掉配置文件 | 自动重载，回默认值 |
 | 删掉某个键再保存 | 那个键回默认值 |
+| 删掉一份 include 进来的文件 | 自动重载 + 报「打不开 <那份>」（补回来就又好了） |
+| 从入口里删掉一行 include | 那一类的键回默认值，那份文件以后改了也不重载 |
 | 同一个目录里动别的文件（`portals.conf` / `shaders/`） | 不重载 |
 | 配置文件是符号链接（dotfiles 仓库） | 认（盯的是解析后的真身） |
 
@@ -2434,7 +2480,8 @@ src/layer.c    layer surface 生命周期、层级树、exclusive zone、键盘�
 src/decoration.c zxdg_decoration_manager_v1：按 decor 配置告诉客户端「装饰谁画」。
                   不给这个全局，kitty / GTK / Qt 就自己画标题栏，跟我们的圆角打架
 src/input.c    键盘/指针/滚轮/拖动、快捷键、虚拟键盘与虚拟指针、光标、剪贴板
-src/config.c   配置解析（文件 + VIDOW_* 环境变量覆盖，含颜色/布尔/枚举）
+src/config.c   配置键表（键名/类型/范围/分节）+ 默认值 + VIDOW_* 环境变量覆盖 + 配置「族」
+               的表写法 + 默认配置按类别拆成 configs/ 那一套（--default-config / --write-config）
 src/scale.c    缩放计算（纯函数，不碰 wlroots）：ppi→scale、量化夹取、每输出覆盖、
                优先级。tools/scaletest.c 直接拿这份源码编译来自检
 src/hotplug.c  热插拔的纯逻辑（不碰 wlroots）：输出身份、记忆台账、拔线时挑哪块屏
@@ -2452,7 +2499,10 @@ src/overview.c niri 风格全景：世界→屏幕的缩放变换、相机（跟
 src/xwayland.c XWayland：懒启动服务、seat、xwayland_shell 只给 Xwayland 自己、
                X 全局缩放（= ceil(最密那块屏)）、X11 客户端环境（GDK_SCALE 等）
 src/exec.c     异步 `sh -c`：pipe + wl_event_loop_add_fd + 共享超时定时器，绝不阻塞渲染
-src/script.c   配置语言：Lua 5.4，协程化的 vidow.exec、全局名→配置键、SIGHUP 重载
+src/script.c   配置语言：Lua 5.4，协程化的 vidow.exec、全局名→配置键、vidow.include()
+               （一类一份配置就地展开）、SIGHUP 重载
+src/configwatch.c 配置自动重载：inotify 盯目录 + stat 比对，盯的是「配置真正读了哪些文件」
+               （入口 + 每一份 include 的），改哪一份都重载
 src/anim.c     动画引擎：单调时钟进度、缓动函数、每帧 tick
 src/fx.c       SSD 装饰着色器、kawase 模糊链（共享/私有 backdrop + 世代缓存）、离屏渲染、关闭快照
 src/im.c       输入法中继：text-input-v3 <-> input-method-v2、候选框摆位、键盘抢占用与回注防环
@@ -3184,6 +3234,26 @@ protocols/     wlr-layer-shell / wlr-virtual-pointer / input-method-v2 /
      改；`test-ipc.sh`/`test-focus.sh` 同步。回归：defaultconfig / gap / config / workspace /
      ipc / focus / overview / hotplug / clipboard / layerwin / xwayland-popup 全过。
 
+129. **配置按类别拆开：入口 `config.lua` + `configs/` 下一类一份**（`vidow.include()`）。
+     原来那份「一份两三百行、什么都写在一起」的默认配置，改一个圆角要先滚过间距、模糊、
+     动画、剪贴板……于是拆成一类一个文件，入口只剩 include 行。`vidow.include(path)`
+     是「就地展开」：**相对路径按正在 include 的那个文件所在目录解析**（像 C 的
+     `#include "…"`），include 的先后就是键生效的先后。实现上分两层是有原因的：include
+     进来的那段可能调 `vidow.exec()`，而它是 yield 出来的（整份配置跑在 coroutine 里），
+     从 C 里 `lua_call` 出去的调用不能 yield（"attempt to yield across a C-call
+     boundary"）—— 所以 C 侧只留一个「把文件读成函数」的助手，调用交给一层薄薄的 Lua，
+     报错再 `error(msg, 2)` 算回配置里写 include 的那一行。`configwatch` 跟着改成盯
+     **「配置真正读了哪些文件」**（入口 + 每一份 include 的，读不成的也登记 —— 文件补上
+     的那一刻要能发现）：改 `configs/` 下任何一份都自动重载，日志里点名是哪一份；
+     重载会重新登记，从入口里删掉的 include 以后改了也不重载。命令行跟着变：
+     `--default-config` 打入口、`--default-config all` 打全部拼一起（能当单文件配置用）、
+     `--default-config 02-decor.lua` 打其中一份（也认 `decor`）、`--write-config` 写一整套
+     （入口 + `configs/`，已有的不动，除非 `--force`）。仓库里的 `config.lua.example`
+     换成 `config.example/` 一整套，`test-defaultconfig.sh` 逐份比对 + 文件清单比对
+     （41 项）；新增 `./test-config-include.sh`（25 项）：路径解析（相对 / 绝对 / 嵌套）、
+     顺序即优先级、include 里跑 `vidow.exec()`、改 / 删 / 补一份都自动重载、文件不在 /
+     语法错 / 自己 include 自己都当场报错且只带走后面那些键。
+
 128. **激活令牌攥着的 surface 先没了 → wlroots 断言 → SIGABRT**（用户的会话就这么被带走的：
      `vidow: types/wlr_compositor.c:736: surface_handle_resource_destroy: Assertion
      \`wl_list_empty(&surface->events.destroy.listener_list)' failed.`）。
@@ -3351,12 +3421,13 @@ protocols/     wlr-layer-shell / wlr-virtual-pointer / input-method-v2 /
      项名拼错、给只认表的族（`border`/`shadow`/`anim`/`portal`）写一个光秃秃的值，都当场报错并
      列出能写哪些项；删掉的那四个老键名会喊一声「这个键没有了，现在用 xxx」——「配置写了没反应」
      最难查。`vidow --default-config` 打一份完整默认配置（每个键都写着自己的默认值），仓库里的
-     `config.lua.example` 就是它的输出，`./test-defaultconfig.sh` 里有一条断言盯着这两者一致，
+     `config.lua.example` 就是它的输出（129 之后换成 `config.example/` 一整套），
+     `./test-defaultconfig.sh` 里有一条断言盯着这两者一致，
      所以文档不会跟代码走散（`shader_dir` 那种跟着配置目录走的默认值打的是注释，不把 HOME 写进去）。
      实测：默认布局不变（离屏幕边 6 / 窗口之间 6、列宽 634）；`gaps 16` 从「离屏幕边 32 + 列宽 608」
      变成「16 + 624」；`gaps 40` → 边距 40、列宽 600。`./test-gap.sh` 按新语义重写成 33 条断言，
      新增 `./test-defaultconfig.sh`（20 条：默认配置回灌后逐键等于内置默认值 / 表写法只盖写了的项 /
-     报错信息 / 老键名提示 / `config.lua.example` 不漂移）。
+     报错信息 / 老键名提示 / 示例文件不漂移）。
 
 ## 尚未实现（原型边界）
 

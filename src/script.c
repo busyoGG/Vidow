@@ -1,7 +1,9 @@
 #include "server.h"
 #include "ipc.h"
 
+#include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -736,6 +738,109 @@ static int l_workspace_move(lua_State *L) {
 	return 1;
 }
 
+/* ---------------------------------------------------------------- include
+ *
+ * vidow.include("configs/01-gaps.lua") —— 把另一份配置读进来，就地展开，等价于
+ * 把那个文件的内容抄在这里。配置按类别拆成好几个文件之后，入口 config.lua 就
+ * 只剩这些 include 行。
+ *
+ * 相对路径按**正在 include 的那个文件所在目录**解析（像 C 的 #include "…"），
+ * 所以入口里写 "configs/01-gaps.lua"、configs 里的文件互相引用写 "02-decor.lua"，
+ * 两边都对；绝对路径照用。$VIDOW_CONFIG 把入口指到别处时这条规则也跟着走。
+ *
+ * 为什么调用动作交给一段 Lua（见 include_lua）：include 进来的那段可能调
+ * vidow.exec()，而 vidow.exec() 是 yield 出来的（整份配置跑在一个 coroutine
+ * 里）。从 C 里 lua_call 出去的调用不能 yield（"attempt to yield across a
+ * C-call boundary"），从 Lua 里调就没这个问题 —— 所以 C 侧只留一个「把文件读
+ * 成函数」的助手，调不调、什么时候调，由下面那段 Lua 决定。 */
+
+/* 相对路径 → 绝对路径。from 是 debug.getinfo(2).source，形如 "@/path/config.lua"；
+ * 不是文件（[string "…"] / =stdin）时退回配置目录。 */
+static void include_path(char *buf, size_t size, const char *name,
+		const char *from) {
+	if (name[0] == '/') {
+		snprintf(buf, size, "%s", name);
+		return;
+	}
+	char dir[PATH_MAX] = "";
+	if (from != NULL && from[0] == '@') {
+		snprintf(dir, sizeof(dir), "%s", from + 1);
+		char *slash = strrchr(dir, '/');
+		if (slash != NULL) {
+			*slash = '\0';
+		} else {
+			dir[0] = '\0';
+		}
+	}
+	if (dir[0] == '\0') {
+		vidow_config_dir(dir, sizeof(dir));
+	}
+	snprintf(buf, size, "%s/%s", dir, name);
+}
+
+/* include 的助手：把文件读成一个函数（不调用）。成功返回那个函数，失败返回
+ * nil + 一句人话（哪个路径、为什么）。 */
+static int l_include_load(lua_State *L) {
+	struct vidow_script *s = script_of(L);
+	const char *name = luaL_checkstring(L, 1);
+	const char *from = luaL_optstring(L, 2, NULL);
+
+	char path[PATH_MAX];
+	include_path(path, sizeof(path), name, from);
+
+	/* 登记给 configwatch（它盯的是「配置真正读了哪些文件」，不是配置目录里有
+	 * 什么）：改了这份就自动重载。**读不成也要登记** —— 文件不在的时候登记的
+	 * 是「这个路径 + 它所在的目录」，等文件补上（或改对）了才知道要重载。 */
+	vidow_configwatch_add(s->server, path);
+
+	/* 先自己开一下：文件不在和语法写错是两回事，报错得分得清。 */
+	FILE *probe = fopen(path, "r");
+	if (probe == NULL) {
+		lua_pushnil(L);
+		lua_pushfstring(L, "vidow.include: 打不开 %s：%s", path,
+			strerror(errno));
+		return 2;
+	}
+	fclose(probe);
+
+	if (luaL_loadfile(L, path) != LUA_OK) {
+		const char *why = lua_tostring(L, -1);
+		char msg[PATH_MAX + 64];
+		snprintf(msg, sizeof(msg), "vidow.include: %s",
+			why != NULL ? why : "读不了");
+		lua_settop(L, 1); /* 丢掉 loadfile 那条，留我们自己这条 */
+		lua_pushnil(L);
+		lua_pushstring(L, msg);
+		return 2;
+	}
+
+	wlr_log(WLR_INFO, "config.lua: include %s", path);
+	return 1;
+}
+
+/* vidow.include 的实现：调 l_include_load 拿函数，再调用它。
+ *
+ * error(…, 2) 是故意的：这一层是 C 的助手和配置之间的一层薄壳，报错要算在
+ * 配置里写 include 的那一行上（level 2），不是算在这段内置代码上。 */
+static const char include_lua[] =
+	"local load, getinfo = ..., debug.getinfo\n"
+	"local depth = 0\n"
+	"return function(name)\n"
+	"	if type(name) ~= \"string\" or name == \"\" then\n"
+	"		error(\"vidow.include: 要一个文件名\", 2)\n"
+	"	end\n"
+	"	depth = depth + 1\n"
+	"	if depth > 32 then\n"
+	"		error(\"vidow.include: include 套得太深了（是不是自己 include 自己？）\", 2)\n"
+	"	end\n"
+	"	local chunk, err = load(name, getinfo(2, \"S\").source)\n"
+	"	if chunk == nil then\n"
+	"		error(err, 2)\n"
+	"	end\n"
+	"	chunk()\n"
+	"	depth = depth - 1\n"
+	"end\n";
+
 static void register_api(struct vidow_script *s) {
 	lua_State *L = s->L;
 	lua_newtable(L);
@@ -768,6 +873,23 @@ static void register_api(struct vidow_script *s) {
 	}
 	lua_pushstring(L, "vidow 0.1 (lua " LUA_VERSION ")");
 	lua_setfield(L, -2, "version");
+
+	/* vidow.include()：C 侧的助手 + 上面那段 Lua（为什么要分两层见注释）。 */
+	if (luaL_loadstring(L, include_lua) == LUA_OK) {
+		lua_pushlightuserdata(L, s);
+		lua_pushcclosure(L, l_include_load, 1);
+		if (lua_pcall(L, 1, 1, 0) == LUA_OK) {
+			lua_setfield(L, -2, "include");
+		} else {
+			wlr_log(WLR_ERROR, "vidow.include 起不来：%s",
+				lua_tostring(L, -1) != NULL ? lua_tostring(L, -1) : "?");
+			lua_pop(L, 1);
+		}
+	} else {
+		wlr_log(WLR_ERROR, "vidow.include 起不来：%s",
+			lua_tostring(L, -1) != NULL ? lua_tostring(L, -1) : "?");
+		lua_pop(L, 1);
+	}
 	lua_setglobal(L, "vidow");
 
 	/* Config keys as globals. */
@@ -1092,6 +1214,9 @@ bool vidow_script_load(struct vidow_server *server) {
 	/* 重载 = 重新读一遍配置：先回到默认值（再压上环境变量）。配置文件里删掉的
 	 * 行才会真的消失 —— 不然改完配置重载，被删的键还留着旧值。 */
 	vidow_config_reset(&server->config);
+	/* 上一轮 include 过哪些文件不算数了：这一轮读到哪些就重新登记哪些，改哪份
+	 * 都自动重载（见 configwatch.c）。 */
+	vidow_configwatch_begin(server);
 
 	char path[PATH_MAX];
 	vidow_config_path(path, sizeof(path));
