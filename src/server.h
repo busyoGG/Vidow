@@ -22,6 +22,7 @@
 #include <wlr/types/wlr_input_device.h>
 #include <wlr/types/wlr_input_method_v2.h>
 #include <wlr/types/wlr_keyboard.h>
+#include <wlr/types/wlr_keyboard_group.h>
 #include <wlr/types/wlr_layer_shell_v1.h>
 #include <wlr/types/wlr_xdg_decoration_v1.h>
 #include <wlr/types/wlr_output.h>
@@ -186,6 +187,13 @@ struct vidow_config {
 	 * $XDG_RUNTIME_DIR/vidow-<display>.sock。 */
 	bool ipc;
 	char ipc_socket[PATH_MAX];
+
+	/* 输入注入（见 input.c 的「注入」段 + ipc.c）：IPC 的 move-cursor /
+	 * pointer-button / pointer-scroll / send-key / type-text 能合成鼠标和键盘
+	 * 事件，等于「谁连上 socket 谁就能操控整个桌面」。默认开 —— socket 是
+	 * 0600（只有本用户能连），而状态栏 / 脚本 / 自动化本来就靠 IPC；每次注入
+	 * 都会打一条 info 日志留痕。关掉之后只剩 vidow 自己的快捷键能动。 */
+	bool input_injection;
 
 	/* 剪贴板（见 clipboard.c）：X11(Xwayland) 与 Wayland 两边共用一份内容。
 	 * clipboard = false 就不接管，退回 wlroots 自带那套（只在有 X11 窗口聚焦
@@ -751,6 +759,9 @@ struct vidow_keyboard {
 	struct wlr_keyboard *wlr_keyboard;
 	/* 虚拟键盘（wtype、输入法回注）的来源，物理键盘为 NULL */
 	struct wlr_virtual_keyboard_v1 *virtual;
+	/* vidow 自己造的注入键盘（IPC 的 send-key / type-text 用它按键），
+	 * 不是真设备也不是客户端来的 */
+	bool inject;
 
 	struct wl_listener modifiers;
 	struct wl_listener key;
@@ -1082,6 +1093,12 @@ struct vidow_server {
 	struct wl_list outputs;   /* vidow_output.link */
 	struct wl_list views;     /* vidow_view.link */
 	struct wl_list keyboards; /* vidow_keyboard.link */
+	/* 注入用的键盘（IPC 的 send-key / type-text）。wlroots 没有公开的「造一个
+	 * 键盘」接口，键盘组能给出一个干净的 wlr_keyboard（自带 keymap 和
+	 * xkb_state），借它按下注入的键就够了。它也挂在上面的 keyboards 列表里：
+	 * headless 会话里它就是「这个座位有键盘」的唯一证据（少了它客户端连
+	 * wl_keyboard 都不会去要，注入的键也就没地方送）。 */
+	struct wlr_keyboard_group *inject_group;
 	struct wl_list layers;    /* vidow_layer_surface.link */
 	struct wl_list columns;   /* vidow_column.link（所有列的并集，顺序 = 工作区顺序） */
 	struct wl_list workspaces; /* vidow_workspace.link */
@@ -1370,6 +1387,46 @@ void vidow_pointer_button(struct vidow_server *server, uint32_t button,
 		bool pressed, uint32_t time_msec, bool force_mod);
 /* 指针移动（测试注入也走这里）。 */
 void vidow_pointer_motion(struct vidow_server *server, uint32_t time_msec);
+/* 滚轮。真实滚轮和 IPC 注入走同一条路（overview 平移 / Mod+滚轮换列 / 转发给
+ * 客户端），所以直接收一个 wlr_pointer_axis_event 的字段而不是拆开的 dx/dy。 */
+void vidow_pointer_axis(struct vidow_server *server,
+		enum wl_pointer_axis orientation, double delta, int32_t delta_discrete,
+		enum wl_pointer_axis_source source, uint32_t time_msec);
+
+/* --------------------------------------------------------------- 注入（IPC）
+ *
+ * 合成输入：给自动化 / 远程操控用（UI 识别之后总得能动手）。默认开着，见
+ * config.input_injection。所有函数返回 false 时 err 里是给人看的原因。
+ *
+ * 注入的按键只给**客户端**，不触发 vidow 自己的快捷键 —— 要操作合成器请用
+ * 对应的 IPC 命令（focus-window / toggle-overview / …）。
+ */
+/* 建注入键盘。input_init 里调一次；失败只是注入不能用，不影响别的。 */
+bool vidow_input_inject_init(struct vidow_server *server);
+/* 开关（config.input_injection）；关着时 err 里说明原因。 */
+bool vidow_inject_allowed(struct vidow_server *server, char *err, size_t errlen);
+/* 指针绝对 / 相对移动（布局坐标）。relative = true 时 x/y 是增量。 */
+bool vidow_inject_pointer_move(struct vidow_server *server, double x, double y,
+		bool relative, char *err, size_t errlen);
+/* "left" / "right" / "middle" / 数字（BTN_LEFT = 272 这种没人记得住）。
+ * mode: 0 = click（按下再松开），1 = 只按下，2 = 只松开。count > 1 时按 40ms
+ * 间隔连点（客户端才会认成双击）。 */
+bool vidow_inject_pointer_button(struct vidow_server *server, const char *name,
+		int mode, int count, char *err, size_t errlen);
+/* 按键名 → evdev 按钮码；认不出来返回 0。键位动作和 IPC 共用。 */
+uint32_t vidow_pointer_button_from_name(const char *name);
+/* 滚轮：discrete = true 当滚轮（WL_POINTER_AXIS_SOURCE_WHEEL），这时 dx/dy 是
+ * **格数**（一格 = delta 15 像素 + delta_discrete 120，和真鼠标一致）；false 就
+ * 当触摸板式的连续滚动，dx/dy 直接是像素。 */
+bool vidow_inject_pointer_scroll(struct vidow_server *server, double dx, double dy,
+		bool discrete, char *err, size_t errlen);
+/* "ctrl+shift+t" / "Return" / "super+Tab"。mode: 0 = tap（按下再松开），
+ * 1 = 只按下，2 = 只松开（要自己按组合键就先 press 修饰键、再 press 主键）。 */
+bool vidow_inject_key_combo(struct vidow_server *server, const char *combo,
+		int mode, char *err, size_t errlen);
+/* 逐字符打一段 UTF-8（按当前 keymap 找键位，需要 Shift 就自己按）。 */
+bool vidow_inject_text(struct vidow_server *server, const char *text, char *err,
+		size_t errlen);
 /* 区域变了要重画一次：贴图身份没变，不主动失效帧循环不会动。 */
 void vidow_view_blur_invalidate(struct vidow_view *view);
 /* 从 wlr_surface（含子表面）找回它的窗口，找不到返回 NULL。 */

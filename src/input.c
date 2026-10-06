@@ -1,6 +1,9 @@
 #include "server.h"
 
+#include <math.h>
 #include <stdlib.h>
+#include <string.h>
+#include <strings.h>
 #include <unistd.h>
 
 #include <linux/input-event-codes.h>
@@ -248,7 +251,7 @@ static void keyboard_destroy(struct wl_listener *listener, void *data) {
 
 static void server_add_keyboard(struct vidow_server *server,
 		struct wlr_keyboard *wlr_keyboard, struct wlr_input_device *device,
-		struct wlr_virtual_keyboard_v1 *virtual) {
+		struct wlr_virtual_keyboard_v1 *virtual, bool inject) {
 	struct vidow_keyboard *kb = calloc(1, sizeof(*kb));
 	if (kb == NULL) {
 		return;
@@ -256,6 +259,7 @@ static void server_add_keyboard(struct vidow_server *server,
 	kb->server = server;
 	kb->wlr_keyboard = wlr_keyboard;
 	kb->virtual = virtual;
+	kb->inject = inject;
 
 	/* 虚拟键盘自己会送 keymap（协议要求），别用我们的覆盖它：输入法回注的
 	 * 按键是按它自己的 keymap 发的，覆盖了就会解释成别的键（ESC 关窗口）。 */
@@ -287,7 +291,7 @@ static void server_add_keyboard(struct vidow_server *server,
 static void server_new_keyboard(struct vidow_server *server,
 		struct wlr_input_device *device) {
 	server_add_keyboard(server, wlr_keyboard_from_input_device(device), device,
-		NULL);
+		NULL, false);
 }
 
 /* 座位现在有什么能力。每加一个输入设备（真设备 / 虚拟键盘 / 虚拟指针）都要重算
@@ -310,7 +314,7 @@ static void server_new_virtual_keyboard(struct wl_listener *listener, void *data
 
 	wlr_log(WLR_INFO, "virtual keyboard attached");
 	server_add_keyboard(server, &virtual_keyboard->keyboard,
-		&virtual_keyboard->keyboard.base, virtual_keyboard);
+		&virtual_keyboard->keyboard.base, virtual_keyboard, false);
 
 	seat_update_capabilities(server);
 }
@@ -508,11 +512,22 @@ static void server_cursor_axis(struct wl_listener *listener, void *data) {
 	struct vidow_server *server = wl_container_of(listener, server, cursor_axis);
 	struct wlr_pointer_axis_event *event = data;
 
+	vidow_pointer_axis(server, event->orientation, event->delta,
+		event->delta_discrete, event->source, event->time_msec);
+}
+
+/* 滚轮。真设备和 IPC 注入走同一条路：overview 平移 / Mod+滚轮换列 / 转发给
+ * 客户端。注入那边（ipc.c）调完这个再补一个 pointer frame。 */
+void vidow_pointer_axis(struct vidow_server *server,
+		enum wl_pointer_axis orientation, double delta, int32_t delta_discrete,
+		enum wl_pointer_axis_source source, uint32_t time_msec) {
+	/* 有些设备只发离散值（老鼠标），所以两个都看 */
+	double amount = delta != 0 ? delta : delta_discrete;
+
 	/* overview 里滚轮平移相机（世界坐标的一小步；换列会把平移清零、改回跟焦点走） */
 	if (vidow_overview_active(server)) {
-		double delta = event->delta != 0 ? event->delta : event->delta_discrete;
-		if (delta != 0) {
-			vidow_overview_pan(server, delta > 0 ? 60 : -60);
+		if (amount != 0) {
+			vidow_overview_pan(server, amount > 0 ? 60 : -60);
 		}
 		return;
 	}
@@ -521,16 +536,14 @@ static void server_cursor_axis(struct wl_listener *listener, void *data) {
 	 * A plain wheel is forwarded to the client so apps keep scrolling. */
 	struct wlr_keyboard *kb = wlr_seat_get_keyboard(server->seat);
 	if (kb != NULL && (wlr_keyboard_get_modifiers(kb) & MOD_KEY)) {
-		double delta = event->delta != 0 ? event->delta : event->delta_discrete;
-		if (delta != 0) {
-			vidow_focus_column(server, delta > 0 ? 1 : -1);
+		if (amount != 0) {
+			vidow_focus_column(server, amount > 0 ? 1 : -1);
 		}
 		return;
 	}
 
-	wlr_seat_pointer_notify_axis(server->seat, event->time_msec,
-		event->orientation, event->delta, event->delta_discrete, event->source,
-		event->relative_direction);
+	wlr_seat_pointer_notify_axis(server->seat, time_msec, orientation, delta,
+		delta_discrete, source, WL_POINTER_AXIS_RELATIVE_DIRECTION_IDENTICAL);
 }
 
 static void server_cursor_frame(struct wl_listener *listener, void *data) {
@@ -631,5 +644,497 @@ bool vidow_input_init(struct vidow_server *server) {
 	wl_signal_add(&server->seat->events.request_set_primary_selection,
 		&server->request_set_primary_selection);
 
+	/* 注入键盘（IPC 的 send-key / type-text）。建不起来只是那几个命令不能用，
+	 * 不该拖垮整个输入初始化。 */
+	vidow_input_inject_init(server);
+
+	return true;
+}
+
+/* ------------------------------------------------------------------ 注入 */
+
+/* IPC 的输入注入（自动化 / 远程操控）。两条原则：
+ *   1. 走和真设备完全同一条路：指针走 vidow_pointer_motion / _button /
+ *      _axis，按键走 seat 的 notify_*。所以「注入的点击」和真点击在
+ *      合成器里是同一种东西（该抢焦点就抢、该起拖拽就起）。
+ *   2. 按键只给**客户端**，不触发 vidow 自己的快捷键 —— 自动化要操作合成器
+ *      有专门的 IPC 命令，而它想给应用发 Ctrl+C 时不该被 Mod+C 之类的绑定吃掉。
+ */
+
+#define INJECT_MAX_MODS 4
+
+struct inject_combo {
+	uint32_t mods[INJECT_MAX_MODS]; /* 修饰键的 evdev 键码，按要按下的顺序 */
+	size_t nmods;
+	uint32_t keycode;
+};
+
+static uint32_t inject_now_ms(void) {
+	return (uint32_t)(vidow_now_ns() / 1000000LL);
+}
+
+bool vidow_inject_allowed(struct vidow_server *server, char *err, size_t errlen) {
+	if (!server->config.input_injection) {
+		snprintf(err, errlen, "输入注入被配置关了（input_injection = false）");
+		return false;
+	}
+	if (server->inject_group == NULL) {
+		snprintf(err, errlen, "注入键盘没建起来（看启动日志）");
+		return false;
+	}
+	return true;
+}
+
+static struct wlr_keyboard *inject_keyboard(struct vidow_server *server) {
+	return &server->inject_group->keyboard;
+}
+
+/* 把注入键盘借给 seat：客户端是按「seat 上那个键盘的 keymap」解释键码的，
+ * 注入的键码也是按它算出来的，两边必须是同一份。真键盘按下时会自己抢回去
+ * （keyboard_key 里每次透传都 set 一遍），所以这里不用还原。 */
+static void inject_take_seat_keyboard(struct vidow_server *server) {
+	struct wlr_keyboard *kb = inject_keyboard(server);
+	if (wlr_seat_get_keyboard(server->seat) != kb) {
+		wlr_seat_set_keyboard(server->seat, kb);
+	}
+}
+
+/* 一个按键事件。xkb_state 和修饰键得自己更新：wlroots 那套是设备侧
+ * （wlr_keyboard_notify_key）做的，注入没有设备，只能照它抄一遍。 */
+static void inject_key(struct vidow_server *server, uint32_t keycode,
+		bool pressed) {
+	struct wlr_keyboard *kb = inject_keyboard(server);
+	inject_take_seat_keyboard(server);
+
+	if (kb->xkb_state != NULL) {
+		xkb_state_update_key(kb->xkb_state, keycode + 8,
+			pressed ? XKB_KEY_DOWN : XKB_KEY_UP);
+		kb->modifiers.depressed = xkb_state_serialize_mods(kb->xkb_state,
+			XKB_STATE_MODS_DEPRESSED);
+		kb->modifiers.latched = xkb_state_serialize_mods(kb->xkb_state,
+			XKB_STATE_MODS_LATCHED);
+		kb->modifiers.locked = xkb_state_serialize_mods(kb->xkb_state,
+			XKB_STATE_MODS_LOCKED);
+		kb->modifiers.group = xkb_state_serialize_layout(kb->xkb_state,
+			XKB_STATE_LAYOUT_EFFECTIVE);
+		wlr_seat_keyboard_notify_modifiers(server->seat, &kb->modifiers);
+	}
+
+	wlr_seat_keyboard_notify_key(server->seat, inject_now_ms(), keycode,
+		pressed ? WL_KEYBOARD_KEY_STATE_PRESSED
+			: WL_KEYBOARD_KEY_STATE_RELEASED);
+}
+
+/* 在 keymap 里反查「哪个键、哪个 level 能打出这个 keysym」。keymap 里的键码
+ * 从 8 开始（evdev 码 + 8），返回时减回去。 */
+static bool inject_lookup_key(struct wlr_keyboard *kb, xkb_keysym_t sym,
+		uint32_t *keycode, xkb_level_index_t *level) {
+	if (kb->keymap == NULL || sym == XKB_KEY_NoSymbol) {
+		return false;
+	}
+	xkb_keycode_t min = xkb_keymap_min_keycode(kb->keymap);
+	xkb_keycode_t max = xkb_keymap_max_keycode(kb->keymap);
+	xkb_layout_index_t layouts = xkb_keymap_num_layouts(kb->keymap);
+	for (xkb_keycode_t kc = min; kc <= max; kc++) {
+		for (xkb_layout_index_t l = 0; l < layouts; l++) {
+			xkb_level_index_t levels =
+				xkb_keymap_num_levels_for_key(kb->keymap, kc, l);
+			for (xkb_level_index_t lv = 0; lv < levels; lv++) {
+				const xkb_keysym_t *syms = NULL;
+				int n = xkb_keymap_key_get_syms_by_level(kb->keymap, kc, l,
+					lv, &syms);
+				for (int i = 0; i < n; i++) {
+					if (syms[i] == sym) {
+						*keycode = kc - 8;
+						*level = lv;
+						return true;
+					}
+				}
+			}
+		}
+	}
+	return false;
+}
+
+/* level → 要按住的修饰键。0 = 不用，1 = Shift，2 = AltGr，3 = 两个都要 ——
+ * 这是 xkb 里 4 级布局的通用约定（us / de / ru 这些常见布局都符合）。 */
+static size_t inject_level_keys(xkb_level_index_t level, xkb_keysym_t *out) {
+	size_t n = 0;
+	if (level == 1 || level == 3) {
+		out[n++] = XKB_KEY_Shift_L;
+	}
+	if (level == 2 || level == 3) {
+		out[n++] = XKB_KEY_ISO_Level3_Shift;
+	}
+	return n;
+}
+
+static xkb_keysym_t inject_mod_keysym(const char *name) {
+	if (strcasecmp(name, "shift") == 0) {
+		return XKB_KEY_Shift_L;
+	}
+	if (strcasecmp(name, "ctrl") == 0 || strcasecmp(name, "control") == 0) {
+		return XKB_KEY_Control_L;
+	}
+	if (strcasecmp(name, "alt") == 0 || strcasecmp(name, "mod1") == 0) {
+		return XKB_KEY_Alt_L;
+	}
+	if (strcasecmp(name, "super") == 0 || strcasecmp(name, "logo") == 0 ||
+			strcasecmp(name, "meta") == 0 || strcasecmp(name, "win") == 0 ||
+			strcasecmp(name, "mod4") == 0) {
+		return XKB_KEY_Super_L;
+	}
+	if (strcasecmp(name, "altgr") == 0 || strcasecmp(name, "level3") == 0) {
+		return XKB_KEY_ISO_Level3_Shift;
+	}
+	return XKB_KEY_NoSymbol;
+}
+
+/* UTF-8 解一个码点，返回下一个字符的位置。坏字节按 U+FFFD 走。 */
+static const char *inject_utf8_next(const char *s, uint32_t *cp) {
+	unsigned char c = (unsigned char)*s;
+	if (c < 0x80) {
+		*cp = c;
+		return s + 1;
+	}
+	int extra;
+	uint32_t v;
+	if ((c & 0xE0) == 0xC0) {
+		extra = 1;
+		v = c & 0x1F;
+	} else if ((c & 0xF0) == 0xE0) {
+		extra = 2;
+		v = c & 0x0F;
+	} else if ((c & 0xF8) == 0xF0) {
+		extra = 3;
+		v = c & 0x07;
+	} else {
+		*cp = 0xFFFD;
+		return s + 1;
+	}
+	for (int i = 0; i < extra; i++) {
+		if ((s[1 + i] & 0xC0) != 0x80) {
+			*cp = 0xFFFD;
+			return s + 1 + i;
+		}
+		v = (v << 6) | (uint32_t)(s[1 + i] & 0x3F);
+	}
+	*cp = v;
+	return s + 1 + extra;
+}
+
+/* 一个键名（keysym 名字 / 单字符 / 修饰键别名）→ keysym */
+static xkb_keysym_t inject_key_sym(const char *name) {
+	xkb_keysym_t sym = inject_mod_keysym(name);
+	if (sym != XKB_KEY_NoSymbol) {
+		return sym;
+	}
+	/* 先按原样找（大小写敏感）：'M' 和 'm' 是两个不同的键（差一个 Shift） */
+	sym = xkb_keysym_from_name(name, XKB_KEYSYM_NO_FLAGS);
+	if (sym != XKB_KEY_NoSymbol) {
+		return sym;
+	}
+	sym = xkb_keysym_from_name(name, XKB_KEYSYM_CASE_INSENSITIVE);
+	if (sym != XKB_KEY_NoSymbol) {
+		return sym;
+	}
+	uint32_t cp = 0;
+	const char *rest = inject_utf8_next(name, &cp);
+	if (*rest == '\0' && cp != 0 && cp != 0xFFFD) {
+		return xkb_utf32_to_keysym(cp);
+	}
+	return XKB_KEY_NoSymbol;
+}
+
+static bool inject_combo_add_mod(struct wlr_keyboard *kb,
+		struct inject_combo *c, xkb_keysym_t sym) {
+	uint32_t keycode = 0;
+	xkb_level_index_t level = 0;
+	if (!inject_lookup_key(kb, sym, &keycode, &level)) {
+		return false;
+	}
+	for (size_t i = 0; i < c->nmods; i++) {
+		if (c->mods[i] == keycode) {
+			return true; /* 已经要按了（比如 "shift+A" 里 Shift 只按一次） */
+		}
+	}
+	if (c->nmods >= INJECT_MAX_MODS) {
+		return false;
+	}
+	c->mods[c->nmods++] = keycode;
+	return true;
+}
+
+/* "ctrl+shift+t" → 修饰键列表 + 主键。最后一个 '+' 后面那个才是主键。 */
+static bool inject_combo_parse(struct vidow_server *server, const char *combo,
+		struct inject_combo *out, char *err, size_t errlen) {
+	struct wlr_keyboard *kb = inject_keyboard(server);
+	char buf[128];
+	snprintf(buf, sizeof(buf), "%s", combo);
+	out->nmods = 0;
+	out->keycode = 0;
+
+	char *save = NULL;
+	char *tok = strtok_r(buf, "+", &save);
+	char *main_tok = NULL;
+	while (tok != NULL) {
+		if (main_tok != NULL) {
+			xkb_keysym_t msym = inject_mod_keysym(main_tok);
+			if (msym == XKB_KEY_NoSymbol) {
+				snprintf(err, errlen, "不认识的修饰键 '%s'"
+					"（shift / ctrl / alt / super / altgr）", main_tok);
+				return false;
+			}
+			if (!inject_combo_add_mod(kb, out, msym)) {
+				snprintf(err, errlen, "这个键盘布局里没有 '%s' 这个修饰键",
+					main_tok);
+				return false;
+			}
+		}
+		main_tok = tok;
+		tok = strtok_r(NULL, "+", &save);
+	}
+	if (main_tok == NULL) {
+		snprintf(err, errlen, "没给按键");
+		return false;
+	}
+
+	xkb_keysym_t sym = inject_key_sym(main_tok);
+	xkb_level_index_t level = 0;
+	if (sym == XKB_KEY_NoSymbol ||
+			!inject_lookup_key(kb, sym, &out->keycode, &level)) {
+		snprintf(err, errlen, "当前键盘布局里没有 '%s' 这个键"
+			"（写 keysym 名字：Return / Tab / a / F5 / XF86AudioMute）", main_tok);
+		return false;
+	}
+	/* 主键自己所在的 level 也要按修饰键："A" 要 Shift，"@" 要 Shift+2 */
+	xkb_keysym_t lvl_keys[2];
+	size_t nlvl = inject_level_keys(level, lvl_keys);
+	for (size_t i = 0; i < nlvl; i++) {
+		if (!inject_combo_add_mod(kb, out, lvl_keys[i])) {
+			snprintf(err, errlen, "当前键盘布局缺 Shift / AltGr 键位，"
+				"打不出 '%s'", main_tok);
+			return false;
+		}
+	}
+	return true;
+}
+
+/* 按下 → 松开一个 keysym（自己处理 level 需要的 Shift / AltGr） */
+static bool inject_tap_sym(struct vidow_server *server, xkb_keysym_t sym) {
+	struct wlr_keyboard *kb = inject_keyboard(server);
+	uint32_t keycode = 0;
+	xkb_level_index_t level = 0;
+	if (!inject_lookup_key(kb, sym, &keycode, &level)) {
+		return false;
+	}
+	xkb_keysym_t lvl_keys[2];
+	size_t nlvl = inject_level_keys(level, lvl_keys);
+	uint32_t modcodes[2];
+	size_t nmods = 0;
+	for (size_t i = 0; i < nlvl; i++) {
+		xkb_level_index_t ml = 0;
+		if (!inject_lookup_key(kb, lvl_keys[i], &modcodes[nmods], &ml)) {
+			return false;
+		}
+		nmods++;
+	}
+	for (size_t i = 0; i < nmods; i++) {
+		inject_key(server, modcodes[i], true);
+	}
+	inject_key(server, keycode, true);
+	inject_key(server, keycode, false);
+	for (size_t i = nmods; i-- > 0;) {
+		inject_key(server, modcodes[i], false);
+	}
+	return true;
+}
+
+bool vidow_inject_pointer_move(struct vidow_server *server, double x, double y,
+		bool relative, char *err, size_t errlen) {
+	if (!vidow_inject_allowed(server, err, errlen)) {
+		return false;
+	}
+	double tx = relative ? server->cursor->x + x : x;
+	double ty = relative ? server->cursor->y + y : y;
+	if (!wlr_cursor_warp(server->cursor, NULL, tx, ty)) {
+		snprintf(err, errlen, "%.0f,%.0f 在输出布局之外", tx, ty);
+		return false;
+	}
+	/* wlr_cursor_warp 只挪位置、不发事件（wlroots 的 cursor_warp_unchecked），
+	 * 所以显式走一遍处理：指针焦点、enter/motion、拖拽的 grab 分支都在里面。 */
+	vidow_pointer_motion(server, inject_now_ms());
+	wlr_log(WLR_INFO, "注入: 指针%s移到 %.0f,%.0f", relative ? "相对" : "",
+		server->cursor->x, server->cursor->y);
+	return true;
+}
+
+uint32_t vidow_pointer_button_from_name(const char *name) {
+	if (name == NULL || name[0] == '\0') {
+		return 0;
+	}
+	if (strcasecmp(name, "left") == 0) {
+		return BTN_LEFT;
+	}
+	if (strcasecmp(name, "right") == 0) {
+		return BTN_RIGHT;
+	}
+	if (strcasecmp(name, "middle") == 0) {
+		return BTN_MIDDLE;
+	}
+	if (strcasecmp(name, "back") == 0) {
+		return BTN_SIDE;
+	}
+	if (strcasecmp(name, "forward") == 0) {
+		return BTN_EXTRA;
+	}
+	/* 也认数字（BTN_LEFT = 272 这种写在脚本里没人记得住） */
+	char *end = NULL;
+	long v = strtol(name, &end, 10);
+	if (end != NULL && *end == '\0' && v > 0 && v < 0x200) {
+		return (uint32_t)v;
+	}
+	return 0;
+}
+
+bool vidow_inject_pointer_button(struct vidow_server *server, const char *name,
+		int mode, int count, char *err, size_t errlen) {
+	if (!vidow_inject_allowed(server, err, errlen)) {
+		return false;
+	}
+	uint32_t btn = vidow_pointer_button_from_name(name);
+	if (btn == 0) {
+		snprintf(err, errlen, "不认识的按钮 '%s'"
+			"（left / right / middle / back / forward / 数字）",
+			name != NULL ? name : "");
+		return false;
+	}
+	if (count < 1) {
+		count = 1;
+	}
+	for (int i = 0; i < count; i++) {
+		/* 连点：时间戳拉开 40ms，客户端才会把两下认成双击 */
+		uint32_t t = inject_now_ms() + (uint32_t)(i * 40);
+		if (mode != 2) {
+			vidow_pointer_button(server, btn, true, t, false);
+		}
+		if (mode != 1) {
+			vidow_pointer_button(server, btn, false, t, false);
+		}
+	}
+	wlr_log(WLR_INFO, "注入: 按钮 %u %s%s（在 %.0f,%.0f）", btn,
+		mode == 0 ? "点一下" : mode == 1 ? "按下" : "松开",
+		count > 1 ? "（连点）" : "", server->cursor->x, server->cursor->y);
+	return true;
+}
+
+bool vidow_inject_pointer_scroll(struct vidow_server *server, double dx,
+		double dy, bool discrete, char *err, size_t errlen) {
+	if (!vidow_inject_allowed(server, err, errlen)) {
+		return false;
+	}
+	if (dx == 0 && dy == 0) {
+		snprintf(err, errlen, "dx / dy 都是 0，没得滚");
+		return false;
+	}
+	enum wl_pointer_axis_source source = discrete
+		? WL_POINTER_AXIS_SOURCE_WHEEL : WL_POINTER_AXIS_SOURCE_CONTINUOUS;
+	/* 滚轮模式下数字是**格数**：一格 = delta 15 像素 + delta_discrete 120，
+	 * 和真鼠标经 libinput 过来的一模一样（libinput 的轴值 ≈15/格，离散值按
+	 * WLR_POINTER_AXIS_DISCRETE_STEP = 120 放大）。连续模式就按原值给。 */
+	double ddx = discrete ? dx * 15.0 : dx;
+	double ddy = discrete ? dy * 15.0 : dy;
+	int32_t sdx = discrete ? (int32_t)lround(dx * 120.0) : 0;
+	int32_t sdy = discrete ? (int32_t)lround(dy * 120.0) : 0;
+	uint32_t t = inject_now_ms();
+	if (ddy != 0) {
+		vidow_pointer_axis(server, WL_POINTER_AXIS_VERTICAL_SCROLL, ddy, sdy,
+			source, t);
+	}
+	if (ddx != 0) {
+		vidow_pointer_axis(server, WL_POINTER_AXIS_HORIZONTAL_SCROLL, ddx, sdx,
+			source, t);
+	}
+	wlr_seat_pointer_notify_frame(server->seat);
+	wlr_log(WLR_INFO, "注入: 滚轮 %.1f,%.1f 格（%s）", dx, dy,
+		discrete ? "滚轮" : "连续");
+	return true;
+}
+
+bool vidow_inject_key_combo(struct vidow_server *server, const char *combo,
+		int mode, char *err, size_t errlen) {
+	if (!vidow_inject_allowed(server, err, errlen)) {
+		return false;
+	}
+	if (combo == NULL || combo[0] == '\0') {
+		snprintf(err, errlen, "要一个按键（ctrl+shift+t / Return / a）");
+		return false;
+	}
+	struct inject_combo c;
+	if (!inject_combo_parse(server, combo, &c, err, errlen)) {
+		return false;
+	}
+	if (mode != 2) { /* tap / press：修饰键先按住 */
+		for (size_t i = 0; i < c.nmods; i++) {
+			inject_key(server, c.mods[i], true);
+		}
+		inject_key(server, c.keycode, true);
+	}
+	if (mode != 1) { /* tap / release：主键先松开，再松修饰键 */
+		inject_key(server, c.keycode, false);
+		for (size_t i = c.nmods; i-- > 0;) {
+			inject_key(server, c.mods[i], false);
+		}
+	}
+	wlr_log(WLR_INFO, "注入: 按键 %s（%s）", combo,
+		mode == 0 ? "按下并松开" : mode == 1 ? "按下" : "松开");
+	return true;
+}
+
+bool vidow_inject_text(struct vidow_server *server, const char *text, char *err,
+		size_t errlen) {
+	if (!vidow_inject_allowed(server, err, errlen)) {
+		return false;
+	}
+	if (text == NULL || text[0] == '\0') {
+		snprintf(err, errlen, "要一段文字");
+		return false;
+	}
+	size_t done = 0;
+	const char *p = text;
+	while (*p != '\0') {
+		uint32_t cp = 0;
+		p = inject_utf8_next(p, &cp);
+		xkb_keysym_t sym = xkb_utf32_to_keysym(cp);
+		if (sym == XKB_KEY_NoSymbol || !inject_tap_sym(server, sym)) {
+			/* 中文这类字符得靠输入法，不是「按个键」能打出来的 */
+			snprintf(err, errlen, "第 %zu 个字符（U+%04X）在当前键盘布局里"
+				"打不出来（中文之类要走输入法）", done + 1, cp);
+			return false;
+		}
+		done++;
+	}
+	wlr_log(WLR_INFO, "注入: 打了 %zu 个字符", done);
+	return true;
+}
+
+bool vidow_input_inject_init(struct vidow_server *server) {
+	/* wlroots 没有公开的「造一个键盘」接口，只有键盘组能给出一个干净的
+	 * wlr_keyboard（自带 keymap / xkb_state）—— 借它的 keyboard 成员正好够用。 */
+	server->inject_group = wlr_keyboard_group_create();
+	if (server->inject_group == NULL) {
+		wlr_log(WLR_ERROR, "注入键盘建不起来：IPC 的 send-key / type-text 不能用");
+		return false;
+	}
+	struct wlr_keyboard *kb = &server->inject_group->keyboard;
+	free(kb->base.name);
+	kb->base.name = strdup("vidow-inject");
+	/* 挂进 keyboards 列表：headless 会话里它就是「这个座位有键盘」的唯一证据
+	 * （少了它客户端连 wl_keyboard 都不会去要，注入的键也就没地方送）。
+	 * keymap 走 server_add_keyboard 里那套（系统默认布局），和真键盘一致。 */
+	server_add_keyboard(server, kb, &kb->base, NULL, true);
+	seat_update_capabilities(server);
+	wlr_log(WLR_INFO, "注入键盘就绪：%s（IPC 的 send-key / type-text 用它）",
+		kb->base.name);
 	return true;
 }

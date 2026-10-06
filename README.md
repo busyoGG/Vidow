@@ -610,6 +610,7 @@ python3 test-float.py        # 三个真实 GTK 窗口，验证浮动模式自�
 ./test-vt.sh                         # tty 的 VT 切换（Ctrl+Alt+F1..F12 / switch-vt 动作）（全 headless，11 项断言）
 ./test-focus.sh                      # 焦点规则 + 激活请求（全 headless，61 项断言）
 ./test-ipc.sh                        # IPC：状态输出 / 命令 / 事件 / 多屏（全 headless，162 项断言）
+./test-input-inject.sh               # 输入注入：鼠标 / 键盘合成事件到客户端（全 headless，54 项断言）
 ./test-config.sh                     # 配置系统：一个 Lua 文件 + 改了就自动重载（全 headless，15 项断言）
 ./test-defaultconfig.sh              # 完整默认配置（--default-config / --write-config）+ 配置族的表写法（全 headless，29 项断言）
 ./test-gap.sh                        # 间距：一个数管全部 + 单边/内间距覆盖（全 headless，33 项断言）
@@ -1185,7 +1186,7 @@ vidow 自己的，比如 `vidow-wayland-1.sock`）；`ipc_socket` 可以写死�
 | `layers` | 每个 layer surface：`namespace`、`layer`、`output`、`mapped`、`exclusive_zone`、`keyboard_interactivity`、`anchor`、`margin`、想要 / 实际尺寸、几何 |
 | `config` | **配置表的全部键值**（跟 `config.lua` 里 `vidow.get` 读到的是同一个东西）；`config` + `key` 只取一个 |
 | `keybinds` / `rules` | 键位表（触发串 + 动作串）、窗口规则（含「这一条到底写没写」的 null 语义） |
-| `seats` / `input` | seat 的能力列表、当前键盘的布局 / repeat / LED、所有键盘（含虚拟键盘）、光标位置、当前的交互式 grab、拿着键盘的 layer surface |
+| `seats` / `input` | seat 的能力列表、当前键盘的布局 / repeat / LED、所有键盘（含虚拟键盘和 vidow 自己的注入键盘 `vidow-inject`）、光标位置、当前的交互式 grab、拿着键盘的 layer surface |
 | `tokens` | 活着的 xdg-activation 令牌（app_id、serial 校验过没过、活了多久） |
 | `memories` | 热插拔记忆（每块见过的屏：在不在、上次的布局位置、离开时的滚动位置和焦点） |
 | `anims` | 正在跑的动画（tag / 进度 / 时长 / 缓动）+ 正在淡出的关闭快照 |
@@ -1203,6 +1204,7 @@ vidow 自己的，比如 `vidow-wayland-1.sock`）；`ipc_socket` 可以写死�
 | 输出 | `output-power`（`on` / `off` / `toggle`）、`output-enable` / `output-disable` / `output-toggle`、`output-scale`（数字或 `auto`）、`output-transform`、`output-mode`（宽 高 [刷新率]）、`output-position`、`output-focus` |
 | 剪贴板 | `clipboard`（查状态）、`clipboard-get`（取数据：文本或 base64）、`clipboard-set`（放数据：文本 / base64 / 指定 mime / 指定选区）、`clipboard-clear` |
 | 合成器 | `action`（键位那套动作字符串）、`set-config` / `get-config`、`reload-config`、`toggle-overview`、`move-cursor`、`quit` |
+| 输入注入 | `pointer-button`（`click` / `press` / `release` + `button` / `count`）、`pointer-scroll`（`dx` / `dy` / `discrete`）、`send-key`（`state` + `keys`）、`type-text`（`text`）；见下面「输入注入」一节 |
 | 订阅 | `subscribe`（可带 `events` 过滤器）、`unsubscribe` |
 
 几条语义值得记一下：
@@ -1282,6 +1284,77 @@ ipc_socket = /run/user/1000/vidow.sock   # 留空 = 按 WAYLAND_DISPLAY 自动�
    原因提交一次**旧尺寸**，`vidow_float_on_commit()` 会拿旧尺寸把浮动盒改回去，随后 arrange
    又按旧尺寸 configure —— 等于这条命令没发生。现在记着「我让它多大」（`float_want_w/h`），
    在客户端认下来之前不采纳它的旧尺寸，并且再催一次 configure。
+
+## 输入注入：IPC 能操控鼠标和键盘
+
+「谁连上 socket 谁就能操控整个桌面」。这是给自动化 / 远程操控 / 测试用的，也是 UI 识别
+（[`docs/ui-tree-feasibility.md`](docs/ui-tree-feasibility.md)）的另一半：能看见控件，还得能
+点下去 —— 而且对**没有无障碍树**的应用（游戏、自绘 GUI），合成输入是唯一能动手的办法。
+
+### 五条命令
+
+| 命令 | 干什么 |
+|------|--------|
+| `move-cursor x y [--relative]` | 把指针移到（布局坐标），顺带更新指针焦点 |
+| `pointer-button click\|press\|release [键] [连点数]` | 点 / 按住 / 松开；键认 `left` `right` `middle` `back` `forward` 和数字 |
+| `pointer-scroll dx dy [--discrete false]` | 滚轮（dx/dy 是**格数**）；`--discrete false` = 触摸板式连续滚动 |
+| `send-key [tap\|press\|release] 组合键` | `Return` / `ctrl+shift+t` / `super+Tab` / `XF86AudioMute` |
+| `type-text 文字` | 逐字符打（ASCII / Latin-1；中文要走输入法，会明确报错） |
+
+```bash
+vidowmsg move-cursor 300 200             # 挪到 (300,200)
+vidowmsg pointer-button click            # 左键点一下
+vidowmsg pointer-button press left       # 按住不放（拖拽前半段）
+vidowmsg move-cursor 100 50 --relative   # 相对挪（拖拽后半段）
+vidowmsg pointer-button release left     # 松手
+vidowmsg pointer-scroll 0 -3             # 往上滚三格
+vidowmsg send-key tap ctrl+c             # 给焦点窗口发 Ctrl+C
+vidowmsg type-text "hello world"         # 打一段字
+```
+
+### 两条设计原则
+
+1. **走和真设备完全同一条路**。指针走 `vidow_pointer_motion` / `vidow_pointer_button` /
+   `vidow_pointer_axis`，按键走 seat 的 `wlr_seat_keyboard_notify_*`。所以注入的点击会像真
+   点击一样抢焦点、起拖拽；注入的 super 按住时滚轮是**换列**（不是滚客户端）。测试注入
+   （`VIDOW_TEST_ACTION` 的 `pointer-motion` / `pointer-button` 动作）用的就是这条路。
+2. **注入的按键只给客户端，不触发 vidow 自己的快捷键**。要操作合成器请用对应的 IPC 命令
+   （`focus-window` / `toggle-overview` / `focus-workspace`…）—— 否则「给应用发 Ctrl+C」会被
+   绑定的 Ctrl+C 吃掉。测试里专门验了这条。
+
+### 键盘是哪来的
+
+往 seat 上送按键需要一个 `wlr_keyboard`，而 wlroots 没公开「造一个键盘」的接口，只有**键盘组**
+能给出一个干净的（自带 keymap 和 xkb_state）。所以 vidow 启动时建一个 `vidow-inject` 键盘
+（`vidowmsg input` 里能看到，`inject: true`），keymap 和真键盘同一份（系统默认布局），按键时
+借给 seat 用一下 —— 真键盘一按就自己抢回去了。
+
+组合键的键码是**从 keymap 反查**的：`xkb_keymap_key_get_syms_by_level` 扫一遍
+keycode × level，找到能打出这个 keysym 的那个键，再按 level 补上 Shift / AltGr
+（`A` 要 Shift、`@` 要 Shift+2、`!` 要 Shift+1 都是这么来的）。
+
+headless 会话里这个键盘还有个额外好处：座位因此报出 KEYBOARD 能力，客户端才会去要
+`wl_keyboard` —— 否则注入的键没地方送。
+
+### 安全边界
+
+- socket 是 **0600**（只有本用户能连），但连上之后所有命令都能用 —— 包括这五条。
+- 默认**开**（`input_injection = true`）。要收紧就写 `false`：五条命令全部拒绝，理由写清楚。
+- 每次注入都打一条 **info 日志**（`注入: 指针移到 300,200` / `注入: 按键 ctrl+c（按下并松开）`）。
+- 注入的按键不碰 vidow 自己的快捷键（见上面第 2 条），所以它按不动 vidow 的绑定。
+
+### 测试
+
+`./test-input-inject.sh`（全 headless，54 项断言）拿 **wev**（第三方 Wayland 事件查看器）当
+观察者 —— 「事件真的到客户端了」由它说了算，不是合成器自己说：窗口内坐标（窗口在 6,6，
+光标到 300,200 → 局部 294,194）、相对移动、左右键的 press/release/连点、滚轮的
+`axis_value120`（一格 = 120、delta = 15）与连续滚动的区别、`ctrl+shift+t` 的**顺序**
+（修饰键先按后松）、`Hi!` 里每个字符的 Shift、注入 `super+t` 不触发绑定但客户端照样收到、
+按住 super 滚轮不转发给客户端、`input_injection = false` 之后全部拒绝。
+
+顺带修掉一个真 bug：`move-cursor` 以前只挪光标位置、**不给客户端发 motion**
+（`wlr_cursor_warp` 就是这样，只改坐标不发事件），现在它和真鼠标一样会更新指针焦点 ——
+这也是「脚本点了没反应」类问题的根源之一。
 
 ## 剪贴板：X11 ↔ Wayland 同步（自建桥）
 
@@ -2212,6 +2285,12 @@ test-minimize.sh   最小化：窗口留在原列里（不占位 / 不显示 / �
                    同列剩下的撑满、焦点交给邻居、放回回原位、浮窗也认、整列收起、
                    客户端自己请求（`xdg_toplevel.set_minimized`）、`force_render` 的窗口
                    收起来照样出帧、SIGHUP 不改状态、X11 的 `WM_STATE` Iconic ⇄ Normal
+test-input-inject.sh 输入注入：`move-cursor` / `pointer-button` / `pointer-scroll` /
+                  `send-key` / `type-text` 合成的事件**真的到客户端了**（拿 wev 当观察者）：
+                  窗口内坐标、相对移动、连点、滚轮的 value120 与连续滚动的区别、
+                  `ctrl+shift+t` 的顺序、`Hi!` 里每个字符的 Shift、注入 super+t 不触发
+                  绑定但客户端照样收到、按住 super 滚轮不转发给客户端、
+                  `input_injection = false` 之后全部拒绝
 test-xwayland-hidpi.sh  XWayland 的 HiDPI 告知：`_XWAYLAND_GLOBAL_OUTPUT_SCALE`
                   让 X 屏幕 / RandR 变成设备像素（补丁生效时），`Xft.dpi = 96×S`，
                   以及没打补丁时量到屏幕没跟着缩放、自动退回 1 倍（钩子模拟），

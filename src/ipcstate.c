@@ -757,6 +757,7 @@ void vidow_ipc_json_input(struct jbuf *b, struct vidow_server *server) {
 		jb_obj(b);
 		jb_kv_str(b, "name", k->base.name);
 		jb_kv_bool(b, "virtual", kb->virtual != NULL);
+		jb_kv_bool(b, "inject", kb->inject);
 		const char *layout = NULL;
 		if (k->keymap != NULL) {
 			layout = xkb_keymap_layout_get_name(k->keymap, k->modifiers.group);

@@ -218,10 +218,17 @@ AT-SPI 除了读，还有 `Action` 接口（"按"某个控件），以及 `Edita
 | 之后读 checkbox 的 `CHECKED` 状态 | **`False` → `False`（没生效）** |
 
 **所以"能点"这件事没被证实。** 可能是调用方式不对（`get_action_iface()` 再调），可能是
-Chromium 的 Action 实现有前置条件，也可能只是这次实验的观测点不好。要用之前先查清；
-兜底是合成输入——vidow 已经有 `wlr_virtual_keyboard_manager_v1` /
-`wlr_virtual_pointer_manager_v1`（`src/input.c:306`、`src/input.c:576`），以及
-`vidowmsg move-cursor x y`。
+Chromium 的 Action 实现有前置条件，也可能只是这次实验的观测点不好。要用之前先查清。
+
+**2026-10-06 更新：操作这一半已经不用等 AT-SPI 了。** vidow 自己做了 IPC 输入注入
+（`move-cursor` / `pointer-button` / `pointer-scroll` / `send-key` / `type-text`，见
+README 的「输入注入」一节，`test-input-inject.sh` 54 项断言，用 wev 当观察者验到客户端
+真的收到）。它走的是和真设备同一条路，所以对**没有无障碍树的应用**（游戏、自绘 GUI）
+同样有效 —— 覆盖缺口里唯一绕不过去的那条（§0 第 1 项）由此有了兜底：看得见的部分靠
+AT-SPI（或表面树），看不见的部分靠坐标 + 合成输入。
+
+AT-SPI 的 `Action` / `EditableText` 仍然值得做（不用猜坐标、不依赖焦点），但它是**优化**
+而不是**前提**。
 
 ---
 
@@ -233,7 +240,7 @@ Chromium 的 Action 实现有前置条件，也可能只是这次实验的观测
 | **B. AT-SPI 侧车** | 看应用 | `vidow-a11y` 进程读总线，输出控件级树 | ~1 天 |
 | **C. A+B 合并** | A∪B | 全局坐标（A 的窗口位置 + B 的窗口内偏移）、pid 关联、统一 JSON | ~半天 |
 | **D. 像素兜底** | 100%（不精确） | 截图 + OCR / 视觉模型，补 A/B 都拿不到的窗口内部 | 取决于模型，慢 |
-| **E. 操作** | — | AT-SPI `Action`/`EditableText`（未验证）或 vidow 合成输入（已有） | 半天（含验证） |
+| **E. 操作** | — | ✅ vidow 合成输入（已有：IPC 五条命令 + `test-input-inject.sh`）；AT-SPI `Action`/`EditableText` 仍未验证（做了更准，但不再是前提） | 已完成 |
 
 **A+B+C ≈ 2 天**，得到"能读的应用有控件级树，其余至少到窗口级"——仍然不是"所有应用的
 UI 元素树"。要真正逼近"所有"，D 是唯一兜底，但它不是树。
@@ -371,6 +378,7 @@ for i in range(d.get_child_count()):
 2. **`--force-renderer-accessibility` 单独够不够**——只跑了一次（结果：不够）。
 3. **Action 为什么不生效**——`do_action` 返回 `True` 但状态没变；要试
    `get_action_iface()`、换控件类型、换观测点（`EditableText.set_text_content`）。
+   （vidow 自己的输入注入已经能替代它，所以这条不挡路了）
 4. **GTK 在 X11 下是否报真·屏幕坐标**——影响 Xwayland 窗口的合并逻辑（若报真屏幕坐标，
    这类窗口不能加偏移，要识别出来）。
 5. **同 pid 多窗口的消歧**——尺寸匹配在"两个同尺寸窗口"时会歧义。

@@ -494,16 +494,13 @@ bool vidow_action_run(struct vidow_server *server, const char *action) {
 				"press|release [mod]");
 			return false;
 		}
-		/* 认名字也认数字（BTN_LEFT = 272 这种数字写在测试里没人记得住） */
-		uint32_t btn;
-		if (strcmp(key, "left") == 0) {
-			btn = BTN_LEFT;
-		} else if (strcmp(key, "right") == 0) {
-			btn = BTN_RIGHT;
-		} else if (strcmp(key, "middle") == 0) {
-			btn = BTN_MIDDLE;
-		} else {
-			btn = (uint32_t)atoi(key);
+		/* 认名字也认数字（BTN_LEFT = 272 这种数字写在测试里没人记得住）。
+		 * 名字表在 input.c，和 IPC 的 pointer-button 共用一份。 */
+		uint32_t btn = vidow_pointer_button_from_name(key);
+		if (btn == 0) {
+			wlr_log(WLR_ERROR, "不认识的按钮 '%s'"
+				"（left / right / middle / back / forward / 数字）", key);
+			return false;
 		}
 		bool pressed = strcmp(state, "press") == 0;
 		vidow_pointer_button(server, btn, pressed,

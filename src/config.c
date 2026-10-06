@@ -181,6 +181,10 @@ static const struct entry entries[] = {
 		"开 IPC socket（vidowmsg、状态栏、脚本靠它）" },
 	{ "ipc_socket",      K_STRING, OFF(ipc_socket),      SZ(ipc_socket), 7,
 		"socket 路径，留空 = 按 WAYLAND_DISPLAY 自动取" },
+	{ "input_injection", K_BOOL,   OFF(input_injection), SZ(input_injection), 7,
+		"IPC 能不能合成鼠标 / 键盘事件（move-cursor / pointer-button / "
+		"pointer-scroll / send-key / type-text）：等于「谁连上 socket 谁就能"
+		"操控整个桌面」。默认开，每次注入都打一条 info 日志" },
 
 	{ "scale",           K_STRING, OFF(scale),           SZ(scale), 8,
 		"所有输出的默认缩放：auto = 按 EDID 的 ppi 推，也可以写死 \"1\" / \"1.5\""
@@ -540,6 +544,10 @@ static void defaults(struct vidow_config *cfg) {
 	 * 路径留空 = 按 WAYLAND_DISPLAY 自动取（$XDG_RUNTIME_DIR/vidow-<display>.sock）。 */
 	cfg->ipc = true;
 	cfg->ipc_socket[0] = '\0';
+	/* 输入注入默认开：IPC 能合成鼠标 / 键盘事件（move-cursor / pointer-button /
+	 * pointer-scroll / send-key / type-text），自动化靠它动手。socket 是 0600，
+	 * 只有本用户能连，而且每次注入都打一条 info 日志留痕；要收紧就写 false。 */
+	cfg->input_injection = true;
 	/* 剪贴板默认接管：X11(Xwayland) 和 Wayland 两边共用一份内容，而且不看焦点
 	 * （wlroots 自带那套只在有 X11 窗口聚焦时才同步）。每个类型读进内存的上限
 	 * 32MiB —— 「源程序退出后还能粘」靠的就是这份副本。 */
@@ -749,6 +757,8 @@ void vidow_config_log(const struct vidow_config *cfg) {
 	wlr_log(WLR_INFO, "config: ipc=%s socket=%s",
 		cfg->ipc ? "on" : "off",
 		cfg->ipc_socket[0] != '\0' ? cfg->ipc_socket : "(自动)");
+	wlr_log(WLR_INFO, "config: input_injection=%s（IPC 能不能合成鼠标 / 键盘）",
+		cfg->input_injection ? "on" : "off");
 	wlr_log(WLR_INFO, "config: clipboard=%s primary=%s max=%d 字节",
 		cfg->clipboard ? "on" : "off",
 		cfg->clipboard_primary ? "on" : "off", cfg->clipboard_max_bytes);

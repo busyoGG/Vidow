@@ -1427,6 +1427,13 @@ static bool cmd_quit(struct vidow_server *server, struct jval *req,
 	return true;
 }
 
+/* ------------------------------------------------------- 输入注入（见 input.c）
+ *
+ * 这几条命令能合成鼠标 / 键盘事件 —— 谁连上 socket 谁就能操控整个桌面。默认
+ * 开着（config.input_injection），每次注入都会打一条 info 日志留痕。
+ * 注入的按键只给**客户端**，不触发 vidow 自己的快捷键。
+ */
+
 static bool cmd_move_cursor(struct vidow_server *server, struct jval *req,
 		struct jbuf *out, char *err, size_t errlen) {
 	double x = 0.0, y = 0.0;
@@ -1434,12 +1441,152 @@ static bool cmd_move_cursor(struct vidow_server *server, struct jval *req,
 		snprintf(err, errlen, "要 x / y（布局坐标）");
 		return false;
 	}
-	wlr_cursor_warp(server->cursor, NULL, x, y);
+	bool relative = false;
+	jget_bool(req, "relative", &relative);
+	/* 顺带把指针焦点也更新了（wlr_cursor_warp 自己只挪位置，见 input.c） */
+	if (!vidow_inject_pointer_move(server, x, y, relative, err, errlen)) {
+		return false;
+	}
 	jb_obj(out);
 	jb_key(out, "cursor");
 	jb_obj(out);
 	jb_kv_double(out, "x", server->cursor->x);
 	jb_kv_double(out, "y", server->cursor->y);
+	jb_obj_end(out);
+	jb_obj_end(out);
+	return true;
+}
+
+/* state = click / press / release；button = left（默认）/ right / middle /
+ * back / forward / 数字；count > 1 连点（时间戳隔 40ms，客户端才认双击）。 */
+static bool cmd_pointer_button(struct vidow_server *server, struct jval *req,
+		struct jbuf *out, char *err, size_t errlen) {
+	const char *state = jget_str(req, "state");
+	int mode = -1;
+	if (state != NULL) {
+		if (strcasecmp(state, "click") == 0 || strcasecmp(state, "tap") == 0) {
+			mode = 0;
+		} else if (strcasecmp(state, "press") == 0 ||
+				strcasecmp(state, "down") == 0) {
+			mode = 1;
+		} else if (strcasecmp(state, "release") == 0 ||
+				strcasecmp(state, "up") == 0) {
+			mode = 2;
+		}
+	}
+	if (mode < 0) {
+		snprintf(err, errlen, "要 state = click / press / release");
+		return false;
+	}
+	const char *button = jget_str(req, "button");
+	if (button == NULL || button[0] == '\0') {
+		button = "left";
+	}
+	long long count = 1;
+	jget_int(req, "count", &count);
+	if (count < 1) {
+		count = 1;
+	}
+	if (count > 100) {
+		count = 100;
+	}
+	if (!vidow_inject_pointer_button(server, button, mode, (int)count, err,
+			errlen)) {
+		return false;
+	}
+	jb_obj(out);
+	jb_key(out, "pointer");
+	jb_obj(out);
+	jb_kv_str(out, "button", button);
+	jb_kv_uint(out, "code", vidow_pointer_button_from_name(button));
+	jb_kv_str(out, "state", mode == 0 ? "click" : mode == 1 ? "press" : "release");
+	jb_kv_int(out, "count", count);
+	jb_obj_end(out);
+	jb_obj_end(out);
+	return true;
+}
+
+/* dx / dy：discrete（默认 true）= 格数，一格 = delta 15 像素 + 离散值 120；
+ * false = 连续滚动的像素值。 */
+static bool cmd_pointer_scroll(struct vidow_server *server, struct jval *req,
+		struct jbuf *out, char *err, size_t errlen) {
+	double dx = 0.0, dy = 0.0;
+	bool has_dx = jget_double(req, "dx", &dx) || jget_double(req, "x", &dx);
+	bool has_dy = jget_double(req, "dy", &dy) || jget_double(req, "y", &dy);
+	if (!has_dx && !has_dy) {
+		snprintf(err, errlen, "要 dx / dy（滚轮模式下是格数）");
+		return false;
+	}
+	bool discrete = true;
+	jget_bool(req, "discrete", &discrete);
+	if (!vidow_inject_pointer_scroll(server, dx, dy, discrete, err, errlen)) {
+		return false;
+	}
+	jb_obj(out);
+	jb_key(out, "scroll");
+	jb_obj(out);
+	jb_kv_double(out, "dx", dx);
+	jb_kv_double(out, "dy", dy);
+	jb_kv_bool(out, "discrete", discrete);
+	jb_obj_end(out);
+	jb_obj_end(out);
+	return true;
+}
+
+/* state = tap（默认）/ press / release；keys = "ctrl+shift+t" / "Return" / "a"。 */
+static bool cmd_send_key(struct vidow_server *server, struct jval *req,
+		struct jbuf *out, char *err, size_t errlen) {
+	const char *keys = jget_str(req, "keys");
+	if (keys == NULL || keys[0] == '\0') {
+		keys = jget_str(req, "key");
+	}
+	if (keys == NULL || keys[0] == '\0') {
+		snprintf(err, errlen, "要 keys（ctrl+shift+t / Return / a）");
+		return false;
+	}
+	const char *state = jget_str(req, "state");
+	int mode = 0;
+	if (state != NULL) {
+		if (strcasecmp(state, "tap") == 0 || strcasecmp(state, "click") == 0) {
+			mode = 0;
+		} else if (strcasecmp(state, "press") == 0 ||
+				strcasecmp(state, "down") == 0) {
+			mode = 1;
+		} else if (strcasecmp(state, "release") == 0 ||
+				strcasecmp(state, "up") == 0) {
+			mode = 2;
+		} else {
+			snprintf(err, errlen, "state 只能是 tap / press / release");
+			return false;
+		}
+	}
+	if (!vidow_inject_key_combo(server, keys, mode, err, errlen)) {
+		return false;
+	}
+	jb_obj(out);
+	jb_key(out, "key");
+	jb_obj(out);
+	jb_kv_str(out, "keys", keys);
+	jb_kv_str(out, "state", mode == 0 ? "tap" : mode == 1 ? "press" : "release");
+	jb_obj_end(out);
+	jb_obj_end(out);
+	return true;
+}
+
+static bool cmd_type_text(struct vidow_server *server, struct jval *req,
+		struct jbuf *out, char *err, size_t errlen) {
+	const char *text = jget_str(req, "text");
+	if (text == NULL || text[0] == '\0') {
+		snprintf(err, errlen, "要 text（要打的那段字）");
+		return false;
+	}
+	if (!vidow_inject_text(server, text, err, errlen)) {
+		return false;
+	}
+	jb_obj(out);
+	jb_key(out, "typed");
+	jb_obj(out);
+	jb_kv_str(out, "text", text);
 	jb_obj_end(out);
 	jb_obj_end(out);
 	return true;
@@ -1989,6 +2136,19 @@ static bool ipc_run(struct vidow_server *server, struct ipc_client *c,
 	}
 	if (strcmp(cmd, "move_cursor") == 0) {
 		return cmd_move_cursor(server, req, out, err, errlen);
+	}
+	/* 输入注入（合成鼠标 / 键盘事件，见上面那一节） */
+	if (strcmp(cmd, "pointer_button") == 0) {
+		return cmd_pointer_button(server, req, out, err, errlen);
+	}
+	if (strcmp(cmd, "pointer_scroll") == 0) {
+		return cmd_pointer_scroll(server, req, out, err, errlen);
+	}
+	if (strcmp(cmd, "send_key") == 0) {
+		return cmd_send_key(server, req, out, err, errlen);
+	}
+	if (strcmp(cmd, "type_text") == 0) {
+		return cmd_type_text(server, req, out, err, errlen);
 	}
 	if (strcmp(cmd, "toggle_overview") == 0) {
 		return cmd_toggle_overview(server, req, out, err, errlen);
