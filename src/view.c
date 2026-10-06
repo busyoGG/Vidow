@@ -789,7 +789,8 @@ void vidow_view_render_pump(struct vidow_server *server,
 
 	/* 补帧得有人推：不主动排下一帧的话，画面没变化时 wlroots 就不给帧事件了。 */
 	if (keep_going) {
-		wlr_output_schedule_frame(output->wlr_output);
+		vidow_output_schedule_frame(output->server, output->wlr_output,
+			"布局/视图改了");
 	}
 
 	/* 被节流挡下的：定个到点闹钟（比当前定的更早就改早一点）。 */
@@ -2372,6 +2373,16 @@ static void view_unmap(struct wl_listener *listener, void *data) {
 static void view_commit(struct wl_listener *listener, void *data) {
 	(void)data;
 	struct vidow_view *view = wl_container_of(listener, view, commit);
+
+	/* 帧追踪（VIDOW_TRACE_FRAMES=1）：客户端在这里交帧。只记「真画在这块屏上、
+	 * 还显示着」的那些 —— 视口外的窗口本来就没人给它出帧，记了就是误报。
+	 * 这块屏要是从此不再出帧，就是「客户端在画、屏幕不更新」。 */
+	struct vidow_output *trace_out =
+		vidow_output_lookup(view->server, view->output);
+	if (trace_out != NULL && view_shows(view) &&
+			view_on_screen(view->server, trace_out, view)) {
+		vidow_output_trace_commit(trace_out);
+	}
 
 	/* New pixels: everything that samples this window as a backdrop (a
 	 * floating window on top of it) has to be re-blurred. */

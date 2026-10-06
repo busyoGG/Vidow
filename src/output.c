@@ -84,12 +84,82 @@ void vidow_output_render(struct vidow_output *output) {
 
 }
 
+/* ---------------------------------------------------------------- 帧追踪
+ *
+ * VIDOW_TRACE_FRAMES=1 时开：每次「要帧」记一笔（谁要的、要了几次），帧事件回来
+ * 就销账；250ms 一轮检查，发现「要了帧但 300ms 没帧事件」就喊一行 —— 那块屏的
+ * 帧链断了（后端没给帧事件）。用户报过「某块屏上的窗口停在最后一帧、拖到另一块屏
+ * 就活」，那种只在真 DRM 上出现的问题就靠这几行定案。默认不开。 */
+struct vidow_output *vidow_output_lookup(struct vidow_server *server,
+		struct wlr_output *wlr_output) {
+	if (server == NULL || wlr_output == NULL) {
+		return NULL;
+	}
+	struct vidow_output *output;
+	wl_list_for_each(output, &server->outputs, link) {
+		if (output->wlr_output == wlr_output) {
+			return output;
+		}
+	}
+	return NULL;
+}
+
+static int trace_timer_cb(void *data) {
+	struct vidow_server *server = data;
+	int64_t now = vidow_now_ns();
+	struct vidow_output *output;
+	wl_list_for_each(output, &server->outputs, link) {
+		int64_t gap = (now - output->last_frame_ns) / 1000000;
+		if (gap < 300) {
+			continue;
+		}
+		bool stale_content = output->content_ns > output->last_frame_ns;
+		if (!stale_content && !output->want_frame) {
+			continue;
+		}
+		wlr_log(WLR_ERROR, "trace: %s %lldms 没出帧（vidow 主动要过 %d 帧，"
+			"最近一次：%s）%s", output->wlr_output->name, (long long)gap,
+			output->want_frame_n,
+			output->want_frame_why != NULL ? output->want_frame_why : "没要过",
+			stale_content ? "；客户端还在交帧，屏幕却不更新 ← 帧链断了" : "");
+		output->want_frame = false; /* 记一次就够，别刷屏 */
+		output->content_ns = output->last_frame_ns;
+	}
+	wl_event_source_timer_update(server->trace_timer, 250);
+	return 0;
+}
+
+/* 要一帧。记账只为诊断（VIDOW_TRACE_FRAMES=1 时 trace_timer_cb 会用它），
+ * 找不到对应的 vidow_output 也照样排帧 —— 诊断不许改变行为。 */
+void vidow_output_schedule_frame(struct vidow_server *server,
+		struct wlr_output *wlr_output, const char *why) {
+	if (wlr_output == NULL) {
+		return;
+	}
+	struct vidow_output *output = vidow_output_lookup(server, wlr_output);
+	if (output != NULL) {
+		output->want_frame = true;
+		output->want_frame_n++;
+		output->want_frame_why = why;
+	}
+	wlr_output_schedule_frame(wlr_output);
+}
+
+/* 客户端交帧了：帧追踪记一笔（没开追踪就什么都不做，零开销）。 */
+void vidow_output_trace_commit(struct vidow_output *output) {
+	if (output == NULL || output->server->trace_timer == NULL) {
+		return;
+	}
+	output->content_ns = vidow_now_ns();
+}
+
 /* 补帧闹钟到点：催一帧出来（渲染里会走到 vidow_view_render_pump，到点的窗口就补上）。
  * 只在这里催，不在「还没到点」的时候催 —— 那样会变成每帧都渲染却什么都不补的空转。 */
 static int pump_timer_cb(void *data) {
 	struct vidow_output *output = data;
 	output->pump_at_ms = 0;
-	wlr_output_schedule_frame(output->wlr_output);
+	vidow_output_schedule_frame(output->server, output->wlr_output,
+		"补帧闹钟到点");
 	return 0;
 }
 
@@ -168,7 +238,26 @@ static void output_frame(struct wl_listener *listener, void *data) {
 	struct vidow_output *output = wl_container_of(listener, output, frame);
 	struct vidow_server *server = output->server;
 
-	output->last_frame_ns = vidow_now_ns();
+	/* 测试钩子：当作「后端不再给这块屏帧事件」= 用户报过的「这块屏上的窗口停在
+	 * 最后一帧，拖到另一块屏就活」。真机上只有 DRM 的 page-flip 不回来才会这样
+	 * （headless 的帧事件和 commit 无关，按不住）；帧追踪的判据靠它验。 */
+	const char *stall = getenv("VIDOW_TEST_STALL_OUTPUT");
+	if (stall != NULL && strcmp(stall, output->wlr_output->name) == 0) {
+		return;
+	}
+
+	int64_t now_ns = vidow_now_ns();
+	if (output->want_frame && server->trace_timer != NULL) {
+		int64_t gap = (now_ns - output->last_frame_ns) / 1000000;
+		if (gap >= 300) {
+			wlr_log(WLR_INFO, "trace: %s 又出帧了（停了 %lldms，这期间被要了"
+				" %d 帧）", output->wlr_output->name, (long long)gap,
+				output->want_frame_n);
+		}
+	}
+	output->want_frame = false;
+	output->want_frame_n = 0;
+	output->last_frame_ns = now_ns;
 	vidow_output_render(output);
 
 	/* An animating node usually damages the scene, but not always (a pure
@@ -176,7 +265,8 @@ static void output_frame(struct wl_listener *listener, void *data) {
 	 * anyway, and arm the watchdog in case the request goes nowhere.
 	 * 拖着果冻也一样：网格在动，帧不能停。 */
 	if (vidow_anim_pending(server) || vidow_jelly_pending(server)) {
-		wlr_output_schedule_frame(output->wlr_output);
+		vidow_output_schedule_frame(server, output->wlr_output,
+			"动画/果冻在跑");
 		vidow_output_kick_watchdog(server);
 	}
 }
@@ -901,6 +991,9 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 	}
 	output->server = server;
 	output->wlr_output = wlr_output;
+	/* 帧追踪的基准：第一次出帧之前 last_frame_ns 是 0，而 vidow_now_ns() 是开机
+	 * 以来的纳秒数 —— 不初始化的话第一帧会被算成「停了 3.8 小时」（实测）。 */
+	output->last_frame_ns = vidow_now_ns();
 	output->scene_output = wlr_scene_output_create(server->scene, wlr_output);
 	/* 配置里点了名的屏摆在它说的位置；没点名就按到达顺序自动排。
 	 * 「哪块在左边」不能靠自动排 —— 那个顺序是后端给的（headless 上实测是
@@ -1279,6 +1372,17 @@ bool vidow_output_init(struct vidow_server *server) {
 		wl_display_get_event_loop(server->display), kick_timer_cb, server);
 	if (server->kick_timer == NULL) {
 		wlr_log(WLR_ERROR, "failed to create the resume kick timer");
+	}
+	if (getenv("VIDOW_TRACE_FRAMES") != NULL) {
+		server->trace_timer = wl_event_loop_add_timer(
+			wl_display_get_event_loop(server->display), trace_timer_cb, server);
+		if (server->trace_timer == NULL) {
+			wlr_log(WLR_ERROR, "failed to create the frame trace timer");
+		} else {
+			wl_event_source_timer_update(server->trace_timer, 250);
+			wlr_log(WLR_INFO, "帧追踪: 开（VIDOW_TRACE_FRAMES=1）—— 要了帧"
+				"却 300ms 没出帧会报 WLR_ERROR");
+		}
 	}
 	server->new_output.notify = server_new_output;
 	wl_signal_add(&server->backend->events.new_output, &server->new_output);

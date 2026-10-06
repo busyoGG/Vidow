@@ -1791,7 +1791,8 @@ void vidow_view_blur_invalidate(struct vidow_view *view) {
 	}
 	view->fx.blur_ver++;
 	if (view->output != NULL) {
-		wlr_output_schedule_frame(view->output);
+		vidow_output_schedule_frame(view->server, view->output,
+			"装饰模糊失效");
 	}
 }
 
@@ -2174,7 +2175,8 @@ static void layer_blur_capture_visible(struct vidow_server *server, bool on) {
 void vidow_layer_blur_invalidate(struct vidow_layer_surface *ls) {
 	ls->fx.blur_ver++;
 	if (ls->output != NULL) {
-		wlr_output_schedule_frame(ls->output->wlr_output);
+		vidow_output_schedule_frame(ls->server, ls->output->wlr_output,
+			"layer 模糊失效");
 	}
 }
 

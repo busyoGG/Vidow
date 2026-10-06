@@ -491,6 +491,17 @@ struct vidow_output {
 	/* 上一次在这块屏上亮着的工作区（focus-workspace-previous / auto-back-and-forth） */
 	uint64_t prev_ws_id;
 	int64_t last_frame_ns;      /* last frame event, for the animation watchdog */
+	/* 帧追踪（VIDOW_TRACE_FRAMES=1 时才有意义）：这块屏被要过帧、要了几次、
+	 * 最近一次是谁要的。**要了帧却迟迟没有帧事件**就是「这块屏的帧链断了」——
+	 * 用户报过「某块屏上的窗口停在最后一帧、拖到另一块屏就活」，只有真 DRM 上
+	 * 才会出现，靠这三个字段 + trace 定时器能一眼分开是后端没给帧还是 vidow
+	 * 自己没画。默认不开，正常路径只有一次赋值。 */
+	bool want_frame;
+	int want_frame_n;
+	const char *want_frame_why;
+	/* 客户端最近一次交帧（view_commit 那一路）。**它比 last_frame_ns 新**而这块
+	 * 屏又迟迟不出帧 = 客户端在画、屏幕不更新，正是用户报过的「停在最后一帧」。 */
+	int64_t content_ns;
 
 
 	/* Backdrop snapshot: the scene without the blurred windows, used as the
@@ -1226,11 +1237,24 @@ struct vidow_server {
 	/* 会话切回来（或输出刚建好）之后主动画一帧的一次性闹钟，见
 	 * vidow_output_kick_all()。 */
 	struct wl_event_source *kick_timer;
+	/* 帧追踪的定时器（VIDOW_TRACE_FRAMES=1 才建），见
+	 * vidow_output_schedule_frame()。 */
+	struct wl_event_source *trace_timer;
 };
 
 /* -------------------------------------------------------------------- init */
 
 bool vidow_output_init(struct vidow_server *server);
+/* 要一帧（vidow 主动排帧的唯一入口：VIDOW_TRACE_FRAMES=1 时记下是谁要的，
+ * 供帧追踪用）。找得到对应的 vidow_output 才记账 —— 记账只是诊断，
+ * 找不到也照样排帧。why 只进日志。 */
+void vidow_output_schedule_frame(struct vidow_server *server,
+		struct wlr_output *wlr_output, const char *why);
+/* 客户端交帧了（view_commit）：给帧追踪记一笔时间戳。 */
+void vidow_output_trace_commit(struct vidow_output *output);
+/* 按 wlroots 的输出反查 vidow 的那一份（找不到 NULL）。 */
+struct vidow_output *vidow_output_lookup(struct vidow_server *server,
+		struct wlr_output *wlr_output);
 /* 按配置（全局 scale + vidow.output{ name = … } 里那块屏的 scale）算并设一个
  * 输出的缩放；SIGHUP 后整套重来。 */
 void vidow_output_apply_scale(struct vidow_server *server,

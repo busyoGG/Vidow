@@ -418,6 +418,7 @@ end
 ### 测试
 
 ```bash
+./test-frametrace.sh     # 16 项：帧追踪（健康不误报 / 掐断帧链点名 / 关掉零日志）
 ./test-force-render.sh   # 28 项断言：控制组（不配就停帧）→ 规则（~60 帧/秒）→ 回到画面
                          # 上就停 → 藏起来的工作区照样补帧 → 录屏（抓到的画面在变）→
                          # 录屏客户端断开后不再补帧 → 节流可配置（全局 30Hz / 规则 15Hz
@@ -427,6 +428,32 @@ end
 两个测试客户端也是这次加的：`tools/frames.c`（只按帧回调出帧，每帧打印一行，把「客户端
 还在不在出帧」变成可断言的输出）、`tools/capture.c`（走 ext-image-copy-capture +
 窗口截图源抓某个窗口，打印每帧的像素校验和 —— 校验和不变就说明录到的是冻住的一张）。
+
+## 某块屏的帧链断了：`VIDOW_TRACE_FRAMES=1`
+
+用户报过一条真机症状：**某块屏上的窗口停在最后一帧，拖到另一块屏就活**。帧回调是跟着
+输出的帧事件走的（`src/output.c`：`wlr_scene_output_commit` 成功那一帧之后才
+`wlr_scene_output_send_frame_done`）—— 所以一块屏的 page-flip 要是不回来了，那块屏上
+的**所有**客户端都拿不到帧回调，全停在最后一帧；而输入照旧（键盘 / 点击不走渲染），
+看着就像「应用不渲染新画面」。
+
+headless 上模拟不出来（那边的帧事件和 commit 无关，按不住），所以有两样东西：
+
+- `VIDOW_TRACE_FRAMES=1`：开帧追踪。每次「要帧」记一笔（谁要的），帧事件回来销账；
+  250ms 一轮，发现「要过帧（或客户端还在交帧）却 300ms 没出帧」就报一行 `WLR_ERROR`，
+  点名哪块屏、vidow 要过几帧、最近一次是谁要的。默认关，不开的时候整条路径不做任何事。
+- `VIDOW_TEST_STALL_OUTPUT=<屏名>`：测试钩子，把那块屏的帧**事件**按住 = 复现这个症状。
+
+```bash
+VIDOW_TRACE_FRAMES=1 VIDOW_LOG=debug ./build/vidow > /tmp/v.log 2>&1
+# 复现（窗口停在最后一帧）之后：
+grep -a "trace:" /tmp/v.log | tail
+#   [ERROR] trace: DP-2 997ms 没出帧（vidow 主动要过 1 帧，最近一次：脚本/配置改了状态）；
+#           客户端还在交帧，屏幕却不更新 ← 帧链断了
+```
+
+回归判据见 `./test-frametrace.sh`（16 项，headless：健康时不误报 + 掐断帧链时点名 + 追踪
+关掉时零日志）。
 
 ## 截图 / 录屏里不出现：`capture = "hide"`（窗口规则 / layer 规则）
 
@@ -735,6 +762,7 @@ python3 test-float.py        # 三个真实 GTK 窗口，验证浮动模式自�
 ./test-focusclose.sh                 # 关窗口后焦点落谁身上：右边最近的顶上（21 项断言）
 ./test-lastoutput.sh                  # 屏没了不许留野指针、没屏时开窗不许崩（拔一块 / 最后一块没了，22 项断言）
 ./test-actsurface.sh                  # 激活令牌攥着的 surface 先没了也不能崩（8 项断言）
+./test-frametrace.sh                 # 帧追踪：某块屏的帧链断了（窗口停在最后一帧）要报出来（16 项断言）
 ./test-preinit.sh                    # 状态请求抢在第一次 commit 之前（set_maximized /
                                      #   set_minimized / set_fullscreen）不许把合成器打死（22 项断言）
 ./test-drag.sh                       # 拖窗口：拖得动 / 跨屏改归属 / 平铺按落点插入（11 项）
@@ -2648,6 +2676,10 @@ test-outputpos.sh  显示器配置（`vidow.output{ name = …, scale = …, x =
                    按名字摆（自动排的顺序是后端给的，headless 上实测是反的）、
                   只写 x 不写 y 也认、项名写错当场报错、拔插后回到配置说的位置、
                   SIGHUP 改配置立刻生效
+test-frametrace.sh  帧追踪：某块屏的帧链断了（page-flip 不回来）—— 那块屏上的窗口全停在
+                   最后一帧、拖到另一块屏就活。headless 上用 VIDOW_TEST_STALL_OUTPUT
+                   把帧事件按住复现，判据是 VIDOW_TRACE_FRAMES=1 的那行 ERROR（点名屏、
+                   要过几帧、谁要的、客户端还在交帧）
 test-preinit.sh    状态请求抢跑：客户端在第一次 commit **之前**就 set_maximized /
                    set_minimized / set_fullscreen（xdg-shell 允许），合成器不许在
                    `assert(surface->initialized)` 上 abort；抢跑的最大化答「不最大化」、
@@ -3440,6 +3472,31 @@ protocols/     wlr-layer-shell / wlr-virtual-pointer / input-method-v2 /
      `GDK_SCALE=QT_SCALE_FACTOR` 这种下发。把修复回退掉跑一遍，这三条都红
      （`childenv QT_SCALE_FACTOR=2`）✓。回归：`test-dpi.sh` 15/15、
      `test-xwayland-hidpi.sh` 20/20、`test-x11scale.sh` 18/18、`test-preinit.sh` 22/22。
+
+135. **帧追踪：哪块屏的帧链断了，日志点名**（用户报的「KDE 的窗口不渲染新画面」）：
+     kate / dolphin 的窗口停在最后一帧、**拖到另一块屏就活**、输入照旧能点。这个组合只有
+     一个机制能解释：帧回调是跟着**输出的帧事件**走的（`src/output.c`：
+     `wlr_scene_output_commit` 成功那一帧之后才 `send_frame_done`），所以某块屏的
+     page-flip 不回来了，那块屏上的所有客户端就都拿不到帧回调 —— 全停在最后一帧，而
+     键盘 / 点击不走渲染，照旧能用。
+
+     我没法在 headless 上复现它（那边的帧事件和 commit 无关，按不住），所以这轮给的是
+     **能定案的诊断**，不是盲改：
+
+     - `VIDOW_TRACE_FRAMES=1`：要帧时记一笔（谁要的、几次），帧事件回来销账；250ms 一轮，
+       发现「要过帧（或客户端还在交帧）却 300ms 没出帧」就报一行 `WLR_ERROR`，点名哪块屏、
+       vidow 要过几帧、最近一次谁要的。默认关；不开的时候 `vidow_output_trace_commit()`
+       第一行就返回，正常路径零开销。顺带把六处 `wlr_output_schedule_frame()` 收口到
+       `vidow_output_schedule_frame(server, wlr_output, why)`（唯一的排帧出口）。
+     - `VIDOW_TEST_STALL_OUTPUT=<屏名>`：测试钩子，把那块屏的帧**事件**按住 = 复现症状。
+     - 顺手修的一个自己踩的坑：输出刚建出来时 `last_frame_ns` 是 0，而 `vidow_now_ns()`
+       是开机以来的纳秒数 —— 不初始化的话第一帧会被算成「停了 3.8 小时」（实测），
+       现在建输出时就打上基准。
+
+     新增 `./test-frametrace.sh`（16 项）：①健康 + 追踪开：窗口内容上屏、**一行 trace 都
+     没有**（不误报）；②掐断帧链 + 追踪开：客户端确实交过帧，追踪报出 ERROR 且点名
+     HEADLESS-1、写明「客户端还在交帧，屏幕却不更新」；③掐断帧链 + 追踪**关**：一条 trace
+     日志都没有、vidow 照样活着（诊断不改变行为）。
 
 129. **配置按类别拆开：入口 `config.lua` + `configs/` 下一类一份**（`vidow.include()`）。
      原来那份「一份两三百行、什么都写在一起」的默认配置，改一个圆角要先滚过间距、模糊、

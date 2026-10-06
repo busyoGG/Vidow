@@ -965,7 +965,8 @@ static void script_apply(struct vidow_script *s) {
 
 	struct vidow_output *output;
 	wl_list_for_each(output, &server->outputs, link) {
-		wlr_output_schedule_frame(output->wlr_output);
+		vidow_output_schedule_frame(server, output->wlr_output,
+			"脚本/配置改了状态");
 	}
 }
 
