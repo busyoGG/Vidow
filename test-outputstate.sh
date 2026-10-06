@@ -15,7 +15,9 @@
 #   6) 改配置 + SIGHUP：上面每一项都跟着改（不用重启）
 #   7) 写错的值（mode="800x600x2" / depth=12 / transform="sideways"）当场报错，
 #      不静默生效
-#   8) 日志里没有 assert / abort
+#   8) 色彩能力（primaries / transfer_functions / hdr_capable）如实上报 ——
+#      headless 什么都不报，vidow 也就不许假装能做 HDR
+#   9) 日志里没有 assert / abort
 #
 # 用法：./test-outputstate.sh   （VIDOW_TEST_KEEP=1 保留运行目录）
 set -u
@@ -115,6 +117,11 @@ if grep -aq "这块屏 / 这个后端不支持 VRR" "$RUNDIR/log"; then
 else
 	fail "日志没说 VRR 为什么没生效"
 fi
+
+mark "2b) 色彩能力如实上报（HDR 能不能做就看这里）"
+check "False" "$(field_of HEADLESS-1 hdr_capable)" "headless 报 hdr_capable=false"
+check "[]" "$(field_of HEADLESS-1 primaries)" "headless 没报任何 primaries"
+check "[]" "$(field_of HEADLESS-1 transfer_functions)" "headless 没报任何传输函数"
 
 mark "3) 改配置 + SIGHUP：每一项都跟着改，不用重启"
 write_config 'vidow.output{ name = "HEADLESS-1", mode = "1024x768@60", depth = 8, vrr = false, transform = "normal" }

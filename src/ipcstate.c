@@ -455,6 +455,33 @@ void vidow_ipc_json_output(struct jbuf *b, struct vidow_server *server,
 		jb_kv_int(b, "depth", o->render_format == DRM_FORMAT_XRGB2101010 ?
 			10 : 8);
 	}
+	{
+		/* 这块屏**自己报**出来的色彩能力：wlroots 从 EDID + 连接器属性填的
+		 * （DRM 那边是 Colorspace 属性 + EDID 的 BT2020 / HDR static metadata，
+		 * 见 backend/drm/util.c）。vidow 现在不拿它做 HDR，但「这台机器能不能
+		 * 做 HDR」就取决于这里有没有 bt2020 + st2084_pq —— 两个都有才轮得到
+		 * image description 不被拒。headless / wayland 后端一律是空的。 */
+		jb_key(b, "primaries");
+		jb_arr(b);
+		if (o->supported_primaries & WLR_COLOR_NAMED_PRIMARIES_SRGB) {
+			jb_str(b, "srgb");
+		}
+		if (o->supported_primaries & WLR_COLOR_NAMED_PRIMARIES_BT2020) {
+			jb_str(b, "bt2020");
+		}
+		jb_arr_end(b);
+		jb_key(b, "transfer_functions");
+		jb_arr(b);
+		if (o->supported_transfer_functions &
+				WLR_COLOR_TRANSFER_FUNCTION_ST2084_PQ) {
+			jb_str(b, "st2084_pq");
+		}
+		jb_arr_end(b);
+		jb_kv_bool(b, "hdr_capable",
+			(o->supported_primaries & WLR_COLOR_NAMED_PRIMARIES_BT2020) != 0 &&
+			(o->supported_transfer_functions &
+				WLR_COLOR_TRANSFER_FUNCTION_ST2084_PQ) != 0);
+	}
 	jb_kv_bool(b, "focused", server->focused_output == o);
 	jb_kv_str(b, "memory", output->memory != NULL ? output->memory->key : NULL);
 	jb_key(b, "layout");

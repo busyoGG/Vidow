@@ -722,22 +722,42 @@ vidow.output{ name = "HDMI-A-1", enabled = false }        -- 接着投影仪才�
 - **开关**：`enabled = false` 关掉一块屏 —— 上面的窗口、工作区、焦点都留着（DRM 那边
   就是关 CRTC），再打开照原样画回来。
 
-**HDR：wlroots 0.20 这条链上没有输出通路，所以 vidow 没做。** 具体卡在哪：wlroots 0.20
-确实有 `wlr_output_state_set_image_description()`（primaries / 传输函数 / mastering
-亮度）和 `wlr_color_manager_v1`，但
+**HDR：现在做不了，卡在 GLES2 渲染器 —— 不在 DRM 那边。**
 
-1. 提交状态时会校验 `output->supported_primaries` / `supported_transfer_functions`，
-   而 0.20.2 里**没有任何后端会填这两个字段**（DRM 后端全文没有 colorspace /
-   `HDR_OUTPUT_METADATA` 相关的代码）—— 也就是说任何 image description 都会被
-   `Unsupported image description primaries` 拒掉；
-2. 就算绕过去，DRM 后端也不会把它写成内核的 HDR 元数据（`HDR_OUTPUT_METADATA` 属性），
-   显示器那边什么都不会发生；
-3. 而 vidow 自己的渲染管线（wlr_scene + GLES2）也没有「SDR 内容 → PQ/2020 输出」的
-   色调映射，硬把输出声明成 HDR 只会让 SDR 内容发灰。
+（更正：之前这里写过「wlroots 0.20.2 里没有任何后端会填 `supported_primaries`」，那是
+**错的** —— 那只是 headless 后端的现象。下面这段是按 0.20.2 的源码重写的。）
 
-所以 `hdr = true` 这种键现在只会是个骗人的开关。真要做，前提是 wlroots 先把 DRM 那边的
-色彩管线（colorspace / HDR metadata / 3D LUT）接起来 —— 那之前 `depth = 10` 是这条链上
-唯一能真的生效的「画质」项。
+wlroots 0.20.2 的 DRM 后端这条链其实是齐的：
+
+1. `backend/drm/util.c` 读 EDID：连接器有 `Colorspace` 属性 + EDID 报 BT2020 →
+   `supported_primaries |= BT2020`；有 `HDR_OUTPUT_METADATA` 属性 + EDID 的 HDR static
+   metadata 报 type1 + PQ → `supported_transfer_functions |= ST2084_PQ`。
+2. `backend/drm/atomic.c` 把 image description 真的写进内核：`HDR_OUTPUT_METADATA` blob、
+   `Colorspace`（BT2020_RGB = 9），并按缓冲格式选 `max bpc`（`XRGB2101010` → 10 位）。
+3. `types/scene/wlr_scene.c` 按 image description 现算这一帧的 color transform（sRGB →
+   目标 primaries 的绝对比色矩阵 × 亮度缩放，再套目标传输函数的反 EOTF），交给这一帧的
+   render pass。
+
+墙在这里：**这个 color transform 只有 Vulkan 渲染器认。** `render/gles2/renderer.c` 里
+写死 `features.output_color_transform = false`（master 上也还是 false），GLES2 的
+`begin_buffer_pass` 根本不看 `options->color_transform` —— wlr_scene 算好的变换被丢掉，
+缓冲里还是 sRGB 编码的像素，DRM 那边却已经按 PQ / BT2020 上了屏：画面发灰。这就是
+「假 HDR」的样子，也正因为这样 vidow 不给 `hdr = true` 这种开关。（同理
+`input_color_transform = false`：GLES2 也没法把客户端声明成 PQ / BT2020 的内容转回来。）
+
+真要做，两条路，都不小：
+
+- **换 Vulkan 渲染器**：`fx.c` 那 2300 行原生 GL（`glCreateShader` /
+  `wlr_gles2_renderer_get_buffer_fbo` / 自己的 FBO 管线）得整个重写。
+- **vidow 自己出最后一趟**：场景先渲进离屏缓冲，再用自己的全屏着色器做 sRGB → linear →
+  BT2020 → PQ 编码写进输出缓冲，同时给输出设 image description。这能出「整屏 HDR 容器」
+  （SDR 内容统一映射上去），但客户端真正的 HDR 内容（mpv 的 PQ 视频）还是过不去 ——
+  GLES2 没有 per-surface 的输入变换。
+
+另外 headless / wayland 后端这两个字段都不填，所以 headless 上任何 image description 都被
+`Unsupported image description primaries` 拒 —— HDR 这条路只能靠真显卡 + 真 HDR 屏验证。
+`vidowmsg outputs` 现在会报每块屏自己声明的 `primaries` / `transfer_functions` /
+`hdr_capable`：**这台机器能不能做 HDR，先看这三个字段**（两个都有才是真能做）。
 
 ### 一条链：从输出缩放到清晰的像素
 
@@ -1109,7 +1129,7 @@ vidow 自己的，比如 `vidow-wayland-1.sock`）；`ipc_socket` 可以写死�
 | `windows` | 每个窗口：`id`、`kind`（xdg / x11）、`title`、`app_id`、`pid`、`geometry`（布局坐标）、`float_geometry`、`surface`（表面尺寸 / 缓冲 / scale）、`column`（列 id / 宽比 / 偏移 / 序号）、`workspace`、`output`、`home`、`floating` + `float_mode`、`fullscreen`、`mapped` / `visible`、`rules`（三条规则的实际取值）、`size_hints`、`anim_*`、`force_render`、`capture_holders`、X11 还多一份 `x11` 子对象 |
 | `columns` | 每条列：`id`、`width_fraction`、算出来的 `width` / `offset`、序号、里面的窗口 |
 | `workspaces` | 每块工作区：名字、`special`、`active` / `visible` / `shown`、住哪块屏 / 归属哪块屏、滚动位置、列与窗口、离开时的焦点窗口（**特殊工作区也在列表里**，`special = true`；Lua 的 `vidow.workspace_list()` 不给它） |
-| `outputs` | 每块屏：连接器名 / 描述 / make / model、`enabled`、`scale`、`transform`、刷新率、物理尺寸、布局矩形、`usable_area`、`viewport_x`、活动 / 显示着的工作区、它上面的工作区 / 窗口 / layer、**所有可用模式**、`adaptive_sync` / `vrr_supported`、`depth` / `render_format`、模糊贴图状态 |
+| `outputs` | 每块屏：连接器名 / 描述 / make / model、`enabled`、`scale`、`transform`、刷新率、物理尺寸、布局矩形、`usable_area`、`viewport_x`、活动 / 显示着的工作区、它上面的工作区 / 窗口 / layer、**所有可用模式**、`adaptive_sync` / `vrr_supported`、`depth` / `render_format`、`primaries` / `transfer_functions` / `hdr_capable`（这块屏**自己报**的色彩能力，HDR 可行性就看它）、模糊贴图状态 |
 | `layers` | 每个 layer surface：`namespace`、`layer`、`output`、`mapped`、`exclusive_zone`、`keyboard_interactivity`、`anchor`、`margin`、想要 / 实际尺寸、几何 |
 | `config` | **配置表的全部键值**（跟 `config.lua` 里 `vidow.get` 读到的是同一个东西）；`config` + `key` 只取一个 |
 | `keybinds` / `rules` | 键位表（触发串 + 动作串）、窗口规则（含「这一条到底写没写」的 null 语义） |
@@ -2130,7 +2150,8 @@ test-scrollcull.sh  两块并排的屏 + 三列装不下：滚出视口的列被
 test-outputstate.sh 每块屏那一组的其余项：`mode`（分辨率 / 刷新率）、`enabled`、
                   `vrr`（headless 上不支持 → 只报一句，别的照常生效）、`depth = 10`
                   （输出缓冲真的换成 XRGB2101010）、`transform`，SIGHUP 后每项都跟着
-                  改，写错的值当场报错
+                  改，写错的值当场报错；色彩能力（`primaries` /
+                   `transfer_functions` / `hdr_capable`）如实上报 —— headless 什么都不报
 test-outputpos.sh  显示器配置（`vidow.output{ name = …, scale = …, x = …, y = … }`）
                    按名字摆（自动排的顺序是后端给的，headless 上实测是反的）、
                   只写 x 不写 y 也认、项名写错当场报错、拔插后回到配置说的位置、
