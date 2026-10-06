@@ -3150,6 +3150,13 @@ protocols/     wlr-layer-shell / wlr-virtual-pointer / input-method-v2 /
    - 没有权限分级：socket 是 0600（只有本人能连），但连上之后所有命令都能用
    - 事件没有背压策略之外的流控：订阅者卡住（不读 socket）攒到 8 MiB 会被踢掉
 
+30. UI 元素树（给 UI 识别用）：合成器只能给**表面树**（窗口 / 弹层 / 子表面的矩形 + pid），
+    控件级的树（角色 / 名字 / 文本 / 动作）**只有 AT-SPI 一条路**，而且只覆盖**实现了无障碍**
+    的应用（Chromium / Electron 系还要 `ACCESSIBILITY_ENABLED=1` 才上总线，纯自绘应用永远没有）。
+    另外 AT-SPI 报的坐标是**窗口相对的**，全局坐标要合成器补窗口位置 —— 这是 vidow 在这件事里
+    唯一不可替代的部分。调研、实测数据（含覆盖率与「操作路径未验证」）与补齐路线见
+    [`docs/ui-tree-feasibility.md`](docs/ui-tree-feasibility.md)
+
 ## 下一步建议顺序
 
 1. 浮动窗口的八向缩放边缘 + 双击标题栏最大化
