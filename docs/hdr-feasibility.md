@@ -209,13 +209,69 @@ wlr_scene 渲染  ──►  离屏缓冲（XRGB2101010 或 FP16）
 ## 5. 方案 B：换 Vulkan 渲染器
 
 Vulkan 侧 feature 齐全（§3），也能做 per-surface 的输入变换。但 vidow 的自定义着色器管线
-`src/fx.c`（2330 行）是**原生 GL**：`glCreateShader` / `link_program` /
-`wlr_gles2_renderer_get_egl` / `wlr_gles2_renderer_get_buffer_fbo` / 自己的 FBO 与
-uniform 管理（模糊的 Kawase 上下采样、装饰着色器、窗口开关动画都挂在上面）。
-wlroots 0.20 的渲染器接口里**没有**通用的自定义着色器 API（`include/wlr/render/*.h` 里
-没有 custom shader 入口），所以换 Vulkan = 把整条 FX 管线重写成 Vulkan。
+`src/fx.c`（2330 行）是**原生 GL**：`glCreateShader` / `glLinkProgram` / `glUniform*` /
+自己的 FBO 与顶点数组（模糊的 Kawase 上下采样、装饰着色器、窗口开关动画都挂在上面）。
+所以换 Vulkan 之前必须弄清一件事：**在 wlroots 里，Vulkan 能不能跑自定义 shader？**
 
-工作量：**1–2 周**，且中途会丢现在的手写 shader 特性。只有在「一定要 HDR 内容」时才值得。
+### 5.1 结论：Vulkan 本身能，wlroots 的接口不能
+
+- **Vulkan 当然能自定义 shader**（SPIR-V，任意管线）。限制在 wlroots 的 API 上。
+- **wlroots 0.20.2 的公开渲染接口里一个 `shader` 字都没有**：`grep -ric shader
+  /usr/include/wlroots-0.20/wlr/render/*.h` → 全 0；master 的 `wlr_renderer.h` / `pass.h` /
+  `interface.h` / `gles2.h` 也全是 0。公开 API 只有「画矩形」「画贴图」两个操作
+  （`wlr_render_pass_add_rect` / `add_texture`，带 clip 与 blend mode）。
+- Vulkan 渲染器的 shader 是**内置且烤死的**：`render/vulkan/shaders/` 只有 4 个
+  （`common.vert` / `output.frag` / `quad.frag` / `texture.frag`），构建时用 glslang 编成
+  SPIR-V；管线按固定的 key 缓存（`include/render/vulkan.h:166-200` 的
+  `wlr_vk_pipeline_key` = shader 来源 × blend mode × texture transform）。从外面插不进
+  自己的一趟。
+
+### 5.2 vidow 现在能用自定义 shader，靠的是 GLES2 的「逃生舱」
+
+GLES2 渲染器公开了三个口子（`/usr/include/wlroots-0.20/wlr/render/gles2.h:34-36`）：
+
+```c
+struct wlr_egl *wlr_gles2_renderer_get_egl(struct wlr_renderer *renderer);
+bool wlr_gles2_renderer_check_ext(struct wlr_renderer *renderer, const char *ext);
+GLuint wlr_gles2_renderer_get_buffer_fbo(struct wlr_renderer *renderer, struct wlr_buffer *buffer);
+```
+
+拿到 EGL context 就能 `eglMakeCurrent` + 任意 GL 调用 —— GL 是全局状态机，所以「自己画一趟」
+是天然可行的（vidow 的 `fx.c` 就是这么干的）。
+
+Vulkan 渲染器**没有等价物**。公开 API 只有句柄（`wlr/render/vulkan.h:23-33`）：
+`get_instance` / `get_physical_device` / `get_device` / `get_queue_family` / 贴图属性。
+你能拿到 `VkDevice`，但拿不到 wlroots 内部的 `VkCommandBuffer`、render pass、图像布局状态
+（公开头文件里连 `VkCommandBuffer` 都不出现）—— 而 wlroots 的 Vulkan 渲染器把命令攒进自己的
+command buffer 批量提交、自己做 layout 转换，你没法把自己的 `VkPipeline` 插进它那一趟。
+
+### 5.3 所以「换 Vulkan」实际是三条路
+
+1. **给 wlroots 加自定义 shader / 管线接口**（上游活，vidow 只能等或自己维护 fork）。
+2. **vidow 自己起一个独立 `VkDevice` 做 FX**，结果以 dmabuf 交回 wlroots 合成 —— 要自己处理
+   同步（timeline semaphore / 隐式 fence）、格式与 modifier 协商、内存，等于自己写半个渲染器。
+3. **放弃自定义 FX** —— 圆角、装饰着色器、窗口开关动画、Kawase 模糊全是 vidow 自写的
+   （`src/fx.c` 里 30+ 个 GL 入口：`glCreateShader` / `glCompileShader` / `glLinkProgram` /
+   `glUniform*` / `glDrawArrays` …），换 Vulkan 就是把这些重写。
+
+### 5.4 Vulkan 相对 OpenGL 的真实优势（以及代价）
+
+对 vidow 这种 2D 合成器，**吞吐量的差别通常很小**（瓶颈是显存带宽，不是 API）。真正的差别在
+**控制力**：
+
+| 维度 | Vulkan | OpenGL / GLES2 |
+|---|---|---|
+| 状态管理 | 管线状态对象（PSO）编译期定死，运行时切换便宜、无隐式重编译 | 全局状态机，驱动可能在运行时重编译 shader（合成器掉帧的经典来源） |
+| 同步 | 显式（fence / semaphore / timeline），可与 KMS 的 explicit fencing 对齐 | 隐式，驱动自己猜 |
+| 命令录制 | 可多线程录制，CPU 峰值可控 | 单线程提交 |
+| 内存 / 格式 | 显式内存类型与格式选择 | 驱动决定 |
+| 色彩管理 | wlroots 里**只有 Vulkan 渲染器** `input/output_color_transform = true`（HDR 那条路），输出侧还有 3D LUT | 两个都是 `false`（§3） |
+| 可渲染格式面 | 10 位 / FP16 / FP32 / YUV（`render/vulkan/pixel_format.c` 里 40+ 项） | 窄一截（`render/gles2/pixel_format.c` 约 18 项，也含 10 位与 FP16） |
+| 代码量 / 调试 | 描述符集、管线布局、layout 转换、同步、扩展与驱动差异，量大且难调 | 「改一行就能画」 |
+| wlroots 侧成熟度 | 功能面较新，没有自定义 shader 接口，平台 / 驱动覆盖面小 | vidow 现在跑的就是它 |
+
+工作量：**1–2 周**（主要在第 5.3 的第 1 或第 2 条），且中途会丢现在的手写 shader 特性。
+只有在「一定要 HDR 内容」时才值得 —— 只为 HDR 输出（方案 A 能做的部分）换 Vulkan，性价比很低。
 
 ---
 
@@ -316,6 +372,8 @@ master 的现状（判断「要不要等上游」）：`https://gitlab.freedeskt
 ## 10. 未验证 / 不确定清单
 
 - 用户的 DP-3 / DP-2 到底报不报 BT2020 + PQ（§7.1 一条命令就知道）。
+- wlroots 会不会加「自定义 shader / 管线」接口（§5.1 查的是 2026-10-06 的 master，没有）；
+  真加了，方案 B 的成本会从「1–2 周重写」掉到「换 API 调用」。
 - 真机上 10 位 + PQ 的实际观感与灰阶表现（本机没法验）。
 - 方案 A 第 4 条的三个收尾（damage ring / 直扫 / 光标）实际有多脏 —— 现在只是按
   wlroots 的接口推断，没写过。
