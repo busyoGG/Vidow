@@ -759,6 +759,9 @@ wlroots 0.20.2 的 DRM 后端这条链其实是齐的：
 `vidowmsg outputs` 现在会报每块屏自己声明的 `primaries` / `transfer_functions` /
 `hdr_capable`：**这台机器能不能做 HDR，先看这三个字段**（两个都有才是真能做）。
 
+完整调研（每条结论的 wlroots 源码出处、两条路线的步骤与工作量、真机验证清单、复现调研的
+命令）见 [`docs/hdr-feasibility.md`](docs/hdr-feasibility.md)。
+
 ### 一条链：从输出缩放到清晰的像素
 
 ```
