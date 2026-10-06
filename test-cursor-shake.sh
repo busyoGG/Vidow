@@ -5,7 +5,9 @@
 # 判据（headless 1280x720 一块屏，截图用 grim 当裁判 —— 「进没进截图」由像素说了算）：
 #   1) cursor 命令报得出光标状态：image（当前光标图的物理尺寸）/ hardware / hw_max
 #   2) 慢慢往一个方向移动**不**触发（不然正常用鼠标就会乱放大）
-#   3) 来回晃（700ms 内 4 次换向、每段 ≥12px）触发：光标图放大 2 倍
+#   3) 来回晃（800ms 内 5 次换向、每段 ≥16px、而且跨 ≥250ms）触发：光标图放大 2 倍
+#   3b) **太容易触发**的反面：同一串换向挤在几十毫秒里（顺手甩两下）不放大 ——
+#      门槛从「3 次换向」抬到「5 次换向 + 晃够 250ms」（用户报的「太容易触发」）
 #   4) 到点自己**动画**缩回去（700ms 后开始缩，200ms 线性补间走完，中途能量到
 #      1 和 2 之间的中间值 —— 不是「啪」地跳回原尺寸）
 #   5) 接着晃接着大，而且是**线性加**不是乘：2→3→4→5→6（每一圈只 +1），
@@ -132,12 +134,24 @@ print("" if v is None else (str(v).lower() if isinstance(v, bool) else v))
 ' "$1"
 }
 
-# 摇晃一次：4 段、每段 40px（700ms 窗口内 3 次换向）
+# 摇晃一次：6 段、每段 40px、段间 70ms —— 800ms 窗口内 5 次换向，而且这一串
+# 摇晃跨了 ~280ms（新门槛要求「来回晃一会儿」，见 cursorfx.c 的 SHAKE_*）。
 shake() {
-	msg move-cursor 40 0 --relative >/dev/null
-	msg move-cursor -40 0 --relative >/dev/null
-	msg move-cursor 40 0 --relative >/dev/null
-	msg move-cursor -40 0 --relative >/dev/null
+	local d=40
+	for _ in 1 2 3 4 5 6; do
+		msg move-cursor "$d" 0 --relative >/dev/null
+		d=$((-d))
+		sleep 0.07
+	done
+}
+
+# 顺手甩两下：同样 6 段（5 次换向），但挤在几十毫秒里 —— 跨时不够，不许放大。
+flick() {
+	local d=40
+	for _ in 1 2 3 4 5 6; do
+		msg move-cursor "$d" 0 --relative >/dev/null
+		d=$((-d))
+	done
 }
 
 # 画面里的「墨迹」：非黑像素个数 + 外接矩形（黑底 = headless 的默认背景）
@@ -202,6 +216,16 @@ sleep 0.2
 [ "$(cfield magnified)" = "false" ] && pass "单方向大范围移动不放大" \
 	|| fail "慢慢移动也放大了（误触发）"
 [ "$(cfield image)" = "$IMG0" ] && pass "尺寸没变（$IMG0）" \
+	|| fail "尺寸被改了：$(cfield image)"
+
+# ------------------------------------------------------------ 2b) 顺手甩两下不算
+mark "2b. 一瞬间的来回甩不触发（要晃一会儿才算）"
+msg move-cursor 300 100 >/dev/null
+flick
+sleep 0.35
+[ "$(cfield magnified)" = "false" ] && pass "几十毫秒内 5 次换向不放大" \
+	|| fail "甩一下就放大了（太容易触发）"
+[ "$(cfield image)" = "$IMG0" ] && pass "尺寸还是 $IMG0" \
 	|| fail "尺寸被改了：$(cfield image)"
 
 # ------------------------------------------------------------ 3) 摇晃触发

@@ -44,10 +44,18 @@
 #include "server.h"
 
 /* 摇晃判定：SHAKE_WINDOW_MS 里至少换向 SHAKE_FLIPS 次，每次换向前至少走
- * SHAKE_MIN_TRAVEL 个逻辑像素 —— 慢慢画圈不算，来回抖才算。 */
-#define SHAKE_WINDOW_MS 700
-#define SHAKE_MIN_TRAVEL 12.0
-#define SHAKE_FLIPS 3
+ * SHAKE_MIN_TRAVEL 个逻辑像素，**而且**从这一串摇晃的第一次换向起至少过了
+ * SHAKE_MIN_SPAN_MS —— 慢慢画圈不算，顺手一甩也不算，「来回晃一会儿」才放大。
+ *
+ * 三个数一起把门槛抬高（用户报的「太容易触发」）：正常用鼠标定位时来回甩两下
+ * 很常见，但甩不了这么久、也甩不了这么多次。 */
+#define SHAKE_WINDOW_MS 800
+#define SHAKE_MIN_TRAVEL 16.0
+#define SHAKE_FLIPS 5
+#define SHAKE_MIN_SPAN_MS 250
+/* 两次换向之间超过这么久就算「这一串断了」，从头数 —— 顺手甩两下之后过一会儿
+ * 再动一下，不该和甩的那两下拼成一次「摇晃」。 */
+#define SHAKE_GAP_MS 300
 /* 放大后保持多久（不晃了就缩回去）。 */
 #define SHAKE_HOLD_MS 700
 /* 后端没报硬件光标尺寸上限时的天花板：只有嵌套 Wayland / headless / X11 会走到
@@ -76,6 +84,8 @@ struct vidow_cursor_fx {
 	double acc;     /* 当前方向累计走了多远 */
 	int flips;      /* 窗口内换了几次向 */
 	int64_t window_ns;
+	int64_t span_ns; /* 这一串摇晃的第一次换向在哪（「晃了多久」的起点） */
+	int64_t flip_ns; /* 上一次换向在哪（判断这一串断没断） */
 
 	/* 放大中 */
 	bool active;
@@ -529,6 +539,7 @@ void vidow_cursor_fx_motion(struct vidow_server *server) {
 		/* 窗口过期：上一串摇晃作废，重新数。 */
 		fx->window_ns = now;
 		fx->flips = 0;
+		fx->span_ns = now;
 		fx->acc = 0;
 		fx->dir = 0;
 	}
@@ -537,17 +548,30 @@ void vidow_cursor_fx_motion(struct vidow_server *server) {
 		fx->acc += dist;
 	} else {
 		if (fx->acc >= SHAKE_MIN_TRAVEL) {
+			if (fx->flips > 0 && now - fx->flip_ns >
+					(int64_t)SHAKE_GAP_MS * 1000000) {
+				fx->flips = 0; /* 隔太久了：上一串断掉，从头数 */
+			}
+			if (fx->flips == 0) {
+				/* 这一串的第一段走完了：从现在开始算「晃了多久」 */
+				fx->span_ns = now;
+			}
+			fx->flip_ns = now;
 			fx->flips++;
 		}
 		fx->acc = dist;
 		fx->dir = dir;
 	}
 
-	if (fx->flips >= SHAKE_FLIPS) {
+	if (fx->flips >= SHAKE_FLIPS &&
+			now - fx->span_ns >= (int64_t)SHAKE_MIN_SPAN_MS * 1000000) {
+		wlr_log(WLR_DEBUG, "摇晃: %d 次换向、跨了 %dms，触发放大",
+			fx->flips, (int)((now - fx->span_ns) / 1000000));
 		fx->flips = 0;
 		fx->acc = 0;
 		fx->dir = 0;
 		fx->window_ns = now;
+		fx->span_ns = now;
 		const char *why = NULL;
 		vidow_cursor_fx_shake(server, &why);
 	}
