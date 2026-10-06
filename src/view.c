@@ -1945,7 +1945,11 @@ void vidow_view_set_minimized(struct vidow_view *view, bool minimized) {
 
 	if (view->kind == VIDOW_VIEW_X11 && view->x11 != NULL) {
 		wlr_xwayland_surface_set_minimized(view->x11, minimized);
-	} else if (view->xdg_toplevel != NULL) {
+	} else if (view->xdg_toplevel != NULL &&
+			vidow_view_configure_ready(view)) {
+		/* 客户端第一帧还没来（surface 没 initialized）就 set_minimized 的话，
+		 * 这里排 configure 会踩 schedule_configure 里那句 assert —— 见
+		 * view_request_maximize 的说明；应答由初始 configure 捎过去。 */
 		wlr_xdg_surface_schedule_configure(view->xdg_toplevel->base);
 	}
 	if (view->ftm_handle != NULL) {
@@ -2398,6 +2402,14 @@ static void view_commit(struct wl_listener *listener, void *data) {
 
 	/* xdg-shell: the initial commit must be answered with a configure. */
 	if (view->xdg_toplevel->base->initial_commit) {
+		/* 抢跑的状态请求：客户端在第一次 commit *之前* 就 set_fullscreen 的话
+		 * （Qt/KDE 恢复全屏窗口会这么开窗），view_request_fullscreen 里发不了
+		 * configure，只把请求留在 wlroots 那边。现在 surface initialized 了，
+		 * 在 arrange 之前兑现它 —— 晚了 arrange 就按「不是全屏」排过一遍了。 */
+		if (view->xdg_toplevel->requested.fullscreen && !view->fullscreen) {
+			view->fullscreen = true;
+			vidow_view_set_fullscreen(view, true);
+		}
 		vidow_float_update_mode(view);
 		if (view->float_mode == VIDOW_FLOAT_NONE) {
 			view_ensure_column(view->server, view);
@@ -2567,6 +2579,13 @@ static void view_request_fullscreen(struct wl_listener *listener, void *data) {
 	struct vidow_view *view = wl_container_of(listener, view, request_fullscreen);
 	bool want = view->xdg_toplevel->requested.fullscreen;
 
+	if (!vidow_view_configure_ready(view)) {
+		/* 第一次 commit 之前来的全屏请求：这时候既发不出 configure，也不能改
+		 * 状态 —— 改了就是「布局当它全屏、客户端以为自己不是全屏」。等它的初始
+		 * commit（surface initialized 之后）再兑现，见 view_commit。 */
+		return;
+	}
+
 	view->fullscreen = want;
 	vidow_view_set_fullscreen(view, want);
 	vidow_arrange(view->server);
@@ -2576,6 +2595,19 @@ static void view_request_fullscreen(struct wl_listener *listener, void *data) {
 static void view_request_maximize(struct wl_listener *listener, void *data) {
 	(void)data;
 	struct vidow_view *view = wl_container_of(listener, view, request_maximize);
+
+	/* 客户端可能在**第一次 commit 之前**就 set_maximized（Qt/KDE 恢复「上次是
+	 * 最大化」的窗口就是这么开窗的 —— kate 一开就把合成器打死）。wlroots 收到
+	 * 请求立刻发这个信号，而那时候 surface 还没 initialized：
+	 * wlr_xdg_toplevel_set_maximized() 内部的 wlr_xdg_surface_schedule_configure()
+	 * 第一句就是 assert(surface->initialized)，直接 abort
+	 * （wlroots 0.20.2：types/xdg_shell/wlr_xdg_surface.c:168）。
+	 * 还没 initialized 就先不应答：初始 configure 由 view_commit 的
+	 * initial_commit 分支发，那一次本来就是 maximized=false，等于把「不接受
+	 * 最大化」这个答复捎过去了（xdg-shell 只要求有应答）。 */
+	if (!vidow_view_configure_ready(view)) {
+		return;
+	}
 
 	/* Unsupported: still answer with a configure, as xdg-shell requires. */
 	wlr_xdg_toplevel_set_maximized(view->xdg_toplevel, false);

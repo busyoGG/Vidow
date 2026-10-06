@@ -735,6 +735,8 @@ python3 test-float.py        # 三个真实 GTK 窗口，验证浮动模式自�
 ./test-focusclose.sh                 # 关窗口后焦点落谁身上：右边最近的顶上（21 项断言）
 ./test-lastoutput.sh                  # 屏没了不许留野指针、没屏时开窗不许崩（拔一块 / 最后一块没了，22 项断言）
 ./test-actsurface.sh                  # 激活令牌攥着的 surface 先没了也不能崩（8 项断言）
+./test-preinit.sh                    # 状态请求抢在第一次 commit 之前（set_maximized /
+                                     #   set_minimized / set_fullscreen）不许把合成器打死（22 项断言）
 ./test-drag.sh                       # 拖窗口：拖得动 / 跨屏改归属 / 平铺按落点插入（11 项）
 ./test-ws-dynamic.sh                 # 动态工作区：栈底空位 / 空了就收 / 序号夹住 / 具名永存（9 项）
 ./test-dpi.sh                        # 混合 DPI + XWayland：装饰缓冲按**窗口几何**算（见 SSD 那节）
@@ -2596,6 +2598,10 @@ tools/activate.c  激活请求客户端：一个窗口 + 一次 xdg-activation�
                   才用它请求激活；serial 可选「点击事件 / 0 / 不带」三种）
 tools/popup.py    最小 Wayland xdg_popup 客户端（窗口 + Gtk.Menu）：专门撞
                   「unconstrain 只能等 popup 第一次 commit」这条断言
+tools/preinit.c   状态请求抢跑客户端：surface 还没 initialized（一次都没 commit）就发
+                  set_maximized / set_minimized / set_fullscreen；`--after-commit` 是
+                  对照组（上屏之后再发）—— 专门撞 schedule_configure 里那句
+                  `assert(surface->initialized)`
 tools/pattern.py  四象限测试窗口（验证 shader 管线方向与颜色）
 tools/glass.py    半透明定尺寸窗口（验证窗口透明度与背景模糊）
                    VIDOW_TEST_EMPTY=1 时不画内容，只剩装饰 + 模糊
@@ -2632,6 +2638,10 @@ test-outputpos.sh  显示器配置（`vidow.output{ name = …, scale = …, x =
                    按名字摆（自动排的顺序是后端给的，headless 上实测是反的）、
                   只写 x 不写 y 也认、项名写错当场报错、拔插后回到配置说的位置、
                   SIGHUP 改配置立刻生效
+test-preinit.sh    状态请求抢跑：客户端在第一次 commit **之前**就 set_maximized /
+                   set_minimized / set_fullscreen（xdg-shell 允许），合成器不许在
+                   `assert(surface->initialized)` 上 abort；抢跑的最大化答「不最大化」、
+                   抢跑的最小化真的收起来、抢跑的全屏**兑现**（两边状态一致）
 test-minimize.sh   最小化：窗口留在原列里（不占位 / 不显示 / 不参与焦点），条带合拢、
                    同列剩下的撑满、焦点交给邻居、放回回原位、浮窗也认、整列收起、
                    客户端自己请求（`xdg_toplevel.set_minimized`）、`force_render` 的窗口
@@ -3357,6 +3367,40 @@ protocols/     wlr-layer-shell / wlr-virtual-pointer / input-method-v2 /
      写晚了）；②新增一段「三块屏全拔光 → 开两个窗口 → 插回来一块」，断言每个窗口的
      output 都变成插回来那块屏（没屏期间收下的窗口跟着工作区一起回来）。把修复回退掉
      跑一遍，这两条都会红（`段错误（核心已转储）`）。
+
+133. **状态请求抢在第一次 commit 之前 → wlroots 断言 → SIGABRT**（用户报的「tty 起 vidow，
+     开 kate 直接崩」，tty 上打的就是那句 assert：`surface initialized failed`）。崩在
+     `view_request_maximize()`（`src/view.c`）：它转手调
+     `wlr_xdg_toplevel_set_maximized()`，而那里面是
+     `wlr_xdg_surface_schedule_configure()` —— 第一句就是 `assert(surface->initialized)`
+     （wlroots 0.20.2：`types/xdg_shell/wlr_xdg_surface.c:168`）。xdg-shell 允许客户端建好
+     `xdg_toplevel` 之后、交第一帧之前就 `set_maximized`，wlroots 收到请求**立刻**发
+     `events.request_maximize`（`xdg_toplevel_handle_set_maximized` 里直接
+     `wl_signal_emit_mutable`），那时候 surface 还没 initialized → 合成器 abort。
+     Qt/KDE 恢复「上次是最大化」的窗口就是这么开窗的（kate 首当其冲）。
+
+     用户那边的证据：`coredumpctl` 里 4 个 vidow 核心转储（21:31、21:34、21:40、23:01）
+     栈顶全是 `view_request_maximize`，`session-3`（tty）跑的 `./build/vidow`。
+
+     修法（三条路都过一遍 `vidow_view_configure_ready()`）：
+     ①`view_request_maximize`：surface 没 initialized 就先不应答 —— 初始 configure 由
+     `view_commit` 的 `initial_commit` 分支发，那一次本来就是 `maximized=false`，等于把
+     「不接受最大化」这个答复捎过去了（xdg-shell 只要求有应答）；
+     ②`vidow_view_set_minimized`：同一句 assert，客户端第一帧还没来就
+     `set_minimized` 的话（xdg-shell v6 起有）先不排 configure，状态照记；
+     ③`view_request_fullscreen` 反过来是**兑现**：没 ready 就先不记状态（记了就是「布局
+     当它全屏、客户端以为自己不是全屏」），改到 `initial_commit` 分支里、arrange **之前**
+     补上，这样第一次 configure 就带 fullscreen。
+
+     新增 `tools/preinit.c`（`--maximize` / `--minimize` / `--fullscreen`，可叠加；
+     `--after-commit` 是对照组 —— 上屏之后再发，这条时序本来就好）+ `./test-preinit.sh`
+     （22 项）：①抢跑 set_maximized：vidow 活着、请求确实发在 commit 之前（request 行在
+     mapped 行前面）、客户端拿到 configure 且里面**没有** maximized、尺寸不是 0x0、窗口
+     正常进列表；②对照组一样活着、一样答「不最大化」；③抢跑 set_minimized：vidow 活着、
+     `vidowmsg windows` 里 `minimized=true`、日志有「最小化: 收起 收起」；④抢跑
+     set_fullscreen：窗口 `fullscreen=true` 且客户端拿到的 configure 里带 fullscreen；
+     ⑤日志无 assert / abort、收尾一个 vidow 都不剩。把修复回退掉跑一遍：①②③④ 都红
+     （`Assertion 'surface->initialized' failed`，vidow 当场被带走）。
 
 129. **配置按类别拆开：入口 `config.lua` + `configs/` 下一类一份**（`vidow.include()`）。
      原来那份「一份两三百行、什么都写在一起」的默认配置，改一个圆角要先滚过间距、模糊、

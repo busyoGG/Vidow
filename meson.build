@@ -239,6 +239,15 @@ executable('activate',
   include_directories: include_directories('.'),
   install: false)
 
+# 测试工具：状态请求抢在第一次 commit 之前发（set_maximized / set_minimized /
+# set_fullscreen）—— wlroots 对「给还没 initialized 的 surface 排 configure」用的
+# 是 assert，合成器得自己挡住（Qt/KDE 恢复最大化窗口就是这么开窗的）
+executable('preinit',
+  ['tools/preinit.c', xs_header, xs_code],
+  dependencies: [wayland_client_dep],
+  include_directories: include_directories('.'),
+  install: false)
+
 executable('bgblur',
   ['tools/bgblur.c', xs_header, xs_code, bge_client_header, bgeffect_code],
   dependencies: [wayland_client_dep],
