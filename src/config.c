@@ -167,7 +167,7 @@ static const struct entry entries[] = {
 		"窗口空闲（一直开着不动画）时用的 shader 名字，留空 = 不用" },
 
 	{ "force_render_hz", K_INT,    OFF(force_render_hz), SZ(force_render_hz), 5,
-		"滚出视口的窗口每秒补多少帧（0 = 不限），配合窗口规则的 force_render" },
+		"滚出视口 / 被藏起来 / 最小化的窗口每秒补多少帧（0 = 不限），配合规则的 force_render" },
 
 	{ "clipboard",       K_BOOL,   OFF(clipboard),       SZ(clipboard), 6,
 		"接管 X11(XWayland) ↔ Wayland 的剪贴板同步" },

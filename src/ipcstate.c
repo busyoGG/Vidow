@@ -195,6 +195,9 @@ void vidow_ipc_json_window(struct jbuf *b, struct vidow_server *server,
 	jb_kv_bool(b, "placed", view->placed);
 	jb_kv_bool(b, "popup", view->popup);
 	jb_kv_bool(b, "fullscreen", view->fullscreen);
+	/* 最小化：窗口还在原来的列里（列宽 / 顺序 / 工作区都留着），只是不占位、不显示、
+	 * 不参与焦点。任务栏 / 状态栏拿它决定画不画那个「收起来」的条目。 */
+	jb_kv_bool(b, "minimized", view->minimized);
 	jb_kv_bool(b, "focused", server->focused == view);
 	jb_kv_bool(b, "visible", view->scene_tree != NULL &&
 		view->scene_tree->node.enabled);

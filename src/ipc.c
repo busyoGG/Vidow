@@ -457,6 +457,78 @@ static bool cmd_close_window(struct vidow_server *server, struct jval *req,
 	return true;
 }
 
+/* 最小化：窗口留在原来的列里，只是不占位、不显示、不参与焦点（见 view.c）。 */
+static bool cmd_minimize_window(struct vidow_server *server, struct jval *req,
+		struct jbuf *out, char *err, size_t errlen) {
+	struct vidow_view *view = req_view(server, req, err, errlen);
+	if (view == NULL) {
+		return false;
+	}
+	if (view->minimized) {
+		snprintf(err, errlen, "id = %llu 的窗口已经最小化了",
+			(unsigned long long)view->id);
+		return false;
+	}
+	uint64_t id = view->id;
+	vidow_view_set_minimized(view, true);
+	jb_obj(out);
+	jb_kv_uint(out, "minimized", id);
+	jb_obj_end(out);
+	return true;
+}
+
+/* 放回：没指认窗口（没有 id / app_id / title）就是「最近收起来的那个」——
+ * 键位要的正是这个，不用先知道收起来的是谁。 */
+static bool cmd_unminimize_window(struct vidow_server *server, struct jval *req,
+		struct jbuf *out, char *err, size_t errlen) {
+	long long want_id = 0;
+	char text[256];
+	bool has_target = jget_int(req, "id", &want_id) ||
+		jtext(req, "app_id", text, sizeof(text)) != NULL ||
+		jtext(req, "title", text, sizeof(text)) != NULL;
+	if (!has_target) {
+		if (!vidow_view_restore_last(server)) {
+			snprintf(err, errlen, "现在没有最小化的窗口");
+			return false;
+		}
+		jb_obj(out);
+		jb_kv_str(out, "restored", "最近收起来的那个");
+		jb_obj_end(out);
+		return true;
+	}
+	struct vidow_view *view = req_view(server, req, err, errlen);
+	if (view == NULL) {
+		return false;
+	}
+	if (!view->minimized) {
+		snprintf(err, errlen, "id = %llu 的窗口没最小化",
+			(unsigned long long)view->id);
+		return false;
+	}
+	uint64_t id = view->id;
+	vidow_view_restore(view);
+	jb_obj(out);
+	jb_kv_uint(out, "restored", id);
+	jb_obj_end(out);
+	return true;
+}
+
+static bool cmd_toggle_minimize(struct vidow_server *server, struct jval *req,
+		struct jbuf *out, char *err, size_t errlen) {
+	struct vidow_view *view = req_view(server, req, err, errlen);
+	if (view == NULL) {
+		return false;
+	}
+	uint64_t id = view->id;
+	bool was_minimized = view->minimized;
+	vidow_view_toggle_minimized(view);
+	jb_obj(out);
+	jb_kv_uint(out, "id", id);
+	jb_kv_bool(out, "minimized", !was_minimized);
+	jb_obj_end(out);
+	return true;
+}
+
 static bool cmd_toggle_floating(struct vidow_server *server, struct jval *req,
 		struct jbuf *out, char *err, size_t errlen) {
 	struct vidow_view *view = req_view(server, req, err, errlen);
@@ -1767,6 +1839,15 @@ static bool ipc_run(struct vidow_server *server, struct ipc_client *c,
 	}
 	if (strcmp(cmd, "close_window") == 0) {
 		return cmd_close_window(server, req, out, err, errlen);
+	}
+	if (strcmp(cmd, "minimize_window") == 0) {
+		return cmd_minimize_window(server, req, out, err, errlen);
+	}
+	if (strcmp(cmd, "unminimize_window") == 0) {
+		return cmd_unminimize_window(server, req, out, err, errlen);
+	}
+	if (strcmp(cmd, "toggle_minimize") == 0) {
+		return cmd_toggle_minimize(server, req, out, err, errlen);
 	}
 	if (strcmp(cmd, "toggle_floating") == 0) {
 		return cmd_toggle_floating(server, req, out, err, errlen);

@@ -476,17 +476,34 @@ struct vidow_view *vidow_view_at(struct vidow_server *server,
 
 /* ------------------------------------------------------------- columns */
 
-static struct vidow_view *column_first_view(struct vidow_column *col) {
-	struct vidow_view *view;
-	if (wl_list_empty(&col->views)) {
-		return NULL;
-	}
-	view = wl_container_of(col->views.next, view, column_link);
-	return view;
-}
-
 static bool column_has_views(struct vidow_column *col) {
 	return !wl_list_empty(&col->views);
+}
+
+/* 最小化的窗口**留在原来的列里**（位置、列宽、上下顺序、归属工作区全都不用重建，
+ * 放回来是瞬时的），但它不占位：布局、焦点遍历、命中都要跳过它。列里就剩它一个的
+ * 时候，那条列也跟着从条带里消失（niri 的条带是「有东西才占宽度」）。
+ *
+ * 注意别把它当成「藏起来的工作区」那种不可见：那边是整列都不在条带上，这边列还在，
+ * 只是这条列可能空着。所以下面这些判据是「还占着位置」而不是「场景节点开着」。 */
+static bool view_shows(const struct vidow_view *view) {
+	return view != NULL && !view->minimized;
+}
+
+/* 列里第一个「还占着位置」的窗口（焦点落点用）。 */
+static struct vidow_view *column_first_shown_view(struct vidow_column *col) {
+	struct vidow_view *view;
+	wl_list_for_each(view, &col->views, column_link) {
+		if (view_shows(view)) {
+			return view;
+		}
+	}
+	return NULL;
+}
+
+/* 这条列在条带上占位置吗（整列都最小化了就不占）。 */
+static bool column_has_shown_views(struct vidow_column *col) {
+	return column_first_shown_view(col) != NULL;
 }
 
 /* 这块屏上现在该摆哪些列：有特殊工作区开着就摆它的（普通工作区让位），否则摆
@@ -745,9 +762,14 @@ void vidow_view_render_pump(struct vidow_server *server,
 			} else {
 				snprintf(rate, sizeof(rate), "不限速");
 			}
-			wlr_log(WLR_INFO, "强制渲染: %s 在视口外/藏起来，照样补帧回调"
+			/* 「为什么它没画在画面上」说清楚：最小化 / 工作区被藏起来 / 滚出
+			 * 视口 —— 三种的判据都是 view_on_screen()，这里只是把原因写出来。 */
+			const char *why = view->minimized ? "它最小化了" :
+				(!vidow_workspace_view_visible(server, view) ?
+					"它那块工作区藏起来了" : "它滚出视口了");
+			wlr_log(WLR_INFO, "强制渲染: %s %s，照样补帧回调"
 				"（%s，%s）", vidow_view_title(view) != NULL ?
-					vidow_view_title(view) : "(无题)",
+					vidow_view_title(view) : "(无题)", why,
 				vidow_view_capture_held(view) ? "有人正在录屏 / 预览它" :
 					"窗口规则要求", rate);
 		}
@@ -1246,6 +1268,13 @@ static void output_arrange(struct vidow_server *server,
 	int cursor = 0;
 	struct vidow_column *col;
 	wl_list_for_each(col, shown, link) {
+		/* 整列都最小化了：这条列从条带里消失（宽度 0、不占位置），剩下的列
+		 * 自然合拢 —— 最小化的窗口自己还在列里，放回来就照旧。 */
+		if (!column_has_shown_views(col)) {
+			col->width = 0;
+			col->offset = cursor;
+			continue;
+		}
 		int width = (int)(work.width * col->width_fraction);
 		if (width < 1) {
 			width = 1;
@@ -1289,7 +1318,9 @@ static void output_arrange(struct vidow_server *server,
 	output->viewport_x = viewport;
 
 	/* Pass 3: place the tiled windows. Floating views are placed afterwards
-	 * so that a follow-float can read its parent's fresh tile geometry. */
+	 * so that a follow-float can read its parent's fresh tile geometry.
+	 * 最小化的窗口不摆放（它原来的几何留着，放回来那次 arrange 会重算），
+	 * 也不参与 n —— 同列剩下的窗口因此自己撑满。 */
 	struct vidow_view *fullscreen = NULL;
 	wl_list_for_each(col, shown, link) {
 		int x = work.x + col->offset - (int)viewport;
@@ -1297,6 +1328,9 @@ static void output_arrange(struct vidow_server *server,
 		int n = 0;
 		struct vidow_view *view;
 		wl_list_for_each(view, &col->views, column_link) {
+			if (!view_shows(view)) {
+				continue;
+			}
 			if (view->fullscreen && view->mapped) {
 				fullscreen = view;
 				continue;
@@ -1309,7 +1343,7 @@ static void output_arrange(struct vidow_server *server,
 
 		int y = work.y;
 		wl_list_for_each(view, &col->views, column_link) {
-			if (view->fullscreen && view->mapped) {
+			if (!view_shows(view) || (view->fullscreen && view->mapped)) {
 				continue;
 			}
 			int h = (work.height - (n - 1) * inner) / n;
@@ -1603,6 +1637,12 @@ void vidow_focus_view(struct vidow_view *view) {
 	struct wlr_surface *surface = vidow_view_surface(view);
 	struct wlr_surface *prev = seat->keyboard_state.focused_surface;
 
+	/* 最小化的窗口不接键盘（它没画在画面上）。真走到这儿是调用方漏了跳过，
+	 * 放回来那条路会先把 minimized 清掉再进来。 */
+	if (view->minimized) {
+		return;
+	}
+
 	if (prev != surface) {
 		if (prev != NULL) {
 			struct vidow_view *prev_view =
@@ -1681,6 +1721,13 @@ void vidow_view_activate(struct vidow_view *view) {
 	const char *title = vidow_view_title(view) != NULL ?
 		vidow_view_title(view) : "(无题)";
 
+	/* 最小化的窗口被激活（点通知 / 任务栏点它 / IPC restore-window）：先放回布局，
+	 * 再走下面那套「端出工作区 + 给焦点」。规则说不理激活请求的话，也照样放回 ——
+	 * 「别抢焦点」不等于「别把它端出来」。 */
+	if (view->minimized) {
+		vidow_view_set_minimized(view, false);
+	}
+
 	/* 规则说别理它的激活请求（后台 Electron 反复把自己顶上来那类）。 */
 	if (!view->focus_on_activate) {
 		wlr_log(WLR_INFO, "激活: %s 不理（窗口规则 focus_on_activate = false）",
@@ -1731,7 +1778,7 @@ static void focus_nearest_column(struct vidow_server *server,
 	struct vidow_column *col;
 	struct wl_list *shown = output_shown_columns(server, output);
 	wl_list_for_each(col, shown, link) {
-		struct vidow_view *view = column_first_view(col);
+		struct vidow_view *view = column_first_shown_view(col);
 		if (view != NULL) {
 			vidow_focus_view(view);
 			return;
@@ -1762,7 +1809,8 @@ static struct vidow_view *focus_nearest_by_x(struct vidow_server *server,
 
 	wl_list_for_each(v, &server->views, link) {
 		if (v == dying || !v->mapped || v->popup || v->ws != ws ||
-				v->output != output || v->geom.width <= 0) {
+				v->output != output || v->geom.width <= 0 ||
+				!view_shows(v)) {
 			continue;
 		}
 		if (v->geom.x > dying->geom.x) {
@@ -1776,7 +1824,7 @@ static struct vidow_view *focus_nearest_by_x(struct vidow_server *server,
 
 	next = right != NULL ? right : left;
 	if (next != NULL && next->column != NULL) {
-		next = column_first_view(next->column);
+		next = column_first_shown_view(next->column);
 	}
 	return next;
 }
@@ -1807,13 +1855,18 @@ static struct vidow_view *focus_after_close(struct vidow_server *server,
 		return focus_nearest_by_x(server, view, output);
 	}
 
-	if (view->column_link.next != &col->views) {
-		next = wl_container_of(view->column_link.next, next, column_link);
-		return next;
+	/* 同列上下：最小化的兄弟不接键盘（它没画在画面上），跳过它继续找。 */
+	for (node = view->column_link.next; node != &col->views; node = node->next) {
+		next = wl_container_of(node, next, column_link);
+		if (view_shows(next)) {
+			return next;
+		}
 	}
-	if (view->column_link.prev != &col->views) {
-		next = wl_container_of(view->column_link.prev, next, column_link);
-		return next;
+	for (node = view->column_link.prev; node != &col->views; node = node->prev) {
+		next = wl_container_of(node, next, column_link);
+		if (view_shows(next)) {
+			return next;
+		}
 	}
 
 	/* 列里就它一个：跨列找，但只在它那块工作区正摆在这块屏上时找 —— 藏着的
@@ -1824,14 +1877,14 @@ static struct vidow_view *focus_after_close(struct vidow_server *server,
 
 	for (node = col->link.next; node != &col->ws->columns; node = node->next) {
 		c = wl_container_of(node, c, link);
-		next = column_first_view(c);
+		next = column_first_shown_view(c);
 		if (next != NULL) {
 			return next;
 		}
 	}
 	for (node = col->link.prev; node != &col->ws->columns; node = node->prev) {
 		c = wl_container_of(node, c, link);
-		next = column_first_view(c);
+		next = column_first_shown_view(c);
 		if (next != NULL) {
 			return next;
 		}
@@ -1840,6 +1893,120 @@ static struct vidow_view *focus_after_close(struct vidow_server *server,
 	/* 这块工作区上没有别的列了：可能还剩浮窗 —— 它们照样该接住键盘（niri 的
 	 * 「平铺关完落到浮窗上」）。挑不到就返回 NULL，调用方走兜底。 */
 	return focus_nearest_by_x(server, view, output);
+}
+
+/* ------------------------------------------------------------------ 最小化 */
+
+/* 最小化 / 放回。窗口**留在原来的列里**（列宽、上下顺序、滚动位置、归属工作区和
+ * 归属屏全都不用重建，放回来是瞬时的），只是不占位、不显示、不参与焦点：
+ *
+ *   - 布局：arrange 跳过它；整列都最小化了，那条列从条带里消失（剩下的列合拢）；
+ *   - 可见性：vidow_workspace_view_visible() 说它不可见 → 场景节点关掉，跟「工作区
+ *     被藏起来」是同一套；
+ *   - 补帧：**规则要求保活（force_render）或者有人正在录 / 预览的窗口照样出帧** ——
+ *     补帧那条路的判据是 view_on_screen()（最小化让它变假），所以它反而进了补帧分支。
+ *     这里不许加「最小化就不补帧」的判断，那会把录屏录成一张冻住的画面。
+ *   - 客户端：X11 要告诉它（WM_STATE=IconicState + _NET_WM_STATE_HIDDEN），Wayland
+ *     回一次 configure（xdg-shell 规定状态请求必须有应答），任务栏（foreign toplevel）
+ *     跟着更新状态。 */
+void vidow_view_set_minimized(struct vidow_view *view, bool minimized) {
+	if (view == NULL || view->popup || view->minimized == minimized) {
+		return;
+	}
+	struct vidow_server *server = view->server;
+	struct wlr_output *output = view->output;
+	const char *title = vidow_view_title(view) != NULL ?
+		vidow_view_title(view) : "(无题)";
+
+	if (minimized) {
+		/* 全屏的先退出全屏：布局里 fullscreen 那条分支不看占位，留着它会一直
+		 * 占着整块屏。 */
+		if (view->fullscreen) {
+			view->fullscreen = false;
+			vidow_view_set_fullscreen(view, false);
+		}
+		view->minimized_seq = ++server->next_minimize_seq;
+	}
+	view->minimized = minimized;
+
+	if (view->kind == VIDOW_VIEW_X11 && view->x11 != NULL) {
+		wlr_xwayland_surface_set_minimized(view->x11, minimized);
+	} else if (view->xdg_toplevel != NULL) {
+		wlr_xdg_surface_schedule_configure(view->xdg_toplevel->base);
+	}
+	if (view->ftm_handle != NULL) {
+		wlr_foreign_toplevel_handle_v1_set_minimized(view->ftm_handle, minimized);
+	}
+
+	wlr_log(WLR_INFO, "最小化: %s %s（%s）", title,
+		minimized ? "收起" : "放回",
+		view->ws != NULL ? view->ws->name : "-");
+
+	if (minimized && server->focused == view) {
+		/* 焦点交给邻居 —— 跟关窗同一套规矩（位置不动，谁滑到空出来的位置就是谁）。
+		 * 必须在把窗口摘出布局**之前**找（邻居要靠它还在列里才找得到）。 */
+		struct vidow_view *next = focus_after_close(server, view, output);
+		server->focused = NULL;
+		if (next != NULL) {
+			vidow_focus_view(next);
+		} else {
+			focus_nearest_column(server, output);
+		}
+	}
+
+	vidow_workspace_apply_visibility(server);
+	vidow_arrange(server);
+	vidow_backdrop_damage(server, false);
+	vidow_ipc_emit_window(server, minimized ? "window-minimized" :
+		"window-unminimized", view);
+}
+
+/* 放回一个最小化的窗口 + 给焦点。跨屏 / 跨工作区都会跟过去 —— 走的是「点通知」那条
+ * 路（vidow_view_activate：先把工作区端出来，再给键盘）。没最小化的窗口调它没关系
+ * （activate 自己会判断该不该理）。 */
+void vidow_view_restore(struct vidow_view *view) {
+	if (view == NULL || !view->minimized) {
+		return;
+	}
+	vidow_view_set_minimized(view, false);
+	vidow_view_activate(view);
+}
+
+/* 放回「最近收起来的那个」：优先当前聚焦屏上的，那块屏上没有才跨屏挑。 */
+bool vidow_view_restore_last(struct vidow_server *server) {
+	struct vidow_view *best = NULL;      /* 聚焦屏上最新的 */
+	struct vidow_view *best_any = NULL;  /* 全屏范围内最新的 */
+	struct vidow_view *view;
+	wl_list_for_each(view, &server->views, link) {
+		if (!view->minimized) {
+			continue;
+		}
+		if (best_any == NULL || view->minimized_seq > best_any->minimized_seq) {
+			best_any = view;
+		}
+		if (view->output == server->focused_output &&
+				(best == NULL || view->minimized_seq > best->minimized_seq)) {
+			best = view;
+		}
+	}
+	struct vidow_view *pick = best != NULL ? best : best_any;
+	if (pick == NULL) {
+		return false;
+	}
+	vidow_view_restore(pick);
+	return true;
+}
+
+bool vidow_view_toggle_minimized(struct vidow_view *view) {
+	if (view == NULL || view->popup) {
+		return false;
+	}
+	if (view->minimized) {
+		vidow_view_restore(view);
+	} else {
+		vidow_view_set_minimized(view, true);
+	}
+	return true;
 }
 
 void vidow_focus_column(struct vidow_server *server, int direction) {
@@ -1856,8 +2023,9 @@ void vidow_focus_column(struct vidow_server *server, int direction) {
 	struct wl_list *node = direction > 0 ? col->link.next : col->link.prev;
 	while (node != &col->ws->columns) {
 		struct vidow_column *c = wl_container_of(node, c, link);
-		if (column_has_views(c)) {
-			vidow_focus_view(column_first_view(c));
+		/* 整列都最小化的列跳过：焦点不该落进一条看不见的列。 */
+		if (column_has_shown_views(c)) {
+			vidow_focus_view(column_first_shown_view(c));
 			return;
 		}
 		node = direction > 0 ? node->next : node->prev;
@@ -1871,12 +2039,16 @@ void vidow_focus_window(struct vidow_server *server, int direction) {
 		return;
 	}
 
+	/* 同列上下：跳过最小化的（它不占位，也不接键盘）。 */
 	struct wl_list *node = direction > 0 ? view->column_link.next :
 		view->column_link.prev;
-	if (node != &view->column->views) {
+	while (node != &view->column->views) {
 		struct vidow_view *next = wl_container_of(node, next, column_link);
-		vidow_focus_view(next);
-		return;
+		if (view_shows(next)) {
+			vidow_focus_view(next);
+			return;
+		}
+		node = direction > 0 ? node->next : node->prev;
 	}
 
 	/* Single-window column (the common case): fall through to the
@@ -2314,6 +2486,7 @@ static void view_destroy(struct wl_listener *listener, void *data) {
 	wl_list_remove(&view->set_parent.link);
 	wl_list_remove(&view->request_fullscreen.link);
 	wl_list_remove(&view->request_maximize.link);
+	wl_list_remove(&view->request_minimize.link);
 	wl_list_remove(&view->request_move.link);
 	wl_list_remove(&view->request_resize.link);
 	wl_list_remove(&view->destroy.link);
@@ -2390,6 +2563,16 @@ static void view_request_maximize(struct wl_listener *listener, void *data) {
 
 	/* Unsupported: still answer with a configure, as xdg-shell requires. */
 	wlr_xdg_toplevel_set_maximized(view->xdg_toplevel, false);
+}
+
+/* xdg_toplevel.set_minimized：客户端自己要求最小化（xdg-shell v6 起有，wlroots 只把
+ * 请求转成信号，认不认由合成器定）。vidow 认 —— 和 IPC / 键位走同一条路；应答的那次
+ * configure 由 vidow_view_set_minimized() 里发（协议要求状态请求必须有应答）。 */
+static void view_request_minimize(struct wl_listener *listener, void *data) {
+	(void)data;
+	struct vidow_view *view = wl_container_of(listener, view, request_minimize);
+
+	vidow_view_set_minimized(view, true);
 }
 
 static void view_request_move(struct wl_listener *listener, void *data) {
@@ -2904,6 +3087,17 @@ static void x11_request_maximize(struct wl_listener *listener, void *data) {
 	}
 }
 
+/* X11 客户端自己要求最小化 / 放回：`WM_CHANGE_STATE` 的 IconicState / NormalState，
+ * 或者 `_NET_WM_STATE_HIDDEN`（托盘图标「收起来 / 放出来」走这条）。wlroots 把两种
+ * 都转成同一个信号，event->minimize 就是要不要收起。 */
+static void x11_request_minimize(struct wl_listener *listener, void *data) {
+	struct wlr_xwayland_minimize_event *event = data;
+	struct vidow_view *view =
+		wl_container_of(listener, view, x11_request_minimize);
+
+	vidow_view_set_minimized(view, event->minimize);
+}
+
 static void x11_destroy_view(struct wl_listener *listener, void *data) {
 	(void)data;
 	struct vidow_view *view = wl_container_of(listener, view, x11_destroy);
@@ -2933,6 +3127,7 @@ static void x11_destroy_view(struct wl_listener *listener, void *data) {
 	wl_list_remove(&view->x11_request_close.link);
 	wl_list_remove(&view->x11_request_fullscreen.link);
 	wl_list_remove(&view->x11_request_maximize.link);
+	wl_list_remove(&view->x11_request_minimize.link);
 	wl_list_remove(&view->x11_destroy.link);
 
 	x11_drop_surface(view);
@@ -3047,6 +3242,8 @@ void vidow_view_new_x11(struct vidow_server *server,
 		&xsurface->events.request_fullscreen, x11_request_fullscreen);
 	x11_add_listener(&view->x11_request_maximize,
 		&xsurface->events.request_maximize, x11_request_maximize);
+	x11_add_listener(&view->x11_request_minimize,
+		&xsurface->events.request_minimize, x11_request_minimize);
 	x11_add_listener(&view->x11_destroy, &xsurface->events.destroy,
 		x11_destroy_view);
 
@@ -3054,6 +3251,15 @@ void vidow_view_new_x11(struct vidow_server *server,
 	x11_attach_surface(view);
 
 	vidow_float_update_mode(view);
+
+	/* 客户端一上来就是图标化状态（托盘类程序会这么启动）：直接当最小化收起来 ——
+	 * 不占位置、不显示、不抢焦点。X 那边本来就是它自己的状态，不用再告诉它一次。 */
+	if (xsurface->minimized) {
+		view->minimized = true;
+		view->minimized_seq = ++view->server->next_minimize_seq;
+		wlr_log(WLR_INFO, "x11: %s 启动时就是图标化状态，按最小化收起来",
+			vidow_view_title(view) != NULL ? vidow_view_title(view) : "(无题)");
+	}
 
 	wlr_log(WLR_INFO, "x11: 新窗口 %s（%s%s，%s%s）",
 		vidow_view_title(view) != NULL ? vidow_view_title(view) : "(无题)",
@@ -3128,6 +3334,8 @@ static void server_new_toplevel(struct wl_listener *listener, void *data) {
 	wl_signal_add(&xdg_toplevel->events.request_fullscreen, &view->request_fullscreen);
 	view->request_maximize.notify = view_request_maximize;
 	wl_signal_add(&xdg_toplevel->events.request_maximize, &view->request_maximize);
+	view->request_minimize.notify = view_request_minimize;
+	wl_signal_add(&xdg_toplevel->events.request_minimize, &view->request_minimize);
 	view->request_move.notify = view_request_move;
 	wl_signal_add(&xdg_toplevel->events.request_move, &view->request_move);
 	view->request_resize.notify = view_request_resize;

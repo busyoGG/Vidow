@@ -246,6 +246,9 @@ end
 | `workspace-name <名字>` | 给当前这块工作区起名（之后它就不会被自动收掉；不带参数 = 去掉名字） |
 | `special <名字>` | 开/关那个特殊工作区（名字没建过就现建） |
 | `focus <-1\|1>` | 焦点左/右移一列 |
+| `minimize-window`（`minimize` 同义） | 收起当前窗口（留在原列里，只是不占位；见「最小化」一节） |
+| `restore-window`（`unminimize-window` 同义） | 放回最近收起来的那个窗口，并把焦点跟过去 |
+| `toggle-minimize` | 当前窗口收了就放回、没收就收起 |
 | `mousemove` | 把光标所在的那块屏当作「聚焦的屏」（特殊工作区跟的就是它） |
 | `none` | 空绑定，用来屏蔽某个键 |
 
@@ -282,11 +285,54 @@ end
 一行执行一行（`test-workspace.sh` 用的就是它，时序可控且和真实按键走同一个入口
 `vidow_action_run()`）。
 
+## 最小化：窗口留在原列里，只是不占位
+
+```bash
+vidowmsg minimize-window            # 收起当前窗口
+vidowmsg minimize-window --id 3     # 按 id 收起某个
+vidowmsg unminimize-window          # 放回最近收起来的那个（键位要的就是这个）
+vidowmsg toggle-minimize --id 3     # 收了就放回、没收就收起
+```
+
+键位默认 `Mod+M` 收起、`Mod+Shift+M` 放回；也能绑成动作串
+（`vidow.bind("Mod+M", "minimize-window")`，见「工作区」那节的动作表）。
+
+**窗口还在原来的列里** —— 列宽、同列上下顺序、滚动位置、归属工作区、归属屏全都留着，
+所以放回来是瞬时的，而且位置就是原来那个（不需要「记住它原来在哪」这种账）。只是：
+
+- **不占位**：布局跳过它；同列剩下的窗口自己撑满；一条列里的窗口**全**收起来时，那条列
+  从条带里消失，后面的列合拢（跟 niri 的条带「有东西才占宽度」一致）；
+- **不显示**：场景节点关掉（和「工作区被藏起来」同一套），不参与焦点；
+- **不补帧**：没有规则时客户端就此停帧（省电）。**但规则 `force_render` 的窗口、以及
+  正在被人录屏 / 预览的窗口照样补帧** —— 补帧那条路的判据是「没画在画面上」，最小化正好
+  让它成立，所以录屏录到的还是新画面（日志会写「它最小化了，照样补帧回调」）。
+- **不收工作区**：整块工作区里的窗口全收起来时它不算空（不然窗口的住处会被拆掉）。
+
+三边都接上了：
+
+| 谁 | 怎么进来 | 怎么知道状态 |
+| --- | --- | --- |
+| 键位 / IPC | `Mod+M`、`minimize-window` | `vidowmsg windows` 里的 `minimized`、`window-minimized` / `window-unminimized` 事件 |
+| Wayland 客户端 | `xdg_toplevel.set_minimized`（xdg-shell v6） | 回一次 configure（协议要求状态请求必须有应答） |
+| X11 客户端 | `WM_CHANGE_STATE` 的 IconicState / `_NET_WM_STATE_HIDDEN`（托盘图标的「收起来」走这条） | 写 `WM_STATE=IconicState` + `_NET_WM_STATE_HIDDEN`（`xprop -id <窗口> WM_STATE` 能看到） |
+| 任务栏（waybar 等） | `wlr-foreign-toplevel-management` 的 `set_minimized` / `unset_minimized` | 同样的协议回 `minimized` 状态；点一下那个条目就是 `request_activate`，vidow 会先放回再给焦点 |
+
+X11 客户端一启动就是图标化状态（托盘类程序会这么开）时，vidow 直接按最小化收起来，不抢
+焦点、不占位置。
+
+### 测试
+
+`./test-minimize.sh`：IPC 与动作串、条带合拢、同列撑满、焦点交接、放回原位、浮窗、
+整列收起、客户端自己请求（`tools/frames.c` 的 `VIDOW_TEST_MINIMIZE_MS`）、
+`force_render` 的窗口收起来照样出帧、SIGHUP 不改状态、X11 的 `WM_STATE` 来回切。
+
 ## 视口外强制渲染（窗口规则 / 录屏 / 窗口预览）
 
 Wayland 的帧回调（`wl_surface.frame`）是合成器「我要用你的画面了」的**许可**：客户端
 （mpv、游戏、Qt、GTK）都拿它做节流。窗口滚出视口、或者所在工作区被藏起来时，场景里
 什么都没画到它，就没有回调 —— 客户端停帧，切回来是一张冻住的画面，录屏录到的也是它。
+**最小化的窗口也一样**（它同样「没画在画面上」）：没有规则就停帧，配了 `force_render`
+或者正被人录屏 / 预览就照旧出帧 —— 日志会写「它最小化了，照样补帧回调」。
 
 用 `tools/frames.c`（一个「只按许可出帧」的窗口）量出来：
 
@@ -295,6 +341,8 @@ Wayland 的帧回调（`wl_surface.frame`）是合成器「我要用你的画面
 | 窗口在视口里 | ~60 帧/秒 |
 | 滚出视口，没有规则、没人录 | **0 帧/秒**（停死） |
 | 滚出视口，配了 `force_render` | ~60 帧/秒（接着跑；速率可配，见下） |
+| **最小化**，没有规则、没人录 | **0 帧/秒**（停死） |
+| **最小化**，配了 `force_render` | ~60 帧/秒（接着跑） |
 
 两条路让它继续出帧，都不用改布局：
 
@@ -624,6 +672,7 @@ WLR_BACKENDS=headless WLR_HEADLESS_OUTPUTS=1 WLR_LIBINPUT_NO_DEVICES=1 ./build/v
 | `Mod+F` | 当前窗口全屏切换 |
 | `Mod+O` | niri 风格全景（overview）：整条列带缩小铺满这块屏，点谁去谁 |
 | `Mod+Q` | 关闭当前窗口 |
+| `Mod+M` / `Mod+Shift+M` | 收起当前窗口 / 放回最近收起来的那个（见「最小化」一节） |
 | `Mod+Enter` | 启动终端 |
 | `Mod+滚轮` | 焦点左/右移一列 |
 | `Mod+Escape` | 退出合成器 |
@@ -1129,7 +1178,7 @@ vidow 自己的，比如 `vidow-wayland-1.sock`）；`ipc_socket` 可以写死�
 | 命令 | 里面是什么 |
 | --- | --- |
 | `state` | 下面所有的 + 计数（窗口 / 列 / 输出 / 工作区 / layer / 客户端 / 动画 / 订阅者） |
-| `windows` | 每个窗口：`id`、`kind`（xdg / x11）、`title`、`app_id`、`pid`、`geometry`（布局坐标）、`float_geometry`、`surface`（表面尺寸 / 缓冲 / scale）、`column`（列 id / 宽比 / 偏移 / 序号）、`workspace`、`output`、`home`、`floating` + `float_mode`、`fullscreen`、`mapped` / `visible`、`rules`（三条规则的实际取值）、`size_hints`、`anim_*`、`force_render`、`capture_holders`、X11 还多一份 `x11` 子对象 |
+| `windows` | 每个窗口：`id`、`kind`（xdg / x11）、`title`、`app_id`、`pid`、`geometry`（布局坐标）、`float_geometry`、`surface`（表面尺寸 / 缓冲 / scale）、`column`（列 id / 宽比 / 偏移 / 序号）、`workspace`、`output`、`home`、`floating` + `float_mode`、`fullscreen`、`minimized`、`mapped` / `visible`、`rules`（三条规则的实际取值）、`size_hints`、`anim_*`、`force_render`、`capture_holders`、X11 还多一份 `x11` 子对象 |
 | `columns` | 每条列：`id`、`width_fraction`、算出来的 `width` / `offset`、序号、里面的窗口 |
 | `workspaces` | 每块工作区：名字、`special`、`active` / `visible` / `shown`、住哪块屏 / 归属哪块屏、滚动位置、列与窗口、离开时的焦点窗口（**特殊工作区也在列表里**，`special = true`；Lua 的 `vidow.workspace_list()` 不给它） |
 | `outputs` | 每块屏：连接器名 / 描述 / make / model、`enabled`、`scale`、`transform`、刷新率、物理尺寸、布局矩形、`usable_area`、`viewport_x`、活动 / 显示着的工作区、它上面的工作区 / 窗口 / layer、**所有可用模式**、`adaptive_sync` / `vrr_supported`、`depth` / `render_format`、`primaries` / `transfer_functions` / `hdr_capable`（这块屏**自己报**的色彩能力，HDR 可行性就看它）、模糊贴图状态 |
@@ -1148,7 +1197,7 @@ vidow 自己的，比如 `vidow-wayland-1.sock`）；`ipc_socket` 可以写死�
 
 | 类别 | 命令 |
 | --- | --- |
-| 窗口 | `focus-window`、`activate-window`（= 点通知：先把工作区端出来再给焦点）、`close-window`、`toggle-floating`、`set-floating`、`toggle-fullscreen`、`set-fullscreen`、`set-window-size`、`set-window-position`、`center-window`、`set-window-force-render`、`focus-window-direction`、`move-window-direction`、`move-window-to-workspace`、`move-window-to-special`、`move-window-to-output` |
+| 窗口 | `focus-window`、`activate-window`（= 点通知：先把工作区端出来再给焦点）、`close-window`、`minimize-window`、`unminimize-window`（不带参数 = 最近收起来的那个）、`toggle-minimize`、`toggle-floating`、`set-floating`、`toggle-fullscreen`、`set-fullscreen`、`set-window-size`、`set-window-position`、`center-window`、`set-window-force-render`、`focus-window-direction`、`move-window-direction`、`move-window-to-workspace`、`move-window-to-special`、`move-window-to-output` |
 | 列 | `focus-column`、`move-column`、`cycle-column-width`、`set-column-width`（`fraction` 绝对值 / `delta` 相对）、`expand-column-to-available-width`、`center-column` |
 | 工作区 | `focus-workspace`（名字 / `next` / `prev` / `index`）、`toggle-special`（= `focus-special`）、`create-workspace`、`move-workspace-to-output` |
 | 输出 | `output-power`（`on` / `off` / `toggle`）、`output-enable` / `output-disable` / `output-toggle`、`output-scale`（数字或 `auto`）、`output-transform`、`output-mode`（宽 高 [刷新率]）、`output-position`、`output-focus` |
@@ -2159,6 +2208,10 @@ test-outputpos.sh  显示器配置（`vidow.output{ name = …, scale = …, x =
                    按名字摆（自动排的顺序是后端给的，headless 上实测是反的）、
                   只写 x 不写 y 也认、项名写错当场报错、拔插后回到配置说的位置、
                   SIGHUP 改配置立刻生效
+test-minimize.sh   最小化：窗口留在原列里（不占位 / 不显示 / 不参与焦点），条带合拢、
+                   同列剩下的撑满、焦点交给邻居、放回回原位、浮窗也认、整列收起、
+                   客户端自己请求（`xdg_toplevel.set_minimized`）、`force_render` 的窗口
+                   收起来照样出帧、SIGHUP 不改状态、X11 的 `WM_STATE` Iconic ⇄ Normal
 test-xwayland-hidpi.sh  XWayland 的 HiDPI 告知：`_XWAYLAND_GLOBAL_OUTPUT_SCALE`
                   让 X 屏幕 / RandR 变成设备像素（补丁生效时），`Xft.dpi = 96×S`，
                   以及没打补丁时量到屏幕没跟着缩放、自动退回 1 倍（钩子模拟），

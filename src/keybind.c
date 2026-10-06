@@ -402,6 +402,34 @@ bool vidow_action_run(struct vidow_server *server, const char *action) {
 		wlr_log(WLR_ERROR, "focus 的参数是列方向（focus -1 / focus 1）");
 		return false;
 	}
+	/* 最小化（可绑：vidow.bind("Mod+M", "minimize-window")）：
+	 *   minimize-window   —— 收起当前窗口（留在原列里，只是不占位）
+	 *   restore-window    —— 放回最近收起来的那个（同 unminimize-window）
+	 *   toggle-minimize   —— 当前窗口收了就放回、没收就收起
+	 * 按 id 指认某个窗口用 IPC：vidowmsg minimize-window --id 3。 */
+	if (strcmp(name, "minimize-window") == 0 || strcmp(name, "minimize") == 0) {
+		if (server->focused == NULL) {
+			wlr_log(WLR_ERROR, "minimize-window: 现在没有聚焦的窗口");
+			return false;
+		}
+		vidow_view_set_minimized(server->focused, true);
+		return true;
+	}
+	if (strcmp(name, "unminimize-window") == 0 ||
+			strcmp(name, "restore-window") == 0) {
+		if (!vidow_view_restore_last(server)) {
+			wlr_log(WLR_ERROR, "restore-window: 现在没有最小化的窗口");
+			return false;
+		}
+		return true;
+	}
+	if (strcmp(name, "toggle-minimize") == 0) {
+		if (server->focused == NULL) {
+			wlr_log(WLR_ERROR, "toggle-minimize: 现在没有聚焦的窗口");
+			return false;
+		}
+		return vidow_view_toggle_minimized(server->focused);
+	}
 	if (strcmp(name, "mousemove") == 0) {
 		/* 光标走到哪儿，哪块屏就是「聚焦的屏」—— 特殊工作区跟随激活的屏就靠它。 */
 		struct wlr_output *output = wlr_output_layout_output_at(

@@ -85,6 +85,17 @@ static bool handle_keybinding(struct vidow_server *server, xkb_keysym_t sym,
 	case XKB_KEY_r: /* cycle column width: 1/3 -> 1/2 -> 2/3 */
 		vidow_cycle_column_width(server);
 		return true;
+	case XKB_KEY_m: /* Mod+M 收起当前窗口；Mod+Shift+M 放回最近收起来的那个 */
+		if (shift) {
+			if (!vidow_view_restore_last(server)) {
+				wlr_log(WLR_INFO, "放回: 现在没有最小化的窗口");
+			}
+			return true;
+		}
+		if (server->focused != NULL) {
+			vidow_view_set_minimized(server->focused, true);
+		}
+		return true;
 	case XKB_KEY_o: /* niri 风格的全景：整条列带缩小铺满这块屏 */
 		vidow_overview_toggle(server);
 		return true;

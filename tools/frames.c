@@ -11,6 +11,10 @@
  * 那种情况下照样出帧（见 src/view.c 的 vidow_view_render_pump）。
  *
  * 用法：frames <标题> [运行秒数]     颜色每帧都变，方便录屏/截图看出画面是不是新的。
+ *
+ * VIDOW_TEST_MINIMIZE_MS=800 额外做一件事：开起来 800 毫秒之后，客户端**自己**
+ * 请求最小化（xdg_toplevel.set_minimized，xdg-shell v6），并打一行
+ * `minimize-request <毫秒>`。用来测合成器认不认客户端的最小化请求。
  */
 /* memfd_create 要 _GNU_SOURCE（项目全局按 POSIX 编） */
 #define _GNU_SOURCE
@@ -48,6 +52,13 @@ static int frames;
 static struct timespec start;
 static bool running = true;
 static bool configured;
+
+/* 客户端自己要求最小化（测合成器的 xdg_toplevel.set_minimized 那条路）：
+ * VIDOW_TEST_MINIMIZE_MS=800 就是「开起来 800 毫秒之后自己请求最小化」。
+ * 协议版本要 6 才允许发这个请求，所以设了这个环境变量才按 6 绑 wm_base。
+ * 计时靠帧回调（客户端这边没有服务端那种 timer 源）：每帧看一眼到点没有。 */
+static int minimize_after_ms;
+static bool minimize_sent;
 
 static int ms_since_start(void) {
 	struct timespec now;
@@ -101,6 +112,16 @@ static void frame_done(void *data, struct wl_callback *callback, uint32_t time) 
 	printf("frame %d %d %02x%02x%02x\n", frames, ms_since_start(), r, g, b);
 	fflush(stdout);
 
+	/* 到点了就自己请求最小化（只发一次）。发完这一帧照旧画 —— 合成器认了之后
+	 * 就不再给帧回调了，那时候这个客户端自然停下来。 */
+	if (minimize_after_ms > 0 && !minimize_sent &&
+			ms_since_start() >= minimize_after_ms && toplevel != NULL) {
+		minimize_sent = true;
+		xdg_toplevel_set_minimized(toplevel);
+		printf("minimize-request %d\n", ms_since_start());
+		fflush(stdout);
+	}
+
 	wl_surface_attach(surface, buffer, 0, 0);
 	wl_surface_damage_buffer(surface, 0, 0, width, height);
 	draw_next();
@@ -141,6 +162,34 @@ static const struct xdg_wm_base_listener wm_base_listener = {
 	.ping = wm_base_ping,
 };
 
+/* 按 6 版绑 wm_base 就得接这几个事件（configure_bounds / wm_capabilities 是 v4/v5
+ * 加的）。这里全都不关心，收下就算。 */
+static void toplevel_configure(void *data, struct xdg_toplevel *toplevel,
+		int32_t w, int32_t h, struct wl_array *states) {
+	(void)data; (void)toplevel; (void)w; (void)h; (void)states;
+}
+
+static void toplevel_close(void *data, struct xdg_toplevel *toplevel) {
+	(void)data; (void)toplevel;
+}
+
+static void toplevel_configure_bounds(void *data, struct xdg_toplevel *toplevel,
+		int32_t w, int32_t h) {
+	(void)data; (void)toplevel; (void)w; (void)h;
+}
+
+static void toplevel_wm_capabilities(void *data, struct xdg_toplevel *toplevel,
+		struct wl_array *capabilities) {
+	(void)data; (void)toplevel; (void)capabilities;
+}
+
+static const struct xdg_toplevel_listener toplevel_listener = {
+	.configure = toplevel_configure,
+	.close = toplevel_close,
+	.configure_bounds = toplevel_configure_bounds,
+	.wm_capabilities = toplevel_wm_capabilities,
+};
+
 static void registry_global(void *data, struct wl_registry *registry,
 		uint32_t name, const char *interface, uint32_t version) {
 	(void)data;
@@ -151,7 +200,10 @@ static void registry_global(void *data, struct wl_registry *registry,
 	} else if (strcmp(interface, wl_shm_interface.name) == 0) {
 		shm = wl_registry_bind(registry, name, &wl_shm_interface, 1);
 	} else if (strcmp(interface, xdg_wm_base_interface.name) == 0) {
-		wm_base = wl_registry_bind(registry, name, &xdg_wm_base_interface, 1);
+		/* set_minimized 要 v6；没这个需求就按老样子绑 1 版，别动别的测试的
+		 * 行为（v4/v5 会多发 configure_bounds / wm_capabilities）。 */
+		uint32_t want = minimize_after_ms > 0 && version >= 6 ? 6 : 1;
+		wm_base = wl_registry_bind(registry, name, &xdg_wm_base_interface, want);
 		xdg_wm_base_add_listener(wm_base, &wm_base_listener, NULL);
 	}
 }
@@ -176,6 +228,8 @@ static void on_signal(int signo) {
 int main(int argc, char *argv[]) {
 	const char *title = argc > 1 ? argv[1] : "frames";
 	int limit_ms = argc > 2 ? atoi(argv[2]) * 1000 : 0;
+	const char *min_env = getenv("VIDOW_TEST_MINIMIZE_MS");
+	minimize_after_ms = min_env != NULL ? atoi(min_env) : 0;
 	clock_gettime(CLOCK_MONOTONIC, &start);
 
 	signal(SIGTERM, on_signal);
@@ -220,6 +274,9 @@ int main(int argc, char *argv[]) {
 	xdg_surface = xdg_wm_base_get_xdg_surface(wm_base, surface);
 	xdg_surface_add_listener(xdg_surface, &xdg_surface_listener, NULL);
 	toplevel = xdg_surface_get_toplevel(xdg_surface);
+	if (minimize_after_ms > 0) {
+		xdg_toplevel_add_listener(toplevel, &toplevel_listener, NULL);
+	}
 	xdg_toplevel_set_title(toplevel, title);
 	xdg_toplevel_set_app_id(toplevel, "frames");
 	wl_surface_commit(surface);

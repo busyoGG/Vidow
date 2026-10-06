@@ -75,6 +75,22 @@ static void ftm_request_fullscreen(struct wl_listener *listener, void *data) {
 	vidow_arrange(view->server);
 }
 
+/* 任务栏要求最小化 / 放回（waybar 的 taskbar 模块、各种面板都走这条）。
+ * 收起和放回是**同一个信号**，event->minimized 说要哪个 —— 别去找
+ * request_unminimize，协议里没那个东西。 */
+static void ftm_request_minimize(struct wl_listener *listener, void *data) {
+	struct wlr_foreign_toplevel_handle_v1_minimized_event *event = data;
+	struct vidow_view *view =
+		wl_container_of(listener, view, ftm_request_minimize);
+
+	if (event->minimized) {
+		vidow_view_set_minimized(view, true);
+	} else if (view->minimized) {
+		/* 放回顺手给焦点：点任务栏里那个缩条，期待的就是它回到眼前。 */
+		vidow_view_restore(view);
+	}
+}
+
 /* --------------------------------------------------------- ext-...-list v1 */
 
 static void capture_request(struct wl_listener *listener, void *data) {
@@ -198,6 +214,9 @@ void vidow_portal_view_new(struct vidow_view *view) {
 			view->ftm_request_fullscreen.notify = ftm_request_fullscreen;
 			wl_signal_add(&view->ftm_handle->events.request_fullscreen,
 				&view->ftm_request_fullscreen);
+			view->ftm_request_minimize.notify = ftm_request_minimize;
+			wl_signal_add(&view->ftm_handle->events.request_minimize,
+				&view->ftm_request_minimize);
 		}
 	}
 
@@ -225,6 +244,7 @@ void vidow_portal_view_free(struct vidow_view *view) {
 		wl_list_remove(&view->ftm_request_activate.link);
 		wl_list_remove(&view->ftm_request_close.link);
 		wl_list_remove(&view->ftm_request_fullscreen.link);
+		wl_list_remove(&view->ftm_request_minimize.link);
 		wlr_foreign_toplevel_handle_v1_destroy(view->ftm_handle);
 		view->ftm_handle = NULL;
 	}

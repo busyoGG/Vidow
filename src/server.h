@@ -574,6 +574,16 @@ struct vidow_view {
 	bool mapped;
 	bool configured; /* initial configure already answered */
 	bool fullscreen;
+	/* 最小化：窗口**留在原来的列里**（列宽、上下顺序、滚动位置、归属工作区和屏
+	 * 全都不用重建，放回来是瞬时的），但不占位、不显示、不参与焦点 —— 布局、
+	 * 焦点遍历、可见性都会跳过它（见 view.c 的 view_shows()）。
+	 *
+	 * 规则 force_render 的窗口最小化之后**照样补帧**（录屏 / 预览要的是新画面）：
+	 * 补帧那条路的判据是「没画在画面上」，最小化正好让 view_on_screen() 变假，
+	 * 于是它进补帧分支 —— 别在这里加「最小化就不补帧」的判断。
+	 * minimized_seq：什么时候收起来的（单调递增），「放回最近收起来的那个」按它挑。 */
+	bool minimized;
+	uint64_t minimized_seq;
 
 	/* X11（XWayland）专用：popup = 菜单 / 提示 / 下拉框这类「弹出物」。对应
 	 * Wayland 的 xdg_popup：不装饰、不跑 shader、不做开关动画、不参与布局
@@ -635,6 +645,7 @@ struct vidow_view {
 	struct wl_listener x11_request_close;
 	struct wl_listener x11_request_fullscreen;
 	struct wl_listener x11_request_maximize;
+	struct wl_listener x11_request_minimize;
 	struct wl_listener x11_destroy;
 
 	/* animation */
@@ -675,6 +686,7 @@ struct vidow_view {
 	struct wl_listener request_maximize;
 	struct wl_listener request_move;
 	struct wl_listener request_resize;
+	struct wl_listener request_minimize;
 
 	/* 窗口列表（waybar / xdg-desktop-portal 的 ScreenCast 窗口选择器） */
 	struct wlr_foreign_toplevel_handle_v1 *ftm_handle;
@@ -685,6 +697,7 @@ struct vidow_view {
 	struct wl_listener ftm_request_activate;
 	struct wl_listener ftm_request_close;
 	struct wl_listener ftm_request_fullscreen;
+	struct wl_listener ftm_request_minimize;
 };
 
 /* ----------------------------------------------------------- layer shell */
@@ -1121,6 +1134,8 @@ struct vidow_server {
 	uint64_t next_view_id;
 	uint64_t next_column_id;
 	uint64_t next_layer_id;
+	/* 最小化的先后（「放回最近收起来的那个」按它挑，见 view.c） */
+	uint64_t next_minimize_seq;
 
 	struct vidow_view *focused;
 	struct vidow_layer_surface *keyboard_layer; /* exclusive layer grab */
@@ -1440,6 +1455,19 @@ void vidow_view_capture_hold(struct vidow_view *view,
 		struct vidow_server *server,
 		struct wlr_ext_image_capture_source_v1 *source, struct wl_client *client);
 void vidow_place_view(struct vidow_view *view, int x, int y, int w, int h);
+
+/* 最小化 / 放回（见 view.c）：
+ *   vidow_view_set_minimized —— 唯一的状态入口。窗口留在原列里，只是不占位、不显示、
+ *     不参与焦点；X11 那边会同步 WM_STATE / _NET_WM_STATE_HIDDEN，Wayland 那边回一次
+ *     configure，任务栏（foreign toplevel）跟着更新状态。
+ *   vidow_view_restore_last —— 放回「最近收起来的那个」（优先当前聚焦屏上的）。
+ *   vidow_view_toggle_minimized —— 收了就放回、没收入就收起（按 id 指认时用）。
+ *   vidow_view_restore —— 放回一个 + 给焦点（端出工作区 / 跟到那块屏，和点通知
+ *     同一条路：vidow_view_activate）。 */
+void vidow_view_set_minimized(struct vidow_view *view, bool minimized);
+void vidow_view_restore(struct vidow_view *view);
+bool vidow_view_restore_last(struct vidow_server *server);
+bool vidow_view_toggle_minimized(struct vidow_view *view);
 
 /* ------------------------------------------------------------- overview */
 

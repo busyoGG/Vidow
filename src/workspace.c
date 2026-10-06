@@ -675,6 +675,13 @@ bool vidow_workspace_view_visible(struct vidow_server *server,
 	if (view == NULL || view->popup) {
 		return false; /* 弹出物不进工作区，跟父窗口走 */
 	}
+	/* 最小化的窗口不算可见 —— 它是**唯一**的判据口，别的判断都从这儿问：
+	 *   场景节点（apply_visibility）、浮窗摆放（float.c）、overview 收集、
+	 *   补帧那条路的 view_on_screen()（最小化让「画在画面上」变假 → 规则要求
+	 *   保活 / 有人录屏的窗口照样出帧，见 view.c 的 vidow_view_render_pump）。 */
+	if (view->minimized) {
+		return false;
+	}
 	struct wlr_output *output = view->output;
 	if (output == NULL) {
 		return false;
@@ -1230,6 +1237,9 @@ bool vidow_workspace_is_visible(const struct vidow_workspace *ws) {
 	return ws != NULL && (ws->active || ws->visible);
 }
 
+/* 这块工作区上有几个窗口。**最小化的也算** —— 它还在列里、还指着这块工作区，
+ * 数少了就会被 vidow_workspace_cleanup() 当成「空的、没名字的」收掉，把窗口的
+ * 住处一起拆了（最小化的窗口要能原样放回来，工作区就得留着）。 */
 int vidow_workspace_view_count(const struct vidow_workspace *ws) {
 	if (ws == NULL) {
 		return 0;
