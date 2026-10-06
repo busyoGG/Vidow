@@ -195,6 +195,13 @@ struct vidow_config {
 	 * 都会打一条 info 日志留痕。关掉之后只剩 vidow 自己的快捷键能动。 */
 	bool input_injection;
 
+	/* 摇晃找光标（见 cursorfx.c）：快速来回晃几下指针，指针就地放大一会儿。
+	 * 放大是换一张更大的光标图，走的是硬件光标那条路 —— 放得下就不进合成器
+	 * 的渲染通道，所以不会出现在截图里；放不下会被 wlroots 降级成软光标，所以
+	 * 倍数会按硬件上限先夹一下（cursor_shake_scale 是想要的倍数）。 */
+	bool cursor_shake;
+	double cursor_shake_scale;
+
 	/* 剪贴板（见 clipboard.c）：X11(Xwayland) 与 Wayland 两边共用一份内容。
 	 * clipboard = false 就不接管，退回 wlroots 自带那套（只在有 X11 窗口聚焦
 	 * 时才同步）；clipboard_primary 决定选区（PRIMARY）要不要一起同步；
@@ -1067,6 +1074,7 @@ struct vidow_server {
 
 	struct wlr_cursor *cursor;
 	struct wlr_xcursor_manager *cursor_mgr;
+	struct vidow_cursor_fx *cursor_fx; /* 摇晃放大（cursorfx.c），可能为 NULL */
 	struct wlr_seat *seat;
 
 	struct vidow_config config;
@@ -1336,6 +1344,10 @@ bool vidow_bgeffect_blur_box(struct vidow_server *server,
 
 /* ------------------------------------------------------------- scene fx */
 
+/* 按渲染器能渲染的格式挑一张离屏缓冲（fx.c 的 alloc_target：优先带 alpha 的
+ * 格式，装饰圆角才不会发黑）。摇晃放大也拿它分配光标图。 */
+struct wlr_buffer *vidow_alloc_target(struct vidow_server *server, int w, int h);
+
 void vidow_fx_set_alpha(struct wlr_scene_node *node, double alpha);
 bool vidow_shader_init(struct vidow_server *server);
 struct vidow_shader *vidow_shader_get(struct vidow_server *server,
@@ -1392,6 +1404,26 @@ void vidow_pointer_motion(struct vidow_server *server, uint32_t time_msec);
 void vidow_pointer_axis(struct vidow_server *server,
 		enum wl_pointer_axis orientation, double delta, int32_t delta_discrete,
 		enum wl_pointer_axis_source source, uint32_t time_msec);
+
+/* --------------------------------------------------- 摇晃找光标（cursorfx.c）
+ *
+ * 快速来回晃几下指针，指针就地放大一会儿（cursor_shake / cursor_shake_scale）。
+ * 放大走的是硬件光标那条路：放得下就不进合成器的渲染通道，因此不会出现在截图
+ * 里；放不下会被降级成软光标，所以倍数先按硬件上限夹。 */
+/* 建状态 + 定时器（input_init 里调一次）。失败只是没这个功能，不影响别的。 */
+void vidow_cursor_fx_init(struct vidow_server *server);
+/* 每次指针移动后调（真实鼠标、测试注入、IPC 注入都走这里）。 */
+void vidow_cursor_fx_motion(struct vidow_server *server);
+/* 手动放大一次（IPC 的 cursor-shake）。why 里是拒绝的原因。 */
+bool vidow_cursor_fx_shake(struct vidow_server *server, const char **why);
+/* 客户端换了光标图（request_set_cursor）：记下来，好在放大结束时还原。 */
+void vidow_cursor_fx_set_surface(struct vidow_server *server,
+		struct wlr_surface *surface, int32_t hx, int32_t hy);
+/* 指针底下没窗口了，该显示主题默认箭头。放大期间不动真图，只记状态。 */
+void vidow_cursor_fx_default_cursor(struct vidow_server *server);
+/* 光标状态（magnified / scale / image / hardware / hw_max），写进当前 JSON 对象。 */
+struct jbuf;
+void vidow_cursor_fx_json(struct jbuf *b, struct vidow_server *server);
 
 /* --------------------------------------------------------------- 注入（IPC）
  *

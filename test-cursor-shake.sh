@@ -1,0 +1,377 @@
+#!/bin/bash
+# 摇晃找光标：快速来回晃几下指针，指针就地放大一会儿（config 的 cursor_shake）。
+#
+# 判据（headless 1280x720 一块屏，截图用 grim 当裁判 —— 「进没进截图」由像素说了算）：
+#   1) cursor 命令报得出光标状态：image（当前光标图的物理尺寸）/ hardware / hw_max
+#   2) 慢慢往一个方向移动**不**触发（不然正常用鼠标就会乱放大）
+#   3) 来回晃（700ms 内 4 次换向、每段 ≥12px）触发：光标图正好放大 2 倍
+#   4) 到点自己还原（700ms 后回到原尺寸）
+#   5) cursor-shake 命令手动触发（脚本 / 远程入口），放大期间再来一次是续期
+#   6) **不进截图**：grim 不带 -c 抓，画面里一个光标像素都没有（放大中也一样）——
+#      放大走的是硬件光标那条路，不进合成器的渲染通道
+#   7) **显式指定才进截图**：grim -c（screencopy 的 overlay_cursor）抓，光标在，
+#      而且放大后的外接矩形正好是 2 倍、箭头尖还钉在原来那个点上
+#   8) 客户端自己设的光标（wl_pointer.set_cursor 的 surface）也能放大，而且还原的是
+#      **客户端那张**（不是主题箭头）
+#   9) cursor_shake = false：晃不放大、cursor-shake 被拒且理由点得到配置
+#  10) cursor_shake_scale：1.5 → 1.5 倍；20 → 被硬件光标上限夹住并在日志里说明
+#  11) 日志里没有 assert / abort
+#
+# 用法：./test-cursor-shake.sh   （VIDOW_TEST_KEEP=1 保留运行目录）
+# 注意：别和别的测试**并行**跑 —— 收尾按 cmdline 杀 pattern.py / frames / wev。
+set -u
+cd "$(dirname "$0")"
+
+RUNDIR=/tmp/vidow-cursor-shake-test
+CFGDIR="$RUNDIR/home"
+LOG="$RUNDIR/log"
+FAILED=0
+VIDOW_PGID=""
+VIDOW_PIDS=""
+
+pass() { echo "  PASS  $1"; }
+fail() { echo "  FAIL  $1"; FAILED=1; }
+mark() { echo; echo "== $1 =="; }
+
+stop_clients() {
+	for p in /proc/[0-9]*; do
+		pid=${p#/proc/}
+		[ "$pid" = "$$" ] && continue
+		cmd=$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null) || continue
+		case "$cmd" in
+		*pattern.py*|*build/frames*|*build/xpopup*|*/wev*|*grim*|*cursorwin.py*) kill "$pid" 2>/dev/null ;;
+		esac
+	done 2>/dev/null
+}
+
+cleanup() {
+	stop_clients
+	for pid in $VIDOW_PIDS; do
+		[ -n "$pid" ] || continue
+		kill -TERM -- "-$pid" 2>/dev/null
+	done
+	sleep 0.4
+	for pid in $VIDOW_PIDS; do
+		[ -n "$pid" ] || continue
+		kill -KILL -- "-$pid" 2>/dev/null
+	done
+	[ -n "${VIDOW_TEST_KEEP:-}" ] || rm -rf "$RUNDIR"
+}
+trap cleanup EXIT
+
+command -v grim >/dev/null || { echo "test-cursor-shake.sh: 需要 grim"; exit 1; }
+python3 -c 'import PIL' 2>/dev/null || { echo "test-cursor-shake.sh: 需要 python3-PIL"; exit 1; }
+[ -x ./build/vidowmsg ] || { echo "test-cursor-shake.sh: 先构建"; exit 1; }
+
+mkdir -p "$CFGDIR/.config/vidow" "$RUNDIR/run"
+chmod 700 "$RUNDIR/run"
+
+write_config() { # <额外配置行>
+	cat > "$CFGDIR/.config/vidow/config.lua" <<CFG
+scale = "1"
+window_open_ms = 60
+window_close_ms = 60
+window_move_ms = 60
+$1
+CFG
+}
+
+export XDG_RUNTIME_DIR="$RUNDIR/run"
+export HOME="$CFGDIR" VIDOW_LOG=debug
+export DISPLAY= WAYLAND_DISPLAY=
+export VIDOW_CONFIG_LUA="$CFGDIR/.config/vidow/config.lua"
+
+start_vidow() { # <额外配置行>
+	export WLR_BACKENDS=headless WLR_HEADLESS_OUTPUTS=1 WLR_LIBINPUT_NO_DEVICES=1
+	write_config "$1"
+	rm -f "$LOG"
+	setsid ./build/vidow > "$LOG" 2>&1 &
+	VIDOW_PGID=$!
+	VIDOW_PIDS="$VIDOW_PIDS $VIDOW_PGID"
+	for _ in $(seq 1 60); do
+		grep -aq "vidow ready" "$LOG" && break
+		sleep 0.25
+	done
+	if ! grep -aq "vidow ready" "$LOG"; then
+		echo "vidow 没起来"; tail -5 "$LOG"; exit 1
+	fi
+	export WAYLAND_DISPLAY=$(grep -ao "WAYLAND_DISPLAY=[a-z0-9-]*" "$LOG" |
+		tail -1 | cut -d= -f2)
+	sleep 0.5
+}
+
+stop_vidow() {
+	stop_clients
+	if [ -n "$VIDOW_PGID" ]; then
+		kill -TERM -- "-$VIDOW_PGID" 2>/dev/null
+		sleep 0.5
+		kill -KILL -- "-$VIDOW_PGID" 2>/dev/null
+		VIDOW_PGID=""
+	fi
+}
+
+msg() { ./build/vidowmsg --raw "$@" 2>&1; }
+
+# cursor 命令里某个字段（字符串原样、布尔输出 true/false）
+cfield() { # <键>
+	msg cursor | python3 -c '
+import json,sys
+try:
+    v = json.loads(sys.stdin.read())["result"].get(sys.argv[1])
+except Exception:
+    v = None
+print("" if v is None else (str(v).lower() if isinstance(v, bool) else v))
+' "$1"
+}
+
+# 摇晃一次：4 段、每段 40px（700ms 窗口内 3 次换向）
+shake() {
+	msg move-cursor 40 0 --relative >/dev/null
+	msg move-cursor -40 0 --relative >/dev/null
+	msg move-cursor 40 0 --relative >/dev/null
+	msg move-cursor -40 0 --relative >/dev/null
+}
+
+# 画面里的「墨迹」：非黑像素个数 + 外接矩形（黑底 = headless 的默认背景）
+ink() { # <png>
+	python3 - "$1" <<'PY'
+import sys
+from PIL import Image
+im = Image.open(sys.argv[1]).convert("RGB")
+w, h = im.size
+px = im.load()
+xs = []
+ys = []
+n = 0
+for y in range(h):
+    for x in range(w):
+        r, g, b = px[x, y]
+        if r + g + b > 24:
+            n += 1
+            xs.append(x)
+            ys.append(y)
+if n == 0:
+    print("0 0 0 0 0")
+else:
+    print(n, min(xs), min(ys), max(xs) - min(xs) + 1, max(ys) - min(ys) + 1)
+PY
+}
+
+# 尺寸按倍数算（和 C 里的 lround 对齐）
+scale_size() { # <w> <h> <倍数>
+	python3 -c 'import sys
+w,h,f = int(sys.argv[1]), int(sys.argv[2]), float(sys.argv[3])
+print("%dx%d" % (round(w*f), round(h*f)))' "$1" "$2" "$3"
+}
+
+# ------------------------------------------------------------ 1) 基本状态
+mark "1. cursor 命令报得出光标状态"
+start_vidow ""
+msg move-cursor 300 100 >/dev/null
+sleep 0.3
+IMG0=$(cfield image)
+HWMAX=$(cfield hw_max)
+[ -n "$IMG0" ] && [ "$IMG0" != "0x0" ] && pass "光标图尺寸 image=$IMG0" \
+	|| fail "image 没报出来（拿到 '$IMG0'）"
+[ "$(cfield magnified)" = "false" ] && pass "初始 magnified=false" \
+	|| fail "初始就是放大状态"
+[ "$(cfield scale)" = "1" ] && pass "初始 scale=1" || fail "初始 scale 不是 1"
+[ -n "$HWMAX" ] && pass "硬件光标上限 hw_max=$HWMAX" || fail "hw_max 没报出来"
+case "$(cfield hardware)" in
+true)  pass "光标在硬件平面上（不进渲染通道）" ;;
+false) pass "光标是软光标（headless 下也说得通，截图那条判据会自己说明）" ;;
+*)     fail "hardware 字段没报出来" ;;
+esac
+
+# ------------------------------------------------------------ 2) 慢速不触发
+mark "2. 慢慢移动不触发"
+msg move-cursor 200 0 --relative >/dev/null
+sleep 0.1
+msg move-cursor 0 120 --relative >/dev/null
+sleep 0.1
+msg move-cursor -180 0 --relative >/dev/null
+sleep 0.2
+[ "$(cfield magnified)" = "false" ] && pass "单方向大范围移动不放大" \
+	|| fail "慢慢移动也放大了（误触发）"
+[ "$(cfield image)" = "$IMG0" ] && pass "尺寸没变（$IMG0）" \
+	|| fail "尺寸被改了：$(cfield image)"
+
+# ------------------------------------------------------------ 3) 摇晃触发
+mark "3. 来回晃触发放大"
+msg move-cursor 300 100 >/dev/null
+shake
+sleep 0.2
+[ "$(cfield magnified)" = "true" ] && pass "摇晃之后 magnified=true" \
+	|| fail "摇晃没触发放大"
+BIG=$(scale_size "${IMG0%x*}" "${IMG0#*x}" 2)
+[ "$(cfield image)" = "$BIG" ] && pass "光标图放大 2 倍：$IMG0 → $BIG" \
+	|| fail "放大后的尺寸是 $(cfield image)，期望 $BIG"
+grep -aq "摇晃: 光标放大 2.00x（$IMG0 → $BIG" "$LOG" \
+	&& pass "日志记了放大（$IMG0 → $BIG）" \
+	|| fail "日志里没有放大记录"
+grep -aq "摇晃: 光标放大.*硬件光标，不进截图" "$LOG" \
+	&& pass "日志说明它待在硬件光标上（不进截图）" \
+	|| fail "日志没说硬件光标"
+
+# ------------------------------------------------------------ 4) 到点还原
+mark "4. 到点自己还原"
+sleep 0.9
+[ "$(cfield magnified)" = "false" ] && pass "700ms 后 magnified=false" \
+	|| fail "一直没还原"
+[ "$(cfield image)" = "$IMG0" ] && pass "尺寸回到 $IMG0" \
+	|| fail "还原后的尺寸是 $(cfield image)"
+grep -aq "摇晃: 光标还原" "$LOG" && pass "日志记了还原" || fail "日志里没有还原记录"
+
+# ------------------------------------------------------------ 5) 手动触发
+mark "5. cursor-shake 手动触发（脚本入口）"
+msg cursor-shake | grep -aq '"magnified":true' \
+	&& pass "cursor-shake 立刻放大" || fail "cursor-shake 没放大"
+[ "$(cfield image)" = "$BIG" ] && pass "手动触发也是 $BIG" \
+	|| fail "手动触发后尺寸是 $(cfield image)"
+sleep 0.4
+msg cursor-shake >/dev/null
+sleep 0.5
+[ "$(cfield magnified)" = "true" ] && pass "放大期间再来一次是续期（还没还原）" \
+	|| fail "放大期间再触发反而提前还原了"
+sleep 0.9
+[ "$(cfield magnified)" = "false" ] && pass "续期之后照样到点还原" \
+	|| fail "续期之后没还原"
+
+# ------------------------------------------------------------ 6) 不进截图
+mark "6. 不进截图（grim 不带 -c）"
+msg move-cursor 300 100 >/dev/null
+sleep 0.3
+grim "$RUNDIR/plain.png" >/dev/null 2>&1
+read -r N X Y W H <<< "$(ink "$RUNDIR/plain.png")"
+[ "$N" = "0" ] && pass "普通截图里没有光标（0 个非背景像素）" \
+	|| fail "普通截图里有 $N 个非背景像素（$W x $H @ $X,$Y）"
+msg cursor-shake >/dev/null
+sleep 0.2
+grim "$RUNDIR/plain-mag.png" >/dev/null 2>&1
+read -r N X Y W H <<< "$(ink "$RUNDIR/plain-mag.png")"
+[ "$N" = "0" ] && pass "**放大中**的普通截图里也没有光标（不进渲染通道）" \
+	|| fail "放大中的普通截图里出现了 $N 个像素（$W x $H @ $X,$Y）—— 放大图进截图了"
+sleep 0.9
+
+# ------------------------------------------------------------ 7) 显式指定才进
+mark "7. 显式要光标才进截图（grim -c）"
+grim -c "$RUNDIR/cur.png" >/dev/null 2>&1
+read -r N1 X1 Y1 W1 H1 <<< "$(ink "$RUNDIR/cur.png")"
+[ "$N1" -gt 0 ] && pass "grim -c 抓到了光标（$N1 个像素，$W1 x $H1 @ $X1,$Y1）" \
+	|| fail "grim -c 也没抓到光标"
+[ "$W1" = "${IMG0%x*}" ] && [ "$H1" = "${IMG0#*x}" ] \
+	&& pass "没放大时外接矩形就是光标图大小（$IMG0）" \
+	|| fail "外接矩形是 $W1 x $H1，期望 $IMG0"
+msg cursor-shake >/dev/null
+sleep 0.2
+grim -c "$RUNDIR/cur-mag.png" >/dev/null 2>&1
+read -r N2 X2 Y2 W2 H2 <<< "$(ink "$RUNDIR/cur-mag.png")"
+[ "$W2" = "${BIG%x*}" ] && [ "$H2" = "${BIG#*x}" ] \
+	&& pass "放大后外接矩形是 $BIG（正好 2 倍）" \
+	|| fail "放大后外接矩形是 $W2 x $H2，期望 $BIG"
+[ "$N2" -gt "$N1" ] && pass "像素更多了（$N1 → $N2）" \
+	|| fail "放大后像素没变多（$N1 → $N2）"
+# 箭头尖（热点）还钉在 300,100：放大图的左上角 = 2×原来的左上角 - 指针位置
+EXP_X=$(( 2 * X1 - 300 ))
+EXP_Y=$(( 2 * Y1 - 100 ))
+[ "$X2" = "$EXP_X" ] && [ "$Y2" = "$EXP_Y" ] \
+	&& pass "热点没跑（左上角 $X1,$Y1 → $X2,$Y2，箭头尖还在 300,100）" \
+	|| fail "热点跑了：左上角 $X1,$Y1 → $X2,$Y2，期望 $EXP_X,$EXP_Y"
+sleep 0.9
+
+# ------------------------------------------------------------ 8) 客户端设的光标
+mark "8. 客户端自己设的光标（wl_pointer.set_cursor）也能放大并还原"
+python3 tools/cursorwin.py > "$RUNDIR/cursorwin.log" 2>&1 &
+CURWIN_PID=$!
+for _ in $(seq 1 40); do
+	grep -aq "place cursorwin" "$LOG" && break
+	sleep 0.25
+done
+PLACE=$(grep -a "place cursorwin" "$LOG" | tail -1)
+if [ -z "$PLACE" ]; then
+	fail "cursorwin 没起来"
+else
+	pass "客户端窗口起来了：${PLACE##*place }"
+	WX=$(echo "$PLACE" | sed 's/.*-> \([0-9-]*\),[0-9-]* .*/\1/')
+	WY=$(echo "$PLACE" | sed 's/.*-> [0-9-]*,\([0-9-]*\) .*/\1/')
+	msg move-cursor $((WX + 120)) $((WY + 120)) >/dev/null
+	sleep 0.4
+	IMG_C=$(cfield image)
+	[ "$IMG_C" != "$IMG0" ] \
+		&& pass "指针进了客户端窗口，光标图换成它设的（$IMG0 → $IMG_C）" \
+		|| fail "客户端设的光标没生效（还是 $IMG_C）"
+	msg cursor-shake >/dev/null
+	sleep 0.2
+	BIG_C=$(scale_size "${IMG_C%x*}" "${IMG_C#*x}" 2)
+	[ "$(cfield image)" = "$BIG_C" ] \
+		&& pass "客户端的光标照样放大 2 倍（$IMG_C → $BIG_C）" \
+		|| fail "客户端光标没放大（$(cfield image)，期望 $BIG_C）"
+	sleep 0.9
+	[ "$(cfield image)" = "$IMG_C" ] \
+		&& pass "还原成客户端那张（$IMG_C），没变成主题箭头" \
+		|| fail "还原后是 $(cfield image)，期望客户端那张 $IMG_C"
+fi
+kill "$CURWIN_PID" 2>/dev/null
+
+# ------------------------------------------------------------ 9) 关掉
+mark "9. cursor_shake = false"
+stop_vidow
+start_vidow "cursor_shake = false"
+msg move-cursor 300 100 >/dev/null
+shake
+sleep 0.3
+[ "$(cfield magnified)" = "false" ] && pass "关掉之后晃不放大" \
+	|| fail "关掉了还是放大了"
+msg cursor-shake | grep -aq 'cursor_shake' \
+	&& pass "cursor-shake 被拒，理由里点了 cursor_shake" \
+	|| fail "cursor-shake 的拒绝理由没说清楚"
+grep -aq "config: cursor_shake=off" "$LOG" && pass "启动日志里写着 off" \
+	|| fail "启动日志没写 cursor_shake=off"
+
+# ------------------------------------------------------------ 10) 倍数
+mark "10. cursor_shake_scale"
+stop_vidow
+start_vidow "cursor_shake_scale = 1.5"
+msg move-cursor 300 100 >/dev/null
+IMG=$(cfield image)
+SHAKE15=$(scale_size "${IMG%x*}" "${IMG#*x}" 1.5)
+shake
+sleep 0.2
+[ "$(cfield image)" = "$SHAKE15" ] && pass "1.5 倍：$IMG → $SHAKE15" \
+	|| fail "1.5 倍的尺寸是 $(cfield image)，期望 $SHAKE15"
+sleep 0.9
+
+stop_vidow
+start_vidow "cursor_shake_scale = 20"
+msg move-cursor 300 100 >/dev/null
+IMG=$(cfield image)
+HWMAX=$(cfield hw_max)
+CAPPED=$(python3 -c 'import sys
+w,h = (int(v) for v in sys.argv[1].split("x"))
+mw,mh = (int(v) for v in sys.argv[2].split("x"))
+f = min(20.0, mw/w, mh/h)
+print("%dx%d" % (round(w*f), round(h*f)))' "$IMG" "$HWMAX")
+shake
+sleep 0.2
+[ "$(cfield image)" = "$CAPPED" ] && pass "20 倍被硬件上限 $HWMAX 夹成 $CAPPED（$IMG 起）" \
+	|| fail "20 倍的尺寸是 $(cfield image)，期望 $CAPPED"
+grep -aq "摇晃: 硬件光标最大 $HWMAX.*夹到" "$LOG" \
+	&& pass "日志说明了被上限夹住" || fail "日志没说明夹了多少"
+# 夹过的图还得在硬件平面上（不然就进截图了，正是要避免的那件事）
+case "$(cfield hardware)" in
+true) pass "夹完仍然在硬件平面上" ;;
+*)    fail "夹完掉成软光标了" ;;
+esac
+
+# ------------------------------------------------------------ 11) 日志干净
+mark "11. 日志干净"
+grep -aqE 'assert|abort|Assertion' "$LOG" && fail "日志里有 assert/abort" \
+	|| pass "日志里没有 assert / abort"
+
+echo
+if [ "$FAILED" -eq 0 ]; then
+	echo "全部通过"
+else
+	echo "有失败项"
+fi
+exit "$FAILED"

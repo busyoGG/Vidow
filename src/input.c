@@ -349,6 +349,10 @@ static void pointer_grab_update(struct vidow_server *server) {
 }
 
 void vidow_pointer_motion(struct vidow_server *server, uint32_t time_msec) {
+	/* 摇晃找光标：先看这一下位移算不算「在晃」（拖拽中也算 —— 拖到一半找不到
+	 * 指针了一样要放大）。 */
+	vidow_cursor_fx_motion(server);
+
 	/* 拖着东西的时候指针事件全归 grab：平铺拖拽走 drag.c，浮动窗口走 float.c。
 	 * 测试注入（pointer-motion 动作）也走这里，和真实鼠标同一条路。 */
 	if (server->grab_mode != VIDOW_GRAB_NONE) {
@@ -385,7 +389,8 @@ void vidow_pointer_motion(struct vidow_server *server, uint32_t time_msec) {
 		wlr_seat_pointer_notify_enter(server->seat, surface, sx, sy);
 		wlr_seat_pointer_notify_motion(server->seat, time_msec, sx, sy);
 	} else {
-		wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "left_ptr");
+		/* 主题默认箭头；摇晃放大期间只记状态、不碰真图（见 cursorfx.c）。 */
+		vidow_cursor_fx_default_cursor(server);
 		wlr_seat_pointer_notify_clear_focus(server->seat);
 	}
 }
@@ -563,6 +568,9 @@ static void server_request_cursor(struct wl_listener *listener, void *data) {
 	if (focused != event->seat_client) {
 		return;
 	}
+	/* 先告诉摇晃放大「光标图要换了」（放大中就直接收摊），再设上去。 */
+	vidow_cursor_fx_set_surface(server, event->surface, event->hotspot_x,
+		event->hotspot_y);
 	wlr_cursor_set_surface(server->cursor, event->surface, event->hotspot_x,
 		event->hotspot_y);
 }
@@ -647,6 +655,10 @@ bool vidow_input_init(struct vidow_server *server) {
 	/* 注入键盘（IPC 的 send-key / type-text）。建不起来只是那几个命令不能用，
 	 * 不该拖垮整个输入初始化。 */
 	vidow_input_inject_init(server);
+
+	/* 摇晃找光标（cursor_shake）：指针的移动事件都经过 vidow_pointer_motion，
+	 * 状态和定时器在这里建起来。 */
+	vidow_cursor_fx_init(server);
 
 	return true;
 }

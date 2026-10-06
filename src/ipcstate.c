@@ -748,6 +748,8 @@ void vidow_ipc_json_input(struct jbuf *b, struct vidow_server *server) {
 	jb_obj(b);
 	jb_kv_double(b, "x", server->cursor->x);
 	jb_kv_double(b, "y", server->cursor->y);
+	/* 摇晃放大的状态：magnified / scale / image / hardware / hw_max */
+	vidow_cursor_fx_json(b, server);
 	jb_obj_end(b);
 	jb_key(b, "keyboards");
 	jb_arr(b);

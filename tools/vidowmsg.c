@@ -68,7 +68,7 @@ static void usage(void) {
 "      output-transform 输出 normal|90|… / output-mode 输出 宽 高 [刷新率] /\n"
 "      output-position 输出 x y / output-focus 输出\n"
 "合成器：action \"工作区动作\" / set-config 键 值 / get-config 键 / reload-config /\n"
-"      toggle-overview / move-cursor x y [--relative] / quit\n"
+"      toggle-overview / move-cursor x y [--relative] / cursor-shake / quit\n"
 "注入：move-cursor x y / pointer-button click|press|release [键] [连点数] /\n"
 "      pointer-scroll dx dy / send-key [tap|press|release] 组合键 / type-text 文字 /\n"
 "      （合成鼠标键盘事件，等于操控整个桌面；按键只给客户端，不触发 vidow 的\n"
@@ -173,6 +173,7 @@ static const char *positional_key(const char *cmd, int index) {
 		{ "output-focus", { "output", NULL } },
 		{ "pick-window", { "x", "y", NULL } },
 		{ "move-cursor", { "x", "y", NULL } },
+		{ "cursor-shake", { NULL } },
 		{ "pointer-button", { "state", "button", "count", NULL } },
 		{ "pointer-scroll", { "dx", "dy", NULL } },
 		{ "send-key", { "state", "keys", NULL } },

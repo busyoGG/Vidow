@@ -71,6 +71,7 @@ sources = files(
   'src/outputconf.c',
   'src/view.c',
   'src/input.c',
+  'src/cursorfx.c',
   'src/layer.c',
   'src/float.c',
   'src/drag.c',

@@ -59,6 +59,7 @@ static const char *section_titles[] = {
 	"XWayland",
 	"窗口激活",
 	"xdg-desktop-portal",
+	"指针",
 };
 #define N_SECTIONS (sizeof(section_titles) / sizeof(section_titles[0]))
 
@@ -209,6 +210,13 @@ static const struct entry entries[] = {
 		"把 XDG_CURRENT_DESKTOP 设成下面这个名字" },
 	{ "portal_desktop",  K_STRING, OFF(portal_desktop),  SZ(portal_desktop), 11,
 		"XDG_CURRENT_DESKTOP 的值（xdg-desktop-portal 按它选 <名字>-portals.conf）" },
+
+	{ "cursor_shake",    K_BOOL,   OFF(cursor_shake),    SZ(cursor_shake), 12,
+		"摇晃指针就放大一下（快速来回晃几下，指针变大一会儿，好找）" },
+	{ "cursor_shake_scale", K_DOUBLE, OFF(cursor_shake_scale),
+		SZ(cursor_shake_scale), 12,
+		"放大倍数：2 = 两倍大。放大走硬件光标那条路（放得下就不进截图），"
+		"放不下会被降级成软光标，所以实际倍数会先按硬件光标尺寸上限夹住" },
 };
 
 /* ------------------------------------------------------------ 配置组
@@ -548,6 +556,11 @@ static void defaults(struct vidow_config *cfg) {
 	 * pointer-scroll / send-key / type-text），自动化靠它动手。socket 是 0600，
 	 * 只有本用户能连，而且每次注入都打一条 info 日志留痕；要收紧就写 false。 */
 	cfg->input_injection = true;
+	/* 摇晃找光标默认开：快速来回晃几下指针就放大一会儿，好找。放大是换一张更大
+	 * 的光标图，走硬件光标那条路（不进渲染通道 = 不进截图），所以倍数会先按硬件
+	 * 上限夹一下（见 cursorfx.c）。 */
+	cfg->cursor_shake = true;
+	cfg->cursor_shake_scale = 2.0;
 	/* 剪贴板默认接管：X11(Xwayland) 和 Wayland 两边共用一份内容，而且不看焦点
 	 * （wlroots 自带那套只在有 X11 窗口聚焦时才同步）。每个类型读进内存的上限
 	 * 32MiB —— 「源程序退出后还能粘」靠的就是这份副本。 */
@@ -759,6 +772,8 @@ void vidow_config_log(const struct vidow_config *cfg) {
 		cfg->ipc_socket[0] != '\0' ? cfg->ipc_socket : "(自动)");
 	wlr_log(WLR_INFO, "config: input_injection=%s（IPC 能不能合成鼠标 / 键盘）",
 		cfg->input_injection ? "on" : "off");
+	wlr_log(WLR_INFO, "config: cursor_shake=%s scale=%.2f（摇晃指针就放大，好找）",
+		cfg->cursor_shake ? "on" : "off", cfg->cursor_shake_scale);
 	wlr_log(WLR_INFO, "config: clipboard=%s primary=%s max=%d 字节",
 		cfg->clipboard ? "on" : "off",
 		cfg->clipboard_primary ? "on" : "off", cfg->clipboard_max_bytes);

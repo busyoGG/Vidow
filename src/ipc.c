@@ -1427,6 +1427,24 @@ static bool cmd_quit(struct vidow_server *server, struct jval *req,
 	return true;
 }
 
+/* ------------------------------------------------- 摇晃找光标（见 cursorfx.c）
+ *
+ * 摇晃是「找指针」用的：快速来回晃几下，指针就地放大一会儿。平时不用调它 ——
+ * 这条命令是给脚本 / 远程用的（也是测试的确定性入口）。 */
+static bool cmd_cursor_shake(struct vidow_server *server, struct jval *req,
+		struct jbuf *out, char *err, size_t errlen) {
+	(void)req;
+	const char *why = NULL;
+	if (!vidow_cursor_fx_shake(server, &why)) {
+		snprintf(err, errlen, "%s", why != NULL ? why : "放大不了");
+		return false;
+	}
+	jb_obj(out);
+	vidow_cursor_fx_json(out, server);
+	jb_obj_end(out);
+	return true;
+}
+
 /* ------------------------------------------------------- 输入注入（见 input.c）
  *
  * 这几条命令能合成鼠标 / 键盘事件 —— 谁连上 socket 谁就能操控整个桌面。默认
@@ -1934,6 +1952,8 @@ static bool ipc_run(struct vidow_server *server, struct ipc_client *c,
 		jb_obj(out);
 		jb_kv_double(out, "x", server->cursor->x);
 		jb_kv_double(out, "y", server->cursor->y);
+		/* 摇晃放大的状态：magnified / scale / image / hardware / hw_max */
+		vidow_cursor_fx_json(out, server);
 		jb_obj_end(out);
 		return true;
 	}
@@ -2136,6 +2156,9 @@ static bool ipc_run(struct vidow_server *server, struct ipc_client *c,
 	}
 	if (strcmp(cmd, "move_cursor") == 0) {
 		return cmd_move_cursor(server, req, out, err, errlen);
+	}
+	if (strcmp(cmd, "cursor_shake") == 0) {
+		return cmd_cursor_shake(server, req, out, err, errlen);
 	}
 	/* 输入注入（合成鼠标 / 键盘事件，见上面那一节） */
 	if (strcmp(cmd, "pointer_button") == 0) {

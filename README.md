@@ -611,6 +611,7 @@ python3 test-float.py        # 三个真实 GTK 窗口，验证浮动模式自�
 ./test-focus.sh                      # 焦点规则 + 激活请求（全 headless，61 项断言）
 ./test-ipc.sh                        # IPC：状态输出 / 命令 / 事件 / 多屏（全 headless，162 项断言）
 ./test-input-inject.sh               # 输入注入：鼠标 / 键盘合成事件到客户端（全 headless，54 项断言）
+./test-cursor-shake.sh              # 摇晃找光标：指针放大、不进截图（全 headless，37 项断言）
 ./test-config.sh                     # 配置系统：一个 Lua 文件 + 改了就自动重载（全 headless，15 项断言）
 ./test-defaultconfig.sh              # 完整默认配置（--default-config / --write-config）+ 配置族的表写法（全 headless，29 项断言）
 ./test-gap.sh                        # 间距：一个数管全部 + 单边/内间距覆盖（全 headless，33 项断言）
@@ -1355,6 +1356,56 @@ headless 会话里这个键盘还有个额外好处：座位因此报出 KEYBOAR
 顺带修掉一个真 bug：`move-cursor` 以前只挪光标位置、**不给客户端发 motion**
 （`wlr_cursor_warp` 就是这样，只改坐标不发事件），现在它和真鼠标一样会更新指针焦点 ——
 这也是「脚本点了没反应」类问题的根源之一。
+
+## 摇晃找光标：晃两下指针就变大
+
+鼠标找不着的时候，**快速来回晃几下**，指针就地放大一会儿（默认 2 倍、停 700ms）——
+不用去点「显示指针位置」。也可以随时 `vidowmsg cursor-shake` 手动放大一次（脚本 / 远程用）。
+
+### 放大的是「光标图」，不是另画一层
+
+放大不是往场景里塞一个节点，而是**换一张更大的光标图**：把当前光标图（客户端设的
+`wl_pointer.set_cursor` surface，或者主题里的箭头）放大重画进一张新 buffer，再交给
+`wlr_cursor_set_buffer()`。于是它和普通光标走**同一条路**：
+
+- **待在硬件光标平面上** → 不进合成器的渲染通道 → **截图 / 录屏里没有它**。这条是关键：
+  截图里冒出一个两倍大的光标，比没这个功能还糟。
+- 截图应用**显式要光标**时才给（screencopy 的 `overlay_cursor`，`grim -c` 就是它）——
+  那时 wlroots 会临时把光标锁成软光标画进画面，正好是「你要就给你」。
+- 放大倍数先按**硬件光标尺寸上限**夹一下（DRM 会报，比如 256x256）：宁可小一点，也要待在
+  硬件平面上 —— 超了上限 wlroots 会降级成软光标，那就进截图了。日志里写清楚：
+  `摇晃: 光标放大 2.00x（20x32 → 40x64，硬件光标，不进截图）`；被夹住时另有一条说明。
+
+嵌套 Wayland / headless 后端没有真正的光标平面（光标是交给上层合成器画的），vidow 按
+256x256 估个上限 —— 那种情况下「硬件光标」指的是上层合成器的光标，同样不进 vidow 自己的截图。
+
+### 怎么算「在晃」
+
+700ms 窗口内至少 **4 段、3 次换向**，每段主方向轴上至少走 12 个逻辑像素。慢慢往一个方向甩
+不算；拖拽时照样认（拖到一半找不到指针了一样要找）。判定挂在 `vidow_pointer_motion` 上，
+所以真实鼠标、触摸板、`vidowmsg move-cursor` 注入的移动都走同一条路。
+
+### 配置
+
+```lua
+cursor_shake = true        -- 摇晃指针就放大一下（默认开）
+cursor_shake_scale = 2     -- 放大倍数（会被硬件光标尺寸上限夹住）
+```
+
+### 状态与命令
+
+`vidowmsg cursor` 多报几个字段：`magnified`（现在是不是放大中）、`scale`（当前实际倍数）、
+`image`（当前光标图的物理尺寸，比如 `20x32`）、`hardware`（在不在硬件光标平面上）、
+`hw_max`（这块屏的硬件光标上限）。`vidowmsg cursor-shake` 手动放大一次。
+
+### 测试
+
+`./test-cursor-shake.sh`（全 headless，37 项断言）拿 **grim** 当裁判 —— 「进没进截图」由像素
+说了算：普通截图里**一个光标像素都没有**（放大中也一样）；`grim -c` 抓到的外接矩形正好是
+`10x16 → 20x32`，而且箭头尖还钉在原来那个点上（热点按倍数跟着缩放）。再加上摇晃触发 /
+慢速不误触 / 到点还原 / 手动触发续期 / 客户端自己设的光标（`tools/cursorwin.py` 的
+crosshair）放大后还原的还是**它自己那张**、`cursor_shake = false` 全拒 /
+`cursor_shake_scale = 20` 被硬件上限夹住后仍在硬件平面上。
 
 ## 剪贴板：X11 ↔ Wayland 同步（自建桥）
 
@@ -2291,6 +2342,11 @@ test-input-inject.sh 输入注入：`move-cursor` / `pointer-button` / `pointer-
                   `ctrl+shift+t` 的顺序、`Hi!` 里每个字符的 Shift、注入 super+t 不触发
                   绑定但客户端照样收到、按住 super 滚轮不转发给客户端、
                   `input_injection = false` 之后全部拒绝
+test-cursor-shake.sh 摇晃找光标：来回晃触发 / 慢速不误触 / 到点还原 / 手动触发续期，
+                  光标图真的放大 2 倍（`image` 10x16 → 20x32）；**截图**由像素作证 ——
+                  grim 不带 -c 时画面里没有光标（放大中也没有），`grim -c` 抓到的外接矩形
+                  是 2 倍且箭头尖还在原点；`cursor_shake = false` 全拒、`cursor_shake_scale`
+                  被硬件光标上限夹住后仍在硬件平面上
 test-xwayland-hidpi.sh  XWayland 的 HiDPI 告知：`_XWAYLAND_GLOBAL_OUTPUT_SCALE`
                   让 X 屏幕 / RandR 变成设备像素（补丁生效时），`Xft.dpi = 96×S`，
                   以及没打补丁时量到屏幕没跟着缩放、自动退回 1 倍（钩子模拟），

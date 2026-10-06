@@ -506,7 +506,7 @@ static int format_score(uint32_t format) {
 
 /* The output is composited with alpha, so an alpha-capable format is strongly
  * preferred: on XRGB the rounded corners would come out black. */
-static struct wlr_buffer *alloc_target(struct vidow_server *server, int w,
+struct wlr_buffer *vidow_alloc_target(struct vidow_server *server, int w,
 		int h) {
 	const uint32_t caps[] = { WLR_BUFFER_CAP_DMABUF, WLR_BUFFER_CAP_SHM };
 	for (int want = 3; want >= 0; want--) {
@@ -578,7 +578,7 @@ static bool ensure_targets(struct vidow_server *server,
 	}
 	drop_targets(fx);
 	for (int i = 0; i < 2; i++) {
-		fx->buf[i] = alloc_target(server, w, h);
+		fx->buf[i] = vidow_alloc_target(server, w, h);
 		if (fx->buf[i] == NULL) {
 			wlr_log(WLR_ERROR, "fx: cannot allocate a %dx%d render target", w, h);
 			drop_targets(fx);
@@ -828,7 +828,7 @@ static bool blur_set_alloc(struct vidow_server *server,
 		struct vidow_blur_set *set, int w, int h, int levels) {
 	blur_set_drop(set);
 	for (int i = 0; i < levels; i++) {
-		set->down[i] = alloc_target(server, w >> (i + 1), h >> (i + 1));
+		set->down[i] = vidow_alloc_target(server, w >> (i + 1), h >> (i + 1));
 		if (set->down[i] == NULL) {
 			blur_set_drop(set);
 			return false;
@@ -838,7 +838,7 @@ static bool blur_set_alloc(struct vidow_server *server,
 	 * 放大一圈」的结果，up[0]（半分辨率）就是最终产物，也是给装饰着色器采样的
 	 * 那张。down[0..levels-2] 只是链条中途的暂存。 */
 	for (int i = 0; i < levels - 1; i++) {
-		set->up[i] = alloc_target(server, w >> (i + 1), h >> (i + 1));
+		set->up[i] = vidow_alloc_target(server, w >> (i + 1), h >> (i + 1));
 		if (set->up[i] == NULL) {
 			blur_set_drop(set);
 			return false;
@@ -1310,7 +1310,7 @@ void vidow_blur_update(struct vidow_output *output) {
 			output->backdrop_h != h) {
 		blur_drop(output);
 		shared_blur_drop(output); /* the pyramid is sized for the old output */
-		output->backdrop = alloc_target(server, w, h);
+		output->backdrop = vidow_alloc_target(server, w, h);
 		if (output->backdrop == NULL) {
 			return;
 		}
@@ -1675,7 +1675,7 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 	if (fx->shader != NULL) {
 		for (int i = 0; i < 2; i++) {
 			if (fx->anim_buf[i] == NULL) {
-				fx->anim_buf[i] = alloc_target(server, fx->w, fx->h);
+				fx->anim_buf[i] = vidow_alloc_target(server, fx->w, fx->h);
 			}
 		}
 		anim = pick_free(fx->anim_buf);
@@ -1880,7 +1880,7 @@ static bool layer_region_build(struct vidow_server *server,
 			ls->bd_w = 0;
 			ls->bd_h = 0;
 		}
-		ls->bd = alloc_target(server, rw, rh);
+		ls->bd = vidow_alloc_target(server, rw, rh);
 		if (ls->bd == NULL) {
 			return false;
 		}
@@ -2028,7 +2028,7 @@ static bool layer_blur_frame(struct vidow_server *server,
 			fabs(fx->scale - scale) > 1e-3) {
 		drop_targets(fx);
 		for (int i = 0; i < 2; i++) {
-			fx->buf[i] = alloc_target(server, px_w, px_h);
+			fx->buf[i] = vidow_alloc_target(server, px_w, px_h);
 			if (fx->buf[i] == NULL) {
 				drop_targets(fx);
 				return false;
