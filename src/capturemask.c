@@ -87,6 +87,20 @@ void vidow_capturemask_init(struct vidow_server *server) {
 		&server->new_capture_session);
 }
 
+void vidow_capturemask_finish(struct vidow_server *server) {
+	if (server->new_capture_session.notify == NULL) {
+		return;
+	}
+	/* 这个钩子必须自己摘掉：wlroots 在 display 销毁时有一条
+	 * `assert(wl_list_empty(&manager->events.new_session.listener_list))`
+	 * （types/wlr_ext_image_copy_capture_v1.c），而那个断言就发生在
+	 * wl_display_destroy() 里面、而且是**先于**我们挂上去的任何 display
+	 * 监听器跑的 —— 光挂个 display_destroy 回调来不及。所以退出前显式摘。
+	 * （不摘的话：每次 quit 都在收尾最后一步 SIGABRT，核心转储 + 退出码 134。） */
+	wl_list_remove(&server->new_capture_session.link);
+	server->new_capture_session.notify = NULL;
+}
+
 /* --------------------------------------------------------------- 藏 / 放 */
 
 /* 把一个 buffer 的透明度压成 0（on = true）/ 还原（false）。saved 是压之前的值。 */
@@ -151,6 +165,13 @@ static void mask_apply(struct vidow_server *server, bool off) {
 		opacity_mask(view->scene_surface != NULL ?
 			view->scene_surface->buffer : NULL, &view->mask_saved_surf,
 			off);
+		/* 拖着果冻的时候，画在屏幕上的既不是表面也不是装饰节点，而是果冻那个
+		 * 节点（内容一样，只是弯了）：它也得压，不然「截图里不出现」的窗口
+		 * 一拖就露出来了。 */
+		struct wlr_scene_buffer *jn = vidow_jelly_node(view);
+		if (jn != NULL) {
+			wlr_scene_buffer_set_opacity(jn, off ? 0.0f : 1.0f);
+		}
 		view->mask_opacity = off;
 	}
 	struct vidow_layer_surface *ls;

@@ -342,6 +342,7 @@ int main(int argc, char *argv[]) {
 	if (socket == NULL) {
 		wlr_log(WLR_ERROR, "failed to add wayland socket");
 		wlr_backend_destroy(server.backend);
+		vidow_capturemask_finish(&server);
 		wl_display_destroy(server.display);
 		return 1;
 	}
@@ -361,6 +362,7 @@ int main(int argc, char *argv[]) {
 
 	if (!wlr_backend_start(server.backend)) {
 		wlr_log(WLR_ERROR, "failed to start backend");
+		vidow_capturemask_finish(&server);
 		wl_display_destroy(server.display);
 		return 1;
 	}
@@ -379,6 +381,7 @@ int main(int argc, char *argv[]) {
 	wl_display_run(server.display);
 
 	vidow_configwatch_finish(&server);
+	vidow_capturemask_finish(&server);
 	vidow_ipc_finish(&server);
 	vidow_clipboard_finish(&server);
 	server_finish(&server);

@@ -1541,6 +1541,8 @@ bool vidow_capture_source_is_ours(struct wlr_ext_image_capture_source_v1 *source
 
 /* 挂上 ext-image-copy-capture 的 new_session 监听（main.c 建完协议之后调一次）。 */
 void vidow_capturemask_init(struct vidow_server *server);
+/* 退出前必须调（wl_display_destroy 之前）：把会话钩子摘掉，见 capturemask.c。 */
+void vidow_capturemask_finish(struct vidow_server *server);
 
 /* 压上 / 放开遮挡（引用计数：抓帧渲染期间压着，同时有别的东西在抓也不会被提前放开）。 */
 void vidow_capturemask_hold(struct vidow_server *server);
