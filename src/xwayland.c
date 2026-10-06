@@ -448,16 +448,14 @@ static void xwayland_ready(struct wl_listener *listener, void *data) {
 		wlr_output_layout_get_box(server->output_layout, NULL, &layout);
 		int want_w = (int)lround(layout.width * server->xwayland_scale);
 		int want_h = (int)lround(layout.height * server->xwayland_scale);
+		/* 这里只是**刚写完属性时的快照**，不下结论：Xwayland 是在自己的事件
+		 * 循环里处理这个属性的，这一读经常读在它前面（读到的还是逻辑尺寸）。
+		 * 「认不认这个属性」由 xwayland_probe_cb 反复量过之后说 —— 那一行才算数。 */
 		wlr_log(WLR_INFO,
-			"xwayland: X 屏幕 %ux%u（布局 %dx%d 逻辑 ×%.2f = %dx%d 设备像素）%s",
+			"xwayland: X 屏幕 %ux%u（刚写完属性时的快照；布局 %dx%d 逻辑 ×%.2f "
+			"= %dx%d 设备像素。认不认这个属性看下面「量一次」那行）",
 			xw, xh, layout.width, layout.height, server->xwayland_scale,
-			want_w, want_h,
-			(layout.width > 0 && xw == (unsigned)want_w &&
-				xh == (unsigned)want_h) ? "" :
-			" —— 对不上：X 那边没按设备像素报屏幕（没打 HiDPI 补丁的 Xwayland "
-			"就是这样）。vidow 会在 0.1 秒内量一次，量到它确实没跟着缩放就"
-			"自动退回 1 倍（几何对、2 倍屏上糊）；补丁版的话这一行会显示"
-			"设备像素的尺寸");
+			want_w, want_h);
 		if (layout.width < 1 || layout.height < 1) {
 			/* X 屏幕的大小 = 输出的并集：一块屏都没有时它就是 0x0，X11 客户端
 			 * 会看不见、点不动（用户看到的就是「XWayland 点不动」，见

@@ -17,6 +17,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+#include <wayland-server-protocol.h> /* enum wl_output_transform */
 #include <wayland-util.h>
 
 struct vidow_server;
@@ -30,6 +31,30 @@ struct vidow_output_conf {
 
 	bool has_pos;        /* 写了 x 或 y 才管它的位置 */
 	int x, y;            /* 布局位置，逻辑坐标 */
+
+	/* 模式：分辨率 + 刷新率（mode = "3840x2160@144"）。hz = 0 = 只要分辨率
+	 * 对上，刷新率不挑（拿那块屏的首选刷新率）。 */
+	bool has_mode;
+	int mode_w, mode_h;
+	double mode_hz;
+
+	/* 可变刷新率（adaptive sync / VRR）。后端或这块屏不支持时 vidow 只报一句，
+	 * 不影响别的（见 output.c 的 output_apply_conf_extra）。 */
+	bool has_vrr;
+	bool vrr;
+
+	/* 渲染位深：8 或 10。10 位走 DRM_FORMAT_XRGB2101010 的输出缓冲，需要
+	 * 显卡 + 显示器 + 渲染器都支持；不支持时保持 8 位并说清楚。 */
+	bool has_depth;
+	int depth;
+
+	/* 方向 / 翻转（normal / 90 / 180 / 270 / flipped / flipped-90 …） */
+	bool has_transform;
+	enum wl_output_transform transform;
+
+	/* 这块屏开不开。false = 关掉它（DRM 那边就是关 CRTC），上面的窗口留着。 */
+	bool has_enabled;
+	bool enabled;
 };
 
 /* 配置里的一条（Lua 那边解析完表之后传过来；name 必须有，别的可以为空）。 */
@@ -39,6 +64,17 @@ struct vidow_output_spec {
 	const char *scale;
 	bool has_pos;
 	int x, y;
+	bool has_mode;
+	int mode_w, mode_h;
+	double mode_hz;
+	bool has_vrr;
+	bool vrr;
+	bool has_depth;
+	int depth;
+	bool has_transform;
+	enum wl_output_transform transform;
+	bool has_enabled;
+	bool enabled;
 };
 
 bool vidow_output_conf_init(struct vidow_server *server);

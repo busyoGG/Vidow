@@ -425,13 +425,12 @@ static int l_rules(lua_State *L) {
 	return 1;
 }
 
-/* vidow.output{ name = "DP-3", scale = 2, x = 0, y = 0 }
+/* vidow.output{ name = "DP-3", scale = 2, x = 0, y = 0, mode = "3840x2160@144" }
  *
- * 一块屏一组：缩放（scale，同全局 scale 的写法：auto / off / 一个数）和摆在
- * 布局的哪个位置（x / y，逻辑坐标）写在一起。没写的字段 = 不管这块屏的这一项
- * （scale 不写就用全局 scale，位置不写就按输出到达顺序自动排）。
+ * 一块屏一组：这块屏的缩放、摆在布局的哪个位置、上什么模式、开不开 VRR、
+ * 几位色、什么方向、开不开 —— 全是它的。没写的字段 = 不管这一项。
  *
- * 见 outputconf.c：为什么不是两个平铺键。 */
+ * 见 outputconf.c：为什么不是一堆平铺键。 */
 static int l_output(lua_State *L) {
 	struct vidow_script *s = script_of(L);
 	if (!lua_istable(L, 1)) {
@@ -457,6 +456,8 @@ static int l_output(lua_State *L) {
 	}
 	lua_pop(L, 1);
 
+	const char *who = spec.name != NULL ? spec.name : "?";
+
 	/* 位置：x / y 写哪个算哪个（只写 x = 0 就是摆在最左边那一行的 0 位）。 */
 	const struct { const char *key; int *slot; } coords[] = {
 		{ "x", &spec.x }, { "y", &spec.y },
@@ -467,8 +468,7 @@ static int l_output(lua_State *L) {
 			if (!lua_isnumber(L, -1)) {
 				lua_pop(L, 1);
 				return luaL_error(L, "vidow.output{ name = \"%s\" }: %s 得是"
-					"个数（逻辑坐标，整数）",
-					spec.name != NULL ? spec.name : "?", coords[i].key);
+					"个数（逻辑坐标，整数）", who, coords[i].key);
 			}
 			*coords[i].slot = (int)lua_tointeger(L, -1);
 			spec.has_pos = true;
@@ -476,17 +476,90 @@ static int l_output(lua_State *L) {
 		lua_pop(L, 1);
 	}
 
+	/* 模式："3840x2160@144" / "3840x2160"（刷新率不挑） */
+	lua_getfield(L, 1, "mode");
+	if (!lua_isnil(L, -1)) {
+		const char *text = lua_isstring(L, -1) ? lua_tostring(L, -1) : NULL;
+		if (text == NULL || !vidow_output_parse_mode(text, &spec.mode_w,
+				&spec.mode_h, &spec.mode_hz)) {
+			lua_pop(L, 1);
+			return luaL_error(L, "vidow.output{ name = \"%s\" }: mode 认不出来"
+				"（写 \"3840x2160@144\"，@刷新率可省）", who);
+		}
+		spec.has_mode = true;
+	}
+	lua_pop(L, 1);
+
+	/* 开关屏 */
+	lua_getfield(L, 1, "enabled");
+	if (!lua_isnil(L, -1)) {
+		spec.has_enabled = true;
+		spec.enabled = lua_toboolean(L, -1) != 0;
+	}
+	lua_pop(L, 1);
+
+	/* VRR（adaptive sync / 可变刷新率） */
+	lua_getfield(L, 1, "vrr");
+	if (!lua_isnil(L, -1)) {
+		spec.has_vrr = true;
+		spec.vrr = lua_toboolean(L, -1) != 0;
+	}
+	lua_pop(L, 1);
+
+	/* 位深：8 / 10（10 位要显卡 + 显示器 + 渲染器都支持） */
+	lua_getfield(L, 1, "depth");
+	if (!lua_isnil(L, -1)) {
+		if (!lua_isnumber(L, -1) || (lua_tointeger(L, -1) != 8 &&
+				lua_tointeger(L, -1) != 10)) {
+			const char *shown = luaL_tolstring(L, -1, NULL); /* 数字也能打出来 */
+			char text[32];
+			snprintf(text, sizeof(text), "%s", shown != NULL ? shown : "?");
+			lua_pop(L, 2); /* tolstring 压了一个值进去 */
+			return luaL_error(L, "vidow.output{ name = \"%s\" }: depth 只能是 "
+				"8 或 10（现在写的是 %s）", who, text);
+		}
+		spec.has_depth = true;
+		spec.depth = (int)lua_tointeger(L, -1);
+	}
+	lua_pop(L, 1);
+
+	/* 方向 / 翻转 */
+	lua_getfield(L, 1, "transform");
+	if (!lua_isnil(L, -1)) {
+		const char *text = lua_isstring(L, -1) ? lua_tostring(L, -1) : NULL;
+		if (text == NULL || !vidow_output_parse_transform(text,
+				&spec.transform)) {
+			lua_pop(L, 1);
+			return luaL_error(L, "vidow.output{ name = \"%s\" }: transform 认不出来"
+				"（normal / 90 / 180 / 270 / flipped / flipped-90 / flipped-180 /"
+				" flipped-270）", who);
+		}
+		spec.has_transform = true;
+	}
+	lua_pop(L, 1);
+
 	/* 项名写错（scalee / pos）不该悄悄不生效：列一遍能写什么。 */
+	static const char *const fields[] = {
+		"name", "scale", "x", "y", "mode", "enabled", "vrr", "depth",
+		"transform",
+	};
 	lua_pushnil(L);
 	while (lua_next(L, 1) != 0) {
 		const char *field = lua_type(L, -2) == LUA_TSTRING ?
 			lua_tostring(L, -2) : NULL;
-		if (field == NULL || (strcmp(field, "name") != 0 &&
-				strcmp(field, "scale") != 0 && strcmp(field, "x") != 0 &&
-				strcmp(field, "y") != 0)) {
+		bool known = false;
+		for (size_t i = 0; field != NULL && i < sizeof(fields) / sizeof(fields[0]);
+				i++) {
+			if (strcmp(field, fields[i]) == 0) {
+				known = true;
+				break;
+			}
+		}
+		if (!known) {
 			lua_pop(L, 2);
 			return luaL_error(L, "vidow.output{…}: 没有 '%s' 这一项"
-				"（能写：name / scale / x / y）", field != NULL ? field : "?");
+				"（能写：name / scale / x / y / mode / enabled / vrr / depth / "
+				"transform）", field != NULL ? field : "?");
 		}
 		lua_pop(L, 1);
 	}
@@ -679,6 +752,7 @@ void vidow_config_sync(struct vidow_server *server) {
 	 * 布局位置同理。 */
 	vidow_output_apply_scale_all(server);
 	vidow_output_apply_positions_all(server);
+	vidow_output_apply_state_all(server);
 	vidow_xwayland_scale_apply(server);
 	/* clipboard / clipboard_primary 可能被改过：重新评估接不接管 */
 	vidow_clipboard_apply_config(server);

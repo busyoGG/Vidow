@@ -196,8 +196,10 @@ m = re.search(r"dimensions:\s+(\d+)x(\d+) pixels", start)
 xw, xh = (int(m.group(1)), int(m.group(2))) if m else (0, 0)
 check((xw, xh) == (1280, 720),
       "X 屏幕 %dx%d = 布局 640x360 × 2（补丁生效；没生效的话是 640x360）" % (xw, xh))
-check("xwayland: X 屏幕 1280x720" in log and "对不上" not in log.split("X 屏幕")[1][:200],
-      "日志里 X 屏幕 1280x720 且没报「对不上」")
+check("xwayland: 这台 Xwayland 认这个属性（X 屏幕 1280x720" in log,
+      "日志里说它认这个属性，而且量到的 X 屏幕是 1280x720")
+check("不认 _XWAYLAND_GLOBAL_OUTPUT_SCALE" not in log,
+      "日志里没有「不认这个属性」（没被误判成没补丁的 Xwayland）")
 
 # 3) 端到端：xev 收到的 root 坐标 = 布局坐标 × 2
 xev = read("xev.log")

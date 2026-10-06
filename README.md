@@ -663,11 +663,22 @@ xwayland_env = true                 -- 给 X11 客户端下发 GDK_SCALE / QT_SC
 
 | 字段 | 作用 |
 | --- | --- |
-| `name` | 哪块屏（连接器名，`vidowmsg outputs` 能看到） |
+| `name` | 哪块屏（连接器名，`vidowmsg outputs` 能看到）。必须写 |
 | `scale` | 这块屏的缩放：`auto` / `off` / 一个数，不写就用全局 `scale` |
 | `x` / `y` | 摆在布局的哪里，**逻辑**坐标；不写 = 按输出到达顺序自动排（那个顺序是后端说了算，所以「哪块在左边」要确定就得写） |
+| `mode` | 模式：`"3840x2160@144"` / `"3840x2160"`（刷新率不挑）/ `"3840x2160@59.94"`。列表里没有就按自定义模式试 |
+| `enabled` | 这块屏开不开（`false` = 关掉它，上面的窗口都留着，再打开照原样回来） |
+| `vrr` | 可变刷新率（adaptive sync）：`true` / `false`。后端或这块屏不支持时只报一句，别的设置照常生效 |
+| `depth` | 输出缓冲的位深：`8`（默认）/ `10`。10 位走 `XRGB2101010`，要显卡 + 显示器 + 渲染器都支持 |
+| `transform` | 方向 / 翻转：`"normal"` / `"90"` / `"180"` / `"270"` / `"flipped"` / `"flipped-90"` / `"flipped-180"` / `"flipped-270"` |
 
-名字写错了（`scalee = 2`）会当场报错并列出能写什么；同一块屏写两行也报错。
+名字写错了（`scalee = 2`）、值写错了（`mode = "800x600x2"` / `depth = 12` /
+`transform = "sideways"`）都会当场报错并列出能写什么；同一块屏写两行也报错。
+每一块屏那一组只写你要管的字段 —— 没写的那些 vidow 一概不动（`scale` 不写就用全局
+`scale`，位置不写就自动排，`vrr` / `depth` / `transform` / `mode` 不写就保持现状）。
+
+改完配置不用重启：`kill -HUP $(pgrep -x vidow)`，上面每一项都会对一遍账（只在
+真的不一样时才动那块屏）。
 
 `scale = auto` 按 EDID 的物理尺寸算 `ppi / 96`：4K 27 寸 ≈ 1.70、1440p 27 寸 ≈ 1.15、
 1080p 24 寸 ≈ 0.96（夹到 1.0）。量化到 0.05 再夹进 1.0～8.0 —— `ppi/96` 会算出
@@ -687,6 +698,46 @@ xwayland_env = true                 -- 给 X11 客户端下发 GDK_SCALE / QT_SC
 | `xwayland` | `true` | 起不起 XWayland（`0` = 完全不碰 X 那一摊） |
 | `xwayland_scale` | `auto` | `auto` = `ceil(最密那块屏的缩放)`；`off` = 一律 1:1；也可以写死一个数 |
 | `xwayland_env` | `true` | 给 X11 客户端下发 `GDK_SCALE` / `QT_SCALE_FACTOR` / `XCURSOR_SIZE`（用户自己显式设过的不抢）。**不管** `_XWAYLAND_GLOBAL_OUTPUT_SCALE` 和 `Xft.dpi` —— 那两个是 X 服务自己的事实，vidow 总是自己写（见下） |
+
+### 模式、刷新率、VRR、位深（每块屏那一组里的其余项）
+
+```lua
+vidow.output{ name = "DP-3", mode = "3840x2160@144", vrr = true, depth = 10 }
+vidow.output{ name = "DP-2", mode = "3840x2160@60", transform = "180" }
+vidow.output{ name = "HDMI-A-1", enabled = false }        -- 接着投影仪才开
+```
+
+- **模式 / 刷新率**：`mode = "WxH[@Hz]"`。vidow 先在那块屏报出来的模式表里找（`vidowmsg
+  outputs` 的 `modes` 就是这张表），找到就按它上；找不到才退回自定义模式（有些后端支持
+  自定义模式，有些会拒 —— 拒了日志里会说）。`@Hz` 可以省，省了就是「分辨率对上就行，
+  刷新率用那块屏的首选」。
+- **VRR**：`vrr = true` 开可变刷新率。**先问再试**：vidow 看 `adaptive_sync_supported`
+  （DRM 那边就是连接器的 `vrr_capable`），不支持就直接报一句「这块屏 / 这个后端不支持
+  VRR」，不会拿一次注定失败的 commit 去撞。headless 后端在 wlroots 里根本不接受这个
+  字段，所以 headless 上永远是那句「不支持」。
+- **位深**：`depth = 10` 把输出缓冲换成 `XRGB2101010`。10 位要显卡、显示器、渲染器
+  三样都到位；缺一样 vidow 就保持 8 位并在日志里说清楚。`vidowmsg outputs` 里
+  `depth` / `render_format` 报的是**现在真的在用**的那个。
+- **方向**：`transform` 和 `vidowmsg output_transform` 是同一套名字。
+- **开关**：`enabled = false` 关掉一块屏 —— 上面的窗口、工作区、焦点都留着（DRM 那边
+  就是关 CRTC），再打开照原样画回来。
+
+**HDR：wlroots 0.20 这条链上没有输出通路，所以 vidow 没做。** 具体卡在哪：wlroots 0.20
+确实有 `wlr_output_state_set_image_description()`（primaries / 传输函数 / mastering
+亮度）和 `wlr_color_manager_v1`，但
+
+1. 提交状态时会校验 `output->supported_primaries` / `supported_transfer_functions`，
+   而 0.20.2 里**没有任何后端会填这两个字段**（DRM 后端全文没有 colorspace /
+   `HDR_OUTPUT_METADATA` 相关的代码）—— 也就是说任何 image description 都会被
+   `Unsupported image description primaries` 拒掉；
+2. 就算绕过去，DRM 后端也不会把它写成内核的 HDR 元数据（`HDR_OUTPUT_METADATA` 属性），
+   显示器那边什么都不会发生；
+3. 而 vidow 自己的渲染管线（wlr_scene + GLES2）也没有「SDR 内容 → PQ/2020 输出」的
+   色调映射，硬把输出声明成 HDR 只会让 SDR 内容发灰。
+
+所以 `hdr = true` 这种键现在只会是个骗人的开关。真要做，前提是 wlroots 先把 DRM 那边的
+色彩管线（colorspace / HDR metadata / 3D LUT）接起来 —— 那之前 `depth = 10` 是这条链上
+唯一能真的生效的「画质」项。
 
 ### 一条链：从输出缩放到清晰的像素
 
@@ -1058,7 +1109,7 @@ vidow 自己的，比如 `vidow-wayland-1.sock`）；`ipc_socket` 可以写死�
 | `windows` | 每个窗口：`id`、`kind`（xdg / x11）、`title`、`app_id`、`pid`、`geometry`（布局坐标）、`float_geometry`、`surface`（表面尺寸 / 缓冲 / scale）、`column`（列 id / 宽比 / 偏移 / 序号）、`workspace`、`output`、`home`、`floating` + `float_mode`、`fullscreen`、`mapped` / `visible`、`rules`（三条规则的实际取值）、`size_hints`、`anim_*`、`force_render`、`capture_holders`、X11 还多一份 `x11` 子对象 |
 | `columns` | 每条列：`id`、`width_fraction`、算出来的 `width` / `offset`、序号、里面的窗口 |
 | `workspaces` | 每块工作区：名字、`special`、`active` / `visible` / `shown`、住哪块屏 / 归属哪块屏、滚动位置、列与窗口、离开时的焦点窗口（**特殊工作区也在列表里**，`special = true`；Lua 的 `vidow.workspace_list()` 不给它） |
-| `outputs` | 每块屏：连接器名 / 描述 / make / model、`enabled`、`scale`、`transform`、刷新率、物理尺寸、布局矩形、`usable_area`、`viewport_x`、活动 / 显示着的工作区、它上面的工作区 / 窗口 / layer、**所有可用模式**、模糊贴图状态 |
+| `outputs` | 每块屏：连接器名 / 描述 / make / model、`enabled`、`scale`、`transform`、刷新率、物理尺寸、布局矩形、`usable_area`、`viewport_x`、活动 / 显示着的工作区、它上面的工作区 / 窗口 / layer、**所有可用模式**、`adaptive_sync` / `vrr_supported`、`depth` / `render_format`、模糊贴图状态 |
 | `layers` | 每个 layer surface：`namespace`、`layer`、`output`、`mapped`、`exclusive_zone`、`keyboard_interactivity`、`anchor`、`margin`、想要 / 实际尺寸、几何 |
 | `config` | **配置表的全部键值**（跟 `config.lua` 里 `vidow.get` 读到的是同一个东西）；`config` + `key` 只取一个 |
 | `keybinds` / `rules` | 键位表（触发串 + 动作串）、窗口规则（含「这一条到底写没写」的 null 语义） |
@@ -2076,6 +2127,10 @@ test-x11scale.sh  固定尺寸的 X11 窗口（WM_NORMAL_HINTS min==max）在 2 
 test-scrollcull.sh  两块并排的屏 + 三列装不下：滚出视口的列被摘出场景（修之前它的
                   坐标落进隔壁屏的框里，就画在隔壁显示器上），再滚回来又显示，
                   浮动 / 拖拽不受这条规则管，藏起来的窗口按规则照旧补帧
+test-outputstate.sh 每块屏那一组的其余项：`mode`（分辨率 / 刷新率）、`enabled`、
+                  `vrr`（headless 上不支持 → 只报一句，别的照常生效）、`depth = 10`
+                  （输出缓冲真的换成 XRGB2101010）、`transform`，SIGHUP 后每项都跟着
+                  改，写错的值当场报错
 test-outputpos.sh  显示器配置（`vidow.output{ name = …, scale = …, x = …, y = … }`）
                    按名字摆（自动排的顺序是后端给的，headless 上实测是反的）、
                   只写 x 不写 y 也认、项名写错当场报错、拔插后回到配置说的位置、

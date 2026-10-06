@@ -17,6 +17,8 @@ pixman_dep = dependency('pixman-1')
 # XWayland：wlr_xwayland_get_xwm_connection() 给的是 xcb 连接，诊断和 Xresources
 # 都直接用 xcb 说话。
 xcb_dep = dependency('xcb')
+# 输出缓冲的格式常量（DRM_FORMAT_XRGB8888 / XRGB2101010）：vidow.output 的 depth。
+drm_dep = dependency('libdrm')
 # 剪贴板桥（clipboard.c）靠 XFixes 监听 X 侧的 owner 变化。
 xcb_xfixes_dep = dependency('xcb-xfixes')
 # 配置语言：Lua 5.4（Arch 的 lua54 包）。没有就退回系统默认 lua。
@@ -277,7 +279,7 @@ executable('vidow',
   sources + [bgeffect_code, xa_server_code],
   dependencies: [wlroots_dep, xkbcommon_dep, wayland_server_dep, math_dep,
                  egl_dep, gles2_dep, pixman_dep, lua_dep, xcb_dep,
-                 xcb_xfixes_dep],
+                 xcb_xfixes_dep, drm_dep],
   include_directories: include_directories('.'),
   install: false)
 

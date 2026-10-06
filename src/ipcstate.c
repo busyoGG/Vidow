@@ -10,6 +10,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <drm_fourcc.h> /* DRM_FORMAT_XRGB8888 / XRGB2101010（vidow.output 的 depth） */
+
 #include <wayland-server.h>
 #include <wayland-server-core.h>
 #include <wlr/types/wlr_layer_shell_v1.h>
@@ -435,6 +437,24 @@ void vidow_ipc_json_output(struct jbuf *b, struct vidow_server *server,
 	jb_kv_int(b, "subpixel", (int)o->subpixel);
 	jb_kv_bool(b, "adaptive_sync", o->adaptive_sync_status ==
 		WLR_OUTPUT_ADAPTIVE_SYNC_ENABLED);
+	jb_kv_bool(b, "vrr_supported", o->adaptive_sync_supported);
+	{
+		/* 输出缓冲的位深（vidow.output 的 depth）：10 位走 XRGB2101010。 */
+		const char *name = "?";
+		switch (o->render_format) {
+		case DRM_FORMAT_XRGB8888:
+			name = "xrgb8888";
+			break;
+		case DRM_FORMAT_XRGB2101010:
+			name = "xrgb2101010";
+			break;
+		}
+		char hex[16];
+		snprintf(hex, sizeof(hex), "0x%08x", o->render_format);
+		jb_kv_str(b, "render_format", strcmp(name, "?") == 0 ? hex : name);
+		jb_kv_int(b, "depth", o->render_format == DRM_FORMAT_XRGB2101010 ?
+			10 : 8);
+	}
 	jb_kv_bool(b, "focused", server->focused_output == o);
 	jb_kv_str(b, "memory", output->memory != NULL ? output->memory->key : NULL);
 	jb_key(b, "layout");

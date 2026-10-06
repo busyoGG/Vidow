@@ -33,7 +33,34 @@ static void describe(const struct vidow_output_conf *conf, char *buf,
 		n += (size_t)snprintf(buf + (n < len ? n : len - 1),
 			len - (n < len ? n : len - 1), " 位置=%d,%d", conf->x, conf->y);
 	}
-	if (!conf->has_scale && !conf->has_pos) {
+	if (conf->has_mode) {
+		n += (size_t)snprintf(buf + (n < len ? n : len - 1),
+			len - (n < len ? n : len - 1), " 模式=%dx%d",
+			conf->mode_w, conf->mode_h);
+		if (conf->mode_hz > 0.0) {
+			n += (size_t)snprintf(buf + (n < len ? n : len - 1),
+				len - (n < len ? n : len - 1), "@%.2fHz", conf->mode_hz);
+		}
+	}
+	if (conf->has_vrr) {
+		n += (size_t)snprintf(buf + (n < len ? n : len - 1),
+			len - (n < len ? n : len - 1), " vrr=%s", conf->vrr ? "on" : "off");
+	}
+	if (conf->has_depth) {
+		n += (size_t)snprintf(buf + (n < len ? n : len - 1),
+			len - (n < len ? n : len - 1), " %d位色", conf->depth);
+	}
+	if (conf->has_transform) {
+		n += (size_t)snprintf(buf + (n < len ? n : len - 1),
+			len - (n < len ? n : len - 1), " 方向=%d", (int)conf->transform);
+	}
+	if (conf->has_enabled) {
+		n += (size_t)snprintf(buf + (n < len ? n : len - 1),
+			len - (n < len ? n : len - 1), " %s", conf->enabled ? "开" : "关");
+	}
+	if (!conf->has_scale && !conf->has_pos && !conf->has_mode &&
+			!conf->has_vrr && !conf->has_depth && !conf->has_transform &&
+			!conf->has_enabled) {
 		snprintf(buf + (n < len ? n : len - 1),
 			len - (n < len ? n : len - 1), "（什么也没写：缩放和位置都自动）");
 	}
@@ -63,6 +90,18 @@ struct vidow_output_conf *vidow_output_conf_add(struct vidow_server *server,
 	conf->has_pos = spec->has_pos;
 	conf->x = spec->x;
 	conf->y = spec->y;
+	conf->has_mode = spec->has_mode;
+	conf->mode_w = spec->mode_w;
+	conf->mode_h = spec->mode_h;
+	conf->mode_hz = spec->mode_hz;
+	conf->has_vrr = spec->has_vrr;
+	conf->vrr = spec->vrr;
+	conf->has_depth = spec->has_depth;
+	conf->depth = spec->depth;
+	conf->has_transform = spec->has_transform;
+	conf->transform = spec->transform;
+	conf->has_enabled = spec->has_enabled;
+	conf->enabled = spec->enabled;
 	wl_list_insert(server->output_confs.prev, &conf->link);
 
 	char what[160];

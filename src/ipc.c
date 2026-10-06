@@ -1155,30 +1155,6 @@ static bool cmd_output_scale(struct vidow_server *server, struct jval *req,
 	return true;
 }
 
-static bool parse_transform(const char *text, enum wl_output_transform *out) {
-	static const struct {
-		const char *name;
-		enum wl_output_transform t;
-	} names[] = {
-		{ "normal", WL_OUTPUT_TRANSFORM_NORMAL },
-		{ "0", WL_OUTPUT_TRANSFORM_NORMAL },
-		{ "90", WL_OUTPUT_TRANSFORM_90 },
-		{ "180", WL_OUTPUT_TRANSFORM_180 },
-		{ "270", WL_OUTPUT_TRANSFORM_270 },
-		{ "flipped", WL_OUTPUT_TRANSFORM_FLIPPED },
-		{ "flipped-90", WL_OUTPUT_TRANSFORM_FLIPPED_90 },
-		{ "flipped-180", WL_OUTPUT_TRANSFORM_FLIPPED_180 },
-		{ "flipped-270", WL_OUTPUT_TRANSFORM_FLIPPED_270 },
-	};
-	for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
-		if (strcasecmp(names[i].name, text) == 0) {
-			*out = names[i].t;
-			return true;
-		}
-	}
-	return false;
-}
-
 static bool cmd_output_transform(struct vidow_server *server, struct jval *req,
 		struct jbuf *out, char *err, size_t errlen) {
 	struct vidow_output *output = req_output(server, req, err, errlen);
@@ -1189,7 +1165,7 @@ static bool cmd_output_transform(struct vidow_server *server, struct jval *req,
 	const char *text = jtext(req, "transform", transform_buf,
 		sizeof(transform_buf));
 	enum wl_output_transform transform;
-	if (text == NULL || !parse_transform(text, &transform)) {
+	if (text == NULL || !vidow_output_parse_transform(text, &transform)) {
 		snprintf(err, errlen, "要 transform = normal / 90 / 180 / 270 / flipped…");
 		return false;
 	}

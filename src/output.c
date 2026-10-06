@@ -1,5 +1,8 @@
 #include "server.h"
 
+#include <drm_fourcc.h> /* DRM_FORMAT_XRGB8888 / XRGB2101010（输出缓冲的位深） */
+#include <strings.h> /* strcasecmp（方向的名字） */
+
 #include <math.h>
 #include <stdlib.h>
 #include <time.h>
@@ -184,12 +187,93 @@ static void output_request_state(struct wl_listener *listener, void *data) {
 	}
 }
 
-/* 一个输出该用多大缩放，以及为什么。mode 可能为 NULL（还没上模式）。 */
+/* 方向的名字 -> 枚举（config 和 IPC 共用）。 */
+bool vidow_output_parse_transform(const char *text, enum wl_output_transform *out) {
+	static const struct {
+		const char *name;
+		enum wl_output_transform t;
+	} names[] = {
+		{ "normal", WL_OUTPUT_TRANSFORM_NORMAL },
+		{ "0", WL_OUTPUT_TRANSFORM_NORMAL },
+		{ "90", WL_OUTPUT_TRANSFORM_90 },
+		{ "180", WL_OUTPUT_TRANSFORM_180 },
+		{ "270", WL_OUTPUT_TRANSFORM_270 },
+		{ "flipped", WL_OUTPUT_TRANSFORM_FLIPPED },
+		{ "flipped-90", WL_OUTPUT_TRANSFORM_FLIPPED_90 },
+		{ "flipped-180", WL_OUTPUT_TRANSFORM_FLIPPED_180 },
+		{ "flipped-270", WL_OUTPUT_TRANSFORM_FLIPPED_270 },
+	};
+	if (text == NULL) {
+		return false;
+	}
+	for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+		if (strcasecmp(names[i].name, text) == 0) {
+			*out = names[i].t;
+			return true;
+		}
+	}
+	return false;
+}
+
+/* 模式字符串 -> 分辨率 + 刷新率："3840x2160@144" / "3840x2160"（刷新率不挑）/
+ * "3840x2160@59.94"。@ 后面的刷新率可以带小数。 */
+bool vidow_output_parse_mode(const char *text, int *w, int *h, double *hz) {
+	if (text == NULL) {
+		return false;
+	}
+	char *end = NULL;
+	long width = strtol(text, &end, 10);
+	if (end == text || (*end != 'x' && *end != 'X')) {
+		return false;
+	}
+	const char *rest = end + 1;
+	long height = strtol(rest, &end, 10);
+	if (end == rest || width <= 0 || height <= 0) {
+		return false;
+	}
+	double refresh = 0.0;
+	if (*end == '@') {
+		const char *hz_text = end + 1;
+		refresh = strtod(hz_text, &end);
+		if (end == hz_text || refresh <= 0.0) {
+			return false;
+		}
+	}
+	if (*end != '\0') {
+		return false; /* "3840x2160x2" 这种不认 */
+	}
+	*w = (int)width;
+	*h = (int)height;
+	*hz = refresh;
+	return true;
+}
+
+/* 在输出报的模式表里找 w×h[+hz]。hz <= 0 = 刷新率不挑（优先那块屏的首选模式）。
+ * 找不到返回 NULL（调用方可以退回自定义模式）。 */
+static struct wlr_output_mode *output_find_mode(struct wlr_output *wlr_output,
+		int w, int h, double hz) {
+	struct wlr_output_mode *match = NULL;
+	struct wlr_output_mode *mode;
+	wl_list_for_each(mode, &wlr_output->modes, link) {
+		if (mode->width != w || mode->height != h) {
+			continue;
+		}
+		if (hz > 0.0 && fabs(mode->refresh / 1000.0 - hz) > 0.6) {
+			continue;
+		}
+		match = mode;
+		if (mode->preferred) {
+			break;
+		}
+	}
+	return match;
+}
+
+/* 一个输出该用多大缩放，以及为什么。w / h 是它将要上的那个模式的分辨率
+ * （还没上模式时就是现在这个）。 */
 static double output_pick_scale(struct vidow_server *server,
-		struct wlr_output *wlr_output, struct wlr_output_mode *mode,
+		struct wlr_output *wlr_output, int w, int h,
 		char *why, size_t why_len) {
-	int w = mode != NULL ? mode->width : wlr_output->width;
-	int h = mode != NULL ? mode->height : wlr_output->height;
 	struct vidow_config *cfg = &server->config;
 
 	/* 这块屏自己那一组（vidow.output{ name = … }）里写了 scale 就按它来，
@@ -288,8 +372,10 @@ void vidow_output_apply_scale(struct vidow_server *server,
 		struct vidow_output *output) {
 	struct wlr_output *wlr_output = output->wlr_output;
 	struct wlr_output_mode *mode = wlr_output_preferred_mode(wlr_output);
+	int w = mode != NULL ? mode->width : wlr_output->width;
+	int h = mode != NULL ? mode->height : wlr_output->height;
 	char why[64];
-	double scale = output_pick_scale(server, wlr_output, mode, why, sizeof(why));
+	double scale = output_pick_scale(server, wlr_output, w, h, why, sizeof(why));
 	if (fabs(scale - (double)wlr_output->scale) < 1e-3) {
 		return;
 	}
@@ -402,6 +488,87 @@ bool vidow_output_set_enabled(struct vidow_server *server,
 	return true;
 }
 
+/* VRR（adaptive sync）。这块屏 / 这个后端不支持就只报一句：headless 后端在
+ * wlroots 里根本不吃这个字段（提交会被拒），DRM 那边看连接器的 vrr_capable。 */
+bool vidow_output_set_vrr(struct vidow_server *server,
+		struct wlr_output *wlr_output, bool enabled) {
+	struct vidow_output *output = output_of(server, wlr_output);
+	if (output == NULL) {
+		return false;
+	}
+	bool now = wlr_output->adaptive_sync_status !=
+		WLR_OUTPUT_ADAPTIVE_SYNC_DISABLED;
+	if (now == enabled) {
+		return true;
+	}
+	if (!wlr_output->adaptive_sync_supported) {
+		wlr_log(WLR_INFO, "output %s: 这块屏 / 这个后端不支持 VRR"
+			"（adaptive sync），%s不生效", wlr_output->name,
+			enabled ? "开" : "关");
+		return false;
+	}
+	struct wlr_output_state state;
+	wlr_output_state_init(&state);
+	wlr_output_state_set_adaptive_sync_enabled(&state, enabled);
+	bool ok = wlr_output_commit_state(wlr_output, &state);
+	wlr_output_state_finish(&state);
+	if (!ok) {
+		wlr_log(WLR_INFO, "output %s: VRR %s 失败（后端拒了）", wlr_output->name,
+			enabled ? "开" : "关");
+		return false;
+	}
+	wlr_log(WLR_INFO, "output %s: VRR -> %s（现在 %s）", wlr_output->name,
+		enabled ? "开" : "关",
+		wlr_output->adaptive_sync_status == WLR_OUTPUT_ADAPTIVE_SYNC_ENABLED ?
+		"生效" : "后端没接");
+	return true;
+}
+
+/* 渲染位深：10 位 = DRM_FORMAT_XRGB2101010 的输出缓冲。
+ *
+ * 「支不支持」不猜：先看后端报的格式表（能问就问），再直接提交试一次（后端
+ * 没报格式表的时候只能这样）。失败就保持 8 位，日志里说清楚 —— 10 位要显卡、
+ * 显示器、渲染器三样都到位，缺一样就只剩「本来就不生效」。 */
+bool vidow_output_set_depth(struct vidow_server *server,
+		struct wlr_output *wlr_output, int depth) {
+	struct vidow_output *output = output_of(server, wlr_output);
+	if (output == NULL) {
+		return false;
+	}
+	uint32_t want = depth >= 10 ? DRM_FORMAT_XRGB2101010 : DRM_FORMAT_XRGB8888;
+	if (wlr_output->render_format == want) {
+		return true;
+	}
+	const struct wlr_drm_format_set *formats = wlr_output_get_primary_formats(
+		wlr_output, server->allocator != NULL ?
+		server->allocator->buffer_caps : WLR_BUFFER_CAP_DATA_PTR);
+	/* 格式表里有这个格式就行，modifier 不挑（wlr_drm_format_set_has 是「一模一样的
+	 * modifier」，拿 MOD_INVALID 去问会永远说不支持）。 */
+	if (formats != NULL && formats->len > 0 &&
+			wlr_drm_format_set_get(formats, want) == NULL) {
+		wlr_log(WLR_INFO, "output %s: 这块屏不支持 %d 位色（输出缓冲没有 %s），"
+			"保持 %d 位", wlr_output->name, depth,
+			depth >= 10 ? "XRGB2101010" : "XRGB8888",
+			wlr_output->render_format == DRM_FORMAT_XRGB2101010 ? 10 : 8);
+		return false;
+	}
+	struct wlr_output_state state;
+	wlr_output_state_init(&state);
+	wlr_output_state_set_render_format(&state, want);
+	bool ok = wlr_output_commit_state(wlr_output, &state);
+	wlr_output_state_finish(&state);
+	if (!ok) {
+		wlr_log(WLR_INFO, "output %s: 设成 %d 位色失败（后端 / 渲染器不支持），"
+			"保持 %d 位", wlr_output->name, depth,
+			wlr_output->render_format == DRM_FORMAT_XRGB2101010 ? 10 : 8);
+		return false;
+	}
+	wlr_log(WLR_INFO, "output %s: 输出缓冲 -> %s（%d 位色）", wlr_output->name,
+		depth >= 10 ? "XRGB2101010" : "XRGB8888", depth);
+	output_state_applied(server, output);
+	return true;
+}
+
 bool vidow_output_set_mode(struct vidow_server *server,
 		struct wlr_output *wlr_output, int width, int height,
 		double refresh_hz) {
@@ -409,21 +576,8 @@ bool vidow_output_set_mode(struct vidow_server *server,
 	if (output == NULL) {
 		return false;
 	}
-	struct wlr_output_mode *match = NULL;
-	struct wlr_output_mode *mode;
-	wl_list_for_each(mode, &wlr_output->modes, link) {
-		if (mode->width != width || mode->height != height) {
-			continue;
-		}
-		if (refresh_hz > 0.0 &&
-				fabs(mode->refresh / 1000.0 - refresh_hz) > 0.6) {
-			continue;
-		}
-		match = mode;
-		if (mode->preferred) {
-			break;
-		}
-	}
+	struct wlr_output_mode *match = output_find_mode(wlr_output, width, height,
+		refresh_hz);
 
 	struct wlr_output_state state;
 	wlr_output_state_init(&state);
@@ -496,6 +650,67 @@ void vidow_output_apply_positions_all(struct vidow_server *server) {
 			"（现在 %d,%d）", output->wlr_output->name, x, y, output->box.x,
 			output->box.y);
 		vidow_output_set_position(server, output->wlr_output, x, y);
+	}
+}
+
+/* 配置里除了缩放 / 位置之外的几项（模式、方向、开关、VRR、位深）落到这块屏上。
+ *
+ * 每一项单独 commit：VRR / 位深这类「后端可能不认」的东西要是和开关屏、上模式
+ * 挤在同一次 commit 里，一个不认就整次失败 —— 屏直接不亮，而原因只是一个可选
+ * 项。分开做，谁不认就谁不生效，日志里点名。
+ *
+ * create = true 时只做「建屏那次 commit 没做的事」：模式 / 方向 / 开关已经在
+ * 初始 state 里了，这里只补 VRR 和位深（它们不能在关着的屏上设，也不适合和
+ * 上模式挤在一起）。 */
+static void output_apply_conf_extra(struct vidow_server *server,
+		struct vidow_output *output) {
+	struct wlr_output *wlr_output = output->wlr_output;
+	if (!wlr_output->enabled) {
+		return; /* 关着的屏不能设 VRR / 位深（wlroots 会直接拒） */
+	}
+	const struct vidow_output_conf *conf =
+		vidow_output_conf_for(server, wlr_output->name);
+	if (conf == NULL) {
+		return;
+	}
+	if (conf->has_vrr) {
+		vidow_output_set_vrr(server, wlr_output, conf->vrr);
+	}
+	if (conf->has_depth) {
+		vidow_output_set_depth(server, wlr_output, conf->depth);
+	}
+}
+
+/* 配置里那块屏的开关 / 模式 / 方向改过（SIGHUP、配置刚跑完）：按新配置对一遍账。
+ * 每一项都先比一遍现状，没变的什么都不做（每次 set_xxx 都会重排、重画背景）。 */
+void vidow_output_apply_state_all(struct vidow_server *server) {
+	struct vidow_output *output;
+	wl_list_for_each(output, &server->outputs, link) {
+		struct wlr_output *wlr_output = output->wlr_output;
+		const struct vidow_output_conf *conf =
+			vidow_output_conf_for(server, wlr_output->name);
+		if (conf == NULL) {
+			continue;
+		}
+		if (conf->has_enabled && wlr_output->enabled != conf->enabled) {
+			wlr_log(WLR_INFO, "output %s: 按配置（vidow.output）%s",
+				wlr_output->name, conf->enabled ? "打开" : "关掉");
+			vidow_output_set_enabled(server, wlr_output, conf->enabled);
+		}
+		if (conf->has_mode && wlr_output->enabled &&
+				((int)wlr_output->width != conf->mode_w ||
+				 (int)wlr_output->height != conf->mode_h ||
+				 (conf->mode_hz > 0.0 &&
+				  fabs(wlr_output->refresh / 1000.0 - conf->mode_hz) > 0.6))) {
+			wlr_log(WLR_INFO, "output %s: 按配置（vidow.output）换模式",
+				wlr_output->name);
+			vidow_output_set_mode(server, wlr_output, conf->mode_w,
+				conf->mode_h, conf->mode_hz);
+		}
+		if (conf->has_transform && wlr_output->transform != conf->transform) {
+			vidow_output_set_transform(server, wlr_output, conf->transform);
+		}
+		output_apply_conf_extra(server, output);
 	}
 }
 
@@ -623,19 +838,55 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 		return;
 	}
 
+	/* 配置里这块屏那一组（vidow.output{…}）：开关 / 模式 / 方向都进第一次
+	 * commit —— 一起上屏，客户端看到的第一个尺寸就是对的。VRR 和位深不行
+	 * （不能在关着的屏上设，也不该和上模式挤同一次 commit），commit 之后由
+	 * output_apply_conf_extra() 单独补。 */
+	const struct vidow_output_conf *conf =
+		vidow_output_conf_for(server, wlr_output->name);
+	bool want_enabled = conf != NULL && conf->has_enabled ? conf->enabled : true;
+
 	struct wlr_output_state state;
 	wlr_output_state_init(&state);
-	wlr_output_state_set_enabled(&state, true);
-	struct wlr_output_mode *mode = wlr_output_preferred_mode(wlr_output);
-	if (mode != NULL) {
-		wlr_output_state_set_mode(&state, mode);
+	wlr_output_state_set_enabled(&state, want_enabled);
+	struct wlr_output_mode *mode = NULL;
+	int mode_w = wlr_output->width;
+	int mode_h = wlr_output->height;
+	if (conf != NULL && conf->has_mode) {
+		mode_w = conf->mode_w;
+		mode_h = conf->mode_h;
+		mode = output_find_mode(wlr_output, mode_w, mode_h, conf->mode_hz);
+		if (mode != NULL) {
+			wlr_output_state_set_mode(&state, mode);
+		} else {
+			/* 模式表里没有：按自定义模式试一把（有些后端支持，有些会拒）。 */
+			wlr_output_state_set_custom_mode(&state, mode_w, mode_h,
+				conf->mode_hz > 0.0 ? (int32_t)(conf->mode_hz * 1000.0) : 0);
+			wlr_log(WLR_INFO, "output %s: 模式表里没有 %dx%d%s，按自定义模式试",
+				wlr_output->name, mode_w, mode_h,
+				conf->mode_hz > 0.0 ? "（带刷新率）" : "");
+		}
+	} else {
+		mode = wlr_output_preferred_mode(wlr_output);
+		if (mode != NULL) {
+			mode_w = mode->width;
+			mode_h = mode->height;
+			wlr_output_state_set_mode(&state, mode);
+		}
+	}
+	if (conf != NULL && conf->has_transform) {
+		wlr_output_state_set_transform(&state, conf->transform);
 	}
 	/* 缩放要在第一次 commit 之前定下来：它决定逻辑尺寸（布局坐标的基准），
 	 * 也决定客户端拿到的 preferred_buffer_scale。 */
 	char why[64];
-	double scale = output_pick_scale(server, wlr_output, mode, why, sizeof(why));
+	double scale = output_pick_scale(server, wlr_output, mode_w, mode_h, why,
+		sizeof(why));
 	wlr_output_state_set_scale(&state, (float)scale);
-	wlr_output_commit_state(wlr_output, &state);
+	if (!wlr_output_commit_state(wlr_output, &state)) {
+		wlr_log(WLR_ERROR, "output %s: 第一次上屏失败（配置里那块屏的模式 / "
+			"方向后端不认？）", wlr_output->name);
+	}
 	wlr_output_state_finish(&state);
 
 	struct vidow_output *output = calloc(1, sizeof(*output));
@@ -722,6 +973,10 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 	}
 
 	vidow_arrange(server);
+
+	/* 配置里那块屏还写了 VRR / 位深的话，现在补上（不能在关着的屏上设，也不该
+	 * 和上模式挤同一次 commit）。 */
+	output_apply_conf_extra(server, output);
 
 	/* 新屏可能比现有的都密：X 的全局缩放要跟着涨（涨了已存在的 X11 窗口会
 	 * 重新声明缓冲区比例）。 */

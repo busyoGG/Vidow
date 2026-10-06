@@ -1148,12 +1148,27 @@ void vidow_output_kick_all(struct vidow_server *server);
 /* 按配置（vidow.output{ name = …, x = …, y = … }）把每块屏摆到它该在的位置；
  * SIGHUP 后对一次账。 */
 void vidow_output_apply_positions_all(struct vidow_server *server);
+/* 配置里那块屏的开关 / 模式 / 方向 / VRR / 位深改过：按新配置对一遍账（SIGHUP、
+ * 配置刚跑完）。没变的什么都不做。 */
+void vidow_output_apply_state_all(struct vidow_server *server);
+/* "3840x2160@144" -> 分辨率 + 刷新率（@ 可省，刷新建 0 = 不挑）。config 用。 */
+bool vidow_output_parse_mode(const char *text, int *w, int *h, double *hz);
+/* 方向的名字 -> 枚举（normal / 90 / 180 / 270 / flipped / flipped-90 …）。 */
+bool vidow_output_parse_transform(const char *text,
+		enum wl_output_transform *out);
 /* 输出的运行时改动（IPC 用）。都会 commit 一次并把跟着变的东西（布局、背景
  * 缓存、光标、可用区域）重做一遍。why 只进日志。 */
 bool vidow_output_set_scale(struct vidow_server *server,
 		struct wlr_output *wlr_output, double scale, const char *why);
 bool vidow_output_set_transform(struct vidow_server *server,
 		struct wlr_output *wlr_output, enum wl_output_transform transform);
+/* VRR（adaptive sync）。后端 / 这块屏不支持时只报一句，返回 false。 */
+bool vidow_output_set_vrr(struct vidow_server *server,
+		struct wlr_output *wlr_output, bool enabled);
+/* 渲染位深（8 / 10）。10 位 = DRM_FORMAT_XRGB2101010 的输出缓冲，不支持就保持
+ * 原样并说清楚，返回 false。 */
+bool vidow_output_set_depth(struct vidow_server *server,
+		struct wlr_output *wlr_output, int depth);
 bool vidow_output_set_enabled(struct vidow_server *server,
 		struct wlr_output *wlr_output, bool enabled);
 bool vidow_output_set_mode(struct vidow_server *server,

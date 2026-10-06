@@ -9,9 +9,11 @@
 --     gaps   = { top = 30, inner = 20 }       -- 上边距 30、窗口之间 20、其余 6
 --     border = { width = 0, color = "#2a2e3aff" }
 --
--- 显示器（输出）是一块屏一组，缩放和摆在哪写在一起（写几行就是几块屏）：
---     vidow.output{ name = "DP-3", scale = 2, x = 0,    y = 0 }
---     vidow.output{ name = "DP-2", scale = 2, x = 1920, y = 0 }
+-- 显示器（输出）是一块屏一组：缩放、摆在哪儿、什么模式、开不开 VRR、几位色
+-- 都是这块屏的事，写在一行里（写几行就是几块屏；只写要管的字段）：
+--     vidow.output{ name = "DP-3", scale = 2, x = 0, y = 0, mode = "3840x2160@144" }
+--     vidow.output{ name = "DP-2", scale = 2, x = 1920, y = 0, vrr = true, depth = 10 }
+--     vidow.output{ name = "HDMI-A-1", enabled = false }
 -- 表里的项名写在下面每一节里；平铺键（gaps_inner = 20）和表写法是一回事。
 --
 -- 优先级：环境变量 VIDOW_<键名大写> > 这个文件 > 内置默认值。
