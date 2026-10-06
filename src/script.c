@@ -356,11 +356,13 @@ static int l_rule(lua_State *L) {
 	if (cap != NULL) {
 		if (strcmp(cap, "hide") == 0) {
 			spec.capture = VIDOW_CAPTURE_HIDE;
+		} else if (strcmp(cap, "mosaic") == 0) {
+			spec.capture = VIDOW_CAPTURE_MOSAIC;
 		} else if (strcmp(cap, "off") == 0 || cap[0] == '\0') {
 			spec.capture = VIDOW_CAPTURE_OFF;
 		} else {
-			return luaL_error(L, "vidow.rule 的 capture 只能是 \"off\" 或 "
-				"\"hide\"（\"mosaic\" 还没做），给的是 \"%s\"", cap);
+			return luaL_error(L, "vidow.rule 的 capture 只能是 \"off\"、"
+				"\"hide\" 或 \"mosaic\"，给的是 \"%s\"", cap);
 		}
 	}
 	/* 马赛克的块边长（屏幕像素）。只在 capture = "mosaic" 下有用 —— 单独写它
@@ -369,6 +371,11 @@ static int l_rule(lua_State *L) {
 	spec.has_capture_mosaic = !lua_isnil(L, -1);
 	spec.capture_mosaic = spec.has_capture_mosaic ?
 		(int)lua_tointeger(L, -1) : VIDOW_CAPTURE_MOSAIC_DEFAULT;
+	if (spec.capture_mosaic < VIDOW_CAPTURE_MOSAIC_MIN) {
+		return luaL_error(L, "capture_mosaic 是马赛克的块边长（屏幕像素），"
+			"至少 %d，给的是 %d", VIDOW_CAPTURE_MOSAIC_MIN,
+			spec.capture_mosaic);
+	}
 	lua_pop(L, 1);
 
 	if (!spec.has_force_render && !spec.has_hz && !spec.has_focus_on_open &&

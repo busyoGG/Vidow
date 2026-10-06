@@ -19,7 +19,8 @@
 #      —— 这条是这次改动的核心
 #   7) 录像文件里没有它（screencopy 那条路也藏住了）；-D（纯 copy）再验一遍
 #   8) layer surface 的规则（namespace = "..."）：抓帧里没有，屏幕上还有
-#   9) capture = "mosaic" 还没做 → 配置错误里说清楚（别静默当成 hide）
+#   9) capture = "mosaic"：抓帧里变成块状（块边长 = capture_mosaic），屏幕上
+#      还是原样；块边长 < 2 在配置那一行报错
 #  10) 日志里没有 assert / abort
 #
 # 用法：./test-capture-hide.sh   （VIDOW_TEST_KEEP=1 保留运行目录）
@@ -87,6 +88,25 @@ PY
 }
 blue() { pixels "$1" blue; }
 bright() { pixels "$1" bright; }
+# 平均连续同色像素：横着扫若干行，量「同色能连多长」。渐变 / 照片这类原图跑长
+# 接近 1；马赛克是 1/block 的缩小 + NEAREST 放大，跑长 ≈ 块边长。
+runlen() {
+	python3 - "$1" <<'PY'
+import sys
+from PIL import Image
+im = Image.open(sys.argv[1]).convert("RGB"); px = im.load()
+w, h = im.size
+pix = ch = 0
+for y in range(100, h - 100, 7):
+    prev = px[0, y]
+    for x in range(1, w):
+        cur = px[x, y]
+        pix += 1
+        if cur != prev: ch += 1
+        prev = cur
+print(round(pix / max(ch, 1), 2))
+PY
+}
 
 mkdir -p "$RUNDIR/run"
 chmod 700 "$RUNDIR/run"
@@ -280,6 +300,51 @@ PY
 	[ "$BO" -gt 0 ] && pass "屏幕上还有 dot 壁纸（$BO 个亮点）" \
 		|| fail "屏幕上也没有 dot 壁纸了（$BO 个亮点）"
 	kill "$DPID" 2>/dev/null
+
+	mark "9. capture = \"mosaic\"：抓帧里是块状，屏幕上还是原样"
+	# 基线：capture = "off"，量一遍抓帧和屏幕的「平均连续同色像素」。
+	printf 'scale = "1"\nvidow.rule{ app_id = "bluewin", capture = "hide" }\nvidow.rule{ namespace = "wall", capture = "off" }\n' \
+		> "$HIN/.config/vidow/config.lua"
+	WAYLAND_DISPLAY="$WDIN" HOME="$HIN" python3 tools/wall.py > "$RUNDIR/wall.log" 2>&1 &
+	WPID=$!
+	sleep 1.5
+	WAYLAND_DISPLAY="$WDIN" grim "$RUNDIR/off-in.png" >/dev/null 2>&1
+	WAYLAND_DISPLAY="$WDOUT" grim "$RUNDIR/off-out.png" >/dev/null 2>&1
+	RI0=$(runlen "$RUNDIR/off-in.png")
+	RO0=$(runlen "$RUNDIR/off-out.png")
+	python3 - "$RI0" <<'PY' && pass "基线：抓帧里是原图（跑长 $RI0）" || fail "基线抓帧就不是原图（跑长 $RI0）"
+import sys
+v = float(sys.argv[1]); sys.exit(0 if v < 12 else 1)
+PY
+	# 16 像素的块
+	printf 'scale = "1"\nvidow.rule{ app_id = "bluewin", capture = "hide" }\nvidow.rule{ namespace = "wall", capture = "mosaic", capture_mosaic = 16 }\n' \
+		> "$HIN/.config/vidow/config.lua"
+	sleep 1.5
+	WAYLAND_DISPLAY="$WDIN" grim "$RUNDIR/mos16-in.png" >/dev/null 2>&1
+	WAYLAND_DISPLAY="$WDOUT" grim "$RUNDIR/mos16-out.png" >/dev/null 2>&1
+	RI=$(runlen "$RUNDIR/mos16-in.png")
+	RO=$(runlen "$RUNDIR/mos16-out.png")
+	python3 - "$RI" <<'PY' && pass "抓帧里是块状（平均连续同色像素 $RI，块边长 16）" || fail "抓帧里跑长 $RI，不像 16 像素的块"
+import sys
+v = float(sys.argv[1]); sys.exit(0 if 12 <= v <= 24 else 1)
+PY
+	# 屏幕这条要和基线一样（屏幕没被动手；嵌套显示本身有缩放，跑长不等于 1）
+	python3 - "$RO0" "$RO" <<'PY' && pass "屏幕和基线一样（跑长 $RO0 → $RO，没被块状化）" || fail "屏幕被动了：跑长 $RO0 → $RO"
+import sys
+a, b = float(sys.argv[1]), float(sys.argv[2])
+sys.exit(0 if a * 0.75 <= b <= a * 1.25 else 1)
+PY
+	# 块边长可配
+	printf 'scale = "1"\nvidow.rule{ app_id = "bluewin", capture = "hide" }\nvidow.rule{ namespace = "wall", capture = "mosaic", capture_mosaic = 48 }\n' \
+		> "$HIN/.config/vidow/config.lua"
+	sleep 1.5
+	WAYLAND_DISPLAY="$WDIN" grim "$RUNDIR/mos48-in.png" >/dev/null 2>&1
+	RI2=$(runlen "$RUNDIR/mos48-in.png")
+	python3 - "$RI2" <<'PY' && pass "capture_mosaic = 48 生效（跑长 $RI2）" || fail "块边长 48 没生效（跑长 $RI2）"
+import sys
+v = float(sys.argv[1]); sys.exit(0 if 36 <= v <= 62 else 1)
+PY
+	kill "$WPID" 2>/dev/null
 	kill "$BPID" 2>/dev/null
 fi
 kill -TERM -- "-$IPID" 2>/dev/null
@@ -287,18 +352,20 @@ sleep 0.4
 kill -KILL -- "-$IPID" 2>/dev/null
 
 # --------------------------------------------------- 9) mosaic 还没做的报错
-mark "9. capture = \"mosaic\"：配置错误说清楚（不静默）"
-H3="$RUNDIR/bad"
-start_headless "$H3" 'scale = "1"
-vidow.rule{ app_id = "bluewin", capture = "mosaic" }' "$RUNDIR/bad.log" >/dev/null
-grep -aq 'capture 只能是 "off" 或 "hide"' "$RUNDIR/bad.log" \
-	&& pass "配置错误里点了 capture 的合法值" || fail "配置错误没说清楚"
-grep -aq '"mosaic" 还没做' "$RUNDIR/bad.log" \
-	&& pass "并且说明 mosaic 还没做" || fail "没说 mosaic 还没做"
+mark "10. 配置错误：capture 的合法值 / 块边长下限"
+# 配置在第一处错误就停了，两条各起一次
+start_headless "$RUNDIR/bad" 'scale = "1"
+vidow.rule{ app_id = "bluewin", capture = "blur" }' "$RUNDIR/bad.log" >/dev/null
+grep -aq 'capture 只能是 "off"、"hide" 或 "mosaic"' "$RUNDIR/bad.log" \
+	&& pass "非法 capture 值点了合法值" || fail "非法 capture 值没说清楚"
+start_headless "$RUNDIR/bad2" 'scale = "1"
+vidow.rule{ app_id = "bluewin", capture = "mosaic", capture_mosaic = 1 }' "$RUNDIR/bad2.log" >/dev/null
+grep -aq 'capture_mosaic 是马赛克的块边长' "$RUNDIR/bad2.log" \
+	&& pass "块边长 < 2 在配置那一行报错" || fail "块边长没校验"
 
 # --------------------------------------------------------------- 10) 日志
-mark "10. 日志干净"
-for f in "$RUNDIR/one.log" "$RUNDIR/inner.log" "$RUNDIR/bad.log"; do
+mark "11. 日志干净"
+for f in "$RUNDIR/one.log" "$RUNDIR/inner.log" "$RUNDIR/bad.log" "$RUNDIR/bad2.log"; do
 	[ -f "$f" ] || continue
 	if grep -aqE "assert|abort|Assertion" "$f"; then
 		fail "$(basename "$f") 里有 assert / abort：$(grep -aE 'assert|abort|Assertion' "$f" | tail -1)"

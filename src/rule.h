@@ -53,6 +53,8 @@ enum vidow_capture_mode {
 /* 马赛克块边长（屏幕像素）的默认值：16px 的块在 1080p 上大概 120 格宽，
  * 看得出版面、看不出字。 */
 #define VIDOW_CAPTURE_MOSAIC_DEFAULT 16
+/* 块边长下限：1 就是原图，没有意义（渲染上也要 ≥2 才能叫马赛克）。 */
+#define VIDOW_CAPTURE_MOSAIC_MIN 2
 
 struct vidow_rule {
 	struct wl_list link; /* vidow_server.rules */

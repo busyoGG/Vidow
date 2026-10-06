@@ -421,7 +421,19 @@ vidow.rule{ app_id = "keepassxc", capture = "hide" }
 
 -- layer surface：写了 namespace 的规则只管 layer（子串匹配 layer 的 namespace）
 vidow.rule{ namespace = "noctalia", capture = "hide" }
+
+-- 不想藏、只是打马赛克（抓帧里是块状，屏幕上还是原样）
+vidow.rule{ app_id = "wechat", capture = "mosaic", capture_mosaic = 16 }
 ```
+
+| `capture` | 抓帧里怎么出现 | 屏幕上 |
+| --- | --- | --- |
+| 不写 / `"off"` | 照常出现 | 照常 |
+| `"hide"` | **不出现** | 照常（能点、能输入） |
+| `"mosaic"` | **块状**（块边长 `capture_mosaic`，屏幕像素，默认 16，最小 2） | 照常（原图） |
+
+`capture_mosaic` 单独写不算一条作用（一条规则至少要有 `capture` / `force_render` /
+`hz` / `x11_scale` 之一），写了也不影响 `hide`。
 
 ### 为什么这件事要自己实现抓帧（`src/capture.c` / `src/screencopy.c`）
 
@@ -447,6 +459,16 @@ blit 进客户端缓冲，ext-copy 的输出源监听 `output->events.commit` �
   （当场出帧会让录屏客户端按编码速度空转，实测过 2500fps 那种）；屏幕静止时没有提交，
   靠 `output.c` 的 capture_watchdog 每 50ms 催一帧。
 
+### 马赛克是怎么画的
+
+马赛克不能靠节点自己的属性（场景没有「像素化」这种东西）：先把节点压掉（和 `hide`
+一样），抓帧渲染完再把**块状版本**画回原位置 —— 把画在屏幕上的那张图缩小到
+`1/capture_mosaic`（线性过滤，等于块内平均），再用 `NEAREST` 放大回原尺寸：一个块里
+所有像素取同一个采样点，看着就是马赛克。放大那一步必须 `NEAREST`，不然又糊回原样。
+
+所以马赛克也只影响抓帧：屏幕上那一帧从头到尾没被碰过（`test-capture-hide.sh` 里量了
+屏幕的「平均连续同色像素」，开马赛克前后一样）。
+
 ### 藏法：压透明度，不是关节点
 
 `wlr_scene_node_set_enabled()` 也能让它不进画面，但场景的命中测试会跳过关掉的节点 ——
@@ -466,12 +488,13 @@ blit 进客户端缓冲，ext-copy 的输出源监听 `output->events.commit` �
 ### 测试
 
 ```bash
-./test-capture-hide.sh   # 25 项断言：规则字段 → grim 抓帧里没有它（0 个蓝像素）→
+./test-capture-hide.sh   # 31 项断言：规则字段 → grim 抓帧里没有它（0 个蓝像素）→
                          # 窗口照常能点（pick-window 命中）→ 对照组 capture = "off"
                          # 照样抓得到 → 嵌套跑证明屏幕上还有它 → **录屏期间屏幕上
                          # 照样有它**（wf-recorder / screencopy，这次改动的核心）→
                          # 录像文件里没有它（copy 和 copy_with_damage 各验一遍）→
-                         # layer 的 namespace 规则 → mosaic 的配置报错 → 日志干净
+                         # layer 的 namespace 规则 → 马赛克（抓帧里跑长 ≈ 块边长、
+                         # 屏幕和基线一样、块边长可配）→ 配置报错 → 日志干净
 ```
 
 ## 焦点：谁抢焦点、激活请求理不理（窗口规则）

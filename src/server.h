@@ -1488,6 +1488,17 @@ bool vidow_screencopy_has_pending(struct vidow_screencopy *manager);
 struct wlr_buffer *vidow_capture_grab(struct vidow_server *server,
 		struct wlr_output *output);
 
+/* layer 的内容节点（surface 的 buffer）：wlroots 把它包在 subsurface tree 里，
+ * 所以要递归找。抓帧遮挡（capturemask.c）和马赛克（capture.c）都要用它。 */
+struct wlr_scene_buffer *vidow_layer_surface_buffer(
+		struct wlr_scene_layer_surface_v1 *scene);
+
+/* 把 capture = "mosaic" 的窗口 / layer 用「缩小再 NEAREST 放大」的块状图盖到
+ * 抓帧图上（块边长 = 规则的 capture_mosaic，屏幕像素）。调用前先压过遮挡
+ * （原图不在抓帧里），见 capture.c。 */
+void vidow_capture_paint_mosaic(struct vidow_server *server,
+		struct wlr_output *output, struct wlr_buffer *dst);
+
 /* 把这块屏上的光标合成到抓帧图上（要光标的客户端才调：ext-copy 的
  * PAINT_CURSORS / screencopy 的 overlay_cursor）。抓帧是场景渲染，场景里没有
  * 光标，所以要光标的客户端得我们自己画上去。 */

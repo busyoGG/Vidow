@@ -27,6 +27,14 @@
 
 #include <wlr/util/log.h>
 
+/* 规则说了要在抓帧里「处理掉」的（藏起来 / 打马赛克）都要先把节点压下去：
+ * 藏起来就完事，马赛克则在抓帧渲染完再把块状版本画上去（见 capture.c 的
+ * vidow_capture_paint_mosaic）。 */
+static bool wants_mask(int capture_mode) {
+	return capture_mode == VIDOW_CAPTURE_HIDE ||
+		capture_mode == VIDOW_CAPTURE_MOSAIC;
+}
+
 /* ------------------------------------------------------- 会话（ext-copy） */
 
 static void mask_apply(struct vidow_server *server, bool off);
@@ -119,7 +127,7 @@ static struct wlr_scene_buffer *find_surface_buffer(struct wlr_scene_node *node)
 	return NULL;
 }
 
-static struct wlr_scene_buffer *layer_surface_buffer(
+struct wlr_scene_buffer *vidow_layer_surface_buffer(
 		struct wlr_scene_layer_surface_v1 *scene) {
 	if (scene == NULL || scene->tree == NULL) {
 		return NULL;
@@ -132,7 +140,7 @@ static struct wlr_scene_buffer *layer_surface_buffer(
 static void mask_apply(struct vidow_server *server, bool off) {
 	struct vidow_view *view;
 	wl_list_for_each(view, &server->views, link) {
-		if (view->capture_mode != VIDOW_CAPTURE_HIDE) {
+		if (!wants_mask(view->capture_mode)) {
 			continue;
 		}
 		/* 标志位先立起来：vidow_fx_frame 每帧都会把节点透明度写回 1.0，只戳一下
@@ -147,13 +155,13 @@ static void mask_apply(struct vidow_server *server, bool off) {
 	}
 	struct vidow_layer_surface *ls;
 	wl_list_for_each(ls, &server->layers, link) {
-		if (ls->capture_mode != VIDOW_CAPTURE_HIDE) {
+		if (!wants_mask(ls->capture_mode)) {
 			continue;
 		}
 		ls->fx.masked = off;
 		ls->mask_opacity = off;
 		opacity_mask(ls->fx.node, &ls->mask_saved_fx, off);
-		opacity_mask(layer_surface_buffer(ls->scene), &ls->mask_saved_surf,
+		opacity_mask(vidow_layer_surface_buffer(ls->scene), &ls->mask_saved_surf,
 			off);
 		ls->mask_opacity = off;
 	}
@@ -163,13 +171,13 @@ static void mask_apply(struct vidow_server *server, bool off) {
 static bool anything_maskable(struct vidow_server *server) {
 	struct vidow_view *view;
 	wl_list_for_each(view, &server->views, link) {
-		if (view->capture_mode == VIDOW_CAPTURE_HIDE) {
+		if (wants_mask(view->capture_mode)) {
 			return true;
 		}
 	}
 	struct vidow_layer_surface *ls;
 	wl_list_for_each(ls, &server->layers, link) {
-		if (ls->capture_mode == VIDOW_CAPTURE_HIDE) {
+		if (wants_mask(ls->capture_mode)) {
 			return true;
 		}
 	}

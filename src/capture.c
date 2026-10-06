@@ -38,7 +38,12 @@
 #include <wlr/backend/interface.h>
 #include <wlr/interfaces/wlr_ext_image_capture_source_v1.h>
 #include <wlr/interfaces/wlr_output.h>
+#include <drm_fourcc.h>
+#include <wlr/render/allocator.h>
+#include <wlr/render/drm_format_set.h>
+#include <wlr/render/pass.h>
 #include <wlr/render/swapchain.h>
+#include <wlr/render/wlr_texture.h>
 #include <wlr/render/wlr_renderer.h>
 #include <wlr/types/wlr_buffer.h>
 #include <wlr/types/wlr_ext_image_copy_capture_v1.h>
@@ -62,6 +67,10 @@ struct vidow_capture {
 
 	/* 输出抓帧源（客户端 create_source 时才建） */
 	struct vidow_capture_source *source;
+
+	/* 马赛克用的小块缓冲（缩小后的那一张），一块屏一个、按需重建 */
+	struct wlr_buffer *mosaic;
+	int mosaic_w, mosaic_h;
 
 	/* 光标源（pointer cursor session 用） */
 	struct vidow_cursor_source *cursor;
@@ -184,6 +193,139 @@ void vidow_capture_paint_cursor(struct wlr_output *output, struct wlr_buffer *ds
 	}
 }
 
+/* --------------------------------------------------------------- 马赛克 */
+
+/* 把画在屏幕上的那张图缩小到 1/block，再用 NEAREST 放大回原尺寸：一个块里所有
+ * 像素取同一个采样点，看着就是马赛克。缩小那一遍用默认的线性过滤（等于块内平均），
+ * 放大那一遍必须 NEAREST（不然又糊回原样）。 */
+static void paint_mosaic_one(struct vidow_capture *cap, struct wlr_scene_buffer *sb,
+		struct wlr_buffer *dst, int block) {
+	if (sb == NULL || sb->buffer == NULL || block < 2) {
+		return;
+	}
+	int lx, ly;
+	if (!wlr_scene_node_coords(&sb->node, &lx, &ly)) {
+		return; /* 没画在画面上 */
+	}
+	int lw = sb->dst_width > 0 ? sb->dst_width : (int)sb->buffer->width;
+	int lh = sb->dst_height > 0 ? sb->dst_height : (int)sb->buffer->height;
+	if (lw <= 0 || lh <= 0) {
+		return;
+	}
+	struct wlr_output *output = cap->output;
+	struct vidow_server *server = cap->server;
+	double scale = output->scale > 0 ? output->scale : 1.0;
+	struct wlr_box obox;
+	wlr_output_layout_get_box(server->output_layout, output, &obox);
+	int dw = (int)lround(lw * scale), dh = (int)lround(lh * scale);
+	int dx = (int)lround((lx - obox.x) * scale);
+	int dy = (int)lround((ly - obox.y) * scale);
+	if (dx >= dst->width || dy >= dst->height || dx + dw <= 0 || dy + dh <= 0) {
+		return; /* 整块都在抓帧区域外 */
+	}
+	int bw = dw / block, bh = dh / block;
+	if (bw < 1) {
+		bw = 1;
+	}
+	if (bh < 1) {
+		bh = 1;
+	}
+
+	if (cap->mosaic == NULL || cap->mosaic_w != bw || cap->mosaic_h != bh) {
+		wlr_buffer_unlock(cap->mosaic);
+		cap->mosaic = NULL;
+		/* 格式跟着抓帧输出自己的 swapchain 走（那是渲染器认的渲染目标格式；
+		 * 别自己拼 wlr_drm_format —— 那套 create/add 是 wlroots 内部 API）。 */
+		const struct wlr_drm_format *fmt =
+			cap->grab_output.swapchain != NULL ?
+				&cap->grab_output.swapchain->format : NULL;
+		if (fmt == NULL) {
+			return;
+		}
+		struct wlr_buffer *small =
+			wlr_allocator_create_buffer(server->allocator, bw, bh, fmt);
+		if (small == NULL) {
+			return;
+		}
+		/* 自己拿一把锁：allocator 给的是没锁的缓冲，下次重建时要 unlock。 */
+		cap->mosaic = wlr_buffer_lock(small);
+		cap->mosaic_w = bw;
+		cap->mosaic_h = bh;
+	}
+
+	struct wlr_texture *tex =
+		wlr_texture_from_buffer(server->renderer, sb->buffer);
+	if (tex == NULL) {
+		return;
+	}
+	struct wlr_render_pass *pass = wlr_renderer_begin_buffer_pass(server->renderer,
+		cap->mosaic, NULL);
+	if (pass == NULL) {
+		wlr_texture_destroy(tex);
+		return;
+	}
+	struct wlr_fbox src = sb->src_box;
+	if (src.width <= 0 || src.height <= 0) {
+		src = (struct wlr_fbox){ .width = tex->width, .height = tex->height };
+	}
+	wlr_render_pass_add_texture(pass, &(struct wlr_render_texture_options){
+		.texture = tex,
+		.src_box = src,
+		.dst_box = (struct wlr_box){ .width = bw, .height = bh },
+		.blend_mode = WLR_RENDER_BLEND_MODE_NONE,
+	});
+	wlr_render_pass_submit(pass);
+	wlr_texture_destroy(tex);
+
+	struct wlr_texture *small =
+		wlr_texture_from_buffer(server->renderer, cap->mosaic);
+	if (small == NULL) {
+		return;
+	}
+	pass = wlr_renderer_begin_buffer_pass(server->renderer, dst, NULL);
+	if (pass == NULL) {
+		wlr_texture_destroy(small);
+		return;
+	}
+	wlr_render_pass_add_texture(pass, &(struct wlr_render_texture_options){
+		.texture = small,
+		.dst_box = (struct wlr_box){ .x = dx, .y = dy, .width = dw, .height = dh },
+		.filter_mode = WLR_SCALE_FILTER_NEAREST,
+		.blend_mode = WLR_RENDER_BLEND_MODE_NONE,
+	});
+	wlr_render_pass_submit(pass);
+	wlr_texture_destroy(small);
+}
+
+void vidow_capture_paint_mosaic(struct vidow_server *server,
+		struct wlr_output *output, struct wlr_buffer *dst) {
+	struct vidow_capture *cap = capture_for_output(server, output);
+	if (cap == NULL) {
+		return;
+	}
+	struct vidow_view *view;
+	wl_list_for_each(view, &server->views, link) {
+		if (view->capture_mode != VIDOW_CAPTURE_MOSAIC) {
+			continue;
+		}
+		/* 画在屏幕上的是哪个节点就糊哪个：装饰过的窗口画在 fx 节点上（表面
+		 * 自己是透明的），没装饰的画在表面上。 */
+		struct wlr_scene_buffer *sb =
+			view->fx.node != NULL && view->fx.node->buffer != NULL ? view->fx.node :
+			(view->scene_surface != NULL ? view->scene_surface->buffer : NULL);
+		paint_mosaic_one(cap, sb, dst, view->capture_mosaic);
+	}
+	struct vidow_layer_surface *ls;
+	wl_list_for_each(ls, &server->layers, link) {
+		if (ls->capture_mode != VIDOW_CAPTURE_MOSAIC) {
+			continue;
+		}
+		/* layer 的 fx 节点是它背后的模糊底衬，内容在 surface 上。 */
+		paint_mosaic_one(cap, vidow_layer_surface_buffer(ls->scene), dst,
+			ls->capture_mosaic);
+	}
+}
+
 struct wlr_buffer *vidow_capture_grab(struct vidow_server *server,
 		struct wlr_output *output) {
 	struct vidow_capture *cap = capture_for_output(server, output);
@@ -192,6 +334,11 @@ struct wlr_buffer *vidow_capture_grab(struct vidow_server *server,
 	}
 	vidow_capturemask_hold(server);
 	struct wlr_buffer *buffer = capture_render(cap);
+	if (buffer != NULL) {
+		/* 遮挡把原图压掉了，这里再把「块状版本」画回去（capture = "mosaic"）。
+		 * 放在这里两条抓帧路（screencopy / ext-copy）就都盖到了。 */
+		vidow_capture_paint_mosaic(server, output, buffer);
+	}
 	vidow_capturemask_release(server);
 	return buffer;
 }
@@ -481,6 +628,7 @@ static void capture_destroy(struct vidow_capture *cap) {
 	if (cap->cursor != NULL) {
 		cursor_source_destroy(cap->cursor);
 	}
+	wlr_buffer_unlock(cap->mosaic);
 	wlr_scene_output_destroy(cap->scene_output);
 	wlr_output_finish(&cap->grab_output);
 	wlr_backend_finish(&cap->backend);
