@@ -50,6 +50,10 @@ cleanup() {
 	[ -n "${VIDOW_TEST_KEEP:-}" ] || rm -rf "$RUNDIR"
 }
 trap cleanup EXIT
+# 被 timeout / Ctrl-C 杀掉时也要收尾：bash 收到 SIGTERM 默认不跑 EXIT 陷阱，
+# 直接死掉会留下一串没主的 vidow（它们已经 reparent 到 systemd 了，没人再管）。
+# `exit 143` 会让 EXIT 陷阱照常跑。
+trap 'exit 143' TERM INT
 
 command -v grim >/dev/null || { echo "test-jelly.sh: 需要 grim"; exit 1; }
 python3 -c 'import PIL' 2>/dev/null || { echo "test-jelly.sh: 需要 python3-PIL"; exit 1; }
