@@ -937,9 +937,10 @@ void vidow_view_apply_anim(struct vidow_view *view) {
 		x, y, alpha, view->server->focused == view,
 		view_scale(view) * ov, ov);
 	/* 装饰图真的画上屏了才把真实表面藏起来（只留给命中测试）。没画出来
-	 * 还藏就是窗口整个消失 —— 关掉 decor/shader 时踩过，屏幕一片黑。 */
+	 * 还藏就是窗口整个消失 —— 关掉 decor/shader 时踩过，屏幕一片黑。
+	 * 拖着果冻的时候也一样：内容归 jelly.c 那个节点画。 */
 	wlr_scene_buffer_set_opacity(src,
-		(fx_drawn || view->mask_opacity) ? 0.0f : 1.0f);
+		(fx_drawn || view->mask_opacity || view->jelly != NULL) ? 0.0f : 1.0f);
 }
 
 /* 从 wlr_surface 找回它的窗口：文本输入和 ext-background-effect 都要用。
@@ -2494,6 +2495,8 @@ static void view_destroy(struct wl_listener *listener, void *data) {
 	view_capture_holds_clear(view);
 	vidow_portal_view_free(view);
 	wl_list_remove(&view->link);
+	/* 果冻那个场景节点比 view 活得久，结构里又攥着 view 指针：先收掉。 */
+	vidow_jelly_view_gone(view);
 
 	/* The scene node is owned by wlroots and may outlive the view; clear the
 	 * tag so hit-testing cannot reach the freed struct. */
@@ -3136,6 +3139,8 @@ static void x11_destroy_view(struct wl_listener *listener, void *data) {
 	view_popup_release_keyboard(view);
 	vidow_portal_view_free(view);
 	wl_list_remove(&view->link);
+	/* 同上：果冻先收掉，别留一个攥着野指针的场景节点。 */
+	vidow_jelly_view_gone(view);
 
 	if (server->grab_view == view) {
 		vidow_float_end_grab(server);

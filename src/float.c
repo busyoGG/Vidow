@@ -442,6 +442,10 @@ void vidow_float_begin_grab(struct vidow_server *server,
 		struct vidow_view *view, bool resize) {
 	server->grab_mode = resize ? VIDOW_GRAB_RESIZE : VIDOW_GRAB_MOVE;
 	server->grab_view = view;
+	/* 拖动有果冻，改大小没有：改大小每帧换源缓冲尺寸，网格对不上（见 jelly.c）。 */
+	if (!resize) {
+		vidow_jelly_begin(view);
+	}
 	server->grab_x = server->cursor->x;
 	server->grab_y = server->cursor->y;
 	server->grab_geom = view->float_geom;
@@ -525,6 +529,9 @@ void vidow_float_end_grab(struct vidow_server *server) {
 	server->grab_mode = VIDOW_GRAB_NONE;
 	server->grab_view = NULL;
 	wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "left_ptr");
+	if (view != NULL) {
+		vidow_jelly_release(view);
+	}
 
 	/* 松手时光标落在**另一块屏**上：这块浮窗改归那块屏显示着的工作区（跨屏
 	 * 拖拽）。位置保持绝对坐标不变，改完按新屏原点刷新相对偏移 —— 不刷新的话

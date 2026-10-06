@@ -154,6 +154,12 @@ static const struct entry entries[] = {
 	{ "close_scale_to",  K_DOUBLE, OFF(close_scale_to),  SZ(close_scale_to), 3,
 		"关闭动画的结束缩放（1.0 = 不缩）" },
 
+	{ "jelly",           K_BOOL,   OFF(jelly),           SZ(jelly), 3,
+		"拖窗口时的果冻效果：抓点跟着光标走，窗口其余部分像一块布被拖着、松手"
+		"后晃两下收住（要窗口有装饰节点，也就是 decor 或 shader 开着）" },
+	{ "jelly_strength",  K_DOUBLE, OFF(jelly_strength),  SZ(jelly_strength), 3,
+		"果冻的形变倍率（1.0 = 默认，0.5 = 收敛些，0 = 不弯）" },
+
 	{ "shader_enabled",  K_BOOL,   OFF(shader_enabled),  SZ(shader_enabled), 4,
 		"自定义 shader 总开关（需要 GLES2 渲染器）" },
 	{ "shader_dir",      K_STRING, OFF(shader_dir),      SZ(shader_dir), 4,
@@ -290,6 +296,8 @@ static const struct group_field anim_fields[] = {
 	{ "close_easing",   "close_easing" },
 	{ "open_scale_from", "open_scale_from" },
 	{ "close_scale_to", "close_scale_to" },
+	{ "jelly",          "jelly" },
+	{ "jelly_strength", "jelly_strength" },
 };
 static const struct group_field shader_fields[] = {
 	{ "enabled", "shader_enabled" },
@@ -584,6 +592,11 @@ static void defaults(struct vidow_config *cfg) {
 	cfg->close_easing = VIDOW_EASE_OUT_ELASTIC;
 	cfg->open_scale_from = 0.82;
 	cfg->close_scale_to = 0.82;
+
+	/* 拖窗口的果冻（见 jelly.c）。默认开着：这是「拖着走」这件事本身的
+	 * 手感，不是额外的花活。 */
+	cfg->jelly = true;
+	cfg->jelly_strength = 1.0;
 
 	cfg->decor_enabled = true;
 	/* 关着：客户端自己画的装饰（CSD）不动它。开了就告诉客户端「别画了」，

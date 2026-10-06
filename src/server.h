@@ -51,6 +51,7 @@
 #define VIDOW_VIEW_TAG_MAGIC 0x50574d56u /* "PWMV" */
 
 struct vidow_server;
+struct vidow_jelly;
 
 /* 一个已经发出去的 xdg-activation 令牌（客户端拿到的那个随机串）。资源销毁了它
  * 还得活着：协议说「收到的令牌继续有效」。实现见 activation.c，IPC 要把它报出来
@@ -135,6 +136,11 @@ struct vidow_config {
 	/* 入场从多小弹出来 / 关闭缩到多小（1.0 = 不缩放）。 */
 	double open_scale_from;
 	double close_scale_to;
+	/* 拖动窗口时的果冻（见 jelly.c）：抓点跟着光标走，窗口其余部分像一块布
+	 * 一样被拖着走、松手后晃两下收住。jelly_strength 是形变倍率（0.5 = 收
+	 * 敛些，0 = 不弯）。 */
+	bool jelly;
+	double jelly_strength;
 
 	/* server-side decorations */
 	bool decor_enabled;
@@ -425,6 +431,9 @@ struct vidow_fx_target {
 	 * 的时候不出现，屏幕上照旧。vidow_fx_frame 每帧都会把节点透明度写回 1.0，
 	 * 所以遮挡必须是它认的一个标志位，而不是外面戳一下（见 capturemask.c）。 */
 	bool masked;
+	/* 正在被拖出果冻形变（见 jelly.c）：装饰结果由果冻那个节点显示，这个节点
+	 * 透明度压 0 让位。同样必须是标志位（每帧都会被写回去）。 */
+	bool jelly;
 };
 
 /* 「有人正拿着这个窗口」（窗口截图源：录屏 / 窗口预览）。记录挂在窗口上，源自己
@@ -703,6 +712,9 @@ struct vidow_view {
 	struct vidow_fx_target fx;
 	int fx_dx, fx_dy; /* surface offset inside the view tree */
 	struct wlr_buffer *last_buffer; /* locked, feeds the close animation */
+	/* 拖动时的果冻形变（见 jelly.c）：非空就是「现在正弯着」——窗口本来的
+	 * 装饰节点让位，由它显示。松手后它自己晃回去再消失。 */
+	struct vidow_jelly *jelly;
 
 	/* floating */
 	enum vidow_float_mode float_mode;
@@ -1394,6 +1406,25 @@ void vidow_fx_set_alpha(struct wlr_scene_node *node, double alpha);
 bool vidow_shader_init(struct vidow_server *server);
 struct vidow_shader *vidow_shader_get(struct vidow_server *server,
 		const char *name);
+
+/* ---- 拖窗口的果冻（jelly.c） ---- */
+/* 起手：把窗口现在显示的那块带装饰的离屏图切成网格挂到弹簧上。要窗口有装饰
+ * 节点（fx 节点）才能做；做不了就返回 false，拖动照旧、只是不弯。 */
+bool vidow_jelly_begin(struct vidow_view *view);
+/* 松手：解掉抓点，整张网自己晃回去，晃静了自动交接（装饰节点重新露出来）。 */
+void vidow_jelly_release(struct vidow_view *view);
+/* 立刻收掉（源对不上了 / 松手收尾结束）。 */
+void vidow_jelly_end(struct vidow_view *view);
+/* 视图正在被销毁（free(view) 之前必须调）：果冻结构里攥着 view 指针，而它
+ * 那个场景节点比 view 活得久。 */
+void vidow_jelly_view_gone(struct vidow_view *view);
+/* 每帧积分 + 重画，在 output.c 的帧循环里叫。 */
+void vidow_jelly_tick(struct vidow_server *server, int64_t now_ns);
+/* 还有窗口在弯 -> 帧循环得继续排帧（不然静止屏幕上晃到一半就停了）。 */
+bool vidow_jelly_pending(struct vidow_server *server);
+/* 正在显示形变结果的那个场景节点（没有就是 NULL）。抓帧遮挡要用：藏着不露的
+ * 窗口拖起来的时候，画在屏幕上的其实是这个节点。 */
+struct wlr_scene_buffer *vidow_jelly_node(struct vidow_view *view);
 
 bool vidow_fx_begin(struct vidow_server *server, struct vidow_fx_target *fx,
 		struct wlr_scene_tree *parent, const char *shader_name);

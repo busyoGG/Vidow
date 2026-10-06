@@ -69,6 +69,9 @@ void vidow_tile_grab_begin(struct vidow_server *server,
 	server->grab_mode = VIDOW_GRAB_TILE;
 	server->grab_view = view;
 	view->dragging = true;
+	/* 果冻：把窗口现在显示的装饰结果挂到弹簧网格上。做不了就算了（装饰关着
+	 * 之类），拖动照旧。 */
+	vidow_jelly_begin(view);
 	/* 光标在窗口里的相对位置：拖动时窗口保持这个「抓点」在光标下。 */
 	view->drag_dx = (int)(server->cursor->x - view->geom.x);
 	view->drag_dy = (int)(server->cursor->y - view->geom.y);
@@ -102,6 +105,9 @@ void vidow_tile_grab_end(struct vidow_server *server) {
 	server->grab_mode = VIDOW_GRAB_NONE;
 	server->grab_view = NULL;
 	wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "left_ptr");
+	/* 松手：解掉抓点，网格自己晃回去（位置照旧归下面的布局逻辑管）。
+	 * 放在所有提前返回之前 —— 不管这条路走不走得通，果冻都得收手。 */
+	vidow_jelly_release(view);
 	if (view == NULL || view->column == NULL) {
 		return;
 	}

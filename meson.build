@@ -124,6 +124,7 @@ sources = files(
   'src/portalconf.c',
   'src/xwayland.c',
   'src/capture.c',
+  'src/jelly.c',
   'src/screencopy.c',
 ) + [layer_shell_header, bgeffect_header, xa_server_header,
      eics_server_header, sc_server_header]

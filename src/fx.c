@@ -1762,8 +1762,11 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 		x - pad_ov + (dst_w0 - dst_w) / 2,
 		y - pad_ov + (dst_h0 - dst_h) / 2);
 	wlr_scene_buffer_set_dest_size(fx->node, dst_w, dst_h);
-	/* 被抓帧遮挡压着的窗口，这一帧也照样压着（抓帧随时可能在两帧之间渲染）。 */
-	wlr_scene_buffer_set_opacity(fx->node, fx->masked ? 0.0f : 1.0f);
+	/* 被抓帧遮挡压着的窗口，这一帧也照样压着（抓帧随时可能在两帧之间渲染）。
+	 * 正在被拖出果冻形变的窗口也一样：内容由 jelly.c 那个节点画（同一块缓冲，
+	 * 只是弯了），这一块必须让位，否则两张图叠在一起。 */
+	wlr_scene_buffer_set_opacity(fx->node,
+		(fx->masked || fx->jelly) ? 0.0f : 1.0f);
 
 	/* Full-buffer damage: the node is re-rendered every frame of the effect. */
 	pixman_region32_t damage;

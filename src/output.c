@@ -65,6 +65,8 @@ void vidow_output_render(struct vidow_output *output) {
 	/* Progress comes from CLOCK_MONOTONIC, so a slow frame skips ahead
 	 * instead of stretching the animation. */
 	vidow_anim_tick(server);
+	/* 拖窗口的果冻：积分弹簧、把弯了的窗口重画一遍（见 jelly.c）。 */
+	vidow_jelly_tick(server, vidow_now_ns());
 
 	/* 屏幕这一帧就是屏幕这一帧：抓帧是 vidow 自己另外渲染的一遍（capture.c /
 	 * screencopy.c），和这里没有任何关系 —— capture = "hide" 的窗口 / layer
@@ -114,7 +116,7 @@ static int capture_watchdog(void *data) {
  * dry up while an animation is in flight, drive it from a timer instead. */
 static int anim_watchdog(void *data) {
 	struct vidow_server *server = data;
-	if (!vidow_anim_pending(server)) {
+	if (!vidow_anim_pending(server) && !vidow_jelly_pending(server)) {
 		return 0;
 	}
 	int64_t now = vidow_now_ns();
@@ -125,7 +127,7 @@ static int anim_watchdog(void *data) {
 		}
 		vidow_output_render(output);
 	}
-	if (vidow_anim_pending(server)) {
+	if (vidow_anim_pending(server) || vidow_jelly_pending(server)) {
 		wl_event_source_timer_update(server->anim_timer, 16);
 	}
 	return 0;
@@ -171,8 +173,9 @@ static void output_frame(struct wl_listener *listener, void *data) {
 
 	/* An animating node usually damages the scene, but not always (a pure
 	 * opacity change on a fully occluded window). Ask for the next frame
-	 * anyway, and arm the watchdog in case the request goes nowhere. */
-	if (vidow_anim_pending(server)) {
+	 * anyway, and arm the watchdog in case the request goes nowhere.
+	 * 拖着果冻也一样：网格在动，帧不能停。 */
+	if (vidow_anim_pending(server) || vidow_jelly_pending(server)) {
 		wlr_output_schedule_frame(output->wlr_output);
 		vidow_output_kick_watchdog(server);
 	}

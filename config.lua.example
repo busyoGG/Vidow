@@ -112,7 +112,11 @@ close_easing = "out_elastic"
 open_scale_from = 0.82
 -- 关闭动画的结束缩放（1.0 = 不缩）
 close_scale_to = 0.82
--- 这一族也能写成一张表，只写要改的项（anim = { open_ms = 180, close_ms = 140, move_ms = 190, layer_open_ms = 200, layer_close_ms = 150, easing = "out_cubic", open_alpha_from = 0, open_slide_px = 22, close_alpha_to = 0, close_slide_px = 14, open_easing = "out_elastic", close_easing = "out_elastic", open_scale_from = 0.82, close_scale_to = 0.82 }）
+-- 拖窗口时的果冻效果：抓点跟着光标走，窗口其余部分像一块布被拖着、松手后晃两下收住（要窗口有装饰节点，也就是 decor 或 shader 开着）
+jelly = true
+-- 果冻的形变倍率（1.0 = 默认，0.5 = 收敛些，0 = 不弯）
+jelly_strength = 1
+-- 这一族也能写成一张表，只写要改的项（anim = { open_ms = 180, close_ms = 140, move_ms = 190, layer_open_ms = 200, layer_close_ms = 150, easing = "out_cubic", open_alpha_from = 0, open_slide_px = 22, close_alpha_to = 0, close_slide_px = 14, open_easing = "out_elastic", close_easing = "out_elastic", open_scale_from = 0.82, close_scale_to = 0.82, jelly = true, jelly_strength = 1 }）
 
 -- ================== 自定义着色器
 -- 自定义 shader 总开关（需要 GLES2 渲染器）
