@@ -66,10 +66,7 @@ struct vidow_cursor_fx {
 	int64_t until_ns;
 	double factor;       /* 当前倍数（每晃一次乘一次） */
 	double scale;        /* 光标所在输出的缩放 */
-	bool hardware;       /* 放大图在不在硬件光标平面上 */
-	bool normal_fits;    /* 原尺寸那张放得下硬件平面（抓帧让位得靠它） */
-	int soft_locks_base; /* 放大开始时这块屏上的软光标锁数（认「谁在要光标」） */
-	bool soft_unlocked;  /* 让位时临时松开了软光标锁，渲染完要锁回去 */
+	bool hardware;       /* 放大图在不在硬件光标平面上（只影响日志 / 诊断） */
 	struct wlr_buffer *src; /* 原尺寸那张（1:1，自己画的） */
 	struct wlr_buffer *big; /* 放大那张 */
 	int32_t big_hx, big_hy; /* 放大图的热点（逻辑坐标） */
@@ -278,7 +275,7 @@ static bool shake_grow(struct vidow_server *server, double fit, const char **why
 	wlr_log(WLR_INFO, "摇晃: 光标放大 %.2fx（%dx%d → %dx%d，%s）", fit,
 		src_w, src_h, w, h,
 		hardware ? "硬件光标，不进截图"
-			: "软光标：抓帧时让位，截图里照样没有它");
+			: "软光标：会画进屏幕（抓帧是 vidow 自己渲染的，截图里照样没有它）");
 	return true;
 }
 
@@ -341,8 +338,6 @@ bool vidow_cursor_fx_shake(struct vidow_server *server, const char **why) {
 	wlr_output_effective_resolution(output, &limit_w, &limit_h);
 	limit_w = (int)lround(limit_w * scale);
 	limit_h = (int)lround(limit_h * scale);
-	int maxw = 0, maxh = 0;
-	cursor_size_limit(output, &maxw, &maxh);
 
 	drop_images(fx);
 	fx->src = src;
@@ -351,12 +346,6 @@ bool vidow_cursor_fx_shake(struct vidow_server *server, const char **why) {
 	fx->limit_h = limit_h;
 	fx->src_hx = (int32_t)lround(oc->hotspot_x / scale);
 	fx->src_hy = (int32_t)lround(oc->hotspot_y / scale);
-	fx->normal_fits = (int)oc->width <= maxw && (int)oc->height <= maxh;
-	fx->soft_locks_base = output->software_cursor_locks;
-	if (!fx->normal_fits) {
-		wlr_log(WLR_INFO, "摇晃: 原尺寸的光标图 %dx%d 就超过硬件光标上限 %dx%d，"
-			"抓帧让位让不了（截图里会有它）", oc->width, oc->height, maxw, maxh);
-	}
 	fx->factor = 1.0;
 	fx->active = true;
 
@@ -370,65 +359,15 @@ bool vidow_cursor_fx_shake(struct vidow_server *server, const char **why) {
 	return true;
 }
 
-/* --------------------------------------------------------------- 抓帧让位 */
+/* --------------------------------------------------------------- 抓帧 */
 
-bool vidow_cursor_fx_capture_guard(struct vidow_server *server,
-		struct wlr_output *output) {
-	struct vidow_cursor_fx *fx = server->cursor_fx;
-	if (fx == NULL || !fx->active || fx->hardware || !fx->normal_fits) {
-		return false;
-	}
-	/* 有没有「不要光标」的抓帧正等着这一帧？（要光标的：wlroots 会自己把光标
-	 * 锁成软光标画进去，不用我们管。）两条路都得看：
-	 *   - screencopy（老 grim / wf-recorder）：帧挂在管理器上，带 overlay_cursor；
-	 *   - ext-image-copy-capture（新版 grim 走这条）：帧在 wlroots 自己的实现里，
-	 *     看不到列表，但抓帧期间会把输出锁在「渲染」上，而「要光标」的那种会额外
-	 *     锁软光标 —— 没锁软光标就是在等一张不带光标的帧。 */
-	bool plain = false;
-	if (server->screencopy != NULL) {
-		struct wlr_screencopy_frame_v1 *frame;
-		wl_list_for_each(frame, &server->screencopy->frames, link) {
-			if (frame->output == output && !frame->overlay_cursor) {
-				plain = true;
-				break;
-			}
-		}
-	}
-	if (!plain && output->attach_render_locks > 0 &&
-			output->software_cursor_locks <= fx->soft_locks_base) {
-		plain = true;
-	}
-	if (!plain) {
-		return false;
-	}
-	/* 有人把这块屏的光标锁死在软光标上（测试钩子 / 别的工具）？那换回原尺寸也上不了
-	 * 平面，抓到的帧里还是会有个小光标 —— 这一帧先松开，渲染完再锁回去。 */
-	if (output->software_cursor_locks > 0) {
-		wlr_output_lock_software_cursors(output, false);
-		fx->soft_unlocked = true;
-	}
-	/* 这一帧换回原尺寸那张：它放得下硬件光标平面，于是不进渲染通道 ——
-	 * 画面上光标还在（只是没放大），抓到的帧里一个光标像素都没有。 */
-	wlr_log(WLR_DEBUG, "摇晃: 抓帧让位（%s 这一帧换回 %dx%d）", output->name,
-		fx->src->width, fx->src->height);
-	wlr_cursor_set_buffer(server->cursor, fx->src, fx->src_hx, fx->src_hy,
-		(float)fx->scale);
-	return true;
-}
+/* 这里原来有「抓帧让位」：放大图是软光标时，抓帧那一帧临时换回原尺寸那张，好让
+ * 它落回硬件光标平面、不进截图。现在不需要了 —— vidow 的抓帧（capture.c /
+ * screencopy.c）是自己渲染的一帧场景，场景里本来就没有光标：**不管硬件光标还是
+ * 软光标，普通截图 / 录屏里都没有它**，而屏幕上照旧是放大后的光标（连一帧都不
+ * 用缩回去）。要光标得显式要（grim -c），走 ext-image-copy-capture 的光标会话，
+ * 那里给的就是放大后那张图（见 capture.c 的 cursor source）。 */
 
-void vidow_cursor_fx_capture_unguard(struct vidow_server *server,
-		struct wlr_output *output, bool guarded) {
-	struct vidow_cursor_fx *fx = server->cursor_fx;
-	if (!guarded || fx == NULL || !fx->active || fx->big == NULL) {
-		return;
-	}
-	wlr_cursor_set_buffer(server->cursor, fx->big, fx->big_hx, fx->big_hy,
-		(float)fx->scale);
-	if (fx->soft_unlocked) {
-		wlr_output_lock_software_cursors(output, true);
-		fx->soft_unlocked = false;
-	}
-}
 
 /* --------------------------------------------------------------- 摇晃判定 */
 

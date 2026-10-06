@@ -32,6 +32,7 @@
 #include <wlr/types/wlr_scene.h>
 #include <wlr/types/wlr_server_decoration.h>
 #include <wlr/types/wlr_screencopy_v1.h>
+#include <wlr/types/wlr_ext_image_copy_capture_v1.h>
 #include <wlr/types/wlr_seat.h>
 #include <wlr/types/wlr_subcompositor.h>
 #include <wlr/types/wlr_text_input_v3.h>
@@ -419,6 +420,11 @@ struct vidow_fx_target {
 	bool blur_only;
 
 	bool hidden;  /* temporarily disabled for the backdrop capture */
+
+	/* 抓帧遮挡（窗口规则 capture = "hide"）：这个 fx 节点正被压成透明 —— 抓帧
+	 * 的时候不出现，屏幕上照旧。vidow_fx_frame 每帧都会把节点透明度写回 1.0，
+	 * 所以遮挡必须是它认的一个标志位，而不是外面戳一下（见 capturemask.c）。 */
+	bool masked;
 };
 
 /* 「有人正拿着这个窗口」（窗口截图源：录屏 / 窗口预览）。记录挂在窗口上，源自己
@@ -461,6 +467,9 @@ struct vidow_output {
 	struct wlr_output *wlr_output;
 	struct wlr_scene_output *scene_output;
 	struct wlr_output_layout_output *layout_output;
+	/* 这块屏的抓帧器（capture.c 的 vidow_capture）：独立的假输出 + 自己的
+	 * scene_output，抓帧时自己渲染一帧。懒建。 */
+	struct vidow_capture *capture;
 
 	struct wlr_box usable_area; /* layout coords, minus layer exclusive zones */
 	/* 上次已知的布局位置（逻辑坐标）。拔线时 wlr_output_layout 可能已经先把这块
@@ -496,6 +505,10 @@ struct vidow_output {
 	 * uniform，缓存的贴图不会跟着变）。blur_alpha_min 现在只进装饰着色器、不进
 	 * 金字塔，改它由 vidow_fx 那边直接让帧循环重画（见 blur_mask_min_changed）。 */
 	double blur_offset;
+
+	/* 抓帧遮挡：这块屏上一次看到的抓帧状态。只在翻转时记一行日志 —— 这个功能
+	 * 平时完全看不见，出问题时日志是唯一的线索（见 capturemask.c）。 */
+	bool capture_active;
 
 	/* 视口外补帧的到点闹钟：节流到 30Hz / 15Hz 的时候，光靠客户端提交来推进
 	 * 是不行的（提交一次之后就没人再推了，链子断在半路）—— 到点了由它叫醒一次。 */
@@ -624,6 +637,17 @@ struct vidow_view {
 	bool pending_activate;
 	struct wl_list capture_sources; /* vidow_capture_hold.link */
 	bool render_pumping;
+	/* 抓帧遮挡（窗口规则 capture，机制见 capturemask.c）：有人在截图 / 录屏时，
+	 * 把它在场景里的透明度压成 0 —— 屏幕上照旧、抓到的帧里没有它。
+	 * 不用 node->enabled：场景的命中测试会跳过关掉的节点，窗口就点不着了（输入和
+	 * vidowmsg view-at 都会走错）。透明度只影响合成，命中测试不看它。
+	 * mask_opacity 记着「现在正压着」，两个 saved 是压之前的值（fx 节点和表面节点
+	 * 的透明度本来就不一样：装饰画的时候表面是 0）。 */
+	int capture_mode;   /* enum vidow_capture_mode */
+	int capture_mosaic; /* 马赛克块边长（屏幕像素） */
+	bool mask_opacity;
+	float mask_saved_fx;
+	float mask_saved_surf;
 	/* 补帧节流：这个窗口每秒最多补多少帧（0 = 不限）。规则可以逐窗口覆盖，
 	 * 没写就用配置里的 force_render_hz。pump_next_ms 是下一次到点的时刻。 */
 	int pump_interval_ms;
@@ -748,6 +772,13 @@ struct vidow_layer_surface {
 	struct vidow_fx_target fx;
 	/* 抓底衬时这个 surface 被我们临时藏起来过（抓完要还原，见 fx.c）。 */
 	bool capture_hidden;
+	/* 抓帧遮挡（规则 capture = 写了 namespace 的那种，见 capturemask.c）：
+	 * 和上面那个 capture_hidden 不是一回事 —— 那个是模糊底衬的临时藏法。 */
+	int capture_mode;   /* enum vidow_capture_mode */
+	int capture_mosaic; /* 马赛克块边长（屏幕像素） */
+	bool mask_opacity;
+	float mask_saved_fx;
+	float mask_saved_surf;
 
 	/* 它自己那一小块区域的底衬抓取（含窗口）：基座是共享底衬里对应的那块，窗口
 	 * 另外画上去（见 fx.c 的 layer_region_build）。只有会被窗口遮住的层（top /
@@ -1044,7 +1075,18 @@ struct vidow_server {
 	 * 带一圈阴影留白。见 decoration.c。 */
 	struct wlr_server_decoration_manager *kde_decoration_manager;
 	struct wl_listener new_kde_decoration;
-	struct wlr_screencopy_manager_v1 *screencopy;
+	/* 输出抓帧：vidow 自己实现（capture.c / screencopy.c）。客户端缓冲里放的
+	 * 是**我们自己渲染**的一帧，所以 capture = "hide" 的窗口 / layer 只在抓帧
+	 * 里消失，屏幕上照常显示。 */
+	struct vidow_capture_manager *capture_manager;
+	struct vidow_screencopy *screencopy;
+	/* 新标准抓帧（ext-image-copy-capture）的会话管理器 —— 用 wlroots 那份
+	 * （协议管线 / 约束 / dmabuf feedback 都靠它），只有「输出抓帧源」换成
+	 * vidow 自己的（见 capture.c）。窗口抓帧源仍是 wlroots 的，抓帧遮挡要靠
+	 * 它的 new_session 信号判断「有人在抓窗口」。见 capturemask.c。 */
+	struct wlr_ext_image_copy_capture_manager_v1 *ext_capture;
+	struct wl_list capture_sessions; /* vidow_capture_session.link */
+	struct wl_listener new_capture_session;
 	struct wl_global *bgeffect; /* ext_background_effect_manager_v1 */
 	struct wlr_virtual_keyboard_manager_v1 *virtual_keyboard;
 	struct wlr_virtual_pointer_manager_v1 *virtual_pointer;
@@ -1405,6 +1447,63 @@ void vidow_pointer_axis(struct vidow_server *server,
 		enum wl_pointer_axis orientation, double delta, int32_t delta_discrete,
 		enum wl_pointer_axis_source source, uint32_t time_msec);
 
+/* ------------------------------------------------------------- 抓帧遮挡
+ *
+ * 窗口规则 capture = "hide" / "mosaic" 让一个窗口或 layer surface 在别人截图 /
+ * 录屏时不出现（或者以马赛克出现）。机制见 capturemask.c。
+ *
+ * vidow 自己实现输出抓帧（capture.c / screencopy.c）：抓帧的那一帧是**自己渲染**
+ * 的（渲染前把要藏的节点透明度压 0），所以屏幕那一帧完全不受影响 —— 藏着的东西
+ * 屏幕上照常显示，抓帧里没有。遮挡只在渲染抓帧那一瞬间压上（引用计数，见
+ * vidow_capturemask_hold / _release）。
+ *
+ * 还剩一条老路要照顾：ext-image-copy-capture 的**窗口**抓帧源是 wlroots 那份
+ * （直接渲染窗口的场景子树），接不进去 —— 有人在抓一个 capture = "hide" 的窗口
+ * 时，只能整段时间把它从屏幕上藏起来（就是 vidow_capture_session 这套）。 */
+/* 一个还活着的 ext-image-copy-capture 会话（不是 vidow 自己出帧的那种）。 */
+struct vidow_capture_session {
+	struct wl_list link; /* vidow_server.capture_sessions */
+	struct vidow_server *server;
+	struct wl_listener destroy;
+};
+
+/* 输出抓帧（capture.c：引擎 + 输出抓帧源；screencopy.c：老协议 zwlr_screencopy）。 */
+struct vidow_capture;
+struct vidow_capture_manager;
+struct vidow_screencopy;
+
+/* 建两个抓帧协议：ext_output_image_capture_source_manager_v1（配合 wlroots 的
+ * ext_image_copy_capture_manager_v1）和 zwlr_screencopy_manager_v1。返回 NULL
+ * 表示没建成（不致命：抓帧协议没有，别的照常）。 */
+struct vidow_capture_manager *vidow_capture_manager_create(struct wl_display *display,
+		struct vidow_server *server);
+struct vidow_screencopy *vidow_screencopy_create(struct wl_display *display,
+		struct vidow_server *server);
+/* 还有没有等着的 screencopy 帧（静止的屏幕上没有输出提交，output.c 的
+ * capture_watchdog 靠它决定要不要催一帧）。 */
+bool vidow_screencopy_has_pending(struct vidow_screencopy *manager);
+
+/* 渲染一帧抓帧图（遮挡压好、渲染、放开都在里面），返回**加锁的**缓冲，调用方
+ * 负责 wlr_buffer_unlock()。渲染不出来返回 NULL。 */
+struct wlr_buffer *vidow_capture_grab(struct vidow_server *server,
+		struct wlr_output *output);
+
+/* 把这块屏上的光标合成到抓帧图上（要光标的客户端才调：ext-copy 的
+ * PAINT_CURSORS / screencopy 的 overlay_cursor）。抓帧是场景渲染，场景里没有
+ * 光标，所以要光标的客户端得我们自己画上去。 */
+void vidow_capture_paint_cursor(struct wlr_output *output, struct wlr_buffer *dst);
+
+/* 这个抓帧源是不是 vidow 自己出的帧（是的话「有人抓帧」不该惊动屏幕 —— 屏幕那
+ * 一帧本来就不受影响）。 */
+bool vidow_capture_source_is_ours(struct wlr_ext_image_capture_source_v1 *source);
+
+/* 挂上 ext-image-copy-capture 的 new_session 监听（main.c 建完协议之后调一次）。 */
+void vidow_capturemask_init(struct vidow_server *server);
+
+/* 压上 / 放开遮挡（引用计数：抓帧渲染期间压着，同时有别的东西在抓也不会被提前放开）。 */
+void vidow_capturemask_hold(struct vidow_server *server);
+void vidow_capturemask_release(struct vidow_server *server);
+
 /* --------------------------------------------------- 摇晃找光标（cursorfx.c）
  *
  * 快速来回晃几下指针，指针就地放大一会儿（cursor_shake / cursor_shake_scale）。
@@ -1421,13 +1520,6 @@ void vidow_cursor_fx_set_surface(struct vidow_server *server,
 		struct wlr_surface *surface, int32_t hx, int32_t hy);
 /* 指针底下没窗口了，该显示主题默认箭头。放大期间不动真图，只记状态。 */
 void vidow_cursor_fx_default_cursor(struct vidow_server *server);
-/* 抓帧让位：放大图是软光标时，抓帧那一帧临时换回原尺寸那张（它放得下硬件光标
- * 平面，于是不进渲染通道）—— 画面上照样有光标，抓到的帧里没有。返回 true 表示
- * 让过位，渲染完要调 _unguard 换回去。 */
-bool vidow_cursor_fx_capture_guard(struct vidow_server *server,
-		struct wlr_output *output);
-void vidow_cursor_fx_capture_unguard(struct vidow_server *server,
-		struct wlr_output *output, bool guarded);
 /* 光标状态（magnified / scale / image / hardware / hw_max），写进当前 JSON 对象。 */
 struct jbuf;
 void vidow_cursor_fx_json(struct jbuf *b, struct vidow_server *server);

@@ -11,8 +11,9 @@
 #   6) **不进截图**：grim 不带 -c 抓，画面里一个光标像素都没有（放大中也一样）
 #   7) **显式指定才进截图**：grim -c 抓，光标在，外接矩形正好是放大后的尺寸、
 #      箭头尖还钉在原来那个点上（热点按倍数缩放）
-#   8) **抓帧让位**：软光标那条路（真机上放大超出硬件光标平面就是它）——放大中
-#      普通抓帧里照样一个光标像素都没有，而 grim -c 能抓到放大图
+#   8) **软光标那条路**（真机上放大超出硬件光标平面就是它）：普通抓帧里照样一个
+#      光标像素都没有（vidow 自己渲染抓帧，场景里本来就没光标），而 grim -c 能抓到
+#      放大图 —— 屏幕上那个光标一直是放大的，不用为抓帧缩回去
 #   9) 客户端自己设的光标（wl_pointer.set_cursor 的 surface）也能放大，而且还原的是
 #      **客户端那张**（不是主题箭头）
 #  10) cursor_shake = false：晃不放大、cursor-shake 被拒且理由点得到配置
@@ -296,21 +297,20 @@ export VIDOW_TEST_SOFT_CURSOR=1   # 钩子：把这块屏钉死在软光标上
 start_vidow ""
 msg move-cursor 300 100 >/dev/null
 sleep 0.3
-[ "$(cfield hardware)" = "false" ] && pass "光标现在是软光标（会画进画面）" \
+[ "$(cfield hardware)" = "false" ] && pass "光标现在是软光标（会画进屏幕）" \
 	|| fail "钩子没生效，光标还是硬件光标"
 grim "$RUNDIR/soft.png" >/dev/null 2>&1
 read -r N0 X0 Y0 W0B H0B <<< "$(ink "$RUNDIR/soft.png")"
-[ "$N0" -gt 0 ] && pass "基线：软光标本来就会进画面（$N0 个像素，$W0B x $H0B）" \
-	|| fail "软光标没进画面？那这条判据没意义"
+[ "$N0" = "0" ] && pass "普通抓帧里没有光标（抓帧是 vidow 自己渲染的一帧，本来就不含光标）" \
+	|| fail "普通抓帧里有 $N0 个非背景像素（$W0B x $H0B）"
 for _ in 1 2 3 4 5; do msg cursor-shake >/dev/null; sleep 0.05; done
 IMG_S=$(cfield image)
-grep -aq "摇晃: 光标放大.*软光标：抓帧时让位" "$LOG" \
+grep -aq "摇晃: 光标放大.*软光标" "$LOG" \
 	&& pass "日志说明是软光标（$IMG_S）" || fail "日志没说软光标"
 grim "$RUNDIR/soft-mag.png" >/dev/null 2>&1
 read -r N1 X1 Y1 W1 H1 <<< "$(ink "$RUNDIR/soft-mag.png")"
-[ "$N1" = "0" ] && pass "**放大中的普通抓帧里一个光标像素都没有**（抓帧让位）" \
-	|| fail "放大中的抓帧里还有 $N1 个像素（$W1 x $H1）—— 让位没生效"
-grep -aq "摇晃: 抓帧让位" "$LOG" && pass "日志记了让位" || fail "日志里没有让位记录"
+[ "$N1" = "0" ] && pass "**放大中的普通抓帧里也没有光标**（软光标也一样）" \
+	|| fail "放大中的抓帧里还有 $N1 个像素（$W1 x $H1）"
 grim -c "$RUNDIR/soft-c.png" >/dev/null 2>&1
 read -r N2 X2 Y2 W2 H2 <<< "$(ink "$RUNDIR/soft-c.png")"
 [ "$W2" = "${IMG_S%x*}" ] && [ "$H2" = "${IMG_S#*x}" ] \

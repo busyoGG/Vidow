@@ -269,6 +269,8 @@ static void layer_surface_map(struct wl_listener *listener, void *data) {
 	layer_open_anim(ls);
 	vidow_arrange_layers(server);
 	vidow_arrange(server);
+	/* 窗口规则里写了 namespace 的那些（capture = "hide" / "mosaic"）管的就是它。 */
+	vidow_rule_apply_layer(server, ls);
 	vidow_ipc_emit_layer(server, "layer-mapped", ls);
 }
 

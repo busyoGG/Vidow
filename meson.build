@@ -65,6 +65,30 @@ xa_server_code = custom_target('xdg-activation-v1-server-protocol.c',
   output: 'xdg-activation-v1-server-protocol.c',
   command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
 
+# 输出抓帧：两个协议都**自己实现**（见 src/capture.c 与 src/screencopy.c ——
+# wlroots 那两份都是把屏幕上那一帧的缓冲直接拷给客户端，capture = "hide" 的窗口
+# 藏不掉），所以服务端头 + 代码自己生成。
+#   - ext-image-capture-source-v1：只要输出抓帧源管理器（ext_image_copy_capture
+#     的会话 / 约束 / dmabuf feedback 仍用 wlroots 那份）。
+#   - wlr-screencopy-unstable-v1：老协议，整份自己实现（wf-recorder 走它）。
+eics_server_header = custom_target('ext-image-capture-source-v1-server-protocol.h',
+  input: 'protocols/ext-image-capture-source-v1.xml',
+  output: 'ext-image-capture-source-v1-server-protocol.h',
+  command: [wayland_scanner, 'server-header', '@INPUT@', '@OUTPUT@'])
+eics_server_code = custom_target('ext-image-capture-source-v1-server-protocol.c',
+  input: 'protocols/ext-image-capture-source-v1.xml',
+  output: 'ext-image-capture-source-v1-server-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
+sc_xml = 'protocols/wlr-screencopy-unstable-v1.xml'
+sc_server_header = custom_target('wlr-screencopy-unstable-v1-server-protocol.h',
+  input: sc_xml,
+  output: 'wlr-screencopy-unstable-v1-server-protocol.h',
+  command: [wayland_scanner, 'server-header', '@INPUT@', '@OUTPUT@'])
+sc_server_code = custom_target('wlr-screencopy-unstable-v1-server-protocol.c',
+  input: sc_xml,
+  output: 'wlr-screencopy-unstable-v1-server-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
+
 sources = files(
   'src/main.c',
   'src/output.c',
@@ -72,6 +96,7 @@ sources = files(
   'src/view.c',
   'src/input.c',
   'src/cursorfx.c',
+  'src/capturemask.c',
   'src/layer.c',
   'src/float.c',
   'src/drag.c',
@@ -98,7 +123,10 @@ sources = files(
   'src/ipcstate.c',
   'src/portalconf.c',
   'src/xwayland.c',
-) + [layer_shell_header, bgeffect_header, xa_server_header]
+  'src/capture.c',
+  'src/screencopy.c',
+) + [layer_shell_header, bgeffect_header, xa_server_header,
+     eics_server_header, sc_server_header]
 
 # 测试工具：用虚拟指针模拟鼠标拖拽
 vp_xml = 'protocols/wlr-virtual-pointer-unstable-v1.xml'
@@ -277,7 +305,11 @@ executable('xpopup',
   install: false)
 
 executable('vidow',
-  sources + [bgeffect_code, xa_server_code],
+  # etl_code：ext-image-capture-source-v1 的服务端代码要引
+  # ext_foreign_toplevel_handle_v1_interface（窗口抓帧源的参数类型），那个
+  # interface 结构在这个协议的 private-code 里（libwlroots 没导出这些符号）。
+  sources + [bgeffect_code, xa_server_code, eics_server_code, sc_server_code,
+             etl_code],
   dependencies: [wlroots_dep, xkbcommon_dep, wayland_server_dep, math_dep,
                  egl_dep, gles2_dep, pixman_dep, lua_dep, xcb_dep,
                  xcb_xfixes_dep, drm_dep],

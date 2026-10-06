@@ -38,12 +38,31 @@
 
 struct vidow_server;
 struct vidow_view;
+struct vidow_layer_surface;
+
+/* 抓帧遮挡：这个窗口 / layer 在别人截图、录屏的时候怎么出现。
+ *   OFF    不管（默认）
+ *   HIDE   完全不出现（那块地方露出它背后的东西）
+ *   MOSAIC 出现，但是打马赛克（真实内容降采样再放大，看得出布局看不出字） */
+enum vidow_capture_mode {
+	VIDOW_CAPTURE_OFF = 0,
+	VIDOW_CAPTURE_HIDE,
+	VIDOW_CAPTURE_MOSAIC,
+};
+
+/* 马赛克块边长（屏幕像素）的默认值：16px 的块在 1080p 上大概 120 格宽，
+ * 看得出版面、看不出字。 */
+#define VIDOW_CAPTURE_MOSAIC_DEFAULT 16
 
 struct vidow_rule {
 	struct wl_list link; /* vidow_server.rules */
 	char app_id[128];    /* 空 = 不限 */
 	char title[128];
 	char klass[128];     /* X11 的 WM_CLASS */
+	/* layer-shell 的 namespace（waybar / mako / swaync …）。**写了它这条规则就
+	 * 只管 layer surface**，窗口匹配直接跳过它 —— 否则一条只写了 namespace 的
+	 * 规则会因为 app_id / title / class 全空而匹配上所有窗口。 */
+	char namespace[128];
 
 	bool has_force_render;
 	bool force_render;
@@ -70,6 +89,13 @@ struct vidow_rule {
 	 * 就是「这个客户端没按 2 倍画，别除」。 */
 	bool has_scale;
 	double scale;
+
+	/* 抓帧遮挡（enum vidow_capture_mode）；has_capture = false 时不动。
+	 * capture_mosaic 是马赛克的块边长（屏幕像素），只在 MOSAIC 下有用。 */
+	bool has_capture;
+	int capture;
+	bool has_capture_mosaic;
+	int capture_mosaic;
 };
 
 /* 一条规则的内容。字段多，用结构体传：全是「有没有写 / 写的什么」成对的开关，
@@ -78,6 +104,7 @@ struct vidow_rule_spec {
 	const char *app_id;
 	const char *title;
 	const char *klass;
+	const char *namespace;
 
 	bool has_force_render;
 	bool force_render;
@@ -94,20 +121,26 @@ struct vidow_rule_spec {
 
 	bool has_scale;
 	double scale;
+
+	bool has_capture;
+	int capture;
+	bool has_capture_mosaic;
+	int capture_mosaic;
 };
 
 bool vidow_rule_init(struct vidow_server *server);
 
 /* 加一条规则（Lua 那边解析完表之后调）。至少要写一个作用（force_render / hz /
- * focus_on_open / focus_on_activate / honor_invalid_serial / x11_scale），不然这条
- * 规则什么也不做（调用方负责报错）。 */
+ * focus_on_open / focus_on_activate / honor_invalid_serial / x11_scale / capture），
+ * 不然这条规则什么也不做（调用方负责报错）。 */
 struct vidow_rule *vidow_rule_add(struct vidow_server *server,
 		const struct vidow_rule_spec *spec);
 
 /* 清空（SIGHUP 重载 = 重新声明一遍）。 */
 void vidow_rule_clear(struct vidow_server *server);
 
-/* 这条规则匹配不匹配这个窗口。 */
+/* 这条规则匹配不匹配这个窗口（写了 namespace 的规则只对 layer 生效，这里直接
+ * 返回 false）。 */
 bool vidow_rule_matches(const struct vidow_rule *rule,
 		const struct vidow_view *view);
 
@@ -115,7 +148,12 @@ bool vidow_rule_matches(const struct vidow_rule *rule,
  * 返回强制渲染这个开关有没有变化。 */
 bool vidow_rule_apply(struct vidow_server *server, struct vidow_view *view);
 
-/* 规则重载之后，把新规则套到所有已经开着的窗口上。 */
+/* 把规则套到这个 layer surface 上（它 map 的时候、规则重载时都调）。匹配的是
+ * namespace。 */
+void vidow_rule_apply_layer(struct vidow_server *server,
+		struct vidow_layer_surface *ls);
+
+/* 规则重载之后，把新规则套到所有已经开着的窗口和 layer 上。 */
 void vidow_rule_apply_all(struct vidow_server *server);
 
 size_t vidow_rule_count(const struct vidow_server *server);

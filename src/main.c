@@ -284,12 +284,19 @@ int main(int argc, char *argv[]) {
 	server.output_layout = wlr_output_layout_create(server.display);
 	/* waybar 等客户端要求 zxdg_output_manager_v1 才能拿到输出信息 */
 	wlr_xdg_output_manager_v1_create(server.display, server.output_layout);
-	/* Screen capture: grim / slurp / wf-recorder / OBS all bind this. */
-	server.screencopy = wlr_screencopy_manager_v1_create(server.display);
-	/* 新标准截图/录屏（ext-image-copy-capture）：新版的 grim / wf-recorder /
-	 * OBS 走这条路，比 screencopy 多支持 dmabuf 目标缓冲和逐帧捕获。 */
-	wlr_ext_output_image_capture_source_manager_v1_create(server.display, 1);
-	wlr_ext_image_copy_capture_manager_v1_create(server.display, 1);
+	/* 输出抓帧：grim / slurp / wf-recorder / OBS 走的就是下面这两个协议。
+	 * 两份都是 **vidow 自己实现**的（src/capture.c / src/screencopy.c）：
+	 * wlroots 那两份都是把屏幕上那一帧的缓冲直接拷给客户端，抓到的永远等于
+	 * 屏幕，capture = "hide" 的窗口 / layer 藏不掉。自己出帧之后，抓帧图是
+	 * vidow 另外渲染的一帧 —— 藏起来的东西屏幕上照常显示，只在抓帧里没有。 */
+	server.capture_manager = vidow_capture_manager_create(server.display, &server);
+	server.screencopy = vidow_screencopy_create(server.display, &server);
+	/* 会话管线（约束 / dmabuf feedback / 帧回调）仍用 wlroots 那份，只有
+	 * 「输出抓帧源」换成 vidow 的；窗口抓帧源（ext-foreign-toplevel-*）也是
+	 * wlroots 的，所以那边还要靠 capturemask.c 的会话监听兜着。 */
+	server.ext_capture = wlr_ext_image_copy_capture_manager_v1_create(
+		server.display, 1);
+	vidow_capturemask_init(&server);
 	/* 老协议 wlr-export-dmabuf：老版 wf-recorder、OBS 的 wlrobs 插件 */
 	wlr_export_dmabuf_manager_v1_create(server.display);
 	/* zwp_linux_dmabuf_v1 由 renderer 建（wlr_renderer_init_wl_display），

@@ -356,7 +356,7 @@ vidow.rule{ title = "预览", force_render = true, hz = 15 }     -- 这个窗口
 vidow.rule{ class = "Steam", force_render = false }            -- 后面的覆盖前面的
 vidow.rule{ app_id = "vlc", hz = 0 }                           -- 只调节流：不限速
 
--- 一条规则至少写一个作用（force_render / hz / x11_scale），都不写会在配置那一行报错。
+-- 一条规则至少写一个作用（force_render / hz / x11_scale / capture），都不写会在配置那一行报错。
 
 -- 查回来（状态栏 / 自检用；空字段按 * 显示是调用方的事）
 local function star(v) return (v == nil or v == "") and "*" or v end
@@ -369,7 +369,7 @@ end
 
 | 项 | 说明 |
 | --- | --- |
-| 匹配字段 | `app_id` / `title` / `class`（X11 的 `WM_CLASS`），都是**子串、大小写不敏感**；留空 = 不限。三个都空 = 匹配所有窗口（能用，但日志里会打成 `* / *` 提醒你） |
+| 匹配字段 | `app_id` / `title` / `class`（X11 的 `WM_CLASS`），都是**子串、大小写不敏感**；留空 = 不限。三个都空 = 匹配所有窗口（能用，但日志里会打成 `* / *` 提醒你）。写了 `namespace` 的规则只匹配 **layer surface**（按 layer 的 namespace 子串），窗口那条路会跳过它 —— 见「截图 / 录屏里不出现」 |
 | 覆盖顺序 | 按配置里的先后逐条套用，**后面的覆盖前面的**（同一个窗口命中多条时以最后一条为准） |
 | 生效时机 | 建窗口时判一次；标题 / class 变了再判一次；`SIGHUP` 重载规则后把已经开着的窗口全部重判 |
 | 节流 | `force_render_hz = <每秒几帧>`（默认 60，`0` = 不限速）；规则里写 `hz = <n>` 可以逐窗口覆盖。补帧要主动排下一帧，不限速时会一直出帧（headless 后端上量到过 2500fps），所以默认按刷新率给 |
@@ -409,6 +409,70 @@ end
 两个测试客户端也是这次加的：`tools/frames.c`（只按帧回调出帧，每帧打印一行，把「客户端
 还在不在出帧」变成可断言的输出）、`tools/capture.c`（走 ext-image-copy-capture +
 窗口截图源抓某个窗口，打印每帧的像素校验和 —— 校验和不变就说明录到的是冻住的一张）。
+
+## 截图 / 录屏里不出现：`capture = "hide"`（窗口规则 / layer 规则）
+
+给密码管理器、聊天窗口、内部面板这类东西用：**截图、录屏里不出现，屏幕上照常显示**
+（能点、能输入、`vidowmsg windows` 里还是 `visible: true`）。
+
+```lua
+-- 窗口：按 app_id / title / class 子串匹配（和别的规则一样）
+vidow.rule{ app_id = "keepassxc", capture = "hide" }
+
+-- layer surface：写了 namespace 的规则只管 layer（子串匹配 layer 的 namespace）
+vidow.rule{ namespace = "noctalia", capture = "hide" }
+```
+
+### 为什么这件事要自己实现抓帧（`src/capture.c` / `src/screencopy.c`）
+
+wlroots 那两条抓帧路（`zwlr_screencopy_manager_v1` 和 ext-image-copy-capture 的输出抓帧源）
+都是**把屏幕上那一帧的缓冲直接拷给客户端**：screencopy 从 `output->swapchain` 抓一张再
+blit 进客户端缓冲，ext-copy 的输出源监听 `output->events.commit` 把 `state->buffer` 拷走。
+也就是说「抓帧 == 屏幕那一帧」是写死的 —— 藏起来的东西要么在屏幕上也没了，要么在抓帧
+里还在，没有第三种可能（实测过：掩码放在屏幕那一遍渲染之前，抓帧和屏幕一起干净；放在
+之后，抓帧和屏幕一起还在 —— 两次渲染共用同一遍场景状态，没有第二遍可以钻空子）。
+
+所以 vidow 自己出帧：**抓帧那一帧是自己渲染的一遍场景**（渲染前把要藏的节点透明度压 0），
+屏幕上那一帧完全不受影响。渲染用 `wlr_scene_output_build_state()` 写进一块**自己的**
+`scene_output`（配一个假输出），不和屏幕抢 damage 账本 —— 共用的话屏幕会少画一块
+（屏幕上留上一帧的残影）。
+
+- `src/capture.c`：抓帧引擎 + ext-image-copy-capture 的**输出抓帧源**
+  （会话管线 / 约束 / dmabuf feedback 仍用 wlroots 那份）。
+- `src/screencopy.c`：`zwlr_screencopy_manager_v1` 整份自己实现（wf-recorder 走它）。
+- 两条路都支持 wl_shm 与 linux-dmabuf 目标缓冲、区域抓帧、`copy_with_damage` 的
+  damage 事件、以及「把光标画进帧里」（screencopy 的 `overlay_cursor` /
+  ext-copy 的 `PAINT_CURSORS`，`grim -c` 就是后者）。
+- 出帧节奏跟 wlroots 一样：screencopy 的 `copy` 之后**等下一次输出提交**再出帧
+  （当场出帧会让录屏客户端按编码速度空转，实测过 2500fps 那种）；屏幕静止时没有提交，
+  靠 `output.c` 的 capture_watchdog 每 50ms 催一帧。
+
+### 藏法：压透明度，不是关节点
+
+`wlr_scene_node_set_enabled()` 也能让它不进画面，但场景的命中测试会跳过关掉的节点 ——
+窗口就点不着了（输入焦点和 `vidowmsg pick-window` 都走 `wlr_scene_node_at`）。透明度只
+影响合成，命中测试不看它。遮挡只在**渲染抓帧那一瞬间**压上（引用计数，见
+`src/capturemask.c`），所以平时一个字节都不改，屏幕也不会因为「有人在抓帧」而变化。
+
+### 已知漏点
+
+| 漏点 | 说明 |
+| --- | --- |
+| `zwlr_export_dmabuf_manager_v1` | 老协议，导出的是**屏幕那一帧**，藏不掉（vidow 仍然提供它，给老 wlrobs / wf-recorder 用） |
+| 窗口自己弹的 popup | 菜单 / 下拉框是另一个场景节点，不在遮挡范围内（和窗口装饰一样的道理） |
+| 按窗口录屏（`ext-foreign-toplevel` 抓帧源） | 那条路是 wlroots 那份（直接渲染窗口的场景子树），接不进去：有人在抓一个 `capture = "hide"` 的**窗口**时，只能整段时间把它从屏幕上藏起来 —— 这条路仍然是「录屏时窗口也从屏幕上消失」 |
+| 光标 | 抓帧图里**没有光标**（抓帧是场景渲染，场景里没有光标）。要光标得显式要：`grim -c`（走 PAINT_CURSORS，我们按屏幕上的样子把光标画进去，放大摇晃那种大光标也一样）。屏幕上那个放大光标不再为抓帧缩回去 |
+
+### 测试
+
+```bash
+./test-capture-hide.sh   # 25 项断言：规则字段 → grim 抓帧里没有它（0 个蓝像素）→
+                         # 窗口照常能点（pick-window 命中）→ 对照组 capture = "off"
+                         # 照样抓得到 → 嵌套跑证明屏幕上还有它 → **录屏期间屏幕上
+                         # 照样有它**（wf-recorder / screencopy，这次改动的核心）→
+                         # 录像文件里没有它（copy 和 copy_with_damage 各验一遍）→
+                         # layer 的 namespace 规则 → mosaic 的配置报错 → 日志干净
+```
 
 ## 焦点：谁抢焦点、激活请求理不理（窗口规则）
 

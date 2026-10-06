@@ -48,6 +48,10 @@ struct vidow_rule *vidow_rule_add(struct vidow_server *server,
 	if (spec->klass != NULL) {
 		snprintf(rule->klass, sizeof(rule->klass), "%s", spec->klass);
 	}
+	if (spec->namespace != NULL) {
+		snprintf(rule->namespace, sizeof(rule->namespace), "%s",
+			spec->namespace);
+	}
 	rule->has_force_render = spec->has_force_render;
 	rule->force_render = spec->force_render;
 	rule->has_hz = spec->has_hz;
@@ -60,6 +64,10 @@ struct vidow_rule *vidow_rule_add(struct vidow_server *server,
 	rule->honor_invalid_serial = spec->honor_invalid_serial;
 	rule->has_scale = spec->has_scale;
 	rule->scale = spec->scale;
+	rule->has_capture = spec->has_capture;
+	rule->capture = spec->capture;
+	rule->has_capture_mosaic = spec->has_capture_mosaic;
+	rule->capture_mosaic = spec->capture_mosaic;
 	wl_list_insert(server->rules.prev, &rule->link);
 
 	char hz_text[32];
@@ -76,11 +84,24 @@ struct vidow_rule *vidow_rule_add(struct vidow_server *server,
 	} else {
 		snprintf(scale_text, sizeof(scale_text), "X11 按 %.2g 倍除", spec->scale);
 	}
-	wlr_log(WLR_INFO, "rule: app_id=%s title=%s class=%s -> force_render=%s "
-		"补帧=%s 开窗口抢焦点=%s 激活理它=%s 无效serial也理=%s X11缩放=%s",
+	char cap_text[48];
+	if (!spec->has_capture) {
+		snprintf(cap_text, sizeof(cap_text), "不变");
+	} else if (spec->capture == VIDOW_CAPTURE_HIDE) {
+		snprintf(cap_text, sizeof(cap_text), "抓帧里不出现");
+	} else if (spec->capture == VIDOW_CAPTURE_MOSAIC) {
+		snprintf(cap_text, sizeof(cap_text), "抓帧里打马赛克%s",
+			spec->has_capture_mosaic ? "" : "（块大小用默认）");
+	} else {
+		snprintf(cap_text, sizeof(cap_text), "照常出现");
+	}
+	wlr_log(WLR_INFO, "rule: app_id=%s title=%s class=%s layer=%s -> "
+		"force_render=%s 补帧=%s 开窗口抢焦点=%s 激活理它=%s 无效serial也理=%s "
+		"X11缩放=%s 抓帧=%s",
 		rule->app_id[0] != '\0' ? rule->app_id : "*",
 		rule->title[0] != '\0' ? rule->title : "*",
 		rule->klass[0] != '\0' ? rule->klass : "*",
+		rule->namespace[0] != '\0' ? rule->namespace : "*",
 		spec->has_force_render ?
 			(spec->force_render ? "on" : "off") : "不变",
 		hz_text,
@@ -90,7 +111,7 @@ struct vidow_rule *vidow_rule_add(struct vidow_server *server,
 			(spec->focus_on_activate ? "on" : "off") : "不变",
 		spec->has_honor_invalid_serial ?
 			(spec->honor_invalid_serial ? "on" : "off") : "不变",
-		scale_text);
+		scale_text, cap_text);
 	return rule;
 }
 
@@ -110,6 +131,11 @@ bool vidow_rule_matches(const struct vidow_rule *rule,
 	const char *klass = view->kind == VIDOW_VIEW_X11 && view->x11 != NULL ?
 		view->x11->class : NULL;
 
+	/* 写了 namespace 的规则是给 layer surface 的（窗口没有 namespace）。不跳过
+	 * 的话，一条只写 namespace 的规则会因为下面三个字段全空而匹配上所有窗口。 */
+	if (rule->namespace[0] != '\0') {
+		return false;
+	}
 	if (!contains(app_id, rule->app_id)) {
 		return false;
 	}
@@ -138,6 +164,9 @@ bool vidow_rule_apply(struct vidow_server *server, struct vidow_view *view) {
 	bool honor_invalid_serial = false;
 	/* X11 缩放桥：0 = 跟随全局 xwayland_scale（规则没写就是这个）。 */
 	double x11_scale = 0.0;
+	/* 抓帧遮挡：默认不管（照常出现在截图里）。块大小只在 MOSAIC 下有用。 */
+	int capture = VIDOW_CAPTURE_OFF;
+	int capture_mosaic = VIDOW_CAPTURE_MOSAIC_DEFAULT;
 	struct vidow_rule *rule;
 	wl_list_for_each(rule, &server->rules, link) {
 		if (!vidow_rule_matches(rule, view)) {
@@ -162,6 +191,12 @@ bool vidow_rule_apply(struct vidow_server *server, struct vidow_view *view) {
 		}
 		if (rule->has_scale) {
 			x11_scale = rule->scale;
+		}
+		if (rule->has_capture) {
+			capture = rule->capture;
+		}
+		if (rule->has_capture_mosaic) {
+			capture_mosaic = rule->capture_mosaic;
 		}
 	}
 	/* 没写 hz 就用全局的 force_render_hz（0 = 不限）。 */
@@ -197,6 +232,21 @@ bool vidow_rule_apply(struct vidow_server *server, struct vidow_view *view) {
 	bool changed = view->force_render != want;
 	view->force_render = want;
 	view->pump_interval_ms = interval;
+
+	/* 抓帧遮挡：模式变了才记一行（这个开关平时看不见，出问题时日志是唯一的
+	 * 线索）。已经藏起来的节点不用在这里放出来 —— 下一帧渲染开头会统一放
+	 * （见 capturemask.c），那时候按新规则决定还藏不藏。 */
+	if (view->capture_mode != capture) {
+		view->capture_mode = capture;
+		view->capture_mosaic = capture_mosaic;
+		wlr_log(WLR_INFO, "rule: %s 抓帧遮挡 = %s",
+			vidow_view_title(view) != NULL ? vidow_view_title(view) : "(无题)",
+			capture == VIDOW_CAPTURE_HIDE ? "不出现" :
+			capture == VIDOW_CAPTURE_MOSAIC ? "马赛克" : "关");
+	} else {
+		view->capture_mosaic = capture_mosaic;
+	}
+
 	if (!changed) {
 		return false;
 	}
@@ -207,10 +257,49 @@ bool vidow_rule_apply(struct vidow_server *server, struct vidow_view *view) {
 	return true;
 }
 
+void vidow_rule_apply_layer(struct vidow_server *server,
+		struct vidow_layer_surface *ls) {
+	if (ls == NULL || ls->layer_surface == NULL) {
+		return;
+	}
+	const char *ns = ls->layer_surface->namespace;
+	/* 逐条套用，后面的覆盖前面的（和窗口规则一样）。只有写了 namespace 的规则
+	 * 才管 layer。 */
+	int capture = VIDOW_CAPTURE_OFF;
+	int capture_mosaic = VIDOW_CAPTURE_MOSAIC_DEFAULT;
+	struct vidow_rule *rule;
+	wl_list_for_each(rule, &server->rules, link) {
+		if (rule->namespace[0] == '\0' ||
+				!contains(ns, rule->namespace)) {
+			continue;
+		}
+		if (rule->has_capture) {
+			capture = rule->capture;
+		}
+		if (rule->has_capture_mosaic) {
+			capture_mosaic = rule->capture_mosaic;
+		}
+	}
+	if (ls->capture_mode == capture) {
+		ls->capture_mosaic = capture_mosaic;
+		return;
+	}
+	ls->capture_mode = capture;
+	ls->capture_mosaic = capture_mosaic;
+	wlr_log(WLR_INFO, "rule: layer %s 抓帧遮挡 = %s",
+		ns != NULL ? ns : "(无 namespace)",
+		capture == VIDOW_CAPTURE_HIDE ? "不出现" :
+		capture == VIDOW_CAPTURE_MOSAIC ? "马赛克" : "关");
+}
+
 void vidow_rule_apply_all(struct vidow_server *server) {
 	struct vidow_view *view;
 	wl_list_for_each(view, &server->views, link) {
 		vidow_rule_apply(server, view);
+	}
+	struct vidow_layer_surface *ls;
+	wl_list_for_each(ls, &server->layers, link) {
+		vidow_rule_apply_layer(server, ls);
 	}
 }
 

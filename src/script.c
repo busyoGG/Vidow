@@ -347,19 +347,45 @@ static int l_rule(lua_State *L) {
 	spec.scale = spec.has_scale ? lua_tonumber(L, -1) : 0.0;
 	lua_pop(L, 1);
 
+	/* 抓帧遮挡：截图 / 录屏里这个窗口怎么出现。
+	 *   "off"  = 照常出现（默认）
+	 *   "hide" = 不出现
+	 * 写了 namespace 的规则管的是 layer surface，不写就管窗口。 */
+	const char *cap = table_string(L, 1, "capture");
+	spec.has_capture = cap != NULL;
+	if (cap != NULL) {
+		if (strcmp(cap, "hide") == 0) {
+			spec.capture = VIDOW_CAPTURE_HIDE;
+		} else if (strcmp(cap, "off") == 0 || cap[0] == '\0') {
+			spec.capture = VIDOW_CAPTURE_OFF;
+		} else {
+			return luaL_error(L, "vidow.rule 的 capture 只能是 \"off\" 或 "
+				"\"hide\"（\"mosaic\" 还没做），给的是 \"%s\"", cap);
+		}
+	}
+	/* 马赛克的块边长（屏幕像素）。只在 capture = "mosaic" 下有用 —— 单独写它
+	 * 不算一条作用，所以不参与下面那个「至少写一个作用」的检查。 */
+	lua_getfield(L, 1, "capture_mosaic");
+	spec.has_capture_mosaic = !lua_isnil(L, -1);
+	spec.capture_mosaic = spec.has_capture_mosaic ?
+		(int)lua_tointeger(L, -1) : VIDOW_CAPTURE_MOSAIC_DEFAULT;
+	lua_pop(L, 1);
+
 	if (!spec.has_force_render && !spec.has_hz && !spec.has_focus_on_open &&
 			!spec.has_focus_on_activate && !spec.has_honor_invalid_serial &&
-			!spec.has_scale) {
+			!spec.has_scale && !spec.has_capture) {
 		return luaL_error(L, "vidow.rule 至少写一个作用：force_render = true / "
 			"hz = <每秒补几帧，0 = 不限> / focus_on_open = false / "
 			"focus_on_activate = false / honor_invalid_serial = true / "
-			"x11_scale = <X11 缩放桥，1 = 不除>"
-			"（匹配字段：app_id / title / class）");
+			"x11_scale = <X11 缩放桥，1 = 不除> / capture = \"hide\""
+			"（匹配字段：app_id / title / class / namespace —— 写了 namespace "
+			"这条规则就管 layer surface）");
 	}
 
 	spec.app_id = table_string(L, 1, "app_id");
 	spec.title = table_string(L, 1, "title");
 	spec.klass = table_string(L, 1, "class");
+	spec.namespace = table_string(L, 1, "namespace");
 	struct vidow_rule *rule = vidow_rule_add(s->server, &spec);
 	if (rule == NULL) {
 		return luaL_error(L, "cannot add a window rule");
@@ -396,6 +422,8 @@ static int l_rules(lua_State *L) {
 		lua_setfield(L, -2, "title");
 		lua_pushstring(L, rule->klass);
 		lua_setfield(L, -2, "class");
+		lua_pushstring(L, rule->namespace);
+		lua_setfield(L, -2, "namespace");
 		if (rule->has_force_render) {
 			lua_pushboolean(L, rule->force_render);
 		} else {
@@ -420,6 +448,19 @@ static int l_rules(lua_State *L) {
 			lua_pushnil(L);
 		}
 		lua_setfield(L, -2, "x11_scale");
+		if (rule->has_capture) {
+			lua_pushstring(L, rule->capture == VIDOW_CAPTURE_HIDE ? "hide" :
+				rule->capture == VIDOW_CAPTURE_MOSAIC ? "mosaic" : "off");
+		} else {
+			lua_pushnil(L);
+		}
+		lua_setfield(L, -2, "capture");
+		if (rule->has_capture_mosaic) {
+			lua_pushinteger(L, rule->capture_mosaic);
+		} else {
+			lua_pushnil(L);
+		}
+		lua_setfield(L, -2, "capture_mosaic");
 		lua_settable(L, -3);
 	}
 	return 1;

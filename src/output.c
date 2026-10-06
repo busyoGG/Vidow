@@ -66,11 +66,10 @@ void vidow_output_render(struct vidow_output *output) {
 	 * instead of stretching the animation. */
 	vidow_anim_tick(server);
 
-	/* 抓帧让位：放大图这会儿是软光标的话，抓帧这一帧先换回原尺寸那张
-	 * （见 cursorfx.c）—— 画面上照样有光标，抓到的帧里一个光标像素都没有。 */
-	bool guarded = vidow_cursor_fx_capture_guard(server, output->wlr_output);
+	/* 屏幕这一帧就是屏幕这一帧：抓帧是 vidow 自己另外渲染的一遍（capture.c /
+	 * screencopy.c），和这里没有任何关系 —— capture = "hide" 的窗口 / layer
+	 * 屏幕上照常显示，只在抓帧里没有。 */
 	wlr_scene_output_commit(output->scene_output, NULL);
-	vidow_cursor_fx_capture_unguard(server, output->wlr_output, guarded);
 
 	struct timespec now;
 	clock_gettime(CLOCK_MONOTONIC, &now);
@@ -80,6 +79,7 @@ void vidow_output_render(struct vidow_output *output) {
 	 * 画面上的窗口场景那边已经给过回调了，这里只补没画到的那些。 */
 	vidow_view_render_pump(server, output,
 		(uint32_t)(now.tv_sec * 1000 + now.tv_nsec / 1000000));
+
 }
 
 /* 补帧闹钟到点：催一帧出来（渲染里会走到 vidow_view_render_pump，到点的窗口就补上）。
@@ -97,8 +97,7 @@ static int pump_timer_cb(void *data) {
  * outstanding and render for it directly. */
 static int capture_watchdog(void *data) {
 	struct vidow_server *server = data;
-	bool pending = server->screencopy != NULL &&
-		!wl_list_empty(&server->screencopy->frames);
+	bool pending = vidow_screencopy_has_pending(server->screencopy);
 	if (pending) {
 		struct vidow_output *output;
 		wl_list_for_each(output, &server->outputs, link) {

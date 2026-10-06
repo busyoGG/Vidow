@@ -656,6 +656,9 @@ void vidow_ipc_json_rules(struct jbuf *b, struct vidow_server *server) {
 		jb_kv_str(b, "app_id", rule->app_id[0] != '\0' ? rule->app_id : NULL);
 		jb_kv_str(b, "title", rule->title[0] != '\0' ? rule->title : NULL);
 		jb_kv_str(b, "class", rule->klass[0] != '\0' ? rule->klass : NULL);
+		/* 写了 namespace 的规则管的是 layer surface，不写就管窗口。 */
+		jb_kv_str(b, "namespace",
+			rule->namespace[0] != '\0' ? rule->namespace : NULL);
 		jb_key(b, "force_render");
 		if (rule->has_force_render) {
 			jb_bool(b, rule->force_render);
@@ -689,6 +692,20 @@ void vidow_ipc_json_rules(struct jbuf *b, struct vidow_server *server) {
 		jb_key(b, "x11_scale");
 		if (rule->has_scale) {
 			jb_double(b, rule->scale);
+		} else {
+			jb_null(b);
+		}
+		/* 抓帧遮挡：截图 / 录屏里这个窗口怎么出现 */
+		jb_key(b, "capture");
+		if (rule->has_capture) {
+			jb_str(b, rule->capture == VIDOW_CAPTURE_HIDE ? "hide" :
+				rule->capture == VIDOW_CAPTURE_MOSAIC ? "mosaic" : "off");
+		} else {
+			jb_null(b);
+		}
+		jb_key(b, "capture_mosaic");
+		if (rule->has_capture_mosaic) {
+			jb_int(b, rule->capture_mosaic);
 		} else {
 			jb_null(b);
 		}

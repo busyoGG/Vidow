@@ -1762,7 +1762,8 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 		x - pad_ov + (dst_w0 - dst_w) / 2,
 		y - pad_ov + (dst_h0 - dst_h) / 2);
 	wlr_scene_buffer_set_dest_size(fx->node, dst_w, dst_h);
-	wlr_scene_buffer_set_opacity(fx->node, 1.0f);
+	/* 被抓帧遮挡压着的窗口，这一帧也照样压着（抓帧随时可能在两帧之间渲染）。 */
+	wlr_scene_buffer_set_opacity(fx->node, fx->masked ? 0.0f : 1.0f);
 
 	/* Full-buffer damage: the node is re-rendered every frame of the effect. */
 	pixman_region32_t damage;
@@ -2130,7 +2131,8 @@ static bool layer_blur_frame(struct vidow_server *server,
 
 	wlr_scene_node_set_position(&fx->node->node, 0, 0);
 	wlr_scene_buffer_set_dest_size(fx->node, logical_w, logical_h);
-	wlr_scene_buffer_set_opacity(fx->node, 1.0f);
+	/* 同上：layer surface 也会被抓帧遮挡压着。 */
+	wlr_scene_buffer_set_opacity(fx->node, fx->masked ? 0.0f : 1.0f);
 	pixman_region32_t damage;
 	pixman_region32_init_rect(&damage, 0, 0, logical_w, logical_h);
 	wlr_scene_buffer_set_buffer_with_damage(fx->node, target, &damage);

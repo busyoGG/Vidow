@@ -938,7 +938,8 @@ void vidow_view_apply_anim(struct vidow_view *view) {
 		view_scale(view) * ov, ov);
 	/* 装饰图真的画上屏了才把真实表面藏起来（只留给命中测试）。没画出来
 	 * 还藏就是窗口整个消失 —— 关掉 decor/shader 时踩过，屏幕一片黑。 */
-	wlr_scene_buffer_set_opacity(src, fx_drawn ? 0.0f : 1.0f);
+	wlr_scene_buffer_set_opacity(src,
+		(fx_drawn || view->mask_opacity) ? 0.0f : 1.0f);
 }
 
 /* 从 wlr_surface 找回它的窗口：文本输入和 ext-background-effect 都要用。
