@@ -19,6 +19,8 @@
 #      放大图 —— 屏幕上那个光标一直是放大的，不用为抓帧缩回去
 #   9) 客户端自己设的光标（wl_pointer.set_cursor 的 surface）也能放大，而且还原的是
 #      **客户端那张**（不是主题箭头）
+#   9b) 放大中焦点切到**别的窗口**（新客户端 set_cursor）不许把放大缩回去 ——
+#      用户报的「光标放大在焦点切换的时候会直接重置」
 #  10) cursor_shake = false：晃不放大、cursor-shake 被拒且理由点得到配置
 #  11) cursor_shake_scale：1.5 → 1.5 倍；20 → 被屏幕尺寸封顶
 #  12) 日志里没有 assert / abort
@@ -416,6 +418,42 @@ else
 		&& pass "还原成客户端那张（$IMG_C），没变成主题箭头" \
 		|| fail "还原后是 $(cfield image)，期望客户端那张 $IMG_C"
 fi
+
+	# 9b) 放大中焦点切到另一个「自己设光标」的窗口：新客户端 set_cursor 不许把
+	#     放大缩回去（老行为：vidow_cursor_fx_set_surface 直接把放大整个收掉）。
+	python3 tools/cursorwin.py second > "$RUNDIR/second.log" 2>&1 &
+	SECOND_PID=$!
+	for _ in $(seq 1 40); do
+		grep -aq "place second" "$LOG" && break
+		sleep 0.25
+	done
+	SPLACE=$(grep -a "place second" "$LOG" | tail -1)
+	if [ -z "$SPLACE" ]; then
+		fail "第二个客户端窗口没起来（9b 测不到东西）"
+	else
+		SX=$(echo "$SPLACE" | sed 's/.*-> \([0-9-]*\),[0-9-]* .*/\1/')
+		SY=$(echo "$SPLACE" | sed 's/.*-> [0-9-]*,\([0-9-]*\) .*/\1/')
+		msg move-cursor $((WX + 120)) $((WY + 120)) >/dev/null
+		sleep 0.2
+		# 保持期内（700ms）先晃着、再切过去，窗口不等人
+		msg cursor-shake >/dev/null
+		sleep 0.05
+		msg cursor-shake >/dev/null
+		sleep 0.05
+		BIGTARGET=$(cfield target)
+		msg move-cursor $((SX + 120)) $((SY + 120)) >/dev/null
+		sleep 0.3
+		[ "$(cfield magnified)" = "true" ] \
+			&& pass "切到另一个窗口后还放大着（magnified=true）" \
+			|| fail "切窗口把放大缩回去了（用户报的那个）"
+		[ "$(cfield target)" = "$BIGTARGET" ] \
+			&& pass "放大目标没变：$BIGTARGET 倍" \
+			|| fail "放大目标从 $BIGTARGET 变成 $(cfield target)"
+		grep -aq "光标图换了，放大图跟着换" "$LOG" \
+			&& pass "日志记下了「光标图换了，放大图跟着换」（新图被重新放大）" \
+			|| fail "没有「光标图换了」的日志（新图没被放大）"
+	fi
+	kill "$SECOND_PID" 2>/dev/null
 kill "$CURWIN_PID" 2>/dev/null
 
 # ------------------------------------------------------------ 10) 关掉

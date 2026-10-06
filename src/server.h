@@ -291,6 +291,13 @@ struct vidow_gl_prog {
 	int u_tex, u_texel, u_offset;
 };
 
+/* 任意四边形网格（jelly.c 的果冻形变用）：顶点直接给「渲染目标物理像素坐标 +
+ * 源贴图归一化 UV」，片元就是采样。 */
+struct vidow_mesh_prog {
+	unsigned int program;
+	int u_texture, u_size;
+};
+
 /* The built-in decoration program: rounded corners, border, drop shadow,
  * blurred backdrop and grain. */
 struct vidow_decor_prog {
@@ -1147,6 +1154,7 @@ struct vidow_server {
 	struct vidow_config config;
 	struct vidow_decor_prog decor;
 	struct vidow_gl_prog kawase_down, kawase_up;
+	struct vidow_mesh_prog mesh;
 	struct wlr_texture *empty_tex; /* 1x1 transparent, for disabled samplers */
 	uint64_t blur_serial;          /* hands out blur texture identities */
 
@@ -1456,6 +1464,8 @@ struct vidow_shader *vidow_shader_get(struct vidow_server *server,
 /* 起手：把窗口现在显示的那块带装饰的离屏图切成网格挂到弹簧上。要窗口有装饰
  * 节点（fx 节点）才能做；做不了就返回 false，拖动照旧、只是不弯。 */
 bool vidow_jelly_begin(struct vidow_view *view);
+/* 抓底衬期间把果冻节点也藏起来（它是窗口内容的另一份拷贝）。 */
+void vidow_jelly_capture_visible(struct vidow_view *view, bool on);
 /* 松手：解掉抓点，整张网自己晃回去，晃静了自动交接（装饰节点重新露出来）。 */
 void vidow_jelly_release(struct vidow_view *view);
 /* 立刻收掉（源对不上了 / 松手收尾结束）。 */
@@ -1479,6 +1489,11 @@ bool vidow_fx_begin(struct vidow_server *server, struct vidow_fx_target *fx,
 /* geo = 可见窗口在源缓冲里的位置/尺寸（见 struct vidow_fx_geo）；x/y 是可见窗口
  * 左上角在 fx 节点父坐标系里的位置（视图里就是 0,0：场景树节点的原点就是窗口
  * 原点），装饰矩形会摆在它外面一圈 pad 的地方。 */
+/* 把一张贴图按任意三角形网格画进 dst（jelly.c 用）。verts 里每项 4 个 float：
+ * x, y（渲染目标物理像素）, u, v（源贴图归一化）。 */
+bool vidow_fx_draw_mesh(struct vidow_server *server, struct wlr_buffer *dst,
+	int w, int h, struct wlr_texture *src, const float *verts, int n_verts);
+
 bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 		struct wlr_scene_buffer *src, const struct vidow_fx_geo *geo,
 		int x, int y, int ox, int oy,
@@ -1609,6 +1624,8 @@ void vidow_cursor_fx_set_surface(struct vidow_server *server,
 		struct wlr_surface *surface, int32_t hx, int32_t hy);
 /* 指针底下没窗口了，该显示主题默认箭头。放大期间不动真图，只记状态。 */
 void vidow_cursor_fx_default_cursor(struct vidow_server *server);
+/* 光标图换了（客户端 set_cursor / 焦点切换）：放大中就换成新图，别缩回去。 */
+void vidow_cursor_fx_cursor_changed(struct vidow_server *server);
 /* 光标状态（magnified / scale / image / hardware / hw_max），写进当前 JSON 对象。 */
 struct jbuf;
 void vidow_cursor_fx_json(struct jbuf *b, struct vidow_server *server);

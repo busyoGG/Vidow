@@ -425,11 +425,13 @@ static void server_request_cursor(struct wl_listener *listener, void *data) {
 	if (focused != event->seat_client) {
 		return;
 	}
-	/* 先告诉摇晃放大「光标图要换了」（放大中就直接收摊），再设上去。 */
+	/* 先告诉摇晃放大「光标图要换了」，再设上去，最后让它把新图重新放大一遍
+	 * —— 放大期间客户端换光标（焦点切到别的窗口就会）不再把放大缩回去。 */
 	vidow_cursor_fx_set_surface(server, event->surface, event->hotspot_x,
 		event->hotspot_y);
 	wlr_cursor_set_surface(server->cursor, event->surface, event->hotspot_x,
 		event->hotspot_y);
+	vidow_cursor_fx_cursor_changed(server);
 }
 
 static void server_request_set_selection(struct wl_listener *listener,

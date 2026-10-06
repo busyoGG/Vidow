@@ -87,6 +87,7 @@ struct vidow_jelly {
 
 	int cols, rows;      /* 格子数 */
 	int nx, ny;          /* 节点数 = cols + 1 / rows + 1 */
+	float *verts;        /* 网格顶点：[x, y, u, v] × rows*cols*6，见 jelly_render */
 	float *ox, *oy;      /* 每个节点的偏移（逻辑像素） */
 	float *vx, *vy;      /* 每个节点的速度 */
 	float *lx, *ly;      /* 每个节点的「滞后位置」（跟底座跟得慢的那个版本） */
@@ -160,21 +161,22 @@ static bool jelly_node_rejects_input(struct wlr_scene_buffer *buffer, double *sx
 	return false;
 }
 
-/* 第 j 列节点的 x（设备像素，缓冲局部坐标）= 该在的位置 + 偏移。 */
-static int jelly_node_x(struct vidow_jelly *jelly, int row, int col) {
+/* 第 j 列节点的 x（设备像素，缓冲局部坐标）= 该在的位置 + 偏移。**不取整**：
+ * 网格顶点直接拿小数进光栅器，相邻格才严丝合缝（取整就是那条锯齿边）。 */
+static double jelly_node_xf(struct vidow_jelly *jelly, int row, int col) {
 	int k = row * jelly->nx + col;
 	double step = (double)jelly->src_w / (double)jelly->cols;
 	double x = jelly->margin_px + step * col +
 		(double)jelly->ox[k] * jelly->scale * jelly->strength * jelly->kill;
-	return clampi((int)lround(x), 0, jelly->buf_w);
+	return clampd(x, 0.0, (double)jelly->buf_w);
 }
 
-static int jelly_node_y(struct vidow_jelly *jelly, int row, int col) {
+static double jelly_node_yf(struct vidow_jelly *jelly, int row, int col) {
 	int k = row * jelly->nx + col;
 	double step = (double)jelly->src_h / (double)jelly->rows;
 	double y = jelly->margin_px + step * row +
 		(double)jelly->oy[k] * jelly->scale * jelly->strength * jelly->kill;
-	return clampi((int)lround(y), 0, jelly->buf_h);
+	return clampd(y, 0.0, (double)jelly->buf_h);
 }
 
 /* ---------------------------------------------------------------- 释放 */
@@ -317,6 +319,8 @@ bool vidow_jelly_begin(struct vidow_view *view) {
 	jelly->nx = jelly->cols + 1;
 	jelly->ny = jelly->rows + 1;
 	size_t n = (size_t)jelly->nx * (size_t)jelly->ny;
+	jelly->verts = calloc((size_t)jelly->rows * (size_t)jelly->cols * 24,
+		sizeof(float));
 	jelly->ox = calloc(n, sizeof(float));
 	jelly->oy = calloc(n, sizeof(float));
 	jelly->vx = calloc(n, sizeof(float));
@@ -330,7 +334,8 @@ bool vidow_jelly_begin(struct vidow_view *view) {
 		jelly->target[i] = vidow_alloc_target(server, jelly->buf_w,
 			jelly->buf_h);
 	}
-	if (jelly->ox == NULL || jelly->oy == NULL || jelly->vx == NULL ||
+	if (jelly->verts == NULL ||
+			jelly->ox == NULL || jelly->oy == NULL || jelly->vx == NULL ||
 			jelly->vy == NULL || jelly->gw2 == NULL || jelly->gcc == NULL ||
 			jelly->gtau == NULL || jelly->lx == NULL || jelly->ly == NULL ||
 			jelly->target[0] == NULL ||
@@ -411,6 +416,17 @@ bool vidow_jelly_begin(struct vidow_view *view) {
 	return true;
 }
 
+/* 抓模糊底衬的时候要把这个窗口**整块**藏起来 —— 果冻节点是窗口内容的另一份
+ * 拷贝（弯的那份），只关 fx 节点不够：抓出来的底衬里会留着这个窗口自己上一帧
+ * 的形变图。透明的窗口一拖就是「背景里错位的竖线 / 重影」、模糊看着也没了。
+ * 见 fx.c 的 view_set_capture_visible。 */
+void vidow_jelly_capture_visible(struct vidow_view *view, bool on) {
+	if (view == NULL || view->jelly == NULL || view->jelly->node == NULL) {
+		return;
+	}
+	wlr_scene_node_set_enabled(&view->jelly->node->node, on);
+}
+
 /* 松手：解掉钉住的那个节点，整张网自己晃回去。窗口的位置照旧归布局管。 */
 void vidow_jelly_release(struct vidow_view *view) {
 	if (view == NULL || view->jelly == NULL) {
@@ -489,72 +505,42 @@ static void jelly_render(struct vidow_jelly *jelly) {
 	if (tex == NULL) {
 		return;
 	}
-	struct wlr_render_pass *pass = wlr_renderer_begin_buffer_pass(
-		server->renderer, target, NULL);
-	if (pass == NULL) {
-		wlr_texture_destroy(tex);
-		return;
-	}
 
-	struct wlr_render_rect_options clear = {
-		.box = { .x = 0, .y = 0, .width = jelly->buf_w, .height = jelly->buf_h },
-		.color = { .r = 0.0f, .g = 0.0f, .b = 0.0f, .a = 0.0f },
-		.blend_mode = WLR_RENDER_BLEND_MODE_NONE,
-	};
-	wlr_render_pass_add_rect(pass, &clear);
-
-	double cw = (double)jelly->src_w / jelly->cols;
-	double ch = (double)jelly->src_h / jelly->rows;
+	/* 网格：每格两个三角形，顶点是**相邻格共用**的那几个（节点坐标不取整，
+	 * 直接给小数）—— 相邻格边界严丝合缝，既不会留缝也不会重叠。 */
+	int n = 0;
 	for (int i = 0; i < jelly->rows; i++) {
 		for (int j = 0; j < jelly->cols; j++) {
-			int x0 = jelly_node_x(jelly, i, j);
-			int x1 = jelly_node_x(jelly, i, j + 1);
-			int y0 = jelly_node_y(jelly, i, j);
-			int y1 = jelly_node_y(jelly, i + 1, j);
-			/* 相邻两行（两列）的边界各自取整之后可能差 1px：把这一格往
-			 * 邻格那边撑 1px。宁可重叠也不能留缝 —— 一条透光的缝在窗口
-			 * 中间比什么都显眼，重叠顶多在阴影那圈浓一点点。 */
-			if (i + 1 < jelly->rows) {
-				int a = jelly_node_x(jelly, i + 1, j);
-				int b = jelly_node_x(jelly, i + 1, j + 1);
-				if (a < x0) {
-					x0 = a;
-				}
-				if (b > x1) {
-					x1 = b;
-				}
-			}
-			if (j + 1 < jelly->cols) {
-				int a = jelly_node_y(jelly, i, j + 1);
-				int b = jelly_node_y(jelly, i + 1, j + 1);
-				if (a < y0) {
-					y0 = a;
-				}
-				if (b > y1) {
-					y1 = b;
-				}
-			}
-			if (x1 <= x0 || y1 <= y0) {
-				continue;
-			}
-			struct wlr_render_texture_options opt = {
-				.texture = tex,
-				.src_box = {
-					.x = (float)(j * cw),
-					.y = (float)(i * ch),
-					.width = (float)cw,
-					.height = (float)ch,
-				},
-				.dst_box = { .x = x0, .y = y0,
-					.width = x1 - x0, .height = y1 - y0 },
-				.filter_mode = WLR_SCALE_FILTER_BILINEAR,
-				.blend_mode = WLR_RENDER_BLEND_MODE_PREMULTIPLIED,
-			};
-			wlr_render_pass_add_texture(pass, &opt);
+			float x0 = (float)jelly_node_xf(jelly, i, j);
+			float x1 = (float)jelly_node_xf(jelly, i, j + 1);
+			float x2 = (float)jelly_node_xf(jelly, i + 1, j);
+			float x3 = (float)jelly_node_xf(jelly, i + 1, j + 1);
+			float y0 = (float)jelly_node_yf(jelly, i, j);
+			float y1 = (float)jelly_node_yf(jelly, i, j + 1);
+			float y2 = (float)jelly_node_yf(jelly, i + 1, j);
+			float y3 = (float)jelly_node_yf(jelly, i + 1, j + 1);
+			float u0 = (float)j / (float)jelly->cols;
+			float u1 = (float)(j + 1) / (float)jelly->cols;
+			float v0 = (float)i / (float)jelly->rows;
+			float v1 = (float)(i + 1) / (float)jelly->rows;
+			float *w = jelly->verts + (size_t)n * 4;
+			/* 左下三角 (x0,y0)-(x1,y1)-(x2,y2) */
+			w[0] = x0;  w[1] = y0;  w[2] = u0; w[3] = v0;
+			w[4] = x1;  w[5] = y1;  w[6] = u1; w[7] = v0;
+			w[8] = x2;  w[9] = y2;  w[10] = u0; w[11] = v1;
+			/* 右上三角 (x1,y1)-(x3,y3)-(x2,y2) */
+			w[12] = x1; w[13] = y1; w[14] = u1; w[15] = v0;
+			w[16] = x3; w[17] = y3; w[18] = u1; w[19] = v1;
+			w[20] = x2; w[21] = y2; w[22] = u0; w[23] = v1;
+			n += 6;
 		}
 	}
-	wlr_render_pass_submit(pass);
+	bool ok = vidow_fx_draw_mesh(server, target, jelly->buf_w, jelly->buf_h,
+		tex, jelly->verts, n);
 	wlr_texture_destroy(tex);
+	if (!ok) {
+		return;
+	}
 
 	pixman_region32_t damage;
 	pixman_region32_init_rect(&damage, 0, 0, jelly->buf_w, jelly->buf_h);

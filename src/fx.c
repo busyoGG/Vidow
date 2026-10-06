@@ -279,11 +279,38 @@ static const char *kawase_up_src =
 	"	gl_FragColor = sum / 12.0;\n"
 	"}\n";
 
+/* ------------------------------------------------------------ mesh shader */
+
+/* 任意四边形网格：顶点属性直接给「渲染目标的物理像素坐标」和「源贴图归一化
+ * UV」（jelly.c 的果冻形变）。片元没花样，就是采样 —— 每格两个三角形，相邻
+ * 格共用同一对顶点，边界严丝合缝。
+ *
+ * 以前是一格一块**轴对齐矩形**（wlr_render_pass 只能贴轴对齐的矩形）：剪切形变
+ * 下相邻行各自取整，屏幕上就是「窗口像好几条矩形拼出来的」—— 左边缘一段一段
+ * 跳、行边界一条错位的竖线，透明窗口那层模糊透过缝看尤其显眼。 */
+static const char *mesh_vertex_src =
+	"attribute vec2 a_pos;\n"
+	"attribute vec2 a_uv;\n"
+	"uniform vec2 u_size;\n"
+	"varying vec2 v_uv;\n"
+	"void main() {\n"
+	"	v_uv = a_uv;\n"
+	"	gl_Position = vec4(a_pos / u_size * 2.0 - 1.0, 0.0, 1.0);\n"
+	"}\n";
+
+static const char *mesh_fragment_src =
+	"precision mediump float;\n"
+	"uniform sampler2D u_texture;\n"
+	"varying vec2 v_uv;\n"
+	"void main() {\n"
+	"	gl_FragColor = texture2D(u_texture, v_uv);\n"
+	"}\n";
+
 /* --------------------------------------------------------- program build */
 
-static bool link_program(unsigned int *out, const char *frag_src,
-		const char *name) {
-	GLuint vs = compile(GL_VERTEX_SHADER, vertex_src, name);
+static bool link_program_full(unsigned int *out, const char *vert_src,
+		const char *frag_src, const char *name) {
+	GLuint vs = compile(GL_VERTEX_SHADER, vert_src, name);
 	if (vs == 0) {
 		return false;
 	}
@@ -310,6 +337,22 @@ static bool link_program(unsigned int *out, const char *frag_src,
 	}
 	*out = prog;
 	return true;
+}
+
+static bool link_program(unsigned int *out, const char *frag_src,
+		const char *name) {
+	return link_program_full(out, vertex_src, frag_src, name);
+}
+
+static void load_mesh_program(struct vidow_server *server) {
+	struct vidow_mesh_prog *m = &server->mesh;
+	unsigned int prog = 0;
+	if (!link_program_full(&prog, mesh_vertex_src, mesh_fragment_src, "mesh")) {
+		return;
+	}
+	m->program = prog;
+	m->u_texture = glGetUniformLocation(prog, "u_texture");
+	m->u_size = glGetUniformLocation(prog, "u_size");
 }
 
 static void load_decor_program(struct vidow_server *server) {
@@ -464,6 +507,7 @@ bool vidow_shader_init(struct vidow_server *server) {
 	}
 	load_decor_program(server);
 	load_kawase_programs(server);
+	load_mesh_program(server);
 
 	/* A 1x1 transparent texture for samplers that are switched off. */
 	static const uint32_t pixel = 0x00000000;
@@ -658,6 +702,57 @@ static void draw_quad(unsigned int program) {
 	}
 }
 
+/* 把一张贴图按任意三角形网格画进 dst：每项 4 个 float，[x, y, u, v]。
+ * x/y 是渲染目标里的物理像素坐标（小数直接进光栅器，别自己取整 —— 取整就是
+ * 那条锯齿边），u/v 是源贴图的归一化坐标。顶点按 GL_TRIANGLES 顺序给。 */
+bool vidow_fx_draw_mesh(struct vidow_server *server, struct wlr_buffer *dst,
+		int w, int h, struct wlr_texture *src, const float *verts,
+		int n_verts) {
+	struct vidow_mesh_prog *m = &server->mesh;
+	if (m->program == 0 || src == NULL || verts == NULL || n_verts < 3) {
+		return false;
+	}
+	struct wlr_gles2_texture_attribs sa;
+	wlr_gles2_texture_get_attribs(src, &sa);
+
+	struct wlr_egl *egl = NULL;
+	if (begin_pass(server, dst, w, h, &egl) == 0) {
+		return false;
+	}
+	glUseProgram(m->program);
+	bind_tex(0, sa.target, sa.tex);
+	glUniform1i(m->u_texture, 0);
+	glUniform2f(m->u_size, (float)w, (float)h);
+
+	GLint ap = glGetAttribLocation(m->program, "a_pos");
+	GLint au = glGetAttribLocation(m->program, "a_uv");
+	if (ap >= 0) {
+		glVertexAttribPointer(ap, 2, GL_FLOAT, GL_FALSE,
+			sizeof(float) * 4, verts);
+		glEnableVertexAttribArray(ap);
+	}
+	if (au >= 0) {
+		glVertexAttribPointer(au, 2, GL_FLOAT, GL_FALSE,
+			sizeof(float) * 4, verts + 2);
+		glEnableVertexAttribArray(au);
+	}
+	/* 源内容是预乘 alpha 的，混合也按预乘来（和 wlr_render_pass 的
+	 * PREMULTIPLIED 一个公式）。 */
+	glEnable(GL_BLEND);
+	glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+	glDrawArrays(GL_TRIANGLES, 0, n_verts);
+	glDisable(GL_BLEND);
+	if (ap >= 0) {
+		glDisableVertexAttribArray(ap);
+	}
+	if (au >= 0) {
+		glDisableVertexAttribArray(au);
+	}
+	glUseProgram(0);
+	end_pass(egl);
+	return true;
+}
+
 /* The client's own buffer: wlr_texture_from_buffer() on a wlr_client_buffer
  * hands back the wrapper's cached texture, which we must not destroy. */
 static struct wlr_buffer *render_source(struct wlr_buffer *buffer) {
@@ -849,6 +944,17 @@ static void blur_set_drop(struct vidow_blur_set *set) {
 
 static bool blur_set_alloc(struct vidow_server *server,
 		struct vidow_blur_set *set, int w, int h, int levels) {
+	/* 形状没变就**复用**那几块缓冲：拖窗口时重叠的窗口每帧都要重建金字塔
+	 * （另一个窗口在它的底衬里动），而 vidow_alloc_target() 走的是
+	 * wlr_allocator_create_buffer() —— 真后端上每次都是内核层的 GBM 分配。
+	 * 每帧重新分十来块，光分配就够卡了（用户报的「有背景时拖拽卡顿」）。
+	 * 链条每一趟都会把每块缓冲整个写一遍（begin_pass 先 clear），复用安全；
+	 * 调用方重画之前已经放掉了攥着 up[0] 的那张贴图。 */
+	if (set->w == w && set->h == h && set->levels == levels &&
+			set->down[0] != NULL) {
+		set->offset = server->config.blur_offset;
+		return true;
+	}
 	blur_set_drop(set);
 	for (int i = 0; i < levels; i++) {
 		set->down[i] = vidow_alloc_target(server, w >> (i + 1), h >> (i + 1));
@@ -1076,6 +1182,10 @@ static void view_set_capture_visible(struct vidow_view *view, bool on) {
 	} else if (view->scene_tree != NULL) {
 		wlr_scene_node_set_enabled(&view->scene_tree->node, on && view->mapped);
 	}
+	/* 拖着果冻的时候，窗口的内容由果冻节点画 —— 它也得跟着藏，否则抓出来的
+	 * 底衬里带着这个窗口自己上一帧的形变图（透明窗口一拖：背景里错位的竖线、
+	 * 重影，模糊看着像没了）。 */
+	vidow_jelly_capture_visible(view, on);
 }
 
 static struct wlr_box view_screen_box(struct vidow_view *view) {

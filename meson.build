@@ -248,6 +248,13 @@ executable('preinit',
   include_directories: include_directories('.'),
   install: false)
 
+# 测试工具：声明一个比表面还大的窗口几何（越界几何要按整块表面算）
+executable('geowin',
+  ['tools/geowin.c', xs_header, xs_code],
+  dependencies: [wayland_client_dep],
+  include_directories: include_directories('.'),
+  install: false)
+
 executable('bgblur',
   ['tools/bgblur.c', xs_header, xs_code, bge_client_header, bgeffect_code],
   dependencies: [wayland_client_dep],

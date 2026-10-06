@@ -17,7 +17,11 @@
 #      单位写错整块窗口偏 72 逻辑像素（拖起来「坐标偏移」、松手才回位）
 #  10) 半透明 + 模糊的窗口：拖起来连模糊底衬一起画在对的位置（跑位的话模糊的
 #      内容也跟着偏，看着就是「背景错位」）
-#  11) 日志里没有 assert / abort
+#  11) 拖着**透明**窗口抓模糊底衬时，底衬里不许混进这个窗口自己上一帧的形变图：
+#      故意不放壁纸、只放两个重叠窗口（底下那个品红不透明、上面那个半透明绿），
+#      每份底衬 dump 只许有一种颜色 —— 两种都有就是自己混进去了（屏幕上「背景里
+#      错位的竖线 / 重影、模糊看着像没了」）
+#  12) 日志里没有 assert / abort
 #
 # 用法：./test-jelly.sh   （VIDOW_TEST_KEEP=1 保留运行目录）
 # 注意：别和别的测试**并行**跑 —— 收尾按 cmdline 杀 pattern.py / wall.py。
@@ -42,7 +46,7 @@ stop_clients() {
 		[ -r "$p/cmdline" ] || continue
 		cmd=$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null) || continue
 		case "$cmd" in
-		*pattern.py*|*wall.py*|*build/frames*|*/wev*|*grim*) kill "$pid" 2>/dev/null ;;
+		*pattern.py*|*wall.py*|*sheet.py*|*build/frames*|*/wev*|*grim*) kill "$pid" 2>/dev/null ;;
 		esac
 	done 2>/dev/null
 }
@@ -186,6 +190,34 @@ print(0 if not xs else max(xs) - min(xs) + 1)
 PY
 }
 
+# 左边缘逐行步进：果冻是**网格**（每格两个三角形、相邻格共用顶点），形变连续，
+# 相邻行最多差 1px。老实现是「一格一块轴对齐矩形」—— 剪切形变下相邻行各自取整，
+# 左边缘会一段一段跳（屏幕上就是「窗口像好几条矩形拼出来的」+ 锯齿）。
+# 输出 "最大步进 ≥2px的跳变处数 总弯"（量不到就 "none"）。
+edge_steps() { # <png>
+	python3 - "$1" <<'PY'
+import sys
+from PIL import Image
+
+im = Image.open(sys.argv[1]).convert("RGB")
+W, H = im.size
+px = im.load()
+rows = []
+for y in range(H):
+    row = [x for x in range(W) if px[x, y] != (0, 0, 0)]
+    if row:
+        rows.append((y, row[0]))
+if len(rows) < 100:
+    print("none")
+    sys.exit()
+y0, y1 = rows[0][0], rows[-1][0]
+body = [(y, x) for (y, x) in rows if y0 + 30 < y < y1 - 30]
+steps = [abs(body[i + 1][1] - body[i][1]) for i in range(len(body) - 1)]
+big = [s for s in steps if s >= 2]
+print("%d %d %d" % (max(steps), len(big), body[0][1] - body[-1][1]))
+PY
+}
+
 # 从标题栏起拖：往右快速拖 400px，中途截一张，然后松手
 drag_and_shot() { # <png> <x> <y> <dx>
 	local png=$1 cx=$2 cy=$3 dx=$4
@@ -230,6 +262,14 @@ if grep -aq "jelly: w1 起手" "$LOG"; then
 	pass "日志记下了果冻起手：$(grep -a 'jelly: w1 起手' "$LOG" | head -1 | sed 's/.*jelly: /jelly: /')"
 else
 	fail "没有果冻起手日志"
+fi
+read -r MAXSTEP NBIG BEND <<<"$(edge_steps "$RUNDIR/drag.png")"
+if [ "$MAXSTEP" = "none" ]; then
+	fail "量不到左边缘的逐行步进（窗口没截到）"
+elif [ "$MAXSTEP" -le 1 ] && [ "$NBIG" = "0" ]; then
+	pass "左边缘是连续的：逐行步进最大 ${MAXSTEP}px、没有 ≥2px 的跳变（弯了 ${BEND}px）"
+else
+	fail "左边缘一段一段跳：逐行步进最大 ${MAXSTEP}px、≥2px 的跳变 ${NBIG} 处（窗口像几条矩形拼的）"
 fi
 
 sleep 1.4
@@ -614,7 +654,87 @@ else
 fi
 stop_vidow
 
-# ---------------------------------------------------------------- 11) 日志
+# ------------------------------------- 11) 抓底衬不许混进被拖窗口自己
+mark "拖着透明窗口抓底衬：底衬里不许混进它自己上一帧的形变图"
+stop_vidow
+export VIDOW_BLUR_DUMP=400
+# 第 2 个参数才是 blur 那行（同一个键第一次赋值才算数，见 start_vidow 的说明）
+start_vidow "" "blur_enabled = true"
+# 故意**不放壁纸**：底衬里只有别的窗口，混进自己就一眼看得出来（有壁纸时那一块
+# 被壁纸盖住，两种颜色也都是「壁纸色」，这个判据就不灵了）。
+python3 ./tools/sheet.py under 0.9 0.1 0.8 1.0 >/dev/null 2>&1 &
+CLIENT_PIDS="$CLIENT_PIDS $!"
+sleep 1.5
+python3 ./tools/sheet.py green 0.1 0.9 0.2 0.6 >/dev/null 2>&1 &
+CLIENT_PIDS="$CLIENT_PIDS $!"
+sleep 1.5
+./build/vidowmsg set-window-position --title under 300 200 >/dev/null
+sleep 0.4
+./build/vidowmsg set-window-position --title green 100 100 >/dev/null
+sleep 0.8
+read -r WX WY WW WH FLOAT <<<"$(win_geom green)"
+if [ "$WW" -lt 200 ]; then
+	fail "半透明窗口没起来（$WX $WY $WW $WH）"
+else
+	rm -f /tmp/vidow-bd-*.raw /tmp/vidow-bd-*.txt
+	CX=$((WX + WW / 2))
+	CY=$((WY + 8))
+	act "pointer-motion $CX $CY"
+	act "pointer-button left press mod"
+	for i in 1 2 3 4 5 6; do
+		act "pointer-motion $((CX + i * 20)) $((CY + i * 12))" 0.05
+	done
+	sleep 0.3
+	act "pointer-button left release mod"
+	sleep 1.0
+	read -r MIXED GREENONLY MAGONLY EMPTY NDUMP <<<"$(python3 - <<'PY'
+import glob
+import numpy as np
+
+mixed = mag = green = empty = 0
+files = sorted(glob.glob("/tmp/vidow-bd-*.raw"))
+for path in files:
+    base = path[:-4]
+    try:
+        w, h, fmt = open(base + ".txt").read().split()
+        w, h = int(w), int(h)
+        a = np.frombuffer(open(path, "rb").read(), dtype=np.uint8).reshape(h, w, 4)
+    except Exception:
+        continue
+    R, G, B = a[:, :, 2].astype(int), a[:, :, 1].astype(int), a[:, :, 0].astype(int)
+    g = int(((G > 60) & (G > R + 30) & (G > B + 30)).sum())
+    m = int(((R > 60) & (B > 60) & (G < 60)).sum())
+    if g and m:
+        mixed += 1
+    elif g:
+        green += 1
+    elif m:
+        mag += 1
+    else:
+        empty += 1
+print("%d %d %d %d %d" % (mixed, green, mag, empty, len(files)))
+PY
+)"
+	if grep -aq "jelly: green 起手" "$LOG" && grep -aq "blur: own rebuild" "$LOG"; then
+		pass "底衬抓取和果冻都真的在跑（$NDUMP 份 dump）"
+	else
+		fail "果冻或底衬抓取没跑（$NDUMP 份 dump），这条测不到东西"
+	fi
+	if [ "$MIXED" = "0" ]; then
+		pass "每份底衬里只有一种颜色：混进自己的 0 份（别的窗口 $GREENONLY+$MAGONLY 份，空 $EMPTY 份）"
+	else
+		fail "$MIXED 份底衬里同时有自己和别的窗口 —— 被拖窗口的形变图混进底衬了"
+	fi
+	if [ "$GREENONLY" -ge 1 ] && [ "$MAGONLY" -ge 1 ]; then
+		pass "两个窗口都各自抓过一份底衬（品红 $MAGONLY / 绿 $GREENONLY）"
+	else
+		fail "没抓到两种窗口的底衬（品红 $MAGONLY / 绿 $GREENONLY）—— 判据立不住"
+	fi
+fi
+unset VIDOW_BLUR_DUMP
+stop_vidow
+
+# ---------------------------------------------------------------- 12) 日志
 mark "日志里没有 assert / abort"
 if grep -aqE "assert|abort|Assertion" "$LOG"; then
 	fail "日志里有 assert / abort：$(grep -aE 'assert|abort|Assertion' "$LOG" | head -2)"

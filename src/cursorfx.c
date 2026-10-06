@@ -63,6 +63,10 @@
 #define SHAKE_TICK_MS   16
 /* 倍数小于这个就算「没放大」，该还原真图了。 */
 #define SHAKE_UNIT_EPS  1e-3
+/* 光标图换了、新图还没上屏时的重试次数（16ms 一次，≈130ms）—— wlroots 的
+ * output cursor texture 要等下一次渲染才建出来，`wl_cursor_set_surface` 之后当场
+ * 探是 NULL。 */
+#define SHAKE_REFRESH_TRIES 8
 
 struct vidow_cursor_fx {
 	/* 摇晃判定 */
@@ -89,6 +93,7 @@ struct vidow_cursor_fx {
 	int32_t big_hx, big_hy; /* 放大图的热点（逻辑坐标） */
 	int32_t src_hx, src_hy; /* 原尺寸那张的热点（逻辑坐标） */
 	int limit_w, limit_h;   /* 倍数上限：放大图的物理像素不超过这块屏 */
+	int refresh_retry;   /* 换了光标图但新图还没上屏：还要再探几次 */
 	struct wl_event_source *timer;
 
 	/* 当前光标图（还原用）：客户端 surface 或主题 xcursor（surface == NULL） */
@@ -100,6 +105,8 @@ struct vidow_cursor_fx {
 /* 前置声明：定时器（动画的推手）在上面，重画光标图那两段在下面。 */
 static bool shake_draw_at(struct vidow_server *server, double f,
 		const char **why);
+/* 把放大图换成「光标图当前那张」（光标换形状时用），见下面。 */
+static bool cursor_refresh(struct vidow_server *server);
 
 /* --------------------------------------------------------------- 取状态 */
 
@@ -203,6 +210,7 @@ static void shake_restore(struct vidow_server *server) {
 	}
 	fx->active = false;
 	fx->animating = false;
+	fx->refresh_retry = 0;
 	wl_event_source_timer_update(fx->timer, 0);
 	if (fx->surface != NULL) {
 		wlr_cursor_set_surface(server->cursor, fx->surface, fx->hx, fx->hy);
@@ -230,6 +238,16 @@ static int shake_timer_cb(void *data) {
 	struct vidow_server *server = data;
 	struct vidow_cursor_fx *fx = server->cursor_fx;
 	int64_t now = vidow_now_ns();
+
+	/* 光标图换了但新图还没上屏：探到就把放大图换成新那张（不然后面几帧里
+	 * 鼠标底下还是旧形状的大光标）。 */
+	if (fx->refresh_retry > 0 && fx->active) {
+		if (cursor_refresh(server)) {
+			fx->refresh_retry = 0;
+		} else {
+			fx->refresh_retry--;
+		}
+	}
 
 	if (fx->animating) {
 		double t = (double)(now - fx->anim_start_ns) /
@@ -273,8 +291,13 @@ static int shake_timer_cb(void *data) {
 	if (fx->factor > 1.0 + SHAKE_UNIT_EPS) {
 		int64_t left = fx->until_ns - now;
 		if (left > 0) {
-			wl_event_source_timer_update(fx->timer,
-				(int)(left / 1000000) + 1);
+			int wait = (int)(left / 1000000) + 1;
+			/* 还有重试要探：保持期再长也得 16ms 醒一次（换了光标图要马上
+			 * 跟着换放大图，不能等七百毫秒）。 */
+			if (fx->refresh_retry > 0 && wait > SHAKE_TICK_MS) {
+				wait = SHAKE_TICK_MS;
+			}
+			wl_event_source_timer_update(fx->timer, wait);
 			return 0;
 		}
 		wlr_log(WLR_DEBUG, "摇晃: 光标开始缩回（%.2fx → 1.00x，%dms）",
@@ -547,19 +570,15 @@ static void forget_surface(struct vidow_cursor_fx *fx) {
 	fx->surface = NULL;
 }
 
-/* 客户端换了光标图（request_set_cursor）。放大中就直接收摊 —— 新图由调用方设上
- * 去，别让我们的放大图顶掉它。 */
+/* 客户端换了光标图（request_set_cursor）。放大中**不收摊**：新图由调用方设上
+ * 去，紧接着调用方会调 vidow_cursor_fx_cursor_changed()，我们把新图重新放大
+ * 一遍、倍数照旧。早先这里直接把放大整个收掉 —— 后果就是「晃大了光标，一切
+ * 焦点（新窗口的客户端 set_cursor）就缩回原尺寸」。 */
 void vidow_cursor_fx_set_surface(struct vidow_server *server,
 		struct wlr_surface *surface, int32_t hx, int32_t hy) {
 	struct vidow_cursor_fx *fx = server->cursor_fx;
 	if (fx == NULL) {
 		return;
-	}
-	if (fx->active) {
-		fx->active = false;
-		wl_event_source_timer_update(fx->timer, 0);
-		drop_images(fx);
-		fx->factor = 1.0;
 	}
 	forget_surface(fx);
 	fx->surface = surface;
@@ -571,13 +590,75 @@ void vidow_cursor_fx_set_surface(struct vidow_server *server,
 	}
 }
 
+/* 把放大图的**源**换成「光标图当前那张」，并照现在的倍数重画一遍。
+ * 成功返回 true。光标换形状时走这里（放大倍数、保持时间都不动）。 */
+static bool cursor_refresh(struct vidow_server *server) {
+	struct vidow_cursor_fx *fx = server->cursor_fx;
+	struct wlr_output *output = NULL;
+	struct wlr_output_cursor *oc = cursor_under_pointer(server, &output);
+	if (oc == NULL || oc->texture == NULL || oc->width <= 0 || oc->height <= 0 ||
+			oc->transform != WL_OUTPUT_TRANSFORM_NORMAL) {
+		return false; /* 新图还没上屏（或者带旋转）：等重试 */
+	}
+	struct wlr_buffer *src = scale_texture(server, oc->texture, &oc->src_box,
+		oc->width, oc->height);
+	if (src == NULL) {
+		return false;
+	}
+	double scale = output->scale > 0 ? output->scale : 1.0;
+	int limit_w = 0, limit_h = 0;
+	wlr_output_effective_resolution(output, &limit_w, &limit_h);
+	if (fx->src != NULL) {
+		wlr_buffer_drop(fx->src);
+	}
+	fx->src = src;
+	fx->scale = scale;
+	fx->limit_w = (int)lround((double)limit_w * scale);
+	fx->limit_h = (int)lround((double)limit_h * scale);
+	fx->src_hx = (int32_t)lround(oc->hotspot_x / scale);
+	fx->src_hy = (int32_t)lround(oc->hotspot_y / scale);
+	const char *why = NULL;
+	if (!shake_draw_at(server, fx->factor, &why)) {
+		wlr_log(WLR_DEBUG, "摇晃: 换了光标图，但这一帧没画成（%s）", why);
+		return false;
+	}
+	wlr_log(WLR_DEBUG, "摇晃: 光标图换了，放大图跟着换（%.2fx，%dx%d）",
+		fx->factor, fx->big != NULL ? fx->big->width : 0,
+		fx->big != NULL ? fx->big->height : 0);
+	return true;
+}
+
+/* 光标图换成别的了（客户端 set_cursor / 焦点切到别的窗口 / 换回主题箭头）：
+ * 放大中就把新那张重新放大一遍，倍数和保持时间照旧。新图当场可能还没进 wlroots
+ * 的 output cursor（要等下一次渲染），那就挂个 16ms 的重试，别把放大图留在旧那张上。 */
+void vidow_cursor_fx_cursor_changed(struct vidow_server *server) {
+	struct vidow_cursor_fx *fx = server->cursor_fx;
+	if (fx == NULL || !fx->active) {
+		return;
+	}
+	if (cursor_refresh(server)) {
+		fx->refresh_retry = 0;
+		return;
+	}
+	fx->refresh_retry = SHAKE_REFRESH_TRIES;
+	wl_event_source_timer_update(fx->timer, SHAKE_TICK_MS);
+}
+
 /* 指针底下没窗口：该显示主题默认箭头。放大期间**不碰真图**（碰了就把放大图顶
- * 掉、放大白做了），只记住「还原时该给什么」。 */
+ * 掉、放大白做了），只记住「还原时该给什么」。不过光标**形状**换了（原来是
+ * 客户端给的光标图、现在是主题箭头）也得跟着换放大图，不然鼠标底下那个大光标
+ * 一直是上一个窗口的形状。 */
 void vidow_cursor_fx_default_cursor(struct vidow_server *server) {
 	struct vidow_cursor_fx *fx = server->cursor_fx;
 	if (fx != NULL) {
+		bool had_surface = fx->surface != NULL;
 		forget_surface(fx);
 		if (fx->active) {
+			if (had_surface) {
+				wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr,
+					"left_ptr");
+				vidow_cursor_fx_cursor_changed(server);
+			}
 			return;
 		}
 	}

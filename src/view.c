@@ -177,6 +177,22 @@ struct vidow_fx_geo vidow_view_fx_geo(const struct vidow_view *view) {
 	geo.h = g.height;
 	geo.src_w = sw;
 	geo.src_h = sh;
+	/* 声明框落在表面外面：真的会发生 —— 客户端改大小的一两秒里（chromium 系
+	 * 实测 1–2 秒）表面已经缩了，声明的窗口几何还是原来那个大尺寸（wlroots 只在
+	 * **声明那一刻**把几何夹进当时的表面，之后表面缩小它不管）。
+	 * 这时候按声明框采内容，UV 会跑到 1 外面被 clamp 成「窗口框到位了、里面的
+	 * 画面小一圈、右边一条糊边」（用户报的「先渲染小一点然后才按照缩放显示」）。
+	 * 那就当整块表面就是窗口内容：内容铺满这块框（等它把新尺寸画上来就恢复
+	 * 1:1 了）。 */
+	if (g.x < 0 || g.y < 0 || g.x + g.width > sw || g.y + g.height > sh) {
+		wlr_log(WLR_DEBUG,
+			"窗口几何落在表面外面（声明 %dx%d@%d,%d，表面 %dx%d）：按整块表面贴",
+			g.width, g.height, g.x, g.y, sw, sh);
+		geo.off_x = 0;
+		geo.off_y = 0;
+		geo.src_w = g.width;
+		geo.src_h = g.height;
+	}
 	return geo;
 }
 
