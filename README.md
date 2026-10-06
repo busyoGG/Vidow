@@ -709,7 +709,7 @@ python3 test-float.py        # 三个真实 GTK 窗口，验证浮动模式自�
 ./test-portal.sh switch-kde          # 同上，换成 KDE
 ./test-portal.sh raw-gtk             # vidow 不碰 portal 配置，手写一份单独验证协议
 ./test-portal.sh raw-kde             # 同上，换成 KDE
-./test-dpi.sh                        # 混合 DPI + XWayland（全 headless，15 项断言）
+./test-dpi.sh                        # 混合 DPI + XWayland（全 headless，15 项断言；含「QT_SCALE_FACTOR 不许设」）
 ./test-x11scale.sh                   # X11 逐窗口缩放桥 x11_scale=1（全 headless，16 项断言）
 ./test-scrollcull.sh                 # 滚出视口的列不画到隔壁显示器（全 headless，11 项断言）
 ./test-vt.sh                         # tty 的 VT 切换（Ctrl+Alt+F1..F12 / switch-vt 动作）（全 headless，11 项断言）
@@ -868,7 +868,7 @@ xwayland_env = true                 -- 给 X11 客户端下发 GDK_SCALE / QT_SC
 | `scale` | `auto` | 所有输出的默认策略：`auto` = 按 ppi 推，或者写一个数（`1.75`）；单块屏点名用 `vidow.output{ name = …, scale = … }` |
 | `xwayland` | `true` | 起不起 XWayland（`0` = 完全不碰 X 那一摊） |
 | `xwayland_scale` | `auto` | `auto` = `ceil(最密那块屏的缩放)`；`off` = 一律 1:1；也可以写死一个数 |
-| `xwayland_env` | `true` | 给 X11 客户端下发 `GDK_SCALE` / `QT_SCALE_FACTOR` / `XCURSOR_SIZE`（用户自己显式设过的不抢）。**不管** `_XWAYLAND_GLOBAL_OUTPUT_SCALE` 和 `Xft.dpi` —— 那两个是 X 服务自己的事实，vidow 总是自己写（见下） |
+| `xwayland_env` | `true` | 给 X11 客户端下发 `GDK_SCALE` / `QT_AUTO_SCREEN_SCALE_FACTOR` / `XCURSOR_SIZE`（用户自己显式设过的不抢）。**不设 `QT_SCALE_FACTOR`**：Wayland 的 Qt 也认它，会把所有屏上的 Qt 窗口乘一遍（见下）。**不管** `_XWAYLAND_GLOBAL_OUTPUT_SCALE` 和 `Xft.dpi` —— 那两个是 X 服务自己的事实，vidow 总是自己写 |
 
 ### 模式、刷新率、VRR、位深（每块屏那一组里的其余项）
 
@@ -985,11 +985,20 @@ X11 没有 per-window 的缓冲区缩放，所以：
    1/4。回归判据见 `test-xwayland-hidpi.sh`（属性、Xft.dpi、X 屏幕 = 逻辑 × S，
    以及端到端：点一下 xev 收到的 root 坐标 = 布局坐标 × S）。
 
-`GDK_SCALE` / `QT_SCALE_FACTOR = S` 发给 X11 客户端：认这两个变量的 GTK/Qt 按 S 倍
-绘制（于是和 Wayland 程序一样大）；不认的老程序（xterm、xeyes）保持 1:1 绘制 ——
-**物理尺寸在两块屏上依然一致、依然清晰，但相对 Wayland 程序偏小**。这是 X11 的硬限制：
-要么放大（一样大但糊），要么不放大（清晰但小）。想要后一种取舍就把 `xwayland_scale`
-设成 `off`。
+`GDK_SCALE = S` 发给 X11 客户端：认这个变量的 GTK 按 S 倍绘制（于是和 Wayland 程序
+一样大）；不认的老程序（xterm、xeyes）保持 1:1 绘制 —— **物理尺寸在两块屏上依然一致、
+依然清晰，但相对 Wayland 程序偏小**。这是 X11 的硬限制：要么放大（一样大但糊），要么
+不放大（清晰但小）。想要后一种取舍就把 `xwayland_scale` 设成 `off`。
+
+**`QT_SCALE_FACTOR` 绝不设**（这一条是用户报出来的）：它是唯一一个「X11 和 Wayland
+都认」的缩放变量 —— Wayland 的 Qt 程序会在输出缩放之外**再乘它一遍**，于是只要有一块
+2 倍屏（`S = ceil(最密那块)` = 2），**每块屏**上的 Qt 窗口就都大 2 倍（实测 kate 的
+逻辑宽度 634 → 1090；GTK 不受影响：实测 GTK3/GTK4 在 Wayland 下不认 `GDK_SCALE`，声明
+的还是 1 倍）。Qt 那边改走 X 自己的 DPI：`QT_AUTO_SCREEN_SCALE_FACTOR=1` + 上面那条
+`Xft.dpi = 96×S`（写在 X 的 `RESOURCE_MANAGER` 里，Wayland 客户端根本看不到）。
+代价说清楚：混 DPI（一块 1 倍一块 2 倍）时 X 屏幕的 DPI 是两块屏混出来的一个值，Qt 推
+出来的倍数可能不是 S —— 这时 X11 的 Qt 程序按 1 倍画，在密屏上会偏小。要精确就单独给
+这个程序设：`env QT_SCALE_FACTOR=2 kate`（只影响这一个进程）。
 
 **逐窗口改**：`off` 是全体的取舍，可有些程序（微信登录窗、CEF 系那一类）自己不肯按
 `S` 倍画，混在认这套的 GTK/Qt 程序里，全局怎么设都不对。窗口规则可以只给它们改缩放
@@ -1081,7 +1090,8 @@ X11 窗口走的是**同一条装饰管线**：同一个圆角/边框/阴影着�
 | X11（xterm） | 1 倍屏 | 1268×1416 | 634×708 | 缩小 2 倍（不放大） |
 | Wayland（GTK3 zenity） | 1 倍屏 | 340×264 | 340×264 | 1:1 |
 
-`test-dpi.sh` 还会验：`GDK_SCALE=2` 真的进了子进程（`config.lua` 里
+`test-dpi.sh` 还会验：`GDK_SCALE=2` 真的进了子进程、`QT_SCALE_FACTOR` 一定**没有**
+（`config.lua` 里
 `vidow.exec("printenv GDK_SCALE")` 打出来，不是只看合成器自己的日志）、
 X11 的 GTK 对话框不会被压成 1×1、两边各自的装饰缓冲尺寸都等于上面的公式。
 
@@ -3401,6 +3411,35 @@ protocols/     wlr-layer-shell / wlr-virtual-pointer / input-method-v2 /
      set_fullscreen：窗口 `fullscreen=true` 且客户端拿到的 configure 里带 fullscreen；
      ⑤日志无 assert / abort、收尾一个 vidow 都不剩。把修复回退掉跑一遍：①②③④ 都红
      （`Assertion 'surface->initialized' failed`，vidow 当场被带走）。
+
+134. **所有屏上的 Qt 窗口都大 2 倍**（用户报的「kate 在 scale 2 的屏上又 X2 了 ——
+     其实所有屏都 X2」）。原因不是渲染，是**环境变量泄漏**：`vidow_xwayland_env()`
+     把 `GDK_SCALE` / `QT_SCALE_FACTOR` 设成 `S = ceil(最密那块屏的缩放)`（用户那边
+     DP-2 是 2 倍，所以 S = 2），这两个变量是给 X11 客户端用的 —— 但 vidow 只能改
+     **自己**的环境，于是 vidow 拉起来的进程链（键位拉起的终端，以及那个终端里启动
+     的程序）全都继承它，而 Wayland 的 Qt **也认 `QT_SCALE_FACTOR`**：在输出缩放之外
+     再乘一遍 → 每块屏上的 Qt 窗口都大 2 倍。kate 正是 Qt。
+
+     证据：①`coredumpctl` 之外先看配置 —— 用户 `10-xwayland.lua` 是 `xwayland_env =
+     true` + `xwayland_scale = "auto"`，`09-output.lua` 里 DP-2 scale 2 → S = 2；
+     ②`test-dpi.sh` 早就有 `childenv GDK_SCALE=2` 这条断言（子进程真的拿到）；
+     ③实测（headless 2 倍屏）：kate 干净 env → `缓冲 628x696 声明 2 倍 -> 逻辑
+     314x348`（1:1 正确），加上 `QT_SCALE_FACTOR=2` → `缓冲 2180x1132`，逻辑尺寸翻倍
+     = 所有屏都大 2 倍；④1 倍屏上更直观：干净 634x708 → 带变量 1090x708（宽度翻倍）。
+
+     修法：**不再设 `QT_SCALE_FACTOR`**，Qt 那边改走 X 自己的 DPI
+     （`QT_AUTO_SCREEN_SCALE_FACTOR=1` + 早就写好的 `Xft.dpi = 96×S`，那是 X 的
+     `RESOURCE_MANAGER` 属性，Wayland 客户端看不到）。`GDK_SCALE` 留着 —— 实测
+     GTK3/GTK4 在 Wayland 下都不认它（1 倍屏上给 `GDK_SCALE=2`，声明还是 1 倍），
+     所以它只影响 X11 的 GTK。代价如实写进 README：混 DPI 时 X 屏幕的 DPI 是两块屏
+     混出来的值，Qt 推出来的倍数可能不是 S，那时 X11 的 Qt 程序按 1 倍画、密屏上偏小；
+     要精确就单独给那个程序 `env QT_SCALE_FACTOR=2 kate`。
+
+     `test-dpi.sh` 补 3 项（12 → 15）：①子进程**没有** `QT_SCALE_FACTOR`（`printenv`
+     打出来是 nil）；②子进程拿到 `QT_AUTO_SCREEN_SCALE_FACTOR=1`；③日志里不许出现
+     `GDK_SCALE=QT_SCALE_FACTOR` 这种下发。把修复回退掉跑一遍，这三条都红
+     （`childenv QT_SCALE_FACTOR=2`）✓。回归：`test-dpi.sh` 15/15、
+     `test-xwayland-hidpi.sh` 20/20、`test-x11scale.sh` 18/18、`test-preinit.sh` 22/22。
 
 129. **配置按类别拆开：入口 `config.lua` + `configs/` 下一类一份**（`vidow.include()`）。
      原来那份「一份两三百行、什么都写在一起」的默认配置，改一个圆角要先滚过间距、模糊、

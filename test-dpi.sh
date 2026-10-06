@@ -61,6 +61,8 @@ local v = vidow.exec("printenv GDK_SCALE")
 vidow.log("childenv GDK_SCALE=" .. tostring(v or "nil"))
 local q = vidow.exec("printenv QT_SCALE_FACTOR")
 vidow.log("childenv QT_SCALE_FACTOR=" .. tostring(q or "nil"))
+local a = vidow.exec("printenv QT_AUTO_SCREEN_SCALE_FACTOR")
+vidow.log("childenv QT_AUTO_SCREEN_SCALE_FACTOR=" .. tostring(a or "nil"))
 local d = vidow.exec("printenv DISPLAY")
 vidow.log("childenv DISPLAY=" .. tostring(d or "nil"))
 EOF
@@ -158,6 +160,19 @@ if command -v zenity >/dev/null; then
 	grep -aq "childenv GDK_SCALE=2" "$LOG" &&
 		pass "子进程真的拿到 GDK_SCALE=2（X11 客户端按 2 倍画）" ||
 		fail "子进程没拿到 GDK_SCALE=2"
+	# 反向：**QT_SCALE_FACTOR 绝不能设**。它是唯一一个「X11 和 Wayland 都认」的
+	# 缩放变量：Wayland 的 Qt 程序会在输出缩放之外再乘它一遍 —— 只要有一块 2 倍
+	# 屏（S = ceil(最密那块) = 2），**每块屏**上的 Qt 窗口就都大 2 倍（实测 kate
+	# 的逻辑宽度 634 -> 1090，kate 是 Qt）。所以 Qt 那边改走 Xft.dpi：Xft.dpi
+	# 写在 X 的 RESOURCE_MANAGER 里，Wayland 客户端根本看不到。
+	# 注意：GTK 在 Wayland 下不认 GDK_SCALE（实测 GTK3/GTK4 都声明 1 倍），所以
+	# GDK_SCALE 留着不影响 Wayland。
+	grep -aq "childenv QT_SCALE_FACTOR=nil" "$LOG" &&
+		pass "子进程没有 QT_SCALE_FACTOR（Wayland 的 Qt 不会被翻倍）" ||
+		fail "子进程拿到了 QT_SCALE_FACTOR=$(grep -a 'childenv QT_SCALE_FACTOR' "$LOG" | tail -1)"
+	grep -aq "childenv QT_AUTO_SCREEN_SCALE_FACTOR=1" "$LOG" &&
+		pass "子进程拿到 QT_AUTO_SCREEN_SCALE_FACTOR=1（X11 的 Qt 从 DPI 自己推）" ||
+		fail "子进程没拿到 QT_AUTO_SCREEN_SCALE_FACTOR=1"
 else
 	echo "  SKIP  没装 zenity，跳过 SSD 对齐"
 fi
@@ -202,8 +217,11 @@ if outs:
     check(final_x == float(int(densest) + (densest % 1 > 0)),
           "XWayland 全局缩放 = ceil(最密的屏 %.2fx) = %.2f（X 只有一套坐标，"
           "低了这个数密屏上就是放大糊）" % (densest, final_x))
-    check("GDK_SCALE=QT_SCALE_FACTOR=%d" % final_x in log,
-          "给 X11 客户端的环境按同一倍数下发（GDK_SCALE / QT_SCALE_FACTOR）")
+    check("GDK_SCALE=%d" % final_x in log,
+          "给 X11 的 GTK 客户端按同一倍数下发 GDK_SCALE（Wayland 的 GTK 不认它）")
+    check("GDK_SCALE=QT_SCALE_FACTOR" not in log,
+          "绝不设 QT_SCALE_FACTOR（Wayland 的 Qt 也认它，会把所有屏上的 Qt 窗口"
+          "都乘一遍）")
 
 # 3) X11：缓冲区 vs 设备像素（只准缩小，密屏上 1:1）
 x11 = {}

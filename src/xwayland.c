@@ -75,7 +75,6 @@ static struct {
 	char ours[32];
 } managed_env[] = {
 	{ "GDK_SCALE", "" },
-	{ "QT_SCALE_FACTOR", "" },
 	{ "QT_AUTO_SCREEN_SCALE_FACTOR", "" },
 	{ "QT_ENABLE_HIGHDPI_SCALING", "" },
 	{ "XCURSOR_SIZE", "" },
@@ -112,18 +111,22 @@ void vidow_xwayland_env(struct vidow_server *server) {
 	char value[32];
 	set_managed("GDK_SCALE", managed_env[0].ours, sizeof(managed_env[0].ours),
 		int_str(value, sizeof(value), scale));
-	/* Qt 会另外从 Xft.dpi 猜一个缩放，和我们设的叠起来就是 4 倍，关掉。 */
-	set_managed("QT_SCALE_FACTOR", managed_env[1].ours,
-		sizeof(managed_env[1].ours), int_str(value, sizeof(value), scale));
-	set_managed("QT_AUTO_SCREEN_SCALE_FACTOR", managed_env[2].ours,
-		sizeof(managed_env[2].ours), "0");
-	set_managed("QT_ENABLE_HIGHDPI_SCALING", managed_env[3].ours,
-		sizeof(managed_env[3].ours), "1");
-	set_managed("XCURSOR_SIZE", managed_env[4].ours, sizeof(managed_env[4].ours),
+	/* Qt **不设 QT_SCALE_FACTOR**。它是唯一一个「X11 和 Wayland 都认」的缩放
+	 * 变量：Wayland 的 Qt 程序在输出缩放之外再乘它一遍 —— 只要有一块 2 倍屏
+	 * （S = ceil(最密那块) = 2），**每块屏**上的 Qt 窗口就都大 2 倍（实测 kate
+	 * 逻辑尺寸翻倍：628x696 → 2180x1132）。而这个变量只对 X11 有用，所以
+	 * 换成让 Qt 自己从 X 的 DPI 推：Xft.dpi = 96×S 写在 X 的 RESOURCE_MANAGER
+	 * 里（x11_set_xft_dpi），Wayland 客户端根本看不到它。 */
+	set_managed("QT_AUTO_SCREEN_SCALE_FACTOR", managed_env[1].ours,
+		sizeof(managed_env[1].ours), "1");
+	set_managed("QT_ENABLE_HIGHDPI_SCALING", managed_env[2].ours,
+		sizeof(managed_env[2].ours), "1");
+	set_managed("XCURSOR_SIZE", managed_env[3].ours, sizeof(managed_env[3].ours),
 		int_str(value, sizeof(value), 24 * scale));
 
-	wlr_log(WLR_INFO, "xwayland: GDK_SCALE=QT_SCALE_FACTOR=%d（X 客户端按这个画）",
-		scale);
+	wlr_log(WLR_INFO, "xwayland: GDK_SCALE=%d、Qt 走 Xft.dpi=%d 自己推"
+		"（不设 QT_SCALE_FACTOR —— Wayland 的 Qt 也认它，会所有屏都大 %d 倍）",
+		scale, 96 * scale, scale);
 }
 
 /* X 的 root window（写属性用）。 */
