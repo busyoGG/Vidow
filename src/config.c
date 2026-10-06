@@ -75,9 +75,8 @@ static const struct section sections[] = {
 	{ "xdg-desktop-portal", "12-portal.lua", NULL },
 	{ "指针", "13-cursor.lua", NULL },
 	/* 最后一份不是「键」，是 vidow.* 的调用（键位 / 工作区 / 窗口规则）。 */
-	{ "工作区 / 键位 / 规则", "14-keys.lua",
-		"这一份没有配置键，全是 vidow.bind() / vidow.workspace_create() / "
-		"vidow.rule() 这类调用" },
+	{ "键位 / 工作区 / 规则", "14-keys.lua",
+		"键位是配置给的（合成器不内置），工作区与窗口规则也在这一份里" },
 };
 #define N_SECTIONS ((int)(sizeof(sections) / sizeof(sections[0])))
 /* 最后一份是「调用」不是「键」：entries[] 里没有它，打印也单独一套。 */
@@ -959,9 +958,15 @@ static void print_section_header(FILE *f, int section) {
 	fprintf(f,
 		"-- %s —— vidow 配置的一类，由入口 config.lua 读进来：\n"
 		"--     vidow.include(\"configs/%s\")\n"
-		"--\n"
-		"-- 下面每行都是内置默认值：改哪行哪行才生效，删掉那行就回到默认值。\n",
+		"--\n",
 		sections[section].title, sections[section].file);
+	if (section == SECTION_KEYS) {
+		/* 这一份没有配置键：删掉一行就是「不要这个」，没有「回到默认值」一说。 */
+		fputs("-- 这一份没有配置键，全是 vidow.* 的调用 —— 删掉一行就是不要它。\n", f);
+	} else {
+		fputs("-- 下面每行都是内置默认值：改哪行哪行才生效，"
+			"删掉那行就回到默认值。\n", f);
+	}
 	if (sections[section].doc != NULL) {
 		fprintf(f, "-- %s\n", sections[section].doc);
 	}
@@ -1007,15 +1012,60 @@ static void print_output_hint(FILE *f) {
 "-- 没了，写了会在日志里喊一声。\n", f);
 }
 
-/* 14-keys.lua：键位 / 工作区 / 规则。没有配置键，全是 vidow.* 的调用。 */
+/* 14-keys.lua：键位 / 工作区 / 规则。没有配置键，全是 vidow.* 的调用。
+ *
+ * 这里给的是**一套默认键位** —— 合成器自己一个键位都不内置（原来 input.c 里有
+ * 一张写死的键位表，现在那些都成了动作字符串，绑哪个键由这里说了算）。所以
+ * 「把这几行删掉」= 那些键就还给客户端，这正是能改 / 能删的意思。 */
 static void print_keys_lua(FILE *f) {
 	fputs(
-"-- ================== 工作区（niri 那套：动态、按屏、按序号）\n"
+"-- ================== 键位（默认一套，随便改 / 删）\n"
+"--\n"
+"-- 合成器**一个键位都不内置**：下面这些是默认配置给的，删掉就还给客户端，换成\n"
+"-- 别的键也行。动作字符串见 README 的「动作」表；`spawn` 后面跟一条 shell 命令。\n"
+"--\n"
+"-- 窗口与列（H/J/K/L 挪焦点，加 Shift 挪列 / 挪窗口本身）\n"
+"vidow.bind(\"Mod+Return\", \"spawn \" .. (os.getenv(\"VIDOW_TERMINAL\") or \"kitty\"))\n"
+"vidow.bind(\"Mod+Q\", \"close-window\")\n"
+"vidow.bind(\"Mod+H\", \"focus-column left\")\n"
+"vidow.bind(\"Mod+L\", \"focus-column right\")\n"
+"vidow.bind(\"Mod+Shift+H\", \"move-column left\")\n"
+"vidow.bind(\"Mod+Shift+L\", \"move-column right\")\n"
+"vidow.bind(\"Mod+J\", \"focus-window down\")\n"
+"vidow.bind(\"Mod+K\", \"focus-window up\")\n"
+"vidow.bind(\"Mod+Shift+J\", \"move-window down\")\n"
+"vidow.bind(\"Mod+Shift+K\", \"move-window up\")\n"
+"vidow.bind(\"Mod+V\", \"toggle-floating\")\n"
+"vidow.bind(\"Mod+Shift+Space\", \"toggle-floating\")\n"
+"vidow.bind(\"Mod+F\", \"toggle-fullscreen\")\n"
+"vidow.bind(\"Mod+R\", \"cycle-column-width\")\n"
+"vidow.bind(\"Mod+M\", \"minimize-window\")\n"
+"vidow.bind(\"Mod+Shift+M\", \"restore-window\")\n"
+"vidow.bind(\"Mod+O\", \"toggle-overview\")\n"
+"vidow.bind(\"Mod+Escape\", \"quit\")\n"
+"\n"
+"-- 工作区（niri 那套：动态、按屏、按序号）\n"
 "--\n"
 "-- 每块屏各自一份纵向的工作区栈，序号 = 在这块屏上从上往下第几块。栈底永远是\n"
 "-- 一块空的：窗口开在它上面，底下立刻再补一块；中间那些空的、没名字的，切走就\n"
 "-- 自动消失。所以**不用预先建工作区**，直接切就行（序号越界会夹到最后一块）。\n"
-"--\n"
+"vidow.bind(\"Mod+U\", \"workspace down\")\n"
+"vidow.bind(\"Mod+I\", \"workspace up\")\n"
+"vidow.bind(\"Mod+Shift+U\", \"move down\")\n"
+"vidow.bind(\"Mod+Shift+I\", \"move up\")\n"
+"vidow.bind(\"Mod+Ctrl+U\", \"move-workspace down\")\n"
+"vidow.bind(\"Mod+Ctrl+I\", \"move-workspace up\")\n"
+"-- 数字键直跳（工作区是动态的：Mod+3 会夹到当前最后一块，用着用着就长出来了）\n"
+"for i = 1, 9 do\n"
+"\tvidow.bind(\"Mod+\" .. i, \"workspace \" .. i)\n"
+"\tvidow.bind(\"Mod+Shift+\" .. i, \"move \" .. i)\n"
+"end\n"
+"\n"
+"-- 切 tty（只有真机、有会话时才接管；嵌套 / headless 里这组键交给宿主）\n"
+"for i = 1, 12 do\n"
+"\tvidow.bind(\"Ctrl+Alt+F\" .. i, \"switch-vt \" .. i)\n"
+"end\n"
+"\n"
 "-- 想要「永远在、空了也不消失」的工作区，就用具名工作区（niri 的 named\n"
 "-- workspace），它在屏上的位置按声明顺序排，底部那块空的永远在最后：\n"
 "--\n"
@@ -1023,17 +1073,10 @@ static void print_keys_lua(FILE *f) {
 "--     vidow.bind(\"Mod+C\", \"workspace chat\")      -- 切过去\n"
 "--     vidow.bind(\"Mod+Shift+C\", \"move chat\")     -- 把当前窗口搬进去\n"
 "--\n"
-"-- 内置键位：Mod+U / Mod+I 上下切工作区，Mod+Shift+U/I 把窗口搬到上/下一块，\n"
-"-- Mod+Ctrl+U/I 整块工作区上下重排。下面 18 行是「数字键直跳」的绑定，不想要\n"
-"-- 就删掉（工作区是动态的，Mod+3 会夹到当前最后一块，用着用着就长出来了）。\n"
-"--\n"
-"-- 窗口规则 / 键位也写在这一份里：\n"
+"-- 窗口规则也写在这一份里：\n"
 "--     vidow.rule{ app_id = \"mpv\", title = \"预览\", force_render = true }\n"
-"--     vidow.bind(\"Mod+M\", \"minimize-window\")   -- 动作字符串见 README 的动作表\n"
-"for i = 1, 9 do\n"
-"\tvidow.bind(\"Mod+\" .. i, \"workspace \" .. i)\n"
-"\tvidow.bind(\"Mod+Shift+\" .. i, \"move \" .. i)\n"
-"end\n", f);
+"--\n"
+"-- 指针手势（Mod+左键拖窗口 / Mod+右键缩放 / Mod+滚轮切列）不是键位，改不了键。\n", f);
 }
 
 /* 一份分类文件的正文（不含文件头）。 */

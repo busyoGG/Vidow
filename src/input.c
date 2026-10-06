@@ -10,120 +10,18 @@
 #include <wayland-server-protocol.h>
 #include <wlr/util/log.h>
 
+/* 指针手势（Mod+左键拖窗口 / Mod+右键缩放 / Mod+滚轮切列）要求的修饰键。这是
+ * 指针手势，不是键位 —— 键位一个内置的都没有，全在 config.lua 里绑。 */
 #define MOD_KEY WLR_MODIFIER_LOGO /* Super */
 
-/* ------------------------------------------------------------- keybinds */
-
-static void spawn(const char *cmd) {
-	pid_t pid = fork();
-	if (pid < 0) {
-		wlr_log(WLR_ERROR, "fork failed");
-		return;
-	}
-	if (pid == 0) {
-		setsid();
-		execl("/bin/sh", "sh", "-c", cmd, (void *)NULL);
-		_exit(127);
-	}
-}
-
-/* `shift` comes from the modifier mask: some input paths (virtual keyboards)
- * report the unshifted keysym even while Shift is held. */
-static bool handle_keybinding(struct vidow_server *server, xkb_keysym_t sym,
-		uint32_t mods) {
-	bool shift = (mods & WLR_MODIFIER_SHIFT) != 0;
-	bool ctrl = (mods & WLR_MODIFIER_CTRL) != 0;
-	sym = xkb_keysym_to_lower(sym);
-	switch (sym) {
-	case XKB_KEY_Escape:
-		wl_display_terminate(server->display);
-		return true;
-	case XKB_KEY_Return: {
-		const char *term = getenv("VIDOW_TERMINAL");
-		spawn(term != NULL ? term : "kitty");
-		return true;
-	}
-	case XKB_KEY_q:
-		if (server->focused != NULL) {
-			vidow_view_close(server->focused);
-		}
-		return true;
-	case XKB_KEY_h: /* Mod+H / Mod+Shift+H: focus / move the column left */
-		if (shift) {
-			vidow_move_column(server, -1);
-		} else {
-			vidow_focus_column(server, -1);
-		}
-		return true;
-	case XKB_KEY_l:
-		if (shift) {
-			vidow_move_column(server, 1);
-		} else {
-			vidow_focus_column(server, 1);
-		}
-		return true;
-	case XKB_KEY_j: /* Mod+J / Mod+Shift+J: focus / move down the column */
-		if (shift) {
-			vidow_move_window(server, 1);
-		} else {
-			vidow_focus_window(server, 1);
-		}
-		return true;
-	case XKB_KEY_k:
-		if (shift) {
-			vidow_move_window(server, -1);
-		} else {
-			vidow_focus_window(server, -1);
-		}
-		return true;
-	case XKB_KEY_v: /* Mod+V / Mod+Shift+Space: toggle floating */
-	case XKB_KEY_space:
-		if (sym == XKB_KEY_v || shift) {
-			if (server->focused != NULL) {
-				vidow_float_toggle(server->focused);
-			}
-			return true;
-		}
-		return false;
-	case XKB_KEY_r: /* cycle column width: 1/3 -> 1/2 -> 2/3 */
-		vidow_cycle_column_width(server);
-		return true;
-	case XKB_KEY_m: /* Mod+M 收起当前窗口；Mod+Shift+M 放回最近收起来的那个 */
-		if (shift) {
-			if (!vidow_view_restore_last(server)) {
-				wlr_log(WLR_INFO, "放回: 现在没有最小化的窗口");
-			}
-			return true;
-		}
-		if (server->focused != NULL) {
-			vidow_view_set_minimized(server->focused, true);
-		}
-		return true;
-	case XKB_KEY_o: /* niri 风格的全景：整条列带缩小铺满这块屏 */
-		vidow_overview_toggle(server);
-		return true;
-	/* 工作区（niri 的默认键位）：Mod+U/I 上下切、Mod+Shift+U/I 把窗口搬过去、
-	 * Mod+Ctrl+U/I 整块工作区重排。工作区是「每块屏一份、栈底永远空一块」，
-	 * 所以上下切就是最常用的操作；数字键直跳写在默认配置里（可删）。 */
-	case XKB_KEY_u:
-		vidow_action_run(server, ctrl ? "move-workspace down" :
-			(shift ? "move down" : "workspace down"));
-		return true;
-	case XKB_KEY_i:
-		vidow_action_run(server, ctrl ? "move-workspace up" :
-			(shift ? "move up" : "workspace up"));
-		return true;
-	case XKB_KEY_f:
-		if (server->focused != NULL) {
-			vidow_view_toggle_fullscreen(server->focused);
-		}
-		return true;
-	default:
-		return false;
-	}
-}
-
-/* ------------------------------------------------------------- keyboard */
+/* 键位：一个内置的都没有 —— 全都由 config.lua 的 vidow.bind() 声明（默认配置在
+ * configs/14-keys.lua 里给了常用的一套）。合成器只负责「按下的键有没有人绑」，
+ * 没命中的按键照旧透传给客户端。
+ *
+ * 这里以前有一张写死的键位表（Mod+Return 起终端、Mod+Q 关窗、Mod+H/J/K/L 挪焦点、
+ * Mod+V 浮动、Mod+O 全景、Mod+F 全屏、Ctrl+Alt+F1..12 切 tty …），现在那些都是
+ * 动作字符串（spawn / close-window / focus-column / toggle-floating / toggle-overview
+ * / toggle-fullscreen / switch-vt …），用户绑哪个键都行，也能一个都不绑。 */
 
 static void keyboard_modifiers(struct wl_listener *listener, void *data) {
 	(void)data;
@@ -140,35 +38,6 @@ static void keyboard_modifiers(struct wl_listener *listener, void *data) {
 		&kb->wlr_keyboard->modifiers);
 }
 
-/* Ctrl+Alt+F1..F12：切 tty（真机上内核多半自己就切了，见 vidow_vt_switch）。
- *
- * 判据是「F1..F12 + Ctrl+Alt」而不是 XF86Switch_VT_n 那个 keysym：默认键位表里
- * FK01..FK12 的第 5 个符号才是 XF86Switch_VT_n，而 CTRL+ALT 这个 type 把 Control
- * 映射回第 1 层（preserve Control）—— 真按 Ctrl+Alt+F2 拿到的是 **F2** 这个 keysym
- * 加上 ctrl|alt 修饰（`xkbcli how-to-type --keysym XF86Switch_VT_2` 一个 keycode
- * 都找不到，就是这个原因）。两个都认：键位表把 keysym 配上时那条也能用。 */
-static bool vt_switch_key(struct vidow_server *server, xkb_keysym_t sym,
-		uint32_t mods) {
-	unsigned vt;
-	if (sym >= XKB_KEY_F1 && sym <= XKB_KEY_F12 &&
-			(mods & (WLR_MODIFIER_CTRL | WLR_MODIFIER_ALT)) ==
-				(WLR_MODIFIER_CTRL | WLR_MODIFIER_ALT)) {
-		vt = (unsigned)(sym - XKB_KEY_F1) + 1;
-	} else if (sym >= XKB_KEY_XF86Switch_VT_1 &&
-			sym <= XKB_KEY_XF86Switch_VT_12) {
-		vt = (unsigned)(sym - XKB_KEY_XF86Switch_VT_1) + 1;
-	} else {
-		return false;
-	}
-	/* 没有会话就别吃这个键：嵌套里那是宿主（Hyprland）的 Ctrl+Alt+F2。 */
-	if (server->session == NULL) {
-		wlr_log(WLR_DEBUG, "VT: 没有会话（嵌套 / headless），Ctrl+Alt+F%u 交给宿主",
-			vt);
-		return false;
-	}
-	return vidow_vt_switch(server, vt);
-}
-
 static void keyboard_key(struct wl_listener *listener, void *data) {
 	struct vidow_keyboard *kb = wl_container_of(listener, kb, key);
 	struct vidow_server *server = kb->server;
@@ -182,22 +51,10 @@ static void keyboard_key(struct wl_listener *listener, void *data) {
 
 	bool handled = false;
 	uint32_t mods = wlr_keyboard_get_modifiers(kb->wlr_keyboard);
-	/* 0) 切 tty 的键（Ctrl+Alt+F1..F12）：只有真机（有会话）才接管。 */
+	/* config.lua 里 vidow.bind() 声明的键位（动作字符串见 README 的动作表）：
+	 * 工作区切换 / 窗口与列的方向移动 / 浮动 / 全屏 / 全景 / 起命令 / 切 tty …
+	 * 一个内置的都不预设，绑什么是什么；没命中的按键透传给客户端。 */
 	if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
-		for (int i = 0; i < nsyms; i++) {
-			handled = vt_switch_key(server, syms[i], mods) || handled;
-		}
-	}
-	/* 1) 内置键位：进 overview、退出合成器、关窗、丢给布局的那些。 */
-	if ((mods & MOD_KEY) && event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
-		for (int i = 0; i < nsyms; i++) {
-			handled = handle_keybinding(server, syms[i], mods) || handled;
-		}
-	}
-	/* 2) config.lua 里 vidow.bind() 声明的键位：工作区切换 / 特殊工作区 / 搬家。
-	 * 合成器自己一个工作区键都不预设 —— 用户绑什么就是什么。没命中的按键
-	 * 照旧透传给客户端。 */
-	if (!handled && event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
 		for (int i = 0; i < nsyms; i++) {
 			handled = vidow_keybind_key(server, syms[i], mods) || handled;
 		}

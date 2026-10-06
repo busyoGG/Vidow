@@ -215,7 +215,7 @@ vidowmsg set-config gaps_left -1            # 左边界回到「跟随统一值�
 
 ### 配置怎么写
 
-工作区是用户建的，键位也是用户绑的 —— 合成器一个工作区快捷键都不预设（内置键位表见
+工作区是用户建的，键位也是用户绑的 —— 合成器一个快捷键都不预设（默认那套见
 「快捷键」一节，那里全是窗口/列的操作）：
 
 ```lua
@@ -257,6 +257,18 @@ end
 | `toggle-minimize` | 当前窗口收了就放回、没收就收起 |
 | `mousemove` | 把光标所在的那块屏当作「聚焦的屏」（特殊工作区跟的就是它） |
 | `none` | 空绑定，用来屏蔽某个键 |
+| `focus-column <方向>` / `move-column <方向>` | 焦点左/右移一列 / 当前列左/右移一位 |
+| `focus-window <方向>` / `move-window <方向>` | 列内焦点下/上移 / 列内窗口下/上移 |
+| `close-window` | 关掉焦点窗口 |
+| `toggle-floating` | 焦点窗口 平铺 ⇄ 浮动 |
+| `toggle-fullscreen`（`fullscreen` 同义） | 焦点窗口全屏开关 |
+| `cycle-column-width` | 列宽 1/3 → 1/2 → 2/3 |
+| `toggle-overview`（`overview` 同义） | niri 风格全景开关 |
+| `spawn <命令>`（`exec` 同义） | 撒手跑一条 shell 命令（双 fork、不等它、不阻塞渲染） |
+| `switch-vt <1..12>` | 切 tty（没有会话时只记一行日志，交给宿主） |
+| `quit`（`exit` 同义） | 退出合成器 |
+
+`<方向>` = `-1` / `1`，也认 `left` / `right` / `up` / `down` / `prev` / `next`。
 
 `vidow.bind` 的键名大小写不敏感，修饰键认 `Mod`/`Super`/`Logo`/`Win`、`Shift`、`Alt`/`Mod1`、
 `Ctrl`/`Control`；键名可以是单字符（字母、数字）或 X11 惯用名（`grave`、`minus`、`equal`、
@@ -706,6 +718,7 @@ python3 test-float.py        # 三个真实 GTK 窗口，验证浮动模式自�
 ./test-input-inject.sh               # 输入注入：鼠标 / 键盘合成事件到客户端（全 headless，54 项断言）
 ./test-cursor-shake.sh              # 摇晃找光标：晃一下大一倍、晃到屏幕那么大，截图里没有它（全 headless，46 项断言）
 ./test-config.sh                     # 配置系统：一个 Lua 文件 + 改了就自动重载（全 headless，15 项断言）
+./test-binds.sh                      # 键位全是配置给的：没配置=没有键位、默认那套能用、换键位、动作字符串（全 headless，35 项断言）
 ./test-config-include.sh             # 配置拆成好几份：vidow.include() 的路径/顺序/报错 + 改哪份都自动重载（全 headless，25 项断言）
 ./test-defaultconfig.sh              # 默认配置按类别拆成 configs/（--default-config / --write-config）+ 配置族的表写法（全 headless，41 项断言）
 ./test-gap.sh                        # 间距：一个数管全部 + 单边/内间距覆盖（全 headless，33 项断言）
@@ -755,8 +768,15 @@ WLR_BACKENDS=headless WLR_HEADLESS_OUTPUTS=1 WLR_LIBINPUT_NO_DEVICES=1 ./build/v
 
 `Super` = `Mod`（`WLR_MODIFIER_LOGO`）。
 
-| 按键 | 动作 |
-| --- | --- |
+**合成器一个键位都不内置**：下面这一套是默认配置给的（`configs/14-keys.lua`），
+改哪个键、删哪个键都由你 —— 没绑的键原样透传给客户端。键位就是配置里的一行：
+
+```lua
+vidow.bind("Mod+Q", "close-window")        -- 动作字符串见下面那张表
+vidow.bind("Mod+Return", "spawn kitty")    -- spawn 后面跟一条 shell 命令
+```
+
+| 按键（默认配置给的） | 动作 |
 | `Mod+H` / `Mod+L` | 焦点左/右移一列（视口跟随滚动） |
 | `Mod+J` / `Mod+K` | 焦点在列内下/上移；单窗口列则跳到下/上一列 |
 | `Mod+Shift+H` / `Mod+Shift+L` | 当前列左/右移一位 |
@@ -775,8 +795,12 @@ WLR_BACKENDS=headless WLR_HEADLESS_OUTPUTS=1 WLR_LIBINPUT_NO_DEVICES=1 ./build/v
 | `Mod+U` / `Mod+I` | 工作区上/下切一块（niri 的默认键位） |
 | `Mod+Shift+U` / `Mod+Shift+I` | 把当前窗口搬到上/下一块工作区 |
 | `Mod+Ctrl+U` / `Mod+Ctrl+I` | 整块工作区上/下移一位（重排） |
-| `Mod+1`…`Mod+9` | 切到这块屏上第 n 块（默认配置里给的绑定，可删；越界夹到最后一块） |
-| — | 特殊工作区 / 具名工作区的键位不预设，由 `config.lua` 里 `vidow.bind()` 自己绑 |
+| `Mod+1`…`Mod+9` / `Mod+Shift+1`…`9` | 切到这块屏上第 n 块 / 把窗口搬过去（越界夹到最后一块） |
+| `Ctrl+Alt+F1`…`F12` | 切 tty（只有真机、有会话时才接管；嵌套里这组键交给宿主） |
+| — | 特殊工作区 / 具名工作区**默认不绑**，要就自己 `vidow.bind("Mod+C", "workspace chat")` |
+
+指针手势（`Mod+左键拖动` / `Mod+右键拖动` / `Mod+滚轮`）不是键位：它们要的是「按着
+Mod 用鼠标」，改不了键（要改就是改 `src/input.c` 里的 `MOD_KEY`）。
 
 鼠标左键点击窗口即聚焦并滚动到该列；点击 layer 表面（启动器）时按需交出键盘焦点。
 
@@ -1986,7 +2010,7 @@ layer 的模糊底衬把 layer surface 自己的缓冲当 mask 传进去，窗�
     ├── 11-activation.lua        窗口激活
     ├── 12-portal.lua            xdg-desktop-portal
     ├── 13-cursor.lua            指针
-    └── 14-keys.lua              键位 / 工作区 / 窗口规则
+    └── 14-keys.lua              键位（合成器不内置，默认这一套）+ 工作区 / 窗口规则
 ```
 
 `vidow.include("configs/01-gaps.lua")` 就是「把那份文件就地展开」，和抄在这里一个意思：
@@ -2479,7 +2503,8 @@ src/float.c    浮动模式识别与放置、交互式移动/缩放 grab
 src/layer.c    layer surface 生命周期、层级树、exclusive zone、键盘独占、出现/消失动画
 src/decoration.c zxdg_decoration_manager_v1：按 decor 配置告诉客户端「装饰谁画」。
                   不给这个全局，kitty / GTK / Qt 就自己画标题栏，跟我们的圆角打架
-src/input.c    键盘/指针/滚轮/拖动、快捷键、虚拟键盘与虚拟指针、光标、剪贴板
+src/input.c    键盘/指针/滚轮/拖动、虚拟键盘与虚拟指针、光标、剪贴板（键位不在这里：
+               一个都不内置，全由 config.lua 的 vidow.bind() 声明）
 src/config.c   配置键表（键名/类型/范围/分节）+ 默认值 + VIDOW_* 环境变量覆盖 + 配置「族」
                的表写法 + 默认配置按类别拆成 configs/ 那一套（--default-config / --write-config）
 src/scale.c    缩放计算（纯函数，不碰 wlroots）：ppi→scale、量化夹取、每输出覆盖、
@@ -3233,6 +3258,27 @@ protocols/     wlr-layer-shell / wlr-virtual-pointer / input-method-v2 /
      默认配置里给了 `Mod+1..9` 直跳的绑定（可删）。`test-workspace.sh` 的日志断言跟着新格式
      改；`test-ipc.sh`/`test-focus.sh` 同步。回归：defaultconfig / gap / config / workspace /
      ipc / focus / overview / hotplug / clipboard / layerwin / xwayland-popup 全过。
+
+130. **键位一个都不内置了：全由 `vidow.bind()` 声明，默认那套写在 `configs/14-keys.lua`**。
+     `src/input.c` 里原来有一张写死的键位表（`Mod+Return` 起终端、`Mod+Q` 关窗、
+     `Mod+H/J/K/L` 挪焦点、`Mod+V` 浮动、`Mod+R` 列宽、`Mod+M` 最小化、`Mod+O` 全景、
+     `Mod+F` 全屏、`Mod+U/I` 工作区、`Mod+Escape` 退出、`Ctrl+Alt+F1..F12` 切 tty），
+     而且它排在 `vidow.bind()` **前面** —— 想换键位是换不了的，只能改代码。现在整张表
+     没了：那些行为都成了动作字符串（`spawn` / `close-window` / `focus-column` /
+     `focus-window` / `move-column` / `move-window` / `toggle-floating` /
+     `toggle-fullscreen` / `cycle-column-width` / `toggle-overview` / `quit` /
+     `switch-vt`，`<方向>` 认 `-1`/`1` 也认 `left`/`right`/`up`/`down`），默认配置把它们
+     绑在原来的键上，删一行就还给客户端。顺带修掉两个老毛病：`focus -1` 一直是坏的
+     （`parse_number()` 不收负数，而 README 的动作用的是 `focus <-1|1>`），现在统一走
+     `parse_direction()`；键名表里没有 F1..F12，`Ctrl+Alt+F2` 这种绑不上去，现在
+     `F1..F35`（以及 `xf86switch_vt_1..12`）都能写。`spawn` 用的是现成的
+     `vidow_exec_detached()`（双 fork、不阻塞），`Mod+Return` 仍认 `$VIDOW_TERMINAL`。
+     没绑的键原样透传给客户端 —— **没有配置文件 = 一个键位都没有**，这是刻意的。
+     新增 `./test-binds.sh`（35 项）：没配置时按 `Mod+Q`/`Mod+V` 什么都不发生、
+     `--write-config` 那套真的能用（关窗 / 浮动 / 列宽 / 挪列 / 最小化 / 全景）、
+     `Ctrl+Alt+F1..F12` 绑得上、动作字符串逐条跑、参数写错当场报错、把 `Mod+Q` 换成
+     `Mod+W` 后新旧键的行为都跟着变、`quit` 正常退出。`test-vt.sh` / `test-overview.sh` /
+     `test-hotplug.sh` 改成在自己配置里绑上要按的那几个键（它们原来吃的是内置表）。
 
 129. **配置按类别拆开：入口 `config.lua` + `configs/` 下一类一份**（`vidow.include()`）。
      原来那份「一份两三百行、什么都写在一起」的默认配置，改一个圆角要先滚过间距、模糊、

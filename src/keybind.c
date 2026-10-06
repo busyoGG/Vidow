@@ -83,6 +83,27 @@ static bool key_sym(const char *name, xkb_keysym_t *out) {
 			return true;
 		}
 	}
+	/* F1..F35（切 tty 的默认绑定就是 Ctrl+Alt+F1..F12）。表里不一个个列，
+	 * 这里算出来。 */
+	if (name[1] != '\0' && (name[0] == 'f' || name[0] == 'F')) {
+		char *end = NULL;
+		long n = strtol(name + 1, &end, 10);
+		if (end != name + 1 && *end == '\0' && n >= 1 && n <= 35) {
+			*out = (xkb_keysym_t)XKB_KEY_F1 + (xkb_keysym_t)(n - 1);
+			return true;
+		}
+	}
+	/* XF86Switch_VT_1..12：自定义 keymap 里可能直接给这个 keysym
+	 * （默认 keymap 给的是 F1..F12 + ctrl|alt，见 README 的「切 tty」）。 */
+	if (strncasecmp(name, "xf86switch_vt_", 14) == 0) {
+		char *end = NULL;
+		long n = strtol(name + 14, &end, 10);
+		if (end != name + 14 && *end == '\0' && n >= 1 && n <= 12) {
+			*out = (xkb_keysym_t)XKB_KEY_XF86Switch_VT_1 +
+				(xkb_keysym_t)(n - 1);
+			return true;
+		}
+	}
 	return name[1] == '\0' && ascii_key(name[0], out);
 }
 
@@ -208,6 +229,33 @@ static bool parse_number(const char *arg, int *out) {
 	char *end = NULL;
 	long value = strtol(arg, &end, 10);
 	if (end == arg || *end != '\0' || value < 0 || value > 9999) {
+		return false;
+	}
+	*out = (int)value;
+	return true;
+}
+
+/* 方向参数：-1 / 1，也认 left|right|up|down|prev|next（列、窗口都用它）。
+ * 单独写一个是因为 parse_number() 不收负数 —— `focus -1` 就是这么废掉的。 */
+static bool parse_direction(const char *arg, int *out) {
+	if (arg == NULL || arg[0] == '\0') {
+		return false;
+	}
+	if (strcasecmp(arg, "left") == 0 || strcasecmp(arg, "up") == 0 ||
+			strcasecmp(arg, "prev") == 0 ||
+			strcasecmp(arg, "previous") == 0) {
+		*out = -1;
+		return true;
+	}
+	if (strcasecmp(arg, "right") == 0 || strcasecmp(arg, "down") == 0 ||
+			strcasecmp(arg, "next") == 0) {
+		*out = 1;
+		return true;
+	}
+	char *end = NULL;
+	long value = strtol(arg, &end, 10);
+	if (end == arg || *end != '\0' || value == 0 ||
+			value < -1000 || value > 1000) {
 		return false;
 	}
 	*out = (int)value;
@@ -394,13 +442,91 @@ bool vidow_action_run(struct vidow_server *server, const char *action) {
 		return vidow_workspace_toggle_special(server, want);
 	}
 	if (strcmp(name, "focus") == 0) {
-		int n = 0;
-		if (parse_number(arg, &n)) {
-			vidow_focus_column(server, n);
+		int dir = 0;
+		if (parse_direction(arg, &dir)) {
+			vidow_focus_column(server, dir);
 			return true;
 		}
-		wlr_log(WLR_ERROR, "focus 的参数是列方向（focus -1 / focus 1）");
+		wlr_log(WLR_ERROR, "focus 的参数是列方向（focus -1 / focus 1 / "
+			"focus left / focus right）");
 		return false;
+	}
+	/* 窗口 / 布局：原来这些是 input.c 里的内置键位表，现在全走动作 ——
+	 * 默认配置里绑好了一套（configs/14-keys.lua），删了就没了。 */
+	if (strcmp(name, "focus-column") == 0 ||
+			strcmp(name, "move-column") == 0 ||
+			strcmp(name, "focus-window") == 0 ||
+			strcmp(name, "move-window") == 0) {
+		int dir = 0;
+		if (!parse_direction(arg, &dir)) {
+			wlr_log(WLR_ERROR, "%s 要一个方向（-1 / 1，或者 "
+				"left|right|up|down）", name);
+			return false;
+		}
+		if (strcmp(name, "focus-column") == 0) {
+			vidow_focus_column(server, dir);
+		} else if (strcmp(name, "move-column") == 0) {
+			vidow_move_column(server, dir);
+		} else if (strcmp(name, "focus-window") == 0) {
+			vidow_focus_window(server, dir);
+		} else {
+			vidow_move_window(server, dir);
+		}
+		log_action(action, "焦点 / 窗口挪一格");
+		return true;
+	}
+	if (strcmp(name, "close-window") == 0) {
+		if (server->focused == NULL) {
+			return false;
+		}
+		vidow_view_close(server->focused);
+		log_action(action, "关掉焦点窗口");
+		return true;
+	}
+	if (strcmp(name, "toggle-floating") == 0) {
+		if (server->focused == NULL) {
+			return false;
+		}
+		vidow_float_toggle(server->focused);
+		log_action(action, "平铺 ⇄ 浮动");
+		return true;
+	}
+	if (strcmp(name, "toggle-fullscreen") == 0 ||
+			strcmp(name, "fullscreen") == 0) {
+		if (server->focused == NULL) {
+			return false;
+		}
+		vidow_view_toggle_fullscreen(server->focused);
+		log_action(action, "全屏开关");
+		return true;
+	}
+	if (strcmp(name, "cycle-column-width") == 0) {
+		vidow_cycle_column_width(server);
+		log_action(action, "列宽 1/3 → 1/2 → 2/3");
+		return true;
+	}
+	if (strcmp(name, "toggle-overview") == 0 ||
+			strcmp(name, "overview") == 0) {
+		vidow_overview_toggle(server);
+		log_action(action, "全景开关");
+		return true;
+	}
+	/* 跑一条 shell 命令（默认配置里 Mod+Return 用的就是它）：
+	 *   vidow.bind("Mod+Return", "spawn kitty")
+	 * 双 fork、不等它、输出丢掉 —— 不阻塞渲染，也不留僵尸。 */
+	if (strcmp(name, "spawn") == 0 || strcmp(name, "exec") == 0) {
+		if (arg == NULL || arg[0] == '\0') {
+			wlr_log(WLR_ERROR, "spawn 后面要跟一条命令");
+			return false;
+		}
+		vidow_exec_detached(arg);
+		log_action(action, "起了一条命令");
+		return true;
+	}
+	if (strcmp(name, "quit") == 0 || strcmp(name, "exit") == 0) {
+		wlr_log(WLR_INFO, "action: %s -> 退出合成器", action);
+		wl_display_terminate(server->display);
+		return true;
 	}
 	/* 最小化（可绑：vidow.bind("Mod+M", "minimize-window")）：
 	 *   minimize-window   —— 收起当前窗口（留在原列里，只是不占位）

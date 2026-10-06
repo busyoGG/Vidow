@@ -1,5 +1,9 @@
 #!/bin/bash
 # 用 wtype 通过虚拟键盘给嵌套的 vidow 注入按键，验证 niri 式焦点/滚动/改宽。
+#
+# 手动脚本（要先用 ./run-nested.sh 起一个嵌套会话）。**键位来自配置**：合成器
+# 一个键位都不内置，这里按的 Mod+H/J/K/L/R 是 configs/14-keys.lua 里默认那套给的
+# —— 自己删过绑定的话，这个脚本按了不会有反应（自动化的那份见 ./test-binds.sh）。
 set -u
 cd "$(dirname "$0")"
 export WAYLAND_DISPLAY=wayland-0

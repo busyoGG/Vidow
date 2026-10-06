@@ -45,7 +45,9 @@ mkdir -p "$CFGDIR/.config/vidow" "$RUNDIR/run"
 chmod 700 "$RUNDIR/run"
 cat > "$CFGDIR/.config/vidow/config.lua" <<'CFG'
 vidow.output{ name = "HEADLESS-1", scale = 1 }
--- 真机上生效的就是这条（headless 没有会话，只会记一行「没有会话」）
+-- 键位全是配置给的（合成器不内置）：真机上生效的就是这两条，headless 里没有会话，
+-- 只会各记一行「没有会话」。
+vidow.bind("Ctrl+Alt+F2", "switch-vt 2")
 vidow.bind("Ctrl+Alt+P", "switch-vt 3")
 CFG
 
@@ -68,13 +70,13 @@ grep -a "会话:" "$LOG" | tail -1
 grep -aq "会话: 没有（嵌套 / headless 后端）" "$LOG" &&
 	pass "headless 下明说「没有会话」" || fail "没说明会话情况"
 
-mark "2) Ctrl+Alt+F2：认得出来、不接管"
+mark "2) Ctrl+Alt+F2：绑上了、没会话就不接管"
 wtype -M ctrl -M alt -k F2 2>/dev/null
 sleep 0.4
 grep -a "VT:" "$LOG" | tail -1
-grep -aq "VT: 没有会话（嵌套 / headless），Ctrl+Alt+F2 交给宿主" "$LOG" &&
-	pass "认得出 Ctrl+Alt+F2（F1..F12 + Ctrl+Alt 就是 VT 键）" ||
-	fail "没认出 Ctrl+Alt+F2"
+grep -aq "VT: 没有会话（嵌套 / headless），切 VT 交给宿主" "$LOG" &&
+	pass "配置里绑的 Ctrl+Alt+F2 → switch-vt 2 走到了没会话那条路" ||
+	fail "Ctrl+Alt+F2 没生效（绑的是 vidow.bind(\"Ctrl+Alt+F2\", \"switch-vt 2\")）"
 pgrep -x vidow >/dev/null && pass "注入之后合成器还活着" || fail "合成器挂了"
 
 mark "3) IPC 动作 switch-vt：优雅失败"

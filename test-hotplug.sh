@@ -73,6 +73,8 @@ xwayland = false
 window_open_ms = 150
 window_close_ms = 150
 window_move_ms = 150
+-- 键位全是配置给的（合成器不内置）：这个测试要按 Mod+R 切列宽，就自己绑上
+vidow.bind("Mod+R", "cycle-column-width")
 EOF
 
 export XDG_RUNTIME_DIR="$RUNDIR/run"

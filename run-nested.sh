@@ -24,7 +24,8 @@ if [ -z "$sock" ]; then
 	exit 1
 fi
 echo "vidow 运行中: WAYLAND_DISPLAY=$sock (日志 /tmp/vidow-nested.log)"
-echo "窗口内: Super+Enter 开终端, Super+J/K 切焦点, Super+Q 关窗, Super+Escape 退出"
+echo "窗口内: 键位由配置给（合成器不内置）。默认那套在 configs/14-keys.lua:" \
+	"Super+Enter 开终端, Super+J/K 切焦点, Super+Q 关窗, Super+Escape 退出"
 
 for t in a b c; do
 	setsid nohup env WAYLAND_DISPLAY="$sock" "$CLIENT" --title "wm-$t" \
