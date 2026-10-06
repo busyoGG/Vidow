@@ -40,6 +40,7 @@ stop_clients() {
 	for p in /proc/[0-9]*; do
 		pid=${p#/proc/}
 		[ "$pid" = "$$" ] && continue
+		[ -r "$p/cmdline" ] || continue
 		cmd=$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null) || continue
 		case "$cmd" in
 		*bluewin.py*|*tools/dot.py*|*wf-recorder*|*grim*) kill "$pid" 2>/dev/null ;;
@@ -47,7 +48,29 @@ stop_clients() {
 	done 2>/dev/null
 }
 
+# 收尾兜底：把「环境里带着本测试 RUNDIR 的 vidow」全找出来杀掉。不认记下的 pid
+# —— setsid 起来到把 pid 记进列表之间有个空档，正好被 timeout / Ctrl-C 打断时
+# 漏在那里的进程就没人管了（实测漏过 7 个）。按环境变量认：只碰本测试起的那些，
+# 绝不碰用户自己的会话。
+kill_stray_vidows() {
+	for p in /proc/[0-9]*; do
+		local pid=${p#/proc/}
+		[ "$pid" = "$$" ] && continue
+		local cmd
+		[ -r "$p/cmdline" ] || continue
+		cmd=$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null) || continue
+		case "$cmd" in *build/vidow*) ;; *) continue ;; esac
+		local env
+		[ -r "$p/environ" ] || continue
+		env=$(tr '\0' '\n' < "$p/environ" 2>/dev/null) || continue
+		case "$env" in
+		*"$RUNDIR"*) kill -KILL "$pid" 2>/dev/null ;;
+		esac
+	done
+}
+
 cleanup() {
+	kill_stray_vidows
 	stop_clients
 	for pid in $VIDOW_PIDS; do
 		[ -n "$pid" ] || continue
