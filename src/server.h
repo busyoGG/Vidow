@@ -1421,6 +1421,13 @@ void vidow_cursor_fx_set_surface(struct vidow_server *server,
 		struct wlr_surface *surface, int32_t hx, int32_t hy);
 /* 指针底下没窗口了，该显示主题默认箭头。放大期间不动真图，只记状态。 */
 void vidow_cursor_fx_default_cursor(struct vidow_server *server);
+/* 抓帧让位：放大图是软光标时，抓帧那一帧临时换回原尺寸那张（它放得下硬件光标
+ * 平面，于是不进渲染通道）—— 画面上照样有光标，抓到的帧里没有。返回 true 表示
+ * 让过位，渲染完要调 _unguard 换回去。 */
+bool vidow_cursor_fx_capture_guard(struct vidow_server *server,
+		struct wlr_output *output);
+void vidow_cursor_fx_capture_unguard(struct vidow_server *server,
+		struct wlr_output *output, bool guarded);
 /* 光标状态（magnified / scale / image / hardware / hw_max），写进当前 JSON 对象。 */
 struct jbuf;
 void vidow_cursor_fx_json(struct jbuf *b, struct vidow_server *server);

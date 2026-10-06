@@ -1,21 +1,23 @@
 #!/bin/bash
-# 摇晃找光标：快速来回晃几下指针，指针就地放大一会儿（config 的 cursor_shake）。
+# 摇晃找光标：快速来回晃几下指针，指针就地放大 —— 晃一下大一圈，接着晃接着大
+# （config 的 cursor_shake / cursor_shake_scale）。
 #
 # 判据（headless 1280x720 一块屏，截图用 grim 当裁判 —— 「进没进截图」由像素说了算）：
 #   1) cursor 命令报得出光标状态：image（当前光标图的物理尺寸）/ hardware / hw_max
 #   2) 慢慢往一个方向移动**不**触发（不然正常用鼠标就会乱放大）
-#   3) 来回晃（700ms 内 4 次换向、每段 ≥12px）触发：光标图正好放大 2 倍
+#   3) 来回晃（700ms 内 4 次换向、每段 ≥12px）触发：光标图放大 2 倍
 #   4) 到点自己还原（700ms 后回到原尺寸）
-#   5) cursor-shake 命令手动触发（脚本 / 远程入口），放大期间再来一次是续期
-#   6) **不进截图**：grim 不带 -c 抓，画面里一个光标像素都没有（放大中也一样）——
-#      放大走的是硬件光标那条路，不进合成器的渲染通道
-#   7) **显式指定才进截图**：grim -c（screencopy 的 overlay_cursor）抓，光标在，
-#      而且放大后的外接矩形正好是 2 倍、箭头尖还钉在原来那个点上
-#   8) 客户端自己设的光标（wl_pointer.set_cursor 的 surface）也能放大，而且还原的是
+#   5) 接着晃接着大：2→4→8→16→32→45，最后被「屏幕只有这么大」封顶
+#   6) **不进截图**：grim 不带 -c 抓，画面里一个光标像素都没有（放大中也一样）
+#   7) **显式指定才进截图**：grim -c 抓，光标在，外接矩形正好是放大后的尺寸、
+#      箭头尖还钉在原来那个点上（热点按倍数缩放）
+#   8) **抓帧让位**：软光标那条路（真机上放大超出硬件光标平面就是它）——放大中
+#      普通抓帧里照样一个光标像素都没有，而 grim -c 能抓到放大图
+#   9) 客户端自己设的光标（wl_pointer.set_cursor 的 surface）也能放大，而且还原的是
 #      **客户端那张**（不是主题箭头）
-#   9) cursor_shake = false：晃不放大、cursor-shake 被拒且理由点得到配置
-#  10) cursor_shake_scale：1.5 → 1.5 倍；20 → 被硬件光标上限夹住并在日志里说明
-#  11) 日志里没有 assert / abort
+#  10) cursor_shake = false：晃不放大、cursor-shake 被拒且理由点得到配置
+#  11) cursor_shake_scale：1.5 → 1.5 倍；20 → 被屏幕尺寸封顶
+#  12) 日志里没有 assert / abort
 #
 # 用法：./test-cursor-shake.sh   （VIDOW_TEST_KEEP=1 保留运行目录）
 # 注意：别和别的测试**并行**跑 —— 收尾按 cmdline 杀 pattern.py / frames / wev。
@@ -157,7 +159,7 @@ else:
 PY
 }
 
-# 尺寸按倍数算（和 C 里的 lround 对齐）
+# 按倍数算尺寸（和 C 里的 lround 对齐）
 scale_size() { # <w> <h> <倍数>
 	python3 -c 'import sys
 w,h,f = int(sys.argv[1]), int(sys.argv[2]), float(sys.argv[3])
@@ -179,7 +181,7 @@ HWMAX=$(cfield hw_max)
 [ -n "$HWMAX" ] && pass "硬件光标上限 hw_max=$HWMAX" || fail "hw_max 没报出来"
 case "$(cfield hardware)" in
 true)  pass "光标在硬件平面上（不进渲染通道）" ;;
-false) pass "光标是软光标（headless 下也说得通，截图那条判据会自己说明）" ;;
+false) pass "光标是软光标（截图那条判据会自己说明）" ;;
 *)     fail "hardware 字段没报出来" ;;
 esac
 
@@ -222,20 +224,29 @@ sleep 0.9
 	|| fail "还原后的尺寸是 $(cfield image)"
 grep -aq "摇晃: 光标还原" "$LOG" && pass "日志记了还原" || fail "日志里没有还原记录"
 
-# ------------------------------------------------------------ 5) 手动触发
-mark "5. cursor-shake 手动触发（脚本入口）"
-msg cursor-shake | grep -aq '"magnified":true' \
-	&& pass "cursor-shake 立刻放大" || fail "cursor-shake 没放大"
-[ "$(cfield image)" = "$BIG" ] && pass "手动触发也是 $BIG" \
-	|| fail "手动触发后尺寸是 $(cfield image)"
-sleep 0.4
-msg cursor-shake >/dev/null
-sleep 0.5
-[ "$(cfield magnified)" = "true" ] && pass "放大期间再来一次是续期（还没还原）" \
-	|| fail "放大期间再触发反而提前还原了"
+# ------------------------------------------------------------ 5) 接着晃接着大
+mark "5. 接着晃接着大（不封顶，只封到屏幕那么大）"
+W0=${IMG0%x*}
+H0=${IMG0#*x}
+CAP=$(python3 -c "print(min(1280.0/$W0, 720.0/$H0))")
+OK=1
+for i in 1 2 3 4 5 6; do
+	msg cursor-shake >/dev/null
+	sleep 0.05
+	WANT=$(python3 -c "print('%dx%d' % (round($W0*min(2**$i, $CAP)), round($H0*min(2**$i, $CAP))))")
+	GOT=$(cfield image)
+	if [ "$GOT" = "$WANT" ]; then
+		pass "第 $i 次：$GOT"
+	else
+		fail "第 $i 次是 $GOT，期望 $WANT"
+		OK=0
+	fi
+done
+[ "$OK" = "1" ] && pass "一路长到 $(cfield image)（屏幕 1280x720 封顶）" \
+	|| fail "某一圈没长对"
+grep -aq "摇晃: 屏幕只有 1280x720.*到 .* 为止" "$LOG" \
+	&& pass "日志说明了被屏幕尺寸封顶" || fail "日志没说明封顶"
 sleep 0.9
-[ "$(cfield magnified)" = "false" ] && pass "续期之后照样到点还原" \
-	|| fail "续期之后没还原"
 
 # ------------------------------------------------------------ 6) 不进截图
 mark "6. 不进截图（grim 不带 -c）"
@@ -249,8 +260,8 @@ msg cursor-shake >/dev/null
 sleep 0.2
 grim "$RUNDIR/plain-mag.png" >/dev/null 2>&1
 read -r N X Y W H <<< "$(ink "$RUNDIR/plain-mag.png")"
-[ "$N" = "0" ] && pass "**放大中**的普通截图里也没有光标（不进渲染通道）" \
-	|| fail "放大中的普通截图里出现了 $N 个像素（$W x $H @ $X,$Y）—— 放大图进截图了"
+[ "$N" = "0" ] && pass "**放大中**的普通截图里也没有光标" \
+	|| fail "放大中的普通截图里出现了 $N 个像素（$W x $H @ $X,$Y）"
 sleep 0.9
 
 # ------------------------------------------------------------ 7) 显式指定才进
@@ -271,7 +282,6 @@ read -r N2 X2 Y2 W2 H2 <<< "$(ink "$RUNDIR/cur-mag.png")"
 	|| fail "放大后外接矩形是 $W2 x $H2，期望 $BIG"
 [ "$N2" -gt "$N1" ] && pass "像素更多了（$N1 → $N2）" \
 	|| fail "放大后像素没变多（$N1 → $N2）"
-# 箭头尖（热点）还钉在 300,100：放大图的左上角 = 2×原来的左上角 - 指针位置
 EXP_X=$(( 2 * X1 - 300 ))
 EXP_Y=$(( 2 * Y1 - 100 ))
 [ "$X2" = "$EXP_X" ] && [ "$Y2" = "$EXP_Y" ] \
@@ -279,8 +289,40 @@ EXP_Y=$(( 2 * Y1 - 100 ))
 	|| fail "热点跑了：左上角 $X1,$Y1 → $X2,$Y2，期望 $EXP_X,$EXP_Y"
 sleep 0.9
 
-# ------------------------------------------------------------ 8) 客户端设的光标
-mark "8. 客户端自己设的光标（wl_pointer.set_cursor）也能放大并还原"
+# ------------------------------------------------------------ 8) 抓帧让位（软光标）
+mark "8. 抓帧让位：软光标那条路（真机上放大超出硬件平面就是它）"
+stop_vidow
+export VIDOW_TEST_SOFT_CURSOR=1   # 钩子：把这块屏钉死在软光标上
+start_vidow ""
+msg move-cursor 300 100 >/dev/null
+sleep 0.3
+[ "$(cfield hardware)" = "false" ] && pass "光标现在是软光标（会画进画面）" \
+	|| fail "钩子没生效，光标还是硬件光标"
+grim "$RUNDIR/soft.png" >/dev/null 2>&1
+read -r N0 X0 Y0 W0B H0B <<< "$(ink "$RUNDIR/soft.png")"
+[ "$N0" -gt 0 ] && pass "基线：软光标本来就会进画面（$N0 个像素，$W0B x $H0B）" \
+	|| fail "软光标没进画面？那这条判据没意义"
+for _ in 1 2 3 4 5; do msg cursor-shake >/dev/null; sleep 0.05; done
+IMG_S=$(cfield image)
+grep -aq "摇晃: 光标放大.*软光标：抓帧时让位" "$LOG" \
+	&& pass "日志说明是软光标（$IMG_S）" || fail "日志没说软光标"
+grim "$RUNDIR/soft-mag.png" >/dev/null 2>&1
+read -r N1 X1 Y1 W1 H1 <<< "$(ink "$RUNDIR/soft-mag.png")"
+[ "$N1" = "0" ] && pass "**放大中的普通抓帧里一个光标像素都没有**（抓帧让位）" \
+	|| fail "放大中的抓帧里还有 $N1 个像素（$W1 x $H1）—— 让位没生效"
+grep -aq "摇晃: 抓帧让位" "$LOG" && pass "日志记了让位" || fail "日志里没有让位记录"
+grim -c "$RUNDIR/soft-c.png" >/dev/null 2>&1
+read -r N2 X2 Y2 W2 H2 <<< "$(ink "$RUNDIR/soft-c.png")"
+[ "$W2" = "${IMG_S%x*}" ] && [ "$H2" = "${IMG_S#*x}" ] \
+	&& pass "grim -c（显式要）抓到的是放大图 $IMG_S" \
+	|| fail "grim -c 抓到的是 $W2 x $H2，期望 $IMG_S"
+sleep 0.9
+unset VIDOW_TEST_SOFT_CURSOR
+
+# ------------------------------------------------------------ 9) 客户端设的光标
+mark "9. 客户端自己设的光标（wl_pointer.set_cursor）也能放大并还原"
+stop_vidow
+start_vidow ""
 python3 tools/cursorwin.py > "$RUNDIR/cursorwin.log" 2>&1 &
 CURWIN_PID=$!
 for _ in $(seq 1 40); do
@@ -313,8 +355,8 @@ else
 fi
 kill "$CURWIN_PID" 2>/dev/null
 
-# ------------------------------------------------------------ 9) 关掉
-mark "9. cursor_shake = false"
+# ------------------------------------------------------------ 10) 关掉
+mark "10. cursor_shake = false"
 stop_vidow
 start_vidow "cursor_shake = false"
 msg move-cursor 300 100 >/dev/null
@@ -328,8 +370,8 @@ msg cursor-shake | grep -aq 'cursor_shake' \
 grep -aq "config: cursor_shake=off" "$LOG" && pass "启动日志里写着 off" \
 	|| fail "启动日志没写 cursor_shake=off"
 
-# ------------------------------------------------------------ 10) 倍数
-mark "10. cursor_shake_scale"
+# ------------------------------------------------------------ 11) 倍数
+mark "11. cursor_shake_scale"
 stop_vidow
 start_vidow "cursor_shake_scale = 1.5"
 msg move-cursor 300 100 >/dev/null
@@ -345,26 +387,22 @@ stop_vidow
 start_vidow "cursor_shake_scale = 20"
 msg move-cursor 300 100 >/dev/null
 IMG=$(cfield image)
-HWMAX=$(cfield hw_max)
-CAPPED=$(python3 -c 'import sys
-w,h = (int(v) for v in sys.argv[1].split("x"))
-mw,mh = (int(v) for v in sys.argv[2].split("x"))
-f = min(20.0, mw/w, mh/h)
-print("%dx%d" % (round(w*f), round(h*f)))' "$IMG" "$HWMAX")
+W0=${IMG%x*}
+H0=${IMG#*x}
+WANT=$(python3 -c "print('%dx%d' % (round($W0*min(20.0, 1280.0/$W0, 720.0/$H0)), round($H0*min(20.0, 1280.0/$W0, 720.0/$H0))))")
 shake
 sleep 0.2
-[ "$(cfield image)" = "$CAPPED" ] && pass "20 倍被硬件上限 $HWMAX 夹成 $CAPPED（$IMG 起）" \
-	|| fail "20 倍的尺寸是 $(cfield image)，期望 $CAPPED"
-grep -aq "摇晃: 硬件光标最大 $HWMAX.*夹到" "$LOG" \
-	&& pass "日志说明了被上限夹住" || fail "日志没说明夹了多少"
-# 夹过的图还得在硬件平面上（不然就进截图了，正是要避免的那件事）
+[ "$(cfield image)" = "$WANT" ] && pass "20 倍（没到屏幕上限就是 20 倍）：$IMG → $WANT" \
+	|| fail "20 倍时是 $(cfield image)，期望 $WANT"
+# 晃到封顶之后仍然在硬件平面上（不然就进截图了，正是要避免的那件事）
+for _ in 1 2 3 4 5; do msg cursor-shake >/dev/null; sleep 0.05; done
 case "$(cfield hardware)" in
-true) pass "夹完仍然在硬件平面上" ;;
-*)    fail "夹完掉成软光标了" ;;
+true) pass "晃到屏幕封顶也还在硬件平面上（$(cfield image)）" ;;
+*)    fail "晃到封顶掉成软光标了（$(cfield image)）" ;;
 esac
 
-# ------------------------------------------------------------ 11) 日志干净
-mark "11. 日志干净"
+# ------------------------------------------------------------ 12) 日志干净
+mark "12. 日志干净"
 grep -aqE 'assert|abort|Assertion' "$LOG" && fail "日志里有 assert/abort" \
 	|| pass "日志里没有 assert / abort"
 

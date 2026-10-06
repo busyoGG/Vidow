@@ -66,7 +66,11 @@ void vidow_output_render(struct vidow_output *output) {
 	 * instead of stretching the animation. */
 	vidow_anim_tick(server);
 
+	/* 抓帧让位：放大图这会儿是软光标的话，抓帧这一帧先换回原尺寸那张
+	 * （见 cursorfx.c）—— 画面上照样有光标，抓到的帧里一个光标像素都没有。 */
+	bool guarded = vidow_cursor_fx_capture_guard(server, output->wlr_output);
 	wlr_scene_output_commit(output->scene_output, NULL);
+	vidow_cursor_fx_capture_unguard(server, output->wlr_output, guarded);
 
 	struct timespec now;
 	clock_gettime(CLOCK_MONOTONIC, &now);
@@ -934,6 +938,14 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 
 	wlr_xcursor_manager_load(server->cursor_mgr, wlr_output->scale);
 	wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "left_ptr");
+
+	/* 测试钩子：把这块屏钉死在软光标上。真机上「放大图超出硬件光标平面」也是
+	 * 这条路，而 headless 后端的假光标平面什么都收（wlr_output_is_headless()
+	 * 认的就是 impl 指针，没法拿它做假）—— 没有这个钩子就测不到「抓帧让位」
+	 * （见 cursorfx.c）。 */
+	if (getenv("VIDOW_TEST_SOFT_CURSOR") != NULL) {
+		wlr_output_lock_software_cursors(wlr_output, true);
+	}
 
 	if (server->focused_output == NULL) {
 		server->focused_output = wlr_output;

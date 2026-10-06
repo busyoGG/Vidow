@@ -1,15 +1,19 @@
-/* 摇晃找光标：快速来回晃几下指针，指针就地放大一会儿，好找。
+/* 摇晃找光标：快速来回晃几下指针，指针就地放大 —— **晃一下大一圈，接着晃接着大**
+ * （晃到找着为止），停下来 700ms 自己缩回去。
  *
- * 放大不是另画一层，而是**换一张更大的光标图**：把当前光标图放大重画进一张新
- * buffer，再交给 wlr_cursor_set_buffer()。于是它和普通光标走同一条路 ——
+ * 放大是**换一张更大的光标图**：把当前光标图放大重画进一张新 buffer，再交给
+ * wlr_cursor_set_buffer()。于是它和普通光标走同一条路：
  *
- *   - 硬件光标平面放得下就还是硬件光标：不进合成器的渲染通道，因此**不会出现在
- *     截图 / 录屏里**。screencopy 只有在应用显式要 overlay_cursor 时才把光标锁成
- *     软光标画进画面，那正是「显式指定」那条路。
- *   - 放不下 wlroots 会自己降级成软光标（那就进截图了），所以放大倍数先按硬件
- *     光标尺寸上限夹一下：宁可小一点，也要待在硬件平面上。
- *   - 嵌套 / headless 后端根本没有硬件光标，只能软光标 —— 和普通光标一样，不是
- *     这个功能引入的问题。
+ *   - 硬件光标平面放得下（DRM 会报上限，比如 256x256）就还是硬件光标：不进合成器
+ *     的渲染通道，因此**不会出现在截图 / 录屏里**。
+ *   - 放不下 wlroots 会自己降级成软光标 —— 软光标是画进画面的，就会进截图。所以
+ *     抓帧时**让一下位**：那一帧临时换回原尺寸那张（它放得下硬件平面），画面上照样
+ *     有光标，而抓到的帧里一个光标像素都没有。截图应用**显式要光标**（screencopy 的
+ *     overlay_cursor，`grim -c` 就是它）时才连放大的一起给。
+ *   - 倍数不设上限：晃一次乘一次，到屏幕那么大为止（比屏幕还大的光标没意义）。
+ *
+ * 放大图一律从**原尺寸那张**算起（放大开始时自己 1:1 复制一份），不是叠着放大 ——
+ * 不然晃几下就糊成一团。原尺寸那张同时是抓帧让位时的替身。
  *
  * 放大期间不动 wlr_cursor 里记的「当前光标图」（客户端 surface / 主题 xcursor），
  * 所以到点能原样还原；这期间客户端换光标（request_set_cursor）就立刻收摊让位。 */
@@ -28,6 +32,7 @@
 #include <wlr/types/wlr_cursor.h>
 #include <wlr/types/wlr_output.h>
 #include <wlr/types/wlr_output_layout.h>
+#include <wlr/types/wlr_screencopy_v1.h>
 #include <wlr/util/log.h>
 
 #include "json.h"
@@ -38,12 +43,14 @@
 #define SHAKE_WINDOW_MS 700
 #define SHAKE_MIN_TRAVEL 12.0
 #define SHAKE_FLIPS 3
-/* 放大后保持多久。 */
+/* 放大后保持多久（不晃了就缩回去）。 */
 #define SHAKE_HOLD_MS 700
 /* 后端没报硬件光标尺寸上限时的天花板：只有嵌套 Wayland / headless / X11 会走到
  * 这里 —— 它们把光标交给上层合成器画，没有硬性的平面尺寸。真后端（DRM）会报
  * 上限，那就按它夹。 */
 #define SHAKE_SOFT_MAX 256
+/* 每一圈至少长这么多倍，免得配个 1.01 晃半天看不出来。 */
+#define SHAKE_MIN_STEP 1.2
 
 struct vidow_cursor_fx {
 	/* 摇晃判定 */
@@ -57,10 +64,18 @@ struct vidow_cursor_fx {
 	/* 放大中 */
 	bool active;
 	int64_t until_ns;
-	double applied;      /* 实际用上的倍数（可能被硬件上限夹过） */
+	double factor;       /* 当前倍数（每晃一次乘一次） */
+	double scale;        /* 光标所在输出的缩放 */
 	bool hardware;       /* 放大图在不在硬件光标平面上 */
+	bool normal_fits;    /* 原尺寸那张放得下硬件平面（抓帧让位得靠它） */
+	int soft_locks_base; /* 放大开始时这块屏上的软光标锁数（认「谁在要光标」） */
+	bool soft_unlocked;  /* 让位时临时松开了软光标锁，渲染完要锁回去 */
+	struct wlr_buffer *src; /* 原尺寸那张（1:1，自己画的） */
+	struct wlr_buffer *big; /* 放大那张 */
+	int32_t big_hx, big_hy; /* 放大图的热点（逻辑坐标） */
+	int32_t src_hx, src_hy; /* 原尺寸那张的热点（逻辑坐标） */
+	int limit_w, limit_h;   /* 倍数上限：放大图的物理像素不超过这块屏 */
 	struct wl_event_source *timer;
-	struct wlr_buffer *buffer;
 
 	/* 当前光标图（还原用）：客户端 surface 或主题 xcursor（surface == NULL） */
 	struct wlr_surface *surface;
@@ -90,8 +105,8 @@ static struct wlr_output_cursor *cursor_under_pointer(
 	return NULL;
 }
 
-/* 硬件光标能画多大。没有硬件光标（嵌套 / headless 后端）就返回一个够宽松的
- * 天花板，反正那种情况下本来就是软光标。 */
+/* 硬件光标能画多大。没有硬件光标（嵌套 / headless / X11 后端）就返回一个够宽松的
+ * 天花板，反正那种情况下光标是交给上层合成器画的。 */
 static void cursor_size_limit(struct wlr_output *output, int *w, int *h) {
 	*w = SHAKE_SOFT_MAX;
 	*h = SHAKE_SOFT_MAX;
@@ -117,12 +132,49 @@ static void cursor_size_limit(struct wlr_output *output, int *w, int *h) {
 	}
 }
 
+/* --------------------------------------------------------------- 画放大图 */
+
+/* 把一张贴图重画成 w x h 的新 buffer（带 alpha，光标图不能留底色）。 */
+static struct wlr_buffer *scale_texture(struct vidow_server *server,
+		struct wlr_texture *tex, const struct wlr_fbox *src_box, int w, int h) {
+	struct wlr_buffer *buf = vidow_alloc_target(server, w, h);
+	if (buf == NULL) {
+		return NULL;
+	}
+	struct wlr_render_pass *pass =
+		wlr_renderer_begin_buffer_pass(server->renderer, buf, NULL);
+	if (pass == NULL) {
+		wlr_buffer_drop(buf);
+		return NULL;
+	}
+	wlr_render_pass_add_rect(pass, &(struct wlr_render_rect_options){
+		.box = { .width = w, .height = h },
+		.blend_mode = WLR_RENDER_BLEND_MODE_NONE,
+	});
+	wlr_render_pass_add_texture(pass, &(struct wlr_render_texture_options){
+		.texture = tex,
+		.src_box = *src_box,
+		.dst_box = { .width = w, .height = h },
+		.filter_mode = WLR_SCALE_FILTER_BILINEAR,
+		.blend_mode = WLR_RENDER_BLEND_MODE_PREMULTIPLIED,
+	});
+	if (!wlr_render_pass_submit(pass)) {
+		wlr_buffer_drop(buf);
+		return NULL;
+	}
+	return buf;
+}
+
 /* --------------------------------------------------------------- 还原 */
 
-static void drop_buffer(struct vidow_cursor_fx *fx) {
-	if (fx->buffer != NULL) {
-		wlr_buffer_drop(fx->buffer);
-		fx->buffer = NULL;
+static void drop_images(struct vidow_cursor_fx *fx) {
+	if (fx->big != NULL) {
+		wlr_buffer_drop(fx->big);
+		fx->big = NULL;
+	}
+	if (fx->src != NULL) {
+		wlr_buffer_drop(fx->src);
+		fx->src = NULL;
 	}
 }
 
@@ -138,8 +190,9 @@ static void shake_restore(struct vidow_server *server) {
 	} else {
 		wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "left_ptr");
 	}
-	drop_buffer(fx);
-	wlr_log(WLR_DEBUG, "摇晃: 光标还原（%.2fx 收起）", fx->applied);
+	drop_images(fx);
+	wlr_log(WLR_DEBUG, "摇晃: 光标还原（%.2fx 收起）", fx->factor);
+	fx->factor = 1.0;
 }
 
 static int shake_timer_cb(void *data) {
@@ -154,13 +207,105 @@ static int shake_timer_cb(void *data) {
 	return 0;
 }
 
+static void hold(struct vidow_server *server) {
+	struct vidow_cursor_fx *fx = server->cursor_fx;
+	fx->until_ns = vidow_now_ns() + (int64_t)SHAKE_HOLD_MS * 1000000;
+	wl_event_source_timer_update(fx->timer, SHAKE_HOLD_MS);
+}
+
 /* --------------------------------------------------------------- 放大 */
 
-/* 把 oc 的光标图放大 fit 倍，画进一张新 buffer 交给光标系统。
- * 成功时 *why 不动，失败时 *why 里是给人看的原因。 */
-static bool shake_apply(struct vidow_server *server, double fit, const char **why) {
+/* 放大到 fit 倍。成功时 *why 不动，失败时 *why 里是给人看的原因。 */
+static bool shake_grow(struct vidow_server *server, double fit, const char **why) {
 	struct vidow_cursor_fx *fx = server->cursor_fx;
-	struct wlr_cursor *cur = server->cursor;
+	if (fx->src == NULL) {
+		*why = "原尺寸那张光标图没了";
+		return false;
+	}
+	struct wlr_texture *src_tex =
+		wlr_texture_from_buffer(server->renderer, fx->src);
+	if (src_tex == NULL) {
+		*why = "原尺寸那张光标图用不了";
+		return false;
+	}
+	int src_w = fx->src->width, src_h = fx->src->height;
+
+	/* 天花板：放大图的物理像素不超过这块屏（比屏幕还大的光标没有意义，
+	 * 而且 8K 的 ARGB 缓冲就是 256MB）。 */
+	double cap = fit;
+	if (fx->limit_w > 0) {
+		cap = fmin(cap, (double)fx->limit_w / src_w);
+	}
+	if (fx->limit_h > 0) {
+		cap = fmin(cap, (double)fx->limit_h / src_h);
+	}
+	if (cap < 1.05) {
+		*why = "已经放到屏幕那么大了";
+		return false;
+	}
+	if (cap < fit) {
+		wlr_log(WLR_DEBUG, "摇晃: 屏幕只有 %dx%d，%.2fx 放不下，到 %.2fx 为止",
+			fx->limit_w, fx->limit_h, fit, cap);
+	}
+	fit = cap;
+
+	int w = (int)lround(src_w * fit);
+	int h = (int)lround(src_h * fit);
+	struct wlr_fbox box = { .width = src_w, .height = src_h };
+	struct wlr_buffer *big = scale_texture(server, src_tex, &box, w, h);
+	wlr_texture_destroy(src_tex); /* 贴图用完就还（buffer 还留着） */
+	if (big == NULL) {
+		*why = "渲染放大图失败";
+		return false;
+	}
+
+	int32_t hx = (int32_t)lround(fx->src_hx * fit);
+	int32_t hy = (int32_t)lround(fx->src_hy * fit);
+	wlr_cursor_set_buffer(server->cursor, big, hx, hy, (float)fx->scale);
+
+	struct wlr_output *output = NULL;
+	struct wlr_output_cursor *oc = cursor_under_pointer(server, &output);
+	bool hardware = oc != NULL && output->hardware_cursor == oc;
+
+	if (fx->big != NULL) {
+		wlr_buffer_drop(fx->big);
+	}
+	fx->big = big;
+	fx->factor = fit;
+	fx->big_hx = hx;
+	fx->big_hy = hy;
+	fx->hardware = hardware;
+	wlr_log(WLR_INFO, "摇晃: 光标放大 %.2fx（%dx%d → %dx%d，%s）", fit,
+		src_w, src_h, w, h,
+		hardware ? "硬件光标，不进截图"
+			: "软光标：抓帧时让位，截图里照样没有它");
+	return true;
+}
+
+bool vidow_cursor_fx_shake(struct vidow_server *server, const char **why) {
+	struct vidow_cursor_fx *fx = server->cursor_fx;
+	if (fx == NULL) {
+		*why = "摇晃放大没初始化";
+		return false;
+	}
+	if (!server->config.cursor_shake) {
+		*why = "摇晃放大被配置关了（cursor_shake = false）";
+		return false;
+	}
+	double step = server->config.cursor_shake_scale;
+	if (step < SHAKE_MIN_STEP) {
+		step = SHAKE_MIN_STEP;
+	}
+
+	if (fx->active) {
+		/* 已经在放大了：接着晃就再大一圈（晃到找着为止）。到顶了也算成功 ——
+		 * 光标这会儿本来就是大的。 */
+		if (!shake_grow(server, fx->factor * step, why)) {
+			wlr_log(WLR_DEBUG, "摇晃: 不再放大（%s）", *why);
+		}
+		hold(server);
+		return true;
+	}
 
 	struct wlr_output *output = NULL;
 	struct wlr_output_cursor *oc = cursor_under_pointer(server, &output);
@@ -183,108 +328,106 @@ static bool shake_apply(struct vidow_server *server, double fit, const char **wh
 		return false;
 	}
 
+	/* 原尺寸那张：先 1:1 复制一份。放大一律从它算起（不叠着放大，不然晃几下就
+	 * 糊了），抓帧让位时也是拿它当替身。 */
+	struct wlr_buffer *src = scale_texture(server, oc->texture, &oc->src_box,
+		oc->width, oc->height);
+	if (src == NULL) {
+		*why = "复制光标图失败";
+		return false;
+	}
 	double scale = output->scale > 0 ? output->scale : 1.0;
-	if (fit < 1.05) {
-		*why = "放大倍数太小，看不出来";
-		return false;
-	}
+	int limit_w = 0, limit_h = 0;
+	wlr_output_effective_resolution(output, &limit_w, &limit_h);
+	limit_w = (int)lround(limit_w * scale);
+	limit_h = (int)lround(limit_h * scale);
+	int maxw = 0, maxh = 0;
+	cursor_size_limit(output, &maxw, &maxh);
 
-	int src_w = oc->width, src_h = oc->height;
-	int w = (int)lround(src_w * fit);
-	int h = (int)lround(src_h * fit);
-	struct wlr_buffer *buf = vidow_alloc_target(server, w, h);
-	if (buf == NULL) {
-		*why = "分配放大用的缓冲失败";
-		return false;
+	drop_images(fx);
+	fx->src = src;
+	fx->scale = scale;
+	fx->limit_w = limit_w;
+	fx->limit_h = limit_h;
+	fx->src_hx = (int32_t)lround(oc->hotspot_x / scale);
+	fx->src_hy = (int32_t)lround(oc->hotspot_y / scale);
+	fx->normal_fits = (int)oc->width <= maxw && (int)oc->height <= maxh;
+	fx->soft_locks_base = output->software_cursor_locks;
+	if (!fx->normal_fits) {
+		wlr_log(WLR_INFO, "摇晃: 原尺寸的光标图 %dx%d 就超过硬件光标上限 %dx%d，"
+			"抓帧让位让不了（截图里会有它）", oc->width, oc->height, maxw, maxh);
 	}
-	struct wlr_render_pass *pass =
-		wlr_renderer_begin_buffer_pass(server->renderer, buf, NULL);
-	if (pass == NULL) {
-		wlr_buffer_drop(buf);
-		*why = "拿不到渲染通道";
-		return false;
-	}
-	/* 先清成全透明（光标图带 alpha，不能留底色），再把光标图放大画上去。 */
-	wlr_render_pass_add_rect(pass, &(struct wlr_render_rect_options){
-		.box = { .width = w, .height = h },
-		.blend_mode = WLR_RENDER_BLEND_MODE_NONE,
-	});
-	wlr_render_pass_add_texture(pass, &(struct wlr_render_texture_options){
-		.texture = oc->texture,
-		.src_box = oc->src_box,
-		.dst_box = { .width = w, .height = h },
-		.filter_mode = WLR_SCALE_FILTER_BILINEAR,
-		.blend_mode = WLR_RENDER_BLEND_MODE_PREMULTIPLIED,
-	});
-	if (!wlr_render_pass_submit(pass)) {
-		wlr_buffer_drop(buf);
-		*why = "渲染放大图失败";
-		return false;
-	}
-
-	/* hotspot 走逻辑坐标（wlr_cursor_set_buffer 自己乘输出缩放），所以先除回去。 */
-	int32_t hx = (int32_t)lround(oc->hotspot_x * fit / scale);
-	int32_t hy = (int32_t)lround(oc->hotspot_y * fit / scale);
-	wlr_cursor_set_buffer(cur, buf, hx, hy, (float)scale);
-
-	fx->buffer = buf; /* 这份引用我们自己留着，还原时放掉 */
-	fx->applied = fit;
+	fx->factor = 1.0;
 	fx->active = true;
-	fx->hardware = output->hardware_cursor == oc;
-	fx->until_ns = vidow_now_ns() + (int64_t)SHAKE_HOLD_MS * 1000000;
-	wl_event_source_timer_update(fx->timer, SHAKE_HOLD_MS);
-	wlr_log(WLR_INFO, "摇晃: 光标放大 %.2fx（%dx%d → %dx%d，%s）", fit,
-		src_w, src_h, w, h,
-		fx->hardware ? "硬件光标，不进截图" : "软光标，会进截图");
-	return true;
-}
 
-bool vidow_cursor_fx_shake(struct vidow_server *server, const char **why) {
-	struct vidow_cursor_fx *fx = server->cursor_fx;
-	if (fx == NULL) {
-		*why = "摇晃放大没初始化";
-		return false;
-	}
-	if (!server->config.cursor_shake) {
-		*why = "摇晃放大被配置关了（cursor_shake = false）";
-		return false;
-	}
-	if (fx->active) {
-		/* 已经在放大了：续个期，不重画。 */
-		fx->until_ns = vidow_now_ns() + (int64_t)SHAKE_HOLD_MS * 1000000;
-		wl_event_source_timer_update(fx->timer, SHAKE_HOLD_MS);
-		return true;
-	}
-
-	struct wlr_output *output = NULL;
-	struct wlr_output_cursor *oc = cursor_under_pointer(server, &output);
-	double fit = server->config.cursor_shake_scale;
-	if (fit < 1.05) {
-		fit = 1.05;
-	}
-	if (output != NULL && oc != NULL) {
-		/* 按硬件光标上限夹一下：超了 wlroots 会降级成软光标，那就进截图了。 */
-		int maxw = 0, maxh = 0;
-		cursor_size_limit(output, &maxw, &maxh);
-		double cap = fit;
-		if (maxw > 0) {
-			cap = fmin(cap, (double)maxw / oc->width);
-		}
-		if (maxh > 0) {
-			cap = fmin(cap, (double)maxh / oc->height);
-		}
-		if (cap < fit) {
-			wlr_log(WLR_DEBUG,
-				"摇晃: 硬件光标最大 %dx%d，%.2fx 放不下，夹到 %.2fx",
-				maxw, maxh, fit, cap);
-		}
-		fit = cap;
-	}
-	if (!shake_apply(server, fit, why)) {
+	if (!shake_grow(server, step, why)) {
+		fx->active = false;
+		drop_images(fx);
 		wlr_log(WLR_DEBUG, "摇晃: 没放大（%s）", *why);
 		return false;
 	}
+	hold(server);
 	return true;
+}
+
+/* --------------------------------------------------------------- 抓帧让位 */
+
+bool vidow_cursor_fx_capture_guard(struct vidow_server *server,
+		struct wlr_output *output) {
+	struct vidow_cursor_fx *fx = server->cursor_fx;
+	if (fx == NULL || !fx->active || fx->hardware || !fx->normal_fits) {
+		return false;
+	}
+	/* 有没有「不要光标」的抓帧正等着这一帧？（要光标的：wlroots 会自己把光标
+	 * 锁成软光标画进去，不用我们管。）两条路都得看：
+	 *   - screencopy（老 grim / wf-recorder）：帧挂在管理器上，带 overlay_cursor；
+	 *   - ext-image-copy-capture（新版 grim 走这条）：帧在 wlroots 自己的实现里，
+	 *     看不到列表，但抓帧期间会把输出锁在「渲染」上，而「要光标」的那种会额外
+	 *     锁软光标 —— 没锁软光标就是在等一张不带光标的帧。 */
+	bool plain = false;
+	if (server->screencopy != NULL) {
+		struct wlr_screencopy_frame_v1 *frame;
+		wl_list_for_each(frame, &server->screencopy->frames, link) {
+			if (frame->output == output && !frame->overlay_cursor) {
+				plain = true;
+				break;
+			}
+		}
+	}
+	if (!plain && output->attach_render_locks > 0 &&
+			output->software_cursor_locks <= fx->soft_locks_base) {
+		plain = true;
+	}
+	if (!plain) {
+		return false;
+	}
+	/* 有人把这块屏的光标锁死在软光标上（测试钩子 / 别的工具）？那换回原尺寸也上不了
+	 * 平面，抓到的帧里还是会有个小光标 —— 这一帧先松开，渲染完再锁回去。 */
+	if (output->software_cursor_locks > 0) {
+		wlr_output_lock_software_cursors(output, false);
+		fx->soft_unlocked = true;
+	}
+	/* 这一帧换回原尺寸那张：它放得下硬件光标平面，于是不进渲染通道 ——
+	 * 画面上光标还在（只是没放大），抓到的帧里一个光标像素都没有。 */
+	wlr_log(WLR_DEBUG, "摇晃: 抓帧让位（%s 这一帧换回 %dx%d）", output->name,
+		fx->src->width, fx->src->height);
+	wlr_cursor_set_buffer(server->cursor, fx->src, fx->src_hx, fx->src_hy,
+		(float)fx->scale);
+	return true;
+}
+
+void vidow_cursor_fx_capture_unguard(struct vidow_server *server,
+		struct wlr_output *output, bool guarded) {
+	struct vidow_cursor_fx *fx = server->cursor_fx;
+	if (!guarded || fx == NULL || !fx->active || fx->big == NULL) {
+		return;
+	}
+	wlr_cursor_set_buffer(server->cursor, fx->big, fx->big_hx, fx->big_hy,
+		(float)fx->scale);
+	if (fx->soft_unlocked) {
+		wlr_output_lock_software_cursors(output, true);
+		fx->soft_unlocked = false;
+	}
 }
 
 /* --------------------------------------------------------------- 摇晃判定 */
@@ -369,7 +512,8 @@ void vidow_cursor_fx_set_surface(struct vidow_server *server,
 	if (fx->active) {
 		fx->active = false;
 		wl_event_source_timer_update(fx->timer, 0);
-		drop_buffer(fx);
+		drop_images(fx);
+		fx->factor = 1.0;
 	}
 	forget_surface(fx);
 	fx->surface = surface;
@@ -403,7 +547,7 @@ void vidow_cursor_fx_json(struct jbuf *b, struct vidow_server *server) {
 	char buf[64];
 
 	jb_kv_bool(b, "magnified", fx != NULL && fx->active);
-	jb_kv_double(b, "scale", fx != NULL && fx->active ? fx->applied : 1.0);
+	jb_kv_double(b, "scale", fx != NULL && fx->active ? fx->factor : 1.0);
 	if (oc != NULL) {
 		snprintf(buf, sizeof(buf), "%dx%d", oc->width, oc->height);
 		jb_kv_str(b, "image", buf);
@@ -430,7 +574,7 @@ void vidow_cursor_fx_init(struct vidow_server *server) {
 	fx->last_x = server->cursor->x;
 	fx->last_y = server->cursor->y;
 	fx->have_last = true;
-	fx->applied = 1.0;
+	fx->factor = 1.0;
 	fx->timer = wl_event_loop_add_timer(
 		wl_display_get_event_loop(server->display), shake_timer_cb, server);
 	if (fx->timer == NULL) {
