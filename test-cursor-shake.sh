@@ -6,8 +6,11 @@
 #   1) cursor 命令报得出光标状态：image（当前光标图的物理尺寸）/ hardware / hw_max
 #   2) 慢慢往一个方向移动**不**触发（不然正常用鼠标就会乱放大）
 #   3) 来回晃（700ms 内 4 次换向、每段 ≥12px）触发：光标图放大 2 倍
-#   4) 到点自己还原（700ms 后回到原尺寸）
-#   5) 接着晃接着大：2→4→8→16→32→45，最后被「屏幕只有这么大」封顶
+#   4) 到点自己**动画**缩回去（700ms 后开始缩，200ms 线性补间走完，中途能量到
+#      1 和 2 之间的中间值 —— 不是「啪」地跳回原尺寸）
+#   5) 接着晃接着大，而且是**线性加**不是乘：2→3→4→5→6（每一圈只 +1），
+#      放大本身也是补间（晃完 50ms 量到的倍数在起点和目标之间），
+#      最后被「屏幕只有这么大」封顶
 #   6) **不进截图**：grim 不带 -c 抓，画面里一个光标像素都没有（放大中也一样）
 #   7) **显式指定才进截图**：grim -c 抓，光标在，外接矩形正好是放大后的尺寸、
 #      箭头尖还钉在原来那个点上（热点按倍数缩放）
@@ -203,7 +206,7 @@ sleep 0.2
 mark "3. 来回晃触发放大"
 msg move-cursor 300 100 >/dev/null
 shake
-sleep 0.2
+sleep 0.35
 [ "$(cfield magnified)" = "true" ] && pass "摇晃之后 magnified=true" \
 	|| fail "摇晃没触发放大"
 BIG=$(scale_size "${IMG0%x*}" "${IMG0#*x}" 2)
@@ -216,38 +219,98 @@ grep -aq "摇晃: 光标放大.*硬件光标，不进截图" "$LOG" \
 	&& pass "日志说明它待在硬件光标上（不进截图）" \
 	|| fail "日志没说硬件光标"
 
-# ------------------------------------------------------------ 4) 到点还原
-mark "4. 到点自己还原"
-sleep 0.9
-[ "$(cfield magnified)" = "false" ] && pass "700ms 后 magnified=false" \
+# ------------------------------------------------------------ 4) 到点缩回（动画）
+mark "4. 到点自己缩回（200ms 线性补间，不是跳）"
+# 保持期 700ms：晃完 0.75s 开始缩，缩的过程 200ms —— 这 200ms 里密集采样，
+# 应该能量到 1 和 2 之间的中间倍数（跳回原尺寸的话只能量到 2 和 1）。
+msg cursor-shake >/dev/null
+sleep 0.75
+SEEN=$(python3 - <<'PYS'
+import json, subprocess, time
+def scale():
+    out = subprocess.run(["./build/vidowmsg", "--raw", "cursor"],
+                         capture_output=True, text=True).stdout
+    try:
+        return float(json.loads(out)["result"]["scale"])
+    except Exception:
+        return 1.0
+vals = []
+t0 = time.time()
+while time.time() - t0 < 0.45:
+    vals.append(scale())
+    time.sleep(0.02)
+mid = [v for v in vals if 1.05 < v < 1.95]
+print("%d %d %.3f" % (len(mid), len(vals), mid[0] if mid else 1.0))
+PYS
+)
+read -r NMID NTOT FIRST <<< "$SEEN"
+if [ "$NMID" -ge 2 ]; then
+	pass "缩回是补间：采样到 $NMID 个中间倍数（共 $NTOT 次采样，第一个 $FIRST）"
+else
+	fail "缩回看着是跳的：$NTOT 次采样里只有 $NMID 个中间值"
+fi
+grep -aq "摇晃: 光标开始缩回" "$LOG" && pass "日志记了缩回开始" \
+	|| fail "日志里没有缩回记录"
+sleep 0.4
+[ "$(cfield magnified)" = "false" ] && pass "缩完 magnified=false" \
 	|| fail "一直没还原"
 [ "$(cfield image)" = "$IMG0" ] && pass "尺寸回到 $IMG0" \
 	|| fail "还原后的尺寸是 $(cfield image)"
 grep -aq "摇晃: 光标还原" "$LOG" && pass "日志记了还原" || fail "日志里没有还原记录"
 
 # ------------------------------------------------------------ 5) 接着晃接着大
-mark "5. 接着晃接着大（不封顶，只封到屏幕那么大）"
+mark "5. 接着晃接着大：线性加（2→3→4→5→6），不是乘（2→4→8→16）"
 W0=${IMG0%x*}
 H0=${IMG0#*x}
-CAP=$(python3 -c "print(min(1280.0/$W0, 720.0/$H0))")
 OK=1
-for i in 1 2 3 4 5 6; do
+for i in 1 2 3 4 5; do
 	msg cursor-shake >/dev/null
-	sleep 0.05
-	WANT=$(python3 -c "print('%dx%d' % (round($W0*min(2**$i, $CAP)), round($H0*min(2**$i, $CAP))))")
+	sleep 0.3
+	WANT=$(python3 -c "print('%dx%d' % (round($W0*($i+1)), round($H0*($i+1))))")
 	GOT=$(cfield image)
 	if [ "$GOT" = "$WANT" ]; then
-		pass "第 $i 次：$GOT"
+		pass "第 $i 圈：$GOT（$(python3 -c "print('%gx' % ($i+1))")）"
 	else
-		fail "第 $i 次是 $GOT，期望 $WANT"
+		fail "第 $i 圈是 $GOT，期望 $WANT"
 		OK=0
 	fi
 done
-[ "$OK" = "1" ] && pass "一路长到 $(cfield image)（屏幕 1280x720 封顶）" \
-	|| fail "某一圈没长对"
-grep -aq "摇晃: 屏幕只有 1280x720.*到 .* 为止" "$LOG" \
+[ "$OK" = "1" ] && pass "每一圈只 +1（线性加）" || fail "某一圈没长对"
+[ "$(cfield target)" = "6" ] && pass "target=6（六圈的目标倍数）" \
+	|| fail "target 是 $(cfield target)，期望 6"
+
+mark "5b. 放大本身也是补间（不是一步到位）"
+msg cursor-shake >/dev/null
+sleep 0.05
+read -r NOW TGT <<< "$(python3 -c '
+import json, subprocess
+out = subprocess.run(["./build/vidowmsg", "--raw", "cursor"],
+                     capture_output=True, text=True).stdout
+r = json.loads(out)["result"]
+print("%.3f %.3f" % (r["scale"], r["target"]))')"
+if python3 -c "import sys; sys.exit(0 if 6.05 < $NOW < 6.95 else 1)"; then
+	pass "晃完 50ms 量到 $NOW（在 6 和 $TGT 之间，正在补间）"
+else
+	fail "晃完 50ms 就是 $NOW（期望在 6 和 7 之间）"
+fi
+sleep 0.3
+[ "$(cfield image)" = "$(scale_size "$W0" "$H0" 7)" ] \
+	&& pass "补间走完到 $(cfield image)（7x）" \
+	|| fail "补间走完是 $(cfield image)，期望 7x"
+
+mark "5c. 一路晃到屏幕封顶"
+for _ in $(seq 1 40); do
+	msg cursor-shake >/dev/null
+	sleep 0.02
+done
+sleep 0.3
+CAP=$(python3 -c "print(min(1280.0/$W0, 720.0/$H0))")
+WANT=$(python3 -c "print('%dx%d' % (round($W0*$CAP), round($H0*$CAP)))")
+[ "$(cfield image)" = "$WANT" ] && pass "封顶在 $WANT（屏幕 1280x720 装得下的最大倍数）" \
+	|| fail "封顶后是 $(cfield image)，期望 $WANT"
+grep -aq "摇晃: 屏幕只有 1280x720.*放不下，到 .* 为止" "$LOG" \
 	&& pass "日志说明了被屏幕尺寸封顶" || fail "日志没说明封顶"
-sleep 0.9
+sleep 1.0
 
 # ------------------------------------------------------------ 6) 不进截图
 mark "6. 不进截图（grim 不带 -c）"
@@ -258,12 +321,12 @@ read -r N X Y W H <<< "$(ink "$RUNDIR/plain.png")"
 [ "$N" = "0" ] && pass "普通截图里没有光标（0 个非背景像素）" \
 	|| fail "普通截图里有 $N 个非背景像素（$W x $H @ $X,$Y）"
 msg cursor-shake >/dev/null
-sleep 0.2
+sleep 0.3
 grim "$RUNDIR/plain-mag.png" >/dev/null 2>&1
 read -r N X Y W H <<< "$(ink "$RUNDIR/plain-mag.png")"
 [ "$N" = "0" ] && pass "**放大中**的普通截图里也没有光标" \
 	|| fail "放大中的普通截图里出现了 $N 个像素（$W x $H @ $X,$Y）"
-sleep 0.9
+sleep 1.2
 
 # ------------------------------------------------------------ 7) 显式指定才进
 mark "7. 显式要光标才进截图（grim -c）"
@@ -275,7 +338,7 @@ read -r N1 X1 Y1 W1 H1 <<< "$(ink "$RUNDIR/cur.png")"
 	&& pass "没放大时外接矩形就是光标图大小（$IMG0）" \
 	|| fail "外接矩形是 $W1 x $H1，期望 $IMG0"
 msg cursor-shake >/dev/null
-sleep 0.2
+sleep 0.35
 grim -c "$RUNDIR/cur-mag.png" >/dev/null 2>&1
 read -r N2 X2 Y2 W2 H2 <<< "$(ink "$RUNDIR/cur-mag.png")"
 [ "$W2" = "${BIG%x*}" ] && [ "$H2" = "${BIG#*x}" ] \
@@ -288,7 +351,7 @@ EXP_Y=$(( 2 * Y1 - 100 ))
 [ "$X2" = "$EXP_X" ] && [ "$Y2" = "$EXP_Y" ] \
 	&& pass "热点没跑（左上角 $X1,$Y1 → $X2,$Y2，箭头尖还在 300,100）" \
 	|| fail "热点跑了：左上角 $X1,$Y1 → $X2,$Y2，期望 $EXP_X,$EXP_Y"
-sleep 0.9
+sleep 1.2
 
 # ------------------------------------------------------------ 8) 抓帧让位（软光标）
 mark "8. 抓帧让位：软光标那条路（真机上放大超出硬件平面就是它）"
@@ -303,7 +366,7 @@ grim "$RUNDIR/soft.png" >/dev/null 2>&1
 read -r N0 X0 Y0 W0B H0B <<< "$(ink "$RUNDIR/soft.png")"
 [ "$N0" = "0" ] && pass "普通抓帧里没有光标（抓帧是 vidow 自己渲染的一帧，本来就不含光标）" \
 	|| fail "普通抓帧里有 $N0 个非背景像素（$W0B x $H0B）"
-for _ in 1 2 3 4 5; do msg cursor-shake >/dev/null; sleep 0.05; done
+for _ in 1 2 3 4 5; do msg cursor-shake >/dev/null; sleep 0.3; done
 IMG_S=$(cfield image)
 grep -aq "摇晃: 光标放大.*软光标" "$LOG" \
 	&& pass "日志说明是软光标（$IMG_S）" || fail "日志没说软光标"
@@ -316,7 +379,7 @@ read -r N2 X2 Y2 W2 H2 <<< "$(ink "$RUNDIR/soft-c.png")"
 [ "$W2" = "${IMG_S%x*}" ] && [ "$H2" = "${IMG_S#*x}" ] \
 	&& pass "grim -c（显式要）抓到的是放大图 $IMG_S" \
 	|| fail "grim -c 抓到的是 $W2 x $H2，期望 $IMG_S"
-sleep 0.9
+sleep 1.2
 unset VIDOW_TEST_SOFT_CURSOR
 
 # ------------------------------------------------------------ 9) 客户端设的光标
@@ -343,12 +406,12 @@ else
 		&& pass "指针进了客户端窗口，光标图换成它设的（$IMG0 → $IMG_C）" \
 		|| fail "客户端设的光标没生效（还是 $IMG_C）"
 	msg cursor-shake >/dev/null
-	sleep 0.2
+	sleep 0.35
 	BIG_C=$(scale_size "${IMG_C%x*}" "${IMG_C#*x}" 2)
 	[ "$(cfield image)" = "$BIG_C" ] \
 		&& pass "客户端的光标照样放大 2 倍（$IMG_C → $BIG_C）" \
 		|| fail "客户端光标没放大（$(cfield image)，期望 $BIG_C）"
-	sleep 0.9
+	sleep 1.2
 	[ "$(cfield image)" = "$IMG_C" ] \
 		&& pass "还原成客户端那张（$IMG_C），没变成主题箭头" \
 		|| fail "还原后是 $(cfield image)，期望客户端那张 $IMG_C"
@@ -378,10 +441,10 @@ msg move-cursor 300 100 >/dev/null
 IMG=$(cfield image)
 SHAKE15=$(scale_size "${IMG%x*}" "${IMG#*x}" 1.5)
 shake
-sleep 0.2
+sleep 0.35
 [ "$(cfield image)" = "$SHAKE15" ] && pass "1.5 倍：$IMG → $SHAKE15" \
 	|| fail "1.5 倍的尺寸是 $(cfield image)，期望 $SHAKE15"
-sleep 0.9
+sleep 1.2
 
 stop_vidow
 start_vidow "cursor_shake_scale = 20"
@@ -391,11 +454,12 @@ W0=${IMG%x*}
 H0=${IMG#*x}
 WANT=$(python3 -c "print('%dx%d' % (round($W0*min(20.0, 1280.0/$W0, 720.0/$H0)), round($H0*min(20.0, 1280.0/$W0, 720.0/$H0))))")
 shake
-sleep 0.2
+sleep 0.35
 [ "$(cfield image)" = "$WANT" ] && pass "20 倍（没到屏幕上限就是 20 倍）：$IMG → $WANT" \
 	|| fail "20 倍时是 $(cfield image)，期望 $WANT"
 # 晃到封顶之后仍然在硬件平面上（不然就进截图了，正是要避免的那件事）
-for _ in 1 2 3 4 5; do msg cursor-shake >/dev/null; sleep 0.05; done
+for _ in 1 2 3 4 5; do msg cursor-shake >/dev/null; sleep 0.2; done
+sleep 0.3
 case "$(cfield hardware)" in
 true) pass "晃到屏幕封顶也还在硬件平面上（$(cfield image)）" ;;
 *)    fail "晃到封顶掉成软光标了（$(cfield image)）" ;;

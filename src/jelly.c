@@ -1,8 +1,8 @@
 /* 拖窗口时的果冻效果（KDE 的 wobbly windows 那一套）。
  *
  * 做法：把正在被拖的那个窗口的内容切成一张网格，每个网格节点挂在一根弹簧上，
- * 抓点那个节点钉死在光标下面（跟手 1:1），其余节点靠相邻弹簧互相拉 —— 于是
- * 「抓点往前走、后面还没跟上」，窗口像一块布一样被拖着走、松手后晃两下收住。
+ * 抓点那个节点钉死在光标下面（跟手 1:1），越往下的节点跟得越慢 —— 于是
+ * 「上面已经走了、下面还没跟上」，窗口像一块布被揪着上边拖着走、松手后晃两下收住。
  *
  * 为什么不改场景节点：wlroots 的场景节点只会把缓冲整块贴上去，一张贴图一个
  * 矩形，没法弯。所以果冻走的是**自己渲染**：源（窗口那份带装饰的离屏图，
@@ -12,18 +12,13 @@
  *
  * 物理（单位：逻辑像素、秒）：
  *
- *   a_i = kn * Σ(o_邻 - o_i) - kr * o_i - c * v_i - drag * c * V
+ *   o'' = -ω²(o - d) - c·o'          d = -(base - l)      l' = (base - l) / τ
  *
- *   o_i  第 i 个节点相对「自己该在的位置」的偏移；v_i 是它的速度。
- *   V    底座（窗口场景树）的速度 —— 只有它把拖拽带进这套方程：底座动得快，
- *        阻尼那一项就给整张网一个「拖后腿」的力，网格于是落后、拉长。
- *   kn   相邻弹簧（网格把形变扩散出去，越大越像一块硬板）
- *   kr   回正弹簧（决定晃的频率：sqrt(kr) ≈ 17 rad/s ≈ 2.7Hz）
- *   c    阻尼（决定晃多久收住）
- *   drag 跟手程度：1 = 完全跟不上（整块拖后腿），0 = 完全不落后
+ *   o    该节点相对「自己该在的位置」的偏移；c 是阻尼、ω 是回正角频率。
+ *   base 底座（窗口场景树）现在在哪；l 是「它以为底座在哪」的滞后版本。
+ *   τ    跟底座的滞后时间常数：越大越跟不上，于是 d（该落后多少）越大。
  *
- * 抓点节点是钉住的（o = 0）：所以抓点永远精确在光标下，不会像「整窗弹性跟随」
- * 那样有输入延迟 —— 这正是 KDE 的手感。
+ * 抓点那个节点钉住（o = 0）：抓点永远精确在光标下，没有输入延迟 —— KDE 的手感。
  *
  * 数值：显式积分（半隐式欧拉）在这个刚度下必须用小步长，一帧按 1/500 秒切子步
  * （见 JELLY_DT），上限 JELLY_MAX_SUB 个子步，防止卡一下之后一次积太多。 */
@@ -44,30 +39,33 @@
 #define JELLY_CELL_MIN  4
 #define JELLY_CELL_MAX  24   /* 每轴最多几格（24x24 = 576 次贴图） */
 
-/* 每个节点是一根**独立**的弹簧振子，但「该落后多少」是**按距离算出来**的：
+/* 每个节点是一根**独立**的弹簧振子（节点之间没有耦合），但「该落后多少」是
+ * **按行号算出来**的：
  *
  *   滞后位置 l_i：  l_i' = (base - l_i) / τ_i        （base = 窗口底座的位置）
  *   目标偏移   d_i：  d_i  = -(base - l_i)
  *   弹簧：          o'' = -ω²(o_i - d_i) - c·o_i'
  *
- * 说人话：离抓点越远的节点，跟底座跟得越慢（τ 越大），于是「底座已经走到哪」
- * 和「它以为底座在哪」差得越多 —— 那个差值就是它该落后的量。抓点那个节点
- * τ = 0（1:1 跟手），最远的角落 τ = JELLY_TAU，于是整张网的落后量从抓点向外
- * **线性渐变**：抓点那一行几乎不落后、离得最远的角落后最多 —— 窗口像被揪着一
- * 个点拖着走，而不是整块平移。
+ * 说人话：越靠下的节点跟底座跟得越慢（τ 越大），于是「底座已经走到哪」和
+ * 「它以为底座在哪」差得越多 —— 那个差值就是它该落后的量。顶行 τ ≈ 0
+ * （1:1 跟手）、底行 τ = JELLY_TAU，中间线性过渡：窗口像上边被揪着、下边垂着
+ * 的一块布，而不是整块平移。
+ *
+ * **梯度只看行号，不看抓点在哪**（抓标题栏还是抓底边，该软的地方一样软）。
+ * 早先是按「到抓点的距离」算的（抓哪儿哪儿硬、四周散开），拖起来像被揪着一个
+ * 点甩，而且抓点一换整块布的软硬分布就变了 —— 手感飘。
  *
  * 为什么不是「给每个节点加一个拖拽力」：那样每个节点受到的力一样，匀速拖动时
  * 整张网会**一起**平移（形变是均匀的），而加速的那一小段时间里软节点反而落后得
  * 少（响应慢）—— 梯度是反的，看着不像果冻、像整窗拖后腿（实测截图里就是这样）。
- * 按距离算「该落后多少」则天然是渐变的，方向也对。
  *
  * ω 决定晃的频率、ζ 决定弹几下收住（阻尼比），τ 决定落后多少（见下面参数）。 */
-#define JELLY_TAU       0.022   /* 最远处落后多久：滞后 ≈ V·τ（V=1500 时约 33px） */
-#define JELLY_W0        19.0    /* 抓点附近的角频率（rad/s），19 ≈ 3Hz */
-#define JELLY_GRADE     2.0     /* 越远越软：ω 最多降到 1/sqrt(3) ≈ 1.7Hz */
+#define JELLY_TAU       0.022   /* 最下面落后多久：滞后 ≈ V·τ（V=1500 时约 33px） */
+#define JELLY_W0        19.0    /* 顶部附近的角频率（rad/s），19 ≈ 3Hz */
+#define JELLY_GRADE     2.0     /* 越往下越软：ω 最低降到 1/sqrt(3) ≈ 1.7Hz */
 #define JELLY_ZETA      0.35    /* 阻尼比：0.35 ≈ 弹两下收住 */
-#define JELLY_TAU_MIN   0.004   /* τ 的下限（抓点附近）：再小就跟死底座了 */
-#define JELLY_MARGIN    72.0
+#define JELLY_TAU_MIN   0.004   /* τ 的下限（顶行）：再小就跟死底座了 */
+#define JELLY_MARGIN    72.0    /* 形变缓冲四周留的余量（**逻辑**像素） */
 
 #define JELLY_DT        (1.0 / 240.0)
 #define JELLY_MAX_SUB   48          /* 一帧最多积分 200ms 的物理 */
@@ -92,8 +90,8 @@ struct vidow_jelly {
 	float *ox, *oy;      /* 每个节点的偏移（逻辑像素） */
 	float *vx, *vy;      /* 每个节点的速度 */
 	float *lx, *ly;      /* 每个节点的「滞后位置」（跟底座跟得慢的那个版本） */
-	/* 每节点预算好的常数（见上面那段公式）：g = 到抓点的距离（归一化），
-	 * w2 = ω²、cc = c、tau = τ。抓点定下来就不变，不必每帧算。 */
+	/* 每节点预算好的常数（见上面那段公式）：g = 行号（归一化，0 顶 1 底），
+	 * w2 = ω²、cc = c、tau = τ。网格定下来就不变，不必每帧算。 */
 	float *gw2, *gcc, *gtau;
 	int pin;             /* 钉住的节点下标，-1 = 松手了（整张网自由回正） */
 
@@ -105,7 +103,8 @@ struct vidow_jelly {
 	int target_index;
 	int buf_w, buf_h;    /* 设备像素 */
 	int dst_w, dst_h;    /* 场景节点尺寸（逻辑单位） */
-	double margin_px;
+	double margin_px;    /* JELLY_MARGIN 换算成**设备**像素（缓冲里那圈留白） */
+
 	int last_rel_x, last_rel_y; /* 源缓冲左上角在场景树里的相对位置 */
 
 	double strength;         /* 形变倍率（配置 jelly_strength） */
@@ -350,9 +349,13 @@ bool vidow_jelly_begin(struct vidow_view *view) {
 		return false;
 	}
 	jelly->node->point_accepts_input = jelly_node_rejects_input;
+	/* 节点位置是**逻辑**像素（场景图就是逻辑像素），缓冲里那圈留白是设备像素：
+	 * 留白换算成逻辑就是 JELLY_MARGIN 本身，**不是** margin_px。写成 margin_px
+	 * 的时候 2 倍屏上整个窗口偏 72 逻辑像素 —— 拖起来「窗口坐标偏移」，松手才
+	 * 回位（那个节点只在果冻期间存在）。 */
 	wlr_scene_node_set_position(&jelly->node->node,
-		jelly->last_rel_x - (int)jelly->margin_px,
-		jelly->last_rel_y - (int)jelly->margin_px);
+		jelly->last_rel_x - (int)lround(JELLY_MARGIN),
+		jelly->last_rel_y - (int)lround(JELLY_MARGIN));
 	wlr_scene_buffer_set_dest_size(jelly->node, jelly->dst_w, jelly->dst_h);
 	wlr_scene_node_raise_to_top(&jelly->node->node);
 	jelly->node_destroy.notify = jelly_node_destroy;
@@ -368,29 +371,17 @@ bool vidow_jelly_begin(struct vidow_view *view) {
 		0, jelly->rows);
 	jelly->pin = pi * jelly->nx + pj;
 
-	/* 每节点的弹簧常数（见文件顶上那段公式）：离抓点越远越软。 */
-	double max_d = 0.0;
+	/* 每节点的弹簧常数（见文件顶上那段公式）：**从上到下**越来越软 —— 顶部跟着
+	 * 底座走（几乎不落后），越往下跟得越慢、落后越多。梯度只看行号，跟抓点在哪
+	 * 无关：抓在标题栏还是抓在底边，整张网该软的地方一样软。 */
 	for (int i = 0; i < jelly->ny; i++) {
-		for (int j = 0; j < jelly->nx; j++) {
-			double d = hypot((double)(i - pi), (double)(j - pj));
-			if (d > max_d) {
-				max_d = d;
-			}
-		}
-	}
-	if (max_d < 1e-6) {
-		max_d = 1.0;
-	}
-	for (int i = 0; i < jelly->ny; i++) {
+		double g = jelly->ny > 1 ?
+			(double)i / (double)(jelly->ny - 1) : 0.0;
+		double w = JELLY_W0 / sqrt(1.0 + JELLY_GRADE * g);
+		double c = 2.0 * JELLY_ZETA * w;
+		double tau = JELLY_TAU_MIN + (JELLY_TAU - JELLY_TAU_MIN) * g;
 		for (int j = 0; j < jelly->nx; j++) {
 			size_t k = (size_t)i * (size_t)jelly->nx + (size_t)j;
-			double g = hypot((double)(i - pi), (double)(j - pj)) / max_d;
-			double w = JELLY_W0 / sqrt(1.0 + JELLY_GRADE * g);
-			double c = 2.0 * JELLY_ZETA * w;
-			double tau = JELLY_TAU * g;
-			if (tau < JELLY_TAU_MIN) {
-				tau = JELLY_TAU_MIN;
-			}
 			jelly->gw2[k] = (float)(w * w);
 			jelly->gcc[k] = (float)c;
 			jelly->gtau[k] = (float)tau;
@@ -643,8 +634,8 @@ void vidow_jelly_tick(struct vidow_server *server, int64_t now_ns) {
 		jelly->last_rel_x = fx_x - tx;
 		jelly->last_rel_y = fx_y - ty;
 		wlr_scene_node_set_position(&jelly->node->node,
-			jelly->last_rel_x - (int)jelly->margin_px,
-			jelly->last_rel_y - (int)jelly->margin_px);
+			jelly->last_rel_x - (int)lround(JELLY_MARGIN),
+			jelly->last_rel_y - (int)lround(JELLY_MARGIN));
 
 		/* 客户端提交了新内容：让装饰那趟重画一次，果冻采到的才是新图。 */
 		struct wlr_buffer *cur =

@@ -11,7 +11,13 @@
 #   5) 改大小（Mod+右键）不弯：那条路每帧换源缓冲尺寸，网格对不上
 #   6) 平铺窗口（没浮动）拖拽也弯
 #   7) 窗口最后落在光标松手的地方（果冻不该把位置语义搞坏）
-#   8) 日志里没有 assert / abort
+#   8) 果冻的软硬梯度**只看行号**：抓标题栏和抓底边，形变方向一样（顶部在前、
+#      底部拖后腿）—— 早先按「到抓点的距离」算，抓底边时梯度是反的
+#   9) 2 倍屏上拖起来窗口不许跑位：那圈留白是设备像素、节点位置是逻辑像素，
+#      单位写错整块窗口偏 72 逻辑像素（拖起来「坐标偏移」、松手才回位）
+#  10) 半透明 + 模糊的窗口：拖起来连模糊底衬一起画在对的位置（跑位的话模糊的
+#      内容也跟着偏，看着就是「背景错位」）
+#  11) 日志里没有 assert / abort
 #
 # 用法：./test-jelly.sh   （VIDOW_TEST_KEEP=1 保留运行目录）
 # 注意：别和别的测试**并行**跑 —— 收尾按 cmdline 杀 pattern.py / wall.py。
@@ -92,14 +98,16 @@ export DISPLAY= WAYLAND_DISPLAY=
 export WLR_BACKENDS=headless WLR_HEADLESS_OUTPUTS=1 WLR_LIBINPUT_NO_DEVICES=1
 export VIDOW_TEST_ACTION="file:$RUNDIR/actions"
 
-start_vidow() { # <额外配置行>
+start_vidow() { # <额外配置行> [blur 那一行，缺省 blur_enabled = false]
+	# 注意：同一个名字在配置里**第一次赋值**才算数（后面那行是普通 Lua 全局），
+	# 所以 blur 开关得在这儿替换，不能塞在 $1 里再写一遍。
 	cat > "$CFGDIR/.config/vidow/config.lua" <<CFG
 scale = "1"
 gaps = 10
 window_open_ms = 0
 window_close_ms = 0
 window_move_ms = 0
-blur_enabled = false
+${2:-blur_enabled = false}
 $1
 CFG
 	stop_clients
@@ -409,7 +417,204 @@ fi
 act "pointer-button left release mod" 0.1
 stop_vidow
 
-# ---------------------------------------------------------------- 7) 日志
+# ------------------------------------------------- 8) 梯度只看行号
+mark "梯度只看行号：抓标题栏 / 抓底边，形变方向一个样"
+start_vidow ""
+python3 ./tools/pattern.py w1 >/dev/null 2>&1 &
+CLIENT_PIDS="$CLIENT_PIDS $!"
+sleep 1.5
+./build/vidowmsg toggle-floating --title w1 >/dev/null
+sleep 0.4
+read -r WX WY WW WH FLOAT <<<"$(win_geom w1)"
+grab_shot() { # <png> <cy>：从 <cy> 那行抓着往右拖 400px，中途截一张
+	local png=$1 cy=$2 cx=$((WX + WW / 2))
+	act "pointer-motion $cx $cy"
+	act "pointer-button left press mod"
+	local i
+	for i in $(seq 1 8); do
+		act "pointer-motion $((cx + i * 50)) $cy" 0.02
+	done
+	grim "$png" 2>/dev/null
+	act "pointer-button left release mod" 0.05
+}
+grab_shot "$RUNDIR/grab-top.png" $((WY + 20))
+read -r TT TM TB <<<"$(edge "$RUNDIR/grab-top.png")"
+sleep 1.5
+read -r WX WY WW WH FLOAT <<<"$(win_geom w1)"
+grab_shot "$RUNDIR/grab-bottom.png" $((WY + WH - 20))
+read -r BT BM BB <<<"$(edge "$RUNDIR/grab-bottom.png")"
+if [ "$TT" = "none" ] || [ "$BT" = "none" ]; then
+	fail "抓上边 / 抓下边有一张截不到窗口（$TT / $BT）"
+else
+	if [ $((TT - TB)) -ge 5 ]; then
+		pass "抓标题栏：顶部在前 $((TT - TB))px（$TT/$TM/$TB）"
+	else
+		fail "抓标题栏没弯：$TT/$TM/$TB"
+	fi
+	if [ $((BT - BB)) -ge 5 ]; then
+		pass "抓底边：顶部照样在前 $((BT - BB))px（$BT/$BM/$BB）—— 梯度跟抓点无关"
+	else
+		fail "抓底边梯度反了：$BT/$BM/$BB（差 $((BT - BB))，要 ≥5）"
+	fi
+fi
+sleep 1.5
+stop_vidow
+
+# ------------------------------------------------- 9) 2 倍屏：不许跑位
+mark "2 倍屏上拖起来窗口不跑位（留白是设备像素、节点位置是逻辑像素）"
+start_vidow 'vidow.output{ name = "HEADLESS-1", scale = 2 }'
+python3 ./tools/pattern.py w1 >/dev/null 2>&1 &
+CLIENT_PIDS="$CLIENT_PIDS $!"
+sleep 1.5
+./build/vidowmsg toggle-floating --title w1 >/dev/null
+sleep 0.4
+# 先把窗口摆到屏幕中间：贴边的话偏移会被屏幕边裁掉，量不出那 144px。
+./build/vidowmsg center-window --title w1 >/dev/null
+sleep 0.3
+read -r WX WY WW WH FLOAT <<<"$(win_geom w1)"
+# 截图是**设备**像素（这块屏 2 倍）：逻辑 72px 的偏移在这里是 144px
+bbox() { # <png> -> "x y w h"（非黑像素外接盒，设备像素）
+	python3 - "$1" <<'PY'
+import sys
+from PIL import Image
+im = Image.open(sys.argv[1]).convert("RGB")
+W, H = im.size
+px = im.load()
+xs = []
+ys = []
+for y in range(0, H, 2):
+    for x in range(0, W, 2):
+        r, g, b = px[x, y]
+        if r + g + b > 24:
+            xs.append(x)
+            ys.append(y)
+if not xs:
+    print("none")
+else:
+    print(min(xs), min(ys), max(xs) - min(xs) + 1, max(ys) - min(ys) + 1)
+PY
+}
+grim "$RUNDIR/s2-rest.png" 2>/dev/null
+read -r RX RY RW RH <<<"$(bbox "$RUNDIR/s2-rest.png")"
+CX=$((WX + WW / 2))
+CY=$((WY + 20))
+act "pointer-motion $CX $CY"
+act "pointer-button left press mod" 0.35
+grim "$RUNDIR/s2-press.png" 2>/dev/null
+read -r PX PY PW PH <<<"$(bbox "$RUNDIR/s2-press.png")"
+if [ "$RX" = "none" ] || [ "$PX" = "none" ]; then
+	fail "2 倍屏上截不到窗口（静置 $RX / 按住 $PX）"
+else
+	DX=$((PX - RX))
+	DY=$((PY - RY))
+	if [ "${DX#-}" -le 2 ] && [ "${DY#-}" -le 2 ]; then
+		pass "按住没动，窗口还在原地：位移 $DX,$DY 设备像素（静置 $RX,$RY → 按住 $PX,$PY）"
+	else
+		fail "按住就跑了 $DX,$DY 设备像素（2 倍屏上单位写错是 144）"
+	fi
+fi
+act "pointer-button left release mod" 0.2
+sleep 1.5
+stop_vidow
+
+# ------------------------------------------------- 10) 半透明 + 模糊
+mark "半透明 + 模糊的窗口：拖起来连底衬一起画对位置"
+start_vidow 'vidow.output{ name = "HEADLESS-1", scale = 2 }
+window_opacity = 0.5' 'blur_enabled = true'
+python3 ./tools/wall.py >/dev/null 2>&1 &
+CLIENT_PIDS="$CLIENT_PIDS $!"
+sleep 1
+python3 ./tools/pattern.py w1 >/dev/null 2>&1 &
+CLIENT_PIDS="$CLIENT_PIDS $!"
+sleep 1.5
+./build/vidowmsg toggle-floating --title w1 >/dev/null
+sleep 0.6
+read -r WX WY WW WH FLOAT <<<"$(win_geom w1)"
+# 窗口那一块（逻辑 -> 设备像素，往外留 20px 收住阴影）
+RX=$((WX * 2 - 20))
+RY=$((WY * 2 - 20))
+RW=$((WW * 2 + 40))
+RH=$((WH * 2 + 40))
+grim "$RUNDIR/blur-rest.png" 2>/dev/null
+CX=$((WX + WW / 2))
+CY=$((WY + 20))
+act "pointer-motion $CX $CY"
+act "pointer-button left press mod" 0.35
+grim "$RUNDIR/blur-press.png" 2>/dev/null
+act "pointer-button left release mod" 0.2
+sleep 1.2
+# 两张图在**同一个窗口矩形**里逐像素比，外加一个「窗口真的在那儿」的哨兵：
+# pattern.py 左半红、右半绿，窗口在的话左边红色分量明显高于右边。窗口整块跑掉
+# （留白单位写错就是偏 144px）时，这一块只剩壁纸 —— 两张图差别巨大、而且哨兵
+# 也立不住。
+DIFF=$(python3 - "$RUNDIR/blur-rest.png" "$RUNDIR/blur-press.png" \
+	"$RX" "$RY" "$RW" "$RH" <<'PY'
+import sys
+from PIL import Image
+
+
+def load(path):
+    return Image.open(path).convert("RGB").load()
+
+
+pa = load(sys.argv[1])
+pb = load(sys.argv[2])
+x0, y0, w, h = (int(v) for v in sys.argv[3:7])
+m = 16
+x0 += m
+y0 += m
+w -= 2 * m
+h -= 2 * m
+n = 0
+bad = 0
+tot = 0
+red_l = 0
+red_r = 0
+for y in range(y0, y0 + h, 2):
+    for x in range(x0, x0 + w, 2):
+        da = pa[x, y]
+        db = pb[x, y]
+        d = abs(da[0] - db[0]) + abs(da[1] - db[1]) + abs(da[2] - db[2])
+        n += 1
+        tot += d
+        if d > 90:
+            bad += 1
+        # 哨兵只在静置那张上量（左边红、右边绿）
+        if x < x0 + w // 3:
+            red_l += da[0] - da[1]
+        elif x > x0 + w - w // 3:
+            red_r += da[0] - da[1]
+mean = tot / max(n, 1)
+frac = bad / max(n, 1)
+left = red_l / max(n / 3, 1)
+right = red_r / max(n / 3, 1)
+print("%.1f %.3f %d %.1f %.1f" % (mean, frac, n, left, right))
+PY
+)
+read -r MEAN FRAC N LEFT RIGHT <<< "$DIFF"
+if python3 -c "import sys; sys.exit(0 if $LEFT - $RIGHT > 10 else 1)"; then
+	pass "窗口真的在这一块里（左半边 R-G=$LEFT、右半边 $RIGHT —— pattern 左红右绿）"
+else
+	fail "这一块里没有窗口（左 R-G=$LEFT、右 $RIGHT），这条测不到东西"
+fi
+if [ "${MEAN%.*}" -le 12 ] && python3 -c "import sys; sys.exit(0 if $FRAC < 0.08 else 1)"; then
+	pass "按住前后窗口那一块几乎一样（平均差 $MEAN，差得多的点 $FRAC，$N 个采样）"
+else
+	fail "拖起来窗口那一块变了样：平均差 $MEAN、差得多的点 $FRAC（$N 个采样）"
+fi
+if grep -aq "blur: shared rebuild\|blur: own rebuild" "$LOG"; then
+	pass "模糊确实在跑（日志里有底衬重建）"
+else
+	fail "模糊没跑，这条测不到东西"
+fi
+if grep -aq "jelly: w1 起手" "$LOG"; then
+	pass "半透明窗口也起了果冻"
+else
+	fail "半透明窗口没起果冻"
+fi
+stop_vidow
+
+# ---------------------------------------------------------------- 11) 日志
 mark "日志里没有 assert / abort"
 if grep -aqE "assert|abort|Assertion" "$LOG"; then
 	fail "日志里有 assert / abort：$(grep -aE 'assert|abort|Assertion' "$LOG" | head -2)"

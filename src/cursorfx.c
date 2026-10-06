@@ -1,5 +1,10 @@
 /* 摇晃找光标：快速来回晃几下指针，指针就地放大 —— **晃一下大一圈，接着晃接着大**
- * （晃到找着为止），停下来 700ms 自己缩回去。
+ * （晃到找着为止），停下来 700ms 自己**动画**缩回去。
+ *
+ * 一圈多大：**加**一个固定倍数，不是乘（`cursor_shake_scale = 2` 是「第一次
+ * 到大一倍，之后每次再 +1」：2x → 3x → 4x → 5x …）。乘的话是 2、4、8、16 一路
+ * 炸开，第一下就大得吓人、再晃一下就顶到屏幕。放大和缩小本身都按**线性**补间
+ * 过去（150ms / 200ms），不跳。
  *
  * 放大是**换一张更大的光标图**：把当前光标图放大重画进一张新 buffer，再交给
  * wlr_cursor_set_buffer()。于是它和普通光标走同一条路：
@@ -49,8 +54,15 @@
  * 这里 —— 它们把光标交给上层合成器画，没有硬性的平面尺寸。真后端（DRM）会报
  * 上限，那就按它夹。 */
 #define SHAKE_SOFT_MAX 256
-/* 每一圈至少长这么多倍，免得配个 1.01 晃半天看不出来。 */
+/* 每一圈至少加这么多（配置值 = 加多少 + 1），免得配个 1.01 晃半天看不出来。 */
 #define SHAKE_MIN_STEP 1.2
+/* 尺寸补间：放大 150ms、缩小 200ms，线性；每 SHAKE_TICK_MS 一帧重画一次光标图
+ * （光标图不像场景，没有每帧回调可用，动画得自己拿定时器推）。 */
+#define SHAKE_GROW_MS   150
+#define SHAKE_SHRINK_MS 200
+#define SHAKE_TICK_MS   16
+/* 倍数小于这个就算「没放大」，该还原真图了。 */
+#define SHAKE_UNIT_EPS  1e-3
 
 struct vidow_cursor_fx {
 	/* 摇晃判定 */
@@ -64,7 +76,12 @@ struct vidow_cursor_fx {
 	/* 放大中 */
 	bool active;
 	int64_t until_ns;
-	double factor;       /* 当前倍数（每晃一次乘一次） */
+	double factor;       /* 当前**画在屏幕上**的倍数（补间中间值） */
+	double want;         /* 目标倍数（每晃一次加一个固定量，被屏幕尺寸夹住） */
+	double anim_from;    /* 这一段补间的起点倍数 */
+	int64_t anim_start_ns;
+	int anim_ms;         /* 这一段补间多长 */
+	bool animating;
 	double scale;        /* 光标所在输出的缩放 */
 	bool hardware;       /* 放大图在不在硬件光标平面上（只影响日志 / 诊断） */
 	struct wlr_buffer *src; /* 原尺寸那张（1:1，自己画的） */
@@ -79,6 +96,10 @@ struct vidow_cursor_fx {
 	int32_t hx, hy;
 	struct wl_listener surface_destroy;
 };
+
+/* 前置声明：定时器（动画的推手）在上面，重画光标图那两段在下面。 */
+static bool shake_draw_at(struct vidow_server *server, double f,
+		const char **why);
 
 /* --------------------------------------------------------------- 取状态 */
 
@@ -181,6 +202,7 @@ static void shake_restore(struct vidow_server *server) {
 		return;
 	}
 	fx->active = false;
+	fx->animating = false;
 	wl_event_source_timer_update(fx->timer, 0);
 	if (fx->surface != NULL) {
 		wlr_cursor_set_surface(server->cursor, fx->surface, fx->hx, fx->hy);
@@ -190,14 +212,74 @@ static void shake_restore(struct vidow_server *server) {
 	drop_images(fx);
 	wlr_log(WLR_DEBUG, "摇晃: 光标还原（%.2fx 收起）", fx->factor);
 	fx->factor = 1.0;
+	fx->want = 1.0;
+}
+
+/* 开始一段尺寸补间：从当前倍数线性走到 want，ms 毫秒走完。 */
+static void shake_animate(struct vidow_server *server, double want, int ms) {
+	struct vidow_cursor_fx *fx = server->cursor_fx;
+	fx->anim_from = fx->factor;
+	fx->want = want;
+	fx->anim_ms = ms > 0 ? ms : 1;
+	fx->anim_start_ns = vidow_now_ns();
+	fx->animating = true;
+	wl_event_source_timer_update(fx->timer, SHAKE_TICK_MS);
 }
 
 static int shake_timer_cb(void *data) {
 	struct vidow_server *server = data;
 	struct vidow_cursor_fx *fx = server->cursor_fx;
-	int64_t left = fx->until_ns - vidow_now_ns();
-	if (left > 0) {
-		wl_event_source_timer_update(fx->timer, (int)(left / 1000000) + 1);
+	int64_t now = vidow_now_ns();
+
+	if (fx->animating) {
+		double t = (double)(now - fx->anim_start_ns) /
+			((double)fx->anim_ms * 1e6);
+		if (t >= 1.0) {
+			t = 1.0;
+			fx->animating = false;
+		}
+		double f = fx->anim_from + (fx->want - fx->anim_from) * t;
+		if (f < 1.0) {
+			f = 1.0;
+		}
+		/* 缩回 1.0 的那一段走完就直接还原真图（f = 1.0 那张就是真图，
+		 * 换回去看不出接缝）。 */
+		if (!fx->animating && fx->want <= 1.0 + SHAKE_UNIT_EPS) {
+			shake_restore(server);
+			return 0;
+		}
+		const char *why = NULL;
+		if (shake_draw_at(server, f, &why)) {
+			if (!fx->animating) {
+				/* 补间走完了：这一刻的尺寸是最终尺寸，日志（含「硬件光标
+				 * / 软光标」那条判据）在这儿记一次就够，别每帧刷屏。 */
+				wlr_log(WLR_INFO,
+					"摇晃: 光标放大 %.2fx（%dx%d → %dx%d，%s）", f,
+					fx->src->width, fx->src->height,
+					fx->big->width, fx->big->height,
+					fx->hardware ? "硬件光标，不进截图"
+						: "软光标：会画进屏幕（抓帧是 vidow 自己渲染的，截图里照样没有它）");
+			}
+		} else {
+			wlr_log(WLR_DEBUG, "摇晃: 这一帧的光标图没画成（%s）", why);
+		}
+		if (fx->animating) {
+			wl_event_source_timer_update(fx->timer, SHAKE_TICK_MS);
+			return 0;
+		}
+	}
+
+	/* 补间走完：还在保持期就等，保持期过了就补间缩回去。 */
+	if (fx->factor > 1.0 + SHAKE_UNIT_EPS) {
+		int64_t left = fx->until_ns - now;
+		if (left > 0) {
+			wl_event_source_timer_update(fx->timer,
+				(int)(left / 1000000) + 1);
+			return 0;
+		}
+		wlr_log(WLR_DEBUG, "摇晃: 光标开始缩回（%.2fx → 1.00x，%dms）",
+			fx->factor, SHAKE_SHRINK_MS);
+		shake_animate(server, 1.0, SHAKE_SHRINK_MS);
 		return 0;
 	}
 	shake_restore(server);
@@ -207,13 +289,16 @@ static int shake_timer_cb(void *data) {
 static void hold(struct vidow_server *server) {
 	struct vidow_cursor_fx *fx = server->cursor_fx;
 	fx->until_ns = vidow_now_ns() + (int64_t)SHAKE_HOLD_MS * 1000000;
-	wl_event_source_timer_update(fx->timer, SHAKE_HOLD_MS);
+	if (!fx->animating) {
+		wl_event_source_timer_update(fx->timer, SHAKE_HOLD_MS);
+	}
 }
 
 /* --------------------------------------------------------------- 放大 */
 
-/* 放大到 fit 倍。成功时 *why 不动，失败时 *why 里是给人看的原因。 */
-static bool shake_grow(struct vidow_server *server, double fit, const char **why) {
+/* 按倍数 f 重画一张光标图交给 wlr_cursor（补间的每一帧都走这里）。
+ * 成功时 *why 不动，失败时 *why 里是给人看的原因。 */
+static bool shake_draw_at(struct vidow_server *server, double f, const char **why) {
 	struct vidow_cursor_fx *fx = server->cursor_fx;
 	if (fx->src == NULL) {
 		*why = "原尺寸那张光标图没了";
@@ -226,9 +311,52 @@ static bool shake_grow(struct vidow_server *server, double fit, const char **why
 		return false;
 	}
 	int src_w = fx->src->width, src_h = fx->src->height;
+	int w = (int)lround(src_w * f);
+	int h = (int)lround(src_h * f);
+	if (w < 1) {
+		w = 1;
+	}
+	if (h < 1) {
+		h = 1;
+	}
+	struct wlr_fbox box = { .width = src_w, .height = src_h };
+	struct wlr_buffer *big = scale_texture(server, src_tex, &box, w, h);
+	wlr_texture_destroy(src_tex); /* 贴图用完就还（buffer 还留着） */
+	if (big == NULL) {
+		*why = "渲染放大图失败";
+		return false;
+	}
 
-	/* 天花板：放大图的物理像素不超过这块屏（比屏幕还大的光标没有意义，
-	 * 而且 8K 的 ARGB 缓冲就是 256MB）。 */
+	int32_t hx = (int32_t)lround(fx->src_hx * f);
+	int32_t hy = (int32_t)lround(fx->src_hy * f);
+	wlr_cursor_set_buffer(server->cursor, big, hx, hy, (float)fx->scale);
+
+	struct wlr_output *output = NULL;
+	struct wlr_output_cursor *oc = cursor_under_pointer(server, &output);
+	fx->hardware = oc != NULL && output->hardware_cursor == oc;
+
+	/* 上一帧那张可能还在屏幕上（场景锁着它）：交给 wlroots 自己等它落地再
+	 * 释放，这里只松手我们这一份引用。 */
+	if (fx->big != NULL) {
+		wlr_buffer_drop(fx->big);
+	}
+	fx->big = big;
+	fx->factor = f;
+	fx->big_hx = hx;
+	fx->big_hy = hy;
+	return true;
+}
+
+/* 把放大目标定在 fit 倍，并开始线性补间过去（放大 150ms）。天花板：放大图的
+ * 物理像素不超过这块屏（比屏幕还大的光标没有意义，而且 8K 的 ARGB 缓冲就是
+ * 256MB）。成功时 *why 不动，失败时 *why 里是给人看的原因。 */
+static bool shake_target(struct vidow_server *server, double fit, const char **why) {
+	struct vidow_cursor_fx *fx = server->cursor_fx;
+	if (fx->src == NULL) {
+		*why = "原尺寸那张光标图没了";
+		return false;
+	}
+	int src_w = fx->src->width, src_h = fx->src->height;
 	double cap = fit;
 	if (fx->limit_w > 0) {
 		cap = fmin(cap, (double)fx->limit_w / src_w);
@@ -244,38 +372,11 @@ static bool shake_grow(struct vidow_server *server, double fit, const char **why
 		wlr_log(WLR_DEBUG, "摇晃: 屏幕只有 %dx%d，%.2fx 放不下，到 %.2fx 为止",
 			fx->limit_w, fx->limit_h, fit, cap);
 	}
-	fit = cap;
-
-	int w = (int)lround(src_w * fit);
-	int h = (int)lround(src_h * fit);
-	struct wlr_fbox box = { .width = src_w, .height = src_h };
-	struct wlr_buffer *big = scale_texture(server, src_tex, &box, w, h);
-	wlr_texture_destroy(src_tex); /* 贴图用完就还（buffer 还留着） */
-	if (big == NULL) {
-		*why = "渲染放大图失败";
-		return false;
+	fx->want = cap;
+	if (fabs(cap - fx->factor) < SHAKE_UNIT_EPS) {
+		return true; /* 已经在这个倍数上了（到顶之后接着晃） */
 	}
-
-	int32_t hx = (int32_t)lround(fx->src_hx * fit);
-	int32_t hy = (int32_t)lround(fx->src_hy * fit);
-	wlr_cursor_set_buffer(server->cursor, big, hx, hy, (float)fx->scale);
-
-	struct wlr_output *output = NULL;
-	struct wlr_output_cursor *oc = cursor_under_pointer(server, &output);
-	bool hardware = oc != NULL && output->hardware_cursor == oc;
-
-	if (fx->big != NULL) {
-		wlr_buffer_drop(fx->big);
-	}
-	fx->big = big;
-	fx->factor = fit;
-	fx->big_hx = hx;
-	fx->big_hy = hy;
-	fx->hardware = hardware;
-	wlr_log(WLR_INFO, "摇晃: 光标放大 %.2fx（%dx%d → %dx%d，%s）", fit,
-		src_w, src_h, w, h,
-		hardware ? "硬件光标，不进截图"
-			: "软光标：会画进屏幕（抓帧是 vidow 自己渲染的，截图里照样没有它）");
+	shake_animate(server, cap, SHAKE_GROW_MS);
 	return true;
 }
 
@@ -293,11 +394,15 @@ bool vidow_cursor_fx_shake(struct vidow_server *server, const char **why) {
 	if (step < SHAKE_MIN_STEP) {
 		step = SHAKE_MIN_STEP;
 	}
+	/* 每晃一次**加**这么多倍（线性）：cursor_shake_scale = 2 就是「第一次到大
+	 * 一倍，之后每次再 +1」。 */
+	double inc = step - 1.0;
 
 	if (fx->active) {
-		/* 已经在放大了：接着晃就再大一圈（晃到找着为止）。到顶了也算成功 ——
+		/* 已经在放大了：接着晃就再大一圈（晃到找着为止）。加在**目标**上而不是
+		 * 当前值上 —— 补间还在路上时连晃几下，每一圈都算数。到顶了也算成功：
 		 * 光标这会儿本来就是大的。 */
-		if (!shake_grow(server, fx->factor * step, why)) {
+		if (!shake_target(server, fx->want + inc, why)) {
 			wlr_log(WLR_DEBUG, "摇晃: 不再放大（%s）", *why);
 		}
 		hold(server);
@@ -347,9 +452,11 @@ bool vidow_cursor_fx_shake(struct vidow_server *server, const char **why) {
 	fx->src_hx = (int32_t)lround(oc->hotspot_x / scale);
 	fx->src_hy = (int32_t)lround(oc->hotspot_y / scale);
 	fx->factor = 1.0;
+	fx->want = 1.0;
+	fx->animating = false;
 	fx->active = true;
 
-	if (!shake_grow(server, step, why)) {
+	if (!shake_target(server, 1.0 + inc, why)) {
 		fx->active = false;
 		drop_images(fx);
 		wlr_log(WLR_DEBUG, "摇晃: 没放大（%s）", *why);
@@ -487,6 +594,9 @@ void vidow_cursor_fx_json(struct jbuf *b, struct vidow_server *server) {
 
 	jb_kv_bool(b, "magnified", fx != NULL && fx->active);
 	jb_kv_double(b, "scale", fx != NULL && fx->active ? fx->factor : 1.0);
+	/* 补间的终点：scale == target 就是这一圈已经走完（scale 在动画中间是
+	 * 中间值，缩小那一段从 2 一路走回 1）。 */
+	jb_kv_double(b, "target", fx != NULL && fx->active ? fx->want : 1.0);
 	if (oc != NULL) {
 		snprintf(buf, sizeof(buf), "%dx%d", oc->width, oc->height);
 		jb_kv_str(b, "image", buf);
