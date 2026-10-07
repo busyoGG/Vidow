@@ -13,7 +13,10 @@
 # 判据（VIDOW_RENDER_STATS=1 打的那行「渲染统计」，只看拖拽期间那几行）：
 #   1) 拖拽期间真的在重建私有底衬（own ≥ 10）—— 不然说明没复现「重叠」这个前提
 #   2) 拖拽期间贴图导入次数为 0 —— 这是这条测试要守的东西
-#   3) vidow 全程活着
+#   3) 重建次数 / 指针步数 < 1.5 —— 只有「它底下那个窗口」该重建；被拖的窗口自己
+#      每步都重抓就是白工（实测：修前 2.23 次/步，修后 0.52）。步长用 20ms 是为了让
+#      每一步都渲染出一帧，不然帧数比步数少，比值会被稀释（4ms 步长下修前只有 0.79）
+#   4) vidow 全程活着
 #
 # 用法：./test-blurcache.sh    （VIDOW_TEST_KEEP=1 保留运行目录）
 set -u
@@ -130,8 +133,8 @@ act() { echo "$1" >&9; sleep "${2:-0.3}"; }
 OFF=$(wc -c < "$LOG")
 act "pointer-motion $CX $CY" 0.2
 act "pointer-button left press mod" 0.2
-for i in $(seq 1 20); do
-	act "pointer-motion $((CX + i * 12)) $((CY + i * 8))" 0.03
+for i in $(seq 1 100); do
+	act "pointer-motion $((CX + i * 6)) $((CY + i * 4))" 0.02
 done
 act "pointer-button left release mod" 0.5
 exec 9>&-
@@ -170,6 +173,22 @@ if [ "$OWN" -ge 10 ] 2>/dev/null; then
 else
 	fail "拖拽期间只有 $OWN 次私有底衬重建 —— 没复现「重叠」这个前提，后面那条判据不算数"
 fi
+STEPS=$(tail -c +$((OFF + 1)) "$LOG" | grep -ac "'pointer-motion .* 完成")
+if [ "$STEPS" -ge 50 ] 2>/dev/null; then
+	pass "拖拽步数记下来了（$STEPS 步）"
+else
+	fail "只数到 $STEPS 步指针动作 —— 拖拽没跑够，下面那条比值不算数"
+fi
+# 重建次数 / 步数：拖一个重叠窗口时**只有它底下那个窗口**该重建（它底下的画面真的在
+# 变），被拖的那个自己的底衬抓的时候把它藏起来了、不该跟着变（只在区域跨网格时才重
+# 建）。修之前（1ead9df）实测 2.23 次/步（两个窗口每步各一次）；修之后 0.52 次/步。
+RATIO=$(python3 -c "print('%.2f' % ($OWN / max($STEPS, 1)))")
+if python3 -c "import sys; sys.exit(0 if $OWN < 1.5 * max($STEPS, 1) else 1)"; then
+	pass "拖拽期间私有底衬重建 $OWN 次 / $STEPS 步 = $RATIO 次/步（< 1.5；修前实测 2.23）"
+else
+	fail "拖拽期间私有底衬重建 $OWN 次 / $STEPS 步 = $RATIO 次/步 —— 被拖的窗口自己也每步重抓了"
+fi
+
 if [ "$NEW" = "0" ]; then
 	pass "一次贴图都没重新导入（优化前同样的拖拽实测 +690/-690，每帧 23 次）"
 else

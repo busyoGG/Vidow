@@ -642,7 +642,7 @@ if [ "${MEAN%.*}" -le 12 ] && python3 -c "import sys; sys.exit(0 if $FRAC < 0.08
 else
 	fail "拖起来窗口那一块变了样：平均差 $MEAN、差得多的点 $FRAC（$N 个采样）"
 fi
-if grep -aq "blur: shared rebuild\|blur: own rebuild" "$LOG"; then
+if grep -aq "blur: shared rebuild\|blur: own region" "$LOG"; then
 	pass "模糊确实在跑（日志里有底衬重建）"
 else
 	fail "模糊没跑，这条测不到东西"
@@ -715,7 +715,7 @@ for path in files:
 print("%d %d %d %d %d" % (mixed, green, mag, empty, len(files)))
 PY
 )"
-	if grep -aq "jelly: green 起手" "$LOG" && grep -aq "blur: own rebuild" "$LOG"; then
+	if grep -aq "jelly: green 起手" "$LOG" && grep -aq "blur: own region" "$LOG"; then
 		pass "底衬抓取和果冻都真的在跑（$NDUMP 份 dump）"
 	else
 		fail "果冻或底衬抓取没跑（$NDUMP 份 dump），这条测不到东西"

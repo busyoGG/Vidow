@@ -746,7 +746,7 @@ python3 test-float.py        # 三个真实 GTK 窗口，验证浮动模式自�
 ./test-cursor-shake.sh              # 摇晃找光标：线性加 + 补间、晃到屏幕那么大，截图里没有它（全 headless，55 项断言）
 ./test-geometry.sh                   # 窗口几何和表面尺寸对不上时内容铺满框（chromium 改大小那 1-2 秒）（全 headless，6 项断言）
 ./test-viewport-crop.sh              # 客户端用 wp_viewport 只声明缓冲的一部分时，装饰按那块采（chromium，5 项断言）
-./test-blurcache.sh                  # 拖重叠窗口时每帧重建底衬、但一次贴图都不重新导入（5 项断言）
+./test-blurcache.sh                  # 拖重叠窗口时只重建「它底下那个」的底衬、且一次贴图都不重新导入（7 项断言）
 ./test-config.sh                     # 配置系统：一个 Lua 文件 + 改了就自动重载（全 headless，15 项断言）
 ./test-binds.sh                      # 键位全是配置给的：没配置=没有键位、默认那套能用、换键位、动作字符串（全 headless，35 项断言）
 ./test-config-include.sh             # 配置拆成好几份：vidow.include() 的路径/顺序/报错 + 改哪份都自动重载（全 headless，25 项断言）
@@ -794,7 +794,7 @@ WLR_BACKENDS=headless WLR_HEADLESS_OUTPUTS=1 WLR_LIBINPUT_NO_DEVICES=1 ./build/v
 | --- | --- |
 | `VIDOW_LOG` | `info`（默认）/ `debug` / `error` |
 | `VIDOW_TERMINAL` | `Super+Enter` 启动的命令，默认 `kitty` |
-| `VIDOW_BLUR_DUMP=N` | 前 N 份底衬 / 模糊图 / layer 区域抓取 dump 成 `/tmp/vidow-{bd,blur,lbd,lblur}-*`（裸 ARGB，测试用） |
+| `VIDOW_BLUR_DUMP=N` | 前 N 份底衬 / 模糊图 / layer 区域抓取 dump 成 `/tmp/vidow-{bd,blur,lbd,lblur}-*`（裸 ARGB，测试用）。`bd`/`blur` 是**被抓的那块区域**那么大（重叠窗口抓的是「窗口 ± 模糊半径」那块，不是整屏；layer 那条路一直是区域大小），每份配一个同名 `.txt` 写宽高 |
 | `VIDOW_FX_DUMP=N` | 前 N 份装饰离屏缓冲 dump 成 `/tmp/vidow-fx-*` |
 | `VIDOW_MASK_DUMP=N` | 前 N 份透明度剔除的 mask（layer 自己的内容）dump 成 `/tmp/vidow-mask-*` |
 | `VIDOW_RENDER_STATS=1` | 每 500ms 一行渲染统计：每帧各阶段耗时（模糊 / 装饰 / 果冻 / 提交）、私有底衬重建次数、**vidow 自己那些目标缓冲的贴图导入次数**、帧率。查「拖窗口卡」先在真机上跑这个看每帧干了多少活，再谈优化 |
@@ -2770,7 +2770,10 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
                   `wlr_texture_from_buffer()` 导入一张、用完销毁，真后端上（GBM/dmabuf）
                   每次都是一次 EGLImage + BO 映射 —— 基准实测每帧 23 次。判据看
                   `VIDOW_RENDER_STATS=1` 那行统计：拖拽期间私有底衬重建 ≥10 次（前提复现）、
-                  贴图导入 **0 次**（把 reuse 关掉跑一遍：518 次 → 当场红）
+                  贴图导入 **0 次**（把 reuse 关掉跑一遍：518 次 → 当场红）。**重建次数 / 指针
+                  步数 < 1.5**（只有「它底下那个窗口」该重建；被拖的那个自己的底衬抓的时候
+                  把它藏起来了，只在区域跨网格时才重建 —— 修前 1.96 次/步、修后 1.01，
+                  退回源码跑同一条测试当场红）
 ```
 
 ## 已验证（wlroots 0.20.2 / AMD radeonsi / EGL 1.5，日志逐条比对坐标）
@@ -3551,6 +3554,74 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
      HEADLESS-1、写明「客户端还在交帧，屏幕却不更新」；③掐断帧链 + 追踪**关**：一条 trace
      日志都没有、vidow 照样活着（诊断不改变行为）。
 
+144. **拖拽卡顿剩下那两笔账：私有底衬按区域抓 + 「只有我自己动了」不算世界变了**（用户说
+     「1 2 可做」，指上一节 143 列的那两件；顺手查出一件更值钱的事）。
+
+     **先查出来的那件：拖动时每一步都在给每个窗口重发 configure。** `vidow_place_view()`
+     每次都调 `vidow_view_set_size()`（→ `wlr_xdg_toplevel_set_size`）和
+     `vidow_view_set_tiled()`，两个都是无条件发的；而拖动时每动一下都会 `vidow_arrange()`
+     一次。客户端收到 configure 就重画 + 交一帧 —— 实测（headless 2560x1440@2，壁纸 + 两个
+     浮动窗口，200 步拖拽）：**每个窗口 200 次 configure、200 次 commit，两个窗口一共 400
+     次**。也就是说「世界」每帧都在变：所有私有底衬每帧重抓，客户端也在陪着白画。
+     修法：`vidow_view_set_size()` / `vidow_view_set_tiled()` 记下最后一次**真的发出去**的
+     状态，一样就不再发（X11 的移动就是 configure，所以位置一起记）。拖拽期间客户端 commit
+     **400 → 0 次**。
+
+     **① 私有底衬只抓窗口那一小块**（`view_region_build()`，替掉 `blur_own_rebuild()`）：
+     - 以前：每次重建都**整屏重画一遍**（壁纸 + background / bottom 层 + 所有窗口），再跑
+       一整条整屏链条
+     - 现在：基座从共享底衬上 **1:1 拷一块**（区域面积），窗口只画进这块区域，链条也只跑
+       这块区域；装饰着色器按区域采样（复用 layer 那条路已有的 `blur_tex_x/y/w/h` +
+       `u_origin` / `u_output_size`，观感逐像素不变）
+     - 区域原点对齐到 **128 网格**、尺寸**只跟窗口大小有关**（拖窗口时区域整体平移，缓冲
+       尺寸不变 → 金字塔缓冲一直复用、贴图不重导入）；原点夹在屏内（屏外没像素可抓，伸
+       出去那圈会被链条混成黑边）
+     - 区域 = 窗口装饰矩形 ± 模糊半径，半径按链条实际采样范围算：
+       `blur_offset * (3 * 2^levels - 5)`（降采样那几趟 + 上升那几趟）
+     - 顺带修掉一个隐患：以前重叠窗口的整屏抓取会把**共享底衬**那块缓冲覆盖掉（而 layer
+       的区域底衬正拿它当基座），现在两者分开，基座永远是「壁纸 + background / bottom 层」
+
+     **② 「世界变了」拆成「我自己动了」/「别人动了」**：
+     - 新增 `vidow_backdrop_damage_view(view)` + `view->self_gen`：窗口自己的变化（被拖、
+       内容重画、开合动画、果冻形变、布局挪它、显隐翻转、置顶、映射 / 销毁）既推进世界
+       代次，也在它自己头上记一笔；私有底衬的缓存键从 `gen_scene` 改成
+       **`gen_scene - view->self_gen`** —— 抓的时候这个窗口本来就藏着，它自己的变化不该
+       让那张图过期
+     - `vidow_arrange()` 不再无条件推世界代次：拖动时每动一下都会重摆一次，这种「只有被拖
+       的那个在动」的重摆不该算「世界变了」。判断办法是让每一处真的变了的地方自己报账
+       （`place_view` 的 moved / resized、可见性翻转、置顶），只要有一个不是被拖的那个就
+       退回「世界变了」（`server->arrange_self_only`）—— 宁可多抓一次，不能糊着旧的
+
+     **证据**（headless 2560x1440@2，壁纸 + 两个**静止**浮动窗口，200 步拖拽，同一脚本）：
+
+     | | 拖拽期间私有底衬重建 | 客户端 commit |
+     | --- | --- | --- |
+     | 改前（1ead9df） | **446 次（2.23 次/步）**：被拖的 223 + 另一个 223 | 400 |
+     | 改后 | **104 次（0.52 次/步）**：另一个 101（必须：它底下真的在变）+ 被拖的 **3**（只在区域跨网格时） | **0** |
+
+     再加上每次重建的填充面积从整屏 3.69M px（还要重画一遍壁纸）降到区域 2.16M px + 一块
+     1:1 拷贝 —— 窗口越小省得越多。
+     - 截图逐像素比对（同一场景改前 / 改后各截一张）：**max diff 2、差 >2 的像素 0 / 3686400**
+       （同一版本跑两次是完全相同的 0 差，所以这个对比是有意义的）
+     - `test-blurcache.sh` 多了一条判据：拖拽期间重建次数 / 指针步数 < 1.5（步长用 20ms，
+       让每一步都渲染出一帧，不然帧数比步数少、比值被稀释 —— 4ms 步长下修前只有 0.79）。
+       把源码退回 1ead9df、只保留新测试跑同一条：**1.96 次/步 → 当场红**；现在 1.01 ✓
+     - 回归全过（42 条）：blurscale / blurlevel / layerblur / layermask / layerghost /
+       layerwin / layerdestroy / geometry / jelly / drag / ipc / dpi / dmabuf-update /
+       viewport-crop / blurcache / openanim / closeanim / minimize / workspace / ws-dynamic /
+       overview / scrollcull / frametrace / force-render / hotplug / outputpos / outputstate /
+       lastoutput / cursor-shake / bounce / focus / focusclose / gap / input-inject /
+       capture-hide / actsurface / config / defaultconfig / preinit / binds / keys / clipboard
+     - `test-jelly.sh` 里按日志找「own rebuild」那条判据跟着日志改名成「own region」
+
+     **③ 还没做（用户问「3 是什么意思」）**：现在是**每个**需要模糊的元素各自抓一份底衬
+     （各自重画一遍世界）+ 各自跑一条 kawase 链 —— 有几个模糊元素就几遍场景渲染。③ 是把
+     它换成 niri 那种「按画家顺序来」：**一帧只画一遍世界**（画进一张离屏图，画到谁就用
+     谁底下那一块算模糊），场景重画从 N 遍变 1 遍。窗口在背景里这件事不会丢 —— 恰恰相反，
+     「谁底下已经画好了什么」天然就在那张图里，所以它永远实时、跟着窗口动；链条还是每个
+     元素一条（源不一样，共享不了）。纯性能改动，不动观感；视频 / 每帧都在重画的客户端
+     （浏览器）背后的模糊要一直实时，靠的就是这条路。
+
 143. **「有背景的时候拖拽还是会卡」**（用户报的「可能是果冻+模糊共同造成的？还是渲染效率
      比较差（我 7900XT 理应性能足够）」，并且「现在没条件测试，源码里面应该有办法知道是什么
      卡」）。
@@ -3607,7 +3678,7 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
        `test-layerghost` / `test-layerwin` / `test-layerdestroy` / `test-geometry` /
        `test-jelly` / `test-drag` 全过
 
-     **还没做的（按收益排，都需要真机数据）**：
+     **还没做的（按收益排，都需要真机数据）**（1 和 2 已经做了，见上面的 144；3 还没做）：
      1. 私有底衬的那次场景重绘只画窗口那一块（+ 模糊半径），别整屏重绘 —— 机制已经有了
         （layer 那条路就是按区域抓的，`backdrop_ctx` 里有 `clip_x/y/w/h`）
      2. 拖自己被拖的那个窗口时，它的私有底衬**本来没变**（抓的时候把自己藏起来了），

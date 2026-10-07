@@ -434,6 +434,15 @@ struct vidow_fx_target {
 	 * **它自己那一小块区域**的抓取，采样坐标得减掉区域原点，否则整块错位。 */
 	int blur_tex_x, blur_tex_y, blur_tex_w, blur_tex_h;
 
+	/* 私有底衬**那一小块区域**的缓冲 + 包着它的贴图（只有重叠的窗口用；layer
+	 * 那一路把同样的东西挂在 struct vidow_layer_surface 上）。位置和尺寸就是
+	 * 上面那组 blur_tex_*。抓的时候只渲染这块区域：基座从共享底衬上 1:1 拷一块
+	 * 过来，别的窗口再画上去 —— 以前每帧要把壁纸整个重画一遍（见 view_region_build）。
+	 * 贴图是包的缓冲、不是包的像素，缓冲复用的时候贴图跟着复用。 */
+	struct wlr_buffer *own_bd;
+	struct wlr_texture *own_bd_tex;
+	int own_bd_w, own_bd_h;
+
 	/* ext-background-effect 的模糊区域（窗口局部坐标）。blur_region_on 为
 	 * true 时着色器只在这个盒子里画模糊；-1 表示不限制。 */
 	bool blur_region_on;
@@ -617,6 +626,21 @@ struct vidow_view {
 	/* IPC 用的稳定编号（进程内唯一，从 1 起）。窗口一建就分配，之后不变 ——
 	 * 外面的脚本靠它指认窗口（vidowmsg close-window --id 3）。 */
 	uint64_t id;
+	/* 「只有这个窗口自己变了」的累计代次（拖动 / 内容重画 / 开合动画 / 果冻
+	 * 形变，见 vidow_backdrop_damage_view）。私有底衬抓的是「世界减掉这个窗口」，
+	 * 抓的时候这个窗口本来就藏着，所以它自己的变化**不影响**那张图：判断要不要
+	 * 重抓时看的是 server->gen_scene - self_gen，而不是 gen_scene 本身。 */
+	uint64_t self_gen;
+	/* 最后一次**真的发出去**的 configure（xdg 只看宽高；X11 的移动就是 configure，
+	 * 所以连位置一起记）。一样的就不再发：拖动时每动一下都会 arrange 一次，无条件
+	 * 发的话每个窗口的客户端都要重画一遍、交一帧 —— 实测拖 200 步 = 每个窗口
+	 * 200 次 configure + 200 次 commit，底衬跟着每帧重抓（见 vidow_view_set_size）。 */
+	int cfg_x, cfg_y, cfg_w, cfg_h;
+	bool cfg_sent;
+	/* 同理，最后一次真的发出去的 tiled 状态（place_view 每次都调 set_tiled，
+	 * 不去重的话每次都会给客户端排一个 configure）。 */
+	int cfg_tiled;
+	bool cfg_tiled_sent;
 	struct wl_list column_link; /* vidow_column.views, top to bottom */
 	struct wl_list ws_link;     /* 浮窗专属：挂在工作区的 views 上（进列了就不挂） */
 	struct vidow_column *column;
@@ -1188,6 +1212,10 @@ struct vidow_server {
 	 * surfaces, gen_scene additionally covers every window: a cached blur is
 	 * reused until the matching generation moves. */
 	uint64_t gen_layer, gen_scene;
+	/* vidow_arrange() 这一趟是不是「只有正被拖的那个窗口在动」（见那里的说明）：
+	 * 拖动时每动一下都会重摆一次，这种情况不该把整个世界代次推一遍。置位之后，
+	 * 只要有任何一个**别的**窗口报「我变了」（vidow_backdrop_damage_view）就清掉。 */
+	bool arrange_self_only;
 
 	/* 正在渲染的那个输出的物理尺寸和布局原点（物理像素），给着色器当
 	 * u_output_size / u_origin 的基准。 */
@@ -1538,6 +1566,8 @@ void vidow_blur_update(struct vidow_output *output);
  * or a background/bottom layer surface; false for anything that only moves or
  * repaints windows. */
 void vidow_backdrop_damage(struct vidow_server *server, bool layers);
+/* 同上，但这一笔账记在某个窗口头上：它自己变了（不影响它自己的私有底衬）。 */
+void vidow_backdrop_damage_view(struct vidow_view *view);
 /* Release the blur resources an output owns. */
 void vidow_blur_output_finish(struct vidow_output *output);
 

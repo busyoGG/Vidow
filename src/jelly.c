@@ -409,7 +409,7 @@ bool vidow_jelly_begin(struct vidow_view *view) {
 	 * apply_anim 让它立刻生效，别等下一帧。 */
 	view->fx.jelly = true;
 	vidow_view_apply_anim(view);
-	vidow_backdrop_damage(server, false);
+	vidow_backdrop_damage_view(view); /* 只有它自己在形变 */
 	wlr_log(WLR_DEBUG, "jelly: %s 起手（%dx%d 网格 %dx%d，抓点 %d,%d）",
 		vidow_view_title(view) != NULL ? vidow_view_title(view) : "?",
 		jelly->src_w, jelly->src_h, jelly->cols, jelly->rows, pj, pi);
@@ -678,8 +678,9 @@ void vidow_jelly_tick(struct vidow_server *server, int64_t now_ns) {
 		jelly->base_drawn_x = tx;
 		jelly->base_drawn_y = ty;
 		if (moved) {
-			/* 网格在动 -> 背后的模糊底衬要重抓（和拖拽时那一下一样）。 */
-			vidow_backdrop_damage(server, false);
+			/* 网格在动 -> 别的窗口背后的模糊底衬要重抓（和拖拽时那一下一样）；
+			 * 它自己的私有底衬不受影响（抓的时候它藏着）。 */
+			vidow_backdrop_damage_view(view);
 			/* 节点在树里的相对位置固定，只有内容在变：重画一次。 */
 			jelly_render(jelly);
 		}

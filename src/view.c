@@ -365,13 +365,29 @@ void vidow_view_set_size(struct vidow_view *view, int w, int h) {
 		if (ch < 1) {
 			ch = 1;
 		}
-		wlr_xwayland_surface_configure(view->x11,
-			(int16_t)(view->geom.x * scale), (int16_t)(view->geom.y * scale),
+		int x = (int)lround((double)view->geom.x * scale);
+		int y = (int)lround((double)view->geom.y * scale);
+		if (view->cfg_sent && view->cfg_x == x && view->cfg_y == y &&
+				view->cfg_w == cw && view->cfg_h == ch) {
+			return; /* 位置尺寸一个都没变：别让客户端白重画一帧 */
+		}
+		wlr_xwayland_surface_configure(view->x11, (int16_t)x, (int16_t)y,
 			(uint16_t)cw, (uint16_t)ch);
+		view->cfg_x = x;
+		view->cfg_y = y;
+		view->cfg_w = cw;
+		view->cfg_h = ch;
+		view->cfg_sent = true;
 		return;
 	}
 
+	if (view->cfg_sent && view->cfg_w == w && view->cfg_h == h) {
+		return; /* 尺寸没变：别让客户端白重画一帧（拖动时每步都会走到这儿） */
+	}
 	wlr_xdg_toplevel_set_size(view->xdg_toplevel, w, h);
+	view->cfg_w = w;
+	view->cfg_h = h;
+	view->cfg_sent = true;
 }
 
 void vidow_view_set_tiled(struct vidow_view *view, bool tiled) {
@@ -381,12 +397,18 @@ void vidow_view_set_tiled(struct vidow_view *view, bool tiled) {
 	if (!vidow_view_configure_ready(view)) {
 		return;
 	}
-	if (tiled) {
-		wlr_xdg_toplevel_set_tiled(view->xdg_toplevel,
-			WLR_EDGE_TOP | WLR_EDGE_BOTTOM | WLR_EDGE_LEFT | WLR_EDGE_RIGHT);
-	} else {
-		wlr_xdg_toplevel_set_tiled(view->xdg_toplevel, 0);
+	int edges = tiled ?
+		(WLR_EDGE_TOP | WLR_EDGE_BOTTOM | WLR_EDGE_LEFT | WLR_EDGE_RIGHT) : 0;
+	/* 状态没变就别再排一个 configure：place_view 每次都会调到这儿，而拖动时每动
+	 * 一下都会 arrange 一次 —— 不去重的话客户端每步都收到一个 configure、重画一
+	 * 帧、交一帧（实测：拖 200 步 = 每个窗口 200 次 configure + 200 次 commit），
+	 * 于是「世界」每帧都在变，所有私有底衬跟着每帧重抓。 */
+	if (view->cfg_tiled_sent && view->cfg_tiled == edges) {
+		return;
 	}
+	wlr_xdg_toplevel_set_tiled(view->xdg_toplevel, edges);
+	view->cfg_tiled = edges;
+	view->cfg_tiled_sent = true;
 }
 
 void vidow_view_set_activated(struct vidow_view *view, bool activated) {
@@ -1066,7 +1088,7 @@ static void view_move_update(void *data, double t, double linear) {
 	struct vidow_view *view = data;
 	view->anim_off_x = view->anim_from_x * (1.0 - t);
 	view->anim_off_y = view->anim_from_y * (1.0 - t);
-	vidow_backdrop_damage(view->server, false);
+	vidow_backdrop_damage_view(view); /* 只有它自己在动 */
 	vidow_view_apply_anim(view);
 }
 
@@ -1101,7 +1123,7 @@ static void view_open_update(void *data, double t, double linear) {
 	view->anim_scale = cfg->open_scale_from +
 		(1.0 - cfg->open_scale_from) * t;
 	view->fx.progress = t;
-	vidow_backdrop_damage(view->server, false);
+	vidow_backdrop_damage_view(view); /* 只有它自己在动 */
 	vidow_view_apply_anim(view);
 }
 
@@ -1250,6 +1272,12 @@ void vidow_place_view(struct vidow_view *view, int x, int y, int w, int h) {
 	int drawn_y = view->geom.y + (int)lround(view->anim_off_y);
 
 	view->geom = (struct wlr_box){ .x = x, .y = y, .width = w, .height = h };
+	/* 布局真的把它挪/缩了（或者第一次摆）：这一笔记在**它自己**头上。它自己的
+	 * 私有底衬（抓的时候它藏着）不受影响；别的窗口因为世界代次前进而重抓 ——
+	 * 拖动时每动一下就重摆一次，分账全靠这里（见 vidow_arrange）。 */
+	if (moved || resized || !view->placed) {
+		vidow_backdrop_damage_view(view);
+	}
 	wlr_log(WLR_DEBUG, "place %s -> %d,%d %dx%d",
 		vidow_view_title(view) != NULL ? vidow_view_title(view) : "?",
 		x, y, w, h);
@@ -1459,14 +1487,26 @@ static void output_arrange(struct vidow_server *server,
 
 	if (fullscreen != NULL) {
 		vidow_place_view(fullscreen, work.x, work.y, work.width, work.height);
+		/* 压在别人上面 / 从别人上面挪开：底衬的合成结果变了，账记在它头上。 */
+		vidow_backdrop_damage_view(fullscreen);
 		wlr_scene_node_raise_to_top(&fullscreen->scene_tree->node);
 	}
 }
 
 void vidow_arrange(struct vidow_server *server) {
 	struct vidow_output *output;
-	/* Moving windows changes what is behind every other window. */
-	vidow_backdrop_damage(server, false);
+	/* Moving windows changes what is behind every other window.
+	 *
+	 * 但拖动的时候每动一下都会重摆一次（被拖的那个窗口的 geom 跟着光标走）：
+	 * 这种「只有它自己在动」的重摆，每一笔都已经由 place_view / 可见性翻转 /
+	 * 置顶那几处记在**它自己头上**了（vidow_backdrop_damage_view）——它自己的
+	 * 私有底衬抓的时候把它藏起来了，不受影响。这里要是照样把整个世界代次推一
+	 * 遍，拖一个重叠的窗口时它自己的底衬每帧都会被判过期，白重抓一遍（基准实测
+	 * 每帧 2 次重抓里的一次）。
+	 *
+	 * 「是不是只有它」：这一趟里只要有任何一个**不是正被拖的那个**窗口报了自己
+	 * 变了，标志就被清掉，退回「世界变了」—— 宁可多抓一次，不能糊着旧的。 */
+	server->arrange_self_only = server->grab_view != NULL;
 	wl_list_for_each(output, &server->outputs, link) {
 		output_arrange(server, output);
 	}
@@ -1478,6 +1518,11 @@ void vidow_arrange(struct vidow_server *server) {
 	 * 立刻从场景里摘掉，不然它的坐标落进隔壁屏的框里，就画到隔壁显示器上了
 	 * （见 vidow_view_in_output_box）。 */
 	vidow_workspace_apply_visibility(server);
+
+	if (!server->arrange_self_only) {
+		vidow_backdrop_damage(server, false);
+	}
+	server->arrange_self_only = false;
 }
 
 /* ------------------------------------------------------------- 热插拔 */
@@ -2350,7 +2395,7 @@ static void view_map(struct wl_listener *listener, void *data) {
 			vidow_workspace_view_visible(server, view->parent)) :
 		vidow_workspace_view_visible(server, view);
 	wlr_scene_node_set_enabled(&view->scene_tree->node, show);
-	vidow_backdrop_damage(server, false);
+	vidow_backdrop_damage_view(view);
 
 	struct wlr_box geo = vidow_view_geometry(view);
 	struct wlr_surface *surface = vidow_view_surface(view);
@@ -2425,7 +2470,7 @@ static void view_unmap(struct wl_listener *listener, void *data) {
 	}
 	view_snapshot_close(view);
 	wlr_scene_node_set_enabled(&view->scene_tree->node, false);
-	vidow_backdrop_damage(server, false);
+	vidow_backdrop_damage_view(view);
 
 	if (server->grab_view == view) {
 		vidow_float_end_grab(server);
@@ -2488,8 +2533,9 @@ static void view_commit(struct wl_listener *listener, void *data) {
 	}
 
 	/* New pixels: everything that samples this window as a backdrop (a
-	 * floating window on top of it) has to be re-blurred. */
-	vidow_backdrop_damage(view->server, false);
+	 * floating window on top of it) has to be re-blurred. 它自己那张私有底衬
+	 * 不受影响（抓的时候它是藏着的），所以这笔账记在它头上。 */
+	vidow_backdrop_damage_view(view);
 
 	if (view->kind == VIDOW_VIEW_X11) {
 		/* X11：缓冲区的缩放比例要跟着 xwayland_scale 走（尺寸变了就重算），
@@ -2538,6 +2584,9 @@ static void view_commit(struct wl_listener *listener, void *data) {
 			 * 定成 FOLLOW 了，到这里 vidow_float_update_mode() 是空操作，
 			 * 没人发 configure 客户端就一直等。 */
 			wlr_xdg_toplevel_set_size(view->xdg_toplevel, 0, 0);
+			view->cfg_w = 0;
+			view->cfg_h = 0;
+			view->cfg_sent = true;
 		}
 		view->configured = true;
 		return;

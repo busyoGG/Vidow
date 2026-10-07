@@ -782,6 +782,9 @@ int vidow_workspace_apply_visibility(struct vidow_server *server) {
 			shown++;
 		}
 		if (node_enabled(view->scene_tree) != want) {
+			/* 它自己进/出场景了：底衬的合成结果变了。账记在它头上（它自己的
+			 * 私有底衬不受影响），别的窗口因为世界代次前进而重抓。 */
+			vidow_backdrop_damage_view(view);
 			wlr_log(WLR_DEBUG, "workspace: %s %s（%s）",
 				vidow_view_title(view) != NULL ?
 					vidow_view_title(view) : "(无题)",

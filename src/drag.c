@@ -96,7 +96,9 @@ void vidow_tile_grab_update(struct vidow_server *server, double lx, double ly) {
 	/* 只改「画在哪」：布局（geom）一个字都不动，所以别的窗口不会跟着抖。 */
 	view->anim_off_x = (lx - view->drag_dx) - view->geom.x;
 	view->anim_off_y = (ly - view->drag_dy) - view->geom.y;
-	vidow_backdrop_damage(server, false);
+	/* 只有这个窗口自己动了：记在它头上，它自己的私有底衬（抓的时候它藏着）
+	 * 不该因为这一笔就过期。 */
+	vidow_backdrop_damage_view(view);
 	vidow_view_apply_anim(view);
 }
 
