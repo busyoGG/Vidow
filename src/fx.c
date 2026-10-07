@@ -2238,6 +2238,9 @@ void vidow_blur_update(struct vidow_output *output) {
 		h > 0 && w <= MAX_TARGET_PX && h <= MAX_TARGET_PX;
 	if (!usable) {
 		wl_list_for_each(view, &server->views, link) {
+			if (view->output != output->wlr_output) {
+				continue; /* 别的屏上的窗口归那一趟收 */
+			}
 			blur_target_release(&view->fx);
 		}
 		struct vidow_layer_surface *off;
@@ -2286,6 +2289,18 @@ void vidow_blur_update(struct vidow_output *output) {
 	}
 
 	wl_list_for_each(view, &server->views, link) {
+		/* 私有底衬是「**这块屏**上的这一块区域」，别的屏上的窗口不归这一趟管。
+		 *
+		 * 少了这一句，两块屏会轮流给同一个窗口建金字塔：每块屏都按自己的
+		 * scale / 尺寸算区域（1 倍屏把 280x380 的窗口算成 640x768，2 倍屏算成
+		 * 896x1152），而金字塔是挂在窗口身上的（view->fx.blur_set），于是两趟
+		 * 每帧互相把对方的缓冲丢掉重建 —— 一次十几块 GBM 缓冲（最大那块
+		 * 2304x2560 = 23 MB），拖窗口时每秒几千次分配，屏幕上一顿一顿的。
+		 * 顺带也修了「区域和贴图归哪块屏」：以前最后写进 fx 的是哪一趟算的
+		 * 就归谁，跨屏的窗口可能采到另一块屏的底衬。 */
+		if (view->output != output->wlr_output) {
+			continue;
+		}
 		if (!view_wants_blur(view) || view->fx.node == NULL) {
 			if (view->fx.blur_own_tex != NULL) {
 				blur_own_drop(&view->fx);

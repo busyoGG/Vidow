@@ -1363,6 +1363,23 @@ void vidow_place_view(struct vidow_view *view, int x, int y, int w, int h) {
 		return;
 	}
 
+	/* 浮动窗口正被鼠标拖着：位置 1:1 跟光标，别起补间。
+	 *
+	 * 指针每动一下就走到这儿（grab 改 float_geom → arrange → place），补间于是被
+	 * 每帧重起一次：弹性缓动在 t≈0 那一段几乎不动，窗口**一直落在光标后面**
+	 * （用户那份 dbg 日志里量出来的：拖 273px/s 时中位滞后 199px、最大 387px，
+	 * 起拖的头 125ms 窗口干脆没动）。平铺窗口的拖拽（drag.c）本来就是「只动场景
+	 * 节点、布局一行都不重排」，浮动窗口没理由不跟手。 */
+	if (view->server->grab_view == view &&
+			view->server->grab_mode == VIDOW_GRAB_MOVE) {
+		vidow_anim_cancel(view->anim_move);
+		view->anim_move = NULL;
+		view->anim_off_x = 0.0;
+		view->anim_off_y = 0.0;
+		vidow_view_apply_anim(view);
+		return;
+	}
+
 	if (!view->placed) {
 		view->placed = true;
 		view->anim_off_x = 0.0;
