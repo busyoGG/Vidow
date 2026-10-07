@@ -23,10 +23,19 @@ def log(msg):
     print(f"popup: {msg}", flush=True)
 
 
-def popup_menu(win, menu):
+def popup_menu(win, menu, event=None):
     log("弹菜单（xdg_popup）")
     menu.show_all()
-    menu.popup_at_widget(win, Gdk.Gravity.SOUTH_WEST, Gdk.Gravity.NORTH_WEST, None)
+    # GTK 3.22 起 popup_at_* 要一个「触发事件」，传 None 会只留一句
+    # 「no trigger event for menu popup」然后把菜单吞掉（菜单根本不出）。
+    # 没有真事件（定时器那条路）就自己合成一个 BUTTON_PRESS。
+    if event is None:
+        event = Gdk.Event.new(Gdk.EventType.BUTTON_PRESS)
+        event.window = win.get_window()
+        event.x = 10.0
+        event.y = 10.0
+        event.button = 1
+    menu.popup_at_pointer(event)
 
 
 def main():
@@ -44,6 +53,9 @@ def main():
 
     button = Gtk.Button(label="点我弹菜单")
     button.connect("clicked", lambda *_: popup_menu(win, menu))
+    # 真事件那条路：窗口里按下就弹（trigger event 现成的）
+    win.connect("button-press-event",
+                lambda w, ev: (popup_menu(w, menu, ev), True)[1])
     box.pack_start(button, False, False, 0)
 
     win.connect("map-event", lambda *_: log("窗口上屏"))

@@ -3796,6 +3796,39 @@ void vidow_popup_unconstrain_on_commit(struct vidow_server *server,
 	wl_signal_add(&popup->base->surface->events.commit, &u->commit);
 }
 
+/* 弹出物的「commit 了什么」诊断（见 server_new_popup 里那段注释）。 */
+struct vidow_popup_trace {
+	struct wl_listener commit;
+	struct wl_listener destroy;
+	struct wlr_xdg_popup *popup;
+	struct wlr_scene_tree *tree;
+};
+
+static void popup_trace_commit(struct wl_listener *listener, void *data) {
+	(void)data;
+	struct vidow_popup_trace *t = wl_container_of(listener, t, commit);
+	struct wlr_surface *s = t->popup->base->surface;
+	int nx = 0, ny = 0;
+	bool enabled = t->tree != NULL && t->tree->node.enabled;
+	if (t->tree != NULL) {
+		wlr_scene_node_coords(&t->tree->node, &nx, &ny);
+	}
+	wlr_log(WLR_DEBUG, "popup: commit 缓冲 %dx%d 逻辑 %dx%d 节点%s 在 %d,%d"
+		"（表面 mapped=%d initialized=%d）",
+		s->current.buffer_width, s->current.buffer_height,
+		s->current.width, s->current.height,
+		enabled ? "开着" : "关着", nx, ny, s->mapped,
+		t->popup->base->initialized);
+}
+
+static void popup_trace_destroy(struct wl_listener *listener, void *data) {
+	(void)data;
+	struct vidow_popup_trace *t = wl_container_of(listener, t, destroy);
+	wl_list_remove(&t->commit.link);
+	wl_list_remove(&t->destroy.link);
+	free(t);
+}
+
 static void server_new_popup(struct wl_listener *listener, void *data) {
 	struct vidow_server *server = wl_container_of(listener, server, new_popup);
 	struct wlr_xdg_popup *popup = data;
@@ -3813,7 +3846,25 @@ static void server_new_popup(struct wl_listener *listener, void *data) {
 	struct wlr_scene_tree *parent = view != NULL ? view->scene_tree :
 		server->layer_toplevels;
 
-	wlr_scene_xdg_surface_create(parent, popup->base);
+	struct wlr_scene_tree *tree = wlr_scene_xdg_surface_create(parent,
+		popup->base);
+	/* 每个弹出物挂一条「它自己 commit 了什么」的日志（一行一条，弹出物本来
+	 * 就不常 commit）。「弹窗不显示」这类问题全卡在这一步上，光看场景树看不
+	 * 出是客户端没交帧还是我们没画：
+	 *   没有这一行           = 客户端在等 configure，压根没交缓冲
+	 *   有行但节点关着/在屏外 = 我们这边的问题（节点没使能 / 位置算错）
+	 *   有行、节点开着在屏内 = 画了但被别的节点压住（层级问题） */
+	if (tree != NULL) {
+		struct vidow_popup_trace *t = calloc(1, sizeof(*t));
+		if (t != NULL) {
+			t->popup = popup;
+			t->tree = tree;
+			t->commit.notify = popup_trace_commit;
+			wl_signal_add(&popup->base->surface->events.commit, &t->commit);
+			t->destroy.notify = popup_trace_destroy;
+			wl_signal_add(&popup->events.destroy, &t->destroy);
+		}
+	}
 
 	/* wlroots 0.20 不保证 popup->parent 非空（父面已经销毁、或者父面不是
 	 * xdg surface 时它就是 NULL），而 unconstrain 要沿 parent 链往上算
