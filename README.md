@@ -2375,6 +2375,26 @@ systemctl --user import-environment XDG_CURRENT_DESKTOP WAYLAND_DISPLAY XDG_RUNT
 systemctl --user restart xdg-desktop-portal
 ```
 
+在 tty 上排查「portal 现在指向谁」（换了会话 / 从别的桌面切过来之后最容易踩）：
+
+```bash
+./portaltest.sh           # 体检 + 发一个真的文件选择器请求（需要 vidow 在跑）
+./portaltest.sh --check   # 只体检，不动你的屏幕
+```
+
+它逐项报出：session bus 在不在、vidow 的 wayland socket 是哪个、systemd 用户管理器里的会话
+环境、**每个 portal 进程各自连着哪块屏**（不在当前这条总线上的不算）、生成的 portals.conf，
+最后起一个 GTK 客户端（`GTK_USE_PORTAL=1`）真的弹一次文件选择器，验证对话框画在 vidow 上、
+挂在发起窗口上（xdg-foreign）、拿到了键盘焦点（xdg-activation）。
+
+最常见的一种 FAIL：从别的桌面（Hyprland / niri）切到 tty 上的 vidow 之后，**portal 后端进程
+还活着、还连着旧合成器**（它们是被 dbus 激活起来的常驻进程，`restart` 前端不会重启它们），
+于是对话框画到另一个会话里。收掉它们即可（下次用到时 dbus 会按新环境重新拉起）：
+
+```bash
+pkill -f xdg-desktop-portal-gtk; pkill -f xdg-desktop-portal-kde; pkill -f xdg-desktop-portal-hyprland
+```
+
 也正因为 vidow 会设 `XDG_CURRENT_DESKTOP=Vidow`，配置里 `vidow.exec` 启动的客户端
 看到的就是 `Vidow`（实测子进程 `env` 里是 `XDG_CURRENT_DESKTOP=Vidow`）。
 
@@ -3587,31 +3607,31 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
      HEADLESS-1、写明「客户端还在交帧，屏幕却不更新」；③掐断帧链 + 追踪**关**：一条 trace
      日志都没有、vidow 照样活着（诊断不改变行为）。
 
-159. **「用标题栏拖一次之后窗口就不听使唤」：客户端那次「按下」永远等不到「松开」**。
+161. **在 tty 上怎么知道 portal 指向谁：`./portaltest.sh`**。
 
-     用户报「微信登录界面用 win 加左键拖拽是正常的，**直接通过标题区域拖拽**就会出问题」。
-     两条路只差一处：Mod+左键那条**按下是合成器吃掉的**，客户端压根没见过；标题栏拖拽是
-     **客户端自己发起**的（CSD 标题栏 → `xdg_toplevel.move`；X11 是 `_NET_WM_MOVERESIZE` →
-     `request_move`），它的按下在 `vidow_pointer_button` 末尾已经 `notify_button(PRESSED)`
-     转给客户端了。
+     用户问「我能否在 tty3 测试 portal」。能 —— portal 走的是**每个用户一条** session bus
+     （`/run/user/$UID/bus`），跟你在哪个 tty 无关；坑在「它现在指向谁」：xdg-desktop-portal
+     的前端和后端都是 **dbus 激活起来的常驻进程**，环境来自 systemd 用户管理器，跟你在哪个
+     tty 起 vidow 没关系。从别的桌面切到 tty 上的 vidow 之后，那些后端还连着旧合成器 ——
+     对话框会画到另一个会话里。实测你这台机器上的状态就是这样：4 个 portal 进程
+     （前端 + gtk/kde/hyprland 三个后端）全指向 `wayland-1`，用户管理器里
+     `XDG_CURRENT_DESKTOP=Hyprland`。
 
-     而松手那条分支（`if (!pressed) { *_end_grab(); return; }`）把松开一起吃掉 —— 客户端手里
-     那次按下永远等不到配对的松开。GTK 的 `in_move_drag`、Chromium 的鼠标键状态都靠松开复位，
-     于是它**一直以为左键按着**：鼠标一动它还在拖，之后第一下点击被当成「按下」而不是
-     「点一下」，得再点一次才能恢复（用户描述的「点一下界面、移出去再移回来再点一次」正是这个）。
+     新增 `./portaltest.sh`（体检 + 真请求）和 `tools/portalprobe.py`（GTK3 探针，
+     `GTK_USE_PORTAL=1` 弹 `Gtk.FileChooserNative`）。体检六项：session bus 在不在、vidow 的
+     wayland socket 是哪个（从 `$XDG_RUNTIME_DIR/vidow-wayland-*.sock` 找，不依赖 shell 的
+     `WAYLAND_DISPLAY`）、systemd 用户管理器里的会话环境、**每个 portal 进程各自连着哪块屏**
+     （只算当前这条总线上的，机器上别的会话不算）、生成的 `vidow-portals.conf`，最后发一次
+     真请求：对话框画在 vidow 上、挂在发起窗口上（xdg-foreign）、拿到键盘焦点（xdg-activation）。
 
-     改法：`server->grab_client_press` —— `vidow_float_begin_grab()` 多一个 `from_client`
-     参数，客户端发起的那四条路（xdg 的 request_move/request_resize、x11 的
-     request_move/request_resize）传 true，Mod+拖拽和平铺拖拽传 false；松手时把这次按下
-     **还**给客户端，顺序放在补位置那次 motion **之后**（motion 先把焦点和局部坐标刷成当前值，
-     松开才落在对的位置上）。两边对称：客户端没见过的按下，松手也不转给它。
+     写这个探针时踩的两件事（都不是 vidow 的问题，但会让人误判）：①原生（走 portal）对话框的
+     `hide()` 里有一句 `assert(data != NULL)`，请求没建起来时收尾直接 abort（GTK 3 的
+     `gtkfilechoosernativeportal.c:532`）—— 探针改成 `os._exit()` 绕开析构；②`send-key` 要两个
+     参数（`send-key tap Escape`），只给一个的话那一个会被当成 `state`，命令静默失败。
 
-     新增 `./test-titlebar-drag.sh`（12 项）：探针是 tools/movedrag.py（GTK3，自己定尺寸
-     320x240 → vidow 直接当浮窗，顶部 30px 当自定义标题栏，按在那里就 `begin_move_drag`）。
-     判据：按下真的到了客户端、客户端发了 move 请求、合成器起了 grab、拖拽 1:1 跟手、
-     **松手后客户端收到松开**、落点没跑、松手后移出去再移回来收得到位置；再加一条反向对照：
-     Mod+左键那条路客户端**既没收到按下也没收到松开**（状态对称）、照样跟手。回退
-     `src/input.c` 那一句跑同一条：只有「收到松开」这条红（其余 11 条全绿）✓。
+     验证：私有 dbus 会话 + headless vidow 里跑一遍全绿（会话总线 / vidow socket / portals.conf /
+     对话框出现在 vidow 上 / 挂在探针窗口上 / 拿到焦点，共 6 条 PASS）；真机上跑 `--check`
+     如实报出「4/4 个 portal 进程还连着别的合成器」并给出收掉它们的命令。
 
 160. **合成器自己造的指针事件没有「帧尾」：客户端把事件扣在缓冲里，等到下一个事件才处理**。
 
@@ -3638,6 +3658,32 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
      断言红、拖拽只跟到 360,224 ✓。
 
 ./test-titlebar-drag.sh              # 客户端发起的拖拽（CSD 标题栏）松手要还给它（12 项断言）
+159. **「用标题栏拖一次之后窗口就不听使唤」：客户端那次「按下」永远等不到「松开」**。
+
+     用户报「微信登录界面用 win 加左键拖拽是正常的，**直接通过标题区域拖拽**就会出问题」。
+     两条路只差一处：Mod+左键那条**按下是合成器吃掉的**，客户端压根没见过；标题栏拖拽是
+     **客户端自己发起**的（CSD 标题栏 → `xdg_toplevel.move`；X11 是 `_NET_WM_MOVERESIZE` →
+     `request_move`），它的按下在 `vidow_pointer_button` 末尾已经 `notify_button(PRESSED)`
+     转给客户端了。
+
+     而松手那条分支（`if (!pressed) { *_end_grab(); return; }`）把松开一起吃掉 —— 客户端手里
+     那次按下永远等不到配对的松开。GTK 的 `in_move_drag`、Chromium 的鼠标键状态都靠松开复位，
+     于是它**一直以为左键按着**：鼠标一动它还在拖，之后第一下点击被当成「按下」而不是
+     「点一下」，得再点一次才能恢复（用户描述的「点一下界面、移出去再移回来再点一次」正是这个）。
+
+     改法：`server->grab_client_press` —— `vidow_float_begin_grab()` 多一个 `from_client`
+     参数，客户端发起的那四条路（xdg 的 request_move/request_resize、x11 的
+     request_move/request_resize）传 true，Mod+拖拽和平铺拖拽传 false；松手时把这次按下
+     **还**给客户端，顺序放在补位置那次 motion **之后**（motion 先把焦点和局部坐标刷成当前值，
+     松开才落在对的位置上）。两边对称：客户端没见过的按下，松手也不转给它。
+
+     新增 `./test-titlebar-drag.sh`（12 项）：探针是 tools/movedrag.py（GTK3，自己定尺寸
+     320x240 → vidow 直接当浮窗，顶部 30px 当自定义标题栏，按在那里就 `begin_move_drag`）。
+     判据：按下真的到了客户端、客户端发了 move 请求、合成器起了 grab、拖拽 1:1 跟手、
+     **松手后客户端收到松开**、落点没跑、松手后移出去再移回来收得到位置；再加一条反向对照：
+     Mod+左键那条路客户端**既没收到按下也没收到松开**（状态对称）、照样跟手。回退
+     `src/input.c` 那一句跑同一条：只有「收到松开」这条红（其余 11 条全绿）✓。
+
 158. **微信弹窗不显示的真凶：unconstrain 的盒子给的是「布局坐标」，而 wlroots 要的是「表面局部坐标」**。
 
      157 把定位做到了「弹出物交了帧、节点开着」，用户那份日志里弹出物的场景节点坐标是
