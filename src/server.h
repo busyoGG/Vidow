@@ -289,6 +289,8 @@ struct vidow_shader {
 struct vidow_gl_prog {
 	unsigned int program;
 	int u_tex, u_texel, u_offset;
+	/* kawase 专用：只画目标里的一块（u_rect，目标像素）时的目标尺寸/矩形。 */
+	int u_rect, u_dst;
 };
 
 /* 任意四边形网格（jelly.c 的果冻形变用）：顶点直接给「渲染目标物理像素坐标 +

@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
@@ -111,6 +112,21 @@ static const char *vertex_src =
 	"void main() {\n"
 	"	v_uv = vec2(a_pos.x, u_flip_y > 0.5 ? 1.0 - a_pos.y : a_pos.y);\n"
 	"	gl_Position = vec4(a_pos.x * 2.0 - 1.0, a_pos.y * 2.0 - 1.0, 0.0, 1.0);\n"
+	"}\n";
+
+/* kawase 那两趟专用：顶点不但能盖住整块目标，还能只盖住目标里的一块（u_rect，
+ * 目标像素）。整块跑的时候 u_rect = (0,0,w,h)，跟上面那个顶点着色器**逐像素等价**
+ * —— 两条路共用同一份采样代码，「只重跑受损那一小块」（见 blur_chain_rect）才
+ * 不用另写一套片元逻辑，也就不会出现「整块和局部算出来不一样」。 */
+static const char *kawase_vertex_src =
+	"attribute vec2 a_pos;\n"
+	"varying vec2 v_uv;\n"
+	"uniform vec4 u_rect;\n" /* 目标像素：x, y, w, h */
+	"uniform vec2 u_dst;\n"  /* 目标尺寸 */
+	"void main() {\n"
+	"	vec2 p = u_rect.xy + a_pos * u_rect.zw;\n"
+	"	v_uv = p / u_dst;\n"
+	"	gl_Position = vec4(p / u_dst * 2.0 - 1.0, 0.0, 1.0);\n"
 	"}\n";
 
 /* Uniform set handed to user animation shaders. */
@@ -424,13 +440,16 @@ static void load_kawase_programs(struct vidow_server *server) {
 	for (size_t i = 0; i < 2; i++) {
 		snprintf(buf, sizeof(buf), "%s%s", kawase_prefix, pass[i].body);
 		unsigned int prog = 0;
-		if (!link_program(&prog, buf, pass[i].name)) {
+		/* 顶点着色器用 kawase 专用的那个（多两个 uniform，能只盖目标里的一块） */
+		if (!link_program_full(&prog, kawase_vertex_src, buf, pass[i].name)) {
 			continue;
 		}
 		pass[i].prog->program = prog;
 		pass[i].prog->u_tex = glGetUniformLocation(prog, "u_tex");
 		pass[i].prog->u_texel = glGetUniformLocation(prog, "u_texel");
 		pass[i].prog->u_offset = glGetUniformLocation(prog, "u_offset");
+		pass[i].prog->u_rect = glGetUniformLocation(prog, "u_rect");
+		pass[i].prog->u_dst = glGetUniformLocation(prog, "u_dst");
 	}
 }
 
@@ -674,8 +693,12 @@ static struct wlr_buffer *pick_free(struct wlr_buffer *bufs[2]) {
 
 /* ------------------------------------------------------------ gl helpers */
 
-static GLuint begin_pass(struct vidow_server *server, struct wlr_buffer *dst,
-		int w, int h, struct wlr_egl **egl) {
+/* 开始往 dst 里画。rect == NULL：整块清成透明；rect != NULL：**不清** —— 那一趟画
+ * 的四边形正好盖满 rect（片元每个像素都写、混合关着），清是多余的；而 rect 外面的
+ * 像素正是要保住的（「只重跑受损那一小块」的底子：缓冲是复用的，没被碰过的地方还是
+ * 上一版的内容）。 */
+static GLuint begin_pass_rect(struct vidow_server *server, struct wlr_buffer *dst,
+		int w, int h, const struct wlr_box *rect, struct wlr_egl **egl) {
 	GLuint fbo = wlr_gles2_renderer_get_buffer_fbo(server->renderer, dst);
 	if (fbo == 0) {
 		wlr_log(WLR_ERROR, "fx: no FBO for a render target");
@@ -687,10 +710,18 @@ static GLuint begin_pass(struct vidow_server *server, struct wlr_buffer *dst,
 	glBindFramebuffer(GL_FRAMEBUFFER, fbo);
 	glViewport(0, 0, w, h);
 	glDisable(GL_BLEND);
-	glDisable(GL_SCISSOR_TEST);
 	glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
-	glClear(GL_COLOR_BUFFER_BIT);
+	glDisable(GL_SCISSOR_TEST);
+	if (rect == NULL) {
+		glClear(GL_COLOR_BUFFER_BIT);
+	}
 	return fbo;
+}
+
+/* 整块清：绝大多数调用点要的就是这个（新缓冲 / 形状变了 / 整块重跑）。 */
+static GLuint begin_pass(struct vidow_server *server, struct wlr_buffer *dst,
+		int w, int h, struct wlr_egl **egl) {
+	return begin_pass_rect(server, dst, w, h, NULL, egl);
 }
 
 static void end_pass(struct wlr_egl *egl) {
@@ -1175,8 +1206,10 @@ static bool blur_set_alloc(struct vidow_server *server,
 	 * （另一个窗口在它的底衬里动），而 vidow_alloc_target() 走的是
 	 * wlr_allocator_create_buffer() —— 真后端上每次都是内核层的 GBM 分配。
 	 * 每帧重新分十来块，光分配就够卡了（用户报的「有背景时拖拽卡顿」）。
-	 * 链条每一趟都会把每块缓冲整个写一遍（begin_pass 先 clear），复用安全；
-	 * 调用方重画之前已经放掉了攥着 up[0] 的那张贴图。 */
+	 * 复用是安全的：整块重跑时每一趟都会把每块缓冲整个写一遍（begin_pass 先
+	 * clear），局部重跑（blur_chain_rect）时**故意**不动那一块以外的像素 ——
+	 * 那正是「其余从上一版拷过来」的省法。调用方重画之前已经放掉了攥着 up[0]
+	 * 的那张贴图。 */
 	if (set->w == w && set->h == h && set->levels == levels &&
 			set->down[0] != NULL) {
 		set->offset = server->config.blur_offset;
@@ -1219,14 +1252,17 @@ static bool blur_set_alloc(struct vidow_server *server,
 	return true;
 }
 
-static void kawase_pass(struct vidow_server *server,
+/* 一趟 kawase。rect == NULL：整块目标都画（u_rect = 整个目标）；rect != NULL：
+ * 只画目标里这一块（别处的像素一个都不碰，见 blur_chain_rect）。 */
+static void kawase_pass_rect(struct vidow_server *server,
 		struct vidow_gl_prog *prog, struct wlr_buffer *dst, int dst_w, int dst_h,
-		struct wlr_texture *src, int src_w, int src_h) {
+		struct wlr_texture *src, int src_w, int src_h,
+		const struct wlr_box *rect) {
 	if (prog->program == 0 || src == NULL) {
 		return;
 	}
 	struct wlr_egl *egl = NULL;
-	if (begin_pass(server, dst, dst_w, dst_h, &egl) == 0) {
+	if (begin_pass_rect(server, dst, dst_w, dst_h, rect, &egl) == 0) {
 		return;
 	}
 	struct wlr_gles2_texture_attribs sa;
@@ -1237,27 +1273,87 @@ static void kawase_pass(struct vidow_server *server,
 	glUniform1i(prog->u_tex, 0);
 	glUniform2f(prog->u_texel, 1.0f / (float)src_w, 1.0f / (float)src_h);
 	glUniform1f(prog->u_offset, (float)server->config.blur_offset);
+	glUniform2f(prog->u_dst, (float)dst_w, (float)dst_h);
+	if (rect != NULL) {
+		glUniform4f(prog->u_rect, (float)rect->x, (float)rect->y,
+			(float)rect->width, (float)rect->height);
+	} else {
+		glUniform4f(prog->u_rect, 0.0f, 0.0f, (float)dst_w, (float)dst_h);
+	}
 	draw_quad(prog->program);
 	glUseProgram(0);
 	end_pass(egl);
 }
 
-static void blur_chain(struct vidow_server *server, struct vidow_blur_set *set,
-		struct wlr_texture *backdrop_tex, int w, int h) {
+/* 把 src 坐标系里的矩形换算到 dst 坐标系（尺寸比就是缩放比，这里是 2 或 1/2），
+ * 往外取整、再放 margin 一圈、夹进目标里。往外取整和 margin 都是「宁可多算一点，
+ * 不能少算」：少算一像素就是新旧模糊值之间一道缝。 */
+static struct wlr_box kawase_rect_scale(const struct wlr_box *r,
+		int sw, int sh, int dw, int dh, int margin) {
+	if (sw <= 0 || sh <= 0) {
+		return (struct wlr_box){0};
+	}
+	double fx = (double)dw / (double)sw;
+	double fy = (double)dh / (double)sh;
+	int x1 = (int)floor((double)r->x * fx) - margin;
+	int y1 = (int)floor((double)r->y * fy) - margin;
+	int x2 = (int)ceil((double)(r->x + r->width) * fx) + margin;
+	int y2 = (int)ceil((double)(r->y + r->height) * fy) + margin;
+	if (x1 < 0) {
+		x1 = 0;
+	}
+	if (y1 < 0) {
+		y1 = 0;
+	}
+	if (x2 > dw) {
+		x2 = dw;
+	}
+	if (y2 > dh) {
+		y2 = dh;
+	}
+	if (x2 <= x1 || y2 <= y1) {
+		return (struct wlr_box){0};
+	}
+	return (struct wlr_box){
+		.x = x1, .y = y1, .width = x2 - x1, .height = y2 - y1,
+	};
+}
+
+/* 跑一遍链条。rect == NULL：整块（老行为）。rect != NULL：只有这块区域里的
+ * **像素内容变了**，别处保持上一版 —— 每一级只重画「上一级变了的那一块缩一半再
+ * 放一圈」的矩形，其余像素不动。
+ *
+ * margin 用的是整条链的采样半径按级别折算（blur_reach_px >> (i+1)）+ 4：真实需要
+ * 的半径小得多（u_offset 个源 texel，1.5 个像素级），这是**够用且宽松**的上界 ——
+ * 局部重跑绝不能因为margin 算少了而在新旧模糊值之间留一道缝。 */
+static void blur_chain_rect(struct vidow_server *server,
+		struct vidow_blur_set *set, struct wlr_texture *backdrop_tex,
+		int w, int h, const struct wlr_box *rect, int reach) {
 	int levels = set->levels;
 	if (levels < 2 || backdrop_tex == NULL) {
 		return;
 	}
 	vidow_stats.chains++;
+	struct wlr_box r = rect != NULL ? *rect : (struct wlr_box){0};
 	struct wlr_texture *tex = backdrop_tex;
 	for (int i = 0; i < levels; i++) {
 		int sw = i == 0 ? w : (w >> i), sh = i == 0 ? h : (h >> i);
-		kawase_pass(server, &server->kawase_down, set->down[i], w >> (i + 1),
-			h >> (i + 1), tex, sw, sh);
+		int dw = w >> (i + 1), dh = h >> (i + 1);
+		struct wlr_box dst_rect = {0};
+		if (rect != NULL) {
+			dst_rect = kawase_rect_scale(&r, sw, sh, dw, dh,
+				(reach >> (i + 1)) + 4);
+			if (dst_rect.width <= 0 || dst_rect.height <= 0) {
+				return; /* 越缩越小：下面几级也没东西可算 */
+			}
+		}
+		kawase_pass_rect(server, &server->kawase_down, set->down[i], dw, dh,
+			tex, sw, sh, rect != NULL ? &dst_rect : NULL);
 		/* 这一趟的结果就是下一趟的源：贴图是常驻的（见 vidow_blur_set），
 		 * 直接换指针 —— 以前这里每趟导入一张、用完销毁，真后端上每帧十几二十次
 		 * EGLImage + BO 映射，拖重叠窗口时的卡顿就是这个。 */
 		tex = set->down_tex[i];
+		r = dst_rect;
 	}
 
 	/* 往上走：每一级只把上一级的结果放大一圈（niri 的 blur_up）。目标必须比源大一
@@ -1265,11 +1361,26 @@ static void blur_chain(struct vidow_server *server, struct vidow_blur_set *set,
 	 * 写 up[0]（半分辨率、给装饰着色器采样的那张）也不例外。 */
 	struct wlr_texture *lower = set->down_tex[levels - 1];
 	for (int i = levels - 2; i >= 0; i--) {
-		kawase_pass(server, &server->kawase_up,
-			set->up[i], w >> (i + 1), h >> (i + 1), lower,
-			w >> (i + 2), h >> (i + 2));
+		int dw = w >> (i + 1), dh = h >> (i + 1);
+		int sw = w >> (i + 2), sh = h >> (i + 2);
+		struct wlr_box dst_rect = {0};
+		if (rect != NULL) {
+			dst_rect = kawase_rect_scale(&r, sw, sh, dw, dh,
+				(reach >> (i + 1)) + 4);
+			if (dst_rect.width <= 0 || dst_rect.height <= 0) {
+				return;
+			}
+		}
+		kawase_pass_rect(server, &server->kawase_up, set->up[i], dw, dh,
+			lower, sw, sh, rect != NULL ? &dst_rect : NULL);
 		lower = set->up_tex[i];
+		r = dst_rect;
 	}
+}
+
+static void blur_chain(struct vidow_server *server, struct vidow_blur_set *set,
+		struct wlr_texture *backdrop_tex, int w, int h) {
+	blur_chain_rect(server, set, backdrop_tex, w, h, NULL, 0);
 }
 
 /* Render the layer trees below the toplevels into the backdrop buffer. Doing
@@ -1288,6 +1399,19 @@ struct backdrop_ctx {
 	 * layer 背后那一小块时，落在外面的 buffer 连贴图都不用建。 */
 	int clip_x, clip_y, clip_w, clip_h;
 };
+
+/* 局部更新要求「只画一块」这件事对每个要抓的 buffer 都成立：转过的客户端缓冲
+ * （wl_surface.set_buffer_transform）得把 dst 子矩形映射回转置过的 src 框，不值得
+ * 为它写一套。碰到就整块重跑。 */
+static void backdrop_clip_check(struct wlr_scene_buffer *sb, int sx, int sy,
+		void *data) {
+	(void)sx;
+	(void)sy;
+	bool *ok = data;
+	if (sb->buffer != NULL && sb->transform != WL_OUTPUT_TRANSFORM_NORMAL) {
+		*ok = false;
+	}
+}
 
 static void backdrop_iter(struct wlr_scene_buffer *sb, int sx, int sy,
 		void *data) {
@@ -1343,6 +1467,37 @@ static void backdrop_iter(struct wlr_scene_buffer *sb, int sx, int sy,
 	if (sbox.width <= 0.0 || sbox.height <= 0.0) {
 		sbox = (struct wlr_fbox){0, 0, (double)sb->buffer->width,
 			(double)sb->buffer->height};
+	}
+	/* 只画 clip 里那一块。局部更新（clip = 受损那一小块）时必须真的夹住：底衬
+	 * 缓冲里 clip 外面是上一版的内容、没清过，整块重画一遍压在它上面，半透明的
+	 * 东西（窗口自己的阴影、薄纱窗口）就会被叠第二次 —— 屏幕上就是「局部更新之后
+	 * 那一圈变深了」。夹 dst 框就得按同样的比例夹 src 框，不然画面会跟着缩。 */
+	if (ctx->clip_w > 0 &&
+			(x1 < ctx->clip_x || y1 < ctx->clip_y ||
+			 x2 > ctx->clip_x + ctx->clip_w ||
+			 y2 > ctx->clip_y + ctx->clip_h)) {
+		int cx1 = x1 > ctx->clip_x ? x1 : ctx->clip_x;
+		int cy1 = y1 > ctx->clip_y ? y1 : ctx->clip_y;
+		int cx2 = x2 < ctx->clip_x + ctx->clip_w ? x2 : ctx->clip_x + ctx->clip_w;
+		int cy2 = y2 < ctx->clip_y + ctx->clip_h ? y2 : ctx->clip_y + ctx->clip_h;
+		if (cx2 <= cx1 || cy2 <= cy1) {
+			if (tex_owned) {
+				wlr_texture_destroy(tex);
+			}
+			return;
+		}
+		double fx1 = (double)(cx1 - x1) / (double)(x2 - x1);
+		double fx2 = (double)(cx2 - x1) / (double)(x2 - x1);
+		double fy1 = (double)(cy1 - y1) / (double)(y2 - y1);
+		double fy2 = (double)(cy2 - y1) / (double)(y2 - y1);
+		sbox.x += fx1 * sbox.width;
+		sbox.y += fy1 * sbox.height;
+		sbox.width *= fx2 - fx1;
+		sbox.height *= fy2 - fy1;
+		x1 = cx1;
+		y1 = cy1;
+		x2 = cx2;
+		y2 = cy2;
 	}
 	struct wlr_render_texture_options opts = {
 		.texture = tex,
@@ -1708,6 +1863,72 @@ static bool view_region_rect(struct vidow_server *server,
 	return true;
 }
 
+/* 「只重跑受损那一小块」的开关：默认开。设了 VIDOW_BLUR_NO_PARTIAL 就整块重跑；
+ * VIDOW_BLUR_NO_PARTIAL_FILE 指的文件一出现也整块重跑（跑着跑着切过去，用来比对
+ * 「同一个场景、同一个客户端、同一个进程」下局部和整块的输出 —— 见
+ * test-blurpartial.sh）。都只给 A/B 比对用。 */
+static bool blur_no_partial(void) {
+	if (getenv("VIDOW_BLUR_NO_PARTIAL") != NULL) {
+		return true;
+	}
+	const char *file = getenv("VIDOW_BLUR_NO_PARTIAL_FILE");
+	return file != NULL && access(file, F_OK) == 0;
+}
+
+/* 这次重抓**只需要动**的那一块（区域局部设备像素）：攒下来的损伤盒子跟区域相交
+ * 的那部分的并集（往外放 2 像素，抵掉逻辑->设备的取整）。返回 false = 用不上，
+ * 调用方整块重跑：
+ *   - 一笔都没相交（不该走到这儿，防御）；
+ *   - 损伤盖住了区域的一大半（>= 60%）：局部省不了多少，整块重跑还简单些。 */
+static bool region_update_rect(struct vidow_output *output,
+		struct vidow_view *view,
+		int rx, int ry, int rw, int rh, struct wlr_box *out) {
+	double scale = output->wlr_output->scale;
+	if (!(scale > 0.0)) {
+		scale = 1.0;
+	}
+	const struct vidow_dmg_set *set = &view->fx.pending_damage;
+	struct wlr_box u = {0};
+	for (int i = 0; i < set->n; i++) {
+		const struct wlr_box *b = &set->box[i];
+		/* 布局逻辑坐标 -> 这块屏的设备像素（减去这块屏的布局原点）-> 区域局部 */
+		double lx = (double)(b->x - output->box.x) * scale;
+		double ly = (double)(b->y - output->box.y) * scale;
+		double hx = (double)(b->x + b->width - output->box.x) * scale;
+		double hy = (double)(b->y + b->height - output->box.y) * scale;
+		struct wlr_box one = {
+			.x = (int)floor(lx) - rx - 2,
+			.y = (int)floor(ly) - ry - 2,
+			.width = (int)ceil(hx) - (int)floor(lx) + 4,
+			.height = (int)ceil(hy) - (int)floor(ly) + 4,
+		};
+		blur_box_add(&u, &one);
+	}
+	if (u.width <= 0 || u.height <= 0) {
+		return false;
+	}
+	bool clip_ok = true;
+	wlr_scene_node_for_each_buffer(&view->server->layer_toplevels->node,
+		backdrop_clip_check, &clip_ok);
+	if (!clip_ok) {
+		return false;
+	}
+	int x1 = u.x < 0 ? 0 : u.x;
+	int y1 = u.y < 0 ? 0 : u.y;
+	int x2 = u.x + u.width > rw ? rw : u.x + u.width;
+	int y2 = u.y + u.height > rh ? rh : u.y + u.height;
+	if (x2 <= x1 || y2 <= y1) {
+		return false;
+	}
+	if ((int64_t)(x2 - x1) * (y2 - y1) * 10 >= (int64_t)rw * rh * 6) {
+		return false; /* 盖住大半了：整块重跑 */
+	}
+	*out = (struct wlr_box){
+		.x = x1, .y = y1, .width = x2 - x1, .height = y2 - y1,
+	};
+	return true;
+}
+
 /* 抓「世界减掉这个窗口」，只抓它自己那一小块区域，然后跑一遍链条。
  *
  * 基座是共享底衬（壁纸 + background / bottom 层）里对应的那一块，1:1 拷过来，
@@ -1716,10 +1937,33 @@ static bool view_region_rect(struct vidow_server *server,
  * 重叠的窗口都要来一次；现在代价只跟这块区域的面积成正比。 */
 static bool view_region_build(struct vidow_server *server,
 		struct vidow_output *output, struct vidow_view *view,
-		int rx, int ry, int rw, int rh, int levels) {
+		int rx, int ry, int rw, int rh, int levels,
+		const struct wlr_box *partial) {
 	double scale = output->wlr_output->scale;
 	if (!(scale > 0.0)) {
 		scale = 1.0;
+	}
+
+	/* partial != NULL：只有这块（**区域局部设备像素**）的像素内容变了，其余保持
+	 * 上一版 —— 抓也只抓这一块、链条也只重跑这一块（见 blur_chain_rect）。
+	 * partial == NULL：整块重跑（第一次 / 形状变了 / 损伤盖满整块）。 */
+	int px = 0, py = 0, pw = rw, ph = rh;
+	if (partial != NULL) {
+		px = partial->x < 0 ? 0 : partial->x;
+		py = partial->y < 0 ? 0 : partial->y;
+		int px2 = partial->x + partial->width;
+		int py2 = partial->y + partial->height;
+		if (px2 > rw) {
+			px2 = rw;
+		}
+		if (py2 > rh) {
+			py2 = rh;
+		}
+		if (px2 <= px || py2 <= py) {
+			return false;
+		}
+		pw = px2 - px;
+		ph = py2 - py;
 	}
 
 	int x1 = rx < 0 ? 0 : rx, y1 = ry < 0 ? 0 : ry;
@@ -1732,6 +1976,30 @@ static bool view_region_build(struct vidow_server *server,
 	}
 	if (x2 <= x1 || y2 <= y1) {
 		return false; /* 整块在屏外，没东西可抓 */
+	}
+	if (partial != NULL) {
+		/* 要抓的那一块也得夹进屏内（区域原点可能被夹过，右/下边可能是屏外）。 */
+		int cx1 = rx + px, cy1 = ry + py;
+		int cx2 = cx1 + pw, cy2 = cy1 + ph;
+		if (cx1 < x1) {
+			cx1 = x1;
+		}
+		if (cy1 < y1) {
+			cy1 = y1;
+		}
+		if (cx2 > x2) {
+			cx2 = x2;
+		}
+		if (cy2 > y2) {
+			cy2 = y2;
+		}
+		if (cx2 <= cx1 || cy2 <= cy1) {
+			return false;
+		}
+		px = cx1 - rx;
+		py = cy1 - ry;
+		pw = cx2 - cx1;
+		ph = cy2 - cy1;
 	}
 
 	struct vidow_fx_target *fx = &view->fx;
@@ -1760,7 +2028,7 @@ static bool view_region_build(struct vidow_server *server,
 		return false;
 	}
 	struct wlr_render_rect_options clear = {
-		.box = { .x = 0, .y = 0, .width = rw, .height = rh },
+		.box = { .x = px, .y = py, .width = pw, .height = ph },
 		.color = { .r = 0.0f, .g = 0.0f, .b = 0.0f, .a = 0.0f },
 		.blend_mode = WLR_RENDER_BLEND_MODE_NONE,
 	};
@@ -1770,16 +2038,30 @@ static bool view_region_build(struct vidow_server *server,
 	 * （不插值、不混合 —— 这块缓冲刚清成全透明，直接覆盖写最便宜）。源框必须
 	 * 夹在底衬里面：wlroots 的 render pass 会断言源框越界（伸到屏外的那圈只能
 	 * 留透明，所以 view_region_rect 把区域原点夹在屏内）。 */
+	int bx1 = rx + px, by1 = ry + py;
+	if (bx1 < x1) {
+		bx1 = x1;
+	}
+	if (by1 < y1) {
+		by1 = y1;
+	}
+	int bx2 = bx1 + pw, by2 = by1 + ph;
+	if (bx2 > x2) {
+		bx2 = x2;
+	}
+	if (by2 > y2) {
+		by2 = y2;
+	}
 	float one = 1.0f;
 	struct wlr_render_texture_options base = {
 		.texture = output->backdrop_tex,
 		.src_box = {
-			.x = (float)x1, .y = (float)y1,
-			.width = (float)(x2 - x1), .height = (float)(y2 - y1),
+			.x = (float)bx1, .y = (float)by1,
+			.width = (float)(bx2 - bx1), .height = (float)(by2 - by1),
 		},
 		.dst_box = {
-			.x = (float)(x1 - rx), .y = (float)(y1 - ry),
-			.width = (float)(x2 - x1), .height = (float)(y2 - y1),
+			.x = (float)(bx1 - rx), .y = (float)(by1 - ry),
+			.width = (float)(bx2 - bx1), .height = (float)(by2 - by1),
 		},
 		.alpha = &one,
 		.transform = WL_OUTPUT_TRANSFORM_NORMAL,
@@ -1798,10 +2080,12 @@ static bool view_region_build(struct vidow_server *server,
 		.scale = scale,
 		.ox = server->output_x + rx,
 		.oy = server->output_y + ry,
-		.clip_x = x1 - rx,
-		.clip_y = y1 - ry,
-		.clip_w = x2 - x1,
-		.clip_h = y2 - y1,
+		/* 只画要抓的那一块（partial 时就是损伤那一小块）：底衬别的像素一个都
+		 * 不碰，其余部分还是上一版的内容。 */
+		.clip_x = bx1 - rx,
+		.clip_y = by1 - ry,
+		.clip_w = bx2 - bx1,
+		.clip_h = by2 - by1,
 	};
 	wlr_scene_node_for_each_buffer(&server->layer_toplevels->node, backdrop_iter,
 		&ctx);
@@ -1817,7 +2101,14 @@ static bool view_region_build(struct vidow_server *server,
 	if (!blur_set_alloc(server, &fx->blur_set, rw, rh, levels)) {
 		return false;
 	}
-	blur_chain(server, &fx->blur_set, fx->own_bd_tex, rw, rh);
+	if (partial != NULL) {
+		blur_chain_rect(server, &fx->blur_set, fx->own_bd_tex, rw, rh,
+			&(struct wlr_box){ .x = px, .y = py,
+				.width = pw, .height = ph },
+			blur_reach_px(server, levels));
+	} else {
+		blur_chain(server, &fx->blur_set, fx->own_bd_tex, rw, rh);
+	}
 	fx->blur_own_tex = fx->blur_set.up_tex[0];
 	if (fx->blur_own_tex == NULL) {
 		return false;
@@ -1843,10 +2134,11 @@ static bool view_region_build(struct vidow_server *server,
 		dumped++;
 	}
 	wlr_log(WLR_DEBUG, "blur: own region %s %dx%d at %d,%d levels=%d"
-		"（损伤 %dx%d at %d,%d）",
+		"（损伤 %dx%d at %d,%d，%s %dx%d）",
 		vidow_view_title(view) != NULL ? vidow_view_title(view) : "?",
 		rw, rh, rx, ry, levels,
-		dmg.width, dmg.height, dmg.x, dmg.y);
+		dmg.width, dmg.height, dmg.x, dmg.y,
+		partial != NULL ? "局部重跑" : "整块重跑", pw, ph);
 	return true;
 }
 
@@ -1983,8 +2275,10 @@ void vidow_blur_update(struct vidow_output *output) {
 			view->fx.blur_set.gen != server->gen_scene - view->self_gen;
 		bool touched = key_changed &&
 			blur_damage_hits(&view->fx, &region_logical);
-		bool fresh = view->fx.blur_set.valid &&
-			view->fx.blur_own_tex != NULL && !touched &&
+		/* 形状（区域位置尺寸 / 级数 / 半径）没变：那张金字塔就是上一版的，可以
+		 * 只更新受损的那一块（见 view_region_build 的 partial）。 */
+		bool shape_ok = view->fx.blur_set.valid &&
+			view->fx.blur_own_tex != NULL &&
 			view->fx.blur_set.w == rw && view->fx.blur_set.h == rh &&
 			view->fx.blur_set.levels == rlevels &&
 			fabs(view->fx.blur_set.offset - server->config.blur_offset) < 1e-6 &&
@@ -1992,10 +2286,16 @@ void vidow_blur_update(struct vidow_output *output) {
 			view->fx.blur_tex_w == rw && view->fx.blur_tex_h == rh &&
 			view->fx.own_bd != NULL && view->fx.own_bd_w == rw &&
 			view->fx.own_bd_h == rh;
-		if (!fresh && !view_region_build(server, output, view, rx, ry, rw, rh,
-				rlevels)) {
-			blur_assign(&view->fx, NULL, false, 0);
-			continue;
+		bool fresh = shape_ok && !touched;
+		if (!fresh) {
+			struct wlr_box upd;
+			bool partial = shape_ok && !blur_no_partial() &&
+				region_update_rect(output, view, rx, ry, rw, rh, &upd);
+			if (!view_region_build(server, output, view, rx, ry, rw, rh,
+					rlevels, partial ? &upd : NULL)) {
+				blur_assign(&view->fx, NULL, false, 0);
+				continue;
+			}
 		}
 		/* owned = false：这张贴图归 view->fx.blur_set（blur_set_drop 收），
 		 * 这里只是指过去采样。 */
