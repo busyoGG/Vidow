@@ -543,6 +543,15 @@ struct vidow_output {
 	/* 上一次在这块屏上亮着的工作区（focus-workspace-previous / auto-back-and-forth） */
 	uint64_t prev_ws_id;
 	int64_t last_frame_ns;      /* last frame event, for the animation watchdog */
+	/* 上一次**真正出帧**的时刻（后端给的帧事件，或者看门狗自己推的那一帧）。
+	 * 看门狗靠它给自己限速：跟后端**自己**的帧间隔走，比它晚 1/4 才补一帧。
+	 * 不并进 last_frame_ns —— 那个是「后端最后一次给帧」，帧追踪
+	 * （VIDOW_TRACE_FRAMES）拿它判「帧链断没断」，看门狗推的帧不能算进去，
+	 * 不然帧链断着也能骗过追踪。 */
+	int64_t last_render_ns;
+	/* 后端帧间隔的滑动平均（只喂「看着正常」的那些间隔，见 output_frame）：
+	 * 看门狗的目标节奏就是它，不用写死 40ms。0 = 还不知道。 */
+	int64_t frame_gap_ns;
 	/* 帧追踪（VIDOW_TRACE_FRAMES=1 时才有意义）：这块屏被要过帧、要了几次、
 	 * 最近一次是谁要的。**要了帧却迟迟没有帧事件**就是「这块屏的帧链断了」——
 	 * 用户报过「某块屏上的窗口停在最后一帧、拖到另一块屏就活」，只有真 DRM 上
@@ -1332,6 +1341,12 @@ struct vidow_server {
 	/* Fallback clock: advances animations when the backend stops delivering
 	 * frame events (a nested Wayland output stalls while the host is idle). */
 	struct wl_event_source *anim_timer;
+	/* 看门狗正在跑（定时器已经排上，还没回调）。拖动时每个指针事件都会来
+	 * kick 一下，而 wl_event_source_timer_update 是「重排」不是「没排就排」——
+	 * 1000Hz 的鼠标每 1ms 把 24ms 的闹钟往后推一次，闹钟永远不响，拖动就又冻住了
+	 * （实测：按住帧事件 + 200Hz 匀速拖 2 秒，只出了 1 帧）。所以这里记住状态，
+	 * 只在没排的时候排一次。 */
+	bool watchdog_armed;
 	/* 会话切回来（或输出刚建好）之后主动画一帧的一次性闹钟，见
 	 * vidow_output_kick_all()。 */
 	struct wl_event_source *kick_timer;

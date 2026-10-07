@@ -16,6 +16,10 @@
 void vidow_output_render(struct vidow_output *output) {
 	struct vidow_server *server = output->server;
 
+	/* 出帧了：看门狗按这个时刻给自己限速（见 watchdog_interval_ns）。放在最前面，
+	 * 中途哪条早退都不影响「这一帧确实画过了」。 */
+	output->last_render_ns = vidow_now_ns();
+
 	server->output_w = output->wlr_output->width;
 	server->output_h = output->wlr_output->height;
 
@@ -255,39 +259,82 @@ static int capture_watchdog(void *data) {
 	return 0;
 }
 
+/* 看门狗自己推帧的节奏：跟着后端**自己**的帧间隔走，比它晚 1/4 才补一帧。
+ *
+ * 后端正常出帧时一帧都不多推 —— 白推一帧就是白画一屏（模糊链 + 装饰 + 提交，
+ * 4K@2 上 ~1ms，嵌套时还会多插一次 commit 打乱上层的帧链）。后端停帧时才按这个
+ * 节奏补上（嵌套在别的合成器里，上层一忙就不给帧）。
+ *
+ * 上限 40ms 是原来那条硬编码的兜底（后端 25Hz 就认了，别自作聪明替它画）；
+ * 下限 6ms 是「至少 ~160Hz」—— 拖动是跟着指针走的，25fps 的步进肉眼就是
+ * 「一顿一顿」（用户报的），所以拖动期间宁可多推也不能卡。
+ * frame_gap_ns == 0（还没量到过一次正常间隔）按 60Hz 猜，拖动期间按 8ms（~125Hz）
+ * 猜 —— 拖动时「宁可多推」优先，动画不用那么急。 */
+static int64_t watchdog_interval_ns(struct vidow_output *output, bool dragging) {
+	int64_t gap = output->frame_gap_ns > 0 ? output->frame_gap_ns
+		: (dragging ? 8 : 16) * 1000000LL;
+	int64_t iv = gap + gap / 4;
+	if (iv < 6 * 1000000LL) {
+		iv = 6 * 1000000LL;
+	}
+	if (iv > 40 * 1000000LL) {
+		iv = 40 * 1000000LL;
+	}
+	return iv;
+}
+
 /* The nested Wayland backend only delivers a frame event once the host
  * compositor has presented our surface, and the host only presents on damage:
  * that deadlocks an animation that is waiting for its next frame. If frames
  * dry up while an animation is in flight, drive it from a timer instead. */
 static int anim_watchdog(void *data) {
 	struct vidow_server *server = data;
+	server->watchdog_armed = false;
 	/* 拖着窗口也算「有活在飞」：浮动拖拽的落位是推迟到帧里做的（见 float.c 的
 	 * arrange_dirty），帧一停它就**一点都不动** —— 上层合成器一旦不给帧事件
 	 * （嵌套在别的合成器里、窗口被盖住 / 那台合成器自己闲着），拖动就冻住。 */
+	bool dragging = server->grab_view != NULL;
 	if (!vidow_anim_pending(server) && !vidow_jelly_pending(server) &&
-			server->grab_view == NULL) {
+			!dragging) {
 		return 0;
 	}
 	int64_t now = vidow_now_ns();
+	int64_t wait_ms = 0;
 	struct vidow_output *output;
 	wl_list_for_each(output, &server->outputs, link) {
-		if (now - output->last_frame_ns < 40 * 1000000LL) {
-			continue; /* the backend is still feeding us frames */
+		int64_t iv = watchdog_interval_ns(output, dragging);
+		int64_t since = now - output->last_render_ns;
+		if (since >= iv) {
+			vidow_output_render(output); /* 后端欠着这一帧，自己补上 */
+			since = 0;
+			iv = watchdog_interval_ns(output, dragging);
 		}
-		vidow_output_render(output);
+		/* 下一轮就在「这个间隔还剩多久」之后 —— 按剩余时间排，而不是固定
+		 * 4ms / 16ms 地空转：4ms 一轮的话，10ms 的目标节奏实际会落成 12ms
+		 * （4 的整数倍），白丢 20% 的帧。 */
+		int64_t left = (iv - since) / 1000000 + 1;
+		if (wait_ms == 0 || left < wait_ms) {
+			wait_ms = left;
+		}
 	}
-	if (vidow_anim_pending(server) || vidow_jelly_pending(server)) {
-		wl_event_source_timer_update(server->anim_timer, 16);
-	}
+	/* 还有活在飞就继续自己推。这条续期是关键：不续的话看门狗只响一次，下次
+	 * 得等新的指针事件来 kick（拖动时后端要是这段时间一直不给帧，就又冻住了）。 */
+	server->watchdog_armed = true;
+	wl_event_source_timer_update(server->anim_timer,
+		(int)(wait_ms < 1 ? 1 : wait_ms));
 	return 0;
 }
 
 /* Armed whenever an animation starts or a frame is presented, so the
- * watchdog is running even if the backend never sends another frame. */
+ * watchdog is running even if the backend never sends another frame.
+ * 已经排上就不再排 —— 拖动时每个指针事件都会调到这儿（见 server.h 的
+ * watchdog_armed）。 */
 void vidow_output_kick_watchdog(struct vidow_server *server) {
-	if (server->anim_timer != NULL) {
-		wl_event_source_timer_update(server->anim_timer, 24);
+	if (server->anim_timer == NULL || server->watchdog_armed) {
+		return;
 	}
+	server->watchdog_armed = true;
+	wl_event_source_timer_update(server->anim_timer, 8);
 }
 
 /* 立刻给每块屏画一帧。切 tty 切回来的路上（DRM 后端会把所有输出销毁再重建）
@@ -336,6 +383,16 @@ static void output_frame(struct wl_listener *listener, void *data) {
 	}
 	output->want_frame = false;
 	output->want_frame_n = 0;
+	/* 后端帧间隔的滑动平均（看门狗的目标节奏，见 watchdog_interval_ns）。
+	 * 只喂「看着正常」的间隔（< 25ms = 40Hz 以上）：后端自己就慢或者刚停过帧的
+	 * 那些长间隔喂进去，会把目标节奏越拉越长，看门狗跟着一起变慢 —— 拖动就又
+	 * 开始一顿一顿。真正的停帧（几百 ms）本来就该由看门狗按健康的节奏补上。 */
+	int64_t gap_ns = now_ns - output->last_frame_ns;
+	if (output->last_frame_ns != 0 && gap_ns > 0 &&
+			gap_ns < 25 * 1000000LL) {
+		output->frame_gap_ns = output->frame_gap_ns > 0 ?
+			(output->frame_gap_ns * 3 + gap_ns) / 4 : gap_ns;
+	}
 	output->last_frame_ns = now_ns;
 	vidow_output_render(output);
 
@@ -1074,6 +1131,8 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 	/* 帧追踪的基准：第一次出帧之前 last_frame_ns 是 0，而 vidow_now_ns() 是开机
 	 * 以来的纳秒数 —— 不初始化的话第一帧会被算成「停了 3.8 小时」（实测）。 */
 	output->last_frame_ns = vidow_now_ns();
+	/* 看门狗的限速基准同理（它比的是「上一次真出帧」，不是「后端上一次给帧」）。 */
+	output->last_render_ns = output->last_frame_ns;
 	output->scene_output = wlr_scene_output_create(server->scene, wlr_output);
 	/* 配置里点了名的屏摆在它说的位置；没点名就按到达顺序自动排。
 	 * 「哪块在左边」不能靠自动排 —— 那个顺序是后端给的（headless 上实测是
