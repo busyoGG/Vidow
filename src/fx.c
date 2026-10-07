@@ -20,6 +20,27 @@ extern const struct wlr_drm_format_set *wlr_renderer_get_render_formats(
 
 #define MAX_SHADER_SIZE (256 * 1024)
 #define MAX_TARGET_PX 8192
+
+/* ---- 渲染统计（VIDOW_RENDER_STATS=1，见 output.c）：每帧各阶段耗时 + 重建次数。
+ * 计数是机器无关的硬指标 —— 「有背景时拖拽卡」这类问题，先在真机上跑
+ * `VIDOW_RENDER_STATS=1 vidow` 看每帧干了多少活，再谈优化。
+ *
+ * tex_new/tex_del 数的是 vidow **自己那些目标缓冲**的贴图导入/销毁：真后端上
+ * （GBM/dmabuf）每次都是一次 EGLImage 创建 + BO 映射，每帧十几次就够呛。客户端
+ * 缓冲走的是 wlr_client_buffer 自己那张，不算在内。 */
+struct vidow_frame_stats vidow_stats;
+static struct wlr_texture *stat_tex_new(struct wlr_texture *t) {
+	if (t != NULL) {
+		vidow_stats.tex_new++;
+	}
+	return t;
+}
+static void stat_tex_del(struct wlr_texture *t) {
+	if (t != NULL) {
+		vidow_stats.tex_del++;
+	}
+	wlr_texture_destroy(t);
+}
 /* ------------------------------------------------------------ scene alpha */
 
 static void alpha_iter(struct wlr_scene_buffer *buffer, int sx, int sy,
@@ -915,6 +936,10 @@ int vidow_fx_pad(struct vidow_server *server) {
 }
 
 static void blur_drop(struct vidow_output *output) {
+	if (output->backdrop_tex != NULL) {
+		stat_tex_del(output->backdrop_tex);
+		output->backdrop_tex = NULL;
+	}
 	if (output->backdrop != NULL) {
 		wlr_buffer_drop(output->backdrop);
 		output->backdrop = NULL;
@@ -932,6 +957,14 @@ static void blur_set_drop(struct vidow_blur_set *set) {
 		if (set->up[i] != NULL) {
 			wlr_buffer_drop(set->up[i]);
 			set->up[i] = NULL;
+		}
+		if (set->down_tex[i] != NULL) {
+			stat_tex_del(set->down_tex[i]);
+			set->down_tex[i] = NULL;
+		}
+		if (set->up_tex[i] != NULL) {
+			stat_tex_del(set->up_tex[i]);
+			set->up_tex[i] = NULL;
 		}
 	}
 	set->w = 0;
@@ -962,6 +995,12 @@ static bool blur_set_alloc(struct vidow_server *server,
 			blur_set_drop(set);
 			return false;
 		}
+		set->down_tex[i] = stat_tex_new(wlr_texture_from_buffer(
+			server->renderer, set->down[i]));
+		if (set->down_tex[i] == NULL) {
+			blur_set_drop(set);
+			return false;
+		}
 	}
 	/* up[i] 和 down[i] 同尺寸：up[i] 是「把 up[i+1]（或者最底层 down[levels-1]）
 	 * 放大一圈」的结果，up[0]（半分辨率）就是最终产物，也是给装饰着色器采样的
@@ -969,6 +1008,12 @@ static bool blur_set_alloc(struct vidow_server *server,
 	for (int i = 0; i < levels - 1; i++) {
 		set->up[i] = vidow_alloc_target(server, w >> (i + 1), h >> (i + 1));
 		if (set->up[i] == NULL) {
+			blur_set_drop(set);
+			return false;
+		}
+		set->up_tex[i] = stat_tex_new(
+			wlr_texture_from_buffer(server->renderer, set->up[i]));
+		if (set->up_tex[i] == NULL) {
 			blur_set_drop(set);
 			return false;
 		}
@@ -1004,38 +1049,32 @@ static void kawase_pass(struct vidow_server *server,
 }
 
 static void blur_chain(struct vidow_server *server, struct vidow_blur_set *set,
-		struct wlr_buffer *backdrop, int w, int h) {
+		struct wlr_texture *backdrop_tex, int w, int h) {
 	int levels = set->levels;
-	if (levels < 2) {
+	if (levels < 2 || backdrop_tex == NULL) {
 		return;
 	}
-	struct wlr_texture *tex =
-		wlr_texture_from_buffer(server->renderer, backdrop);
-	for (int i = 0; i < levels && tex != NULL; i++) {
+	vidow_stats.chains++;
+	struct wlr_texture *tex = backdrop_tex;
+	for (int i = 0; i < levels; i++) {
 		int sw = i == 0 ? w : (w >> i), sh = i == 0 ? h : (h >> i);
 		kawase_pass(server, &server->kawase_down, set->down[i], w >> (i + 1),
 			h >> (i + 1), tex, sw, sh);
-		wlr_texture_destroy(tex);
-		tex = wlr_texture_from_buffer(server->renderer, set->down[i]);
-	}
-	if (tex != NULL) {
-		wlr_texture_destroy(tex);
+		/* 这一趟的结果就是下一趟的源：贴图是常驻的（见 vidow_blur_set），
+		 * 直接换指针 —— 以前这里每趟导入一张、用完销毁，真后端上每帧十几二十次
+		 * EGLImage + BO 映射，拖重叠窗口时的卡顿就是这个。 */
+		tex = set->down_tex[i];
 	}
 
 	/* 往上走：每一级只把上一级的结果放大一圈（niri 的 blur_up）。目标必须比源大一
 	 * 倍，u_texel 传的是**源**的尺寸 —— 放大倍数全靠它算。每一级都是同一趟着色器，
 	 * 写 up[0]（半分辨率、给装饰着色器采样的那张）也不例外。 */
-	struct wlr_texture *lower =
-		wlr_texture_from_buffer(server->renderer, set->down[levels - 1]);
-	for (int i = levels - 2; i >= 0 && lower != NULL; i--) {
+	struct wlr_texture *lower = set->down_tex[levels - 1];
+	for (int i = levels - 2; i >= 0; i--) {
 		kawase_pass(server, &server->kawase_up,
 			set->up[i], w >> (i + 1), h >> (i + 1), lower,
 			w >> (i + 2), h >> (i + 2));
-		wlr_texture_destroy(lower);
-		lower = wlr_texture_from_buffer(server->renderer, set->up[i]);
-	}
-	if (lower != NULL) {
-		wlr_texture_destroy(lower);
+		lower = set->up_tex[i];
 	}
 }
 
@@ -1255,7 +1294,7 @@ static void blur_mask_min_changed(struct vidow_fx_target *fx, double alpha_min) 
 /* Release an owned texture before its pyramid buffer is reused. */
 static void blur_own_drop(struct vidow_fx_target *fx) {
 	blur_assign(fx, NULL, false, 0);
-	fx->blur_own_tex = NULL; /* freed above when it was the owned one */
+	fx->blur_own_tex = NULL; /* 贴图归 blur_set，上面那句只放指针 */
 	fx->blur_own_id = 0;
 }
 
@@ -1268,6 +1307,24 @@ static void blur_target_release(struct vidow_fx_target *fx) {
 
 /* layer surface 背后的模糊（实现在下面「draw」之后）：先声明，抓底衬的时候
  * 要用它把节点藏起来。 */
+/* layer 那块区域底衬（缓冲 + 包着它的贴图）一起收。贴图是包的缓冲、不是包的像素，
+ * 复用缓冲的时候贴图也跟着复用，只有尺寸变了才重建 —— 链条要拿它当第一趟的源，
+ * 以前每趟导入一次、用完销毁，真后端上每帧就是十几次 EGLImage + BO 映射。 */
+static void layer_bd_drop(struct vidow_layer_surface *ls) {
+	if (ls->bd_tex != NULL) {
+		stat_tex_del(ls->bd_tex);
+		ls->bd_tex = NULL;
+	}
+	if (ls->bd != NULL) {
+		wlr_buffer_drop(ls->bd);
+		ls->bd = NULL;
+	}
+	ls->bd_w = 0;
+	ls->bd_h = 0;
+	ls->bd_gen_scene = 0;
+	ls->bd_gen_layer = 0;
+}
+
 static bool layer_blur_wanted(struct vidow_server *server,
 		struct vidow_layer_surface *ls);
 /* 抓底衬时要不要把这个 layer surface 自己藏起来（见下面的定义）。 */
@@ -1290,14 +1347,11 @@ static int blur_levels_for(struct vidow_server *server, int w, int h) {
 }
 
 static void shared_blur_drop(struct vidow_output *output) {
-	if (output->blur_tex != NULL) {
-		wlr_texture_destroy(output->blur_tex);
-		output->blur_tex = NULL;
-	}
-	if (output->backdrop_tex != NULL) {
-		wlr_texture_destroy(output->backdrop_tex);
-		output->backdrop_tex = NULL;
-	}
+	/* 这两张贴图现在归别人管：blur_tex 是金字塔 up[0] 那张常驻贴图（blur_set_drop
+	 * 收），backdrop_tex 跟着底衬缓冲走（blur_drop 收）。这里只把指针放下，
+	 * 顺手把共享金字塔收掉。 */
+	output->blur_tex = NULL;
+	output->backdrop_tex = NULL;
 	blur_set_drop(&output->blur_set);
 	output->blur_id = 0;
 	output->blur_gen = 0;
@@ -1337,20 +1391,14 @@ static bool shared_blur_rebuild(struct vidow_server *server,
 		return false;
 	}
 
-	/* The old texture wraps a buffer the pyramid is about to reuse. */
-	shared_blur_drop(output);
-	/* 未模糊的底衬也留一张贴图：被窗口遮住的 layer surface 拿它当自己那一小块
-	 * 区域底衬的基座（比每次重抓一遍壁纸便宜太多，见 layer_region_build）。 */
-	output->backdrop_tex = wlr_texture_from_buffer(server->renderer,
-		output->backdrop);
+	/* 底衬贴图（backdrop_tex）跟着底衬缓冲一起建、一起收（见 vidow_blur_update），
+	 * 金字塔的贴图跟着金字塔缓冲走（见 blur_set_alloc）：这里一张都不用导入，
+	 * blur_tex 就是 up[0] 那张常驻贴图。 */
 	if (!blur_set_alloc(server, &output->blur_set, w, h, levels)) {
 		return false;
 	}
-	blur_chain(server, &output->blur_set, output->backdrop, w, h);
-	if (output->blur_set.up[0] != NULL) {
-		output->blur_tex = wlr_texture_from_buffer(server->renderer,
-			output->blur_set.up[0]);
-	}
+	blur_chain(server, &output->blur_set, output->backdrop_tex, w, h);
+	output->blur_tex = output->blur_set.up_tex[0];
 	if (output->blur_tex == NULL) {
 		return false;
 	}
@@ -1363,6 +1411,7 @@ static bool shared_blur_rebuild(struct vidow_server *server,
 		}
 		dumped++;
 	}
+	vidow_stats.shared++;
 	output->blur_id = server->blur_serial++;
 	output->blur_gen = server->gen_layer;
 	output->blur_levels = levels;
@@ -1386,15 +1435,13 @@ static bool blur_own_rebuild(struct vidow_server *server,
 	if (!ok) {
 		return false;
 	}
+	vidow_stats.own++;
 	blur_own_drop(&view->fx);
 	if (!blur_set_alloc(server, &view->fx.blur_set, w, h, levels)) {
 		return false;
 	}
-	blur_chain(server, &view->fx.blur_set, output->backdrop, w, h);
-	if (view->fx.blur_set.up[0] != NULL) {
-		view->fx.blur_own_tex = wlr_texture_from_buffer(server->renderer,
-			view->fx.blur_set.up[0]);
-	}
+	blur_chain(server, &view->fx.blur_set, output->backdrop_tex, w, h);
+	view->fx.blur_own_tex = view->fx.blur_set.up_tex[0];
 	if (view->fx.blur_own_tex == NULL) {
 		return false;
 	}
@@ -1461,6 +1508,15 @@ void vidow_blur_update(struct vidow_output *output) {
 		if (output->backdrop == NULL) {
 			return;
 		}
+		/* 未模糊的底衬也留一张贴图：被窗口遮住的 layer surface 拿它当自己那一
+		 * 小块区域底衬的基座（比每次重抓一遍壁纸便宜太多，见 layer_region_build）。
+		 * 贴图是包的缓冲，不包像素 —— 底衬每帧重画也不影响它，建一次就够。 */
+		output->backdrop_tex = stat_tex_new(
+			wlr_texture_from_buffer(server->renderer, output->backdrop));
+		if (output->backdrop_tex == NULL) {
+			blur_drop(output);
+			return;
+		}
 		output->backdrop_w = w;
 		output->backdrop_h = h;
 	}
@@ -1525,7 +1581,9 @@ void vidow_blur_update(struct vidow_output *output) {
 			dump_buffer(server, output->backdrop, w, h, "vidow-bd", dumped);
 			dumped++;
 		}
-		blur_assign(&view->fx, view->fx.blur_own_tex, true,
+		/* owned = false：这张贴图归 view->fx.blur_set（blur_set_drop 收），
+		 * 这里只是指过去采样。 */
+		blur_assign(&view->fx, view->fx.blur_own_tex, false,
 			view->fx.blur_own_id);
 	}
 
@@ -1842,6 +1900,7 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 		anim = pick_free(fx->anim_buf);
 	}
 
+	vidow_stats.bakes++;
 	struct wlr_buffer *displayed = NULL;
 	struct wlr_buffer *decorated = NULL;
 	const float *border = NULL; /* 重画装饰用（动画那趟失败时） */
@@ -2045,14 +2104,15 @@ static bool layer_region_build(struct vidow_server *server,
 	}
 
 	if (ls->bd == NULL || ls->bd_w != rw || ls->bd_h != rh) {
-		if (ls->bd != NULL) {
-			wlr_buffer_drop(ls->bd);
-			ls->bd = NULL;
-			ls->bd_w = 0;
-			ls->bd_h = 0;
-		}
+		layer_bd_drop(ls);
 		ls->bd = vidow_alloc_target(server, rw, rh);
 		if (ls->bd == NULL) {
+			return false;
+		}
+		ls->bd_tex = stat_tex_new(
+			wlr_texture_from_buffer(server->renderer, ls->bd));
+		if (ls->bd_tex == NULL) {
+			layer_bd_drop(ls);
 			return false;
 		}
 		ls->bd_w = rw;
@@ -2119,11 +2179,8 @@ static bool layer_region_build(struct vidow_server *server,
 	if (!blur_set_alloc(server, &ls->fx.blur_set, rw, rh, levels)) {
 		return false;
 	}
-	blur_chain(server, &ls->fx.blur_set, ls->bd, rw, rh);
-	if (ls->fx.blur_set.up[0] != NULL) {
-		ls->fx.blur_own_tex = wlr_texture_from_buffer(server->renderer,
-			ls->fx.blur_set.up[0]);
-	}
+	blur_chain(server, &ls->fx.blur_set, ls->bd_tex, rw, rh);
+	ls->fx.blur_own_tex = ls->fx.blur_set.up_tex[0];
 	if (ls->fx.blur_own_tex == NULL) {
 		return false;
 	}
@@ -2238,7 +2295,7 @@ static bool layer_blur_frame(struct vidow_server *server,
 		fx->blur_tex_y = ry;
 		fx->blur_tex_w = px_w;
 		fx->blur_tex_h = px_h;
-		blur_assign(fx, fx->blur_own_tex, true, fx->blur_own_id);
+		blur_assign(fx, fx->blur_own_tex, false, fx->blur_own_id);
 	} else {
 		/* bottom 层：用共享的那张。`set_layer` 把层改过来的话，之前抓的区域底衬
 		 * 就没用了 —— 连着金字塔一起放掉，别攥着几 MB 不放。 */
@@ -2363,14 +2420,7 @@ void vidow_layer_blur_release(struct vidow_layer_surface *ls) {
 	ls->fx.blur_tex_w = 0;
 	ls->fx.blur_tex_h = 0;
 	/* 抓来的那块区域底衬也得跟着走，否则 layer 没了还占着一张整块大小的缓冲。 */
-	if (ls->bd != NULL) {
-		wlr_buffer_drop(ls->bd);
-		ls->bd = NULL;
-		ls->bd_w = 0;
-		ls->bd_h = 0;
-		ls->bd_gen_scene = 0;
-		ls->bd_gen_layer = 0;
-	}
+	layer_bd_drop(ls);
 }
 
 static void closing_update(void *data, double t, double linear) {

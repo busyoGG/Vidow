@@ -48,9 +48,10 @@ void vidow_output_render(struct vidow_output *output) {
 	 * 因为客户端 commit 会把场景尺寸改回去）。 */
 	vidow_overview_update(server);
 
-	/* Capture what is behind the blurred windows and run the kawase chain
-	 * before anything is drawn, so this frame's decorations can sample it. */
+	/* 临时探针（VIDOW_RENDER_STATS=1）：每帧各阶段耗时 + 贴图导入/重建次数 */
+	int64_t st_t0 = vidow_now_ns();
 	vidow_blur_update(output);
+	int64_t st_t1 = vidow_now_ns();
 
 	/* A blurred decoration is only redrawn when this frame's backdrop differs
 	 * from the one already baked into its buffer. On a still screen nothing
@@ -64,14 +65,45 @@ void vidow_output_render(struct vidow_output *output) {
 
 	/* Progress comes from CLOCK_MONOTONIC, so a slow frame skips ahead
 	 * instead of stretching the animation. */
+	int64_t st_t2 = vidow_now_ns();
 	vidow_anim_tick(server);
 	/* 拖窗口的果冻：积分弹簧、把弯了的窗口重画一遍（见 jelly.c）。 */
 	vidow_jelly_tick(server, vidow_now_ns());
+	int64_t st_t3 = vidow_now_ns();
 
 	/* 屏幕这一帧就是屏幕这一帧：抓帧是 vidow 自己另外渲染的一遍（capture.c /
 	 * screencopy.c），和这里没有任何关系 —— capture = "hide" 的窗口 / layer
 	 * 屏幕上照常显示，只在抓帧里没有。 */
 	wlr_scene_output_commit(output->scene_output, NULL);
+	int64_t st_t4 = vidow_now_ns();
+	if (getenv("VIDOW_RENDER_STATS") != NULL) {
+		vidow_stats.blur_ns += st_t1 - st_t0;
+		vidow_stats.decor_ns += st_t2 - st_t1;
+		vidow_stats.jelly_ns += st_t3 - st_t2;
+		vidow_stats.commit_ns += st_t4 - st_t3;
+		vidow_stats.frames++;
+		static int64_t win_ns = 0;
+		if (win_ns == 0) {
+			win_ns = st_t0;
+		}
+		if (st_t4 - win_ns >= 500 * 1000000LL) {
+			double f = vidow_stats.frames > 0 ? (double)vidow_stats.frames : 1.0;
+			wlr_log(WLR_INFO,
+				"渲染统计: %d 帧/帧窗(%.0fms) %.1f fps | 模糊 %.2fms/帧"
+				"(shared %d own %d chain %d) | 装饰 %.2fms/帧(%d 次重烘) | "
+				"果冻 %.2fms/帧 | 提交 %.2fms/帧 | 贴图 +%d/-%d",
+				vidow_stats.frames, (double)(st_t4 - win_ns) / 1e6,
+				1000.0 * f / ((double)(st_t4 - win_ns) / 1e6),
+				(double)vidow_stats.blur_ns / 1e6 / f,
+				vidow_stats.shared, vidow_stats.own, vidow_stats.chains,
+				(double)vidow_stats.decor_ns / 1e6 / f, vidow_stats.bakes,
+				(double)vidow_stats.jelly_ns / 1e6 / f,
+				(double)vidow_stats.commit_ns / 1e6 / f,
+				vidow_stats.tex_new, vidow_stats.tex_del);
+			vidow_stats = (struct vidow_frame_stats){0};
+			win_ns = st_t4;
+		}
+	}
 
 	struct timespec now;
 	clock_gettime(CLOCK_MONOTONIC, &now);

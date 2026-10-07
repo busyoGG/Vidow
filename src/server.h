@@ -326,6 +326,12 @@ struct vidow_decor_prog {
 struct vidow_blur_set {
 	struct wlr_buffer *down[MAX_BLUR_LEVELS];
 	struct wlr_buffer *up[MAX_BLUR_LEVELS];
+	/* 每块缓冲配一张**常驻**贴图（跟缓冲同生共死）。链条每一趟都要把上一趟的
+	 * 结果当源采样：以前是每趟 wlr_texture_from_buffer() 导入一张、用完销毁，
+	 * 真后端上（GBM/dmabuf）那是一次 EGLImage + BO 映射/解映射 —— 实测拖一个
+	 * 与别的窗口重叠的窗口时每帧 16~23 次。缓冲复用着，贴图一起复用就行。 */
+	struct wlr_texture *down_tex[MAX_BLUR_LEVELS];
+	struct wlr_texture *up_tex[MAX_BLUR_LEVELS];
 	int w, h, levels;
 	uint64_t gen;  /* scene generation this pyramid was built for */
 	double offset; /* kawase 采样步长，建这张金字塔时用的 */
@@ -826,6 +832,9 @@ struct vidow_layer_surface {
 	 * 另外画上去（见 fx.c 的 layer_region_build）。只有会被窗口遮住的层（top /
 	 * overlay）才需要 —— bottom 层的下面根本没有窗口。 */
 	struct wlr_buffer *bd;
+	/* 包着 bd 的常驻贴图（跟缓冲同生共死，见 fx.c 的 layer_bd_drop）：链条拿它
+	 * 当第一趟的源，复用缓冲就不用每趟重新导入。 */
+	struct wlr_texture *bd_tex;
 	int bd_w, bd_h;      /* 设备像素 */
 	int bd_x, bd_y;      /* 相对输出原点的位置，设备像素 */
 	uint64_t bd_gen_scene, bd_gen_layer; /* 抓的时候的世界代次 */
@@ -1058,6 +1067,13 @@ struct vidow_clipboard {
 };
 
 /* ------------------------------------------------------------------ server */
+
+/* 临时探针（VIDOW_RENDER_STATS=1）：见 src/fx.c 里的同名结构 */
+struct vidow_frame_stats {
+	int shared, own, chains, bakes, tex_new, tex_del, frames;
+	int64_t blur_ns, decor_ns, jelly_ns, commit_ns;
+};
+extern struct vidow_frame_stats vidow_stats;
 
 struct vidow_server {
 	struct wl_display *display;

@@ -746,6 +746,7 @@ python3 test-float.py        # 三个真实 GTK 窗口，验证浮动模式自�
 ./test-cursor-shake.sh              # 摇晃找光标：线性加 + 补间、晃到屏幕那么大，截图里没有它（全 headless，55 项断言）
 ./test-geometry.sh                   # 窗口几何和表面尺寸对不上时内容铺满框（chromium 改大小那 1-2 秒）（全 headless，6 项断言）
 ./test-viewport-crop.sh              # 客户端用 wp_viewport 只声明缓冲的一部分时，装饰按那块采（chromium，5 项断言）
+./test-blurcache.sh                  # 拖重叠窗口时每帧重建底衬、但一次贴图都不重新导入（5 项断言）
 ./test-config.sh                     # 配置系统：一个 Lua 文件 + 改了就自动重载（全 headless，15 项断言）
 ./test-binds.sh                      # 键位全是配置给的：没配置=没有键位、默认那套能用、换键位、动作字符串（全 headless，35 项断言）
 ./test-config-include.sh             # 配置拆成好几份：vidow.include() 的路径/顺序/报错 + 改哪份都自动重载（全 headless，25 项断言）
@@ -796,6 +797,7 @@ WLR_BACKENDS=headless WLR_HEADLESS_OUTPUTS=1 WLR_LIBINPUT_NO_DEVICES=1 ./build/v
 | `VIDOW_BLUR_DUMP=N` | 前 N 份底衬 / 模糊图 / layer 区域抓取 dump 成 `/tmp/vidow-{bd,blur,lbd,lblur}-*`（裸 ARGB，测试用） |
 | `VIDOW_FX_DUMP=N` | 前 N 份装饰离屏缓冲 dump 成 `/tmp/vidow-fx-*` |
 | `VIDOW_MASK_DUMP=N` | 前 N 份透明度剔除的 mask（layer 自己的内容）dump 成 `/tmp/vidow-mask-*` |
+| `VIDOW_RENDER_STATS=1` | 每 500ms 一行渲染统计：每帧各阶段耗时（模糊 / 装饰 / 果冻 / 提交）、私有底衬重建次数、**vidow 自己那些目标缓冲的贴图导入次数**、帧率。查「拖窗口卡」先在真机上跑这个看每帧干了多少活，再谈优化 |
 
 ## 快捷键
 
@@ -2757,13 +2759,19 @@ portals.conf.example  拷成 ~/.config/vidow/portals.conf
 protocols/     wlr-layer-shell / wlr-virtual-pointer / input-method-v2 /
                ext-background-effect-v1 / xdg-shell / xdg-foreign v1+v2 协议 XML
                （构建时用 wayland-scanner 生成头文件）
-```
 test-viewport-crop.sh
-                   客户端的 wp_viewport 只声明了缓冲的一部分（chromium / KDE 在分数缩放下
-                   会把缓冲开得比窗口大一圈，只画其中一块、src 框指过去）：装饰必须按场景
-                   节点的 src_box（缓冲像素）采 —— 按整块缓冲采，那圈没画过的像素会一起
-                   铺进窗口，屏幕上就是「框到位了、画面小一圈、右边/下边一条黑边」，而且
-                   会一直那样。没装 chromium 就跳过
+                  客户端的 wp_viewport 只声明了缓冲的一部分（chromium / KDE 在分数缩放下
+                  会把缓冲开得比窗口大一圈，只画其中一块、src 框指过去）：装饰必须按场景
+                  节点的 src_box（缓冲像素）采 —— 按整块缓冲采，那圈没画过的像素会一起
+                  铺进窗口，屏幕上就是「框到位了、画面小一圈、右边/下边一条黑边」，而且
+                  会一直那样。没装 chromium 就跳过
+test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊金字塔每帧都要重建（另一个窗口
+                  在它的底衬里动），但金字塔的缓冲和贴图都得复用：老写法链条每一趟
+                  `wlr_texture_from_buffer()` 导入一张、用完销毁，真后端上（GBM/dmabuf）
+                  每次都是一次 EGLImage + BO 映射 —— 基准实测每帧 23 次。判据看
+                  `VIDOW_RENDER_STATS=1` 那行统计：拖拽期间私有底衬重建 ≥10 次（前提复现）、
+                  贴图导入 **0 次**（把 reuse 关掉跑一遍：518 次 → 当场红）
+```
 
 ## 已验证（wlroots 0.20.2 / AMD radeonsi / EGL 1.5，日志逐条比对坐标）
 
@@ -3542,6 +3550,70 @@ test-viewport-crop.sh
      没有**（不误报）；②掐断帧链 + 追踪开：客户端确实交过帧，追踪报出 ERROR 且点名
      HEADLESS-1、写明「客户端还在交帧，屏幕却不更新」；③掐断帧链 + 追踪**关**：一条 trace
      日志都没有、vidow 照样活着（诊断不改变行为）。
+
+143. **「有背景的时候拖拽还是会卡」**（用户报的「可能是果冻+模糊共同造成的？还是渲染效率
+     比较差（我 7900XT 理应性能足够）」，并且「现在没条件测试，源码里面应该有办法知道是什么
+     卡」）。
+
+     **先说结论：不是渲染吞吐不够，是拖「与别的窗口重叠」的窗口时，每帧在做一件不该做
+     的事 —— 把模糊金字塔的每一级缓冲反复导入成贴图再销毁。** 一个 7900XT 上 4K 一遍模糊
+     是白送的；每帧 23 次 EGLImage 创建 + BO 映射/解映射不是。
+
+     **怎么查出来的**（全部 headless，一台机器就能量）：给帧循环加了个 `VIDOW_RENDER_STATS=1`
+     开关（每 500ms 一行：各阶段耗时 + 私有底衬重建次数 + **vidow 自己那些目标缓冲的贴图
+     导入次数** + 帧率），再用输入注入脚本真拖一个浮动窗口（`pointer-motion` → `pointer-button
+     press` → 20 步 × 30ms → `release`），四种组合各跑一遍（3840x2160@2，壁纸 + 两个浮动窗口）：
+
+     | 场景（拖一个浮动窗口） | 私有底衬重建/帧 | 贴图导入/帧 | 模糊 CPU | 帧率 |
+     | --- | --- | --- | --- | --- |
+     | 两个窗口**不重叠** | **0** | **0** | 0 ms | 62 fps |
+     | 重叠（无模糊） | 0 | 0 | 0 ms | 62 fps |
+     | 重叠 + 模糊（无果冻） | 1.5 | 16 | 0.58 ms | 66 fps |
+     | 重叠 + 模糊 + 果冻 | 2.0 | **23** | 0.77 ms | 59 fps |
+
+     即：**不重叠时模糊一次都不重算**（共享金字塔缓存命中了，见 README 上面那节）；一重叠，
+     每个重叠窗口每帧都要重抓一份「把它自己藏起来」的底衬 + 跑一遍 kawase 链（各自都是
+     **整个屏幕**的场景重绘，不是窗口那一小块），而链条的每一趟都在
+     `wlr_texture_from_buffer()` 导入、用完 `wlr_texture_destroy()`：真后端上（GBM/dmabuf）
+     一次 import = EGLImage 创建 + BO 映射，一次 destroy = 解映射 —— 一帧二十几次，还是
+     在指针每动一下都要走的路上。果冻本身便宜（一次 mesh 绘制，0.08 ms/帧），**不是它的锅**。
+
+     **KDE / niri 是怎么做的**（用户让参考 KDE）：KWin 的模糊（`BlurEffect`）为每个窗口
+     持有**常驻的 GLTexture/FBO**，只在窗口受损时渲染进去，合成时用 KPipeline 采样，**全程
+     不重新导入自己的目标**；「窗口后面的模糊」是直接拿当前帧已经合成好的 framebuffer 内容
+     来做（`blitFromFramebuffer`），不是再渲染一遍场景。niri 更彻底：**每帧只抓一次**底衬到
+     一张 atlas，整张跑一遍链条，所有需要模糊的元素都从那上面采 —— 一个屏幕一帧只有一套
+     抓取 + 一条链，和有几个模糊元素无关。vidow 现在是「每个元素一套抓取 + 一条链」，这是
+     下面还要做的那两件事。
+
+     **这一轮做了什么**（`src/fx.c` / `src/server.h`，行为逐像素不变）：
+     - 金字塔的每块缓冲配一张**常驻贴图**（`vidow_blur_set` 的 `down_tex[]`/`up_tex[]`），
+       建缓冲时一起建、收缓冲时一起收；链条直接换指针，不再每趟导入/销毁
+     - 输出底衬的贴图（`backdrop_tex`）跟着底衬缓冲走（建一次，不再每次重建都导入）；
+       layer 区域底衬（`ls->bd_tex`）同办，收口统一到 `layer_bd_drop()`
+     - `VIDOW_RENDER_STATS=1` 作为**常驻**诊断留在源码里（真机上跑一遍就能看见每帧干了
+       多少活、导入了多少贴图）
+
+     **证据**：
+     - 基准（同一条拖拽）贴图导入 **每帧 23 次 → 0 次**（30 帧窗口：+690/-690 → +0/-0）
+     - 模糊金字塔 dump 逐字节比对：`VIDOW_BLUR_DUMP` 出 `vidow-blur-*.raw`（半分辨率最终
+       结果，装饰采样的就是它）在「改前 / 改后 / 改后再跑一遍」三次里 **sha256 完全相同**；
+       `vidow-bd-*`（底衬）在**两次同版本**运行之间就有 0.06% 像素差（拾取时机不同），
+       说明差异来自运行噪声、不是这次改动（对照实验做了）
+     - 新增 `./test-blurcache.sh`（5 项）：拖重叠窗口时私有底衬重建 ≥10 次（前提复现）、
+       贴图导入 **0 次**、vidow 活着；把金字塔复用那行关掉（`if (0 && …)`）重跑：导入 518
+       次 → 当场红 ✓
+     - 回归：`test-blurscale` / `test-blurlevel` / `test-layerblur` / `test-layermask` /
+       `test-layerghost` / `test-layerwin` / `test-layerdestroy` / `test-geometry` /
+       `test-jelly` / `test-drag` 全过
+
+     **还没做的（按收益排，都需要真机数据）**：
+     1. 私有底衬的那次场景重绘只画窗口那一块（+ 模糊半径），别整屏重绘 —— 机制已经有了
+        （layer 那条路就是按区域抓的，`backdrop_ctx` 里有 `clip_x/y/w/h`）
+     2. 拖自己被拖的那个窗口时，它的私有底衬**本来没变**（抓的时候把自己藏起来了），
+        现在却被 `gen_scene` 一涨就重算 —— 一帧 2 次重建里有 1 次是白做的（要把「世界
+        变了」拆成「我自己动了」和「别人动了」）
+     3. 学 niri：一帧只抓一次、一条链，所有模糊元素共享（上限最高，改动也最大）
 
 142. **chromium 系窗口「框到位了、里面小一圈、右边/下边一条黑边」**（用户报的
      「chromium 系的应用 bug 截图在 /tmp/chromium.png」，并怀疑「和 KDE 那个一样，也是
