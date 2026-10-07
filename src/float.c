@@ -518,12 +518,23 @@ void vidow_float_grab_update(struct vidow_server *server, double lx,
 		view->float_geom.height = h;
 	}
 
-	vidow_arrange(server);
+	/* 重排推迟到这一帧要出帧之前（见 output.c 里那段）：指针比刷新快的时候
+	 * 一帧会来好几个移动事件，中间那些位置屏幕上从来没出现过 —— 以前每个事件
+	 * 都整排一次（所有窗口重新 place，每个都要重烘装饰图），实测每个事件 70µs
+	 * （1000Hz 鼠标 = 每帧 0.44ms，8000Hz = 每帧 3.5ms，全是白算的）。 */
+	server->arrange_dirty = true;
+	vidow_output_schedule_frame(server, view->output, "拖浮动窗口");
 }
 
 void vidow_float_end_grab(struct vidow_server *server) {
 	if (server->grab_mode == VIDOW_GRAB_NONE) {
 		return;
+	}
+	/* 松手前把还欠着的那一次重排补上：最后一个位置得先摆出来，后面的收尾
+	 * （跨屏搬家之类）才是从它接着算的。 */
+	if (server->arrange_dirty) {
+		server->arrange_dirty = false;
+		vidow_arrange(server);
 	}
 	struct vidow_view *view = server->grab_view;
 	server->grab_mode = VIDOW_GRAB_NONE;

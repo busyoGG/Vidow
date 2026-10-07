@@ -991,7 +991,11 @@ static void view_capture_holds_clear(struct vidow_view *view) {
 	}
 }
 
-void vidow_view_apply_anim(struct vidow_view *view) {
+/* 「摆在哪」落到场景节点上：位置 / 透明度 / overview 的显示尺寸 / 装饰的采样
+ * 偏移和 ext-background-effect 的区域。**便宜**，拖动跟手时每个指针事件都走这条。
+ * 装饰图的重烘（贵：整块窗口那么大的离屏渲染）在 vidow_view_anim_bake 里，一帧
+ * 只做一次（见 vidow_tile_grab_update / output.c 的帧回调）。 */
+static void view_anim_place(struct vidow_view *view) {
 	/* 场景节点可能已经没了：X11 销毁窗口时先摘掉表面（scene_tree 归 NULL）再撤
 	 * 动画，而撤销动画会回调 view_open_done() 回到这里 —— 以前就死在这行上。 */
 	if (view->scene_tree == NULL) {
@@ -1034,7 +1038,40 @@ void vidow_view_apply_anim(struct vidow_view *view) {
 	wlr_scene_node_coords(&src->node, &sx, &sy);
 	view->fx_dx = sx - vx;
 	view->fx_dy = sy - vy;
+}
 
+/* 只摆位置（给拖动跟手那条路用，见 drag.c）。 */
+void vidow_view_apply_anim_place(struct vidow_view *view) {
+	view_anim_place(view);
+}
+
+/* 重烘这个窗口的装饰图（含底衬采样）。贵，一帧一次。位置先用 view_anim_place
+ * 摆好；这里把同一套位置参数再算一遍（几个整数，跟重烘比起来不算什么）。 */
+void vidow_view_anim_bake(struct vidow_view *view) {
+	if (view->scene_tree == NULL) {
+		return;
+	}
+	int wx = view->geom.x + (int)lround(view->anim_off_x);
+	int wy = view->geom.y + (int)lround(view->anim_off_y);
+	struct vidow_server *server = view->server;
+	double ov = vidow_overview_scale(server);
+	double alpha = view->anim_alpha;
+	if (server->overview.t > 0.0 && server->overview.output != NULL &&
+			view->output != server->overview.output) {
+		alpha *= 1.0 - server->overview.t;
+	}
+	double sx_mapped = 0, sy_mapped = 0;
+	vidow_overview_map(server, wx, wy, &sx_mapped, &sy_mapped);
+	int x = (int)lround(sx_mapped);
+	int y = (int)lround(sy_mapped);
+
+	if (!view->fx.active || view->scene_surface == NULL) {
+		return;
+	}
+	struct wlr_scene_buffer *src = view->scene_surface->buffer;
+	if (src == NULL) {
+		return;
+	}
 	struct vidow_fx_geo geo = vidow_view_fx_geo(view);
 
 	/* ext-background-effect：客户端要的那块才模糊。区域是 surface 局部坐标，
@@ -1064,6 +1101,11 @@ void vidow_view_apply_anim(struct vidow_view *view) {
 	 * 拖着果冻的时候也一样：内容归 jelly.c 那个节点画。 */
 	wlr_scene_buffer_set_opacity(src,
 		(fx_drawn || view->mask_opacity || view->jelly != NULL) ? 0.0f : 1.0f);
+}
+
+void vidow_view_apply_anim(struct vidow_view *view) {
+	view_anim_place(view);
+	vidow_view_anim_bake(view);
 }
 
 /* 从 wlr_surface 找回它的窗口：文本输入和 ext-background-effect 都要用。

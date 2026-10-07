@@ -1295,6 +1295,15 @@ struct vidow_server {
 	struct vidow_view *grab_view;
 	double grab_x, grab_y;
 	struct wlr_box grab_geom;
+	/* 拖动时指针比刷新快：一帧里会来好几个移动事件，中间那些位置屏幕上从来没
+	 * 出现过。重画装饰（整块窗口那么大的离屏渲染）+ 记损伤推迟到出帧之前做一次
+	 * （见 vidow_tile_grab_update / output.c 的帧回调）—— 实测每个事件 66µs
+	 * （1000Hz 鼠标 = 每帧 0.4ms，8000Hz = 每帧 3.3ms，全是白算的）。
+	 * grab_last_box = **已经画出来**的那个位置（损伤从它算起）。 */
+	bool grab_dirty;
+	struct wlr_box grab_last_box;
+	/* 浮动窗口拖拽同理：每帧最多重排一次（见 vidow_float_grab_update）。 */
+	bool arrange_dirty;
 
 	/* overview（niri 风格全景） */
 	struct vidow_overview overview;
@@ -1622,6 +1631,9 @@ enum vidow_surface_damage vidow_view_surface_damage(struct vidow_view *view,
 void vidow_blur_output_finish(struct vidow_output *output);
 
 void vidow_view_apply_anim(struct vidow_view *view);
+/* 只摆位置（便宜，拖动跟手时每个指针事件走这条） / 只重烘装饰图（贵，一帧一次）。 */
+void vidow_view_anim_bake(struct vidow_view *view);
+void vidow_view_apply_anim_place(struct vidow_view *view);
 
 /* ------------------------------------------------------- 鼠标拖窗口（drag.c） */
 

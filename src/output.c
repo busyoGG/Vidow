@@ -48,6 +48,26 @@ void vidow_output_render(struct vidow_output *output) {
 	 * 因为客户端 commit 会把场景尺寸改回去）。 */
 	vidow_overview_update(server);
 
+	/* 浮动窗口拖拽：一帧里来过的那些移动事件在这里一次性重排（位置取最后一个）。 */
+	if (server->arrange_dirty) {
+		server->arrange_dirty = false;
+		vidow_arrange(server);
+	}
+
+	/* 拖动跟手：一帧里来过的那些移动事件在这里一次性摆到位（位置取最后一个）。
+	 * 中间那些位置屏幕上从来没出现过，所以「从上一帧画在哪到这一帧画在哪」记一笔
+	 * 损伤就够 —— 拖得快的时候一帧能跨过一大截，只记新位置会漏。 */
+	if (server->grab_dirty && server->grab_view != NULL) {
+		struct vidow_view *gv = server->grab_view;
+		server->grab_dirty = false;
+		vidow_backdrop_damage_box(server, &server->grab_last_box);
+		/* 只有这个窗口自己动了：记在它头上，它自己的私有底衬（抓的时候它藏着）
+		 * 不该因为这一笔就过期。 */
+		vidow_backdrop_damage_view(gv);
+		vidow_view_apply_anim(gv);
+		server->grab_last_box = vidow_view_screen_box(gv);
+	}
+
 	/* 临时探针（VIDOW_RENDER_STATS=1）：每帧各阶段耗时 + 贴图导入/重建次数 */
 	int64_t st_t0 = vidow_now_ns();
 	vidow_blur_update(output);

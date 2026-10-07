@@ -83,6 +83,13 @@ xenv() { # <标签>
 	xdpyinfo 2>/dev/null | grep dimensions
 	xrandr --query 2>/dev/null | sed -n '2p'
 }
+# 这两个属性是 vidow 在 xwayland ready 时写的，X 侧（xrdb / xprop）读到它有个
+# 先后：刚 ready 就查，偶尔查到的还是空的那一版（实测两次里栽一次）。等到写进去
+# 为止再拍这一张 —— 属性只写一次，等一会儿不会把判据等松。
+for _ in $(seq 1 40); do
+	xprop -root 2>/dev/null | grep -q "Xft.dpi" && break
+	sleep 0.25
+done
 xenv "启动后" > "$RUNDIR/xenv-start.txt" 2>&1
 cat "$RUNDIR/xenv-start.txt"
 

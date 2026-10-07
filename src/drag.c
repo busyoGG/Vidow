@@ -68,6 +68,8 @@ void vidow_tile_grab_begin(struct vidow_server *server,
 	}
 	server->grab_mode = VIDOW_GRAB_TILE;
 	server->grab_view = view;
+	server->grab_dirty = false;
+	server->grab_last_box = vidow_view_screen_box(view);
 	view->dragging = true;
 	/* 果冻：把窗口现在显示的装饰结果挂到弹簧网格上。做不了就算了（装饰关着
 	 * 之类），拖动照旧。 */
@@ -94,19 +96,29 @@ void vidow_tile_grab_update(struct vidow_server *server, double lx, double ly) {
 		return;
 	}
 	/* 只改「画在哪」：布局（geom）一个字都不动，所以别的窗口不会跟着抖。 */
-	struct wlr_box before = vidow_view_screen_box(view);
 	view->anim_off_x = (lx - view->drag_dx) - view->geom.x;
 	view->anim_off_y = (ly - view->drag_dy) - view->geom.y;
-	/* 只有这个窗口自己动了：记在它头上，它自己的私有底衬（抓的时候它藏着）
-	 * 不该因为这一笔就过期。老位置也记一笔 —— 它挪走了，别人底衬里那块就过期了
-	 * （拖得快的时候一帧能跨过一大截，只记新位置会漏）。 */
-	vidow_backdrop_damage_box(server, &before);
-	vidow_backdrop_damage_view(view);
-	vidow_view_apply_anim(view);
+	/* 真正重画 / 记损伤推迟到这一帧要出帧之前（见 output.c 里那段）：指针比刷新
+	 * 快的时候一帧会来好几个移动事件，中间那些位置屏幕上从来没出现过 —— 以前
+	 * 每个事件都重画一遍这个窗口的装饰（整块窗口那么大的离屏渲染），实测每个事件
+	 * 66µs（1000Hz 鼠标 = 每帧 0.4ms，8000Hz = 每帧 3.3ms）。这里只记「还得摆一次」
+	 * 并要一帧。 */
+	server->grab_dirty = true;
+	/* 位置立刻摆（便宜：场景节点一动就自带损伤）。要帧那一下是**幂等**的
+	 * （wlr_output_schedule_frame 里有 frame_pending 挡着），所以一帧最多催出
+	 * 一次渲染，不会变成「每个事件渲染一遍」。 */
+	vidow_view_apply_anim_place(view);
+	vidow_output_schedule_frame(server, view->output, "拖动跟手");
 }
 
 void vidow_tile_grab_end(struct vidow_server *server) {
 	struct vidow_view *view = server->grab_view;
+	/* 还没摆出来的那个位置屏幕上没出现过，不用管；**已经画出来**的那个位置得记
+	 * 一笔 —— 松手之后窗口就离开那儿了，别人底衬里那一块得重抓。 */
+	if (view != NULL) {
+		vidow_backdrop_damage_box(server, &server->grab_last_box);
+	}
+	server->grab_dirty = false;
 	server->grab_mode = VIDOW_GRAB_NONE;
 	server->grab_view = NULL;
 	wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "left_ptr");
