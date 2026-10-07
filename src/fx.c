@@ -62,6 +62,17 @@ void vidow_fx_set_alpha(struct wlr_scene_node *node, double alpha) {
 
 static bool gl_make_current(struct vidow_server *server,
 		struct wlr_egl **out_egl) {
+	/* 先自己判一次渲染器类型，**不能**直接问 wlr_gles2_renderer_get_egl()：
+	 * 那个函数第一行就是 assert(wlr_renderer_is_gles2(renderer))，渲染器不是
+	 * GLES2（软件兜底的 pixman、或者显式 WLR_RENDERER=pixman）时它不是返回
+	 * NULL，是**当场 abort**。core dump 里那条
+	 *   #4 __assert_fail  #5 libwlroots+0x224c4  #6 libwlroots+0x2255f
+	 *   #7 gl_make_current  #8 vidow_fx_flush  #9 vidow_output_render
+	 * 就是这个（0x224c4 处那条断言的字面量是 wlr_renderer_is_gles2(wlr_renderer)，
+	 * 文件 render/gles2/renderer.c，函数 gles2_get_renderer）。 */
+	if (!wlr_renderer_is_gles2(server->renderer)) {
+		return false;
+	}
 	struct wlr_egl *egl = wlr_gles2_renderer_get_egl(server->renderer);
 	if (egl == NULL) {
 		return false;
@@ -749,6 +760,12 @@ static void end_pass(struct wlr_egl *egl) {
  * 放在 wlr_scene_output_commit 之前 —— 那之后 wlroots 可能走直扫（一个 GL 调用
  * 都不发），没人替我们 flush。 */
 void vidow_fx_flush(struct vidow_server *server) {
+	/* 一帧一次的提交只对「这一帧真的开过离屏趟」有意义，而那些趟全在
+	 * shader_ok 底下（装饰 / 模糊 / 果冻）。渲染器不是 GLES2 时这里必须直接
+	 * 走人：gl_make_current 会碰到 wlroots 那条 assert（见它开头那段）。 */
+	if (!server->shader_ok) {
+		return;
+	}
 	struct wlr_egl *egl = NULL;
 	if (!gl_make_current(server, &egl)) {
 		return;
