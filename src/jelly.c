@@ -409,6 +409,15 @@ bool vidow_jelly_begin(struct vidow_view *view) {
 	 * apply_anim 让它立刻生效，别等下一帧。 */
 	view->fx.jelly = true;
 	vidow_view_apply_anim(view);
+	{
+		/* 形变范围比窗口那块大一圈（见上面 tick 里的说明）。 */
+		struct wlr_box box = vidow_view_screen_box(view);
+		box.x -= 32;
+		box.y -= 32;
+		box.width += 64;
+		box.height += 64;
+		vidow_backdrop_damage_box(server, &box);
+	}
 	vidow_backdrop_damage_view(view); /* 只有它自己在形变 */
 	wlr_log(WLR_DEBUG, "jelly: %s 起手（%dx%d 网格 %dx%d，抓点 %d,%d）",
 		vidow_view_title(view) != NULL ? vidow_view_title(view) : "?",
@@ -679,7 +688,15 @@ void vidow_jelly_tick(struct vidow_server *server, int64_t now_ns) {
 		jelly->base_drawn_y = ty;
 		if (moved) {
 			/* 网格在动 -> 别的窗口背后的模糊底衬要重抓（和拖拽时那一下一样）；
-			 * 它自己的私有底衬不受影响（抓的时候它藏着）。 */
+			 * 它自己的私有底衬不受影响（抓的时候它藏着）。损伤范围比窗口那块大
+			 * 一圈：内容被掰弯了，最远弯出去 max_off 那么多。 */
+			struct wlr_box box = vidow_view_screen_box(view);
+			int pad = (int)max_off + 8;
+			box.x -= pad;
+			box.y -= pad;
+			box.width += 2 * pad;
+			box.height += 2 * pad;
+			vidow_backdrop_damage_box(server, &box);
 			vidow_backdrop_damage_view(view);
 			/* 节点在树里的相对位置固定，只有内容在变：重画一次。 */
 			jelly_render(jelly);

@@ -443,6 +443,12 @@ struct vidow_fx_target {
 	struct wlr_texture *own_bd_tex;
 	int own_bd_w, own_bd_h;
 
+	/* 上一次重建之后、落在「这张底衬管得着的范围」里的损伤（**布局逻辑坐标**；
+	 * 宽或高 <= 0 = 没有；「整屏都算」时填一个巨大的盒子）。世界代次只是粗筛：
+	 * 别的窗口在屏幕另一头重画（视频 / 浏览器）不该让我这张底衬重抓，真正的判据
+	 * 是「这次损伤有没有碰到我这一块」（见 blur_note_damage / blur_damage_hits）。 */
+	struct wlr_box pending_damage;
+
 	/* ext-background-effect 的模糊区域（窗口局部坐标）。blur_region_on 为
 	 * true 时着色器只在这个盒子里画模糊；-1 表示不限制。 */
 	bool blur_region_on;
@@ -1566,6 +1572,15 @@ void vidow_blur_update(struct vidow_output *output);
  * or a background/bottom layer surface; false for anything that only moves or
  * repaints windows. */
 void vidow_backdrop_damage(struct vidow_server *server, bool layers);
+/* 只记一笔损伤区域（布局逻辑坐标，同 pending_damage 的说明），不动世界代次 ——
+ * 给「窗口挪走之后，老位置也得让别人的底衬重抓」这种一个事件两处损伤用。 */
+void vidow_backdrop_damage_box(struct vidow_server *server,
+		const struct wlr_box *box);
+/* 窗口「现在画在哪」：布局几何 + 动画偏移（拖拽 / 开合 / overview 都算在这上面）。 */
+struct wlr_box vidow_view_screen_box(const struct vidow_view *view);
+/* 同上，但世界代次也前进：这次变的**就是** box 这一块（关窗动画那种）。 */
+void vidow_backdrop_damage_region(struct vidow_server *server,
+		const struct wlr_box *box);
 /* 同上，但这一笔账记在某个窗口头上：它自己变了（不影响它自己的私有底衬）。 */
 void vidow_backdrop_damage_view(struct vidow_view *view);
 /* Release the blur resources an output owns. */

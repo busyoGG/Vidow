@@ -94,10 +94,13 @@ void vidow_tile_grab_update(struct vidow_server *server, double lx, double ly) {
 		return;
 	}
 	/* 只改「画在哪」：布局（geom）一个字都不动，所以别的窗口不会跟着抖。 */
+	struct wlr_box before = vidow_view_screen_box(view);
 	view->anim_off_x = (lx - view->drag_dx) - view->geom.x;
 	view->anim_off_y = (ly - view->drag_dy) - view->geom.y;
 	/* 只有这个窗口自己动了：记在它头上，它自己的私有底衬（抓的时候它藏着）
-	 * 不该因为这一笔就过期。 */
+	 * 不该因为这一笔就过期。老位置也记一笔 —— 它挪走了，别人底衬里那块就过期了
+	 * （拖得快的时候一帧能跨过一大截，只记新位置会漏）。 */
+	vidow_backdrop_damage_box(server, &before);
 	vidow_backdrop_damage_view(view);
 	vidow_view_apply_anim(view);
 }

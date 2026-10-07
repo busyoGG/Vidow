@@ -1086,8 +1086,11 @@ struct vidow_view *vidow_view_from_surface(struct vidow_server *server,
 static void view_move_update(void *data, double t, double linear) {
 	(void)linear;
 	struct vidow_view *view = data;
+	/* 滑动两端都算损伤：漏了老位置，别的窗口底衬里会留着它上一帧的残影。 */
+	struct wlr_box rest = view->geom;
 	view->anim_off_x = view->anim_from_x * (1.0 - t);
 	view->anim_off_y = view->anim_from_y * (1.0 - t);
+	vidow_backdrop_damage_box(view->server, &rest);
 	vidow_backdrop_damage_view(view); /* 只有它自己在动 */
 	vidow_view_apply_anim(view);
 }
@@ -1123,6 +1126,11 @@ static void view_open_update(void *data, double t, double linear) {
 	view->anim_scale = cfg->open_scale_from +
 		(1.0 - cfg->open_scale_from) * t;
 	view->fx.progress = t;
+	/* 开窗动画（缩放 + 滑入）：静止那一块（缩放 1、偏移 0）也算损伤。 */
+	{
+		struct wlr_box rest = view->geom;
+		vidow_backdrop_damage_box(view->server, &rest);
+	}
 	vidow_backdrop_damage_view(view); /* 只有它自己在动 */
 	vidow_view_apply_anim(view);
 }
@@ -1270,12 +1278,21 @@ void vidow_place_view(struct vidow_view *view, int x, int y, int w, int h) {
 	 * 得到的是新位置减新位置 = 0，动画照跑 190ms / 30 帧但一格都不动。 */
 	int drawn_x = view->geom.x + (int)lround(view->anim_off_x);
 	int drawn_y = view->geom.y + (int)lround(view->anim_off_y);
+	struct wlr_box before = {
+		.x = drawn_x, .y = drawn_y,
+		.width = view->geom.width, .height = view->geom.height,
+	};
 
 	view->geom = (struct wlr_box){ .x = x, .y = y, .width = w, .height = h };
 	/* 布局真的把它挪/缩了（或者第一次摆）：这一笔记在**它自己**头上。它自己的
 	 * 私有底衬（抓的时候它藏着）不受影响；别的窗口因为世界代次前进而重抓 ——
-	 * 拖动时每动一下就重摆一次，分账全靠这里（见 vidow_arrange）。 */
+	 * 拖动时每动一下就重摆一次，分账全靠这里（见 vidow_arrange）。
+	 *
+	 * 老位置也单独记一笔：别的窗口的底衬里画着它，它挪走了那张图就过期了 ——
+	 * 只记新位置的话，一步跳出去老远（拖得快、或者工作区切换）就漏掉了老位置
+	 * 那一块，别的窗口底衬里会留着它的残影。 */
 	if (moved || resized || !view->placed) {
+		vidow_backdrop_damage_box(view->server, &before);
 		vidow_backdrop_damage_view(view);
 	}
 	wlr_log(WLR_DEBUG, "place %s -> %d,%d %dx%d",
@@ -2108,7 +2125,11 @@ void vidow_view_set_minimized(struct vidow_view *view, bool minimized) {
 
 	vidow_workspace_apply_visibility(server);
 	vidow_arrange(server);
-	vidow_backdrop_damage(server, false);
+	/* 显隐翻转的是它自己这一块（重排里已经按每个窗口记过账了）。 */
+	{
+		struct wlr_box box = vidow_view_screen_box(view);
+		vidow_backdrop_damage_region(server, &box);
+	}
 	vidow_ipc_emit_window(server, minimized ? "window-minimized" :
 		"window-unminimized", view);
 }

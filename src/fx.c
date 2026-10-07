@@ -911,11 +911,107 @@ static void dump_target(struct vidow_server *server,
 /* Everything that can end up inside a blurred backdrop bumps one of these two
  * counters. Cheap, and it is what lets a still desktop skip the whole kawase
  * chain: an unchanged generation means the cached pyramid is still correct. */
-void vidow_backdrop_damage(struct vidow_server *server, bool layers) {
+/* ------------------------------------------------- 损伤区域（私有底衬的重抓判据） */
+
+/* 两个盒子有没有重叠（宽高 <= 0 的空盒子永远不重叠）。用 64 位算，因为「整屏都
+ * 算」那个盒子故意填得很大。 */
+static bool blur_box_touch(const struct wlr_box *a, const struct wlr_box *b) {
+	if (a->width <= 0 || a->height <= 0 || b->width <= 0 || b->height <= 0) {
+		return false;
+	}
+	int64_t ax2 = (int64_t)a->x + a->width, ay2 = (int64_t)a->y + a->height;
+	int64_t bx2 = (int64_t)b->x + b->width, by2 = (int64_t)b->y + b->height;
+	return (int64_t)a->x < bx2 && (int64_t)b->x < ax2 &&
+		(int64_t)a->y < by2 && (int64_t)b->y < ay2;
+}
+
+/* 把 src 并进 dst（dst 为空就直接是 src）。 */
+static void blur_box_add(struct wlr_box *dst, const struct wlr_box *src) {
+	if (src->width <= 0 || src->height <= 0) {
+		return;
+	}
+	if (dst->width <= 0 || dst->height <= 0) {
+		*dst = *src;
+		return;
+	}
+	int x1 = dst->x < src->x ? dst->x : src->x;
+	int y1 = dst->y < src->y ? dst->y : src->y;
+	int x2 = dst->x + dst->width > src->x + src->width ?
+		dst->x + dst->width : src->x + src->width;
+	int y2 = dst->y + dst->height > src->y + src->height ?
+		dst->y + dst->height : src->y + src->height;
+	*dst = (struct wlr_box){ .x = x1, .y = y1, .width = x2 - x1, .height = y2 - y1 };
+}
+
+/* 「整屏都算」用的盒子：故意大到碰得到任何东西（不参与算术，只被 blur_box_touch
+ * 比大小，那边是 64 位）。 */
+static const struct wlr_box blur_box_all = {
+	.x = -0x40000000, .y = -0x40000000,
+	.width = 0x7fffffff, .height = 0x7fffffff,
+};
+
+/* 把「刚变了的这块区域」（布局逻辑坐标）记到每个需要私有底衬的元素头上；skip 那
+ * 个元素自己不记（它自己的变化不该让它自己的底衬过期 —— 抓的时候它是藏着的）。
+ * 记进来的盒子一直攒着，直到那个元素真的重抓一次才清掉：这样「损伤在屏幕另一头」
+ * 攒再多也不会让它重抓，而一旦有一笔碰到它那一块，攒下来的这笔账仍然算数。 */
+static void blur_note_damage(struct vidow_server *server,
+		const struct wlr_box *box, const struct vidow_view *skip) {
+	if (box == NULL || box->width <= 0 || box->height <= 0) {
+		return;
+	}
+	struct vidow_view *view;
+	wl_list_for_each(view, &server->views, link) {
+		if (view == skip) {
+			continue;
+		}
+		blur_box_add(&view->fx.pending_damage, box);
+	}
+	struct vidow_layer_surface *ls;
+	wl_list_for_each(ls, &server->layers, link) {
+		blur_box_add(&ls->fx.pending_damage, box);
+	}
+}
+
+void vidow_backdrop_damage_box(struct vidow_server *server,
+		const struct wlr_box *box) {
+	blur_note_damage(server, box, NULL);
+}
+
+/* 私有底衬要不要因为这次损伤重抓：损伤盒子空 = 没损伤（不用）；否则看它跟
+ * 「这张底衬管得着的那块区域」（布局逻辑坐标）碰不碰得到。区域本身已经把模糊
+ * 半径算进去了（见 view_region_rect），所以碰到区域就是碰到能影响它的内容。 */
+static bool blur_damage_hits(const struct vidow_fx_target *fx,
+		const struct wlr_box *region) {
+	return blur_box_touch(&fx->pending_damage, region);
+}
+
+/* 窗口「现在画在哪」：布局几何 + 动画偏移（拖拽 / 开合 / overview 都算在这上面）。 */
+struct wlr_box vidow_view_screen_box(const struct vidow_view *view) {
+	struct wlr_box box = view->geom;
+	box.x += (int)lround(view->anim_off_x);
+	box.y += (int)lround(view->anim_off_y);
+	return box;
+}
+
+/* 世界代次前进（损伤区域由调用方决定记哪一块）。 */
+static void damage_bump(struct vidow_server *server, bool layers) {
 	server->gen_scene++;
 	if (layers) {
 		server->gen_layer++;
 	}
+}
+
+void vidow_backdrop_damage(struct vidow_server *server, bool layers) {
+	damage_bump(server, layers);
+	/* 不知道具体变的是哪一块（配置、输出、layer、overview、重排这些）：整屏
+	 * 都算。宁可多抓一次，不能糊着旧的 —— 精确的损伤区域见下面两个入口。 */
+	blur_note_damage(server, &blur_box_all, NULL);
+}
+
+void vidow_backdrop_damage_region(struct vidow_server *server,
+		const struct wlr_box *box) {
+	damage_bump(server, false);
+	blur_note_damage(server, box, NULL);
 }
 
 /* 只有某个窗口自己变了的那些改动（它被拖、内容重画、开合动画、果冻形变）：
@@ -923,13 +1019,16 @@ void vidow_backdrop_damage(struct vidow_server *server, bool layers) {
  * 个窗口」（抓的时候它自己藏着），所以那张图只跟 gen_scene - self_gen 有关 ——
  * 不记这一笔，拖一个重叠窗口时它自己的底衬每帧都被判过期，白重抓一遍。 */
 void vidow_backdrop_damage_view(struct vidow_view *view) {
+	struct wlr_box box = vidow_view_screen_box(view);
 	view->self_gen++;
+	damage_bump(view->server, false);
+	/* 变的是它自己这一块：别人（底衬里画着它）得重抓，它自己不用。 */
+	blur_note_damage(view->server, &box, view);
 	/* 一次 arrange 里只要有一个「不是正被拖的那个」窗口报了自己变了，这一趟就
 	 * 不能整笔算在被拖的那个头上（见 vidow_arrange）。 */
 	if (view->server->arrange_self_only && view->server->grab_view != view) {
 		view->server->arrange_self_only = false;
 	}
-	vidow_backdrop_damage(view->server, false);
 }
 
 int vidow_fx_pad(struct vidow_server *server) {
@@ -1250,27 +1349,20 @@ static void view_set_capture_visible(struct vidow_view *view, bool on) {
 	vidow_jelly_capture_visible(view, on);
 }
 
-static struct wlr_box view_screen_box(struct vidow_view *view) {
-	struct wlr_box box = view->geom;
-	box.x += (int)lround(view->anim_off_x);
-	box.y += (int)lround(view->anim_off_y);
-	return box;
-}
-
 /* A window whose box intersects another window cannot use the shared
  * wallpaper-only backdrop: it would lose the window underneath it. Those get
  * a private capture instead. Tiled windows never overlap, so the shared one
  * covers the whole scrolling layout. */
 static bool view_overlaps_other(struct vidow_view *view) {
 	struct vidow_server *server = view->server;
-	struct wlr_box a = view_screen_box(view);
+	struct wlr_box a = vidow_view_screen_box(view);
 	struct vidow_view *other;
 	wl_list_for_each(other, &server->views, link) {
 		if (other == view || !other->mapped || !other->placed ||
 				other->output != view->output) {
 			continue;
 		}
-		struct wlr_box b = view_screen_box(other);
+		struct wlr_box b = vidow_view_screen_box(other);
 		if (a.x < b.x + b.width && b.x < a.x + a.width &&
 				a.y < b.y + b.height && b.y < a.y + a.height) {
 			return true;
@@ -1484,7 +1576,7 @@ static bool view_region_rect(struct vidow_server *server,
 		scale = 1.0;
 	}
 	int pad = vidow_fx_pad(server);
-	struct wlr_box box = view_screen_box(view);
+	struct wlr_box box = vidow_view_screen_box(view);
 	int lv = blur_levels_for(server, server->output_w, server->output_h);
 	int margin = blur_reach_px(server, lv);
 	/* 装饰矩形 = 可见窗口 ± pad（逻辑单位），再往外放一圈模糊半径。 */
@@ -1636,6 +1728,7 @@ static bool view_region_build(struct vidow_server *server,
 	}
 
 	vidow_stats.own++;
+	fx->pending_damage = (struct wlr_box){0}; /* 这一版的账已经算清了 */
 	blur_own_drop(fx);
 	if (!blur_set_alloc(server, &fx->blur_set, rw, rh, levels)) {
 		return false;
@@ -1787,11 +1880,25 @@ void vidow_blur_update(struct vidow_output *output) {
 			continue;
 		}
 		/* 抓的时候这个窗口是藏起来的，所以它自己的位置和内容都不进这张图：
-		 * 键看的是「世界减掉这个窗口」的代次（vidow_backdrop_damage_view），
-		 * 加上区域本身 —— 区域对齐到网格，所以窗口小范围挪动时它不变。 */
+		 * 世界代次只是粗筛，真正的判据是「这次损伤有没有碰到我这一块」—— 别的
+		 * 窗口在屏幕另一头重画（视频 / 浏览器每帧都在交帧）不该让我重抓。
+		 * 区域本身已经把模糊半径算进去了（见 view_region_rect）。 */
+		double oscale = output->wlr_output->scale;
+		if (!(oscale > 0.0)) {
+			oscale = 1.0;
+		}
+		struct wlr_box region_logical = {
+			.x = output->box.x + (int)floor((double)rx / oscale),
+			.y = output->box.y + (int)floor((double)ry / oscale),
+			.width = (int)ceil((double)rw / oscale) + 1,
+			.height = (int)ceil((double)rh / oscale) + 1,
+		};
+		bool key_changed =
+			view->fx.blur_set.gen != server->gen_scene - view->self_gen;
+		bool touched = key_changed &&
+			blur_damage_hits(&view->fx, &region_logical);
 		bool fresh = view->fx.blur_set.valid &&
-			view->fx.blur_own_tex != NULL &&
-			view->fx.blur_set.gen == server->gen_scene - view->self_gen &&
+			view->fx.blur_own_tex != NULL && !touched &&
 			view->fx.blur_set.w == rw && view->fx.blur_set.h == rh &&
 			view->fx.blur_set.levels == rlevels &&
 			fabs(view->fx.blur_set.offset - server->config.blur_offset) < 1e-6 &&
@@ -2397,6 +2504,7 @@ static bool layer_region_build(struct vidow_server *server,
 		return false;
 	}
 
+	ls->fx.pending_damage = (struct wlr_box){0}; /* 这一版的账已经算清了 */
 	/* 旧贴图裹着的缓冲马上要被金字塔复用。 */
 	blur_own_drop(&ls->fx);
 	if (!blur_set_alloc(server, &ls->fx.blur_set, rw, rh, levels)) {
@@ -2502,10 +2610,12 @@ static bool layer_blur_frame(struct vidow_server *server,
 		int levels = blur_levels_for(server, px_w, px_h);
 		/* 缓存键：区域（含输出原点，多屏下会动）、世界代次（窗口重画 / layer
 		 * 变动）、级数、还有那两套直接影响结果的参数。 */
-		bool fresh = ls->bd != NULL && fx->blur_own_tex != NULL &&
+		/* 同窗口那条路：世界代次只是粗筛，损伤盒子没碰到这一块就不重抓。 */
+		bool key_changed = ls->bd_gen_scene != server->gen_scene;
+		bool touched = key_changed && blur_damage_hits(fx, &ls->geom);
+		bool fresh = ls->bd != NULL && fx->blur_own_tex != NULL && !touched &&
 			ls->bd_w == px_w && ls->bd_h == px_h &&
 			ls->bd_x == rx && ls->bd_y == ry &&
-			ls->bd_gen_scene == server->gen_scene &&
 			ls->bd_gen_layer == server->gen_layer &&
 			fx->blur_set.w == px_w && fx->blur_set.h == px_h &&
 			fx->blur_set.levels == levels &&
@@ -2665,7 +2775,15 @@ static void closing_update(void *data, double t, double linear) {
 	closing->off_y = (double)closing->slide_px * t;
 	closing->fx.anim_scale = 1.0 + (closing->anim_scale_to - 1.0) * t;
 	closing->fx.progress = t;
-	vidow_backdrop_damage(closing->server, false);
+	/* 变的就是这张快照（滑下去 + 缩放），别整屏都算损伤 —— 关窗动画每帧都在动，
+	 * 整屏都算的话别人的底衬会跟着每帧重抓。 */
+	{
+		struct wlr_box box = {
+			.x = closing->x, .y = closing->y,
+			.width = closing->w, .height = closing->h,
+		};
+		vidow_backdrop_damage_region(closing->server, &box);
+	}
 
 	int y = closing->y + (int)lround(closing->off_y);
 	if (closing->fx.active) {
