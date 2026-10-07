@@ -44,6 +44,20 @@ void vidow_output_render(struct vidow_output *output) {
 	server->output_x = (int)lround(box.x * scale);
 	server->output_y = (int)lround(box.y * scale);
 
+	/* 探针：拖拽的「指针事件 -> 出帧」延迟（这一帧要出帧了，把从最后一个事件到现在
+	 * 的时间记一笔）。嵌套在别的合成器里时，光标是**上层**画的、窗口是我们画的，
+	 * 这个延迟直接决定「跟不跟手」。 */
+	if (getenv("VIDOW_RENDER_STATS") != NULL && server->grab_ev_ns != 0 &&
+			(server->grab_dirty || server->arrange_dirty)) {
+		int64_t lat = vidow_now_ns() - server->grab_ev_ns;
+		vidow_stats.grab_lat_ns += lat;
+		if (lat > vidow_stats.grab_lat_max_ns) {
+			vidow_stats.grab_lat_max_ns = lat;
+		}
+		vidow_stats.grab_lat_n++;
+		server->grab_ev_ns = 0;
+	}
+
 	/* overview 开着的话先把变换算好、把窗口按它摆一遍（缩放里每帧都要摆，
 	 * 因为客户端 commit 会把场景尺寸改回去）。 */
 	vidow_overview_update(server);
@@ -115,7 +129,7 @@ void vidow_output_render(struct vidow_output *output) {
 				"渲染统计: %d 帧/帧窗(%.0fms) %.1f fps | 模糊 %.2fms/帧"
 				"(shared %d own %d chain %d) | 装饰 %.2fms/帧(%d 次重烘) | "
 				"果冻 %.2fms/帧 | 提交 %.2fms/帧 | 贴图 +%d/-%d | 趟 %d | "
-				"重烘 %.2fms/帧",
+				"重烘 %.2fms/帧 | 拖拽延迟 %.2f/%.2fms(%d)",
 				vidow_stats.frames, (double)(st_t4 - win_ns) / 1e6,
 				1000.0 * f / ((double)(st_t4 - win_ns) / 1e6),
 				(double)vidow_stats.blur_ns / 1e6 / f,
@@ -124,7 +138,11 @@ void vidow_output_render(struct vidow_output *output) {
 				(double)vidow_stats.jelly_ns / 1e6 / f,
 				(double)vidow_stats.commit_ns / 1e6 / f,
 				vidow_stats.tex_new, vidow_stats.tex_del, vidow_stats.passes,
-				(double)vidow_stats.bake_ns / 1e6 / f);
+				(double)vidow_stats.bake_ns / 1e6 / f,
+				vidow_stats.grab_lat_n > 0 ?
+					(double)vidow_stats.grab_lat_ns / 1e6 / vidow_stats.grab_lat_n : 0.0,
+				(double)vidow_stats.grab_lat_max_ns / 1e6,
+				vidow_stats.grab_lat_n);
 			vidow_stats = (struct vidow_frame_stats){0};
 			win_ns = st_t4;
 		}
@@ -243,7 +261,11 @@ static int capture_watchdog(void *data) {
  * dry up while an animation is in flight, drive it from a timer instead. */
 static int anim_watchdog(void *data) {
 	struct vidow_server *server = data;
-	if (!vidow_anim_pending(server) && !vidow_jelly_pending(server)) {
+	/* 拖着窗口也算「有活在飞」：浮动拖拽的落位是推迟到帧里做的（见 float.c 的
+	 * arrange_dirty），帧一停它就**一点都不动** —— 上层合成器一旦不给帧事件
+	 * （嵌套在别的合成器里、窗口被盖住 / 那台合成器自己闲着），拖动就冻住。 */
+	if (!vidow_anim_pending(server) && !vidow_jelly_pending(server) &&
+			server->grab_view == NULL) {
 		return 0;
 	}
 	int64_t now = vidow_now_ns();
@@ -321,9 +343,10 @@ static void output_frame(struct wl_listener *listener, void *data) {
 	 * opacity change on a fully occluded window). Ask for the next frame
 	 * anyway, and arm the watchdog in case the request goes nowhere.
 	 * 拖着果冻也一样：网格在动，帧不能停。 */
-	if (vidow_anim_pending(server) || vidow_jelly_pending(server)) {
+	if (vidow_anim_pending(server) || vidow_jelly_pending(server) ||
+			server->grab_view != NULL) {
 		vidow_output_schedule_frame(server, output->wlr_output,
-			"动画/果冻在跑");
+			server->grab_view != NULL ? "拖动在跑" : "动画/果冻在跑");
 		vidow_output_kick_watchdog(server);
 	}
 }

@@ -104,11 +104,15 @@ void vidow_tile_grab_update(struct vidow_server *server, double lx, double ly) {
 	 * 66µs（1000Hz 鼠标 = 每帧 0.4ms，8000Hz = 每帧 3.3ms）。这里只记「还得摆一次」
 	 * 并要一帧。 */
 	server->grab_dirty = true;
+	server->grab_ev_ns = vidow_now_ns(); /* 探针：量「事件 -> 出帧」延迟 */
 	/* 位置立刻摆（便宜：场景节点一动就自带损伤）。要帧那一下是**幂等**的
 	 * （wlr_output_schedule_frame 里有 frame_pending 挡着），所以一帧最多催出
 	 * 一次渲染，不会变成「每个事件渲染一遍」。 */
 	vidow_view_apply_anim_place(view);
 	vidow_output_schedule_frame(server, view->output, "拖动跟手");
+	/* 顺手把保帧看门狗武装上：要帧那一下可能被「后端已经欠着一帧」挡掉
+	 * （嵌套在别的合成器里时很常见），没有看门狗就没人再推了 —— 拖动会冻住。 */
+	vidow_output_kick_watchdog(server);
 }
 
 void vidow_tile_grab_end(struct vidow_server *server) {

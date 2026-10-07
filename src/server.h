@@ -1116,6 +1116,9 @@ struct vidow_clipboard {
 struct vidow_frame_stats {
 	int shared, own, chains, bakes, tex_new, tex_del, frames, passes;
 	int64_t blur_ns, decor_ns, jelly_ns, commit_ns, bake_ns;
+	/* 探针：拖拽的「指针事件 -> 出帧」延迟 */
+	int64_t grab_lat_ns, grab_lat_max_ns;
+	int grab_lat_n;
 };
 extern struct vidow_frame_stats vidow_stats;
 
@@ -1304,6 +1307,8 @@ struct vidow_server {
 	struct wlr_box grab_last_box;
 	/* 浮动窗口拖拽同理：每帧最多重排一次（见 vidow_float_grab_update）。 */
 	bool arrange_dirty;
+	/* 探针：最近一次拖拽移动事件的时刻（见 output.c 的拖拽延迟统计） */
+	int64_t grab_ev_ns;
 
 	/* overview（niri 风格全景） */
 	struct vidow_overview overview;

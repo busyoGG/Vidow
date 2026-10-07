@@ -773,6 +773,7 @@ python3 test-float.py        # 三个真实 GTK 窗口，验证浮动模式自�
 ./test-preinit.sh                    # 状态请求抢在第一次 commit 之前（set_maximized /
                                      #   set_minimized / set_fullscreen）不许把合成器打死（22 项断言）
 ./test-drag.sh                       # 拖窗口：拖得动 / 跨屏改归属 / 平铺按落点插入（11 项）
+./test-drag-stall.sh                 # 后端不给帧事件时，拖动照样跟手（浮窗 + 平铺两个case，10 项断言）
 ./test-ws-dynamic.sh                 # 动态工作区：栈底空位 / 空了就收 / 序号夹住 / 具名永存（9 项）
 ./test-dpi.sh                        # 混合 DPI + XWayland：装饰缓冲按**窗口几何**算（见 SSD 那节）
 ./build/jsontest                     # 只看 JSON 写出/读入（离线，30 项）
@@ -802,7 +803,7 @@ WLR_BACKENDS=headless WLR_HEADLESS_OUTPUTS=1 WLR_LIBINPUT_NO_DEVICES=1 ./build/v
 | `VIDOW_MASK_DUMP=N` | 前 N 份透明度剔除的 mask（layer 自己的内容）dump 成 `/tmp/vidow-mask-*` |
 | `VIDOW_BLUR_NO_PARTIAL=1` | 关掉「模糊链条只重跑受损那一小块」（强制整块重跑）。只给 A/B 比对用：局部和整块的结果必须逐像素一样，见 `./test-blurpartial.sh` |
 | `VIDOW_BLUR_NO_PARTIAL_FILE=路径` | 同上，但那个文件一出现才切过去 —— 同一个进程、同一个场景里就能比对两种方式（test-blurpartial.sh 用的就是这个） |
-| `VIDOW_RENDER_STATS=1` | 每 500ms 一行渲染统计：每帧各阶段耗时（模糊 / 装饰 / 果冻 / 提交）、私有底衬重建次数、**vidow 自己那些目标缓冲的贴图导入次数**、离屏趟数（`趟`）、装饰重烘总耗时（`重烘`）、帧率。查「拖窗口卡」先在真机上跑这个看每帧干了多少活，再谈优化 |
+| `VIDOW_RENDER_STATS=1` | 每 500ms 一行渲染统计：每帧各阶段耗时（模糊 / 装饰 / 果冻 / 提交）、私有底衬重建次数、**vidow 自己那些目标缓冲的贴图导入次数**、离屏趟数（`趟`）、装饰重烘总耗时（`重烘`）、**拖拽延迟（`拖拽延迟 平均/最大ms(次数)`：从最后一个指针移动事件到这一帧出帧）**、帧率。查「拖窗口卡」先在真机上跑这个看每帧干了多少活，再谈优化 |
 
 ## 快捷键
 
@@ -3580,6 +3581,49 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
      没有**（不误报）；②掐断帧链 + 追踪开：客户端确实交过帧，追踪报出 ERROR 且点名
      HEADLESS-1、写明「客户端还在交帧，屏幕却不更新」；③掐断帧链 + 追踪**关**：一条 trace
      日志都没有、vidow 照样活着（诊断不改变行为）。
+
+150. **后端不给帧事件的时候，拖动不再冻住：保帧看门狗把「正在拖」也算进来**。
+
+     用户报「hyprland 嵌套启动的 vidow，拖拽非常不跟手」。在用户的 Hyprland 会话里嵌套
+     跑起来量（`./build/vidow` + `WLR_BACKENDS=wayland`，注入拖拽，`VIDOW_RENDER_STATS=1`
+     + `VIDOW_TRACE_FRAMES=1`）——
+
+     | 时间 | 出帧 |
+     | --- | --- |
+     | 起来头 0.5s | 143.9 fps |
+     | 拖之前 | 22.2 fps（1126ms 里 25 帧） |
+     | **拖的这 2.9 秒** | **0.3 fps（1 帧）** |
+     | 松手之后 | 144 fps |
+
+     帧追踪那两行点得很清楚：`trace: WL-1 1540ms 没出帧（vidow 主动要过 597 帧，最近一次：
+     拖浮动窗口）` —— 要了 597 次帧，一帧都没来。原因在嵌套后端：帧事件只由**上层合成器**
+     送来（`wl_surface.frame` 回调，wlroots 的 wayland 后端在每次 commit 时申请），
+     上层一旦不给（窗口被别的窗口盖住 / 那台合成器自己闲着），`frame_pending` 就一直挂着，
+     之后所有 `wlr_output_schedule_frame()` 全是空转。
+
+     vidow 本来就有对付这件事的看门狗（`src/output.c` 的 `anim_watchdog`：40ms 没帧就自己
+     推一帧），但它的条件只有「动画 / 果冻在跑」——**拖动不在里面**，而且它只在动画开始时
+     武装。于是：拖的时候帧事件一断，没人再推帧，而浮动拖拽的落位是**推迟到帧里**做的
+     （见 float.c 的 `arrange_dirty`），帧停了它就一点都不动 —— 屏幕上就是「光标在走、
+     窗口不动」。
+
+     改法（三处，都在「有活在飞」这条线上）：
+     - `anim_watchdog` 的条件加上「正在拖」（`server->grab_view != NULL`）；
+     - 两个拖动更新处（`vidow_tile_grab_update` / `vidow_float_grab_update`）要帧之后顺手
+       武装看门狗（要帧那一下本身可能被「后端已经欠着一帧」挡掉）；
+     - `output_frame` 收尾那一支同样把「正在拖」算进来，并在追踪里写成「拖动在跑」。
+
+     验证（新增 `./test-drag-stall.sh`，10 项断言；用现成的测试钩子
+     `VIDOW_TEST_STALL_OUTPUT=HEADLESS-1` 把帧事件按住，headless 上就能复现）：
+     把修复回退掉跑一遍 —— 按着左键拖 240x120，窗口**一动不动**（`geometry` 还是 100,100），
+     拖动期间 0 帧；带上修复：位置跟着走到 340,220，拖动期间 7 帧（看门狗推的），
+     平铺拖拽那条 28 帧。嵌套实测：拖的那两秒 144~210 fps，vidow 侧的
+     「事件 → 出帧」延迟 0.9~2.6ms（最大 6.7ms）。
+
+     顺带给 `VIDOW_RENDER_STATS=1` 加了一项 `拖拽延迟 平均/最大ms(次数)`：它就是上面那个
+     延迟，嵌套在别的合成器里时「跟不跟手」看这一项。另记一条排查结论：嵌套模式下**光标
+     是上层合成器画的**（vidow 没有光标平面），所以上层一旦不给我们帧，光标照走、窗口不走，
+     看着就是「完全不跟手」—— 这也是这条修复要治的。
 
 149. **一帧的离屏趟只提交一次：每趟一次 `eglMakeCurrent(EGL_NO_CONTEXT)` / `glFlush` 是白付的内核提交**。
 

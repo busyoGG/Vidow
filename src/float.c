@@ -523,7 +523,11 @@ void vidow_float_grab_update(struct vidow_server *server, double lx,
 	 * 都整排一次（所有窗口重新 place，每个都要重烘装饰图），实测每个事件 70µs
 	 * （1000Hz 鼠标 = 每帧 0.44ms，8000Hz = 每帧 3.5ms，全是白算的）。 */
 	server->arrange_dirty = true;
+	server->grab_ev_ns = vidow_now_ns(); /* 探针：量「事件 -> 出帧」延迟 */
 	vidow_output_schedule_frame(server, view->output, "拖浮动窗口");
+	/* 同上：浮动拖拽的落位是推迟到帧里做的，帧一停它一点都不动，所以这里
+	 * 必须保证「就算后端不给帧事件，帧也照出」（见 output.c 的 anim_watchdog）。 */
+	vidow_output_kick_watchdog(server);
 }
 
 void vidow_float_end_grab(struct vidow_server *server) {
