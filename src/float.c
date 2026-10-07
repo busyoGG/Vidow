@@ -439,9 +439,12 @@ void vidow_float_detach_children(struct vidow_server *server,
 /* --------------------------------------------------------------- grabs */
 
 void vidow_float_begin_grab(struct vidow_server *server,
-		struct vidow_view *view, bool resize) {
+		struct vidow_view *view, bool resize, bool from_client) {
 	server->grab_mode = resize ? VIDOW_GRAB_RESIZE : VIDOW_GRAB_MOVE;
 	server->grab_view = view;
+	/* 客户端自己发起的那次（见 server.h 里 grab_client_press 的说明）：按下
+	 * 已经转给它了，松手也要转给它，状态才对称。 */
+	server->grab_client_press = from_client;
 	/* 拖动有果冻，改大小没有：改大小每帧换源缓冲尺寸，网格对不上（见 jelly.c）。 */
 	if (!resize) {
 		vidow_jelly_begin(view);
@@ -543,6 +546,7 @@ void vidow_float_end_grab(struct vidow_server *server) {
 	struct vidow_view *view = server->grab_view;
 	server->grab_mode = VIDOW_GRAB_NONE;
 	server->grab_view = NULL;
+	server->grab_client_press = false;
 	wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "left_ptr");
 	if (view != NULL) {
 		vidow_jelly_release(view);

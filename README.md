@@ -3587,6 +3587,57 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
      HEADLESS-1、写明「客户端还在交帧，屏幕却不更新」；③掐断帧链 + 追踪**关**：一条 trace
      日志都没有、vidow 照样活着（诊断不改变行为）。
 
+159. **「用标题栏拖一次之后窗口就不听使唤」：客户端那次「按下」永远等不到「松开」**。
+
+     用户报「微信登录界面用 win 加左键拖拽是正常的，**直接通过标题区域拖拽**就会出问题」。
+     两条路只差一处：Mod+左键那条**按下是合成器吃掉的**，客户端压根没见过；标题栏拖拽是
+     **客户端自己发起**的（CSD 标题栏 → `xdg_toplevel.move`；X11 是 `_NET_WM_MOVERESIZE` →
+     `request_move`），它的按下在 `vidow_pointer_button` 末尾已经 `notify_button(PRESSED)`
+     转给客户端了。
+
+     而松手那条分支（`if (!pressed) { *_end_grab(); return; }`）把松开一起吃掉 —— 客户端手里
+     那次按下永远等不到配对的松开。GTK 的 `in_move_drag`、Chromium 的鼠标键状态都靠松开复位，
+     于是它**一直以为左键按着**：鼠标一动它还在拖，之后第一下点击被当成「按下」而不是
+     「点一下」，得再点一次才能恢复（用户描述的「点一下界面、移出去再移回来再点一次」正是这个）。
+
+     改法：`server->grab_client_press` —— `vidow_float_begin_grab()` 多一个 `from_client`
+     参数，客户端发起的那四条路（xdg 的 request_move/request_resize、x11 的
+     request_move/request_resize）传 true，Mod+拖拽和平铺拖拽传 false；松手时把这次按下
+     **还**给客户端，顺序放在补位置那次 motion **之后**（motion 先把焦点和局部坐标刷成当前值，
+     松开才落在对的位置上）。两边对称：客户端没见过的按下，松手也不转给它。
+
+     新增 `./test-titlebar-drag.sh`（12 项）：探针是 tools/movedrag.py（GTK3，自己定尺寸
+     320x240 → vidow 直接当浮窗，顶部 30px 当自定义标题栏，按在那里就 `begin_move_drag`）。
+     判据：按下真的到了客户端、客户端发了 move 请求、合成器起了 grab、拖拽 1:1 跟手、
+     **松手后客户端收到松开**、落点没跑、松手后移出去再移回来收得到位置；再加一条反向对照：
+     Mod+左键那条路客户端**既没收到按下也没收到松开**（状态对称）、照样跟手。回退
+     `src/input.c` 那一句跑同一条：只有「收到松开」这条红（其余 11 条全绿）✓。
+
+160. **合成器自己造的指针事件没有「帧尾」：客户端把事件扣在缓冲里，等到下一个事件才处理**。
+
+     查 159 时撞上的：headless 里注入一次按下，客户端（GTK）**5 秒都没收到**，一动鼠标才和
+     下一个事件一起收下。strace 一看合成器**当场就写了**（`sendmsg` 里就是那条
+     `wl_pointer.button`）—— 事件到了 socket，是客户端不处理它。
+
+     机制：wl_pointer v5 起事件按帧分组，客户端要等到 `wl_pointer.frame` 才处理这一批。真设备
+     每个帧都由 libinput 的帧事件补上（`server_cursor_frame` → `notify_frame`），而**注入**和
+     **合成器自己造的**那几路没有设备帧：IPC 的 move-cursor / pointer-button、
+     `VIDOW_TEST_ACTION` 的 pointer-motion / pointer-button、以及松手时补的那对（位置 + 松开）。
+     滚轮注入一直是补的（`vidow_inject_pointer_scroll` 里那句 `notify_frame`），其余几处漏了。
+
+     后果两层：①测试里注入的时序全被带偏 —— 按下 / 松手 / 移动要等到**下一个**事件才生效，
+     看起来像「这条动作没执行」（我前两轮查 159 时就被它带偏过一次，把 0.6~9.5 秒的延迟当成了
+     合成器没 flush）；②真实会话里 159 补的那对（位置 + 松开）会被客户端扣住，用户照样得
+     「移出去再移回来」。所以这不是测试专属问题。
+
+     改法：注入的三条路（IPC move-cursor / IPC pointer-button / FIFO 的 pointer-motion 与
+     pointer-button）和松手补的那对，各自补一句 `wlr_seat_pointer_notify_frame()`。
+
+     回归：`./test-titlebar-drag.sh` 里按下当场到客户端（修之前要等下一个事件，实测 ~13 秒），
+     拖拽从「只跟到 360,224」变成 400,230（1:1）。回退 `src/keybind.c` 那两句跑同一条：三条
+     断言红、拖拽只跟到 360,224 ✓。
+
+./test-titlebar-drag.sh              # 客户端发起的拖拽（CSD 标题栏）松手要还给它（12 项断言）
 158. **微信弹窗不显示的真凶：unconstrain 的盒子给的是「布局坐标」，而 wlroots 要的是「表面局部坐标」**。
 
      157 把定位做到了「弹出物交了帧、节点开着」，用户那份日志里弹出物的场景节点坐标是

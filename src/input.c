@@ -290,6 +290,10 @@ void vidow_pointer_button(struct vidow_server *server, uint32_t button,
 	if (server->grab_mode != VIDOW_GRAB_NONE) {
 		/* the grab owns the pointer: swallow everything until release */
 		if (!pressed) {
+			/* 客户端自己发起的那次抓取（CSD 标题栏 / X11 的
+			 * _NET_WM_MOVERESIZE）：按下那次是转给客户端的，松手得还给它。
+			 * 在读之前记下来 —— end_grab 会把状态清掉。 */
+			bool client_saw_press = server->grab_client_press;
 			if (server->grab_mode == VIDOW_GRAB_TILE) {
 				vidow_tile_grab_end(server);
 			} else {
@@ -302,6 +306,23 @@ void vidow_pointer_button(struct vidow_server *server, uint32_t button,
 			 * 鼠标移出去再移回来就好了」（移出去/移回来会触发 enter，位置才刷新）。
 			 * 这里补一次和真实移动同一条路的 motion，坐标当场对上。 */
 			vidow_pointer_motion(server, time_msec);
+			/* 松手本身也要转给客户端 —— 只补给位置是不够的：客户端手里那次
+			 * 按下永远没等到对应的松开，它会一直以为左键还按着（GTK 的
+			 * in_move_drag、Chromium 的鼠标键状态都靠松开事件复位）。症状就是
+			 * 「用标题栏拖一次之后窗口就不听使唤了：鼠标一动它还在拖，第一下
+			 * 点击被当成按下」。放在 motion 之后发：motion 会把焦点和局部坐标
+			 * 刷成当前值，松开事件才落在对的位置上。 */
+			if (client_saw_press) {
+				wlr_seat_pointer_notify_button(server->seat, time_msec, button,
+					WL_POINTER_BUTTON_STATE_RELEASED);
+			}
+			/* 这一对（位置 + 松开）是合成器自己造的，不是设备帧里来的：得自己
+			 * 收一个 frame，客户端才会当场处理。wl_pointer v5 起事件按帧分组，
+			 * GTK/GDK 把「没等到 frame」的事件先扣在自己缓冲里 —— 真鼠标那条
+			 * 路上 frame 由 libinput 的帧事件补上（server_cursor_frame），注入 /
+			 * 合成这条路没有设备帧，漏掉这一句客户端就要等到**下一个**指针事件
+			 * 才反应过来（实测：按下之后什么都不做，客户端 5 秒都没收到）。 */
+			wlr_seat_pointer_notify_frame(server->seat);
 		}
 		return;
 	}
@@ -354,7 +375,7 @@ void vidow_pointer_button(struct vidow_server *server, uint32_t button,
 
 	/* Mod+left drag moves a float, Mod+right drag resizes it. */
 	if (mod && view != NULL && view->float_mode != VIDOW_FLOAT_NONE) {
-		vidow_float_begin_grab(server, view, button == BTN_RIGHT);
+		vidow_float_begin_grab(server, view, button == BTN_RIGHT, false);
 		if (view != server->focused) {
 			vidow_focus_view(view);
 		}
@@ -842,6 +863,12 @@ bool vidow_inject_pointer_move(struct vidow_server *server, double x, double y,
 	/* wlr_cursor_warp 只挪位置、不发事件（wlroots 的 cursor_warp_unchecked），
 	 * 所以显式走一遍处理：指针焦点、enter/motion、拖拽的 grab 分支都在里面。 */
 	vidow_pointer_motion(server, inject_now_ms());
+	/* 真设备每个帧事件都会收一个 wl_pointer.frame（libinput 的帧事件），注入
+	 * 这条路没有设备帧 —— 不补上，wl_pointer v5+ 的客户端（GTK/GDK 就是）会把
+	 * 这些事件扣在缓冲里等下一个 frame：实测「按下之后什么都不做」客户端 5 秒
+	 * 都收不到，一动鼠标才一起收下（测试里就是这条把时序全带偏了）。滚轮注入
+	 * 一直是这么补的（见 vidow_inject_pointer_scroll），这里跟上。 */
+	wlr_seat_pointer_notify_frame(server->seat);
 	wlr_log(WLR_INFO, "注入: 指针%s移到 %.0f,%.0f", relative ? "相对" : "",
 		server->cursor->x, server->cursor->y);
 	return true;
@@ -900,6 +927,9 @@ bool vidow_inject_pointer_button(struct vidow_server *server, const char *name,
 			vidow_pointer_button(server, btn, false, t, false);
 		}
 	}
+	/* 注入没有设备帧：自己收一个（同 vidow_inject_pointer_move，滚轮那条一直
+	 * 是这么补的）。少了它，客户端会把这次按下扣在缓冲里等下一个 frame。 */
+	wlr_seat_pointer_notify_frame(server->seat);
 	wlr_log(WLR_INFO, "注入: 按钮 %u %s%s（在 %.0f,%.0f）", btn,
 		mode == 0 ? "点一下" : mode == 1 ? "按下" : "松开",
 		count > 1 ? "（连点）" : "", server->cursor->x, server->cursor->y);

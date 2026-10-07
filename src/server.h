@@ -1307,6 +1307,14 @@ struct vidow_server {
 	struct vidow_view *grab_view;
 	double grab_x, grab_y;
 	struct wlr_box grab_geom;
+	/* 这次抓取是不是**客户端自己发起**的（CSD 标题栏拖拽 -> xdg_toplevel.move、
+	 * X11 的 _NET_WM_MOVERESIZE -> request_move）。那条路上「按下」是转给客户端
+	 * 了的（input.c 末尾那句 notify_button），松手也必须还给它 —— 不然客户端
+	 * 停在「一直按着」的状态：拖完再动鼠标它还在拖，之后第一下点击被当成按下
+	 * 而不是点一下，得再点一次才能恢复（用户报的「拖拽之后就不行了，点一下
+	 * 界面、移出去再移回来再点一次就好了」）。Mod+拖拽那条路按下是吃掉的，
+	 * 松手也一起吃掉，客户端两边都没见过，状态是对称的。 */
+	bool grab_client_press;
 	/* 拖动时指针比刷新快：一帧里会来好几个移动事件，中间那些位置屏幕上从来没
 	 * 出现过。重画装饰（整块窗口那么大的离屏渲染）+ 记损伤推迟到出帧之前做一次
 	 * （见 vidow_tile_grab_update / output.c 的帧回调）—— 实测每个事件 66µs
@@ -1965,8 +1973,10 @@ void vidow_float_place_all(struct vidow_server *server,
 void vidow_float_on_commit(struct vidow_view *view);
 void vidow_float_detach_children(struct vidow_server *server,
 		struct vidow_view *dying);
+/* from_client = 客户端自己发起的（CSD 标题栏拖拽 / _NET_WM_MOVERESIZE）：它的
+ * 「按下」已经转给客户端了，松手也要转给它，见 grab_client_press 的说明。 */
 void vidow_float_begin_grab(struct vidow_server *server,
-		struct vidow_view *view, bool resize);
+		struct vidow_view *view, bool resize, bool from_client);
 void vidow_float_grab_update(struct vidow_server *server, double lx,
 		double ly);
 void vidow_float_end_grab(struct vidow_server *server);

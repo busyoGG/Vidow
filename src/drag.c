@@ -68,6 +68,9 @@ void vidow_tile_grab_begin(struct vidow_server *server,
 	}
 	server->grab_mode = VIDOW_GRAB_TILE;
 	server->grab_view = view;
+	/* 平铺拖拽是 Mod+左键那条路：按下被合成器吃掉了，客户端没见过，松手也不
+	 * 转给它（见 server.h 里 grab_client_press 的说明）。 */
+	server->grab_client_press = false;
 	server->grab_dirty = false;
 	server->grab_last_box = vidow_view_screen_box(view);
 	view->dragging = true;

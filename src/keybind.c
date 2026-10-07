@@ -608,6 +608,10 @@ bool vidow_action_run(struct vidow_server *server, const char *action) {
 		 * 处理：拖拽靠的就是这条路上的 grab 分支。 */
 		vidow_pointer_motion(server,
 			(uint32_t)(vidow_now_ns() / 1000000LL));
+		/* 注入没有设备帧，自己收一个：wl_pointer v5+ 的客户端（GTK/GDK）会把
+		 * 没收帧的事件扣在缓冲里，等到下一个指针事件才处理 —— 测试里就是这条
+		 * 把「按下 / 松手 / 移动」的时序全带偏（实测能差好几秒）。 */
+		wlr_seat_pointer_notify_frame(server->seat);
 		return true;
 	}
 	if (strcmp(name, "pointer-button") == 0) {
@@ -632,6 +636,8 @@ bool vidow_action_run(struct vidow_server *server, const char *action) {
 		vidow_pointer_button(server, btn, pressed,
 			(uint32_t)(vidow_now_ns() / 1000000LL),
 			strcmp(extra, "mod") == 0);
+		/* 同 pointer-motion：注入要自己收帧，不然客户端把这次按下扣着不放。 */
+		wlr_seat_pointer_notify_frame(server->seat);
 		return true;
 	}
 

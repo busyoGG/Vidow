@@ -2549,6 +2549,7 @@ static void view_unmap(struct wl_listener *listener, void *data) {
 		if (server->grab_view == view) {
 			server->grab_mode = VIDOW_GRAB_NONE;
 			server->grab_view = NULL;
+			server->grab_client_press = false;
 			wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr,
 				"left_ptr");
 		}
@@ -2978,11 +2979,13 @@ static void view_request_move(struct wl_listener *listener, void *data) {
 	struct vidow_view *view = wl_container_of(listener, view, request_move);
 	struct vidow_server *server = view->server;
 
-	/* A CSD titlebar drag: detach a tiled window into a float and grab it. */
+	/* A CSD titlebar drag: detach a tiled window into a float and grab it.
+	 * 这条路上按下是转给客户端的（它才发的 xdg_toplevel.move），from_client
+	 * 让松手也转回去（见 server.h 里 grab_client_press 的说明）。 */
 	if (view->float_mode == VIDOW_FLOAT_NONE) {
 		vidow_float_set_mode(view, VIDOW_FLOAT_FIXED);
 	}
-	vidow_float_begin_grab(server, view, false);
+	vidow_float_begin_grab(server, view, false, true);
 }
 
 static void view_request_resize(struct wl_listener *listener, void *data) {
@@ -2993,7 +2996,7 @@ static void view_request_resize(struct wl_listener *listener, void *data) {
 	if (view->float_mode == VIDOW_FLOAT_NONE) {
 		vidow_float_set_mode(view, VIDOW_FLOAT_FIXED);
 	}
-	vidow_float_begin_grab(server, view, true);
+	vidow_float_begin_grab(server, view, true, true);
 }
 
 /* ------------------------------------------------------- X11（XWayland） */
@@ -3434,7 +3437,9 @@ static void x11_request_move(struct wl_listener *listener, void *data) {
 	if (view->float_mode == VIDOW_FLOAT_NONE) {
 		vidow_float_set_mode(view, VIDOW_FLOAT_FIXED);
 	}
-	vidow_float_begin_grab(server, view, false);
+	/* X11 的 _NET_WM_MOVERESIZE：客户端的标题栏拖拽。按下已经转给它了（X 的
+	 * 隐式抓取就是这么来的），松手也得转回去，否则它停在「按住」状态。 */
+	vidow_float_begin_grab(server, view, false, true);
 }
 
 static void x11_request_resize(struct wl_listener *listener, void *data) {
@@ -3444,7 +3449,7 @@ static void x11_request_resize(struct wl_listener *listener, void *data) {
 	if (view->float_mode == VIDOW_FLOAT_NONE) {
 		vidow_float_set_mode(view, VIDOW_FLOAT_FIXED);
 	}
-	vidow_float_begin_grab(server, view, true);
+	vidow_float_begin_grab(server, view, true, true);
 }
 
 static void x11_request_activate(struct wl_listener *listener, void *data) {
