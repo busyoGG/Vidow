@@ -1412,6 +1412,10 @@ bool vidow_view_init(struct vidow_server *server);
  * schedule_configure 有 assert(surface->initialized)），见 view.c 的注释。 */
 void vidow_popup_unconstrain_on_commit(struct vidow_server *server,
 	struct wlr_xdg_popup *popup, const struct wlr_box *box);
+/* 输出盒（布局坐标）-> 根 toplevel 表面自己的坐标系：unconstrain 要的是后者，
+ * 少这一步窗口不在布局原点时菜单会被摆到屏外（见 view.c 的注释）。 */
+void vidow_popup_box_to_toplevel_space(const struct vidow_view *view,
+	struct wlr_box *box);
 bool vidow_workspace_init(struct vidow_server *server);
 bool vidow_keybind_init(struct vidow_server *server);
 bool vidow_rule_init(struct vidow_server *server);

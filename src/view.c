@@ -3781,6 +3781,29 @@ static void popup_unconstrain_commit(struct wl_listener *listener, void *data) {
 	free(u);
 }
 
+/* 把「输出在布局里的盒子」平移成「根 toplevel 表面自己的坐标系」里的盒子。
+ *
+ * wlr_xdg_popup_unconstrain_from_box() 要的是**根 toplevel 表面的局部坐标**
+ * （它内部会减掉 popup 自己的 toplevel 坐标，见 wlroots 的 wlr_xdg_popup.c），
+ * 而 wlr_output_layout_get_box() 给的是布局坐标。窗口不在布局原点 (0,0) 上时
+ * 这两个差着一整个窗口原点的距离，客户端于是以为「可见区」在它右边一整块屏的
+ * 地方，把菜单摆到屏外：微信主窗口在 DP-2（x=2880）上，右键菜单的场景节点
+ * 坐标是 4800,115（= 2880 + 1920，1920 就是那块屏的 x），而屏幕只有 0..3840
+ * —— 菜单画在屏幕外，看着就是「弹窗不显示」。窗口在 (0,0) 附近时这项差值为 0，
+ * 所以单屏 + 窗口贴左上角测不出来（Hyprland 正常，是因为它减了 t1ParentCoords，
+ * 见它的 CPopup::unconstrain）。 */
+void vidow_popup_box_to_toplevel_space(const struct vidow_view *view,
+		struct wlr_box *box) {
+	if (view == NULL || box == NULL || view->scene_surface == NULL ||
+			view->scene_surface->buffer == NULL) {
+		return;
+	}
+	int sx = 0, sy = 0;
+	wlr_scene_node_coords(&view->scene_surface->buffer->node, &sx, &sy);
+	box->x -= sx;
+	box->y -= sy;
+}
+
 void vidow_popup_unconstrain_on_commit(struct vidow_server *server,
 		struct wlr_xdg_popup *popup, const struct wlr_box *box) {
 	(void)server;
@@ -3879,8 +3902,23 @@ static void server_new_popup(struct wl_listener *listener, void *data) {
 	}
 
 	struct wlr_box box = {0};
-	if (view != NULL && view->output != NULL) {
-		wlr_output_layout_get_box(server->output_layout, view->output, &box);
+	if (view != NULL) {
+		/* 按窗口**真正落**的那块屏算可用区：view->output 是「它属于哪块屏的
+		 * 工作区」，IPC 挪位置 / 跨屏拖拽之后它可能还是旧的那块（浮窗的位置
+		 * 是绝对坐标，不依赖 view->output），而菜单能摆在哪儿得看它现在压在
+		 * 哪块屏上。 */
+		struct wlr_output *out = view->output;
+		struct wlr_output *under = wlr_output_layout_output_at(
+			server->output_layout,
+			view->geom.x + view->geom.width / 2.0,
+			view->geom.y + view->geom.height / 2.0);
+		if (under != NULL) {
+			out = under;
+		}
+		if (out != NULL) {
+			wlr_output_layout_get_box(server->output_layout, out, &box);
+			vidow_popup_box_to_toplevel_space(view, &box);
+		}
 	}
 	vidow_popup_unconstrain_on_commit(server, popup, &box);
 }

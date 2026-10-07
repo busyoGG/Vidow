@@ -353,6 +353,13 @@ static void layer_surface_new_popup(struct wl_listener *listener, void *data) {
 	if (ls->output != NULL) {
 		wlr_output_layout_get_box(server->output_layout,
 			ls->output->wlr_output, &box);
+		/* 同一个坑（见 view.c 的 vidow_popup_box_to_toplevel_space）：输出盒
+		 * 是布局坐标，unconstrain 要的是这块 layer 表面自己的坐标系 —— 状态栏
+		 * 在屏幕顶端时 y 要减掉它的高度，不然菜单会被摆到屏幕上方外面去。 */
+		int sx = 0, sy = 0;
+		wlr_scene_node_coords(&ls->scene->tree->node, &sx, &sy);
+		box.x -= sx;
+		box.y -= sy;
 	}
 	/* 跟 view.c 一样：unconstrain 要等 popup 自己第一次 commit（wlroots 里
 	 * schedule_configure 有 assert(surface->initialized)） */
