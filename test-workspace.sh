@@ -245,7 +245,9 @@ sleep 0.6
 mark "热插拔：屏拔了工作区跟着列走"
 mkpipe
 # 钩子要在进程起来之前设好（它在 output_init 里读一次）
-VIDOW_TEST_OUTPUTS_X="4500:remove:right"
+# 拔屏的延时留够：gone-1 那个窗口要**先 map 上来**（GTK 起窗口偶尔要 1 秒多，
+# 实测有过「窗口刚 map，屏已经被拔了」→ 拔掉的那块屏上 0 列，测试当场红）
+VIDOW_TEST_OUTPUTS_X="6500:remove:right"
 start_vidow 2 "file:$RUNDIR/actions"
 python3 tools/wall.py >/dev/null 2>&1 &
 sleep 0.8
