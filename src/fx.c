@@ -1103,8 +1103,17 @@ static void backdrop_iter(struct wlr_scene_buffer *sb, int sx, int sy,
 		return;
 	}
 	float alpha = sb->opacity;
+	/* 只采客户端声明的有效区域（wp_viewport 的 src 框，没设就是整块缓冲）。
+	 * 不采的话，缓冲比有效内容大一圈的客户端（chromium 分数缩放）会把没画过的
+	 * 那圈像素也画进底衬 —— 后面模糊采到的就是那圈黑。 */
+	struct wlr_fbox sbox = sb->src_box;
+	if (sbox.width <= 0.0 || sbox.height <= 0.0) {
+		sbox = (struct wlr_fbox){0, 0, (double)sb->buffer->width,
+			(double)sb->buffer->height};
+	}
 	struct wlr_render_texture_options opts = {
 		.texture = tex,
+		.src_box = sbox,
 		.dst_box = { .x = x1, .y = y1, .width = x2 - x1, .height = y2 - y1 },
 		.alpha = &alpha,
 		.transform = sb->transform,
@@ -1782,11 +1791,24 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 	 * 也是窗口几何，原因一样（见 struct vidow_fx_geo）。 */
 	int cw = geo->w, ch = geo->h;
 	/* 源缓冲里「可见窗口」在哪（归一化）。窗口几何 == 表面时是 0 / 1，采出来的
-	 * 内容和以前逐像素一样。 */
-	fx->tex_off_x = geo->src_w > 0 ? (float)geo->off_x / (float)geo->src_w : 0.0f;
-	fx->tex_off_y = geo->src_h > 0 ? (float)geo->off_y / (float)geo->src_h : 0.0f;
-	fx->tex_scale_x = geo->src_w > 0 ? (float)geo->w / (float)geo->src_w : 1.0f;
-	fx->tex_scale_y = geo->src_h > 0 ? (float)geo->h / (float)geo->src_h : 1.0f;
+	 * 内容和以前逐像素一样。
+	 *
+	 * 优先用 geo->tex_*（vidow_view_fx_geo 按「客户端缓冲像素 / wp_viewport 的
+	 * 有效区域」算好的）：逻辑尺寸和缓冲像素在分数缩放 + viewporter 下不是一回事，
+	 * 按逻辑尺寸算出来的是整块缓冲 —— 客户端没画过的那圈会一起铺进窗口（见
+	 * struct vidow_fx_geo 的说明）。全 0 的时候（层表面、关闭快照这些自己拼几何的
+	 * 地方）退回老公式。 */
+	if (geo->tex_du > 0.0f && geo->tex_dv > 0.0f) {
+		fx->tex_off_x = geo->tex_u0;
+		fx->tex_off_y = geo->tex_v0;
+		fx->tex_scale_x = geo->tex_du;
+		fx->tex_scale_y = geo->tex_dv;
+	} else {
+		fx->tex_off_x = geo->src_w > 0 ? (float)geo->off_x / (float)geo->src_w : 0.0f;
+		fx->tex_off_y = geo->src_h > 0 ? (float)geo->off_y / (float)geo->src_h : 0.0f;
+		fx->tex_scale_x = geo->src_w > 0 ? (float)geo->w / (float)geo->src_w : 1.0f;
+		fx->tex_scale_y = geo->src_h > 0 ? (float)geo->h / (float)geo->src_h : 1.0f;
+	}
 	int pad = vidow_fx_pad(server);
 	double px_w = ((double)cw + 2.0 * pad) * (scale > 0.0 ? scale : 1.0);
 	double px_h = ((double)ch + 2.0 * pad) * (scale > 0.0 ? scale : 1.0);

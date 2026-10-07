@@ -745,6 +745,7 @@ python3 test-float.py        # 三个真实 GTK 窗口，验证浮动模式自�
 ./test-input-inject.sh               # 输入注入：鼠标 / 键盘合成事件到客户端（全 headless，54 项断言）
 ./test-cursor-shake.sh              # 摇晃找光标：线性加 + 补间、晃到屏幕那么大，截图里没有它（全 headless，55 项断言）
 ./test-geometry.sh                   # 窗口几何和表面尺寸对不上时内容铺满框（chromium 改大小那 1-2 秒）（全 headless，6 项断言）
+./test-viewport-crop.sh              # 客户端用 wp_viewport 只声明缓冲的一部分时，装饰按那块采（chromium，5 项断言）
 ./test-config.sh                     # 配置系统：一个 Lua 文件 + 改了就自动重载（全 headless，15 项断言）
 ./test-binds.sh                      # 键位全是配置给的：没配置=没有键位、默认那套能用、换键位、动作字符串（全 headless，35 项断言）
 ./test-config-include.sh             # 配置拆成好几份：vidow.include() 的路径/顺序/报错 + 改哪份都自动重载（全 headless，25 项断言）
@@ -1340,7 +1341,7 @@ vidow 自己的，比如 `vidow-wayland-1.sock`）；`ipc_socket` 可以写死�
 | 命令 | 里面是什么 |
 | --- | --- |
 | `state` | 下面所有的 + 计数（窗口 / 列 / 输出 / 工作区 / layer / 客户端 / 动画 / 订阅者） |
-| `windows` | 每个窗口：`id`、`kind`（xdg / x11）、`title`、`app_id`、`pid`、`geometry`（布局坐标）、`float_geometry`、`surface`（表面尺寸 / 缓冲 / scale）、`column`（列 id / 宽比 / 偏移 / 序号）、`workspace`、`output`、`home`、`floating` + `float_mode`、`fullscreen`、`minimized`、`mapped` / `visible`、`rules`（三条规则的实际取值）、`size_hints`、`anim_*`、`force_render`、`capture_holders`、X11 还多一份 `x11` 子对象 |
+| `windows` | 每个窗口：`id`、`kind`（xdg / x11）、`title`、`app_id`、`pid`、`geometry`（布局坐标）、`float_geometry`、`surface`（表面尺寸 / 缓冲 / scale / `tex_u0`+`tex_v0`+`tex_du`+`tex_dv` 装饰正在采源缓冲的哪一块 + `frame_width`+`frame_height` 装饰画出来的框——客户端不接受 configure 时会比布局槽位大）、`column`（列 id / 宽比 / 偏移 / 序号）、`workspace`、`output`、`home`、`floating` + `float_mode`、`fullscreen`、`minimized`、`mapped` / `visible`、`rules`（三条规则的实际取值）、`size_hints`、`anim_*`、`force_render`、`capture_holders`、X11 还多一份 `x11` 子对象 |
 | `columns` | 每条列：`id`、`width_fraction`、算出来的 `width` / `offset`、序号、里面的窗口 |
 | `workspaces` | 每块工作区：名字、`special`、`active` / `visible` / `shown`、住哪块屏 / 归属哪块屏、滚动位置、列与窗口、离开时的焦点窗口（**特殊工作区也在列表里**，`special = true`；Lua 的 `vidow.workspace_list()` 不给它） |
 | `outputs` | 每块屏：连接器名 / 描述 / make / model、`enabled`、`scale`、`transform`、刷新率、物理尺寸、布局矩形、`usable_area`、`viewport_x`、活动 / 显示着的工作区、它上面的工作区 / 窗口 / layer、**所有可用模式**、`adaptive_sync` / `vrr_supported`、`depth` / `render_format`、`primaries` / `transfer_functions` / `hdr_capable`（这块屏**自己报**的色彩能力，HDR 可行性就看它）、模糊贴图状态 |
@@ -2757,6 +2758,12 @@ protocols/     wlr-layer-shell / wlr-virtual-pointer / input-method-v2 /
                ext-background-effect-v1 / xdg-shell / xdg-foreign v1+v2 协议 XML
                （构建时用 wayland-scanner 生成头文件）
 ```
+test-viewport-crop.sh
+                   客户端的 wp_viewport 只声明了缓冲的一部分（chromium / KDE 在分数缩放下
+                   会把缓冲开得比窗口大一圈，只画其中一块、src 框指过去）：装饰必须按场景
+                   节点的 src_box（缓冲像素）采 —— 按整块缓冲采，那圈没画过的像素会一起
+                   铺进窗口，屏幕上就是「框到位了、画面小一圈、右边/下边一条黑边」，而且
+                   会一直那样。没装 chromium 就跳过
 
 ## 已验证（wlroots 0.20.2 / AMD radeonsi / EGL 1.5，日志逐条比对坐标）
 
@@ -3535,6 +3542,42 @@ protocols/     wlr-layer-shell / wlr-virtual-pointer / input-method-v2 /
      没有**（不误报）；②掐断帧链 + 追踪开：客户端确实交过帧，追踪报出 ERROR 且点名
      HEADLESS-1、写明「客户端还在交帧，屏幕却不更新」；③掐断帧链 + 追踪**关**：一条 trace
      日志都没有、vidow 照样活着（诊断不改变行为）。
+
+142. **chromium 系窗口「框到位了、里面小一圈、右边/下边一条黑边」**（用户报的
+     「chromium 系的应用 bug 截图在 /tmp/chromium.png」，并怀疑「和 KDE 那个一样，也是
+     没更新渲染」）。
+
+     根因不是「没更新」：装饰管线换算「源缓冲里哪一块是窗口」那一步，拿**逻辑尺寸**的
+     比例去采**客户端缓冲像素**，只有「缓冲 = 逻辑尺寸 × 整数倍、而且整块都有效」时才
+     等价。chromium 在分数缩放下会把缓冲开得比窗口大一圈、再用 `wp_viewport` 的 src 框
+     声明「哪一块有效」——headless 一块 3840x2160@2 上实测：窗口 954x1068、缓冲
+     2304x2560、`viewport src = 0,0 1908x2136`（它先按更大的尺寸把缓冲开好，窗口收小
+     之后接着用那块缓冲），有效区只占缓冲宽度的 **82.8%**。按整块缓冲采，那圈没画过的
+     像素（黑 / 透明）就一起铺进窗口：屏幕上「蓝色边框 949x1068、画面只占左上
+     802x901、其余纯黑」—— 和用户截图量出来的 84.9% 铺满比例逐项对上。wlroots 自己的
+     场景节点手里就是对的：`wlr_scene_buffer.src_box`（缓冲像素，实测 `0,0 1908x2136`）。
+
+     修法：`vidow_view_fx_geo()` 多算一组归一化的贴图坐标 `tex_u0/tex_v0/tex_du/tex_dv`
+     （按场景节点的 `src_box` + 表面逻辑尺寸换算；声明的框超出有效区时，把手里那块铺满
+     窗口，别去采边界外面），装饰着色器用它们（`fx.c` 的 `u_tex_map`）；`off_x/w/src_w`
+     那几个整数量继续给布局、命中、关闭快照用。底衬（模糊的源）那条路取贴图时也带上
+     `src_box`。X11、layer surface、自己拼几何的关闭快照没有这四个值 → 退回老公式，
+     逐像素和以前一样。
+
+     证据：headless `3840x2160@2` + chromium 截图量出来 —— 修前白色内容
+     `x 16..1591 / y 16..1793`（= 缓冲有效区 82.8% 那个位置），修后 `x 16..1915 /
+     y 16..2143`，铺满 954x1068 的框（边框在 12..15 / 1916..1919）✓。
+
+     回归：`./test-viewport-crop.sh`（5 项，headless `scale=2` + chromium，没装 chromium
+     就跳过）——①真的复现了「缓冲比窗口大一圈」的窗口（没复现就 SKIP，不当成通过）
+     ②装饰采的是有效区域（`vidowmsg windows` 新加的 `surface.tex_du`/`tex_dv` 落在
+     0..1 内）③窗口中心有内容、右边缘 / 下边缘不是黑边（修前实测 `0.0 / 0.0`，修后
+     `248 / 245`，中心 `249`）④vidow 全程活着。把 `fx.c` 里用 `tex_*` 那一行停掉
+     （装作没有这个修复）重跑：②仍过、③红 ✓。
+
+     顺带：`vidowmsg windows` 的 `surface` 对象多了 `tex_u0/tex_v0/tex_du/tex_dv` 和
+     `frame_width/frame_height`（装饰真正画出来的那块框 —— 客户端不接受 configure 时会
+     比布局槽位大），排查这类「框和画面不一般大」不用再靠截图猜。
 
 141. **摇晃放大太容易触发**（用户报的「光标放大太容易触发了，应该来回晃动过一会儿才放大」）。
 

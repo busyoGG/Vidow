@@ -230,6 +230,20 @@ void vidow_ipc_json_window(struct jbuf *b, struct vidow_server *server,
 		jb_kv_int(b, "buffer_height", surface->current.buffer_height);
 		jb_kv_int(b, "scale", surface->current.scale);
 		jb_kv_bool(b, "mapped", surface->mapped);
+		/* 装饰管线正在采源缓冲的哪一块（归一化）。du/dv < 1 = 客户端用
+		 * wp_viewport 只声明了缓冲的一部分有效（chromium / KDE 在分数缩放下会
+		 * 把缓冲开得比窗口大一圈）：排查「框到位了、画面小一圈、一条黑边」时，
+		 * 这个值和 geometry 摆在一起就能看出是采错区域还是客户端没画。 */
+		struct vidow_fx_geo fgeo = vidow_view_fx_geo(view);
+		jb_kv_double(b, "tex_u0", (double)fgeo.tex_u0);
+		jb_kv_double(b, "tex_v0", (double)fgeo.tex_v0);
+		jb_kv_double(b, "tex_du", (double)fgeo.tex_du);
+		jb_kv_double(b, "tex_dv", (double)fgeo.tex_dv);
+		/* 装饰真正画出来的那块框（逻辑尺寸 = 可见窗口）。float 尺寸由客户端
+		 * 定，和「按布局算出来的 geometry」不是一回事：客户端不接受 configure
+		 * 时会比槽位大，排查「框和画面不一般大」要看这对。 */
+		jb_kv_int(b, "frame_width", fgeo.w);
+		jb_kv_int(b, "frame_height", fgeo.h);
 		jb_obj_end(b);
 	} else {
 		jb_null(b);

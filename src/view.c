@@ -136,6 +136,74 @@ struct wlr_box vidow_view_geometry(const struct vidow_view *view) {
 	return view->xdg_toplevel->base->geometry;
 }
 
+/* 可见窗口在源贴图里的归一化位置（见 struct vidow_fx_geo 的 tex_* 说明）。
+ *
+ * 只用逻辑尺寸算是不够的：贴图是**客户端缓冲像素**，客户端用 wp_viewport 声明
+ * 「缓冲里哪一块是有效内容」时（chromium / KDE 在分数缩放下会把缓冲开得比窗口大
+ * 一圈，只画其中一块、src 框指过去），按逻辑尺寸算出来的是整块缓冲 —— 右边/下边
+ * 那圈没画过的像素跟着铺进窗口，屏幕上就是「框到位了、画面小一圈、周围一条黑边」，
+ * 而且会一直那样（不是中间态）。场景节点的 src_box 就是 wlroots 画这个表面时用的
+ * 源区域（缓冲像素，客户端没设 viewport 时就是整块缓冲），照它换算。 */
+static void fx_geo_tex_map(struct vidow_fx_geo *geo,
+		const struct wlr_scene_buffer *sb, const struct wlr_surface *surface) {
+	if (sb == NULL || surface == NULL) {
+		return;
+	}
+	/* 有效源区域（缓冲像素）。 */
+	struct wlr_fbox box = sb->src_box;
+	int bw = surface->current.buffer_width;
+	int bh = surface->current.buffer_height;
+	int sw = surface->current.width;
+	int sh = surface->current.height;
+	if (bw <= 0 || bh <= 0) {
+		/* 场景节点手里的那块缓冲才是权威（换了缓冲、buffer_width 还没跟上）。 */
+		bw = sb->buffer != NULL ? (int)sb->buffer->width : 0;
+		bh = sb->buffer != NULL ? (int)sb->buffer->height : 0;
+	}
+	if (box.width <= 0.0 || box.height <= 0.0) {
+		box = (struct wlr_fbox){0, 0, (double)bw, (double)bh};
+	}
+	if (bw <= 0 || bh <= 0 || sw <= 0 || sh <= 0 ||
+			box.width <= 0.0 || box.height <= 0.0) {
+		return; /* 算不了：让调用方按老的「整块贴图」走 */
+	}
+	/* 一个逻辑单位等于多少缓冲像素（viewporter 的 src 框 / 表面的逻辑尺寸）。 */
+	double sx = box.width / (double)sw;
+	double sy = box.height / (double)sh;
+	double x0 = box.x + geo->off_x * sx;
+	double y0 = box.y + geo->off_y * sy;
+	double w0 = geo->w * sx;
+	double h0 = geo->h * sy;
+	/* 声明的窗口比手里这块有效内容还大（客户端还没按新尺寸重画完）：把能用的
+	 * 那块铺满窗口，别去采边界外面的像素。 */
+	if (x0 < box.x) {
+		w0 -= box.x - x0;
+		x0 = box.x;
+	}
+	if (y0 < box.y) {
+		h0 -= box.y - y0;
+		y0 = box.y;
+	}
+	if (x0 + w0 > box.x + box.width) {
+		w0 = box.x + box.width - x0;
+	}
+	if (y0 + h0 > box.y + box.height) {
+		h0 = box.y + box.height - y0;
+	}
+	if (w0 <= 0.0) {
+		w0 = box.width;
+		x0 = box.x;
+	}
+	if (h0 <= 0.0) {
+		h0 = box.height;
+		y0 = box.y;
+	}
+	geo->tex_u0 = (float)(x0 / (double)bw);
+	geo->tex_v0 = (float)(y0 / (double)bh);
+	geo->tex_du = (float)(w0 / (double)bw);
+	geo->tex_dv = (float)(h0 / (double)bh);
+}
+
 /* 可见窗口在源缓冲里的位置/尺寸，逻辑单位（见 struct vidow_fx_geo）。
  *
  * 客户端用 xdg_surface.set_window_geometry 告诉我们「表面里哪一块是窗口」：
@@ -155,6 +223,8 @@ struct vidow_fx_geo vidow_view_fx_geo(const struct vidow_view *view) {
 		return geo;
 	}
 	struct wlr_surface *surface = vidow_view_surface(view);
+	struct wlr_scene_buffer *sb = view->scene_surface != NULL ?
+		view->scene_surface->buffer : NULL;
 	int sw = surface != NULL ? surface->current.width : 0;
 	int sh = surface != NULL ? surface->current.height : 0;
 	if (g.width <= 0 || g.height <= 0) {
@@ -164,6 +234,7 @@ struct vidow_fx_geo vidow_view_fx_geo(const struct vidow_view *view) {
 		geo.h = sh;
 		geo.src_w = sw;
 		geo.src_h = sh;
+		fx_geo_tex_map(&geo, sb, surface);
 		return geo;
 	}
 	if (sw <= 0 || sh <= 0) {
@@ -193,6 +264,7 @@ struct vidow_fx_geo vidow_view_fx_geo(const struct vidow_view *view) {
 		geo.src_w = g.width;
 		geo.src_h = g.height;
 	}
+	fx_geo_tex_map(&geo, sb, surface);
 	return geo;
 }
 
