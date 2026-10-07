@@ -1,6 +1,7 @@
 #include "server.h"
 #include "ipc.h"
 
+#include <signal.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -39,6 +40,19 @@ static enum wlr_log_importance log_level_from_env(void) {
  *
  * 这里只摘「挂在 wlroots 对象上、由我们自己加的」那些：对象内部的监听器
  * （窗口 / 输出 / layer 的）各自在 destroy 回调里已经摘干净了。 */
+
+/* SIGTERM / SIGINT：走正常退出路径（wl_display_terminate），不用默认动作直接
+ * 结束进程。默认动作不跑清理，环境还原（portalconf.c）也就没了 —— 用户管理器
+ * 里会一直留着 vidow 的 socket，回到宿主合成器以后新拉起来的 portal 后端连的是
+ * 一个已经消失的 socket。Ctrl+C 和 pkill 都走这条。 */
+static int terminate_signal(int signo, void *data) {
+	(void)signo;
+	struct vidow_server *server = data;
+	wlr_log(WLR_INFO, "收到退出信号，收尾");
+	wl_display_terminate(server->display);
+	return 0;
+}
+
 /* 会话从「切走了」回到「回来了」：VT 切回来（Ctrl+Alt+F3 再切回来）时，屏幕上的
  * framebuffer 已经是别人的了，场景里的东西一个像素都没变，但必须整屏重画一遍 ——
  * 不然切回来看到的是一张旧图 / 花屏。wlroots 的 DRM 后端自己管「不活动时别往 DRM
@@ -234,6 +248,10 @@ int main(int argc, char *argv[]) {
 	/* portal 靠 XDG_CURRENT_DESKTOP 选 <name>-portals.conf，而配置里启动的
 	 * 客户端也继承它 —— 所以要在任何子进程之前设好。 */
 	vidow_portal_desktop_env(&server.config);
+	/* 顺手记下「原来是什么」：启动时会把环境推进 systemd 用户管理器，退出时
+	 * 得放回去（见 portalconf.c）。这里问的是用户管理器，不是我们继承到的
+	 * 环境 —— 从 tty 起来时后者本来就是空的。 */
+	vidow_portal_env_snapshot();
 
 	/* The custom-shader path drives raw GL, which only exists on the GLES2
 	 * renderer. 配置跑得比渲染器创建晚，所以这里无条件设一次：setenv 的
@@ -263,6 +281,15 @@ int main(int argc, char *argv[]) {
 			server.session->active ? "现在是活动的" : "现在不活动");
 	} else {
 		wlr_log(WLR_INFO, "会话: 没有（嵌套 / headless 后端），切 VT 的键位不接管");
+	}
+
+	/* Ctrl+C / pkill 也要走正常退出：环境还原挂在退出路径上。 */
+	int signals[] = { SIGTERM, SIGINT };
+	for (size_t i = 0; i < sizeof(signals) / sizeof(signals[0]); i++) {
+		if (wl_event_loop_add_signal(wl_display_get_event_loop(server.display),
+				signals[i], terminate_signal, &server) == NULL) {
+			wlr_log(WLR_ERROR, "failed to install the SIG%d handler", signals[i]);
+		}
 	}
 
 	server.renderer = wlr_renderer_autocreate(server.backend);
@@ -402,6 +429,10 @@ int main(int argc, char *argv[]) {
 	vidow_script_load(&server);
 
 	wl_display_run(server.display);
+
+	/* 环境是启动时推进 systemd 用户管理器的，退出前放回去：宿主合成器那边
+	 * 的后端才能重新连上它自己的 socket。放在最前面 —— 后面的清理不碰它。 */
+	vidow_portal_env_restore();
 
 	vidow_configwatch_finish(&server);
 	vidow_capturemask_finish(&server);

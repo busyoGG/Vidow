@@ -2058,8 +2058,15 @@ void vidow_portal_view_activated(struct vidow_view *view, bool activated);
 /* 把 XDG_CURRENT_DESKTOP 设成配置里的 portal_desktop。要在任何子进程之前调，
  * 否则配置里启动的客户端看不到。 */
 void vidow_portal_desktop_env(const struct vidow_config *cfg);
-/* 同步 portals.conf 到 portal 自己的配置目录；内容变了才写，写完异步重启
- * xdg-desktop-portal（先 import-environment，否则后端连的还是宿主合成器）。 */
+/* 记下进入 vidow 之前 systemd 用户管理器里的环境（后端是 dbus 按需激活的，
+ * 环境从那儿拿）。在 vidow_portal_desktop_env 之后、任何 import 之前调一次。 */
+void vidow_portal_env_snapshot(void);
+/* 退出前把环境放回去，并重启 xdg-desktop-portal —— 不放回去，回到宿主合成器
+ * 以后新拉起来的后端连的是已经消失的 vidow socket。没 import 过就什么都不做。 */
+void vidow_portal_env_restore(void);
+/* 同步 portals.conf 到 portal 自己的配置目录；内容变了才写、才重启
+ * xdg-desktop-portal，但每次都 import-environment（先 import 后重启：后端连的
+ * 是用户管理器里的合成器，不导入的话对话框会画到别的桌面上）。 */
 void vidow_portal_conf_sync(const struct vidow_config *cfg);
 
 #endif /* VIDOW_SERVER_H */

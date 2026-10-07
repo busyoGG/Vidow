@@ -736,6 +736,7 @@ python3 test-float.py        # 三个真实 GTK 窗口，验证浮动模式自�
 ./test-portal.sh switch-kde          # 同上，换成 KDE
 ./test-portal.sh raw-gtk             # vidow 不碰 portal 配置，手写一份单独验证协议
 ./test-portal.sh raw-kde             # 同上，换成 KDE
+./test-portalenv.sh                 # 启动推进 / 退出还原 systemd 用户管理器环境 + 录屏后端探测（19 项断言）
 ./test-dpi.sh                        # 混合 DPI + XWayland（全 headless，15 项断言；含「QT_SCALE_FACTOR 不许设」）
 ./test-x11scale.sh                   # X11 逐窗口缩放桥 x11_scale=1（全 headless，16 项断言）
 ./test-scrollcull.sh                 # 滚出视口的列不画到隔壁显示器（全 headless，11 项断言）
@@ -2198,7 +2199,7 @@ portal 相关的两个键：
 | 键 | 默认 | 作用 |
 | --- | --- | --- |
 | `portal_desktop` | `Vidow` | vidow 设给自己的 `XDG_CURRENT_DESKTOP`，也是 `<name>-portals.conf` 的那个 name。留空 = 完全不碰 portal |
-| `portal_conf_sync` | `true` | 把生效的 portals.conf 写到 portal 的配置目录并重启它；`false` = 只算不写 |
+| `portal_conf_sync` | `true` | 把生效的 portals.conf 写到 portal 的配置目录，并每次把环境 import 进 systemd 用户管理器（配置真的变了才重启 portal）；`false` = 只算不写、不碰环境 |
 实测：配置里 `grim /tmp/shot-cfg.png` → `code=0`，产出的 1280x720 PNG 四象限颜色正确；
 `grim --nope` → `code=1`，`err="grim: invalid option -- '-'"`。
 
@@ -2360,11 +2361,25 @@ org.freedesktop.impl.portal.FileChooser=kde   # gtk = GNOME 风格，kde = Dolph
 | 整个通道关掉 | `portal_desktop=`（vidow 连 `XDG_CURRENT_DESKTOP` 都不设） |
 | 只算不写（自己管那个文件） | `portal_conf_sync=false` |
 
-`vidow_portal_conf_sync()` 只在生成内容和现有文件**逐字节相同**时跳过，否则才写盘并重启
-portal —— 不会每次开机都白重启一遍、打断正在进行的 portal 请求。重启是双 fork + setsid
-的，异步、不阻塞渲染。
+`vidow_portal_conf_sync()` 只在生成内容和现有文件**逐字节相同**时跳过写盘和重启
+portal —— 不会每次开机都白重启一遍、打断正在进行的 portal 请求。但**环境那一步不跟着
+跳过**：后端是 dbus 按需激活的，环境取自 systemd 用户管理器，而那里留的是**上一个**
+合成器的值（Hyprland 之类），文件没变不代表环境是对的。所以现在是「每次都 import 环境，
+只在配置真的变了时才重启前端」。重启是双 fork + setsid 的，异步、不阻塞渲染。
 
-两个环境变量（给测试/排查用）：`VIDOW_PORTAL_NO_RESTART=1` 只写文件不重启；
+**退出时会把环境放回去**（`vidow_portal_env_snapshot()` / `vidow_portal_env_restore()`）：
+启动时先问一次 `systemctl --user show-environment`，把 `XDG_CURRENT_DESKTOP` /
+`WAYLAND_DISPLAY` / `XDG_RUNTIME_DIR` 记下来（注意要问用户管理器，不能问 vidow 自己的
+环境 —— 从 tty 起来时那里的 `WAYLAND_DISPLAY` 本来就是空的），退出时 `set-environment`
+写回、原来就没有的 `unset-environment` 掉，再重启一次前端。不还的话：回到宿主合成器
+以后新拉起来的后端连的是**已经消失的 vidow socket**，portal 全线失效；而且
+`Linger=yes` 时登出也救不回来（用户管理器不跟着会话退出，Hyprland 自己的启动逻辑也只
+import 环境、**不重启** `xdg-desktop-portal` —— 这一点在它的二进制里查过）。退出路径包括
+IPC 的 `quit`、键位退出，以及 `SIGTERM` / `SIGINT`（Ctrl+C、`pkill`）—— 这两个信号现在
+走 `wl_display_terminate` 的正常退出，不再用默认动作直接结束进程。
+
+两个环境变量（给测试/排查用）：`VIDOW_PORTAL_NO_RESTART=1` 只写文件，环境快照 / import /
+还原一概不碰（`test-portalenv.sh` 就靠它做隔离）；
 `VIDOW_CONFIG=/path` 换配置文件位置（`VIDOW_CONFIG_LUA` 是同一个东西的旧名字，还认）。
 
 后端是被 DBus 激活起来的，继承的是 systemd user session 的环境，所以重启前必须
@@ -2374,6 +2389,34 @@ portal —— 不会每次开机都白重启一遍、打断正在进行的 porta
 systemctl --user import-environment XDG_CURRENT_DESKTOP WAYLAND_DISPLAY XDG_RUNTIME_DIR
 systemctl --user restart xdg-desktop-portal
 ```
+
+#### 录屏 / 截图：内置默认会自己挑，但**不是 KDE**
+
+`ScreenCast` / `Screenshot` 这两个接口，GTK 后端**根本没有**；KDE 后端有，但它的实现建在
+KWin 的私有 wayland 协议上（`zkde_screencast_unstable_v1`，`xdg-desktop-portal-kde` 的
+二进制里就写着 `zkde_screencast_unstable_v1 does not seem to be available`），vidow 不实现
+它，指过去只会让客户端以为支持、一调用就失败。真能在这台合成器上干活的是：
+
+| 后端 | 走什么 | 本机装了吗 |
+| --- | --- | --- |
+| `wlr` | `zwlr_screencopy_manager_v1`，专为 wlroots 写的 | 没装（`xdg-desktop-portal-wlr`） |
+| `hyprland` | 非 Hyprland 的 wlroots 合成器上同样退到 `zwlr_screencopy_manager_v1`（`UseIn` 里就写着 `wlroots;sway;Wayfire;river`） | 装了 |
+
+vidow 自己实现了 `zwlr_screencopy_manager_v1`（`src/screencopy.c`，实测 `wayland-info`
+报 `zwlr_screencopy_manager_v1 version 3`），所以这两个后端都能用。于是默认**探测装了哪个
+用哪个**（`capture_backend()`，`XDG_DATA_DIRS` 里找 `xdg-desktop-portal/portals/{wlr,hyprland}.portal`，
+wlr 优先），一个都没装就一个字都不写 —— 写了等于骗客户端。想强行指定就在
+`~/.config/vidow/portals.conf` 里覆盖：
+
+```ini
+[preferred]
+org.freedesktop.impl.portal.ScreenCast=hyprland
+org.freedesktop.impl.portal.Screenshot=hyprland
+```
+
+（`[preferred]` 里的显式名字会盖过后端自己的 `UseIn` —— 实测：会话名是 `Vidow`、后端写
+`UseIn=KDE` 时，xdg-desktop-portal 照样按配置去激活那个后端。`RemoteDesktop` 同理，
+但它只有 wlr 后端有实现，hyprland 后端没有，所以默认不写。）
 
 在 tty 上排查「portal 现在指向谁」（换了会话 / 从别的桌面切过来之后最容易踩）：
 
@@ -2679,8 +2722,9 @@ src/clipboard.c X11 <-> Wayland 剪贴板桥（自己接管，不用 wlroots 那
 src/portal.c   portal 要的协议：xdg-foreign v1+v2（共用 registry）、
                foreign-toplevel-management、ext-foreign-toplevel-list + 截图源
                （xdg-activation 在 activation.c）
-src/portalconf.c  portal 后端选择：内置默认 → ~/.config/vidow/portals.conf 逐键覆盖
-               → 同步到 portal 的配置目录并重启它
+src/portalconf.c  portal 后端选择：内置默认（含录屏 / 截图后端探测）→
+               ~/.config/vidow/portals.conf 逐键覆盖 → 同步到 portal 的配置目录；
+               启动时把环境 import 进 systemd 用户管理器、退出时还原（先快照）
 shaders/       示例片段着色器（zoom / genie / wave / round / passthru）
 tools/vdrag.c  虚拟指针拖拽测试工具
 tools/xpopup.c 按绝对坐标造 X11 窗口（owner / or / tooltip / menu / combo / utility），
@@ -2721,6 +2765,9 @@ tools/foreign-app.py  GTK4 客户端版本（export_handle + set_transient_for_e
                   验证真实客户端的 xdg-foreign 路径
 test-portal.sh    私有 dbus 里起 portal + 真实 FileChooser 请求
                   gtk/kde 验证协议链路，switch-gtk/switch-kde 验证配置生成链路
+test-portalenv.sh 假 systemctl 记下每次调用：启动 import 环境 / 配置没变也 import /
+                  退出把环境还原（原来没有的就 unset）/ NO_RESTART 不碰用户管理器 /
+                  ScreenCast-Screenshot 按装了哪个后端探测
 test-dpi.sh       1x + 2x 两块 headless 屏，量 X11 / Wayland 客户端的缓冲区与
                   落屏设备像素（只准缩小不准放大）、X 全局缩放、指针命中坐标
 test-xwayland-popup.sh  弹出物：识别（含属性晚到）、绝对定位、不套 toplevel 样式
@@ -3606,6 +3653,68 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
      没有**（不误报）；②掐断帧链 + 追踪开：客户端确实交过帧，追踪报出 ERROR 且点名
      HEADLESS-1、写明「客户端还在交帧，屏幕却不更新」；③掐断帧链 + 追踪**关**：一条 trace
      日志都没有、vidow 照样活着（诊断不改变行为）。
+
+162. **退出 vidow 要把 portal 的环境还回去；录屏后端不是 KDE**。
+
+     两件事都是用户问出来的：①在 tty3 上测完 portal，回 Hyprland 要不要重启 portal？
+     ②vidow 默认的录屏 portal 应该是 KDE 吧？答案分别是「要，而且现在不用手动」和「不是」。
+
+     **① 环境是 vidow 改的，就得 vidow 还**。后端（`xdg-desktop-portal-gtk` 等）是 dbus
+     **按需激活**的，环境取自 systemd 用户管理器；vidow 启动时把 `XDG_CURRENT_DESKTOP` /
+     `WAYLAND_DISPLAY` / `XDG_RUNTIME_DIR` 换成自己的（不导入的话后端连的还是宿主合成器，
+     对话框画到别的桌面上）。退出后不还，回到 Hyprland 以后新拉起来的后端连的是**已经消失
+     的 vidow socket** —— portal 全线失效。而且这台机器上 `Linger=yes`，登出也救不回来：
+     用户管理器不跟着会话退出，Hyprland 自己的启动逻辑只 `unset-environment` + 重新
+     import，**不重启** `xdg-desktop-portal`（`strings /usr/bin/Hyprland` 里就那两条，没有
+     restart）。用户自己那个 `~/.config/hypr/scripts/import-kde-portal-env.sh` 也只 restart
+     了 `plasma-xdg-desktop-portal-kde`，前端没人管。
+
+     顺手挖出来的一个真 bug：`vidow_portal_conf_sync()` 在生成内容和现有文件**逐字节相同**
+     时直接 return —— 连 `import-environment` 一起跳过了。也就是**第二次**启动 vidow（配置
+     文件已经是对的）时，用户管理器里留的还是 Hyprland 的值，后端连的是 `wayland-1`。现在
+     拆成两步：**每次都 import 环境**，只有配置真的变了才重启前端（重启会打断进行中的 portal
+     请求，能省则省）。
+
+     新增（`src/portalconf.c`）：`vidow_portal_env_snapshot()` 启动时问一次
+     `systemctl --user show-environment`，把三个变量记下来 —— 要问用户管理器，不能问
+     vidow 自己的环境（从 tty 起来时 `WAYLAND_DISPLAY` 本来就是空的）；
+     `vidow_portal_env_restore()` 退出时 `set-environment` 写回、原来就没有的
+     `unset-environment` 掉，再重启一次前端（值是单引号包起来再拼进 sh 的）。还顺手把
+     `SIGTERM` / `SIGINT` 接成 `wl_display_terminate`（走正常退出路径）：以前是默认动作直接
+     结束进程，Ctrl+C 和 `pkill` 都不跑清理，环境还原也就没了。实测正常退出
+     **21ms**（SIGTERM → 进程消失）。
+
+     验证：新增 `./test-portalenv.sh`（19 项断言），用**假 `systemctl`** 把「谁在什么时候被
+     怎么调」记下来 —— 不碰你真实会话的用户管理器。四轮：环境齐全 + 首次写配置 / 同一份
+     配置（内容没变）/ 用户管理器里本来没有那两个变量 / `VIDOW_PORTAL_NO_RESTART=1`。
+     revert-red：把 `main.c` 里那一行 `vidow_portal_env_restore()` 注释掉重编，**7 项红**
+     （退出没还原 / 重启次数 1 而不是 2 / 还原顺序 / 日志缺还原记录 / 第二轮退出没还原 /
+     该 unset 没 unset / set 的内容不对），恢复后 19/19 绿。
+
+     **② 录屏不是 KDE**。GTK 后端**根本没有** ScreenCast / Screenshot 这两个接口；KDE 后端
+     有，但实现建在 KWin 的私有 wayland 协议上 —— `strings /usr/lib/xdg-desktop-portal-kde`
+     里有 `zkde_screencast_unstable_v1`，还有一句现成的报错
+     `zkde_screencast_unstable_v1 does not seem to be available`。vidow 不实现它，指过去只会
+     让客户端以为支持、一调用就失败。真能干活的只有两个：
+
+     | 后端 | 走什么 | 本机 |
+     | --- | --- | --- |
+     | `wlr` | `zwlr_screencopy_manager_v1`，专为 wlroots 写 | **没装** |
+     | `hyprland` | 非 Hyprland 的 wlroots 合成器上同样退到 `zwlr_screencopy_manager_v1`（`hyprland.portal` 的 `UseIn` 里就写着 `wlroots;Hyprland;sway;Wayfire;river`，二进制里也有那条退路的文案） | 装了 |
+
+     vidow 自己实现了 `zwlr_screencopy_manager_v1`（`src/screencopy.c`；`wayland-info` 实测
+     报 `zwlr_screencopy_manager_v1 version 3`），所以两个都能用。于是默认**探测装了哪个用
+     哪个**（`capture_backend()`：在 `XDG_DATA_DIRS` 里找
+     `xdg-desktop-portal/portals/{wlr,hyprland}.portal`，wlr 优先），一个都没装就一个字都不写
+     —— 写了等于骗客户端。用户覆盖照旧能改这两行。
+
+     实测（私有 dbus + headless vidow，会话名 `Vidow`）：前端日志
+     `Using hyprland.portal for org.freedesktop.impl.portal.ScreenCast (config)` +
+     `... for org.freedesktop.impl.portal.Screenshot (config)`，`FileChooser` 仍是 `kde.portal`。
+     这顺便证实了 `[preferred]` 里的显式名字**盖过**后端自己的 `UseIn`（`hyprland.portal` 写
+     的是 `UseIn=wlroots;…`，跟会话名 `Vidow` 并不匹配，照样被激活）。`RemoteDesktop` 同理，
+     但只有 wlr 后端有实现，所以默认不写。revert-red：`test-portalenv.sh` 的 E 节拿改动前的
+     二进制跑就是红的（`本机装的是 hyprland` / 日志没说明为什么不写）。
 
 161. **在 tty 上怎么知道 portal 指向谁：`./portaltest.sh`**。
 

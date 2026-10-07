@@ -23,6 +23,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -46,7 +47,7 @@ struct conf_line {
  * Access / Account / Email / DynamicLauncher / Lockdown / Settings。
  * KDE 补齐 GTK 没有的接口 —— 注意 ScreenCast / Screenshot / RemoteDesktop /
  * InputCapture 的 KDE 实现走 KWin 私有 IPC，在 vidow 上会失败，所以故意不列；
- * 那两个接口应该交给 xdg-desktop-portal-wlr（用户覆盖里加两行即可）。 */
+ * 录屏 / 截图交给 capture_backend() 探测出来的那个后端（见下面）。 */
 static const char *default_lines[] = {
 	"default=gtk",
 	"org.freedesktop.impl.portal.FileChooser=kde",
@@ -56,6 +57,50 @@ static const char *default_lines[] = {
 	"org.freedesktop.impl.portal.Clipboard=kde",
 	"org.freedesktop.impl.portal.Background=kde",
 };
+
+/* ScreenCast / Screenshot 该给谁。GTK 后端根本没有这两个接口；KDE 的实现建在
+ * KWin 的私有 wayland 协议上（zkde_screencast_unstable_v1，二进制里就写着
+ * "zkde_screencast_unstable_v1 does not seem to be available"），vidow 不实现它，
+ * 指过去只会让客户端以为支持、一调用就失败。真能在这台合成器上干活的是：
+ *   - wlr       专为 wlroots 写，走 zwlr_screencopy_manager_v1
+ *   - hyprland  它的 ScreenCast 在非 Hyprland 的 wlroots 合成器上同样退到
+ *               zwlr_screencopy_manager_v1（UseIn 里就写着 wlroots/sway/Wayfire/
+ *               river），二进制里有 "compositor doesn't support zwlr_screencopy_v1"
+ *               这条退路
+ * vidow 自己实现了 zwlr_screencopy_manager_v1（screencopy.c），两个都能用。
+ * 装了哪个用哪个，wlr 优先（更轻，就是为这个场景写的）；一个都没装就一个字都不
+ * 写 —— 写了等于骗客户端。用户仍可在 ~/.config/vidow/portals.conf 里覆盖。 */
+static const char *capture_backend(void) {
+	static const char *const files[] = { "wlr.portal", "hyprland.portal" };
+	static const char *const names[] = { "wlr", "hyprland" };
+	static const char *const fallback_dirs = "/usr/local/share:/usr/share";
+
+	const char *dirs = getenv("XDG_DATA_DIRS");
+	if (dirs == NULL || *dirs == '\0') {
+		dirs = fallback_dirs;
+	}
+
+	for (size_t f = 0; f < sizeof(files) / sizeof(files[0]); f++) {
+		for (const char *p = dirs; *p != '\0';) {
+			const char *end = strchr(p, ':');
+			size_t len = (end != NULL) ? (size_t)(end - p) : strlen(p);
+			if (len > 0) {
+				char path[PATH_MAX];
+				snprintf(path, sizeof(path),
+					"%.*s/xdg-desktop-portal/portals/%s",
+					(int)len, p, files[f]);
+				if (access(path, R_OK) == 0) {
+					return names[f];
+				}
+			}
+			if (end == NULL) {
+				break;
+			}
+			p = end + 1;
+		}
+	}
+	return NULL;
+}
 
 /* --------------------------------------------------------------- 小工具 */
 
@@ -265,7 +310,107 @@ static void ensure_parent(const char *path) {
 	mkdir(buf, 0755);
 }
 
-/* --------------------------------------------------------------- 重启 */
+/* ------------------------------------------------------- 环境快照 / 还原 */
+
+/* 后端是 dbus 按需激活的，环境取自 systemd 用户管理器。vidow 启动时把
+ * XDG_CURRENT_DESKTOP / WAYLAND_DISPLAY / XDG_RUNTIME_DIR 改成自己的（见下面
+ * portal_env_import 里的 import-environment），**退出时必须放回去**：不放回去，
+ * 回到宿主合成器（Hyprland 之类）以后新拉起来的后端连的是已经消失的 vidow
+ * socket，portal 全线失效 —— 而且 Linger=yes 时登出也救不回来（用户管理器不跟
+ * 着会话退出，Hyprland 自己的启动逻辑也不会重启 xdg-desktop-portal）。
+ *
+ * 要还原的是「vidow 进来之前用户管理器里是什么」，不是 vidow 继承到的环境：
+ * vidow 一般从 tty 起，那里的 WAYLAND_DISPLAY 本来就是空的。所以快照问
+ * systemctl；问不到（没有 systemd）才退回进程环境。 */
+static const char *const restore_keys[] = {
+	"XDG_CURRENT_DESKTOP",
+	"WAYLAND_DISPLAY",
+	"XDG_RUNTIME_DIR",
+};
+#define RESTORE_N ((int)(sizeof(restore_keys) / sizeof(restore_keys[0])))
+
+static char restore_value[RESTORE_N][VAL_LEN];
+static bool restore_present[RESTORE_N];
+static bool restore_armed;
+
+/* 从 `systemctl --user show-environment` 的输出里取 KEY=VALUE。 */
+static bool env_line_value(const char *buf, const char *key, char *out, size_t cap) {
+	size_t klen = strlen(key);
+	for (const char *line = buf; *line != '\0';) {
+		const char *nl = strchr(line, '\n');
+		size_t llen = (nl != NULL) ? (size_t)(nl - line) : strlen(line);
+		if (llen > klen && strncmp(line, key, klen) == 0 && line[klen] == '=') {
+			size_t vlen = llen - klen - 1;
+			if (vlen >= cap) {
+				vlen = cap - 1;
+			}
+			memcpy(out, line + klen + 1, vlen);
+			out[vlen] = '\0';
+			return true;
+		}
+		if (nl == NULL) {
+			break;
+		}
+		line = nl + 1;
+	}
+	return false;
+}
+
+/* 单引号包起来，值里的 ' 写成 '\'' —— 值来自用户管理器，不能直接拼进 sh。 */
+static void shell_quote(const char *src, char *out, size_t cap) {
+	size_t n = 0;
+	if (n + 1 < cap) {
+		out[n++] = '\'';
+	}
+	for (const char *p = src; *p != '\0' && n + 6 < cap; p++) {
+		if (*p == '\'') {
+			memcpy(out + n, "'\\''", 4);
+			n += 4;
+		} else {
+			out[n++] = *p;
+		}
+	}
+	if (n + 1 < cap) {
+		out[n++] = '\'';
+	}
+	out[n] = '\0';
+}
+
+/* 往 buf 尾巴上追加（buf 必须已经以 '\0' 结尾）。 */
+static void append(char *buf, size_t cap, const char *fmt, ...) {
+	size_t len = strlen(buf);
+	if (len + 1 >= cap) {
+		return;
+	}
+	va_list ap;
+	va_start(ap, fmt);
+	vsnprintf(buf + len, cap - len, fmt, ap);
+	va_end(ap);
+}
+
+/* 把 vidow 的环境推进 systemd 用户管理器。restart_frontend 只在 portals.conf
+ * 真的变了时才需要（换了选谁，前端得重新读一遍配置）。 */
+static void portal_env_import(bool restart_frontend) {
+	if (getenv("VIDOW_PORTAL_NO_RESTART") != NULL) {
+		wlr_log(WLR_INFO, "portal: VIDOW_PORTAL_NO_RESTART 已设，不碰用户管理器");
+		return;
+	}
+
+	/* import-environment 必须在前：后端是 dbus 激活起来的，环境从 systemd
+	 * 用户管理器拿。不导入的话 xdg-desktop-portal-gtk 连的还是宿主合成器，
+	 * 对话框会画到别的桌面上。 */
+	restore_armed = true;
+	if (restart_frontend) {
+		vidow_exec_detached(
+			"systemctl --user import-environment "
+			"XDG_CURRENT_DESKTOP WAYLAND_DISPLAY XDG_RUNTIME_DIR 2>/dev/null; "
+			"systemctl --user restart xdg-desktop-portal 2>/dev/null");
+	} else {
+		vidow_exec_detached(
+			"systemctl --user import-environment "
+			"XDG_CURRENT_DESKTOP WAYLAND_DISPLAY XDG_RUNTIME_DIR 2>/dev/null");
+	}
+}
 
 /* ------------------------------------------------------------ public API */
 
@@ -274,6 +419,89 @@ void vidow_portal_desktop_env(const struct vidow_config *cfg) {
 		return;
 	}
 	setenv("XDG_CURRENT_DESKTOP", cfg->portal_desktop, 1);
+}
+
+/* 记下「vidow 进来之前」用户管理器里的值。要在第一次 import 之前调，而且只需
+ * 一次 —— 后面对账（配置热重载）时再调会把 vidow 自己的值记成「原来」。 */
+void vidow_portal_env_snapshot(void) {
+	if (getenv("VIDOW_PORTAL_NO_RESTART") != NULL) {
+		wlr_log(WLR_INFO, "portal: VIDOW_PORTAL_NO_RESTART 已设，不记环境快照");
+		return;
+	}
+
+	/* 先问用户管理器（那才是后端真正继承的东西），问不到才退回进程环境。 */
+	char buf[8192];
+	buf[0] = '\0';
+	bool from_manager = false;
+	FILE *f = popen("systemctl --user show-environment 2>/dev/null", "r");
+	if (f != NULL) {
+		size_t got = fread(buf, 1, sizeof(buf) - 1, f);
+		buf[got] = '\0';
+		from_manager = pclose(f) == 0;
+	}
+
+	char log[4 * VAL_LEN];
+	log[0] = '\0';
+	for (int i = 0; i < RESTORE_N; i++) {
+		restore_value[i][0] = '\0';
+		restore_present[i] = false;
+		if (from_manager) {
+			restore_present[i] = env_line_value(buf, restore_keys[i],
+				restore_value[i], sizeof(restore_value[i]));
+		} else {
+			const char *value = getenv(restore_keys[i]);
+			if (value != NULL) {
+				copy_str(restore_value[i], sizeof(restore_value[i]), value);
+				restore_present[i] = true;
+			}
+		}
+		append(log, sizeof(log), "%s %s=%s", i == 0 ? "" : " ",
+			restore_keys[i], restore_present[i] ? restore_value[i] : "(未设)");
+	}
+	wlr_log(WLR_INFO, "portal: 环境快照%s（来源：%s）", log,
+		from_manager ? "systemd 用户管理器" : "进程环境");
+}
+
+/* 退出时把环境放回去。没 import 过（没变过用户管理器）就什么都不做。 */
+void vidow_portal_env_restore(void) {
+	if (!restore_armed) {
+		return;
+	}
+	restore_armed = false;
+
+	char set_list[4 * (VAL_LEN + 8)];
+	char unset_list[4 * 64];
+	set_list[0] = '\0';
+	unset_list[0] = '\0';
+	for (int i = 0; i < RESTORE_N; i++) {
+		if (restore_present[i]) {
+			char quoted[VAL_LEN + 8];
+			shell_quote(restore_value[i], quoted, sizeof(quoted));
+			append(set_list, sizeof(set_list), "%s%s=%s",
+				set_list[0] != '\0' ? " " : "", restore_keys[i], quoted);
+		} else {
+			/* 原来就没有这个变量 —— 还原 = 删掉，别留个空的在那 */
+			append(unset_list, sizeof(unset_list), "%s%s",
+				unset_list[0] != '\0' ? " " : "", restore_keys[i]);
+		}
+	}
+
+	char cmd[sizeof(set_list) + sizeof(unset_list) + 128];
+	cmd[0] = '\0';
+	if (set_list[0] != '\0') {
+		append(cmd, sizeof(cmd),
+			"systemctl --user set-environment %s 2>/dev/null; ", set_list);
+	}
+	if (unset_list[0] != '\0') {
+		append(cmd, sizeof(cmd),
+			"systemctl --user unset-environment %s 2>/dev/null; ", unset_list);
+	}
+	append(cmd, sizeof(cmd),
+		"systemctl --user restart xdg-desktop-portal 2>/dev/null");
+
+	wlr_log(WLR_INFO, "portal: 还原用户管理器环境（%s%s），重启 xdg-desktop-portal",
+		set_list, unset_list);
+	vidow_exec_detached(cmd);
 }
 
 void vidow_portal_conf_sync(const struct vidow_config *cfg) {
@@ -305,6 +533,22 @@ void vidow_portal_conf_sync(const struct vidow_config *cfg) {
 		eff[n].key[klen] = '\0';
 		snprintf(eff[n].value, VAL_LEN, "%s", eq + 1);
 		n++;
+	}
+
+	/* 录屏 / 截图按装了哪个后端来定（GTK 没有这两个接口，KDE 的走 KWin 私有
+	 * IPC），见 capture_backend()。用户覆盖在下一步，仍能改掉这两行。 */
+	const char *capture = capture_backend();
+	if (capture != NULL && n + 2 <= MAX_LINES) {
+		snprintf(eff[n].key, KEY_LEN, "%s", "org.freedesktop.impl.portal.ScreenCast");
+		snprintf(eff[n].value, VAL_LEN, "%s", capture);
+		n++;
+		snprintf(eff[n].key, KEY_LEN, "%s", "org.freedesktop.impl.portal.Screenshot");
+		snprintf(eff[n].value, VAL_LEN, "%s", capture);
+		n++;
+		wlr_log(WLR_INFO, "portal: 录屏 / 截图交给 %s 后端", capture);
+	} else if (capture == NULL) {
+		wlr_log(WLR_INFO, "portal: 没装 xdg-desktop-portal-wlr / -hyprland，"
+			"ScreenCast / Screenshot 不写（GTK 没这两个接口，KDE 的走 KWin）");
 	}
 
 	struct conf_line ov[MAX_LINES];
@@ -344,18 +588,16 @@ void vidow_portal_conf_sync(const struct vidow_config *cfg) {
 		len += (size_t)wrote;
 	}
 
-	/* 3. 内容没变就什么都不做：每次开机重启一遍 portal 太吵，而且会打断
-	 * 正在进行的 portal 请求。 */
+	/* 3. 内容没变就别重写文件、别重启前端（重启太吵，还会打断正在进行的
+	 * portal 请求）。但 import 环境那一步**不能**跟着跳过：后端是 dbus 按需
+	 * 激活的，环境取自用户管理器，而那里留的是上一个合成器的值（Hyprland
+	 * 之类）—— 文件没变不代表环境是对的。 */
 	size_t old_len = 0;
 	char *old = slurp(target, &old_len);
+	bool changed = true;
 	if (old != NULL) {
-		bool same = old_len == len && memcmp(old, content, len) == 0;
+		changed = old_len != len || memcmp(old, content, len) != 0;
 		free(old);
-		if (same) {
-			wlr_log(WLR_DEBUG, "portal: %s 内容没变，跳过", target);
-			free(content);
-			return;
-		}
 	}
 
 	if (!cfg->portal_conf_sync) {
@@ -365,24 +607,17 @@ void vidow_portal_conf_sync(const struct vidow_config *cfg) {
 		return;
 	}
 
-	ensure_parent(target);
-	if (!write_atomic(target, content)) {
-		free(content);
-		return;
+	if (changed) {
+		ensure_parent(target);
+		if (!write_atomic(target, content)) {
+			free(content);
+			return;
+		}
+		wlr_log(WLR_INFO, "portal: 写入 %s（%d 行）", target, n);
+	} else {
+		wlr_log(WLR_DEBUG, "portal: %s 内容没变，只 import 环境", target);
 	}
 	free(content);
-	wlr_log(WLR_INFO, "portal: 写入 %s（%d 行），重启 xdg-desktop-portal", target, n);
 
-	if (getenv("VIDOW_PORTAL_NO_RESTART") != NULL) {
-		wlr_log(WLR_INFO, "portal: VIDOW_PORTAL_NO_RESTART 已设，跳过重启");
-		return;
-	}
-
-	/* import-environment 必须在前：后端是 dbus 激活起来的，环境从 systemd
-	 * 用户管理器拿。不导入的话 xdg-desktop-portal-gtk 连的还是宿主合成器，
-	 * 对话框会画到别的桌面上。 */
-	vidow_exec_detached(
-		"systemctl --user import-environment "
-		"XDG_CURRENT_DESKTOP WAYLAND_DISPLAY XDG_RUNTIME_DIR 2>/dev/null; "
-		"systemctl --user restart xdg-desktop-portal 2>/dev/null");
+	portal_env_import(changed);
 }
