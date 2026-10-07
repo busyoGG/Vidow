@@ -751,6 +751,7 @@ python3 test-float.py        # 三个真实 GTK 窗口，验证浮动模式自�
 ./test-blursmall.sh                  # 客户端只动窗口里一小块时，只有真被它压着的那片模糊该重抓（6 项断言）
 ./test-blurpartial.sh                # 「模糊链条只重跑受损那一小块」和「整块重跑」逐像素一样（6 项断言）
 ./test-blurnooverlap.sh              # 窗口不再重叠之后，模糊底衬和「从没重叠过」时逐像素一样（5 项断言）
+./test-pixman-renderer.sh            # 软件渲染器（pixman）下不崩：装饰关掉、窗口照常上屏（5 项断言）
 ./test-config.sh                     # 配置系统：一个 Lua 文件 + 改了就自动重载（全 headless，15 项断言）
 ./test-binds.sh                      # 键位全是配置给的：没配置=没有键位、默认那套能用、换键位、动作字符串（全 headless，35 项断言）
 ./test-config-include.sh             # 配置拆成好几份：vidow.include() 的路径/顺序/报错 + 改哪份都自动重载（全 headless，25 项断言）
@@ -3582,6 +3583,39 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
      没有**（不误报）；②掐断帧链 + 追踪开：客户端确实交过帧，追踪报出 ERROR 且点名
      HEADLESS-1、写明「客户端还在交帧，屏幕却不更新」；③掐断帧链 + 追踪**关**：一条 trace
      日志都没有、vidow 照样活着（诊断不改变行为）。
+
+153. **崩溃：渲染器不是 GLES2 时，每帧那次 GL 提交会踩 wlroots 的 assert（从 core dump 里挖出来的）**。
+
+     用户报「微信登陆直接导致 vidow 崩溃」。`coredumpctl` 里有三份 vidow 的 core（20:00 / 21:16 /
+     21:56，全是 SIGABRT），栈一模一样：
+
+     ```
+     #4 __assert_fail
+     #5 libwlroots-0.20.so + 0x224c4      ← 0x224c4 处那条断言的字面量是
+     #6 libwlroots-0.20.so + 0x2255f         wlr_renderer_is_gles2(wlr_renderer)，
+     #7 gl_make_current (vidow)              文件 render/gles2/renderer.c，函数 gles2_get_renderer
+     #8 vidow_fx_flush (vidow)
+     #9 vidow_output_render
+     #10 output_frame
+     ```
+
+     断言的字面量是反汇编 0x224b6/0x224be 两条指令读出来的（rdi = `wlr_renderer_is_gles2
+     (wlr_renderer)`、rsi = `render/gles2/renderer.c`、rcx = `gles2_get_renderer`）。
+
+     机制：`wlr_gles2_renderer_get_egl()` 第一行就是那条断言 —— 渲染器不是 GLES2 时它**不是
+     返回 NULL，是当场 abort**。而 `vidow_fx_flush()`（152 那条「一帧的离屏趟只提交一次」的
+     收尾，d4973b5 加的）原来是无条件调的：装饰 / 模糊那条路本来就在 `shader_ok` 底下
+     （渲染器不是 GLES2 时压根不跑），只有这个新加的每帧提交漏了。于是「软件渲染兜底
+     （pixman）」这种完全合法的情况下，第一帧就 abort。
+
+     两处一起收：`gl_make_current()` 自己先判 `wlr_renderer_is_gles2()`（不把「判类型」交给
+     那个会 abort 的函数）；`vidow_fx_flush()` 在 `!server->shader_ok` 时直接走人。
+
+     新增 `./test-pixman-renderer.sh`（5 项）：`WLR_RENDERER=pixman` + headless，断言
+     ①真的在用 pixman ②日志有「renderer is not GLES2, decorations and blur off」③进程活着
+     ④日志里没有 Assertion ⑤窗口照样上屏（纯蓝像素 425414 个）。回退 `src/fx.c` 跑：③④⑤ 全红，
+     日志里就是 `vidow: render/gles2/renderer.c:38: gles2_get_renderer: Assertion ... failed.`
+     + 核心已转储。
 
 152. **窗口「不再重叠」之后模糊底衬变成一块被缩放 + 错位的壁纸：区域要跟着贴图一起换**。
 
