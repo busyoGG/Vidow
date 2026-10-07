@@ -364,7 +364,13 @@ read -r N1 X1 Y1 W1 H1 <<< "$(ink "$RUNDIR/cur.png")"
 	&& pass "没放大时外接矩形就是光标图大小（$IMG0）" \
 	|| fail "外接矩形是 $W1 x $H1，期望 $IMG0"
 msg cursor-shake >/dev/null
-sleep 0.35
+# 等放大补间走完再拍：固定 sleep 0.35 是抢跑（IPC 那一下什么时候被处理掉、补间
+# 走到哪，都随机器快慢飘 —— 实测拍到的外接矩形 31x49 / 35x56 / 52x83 都有）。
+# 判据是「放大后正好是 $BIG」，那就等到它就是 $BIG 为止。
+for _ in $(seq 1 40); do
+	[ "$(cfield image)" = "$BIG" ] && break
+	sleep 0.05
+done
 grim -c "$RUNDIR/cur-mag.png" >/dev/null 2>&1
 read -r N2 X2 Y2 W2 H2 <<< "$(ink "$RUNDIR/cur-mag.png")"
 [ "$W2" = "${BIG%x*}" ] && [ "$H2" = "${BIG#*x}" ] \
