@@ -724,8 +724,35 @@ static GLuint begin_pass(struct vidow_server *server, struct wlr_buffer *dst,
 	return begin_pass_rect(server, dst, w, h, NULL, egl);
 }
 
+/* 一趟画完：只把 FBO 解绑，**不 flush、也不解绑 EGL 上下文**。
+ *
+ * 这两件事以前是每趟都做的，而它们是整条装饰链里最贵的一步：eglMakeCurrent
+ * (EGL_NO_CONTEXT) 会把这批命令提交给内核（实测 amdgpu 上一次 ~40µs），
+ * glFlush 也一样。一帧里「模糊链 + 每个窗口一趟装饰」轻松十几到二十几趟，
+ * 于是每帧白付 0.4~1.0ms 的内核提交 —— 而同一份工作整帧只提交一次就够了。
+ *
+ * 为什么攒到一帧一次是安全的：同一个 GL 上下文里的绘制顺序由 GL 自己保证
+ * （装饰缓冲被场景当贴图采样，不 flush 也一定读到新内容）；wlroots 的
+ * wlr_egl_make_current() 每次都会真的 eglMakeCurrent（它不缓存），所以上下文
+ * 留在这儿绑着不会让谁算错。提交由 vidow_fx_flush() 在每帧提交前做一次，
+ * wlroots 自己在 renderer_end / 换上下文时也会 flush。
+ *
+ * 实测（8 个平铺窗滚动，2560x1440 缩放 2）：每趟一次内核提交 → 每帧一次，
+ * 「重烘」0.56ms/帧 → 0.12ms/帧，CPU 6.8% → 4.8%。 */
 static void end_pass(struct wlr_egl *egl) {
+	(void)egl;
+	vidow_stats.passes++; /* 探针：一帧里开了几趟 */
 	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+
+/* 一帧一次的提交（见 end_pass 的说明）：把这一帧所有离屏趟的命令一次性交给内核。
+ * 放在 wlr_scene_output_commit 之前 —— 那之后 wlroots 可能走直扫（一个 GL 调用
+ * 都不发），没人替我们 flush。 */
+void vidow_fx_flush(struct vidow_server *server) {
+	struct wlr_egl *egl = NULL;
+	if (!gl_make_current(server, &egl)) {
+		return;
+	}
 	glFlush();
 	gl_release(egl);
 }

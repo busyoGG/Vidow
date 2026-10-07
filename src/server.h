@@ -1114,8 +1114,8 @@ struct vidow_clipboard {
 
 /* 临时探针（VIDOW_RENDER_STATS=1）：见 src/fx.c 里的同名结构 */
 struct vidow_frame_stats {
-	int shared, own, chains, bakes, tex_new, tex_del, frames;
-	int64_t blur_ns, decor_ns, jelly_ns, commit_ns;
+	int shared, own, chains, bakes, tex_new, tex_del, frames, passes;
+	int64_t blur_ns, decor_ns, jelly_ns, commit_ns, bake_ns;
 };
 extern struct vidow_frame_stats vidow_stats;
 
@@ -1583,6 +1583,7 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 		double alpha, bool focused, double scale, double ov);
 void vidow_fx_end(struct vidow_server *server, struct vidow_fx_target *fx);
 void vidow_fx_release(struct vidow_fx_target *fx);
+void vidow_fx_flush(struct vidow_server *server);
 bool vidow_fx_set_shader(struct vidow_server *server,
 		struct vidow_fx_target *fx, const char *name,
 		enum vidow_shader_phase phase);

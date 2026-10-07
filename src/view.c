@@ -1093,9 +1093,14 @@ void vidow_view_anim_bake(struct vidow_view *view) {
 	/* 装饰节点摆在「可见窗口」左上角（视图树的原点就是它，见 vidow_fx_geo），
 	 * 不在源缓冲的原点上：源缓冲多出来的那圈 CSD 留白落在装饰矩形外面。 */
 	view->fx.anim_scale = view->anim_scale;
+	int64_t bake_t0 = vidow_now_ns();
 	bool fx_drawn = vidow_fx_frame(view->server, &view->fx, src, &geo, 0, 0,
 		x, y, alpha, view->server->focused == view,
 		view_scale(view) * ov, ov);
+	/* 探针：整块窗口那么大的离屏渲染一共多少钱（见统计行的「重烘」；次数由
+	 * vidow_fx_frame 的 vidow_stats.bakes 记）。拖动 / 滚动动画里每个在动的
+	 * 窗口每帧都要烘一次，所以这项随窗口数线性涨。 */
+	vidow_stats.bake_ns += vidow_now_ns() - bake_t0;
 	/* 装饰图真的画上屏了才把真实表面藏起来（只留给命中测试）。没画出来
 	 * 还藏就是窗口整个消失 —— 关掉 decor/shader 时踩过，屏幕一片黑。
 	 * 拖着果冻的时候也一样：内容归 jelly.c 那个节点画。 */

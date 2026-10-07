@@ -94,6 +94,9 @@ void vidow_output_render(struct vidow_output *output) {
 	/* 屏幕这一帧就是屏幕这一帧：抓帧是 vidow 自己另外渲染的一遍（capture.c /
 	 * screencopy.c），和这里没有任何关系 —— capture = "hide" 的窗口 / layer
 	 * 屏幕上照常显示，只在抓帧里没有。 */
+	/* 这一帧所有离屏趟（模糊链 / 装饰 / 果冻）的命令在这里一次性提交，
+	 * 而不是每趟一次 —— 见 fx.c 的 end_pass。 */
+	vidow_fx_flush(server);
 	wlr_scene_output_commit(output->scene_output, NULL);
 	int64_t st_t4 = vidow_now_ns();
 	if (getenv("VIDOW_RENDER_STATS") != NULL) {
@@ -111,7 +114,8 @@ void vidow_output_render(struct vidow_output *output) {
 			wlr_log(WLR_INFO,
 				"渲染统计: %d 帧/帧窗(%.0fms) %.1f fps | 模糊 %.2fms/帧"
 				"(shared %d own %d chain %d) | 装饰 %.2fms/帧(%d 次重烘) | "
-				"果冻 %.2fms/帧 | 提交 %.2fms/帧 | 贴图 +%d/-%d",
+				"果冻 %.2fms/帧 | 提交 %.2fms/帧 | 贴图 +%d/-%d | 趟 %d | "
+				"重烘 %.2fms/帧",
 				vidow_stats.frames, (double)(st_t4 - win_ns) / 1e6,
 				1000.0 * f / ((double)(st_t4 - win_ns) / 1e6),
 				(double)vidow_stats.blur_ns / 1e6 / f,
@@ -119,7 +123,8 @@ void vidow_output_render(struct vidow_output *output) {
 				(double)vidow_stats.decor_ns / 1e6 / f, vidow_stats.bakes,
 				(double)vidow_stats.jelly_ns / 1e6 / f,
 				(double)vidow_stats.commit_ns / 1e6 / f,
-				vidow_stats.tex_new, vidow_stats.tex_del);
+				vidow_stats.tex_new, vidow_stats.tex_del, vidow_stats.passes,
+				(double)vidow_stats.bake_ns / 1e6 / f);
 			vidow_stats = (struct vidow_frame_stats){0};
 			win_ns = st_t4;
 		}
