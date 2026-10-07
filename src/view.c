@@ -2524,6 +2524,93 @@ static void view_unmap(struct wl_listener *listener, void *data) {
 	vidow_arrange(server);
 }
 
+/* 客户端这一帧到底动了哪一块（布局逻辑坐标，语义见 server.h）。
+ *
+ * surface->buffer_damage 是**缓冲像素**坐标：wlroots 在 surface_update_damage()
+ * 里已经把客户端的 surface damage + buffer damage、viewport 的 src 偏移、scale、
+ * transform 全算进去了（换缓冲 / 换尺寸就是整块）。要变成布局逻辑坐标只差一个
+ * 「缓冲像素 / 表面逻辑像素」的倍率和场景节点的位置。
+ *
+ * 只有这几件事都成立时才敢用小盒子（否则返回 WHOLE，让调用方按整块算）：
+ * 没有 transform / viewport 缩放、没有 subsurface（它们的 commit 我们没在听，
+ * 拿不到损伤区域）、场景节点没有被改成别的显示尺寸（overview / X11 缩放）、
+ * overview 没在跑（那时候节点位置是映射过的，跟布局坐标对不上）。 */
+enum vidow_surface_damage vidow_view_surface_damage(struct vidow_view *view,
+		struct wlr_box *box) {
+	struct wlr_surface *s = vidow_view_surface(view);
+	if (s == NULL || view->scene_surface == NULL ||
+			view->scene_surface->buffer == NULL) {
+		return VIDOW_SURFACE_DAMAGE_WHOLE;
+	}
+	const struct wlr_surface_state *st = &s->current;
+	if (!pixman_region32_not_empty(&s->buffer_damage)) {
+		/* 没报损伤。没换缓冲 = 真的一个像素都没动（只有帧回调 /
+		 * ack_configure 的那种 commit），世界代次都不用动；换了新缓冲却
+		 * 没报损伤 = 内容到底变没变说不清，按整块算。 */
+		return (st->committed & WLR_SURFACE_STATE_BUFFER) != 0 ?
+			VIDOW_SURFACE_DAMAGE_WHOLE : VIDOW_SURFACE_DAMAGE_NONE;
+	}
+	if (st->transform != WL_OUTPUT_TRANSFORM_NORMAL ||
+			st->viewport.has_dst || st->viewport.has_src ||
+			st->width <= 0 || st->height <= 0 ||
+			st->buffer_width <= 0 || st->buffer_height <= 0) {
+		return VIDOW_SURFACE_DAMAGE_WHOLE;
+	}
+	if (!wl_list_empty(&st->subsurfaces_below) ||
+			!wl_list_empty(&st->subsurfaces_above)) {
+		return VIDOW_SURFACE_DAMAGE_WHOLE;
+	}
+	struct wlr_scene_buffer *sb = view->scene_surface->buffer;
+	if (sb->dst_width > 0 &&
+			(sb->dst_width != st->width || sb->dst_height != st->height)) {
+		return VIDOW_SURFACE_DAMAGE_WHOLE;
+	}
+	if (vidow_overview_active(view->server)) {
+		return VIDOW_SURFACE_DAMAGE_WHOLE;
+	}
+	int nx = 0, ny = 0;
+	if (!wlr_scene_node_coords(&sb->node, &nx, &ny)) {
+		return VIDOW_SURFACE_DAMAGE_WHOLE;
+	}
+	pixman_box32_t *d = pixman_region32_extents(&s->buffer_damage);
+	double cs = (double)st->buffer_width / (double)st->width;
+	int x1 = (int)floor((double)d->x1 / cs);
+	int x2 = (int)ceil((double)d->x2 / cs);
+	int y1 = (int)floor((double)d->y1 / cs);
+	int y2 = (int)ceil((double)d->y2 / cs);
+	/* 只算表面里**看得见**的那一块：客户端可以声明窗口几何比表面小（GTK 的
+	 * CSD 留白 —— 装饰着色器只采窗口几何那一块，见 vidow_view_fx_geo），
+	 * 留白那圈 vidow 根本不画。损伤全落在留白里 = 屏幕上什么都没变。 */
+	struct wlr_box g = vidow_view_geometry(view);
+	if (g.width <= 0 || g.height <= 0 || g.x < 0 || g.y < 0 ||
+			g.x + g.width > st->width || g.y + g.height > st->height) {
+		/* 没声明几何 / 声明框落在表面外面（客户端改大小的过渡期）：当整块
+		 * 表面都是可见内容，跟 vidow_view_fx_geo 同一套判断。 */
+		g = (struct wlr_box){ .x = 0, .y = 0,
+			.width = st->width, .height = st->height };
+	}
+	if (x1 < g.x) {
+		x1 = g.x;
+	}
+	if (y1 < g.y) {
+		y1 = g.y;
+	}
+	if (x2 > g.x + g.width) {
+		x2 = g.x + g.width;
+	}
+	if (y2 > g.y + g.height) {
+		y2 = g.y + g.height;
+	}
+	if (x2 <= x1 || y2 <= y1) {
+		return VIDOW_SURFACE_DAMAGE_NONE; /* 只在看不见的留白里动 */
+	}
+	*box = (struct wlr_box){
+		.x = nx + x1, .y = ny + y1,
+		.width = x2 - x1, .height = y2 - y1,
+	};
+	return VIDOW_SURFACE_DAMAGE_BOX;
+}
+
 static void view_commit(struct wl_listener *listener, void *data) {
 	(void)data;
 	struct vidow_view *view = wl_container_of(listener, view, commit);
@@ -2555,8 +2642,23 @@ static void view_commit(struct wl_listener *listener, void *data) {
 
 	/* New pixels: everything that samples this window as a backdrop (a
 	 * floating window on top of it) has to be re-blurred. 它自己那张私有底衬
-	 * 不受影响（抓的时候它是藏着的），所以这笔账记在它头上。 */
-	vidow_backdrop_damage_view(view);
+	 * 不受影响（抓的时候它是藏着的），所以这笔账记在它头上。
+	 *
+	 * 记的是**客户端真动过的那一块**（surface damage），不是整块窗口：一个
+	 * 1000x800 的窗口里只有一条 300x20 的进度条在动的时候，压着它的那个窗口
+	 * 底下那片模糊只该因为这一条过期。说不清的时候照样整块算（见
+	 * vidow_view_surface_damage）。 */
+	struct wlr_box dmg;
+	switch (vidow_view_surface_damage(view, &dmg)) {
+	case VIDOW_SURFACE_DAMAGE_NONE:
+		break; /* 一个像素都没变：世界代次都不动 */
+	case VIDOW_SURFACE_DAMAGE_BOX:
+		vidow_backdrop_damage_view_rect(view, &dmg);
+		break;
+	case VIDOW_SURFACE_DAMAGE_WHOLE:
+		vidow_backdrop_damage_view(view);
+		break;
+	}
 
 	if (view->kind == VIDOW_VIEW_X11) {
 		/* X11：缓冲区的缩放比例要跟着 xwayland_scale 走（尺寸变了就重算），

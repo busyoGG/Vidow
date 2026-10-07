@@ -391,6 +391,15 @@ struct vidow_fx_geo {
 	float tex_u0, tex_v0, tex_du, tex_dv;
 };
 
+/* 攒下来的损伤区域（布局逻辑坐标）：留几个盒子，装不下了才合并 —— 两个客户端在
+ * 同一帧里各动窗口的一角时，单个包围盒会把中间那一大片没变的地方也算成损伤
+ * （见 fx.c 的 dmg_add）。4 个够用了：一帧里真能撞到同一张底衬的损伤笔数就那么多。 */
+#define VIDOW_DMG_BOXES 4
+struct vidow_dmg_set {
+	struct wlr_box box[VIDOW_DMG_BOXES];
+	int n;
+};
+
 struct vidow_fx_target {
 	struct wlr_scene_buffer *node;
 	/* decoration pass */
@@ -443,11 +452,14 @@ struct vidow_fx_target {
 	struct wlr_texture *own_bd_tex;
 	int own_bd_w, own_bd_h;
 
-	/* 上一次重建之后、落在「这张底衬管得着的范围」里的损伤（**布局逻辑坐标**；
-	 * 宽或高 <= 0 = 没有；「整屏都算」时填一个巨大的盒子）。世界代次只是粗筛：
-	 * 别的窗口在屏幕另一头重画（视频 / 浏览器）不该让我这张底衬重抓，真正的判据
-	 * 是「这次损伤有没有碰到我这一块」（见 blur_note_damage / blur_damage_hits）。 */
-	struct wlr_box pending_damage;
+	/* 上一次重建之后攒下来的损伤（**布局逻辑坐标**；n == 0 = 没有；「整屏都算」
+	 * 时里面是一个巨大的盒子）。世界代次只是粗筛：别的窗口在屏幕另一头重画
+	 * （视频 / 浏览器）不该让我这张底衬重抓，真正的判据是「这次损伤有没有碰到
+	 * 我这一块」（见 blur_note_damage / blur_damage_hits）。
+	 *
+	 * 存的是**几个盒子**不是一个包围盒：两个客户端同一帧里各动窗口的一角，
+	 * 包围盒会把中间没变的那一大片也算成损伤（见 fx.c 的 dmg_add）。 */
+	struct vidow_dmg_set pending_damage;
 
 	/* ext-background-effect 的模糊区域（窗口局部坐标）。blur_region_on 为
 	 * true 时着色器只在这个盒子里画模糊；-1 表示不限制。 */
@@ -1583,6 +1595,27 @@ void vidow_backdrop_damage_region(struct vidow_server *server,
 		const struct wlr_box *box);
 /* 同上，但这一笔账记在某个窗口头上：它自己变了（不影响它自己的私有底衬）。 */
 void vidow_backdrop_damage_view(struct vidow_view *view);
+/* 同上，但损伤区域由调用方给（NULL = 整块窗口）：这次变的**就是**这一块 ——
+ * 客户端只重画了窗口里的一小块时用（见 vidow_view_surface_damage）。 */
+void vidow_backdrop_damage_view_rect(struct vidow_view *view,
+		const struct wlr_box *box);
+
+/* 客户端这一帧到底动了哪一块（布局逻辑坐标）。surface->buffer_damage 是**缓冲
+ * 像素**坐标（wlroots 已经把 surface/buffer damage、transform、scale 都算进去
+ * 了），除以「缓冲像素 / 表面逻辑像素」就是布局逻辑像素，再加场景节点的位置。 */
+enum vidow_surface_damage {
+	/* 一个像素都没变（只是帧回调 / ack_configure 的那种 commit）：世界代次都
+	 * 不用动 —— 不动，别人缓存的底衬就还是对的。 */
+	VIDOW_SURFACE_DAMAGE_NONE = 0,
+	/* box 里就是那一块。 */
+	VIDOW_SURFACE_DAMAGE_BOX,
+	/* 说不清（变换 / viewport 缩放 / 有 subsurface / 场景节点被改过显示尺寸 /
+	 * overview 里位置是映射过的 / 换了新缓冲却没报损伤）：按整块窗口算 ——
+	 * 宁可多抓一次，不能糊着旧的。 */
+	VIDOW_SURFACE_DAMAGE_WHOLE,
+};
+enum vidow_surface_damage vidow_view_surface_damage(struct vidow_view *view,
+		struct wlr_box *box);
 /* Release the blur resources an output owns. */
 void vidow_blur_output_finish(struct vidow_output *output);
 

@@ -950,6 +950,77 @@ static const struct wlr_box blur_box_all = {
 	.width = 0x7fffffff, .height = 0x7fffffff,
 };
 
+static bool dmg_box_empty(const struct wlr_box *b) {
+	return b->width <= 0 || b->height <= 0;
+}
+
+static int64_t dmg_box_area(const struct wlr_box *b) {
+	return dmg_box_empty(b) ? 0 : (int64_t)b->width * (int64_t)b->height;
+}
+
+/* b 完全在 a 里面。 */
+static bool dmg_box_inside(const struct wlr_box *a, const struct wlr_box *b) {
+	return a->x <= b->x && a->y <= b->y &&
+		a->x + a->width >= b->x + b->width &&
+		a->y + a->height >= b->y + b->height;
+}
+
+/* 攒着的损伤区域：**不是一个包围盒**。两个客户端在同一帧里各动窗口的一角（一个
+ * 在左上、一个在右下），包围盒会把中间那一大片**没变**的地方也算进去，压着它们的
+ * 那个窗口底下的模糊就白重抓了 —— 损伤盒子本身做小之后，这个「并集吃掉中间」的
+ * 代价反而变成了主要开销。所以留几个盒子（VIDOW_DMG_BOXES 个），装不下了才合并，
+ * 合并到「并进去之后总面积最小」的那个上。 */
+static void dmg_add(struct vidow_dmg_set *set, const struct wlr_box *box) {
+	if (box == NULL || dmg_box_empty(box)) {
+		return;
+	}
+	for (int i = 0; i < set->n; i++) {
+		if (dmg_box_inside(&set->box[i], box)) {
+			return; /* 已经算进去了 */
+		}
+	}
+	if (set->n < VIDOW_DMG_BOXES) {
+		set->box[set->n++] = *box;
+		return;
+	}
+	int best = 0;
+	int64_t best_grow = -1;
+	for (int i = 0; i < set->n; i++) {
+		struct wlr_box merged = set->box[i];
+		blur_box_add(&merged, box);
+		int64_t grow = dmg_box_area(&merged) - dmg_box_area(&set->box[i]);
+		if (best_grow < 0 || grow < best_grow) {
+			best_grow = grow;
+			best = i;
+		}
+	}
+	blur_box_add(&set->box[best], box);
+}
+
+/* 这块区域跟攒下来的任何一笔损伤碰不碰得到。 */
+static bool dmg_touch(const struct vidow_dmg_set *set,
+		const struct wlr_box *region) {
+	for (int i = 0; i < set->n; i++) {
+		if (blur_box_touch(&set->box[i], region)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/* 攒下来的损伤的包围盒：只给日志用（真正的判据是上面那个逐盒子的碰法）。 */
+static struct wlr_box dmg_bounds(const struct vidow_dmg_set *set) {
+	struct wlr_box b = {0};
+	for (int i = 0; i < set->n; i++) {
+		blur_box_add(&b, &set->box[i]);
+	}
+	return b;
+}
+
+static void dmg_clear(struct vidow_dmg_set *set) {
+	set->n = 0;
+}
+
 /* 把「刚变了的这块区域」（布局逻辑坐标）记到每个需要私有底衬的元素头上；skip 那
  * 个元素自己不记（它自己的变化不该让它自己的底衬过期 —— 抓的时候它是藏着的）。
  * 记进来的盒子一直攒着，直到那个元素真的重抓一次才清掉：这样「损伤在屏幕另一头」
@@ -964,11 +1035,11 @@ static void blur_note_damage(struct vidow_server *server,
 		if (view == skip) {
 			continue;
 		}
-		blur_box_add(&view->fx.pending_damage, box);
+		dmg_add(&view->fx.pending_damage, box);
 	}
 	struct vidow_layer_surface *ls;
 	wl_list_for_each(ls, &server->layers, link) {
-		blur_box_add(&ls->fx.pending_damage, box);
+		dmg_add(&ls->fx.pending_damage, box);
 	}
 }
 
@@ -982,7 +1053,7 @@ void vidow_backdrop_damage_box(struct vidow_server *server,
  * 半径算进去了（见 view_region_rect），所以碰到区域就是碰到能影响它的内容。 */
 static bool blur_damage_hits(const struct vidow_fx_target *fx,
 		const struct wlr_box *region) {
-	return blur_box_touch(&fx->pending_damage, region);
+	return dmg_touch(&fx->pending_damage, region);
 }
 
 /* 窗口「现在画在哪」：布局几何 + 动画偏移（拖拽 / 开合 / overview 都算在这上面）。 */
@@ -1017,18 +1088,28 @@ void vidow_backdrop_damage_region(struct vidow_server *server,
 /* 只有某个窗口自己变了的那些改动（它被拖、内容重画、开合动画、果冻形变）：
  * 世界代次照常前进，另外在这个窗口头上单独记一笔。私有底衬抓的是「世界减掉这
  * 个窗口」（抓的时候它自己藏着），所以那张图只跟 gen_scene - self_gen 有关 ——
- * 不记这一笔，拖一个重叠窗口时它自己的底衬每帧都被判过期，白重抓一遍。 */
-void vidow_backdrop_damage_view(struct vidow_view *view) {
-	struct wlr_box box = vidow_view_screen_box(view);
+ * 不记这一笔，拖一个重叠窗口时它自己的底衬每帧都被判过期，白重抓一遍。
+ *
+ * box == NULL：整块窗口都变了（老行为）。box != NULL：变的**只有**这一块 ——
+ * 客户端只重画了窗口里一小块时（见 vidow_view_surface_damage），别人的底衬也
+ * 只该因为这一小块过期：屏幕另一头那条 300px 宽的视频进度条，不该让整个窗口
+ * 底下那片模糊重抓一遍。 */
+void vidow_backdrop_damage_view_rect(struct vidow_view *view,
+		const struct wlr_box *box) {
+	struct wlr_box b = box != NULL ? *box : vidow_view_screen_box(view);
 	view->self_gen++;
 	damage_bump(view->server, false);
 	/* 变的是它自己这一块：别人（底衬里画着它）得重抓，它自己不用。 */
-	blur_note_damage(view->server, &box, view);
+	blur_note_damage(view->server, &b, view);
 	/* 一次 arrange 里只要有一个「不是正被拖的那个」窗口报了自己变了，这一趟就
 	 * 不能整笔算在被拖的那个头上（见 vidow_arrange）。 */
 	if (view->server->arrange_self_only && view->server->grab_view != view) {
 		view->server->arrange_self_only = false;
 	}
+}
+
+void vidow_backdrop_damage_view(struct vidow_view *view) {
+	vidow_backdrop_damage_view_rect(view, NULL);
 }
 
 int vidow_fx_pad(struct vidow_server *server) {
@@ -1654,6 +1735,9 @@ static bool view_region_build(struct vidow_server *server,
 	}
 
 	struct vidow_fx_target *fx = &view->fx;
+	/* 这一版是被哪一块损伤触发的（只给下面那行日志用：pending_damage 这里就要
+	 * 清掉了）。修「客户端只动了一小块，整片模糊却重抓」时，看的就是这个数。 */
+	struct wlr_box dmg = dmg_bounds(&fx->pending_damage);
 	if (fx->own_bd == NULL || fx->own_bd_w != rw || fx->own_bd_h != rh) {
 		own_bd_drop(fx);
 		fx->own_bd = vidow_alloc_target(server, rw, rh);
@@ -1728,7 +1812,7 @@ static bool view_region_build(struct vidow_server *server,
 	}
 
 	vidow_stats.own++;
-	fx->pending_damage = (struct wlr_box){0}; /* 这一版的账已经算清了 */
+	dmg_clear(&fx->pending_damage); /* 这一版的账已经算清了 */
 	blur_own_drop(fx);
 	if (!blur_set_alloc(server, &fx->blur_set, rw, rh, levels)) {
 		return false;
@@ -1758,9 +1842,11 @@ static bool view_region_build(struct vidow_server *server,
 		}
 		dumped++;
 	}
-	wlr_log(WLR_DEBUG, "blur: own region %s %dx%d at %d,%d levels=%d",
+	wlr_log(WLR_DEBUG, "blur: own region %s %dx%d at %d,%d levels=%d"
+		"（损伤 %dx%d at %d,%d）",
 		vidow_view_title(view) != NULL ? vidow_view_title(view) : "?",
-		rw, rh, rx, ry, levels);
+		rw, rh, rx, ry, levels,
+		dmg.width, dmg.height, dmg.x, dmg.y);
 	return true;
 }
 
@@ -2504,7 +2590,7 @@ static bool layer_region_build(struct vidow_server *server,
 		return false;
 	}
 
-	ls->fx.pending_damage = (struct wlr_box){0}; /* 这一版的账已经算清了 */
+	dmg_clear(&ls->fx.pending_damage); /* 这一版的账已经算清了 */
 	/* 旧贴图裹着的缓冲马上要被金字塔复用。 */
 	blur_own_drop(&ls->fx);
 	if (!blur_set_alloc(server, &ls->fx.blur_set, rw, rh, levels)) {
