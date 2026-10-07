@@ -1635,10 +1635,30 @@ static bool view_overlaps_other(struct vidow_view *view) {
 }
 
 /* Point a window at a blurred backdrop. Nothing is redrawn while the texture
- * identity stays the same, which is what keeps a static screen free. */
+ * identity stays the same, which is what keeps a static screen free.
+ *
+ * region 是这张贴图盖住的那一块（设备像素，相对输出原点），NULL = 整屏那张
+ * （fx->blur_tex_w == 0 就是「整屏」的记号，装饰着色器按它算采样 UV，见
+ * decor_draw 里 u_origin / u_output_size 那两行）。
+ *
+ * 区域必须**跟着贴图一起换**：窗口从「和别的窗口重叠」（贴图是它自己那块
+ * 768x768 的私有区域）变成「不重叠」（贴图换成共享的整屏那张）时只换贴图不换
+ * 区域，着色器就会拿整屏那张贴图按 768x768 的区域去采样 —— 屏幕上是一块被
+ * 缩放 + 错位的壁纸模糊。用户报的「窗口不重叠时模糊背景是错的」就是这个：
+ * 拖动 / 滚动 / 开窗动画期间重叠过一下，之后就一直是错的，直到它再次重叠。
+ * （layer surface 那条路本来就在切回共享贴图时把 blur_tex_w/h 清 0，窗口这条路
+ * 漏了 —— 现在两边都从这一个入口走。） */
 static void blur_assign(struct vidow_fx_target *fx, struct wlr_texture *tex,
-		bool owned, uint64_t id) {
-	if (fx->blur_tex_id == id) {
+		bool owned, uint64_t id, const struct wlr_box *region) {
+	int rx = region != NULL ? region->x : 0;
+	int ry = region != NULL ? region->y : 0;
+	int rw = region != NULL ? region->width : 0;
+	int rh = region != NULL ? region->height : 0;
+	/* 区域也算进身份：同一张贴图换了区域，装饰里烘的还是上一版的 UV，
+	 * 得让它重烘（blur_ver++）。 */
+	if (fx->blur_tex_id == id && fx->blur_tex_x == rx &&
+			fx->blur_tex_y == ry && fx->blur_tex_w == rw &&
+			fx->blur_tex_h == rh) {
 		return;
 	}
 	if (fx->blur_owned && fx->blur_tex != NULL) {
@@ -1647,6 +1667,10 @@ static void blur_assign(struct vidow_fx_target *fx, struct wlr_texture *tex,
 	fx->blur_tex = tex;
 	fx->blur_owned = owned;
 	fx->blur_tex_id = id;
+	fx->blur_tex_x = rx;
+	fx->blur_tex_y = ry;
+	fx->blur_tex_w = rw;
+	fx->blur_tex_h = rh;
 	fx->blur_ver++;
 }
 
@@ -1677,7 +1701,7 @@ static void own_bd_drop(struct vidow_fx_target *fx) {
 
 /* Release an owned texture before its pyramid buffer is reused. */
 static void blur_own_drop(struct vidow_fx_target *fx) {
-	blur_assign(fx, NULL, false, 0);
+	blur_assign(fx, NULL, false, 0, NULL);
 	fx->blur_own_tex = NULL; /* 贴图归 blur_set，上面那句只放指针 */
 	fx->blur_own_id = 0;
 }
@@ -2144,12 +2168,8 @@ static bool view_region_build(struct vidow_server *server,
 	fx->blur_set.gen = server->gen_scene - view->self_gen;
 	fx->blur_set.valid = true;
 	fx->blur_own_id = server->blur_serial++;
-	/* 装饰着色器按这块区域采样：u_origin 要减掉区域原点、u_output_size 换成区域
-	 * 尺寸（见 decor_draw 里那两行）。 */
-	fx->blur_tex_x = rx;
-	fx->blur_tex_y = ry;
-	fx->blur_tex_w = rw;
-	fx->blur_tex_h = rh;
+	/* 这块区域本身（blur_tex_x/y/w/h）不在这儿登记：它跟着贴图一起由
+	 * blur_assign() 换（见那里的注释），一处管一处，免得两边不一致。 */
 
 	static int dumped = 0;
 	if (dumped < blur_dump_limit()) {
@@ -2185,7 +2205,7 @@ void vidow_blur_output_finish(struct vidow_output *output) {
 		if (view->fx.blur_owned) {
 			continue; /* 自己的那份跟这块屏无关 */
 		}
-		blur_assign(&view->fx, NULL, false, 0);
+		blur_assign(&view->fx, NULL, false, 0, NULL);
 	}
 }
 
@@ -2254,7 +2274,7 @@ void vidow_blur_update(struct vidow_output *output) {
 				blur_own_drop(&view->fx);
 			}
 			own_bd_drop(&view->fx); /* 这块屏上不再需要私有底衬了 */
-			blur_assign(&view->fx, NULL, false, 0);
+			blur_assign(&view->fx, NULL, false, 0, NULL);
 			continue;
 		}
 
@@ -2269,19 +2289,19 @@ void vidow_blur_update(struct vidow_output *output) {
 				blur_own_drop(&view->fx);
 			}
 			own_bd_drop(&view->fx); /* 不再重叠：私有底衬那块区域可以还了 */
-			blur_assign(&view->fx, output->blur_tex, false, output->blur_id);
+			blur_assign(&view->fx, output->blur_tex, false, output->blur_id, NULL);
 			continue;
 		}
 
 		if (!shared_ok) {
-			blur_assign(&view->fx, NULL, false, 0);
+			blur_assign(&view->fx, NULL, false, 0, NULL);
 			continue;
 		}
 
 		int rx, ry, rw, rh, rlevels;
 		if (!view_region_rect(server, output, view, &rx, &ry, &rw, &rh,
 				&rlevels)) {
-			blur_assign(&view->fx, NULL, false, 0);
+			blur_assign(&view->fx, NULL, false, 0, NULL);
 			continue;
 		}
 		/* 抓的时候这个窗口是藏起来的，所以它自己的位置和内容都不进这张图：
@@ -2320,14 +2340,15 @@ void vidow_blur_update(struct vidow_output *output) {
 				region_update_rect(output, view, rx, ry, rw, rh, &upd);
 			if (!view_region_build(server, output, view, rx, ry, rw, rh,
 					rlevels, partial ? &upd : NULL)) {
-				blur_assign(&view->fx, NULL, false, 0);
+				blur_assign(&view->fx, NULL, false, 0, NULL);
 				continue;
 			}
 		}
 		/* owned = false：这张贴图归 view->fx.blur_set（blur_set_drop 收），
-		 * 这里只是指过去采样。 */
+		 * 这里只是指过去采样。区域跟着一起报（见 blur_assign）。 */
 		blur_assign(&view->fx, view->fx.blur_own_tex, false,
-			view->fx.blur_own_id);
+			view->fx.blur_own_id,
+			&(struct wlr_box){ .x = rx, .y = ry, .width = rw, .height = rh });
 	}
 
 	/* layer surface 背后的模糊（状态栏 / 面板那层）。bottom 层用共享的那份底衬
@@ -3037,11 +3058,9 @@ static bool layer_blur_frame(struct vidow_server *server,
 				px_h, levels)) {
 			return false; /* 抓不出来就留着上一帧那张，别闪 */
 		}
-		fx->blur_tex_x = rx;
-		fx->blur_tex_y = ry;
-		fx->blur_tex_w = px_w;
-		fx->blur_tex_h = px_h;
-		blur_assign(fx, fx->blur_own_tex, false, fx->blur_own_id);
+		blur_assign(fx, fx->blur_own_tex, false, fx->blur_own_id,
+			&(struct wlr_box){ .x = rx, .y = ry,
+				.width = px_w, .height = px_h });
 	} else {
 		/* bottom 层：用共享的那张。`set_layer` 把层改过来的话，之前抓的区域底衬
 		 * 就没用了 —— 连着金字塔一起放掉，别攥着几 MB 不放。 */
@@ -3056,9 +3075,7 @@ static bool layer_blur_frame(struct vidow_server *server,
 			ls->bd_gen_scene = 0;
 			ls->bd_gen_layer = 0;
 		}
-		fx->blur_tex_w = 0; /* 0 = 整屏那张 */
-		fx->blur_tex_h = 0;
-		blur_assign(fx, output->blur_tex, false, output->blur_id);
+		blur_assign(fx, output->blur_tex, false, output->blur_id, NULL);
 	}
 	if (fx->blur_drawn == fx->blur_ver) {
 		return true; /* 已经画的就是这一版 */
