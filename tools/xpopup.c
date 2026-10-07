@@ -112,6 +112,7 @@ int main(int argc, char **argv) {
 	 * 用「当前位置」当基准会让位移叠加，测出来的就不是想测的那个点）。 */
 	const int orig_x = x, orig_y = y;
 	int late_ms = -1;
+	int min_w = 0, min_h = 0, max_w = 0, max_h = 0;
 	int move_dx = 0, move_dy = 0, move_at_ms = 1000;
 	bool do_move = false;
 	bool fixed_size = false;
@@ -122,6 +123,13 @@ int main(int argc, char **argv) {
 			late_ms = atoi(argv[i] + 5);
 		} else if (strcmp(argv[i], "fixed") == 0) {
 			fixed_size = true;
+		} else if (strncmp(argv[i], "hints=", 6) == 0) {
+			/* hints=<minw>x<minh>-<maxw>x<maxh>，0 = 这一头不声明 */
+			int n = sscanf(argv[i] + 6, "%dx%d-%dx%d", &min_w, &min_h,
+				&max_w, &max_h);
+			if (n < 4) {
+				usage();
+			}
 		} else if (strncmp(argv[i], "move=", 5) == 0) {
 			int n = sscanf(argv[i] + 5, "%d,%d,%d", &move_dx, &move_dy,
 				&move_at_ms);
@@ -175,7 +183,8 @@ int main(int argc, char **argv) {
 		values[n++] = 1;
 	}
 	mask |= XCB_CW_EVENT_MASK;
-	values[n++] = XCB_EVENT_MASK_EXPOSURE | XCB_EVENT_MASK_STRUCTURE_NOTIFY;
+	values[n++] = XCB_EVENT_MASK_EXPOSURE | XCB_EVENT_MASK_STRUCTURE_NOTIFY |
+		XCB_EVENT_MASK_BUTTON_PRESS | XCB_EVENT_MASK_BUTTON_RELEASE;
 	xcb_create_window(conn, XCB_COPY_FROM_PARENT, win, screen->root,
 		(int16_t)x, (int16_t)y, (uint16_t)w, (uint16_t)h, 0,
 		XCB_WINDOW_CLASS_INPUT_OUTPUT, screen->root_visual, mask, values);
@@ -191,6 +200,24 @@ int main(int argc, char **argv) {
 		hints[6] = (uint32_t)h;   /* min_height */
 		hints[7] = (uint32_t)w;   /* max_width */
 		hints[8] = (uint32_t)h;   /* max_height */
+		xcb_change_property(conn, XCB_PROP_MODE_REPLACE, win,
+			XCB_ATOM_WM_NORMAL_HINTS, XCB_ATOM_WM_SIZE_HINTS, 32, 18, hints);
+	} else if (min_w > 0 || min_h > 0 || max_w > 0 || max_h > 0) {
+		/* 只有上下限、没有固定值（微信主窗 / 各种 GTK 对话框）：**尺寸由布局
+		 * 定，但客户端自己会夹在上下限里** —— 合成器给一个越界的尺寸，它就
+		 * 自己缩回边界再发一个 ConfigureRequest 回来。见下面的 clamp。 */
+		uint32_t hints[18] = {0};
+		hints[0] = XCB_ICCCM_SIZE_HINT_US_SIZE;
+		if (min_w > 0 && min_h > 0) {
+			hints[0] |= XCB_ICCCM_SIZE_HINT_P_MIN_SIZE;
+			hints[5] = (uint32_t)min_w;
+			hints[6] = (uint32_t)min_h;
+		}
+		if (max_w > 0 && max_h > 0) {
+			hints[0] |= XCB_ICCCM_SIZE_HINT_P_MAX_SIZE;
+			hints[7] = (uint32_t)max_w;
+			hints[8] = (uint32_t)max_h;
+		}
 		xcb_change_property(conn, XCB_PROP_MODE_REPLACE, win,
 			XCB_ATOM_WM_NORMAL_HINTS, XCB_ATOM_WM_SIZE_HINTS, 32, 18, hints);
 	}
@@ -244,6 +271,17 @@ int main(int argc, char **argv) {
 				/* 合成器给的位置尺寸要认（正经客户端就是这么做的）：不认的话
 				 * 窗口缓冲区一直停在创建时的大小，窗口内容会被拉伸着显示。
 				 * 自己 xcb_configure_window 一次把窗口挪成它要的样子。 */
+				/* 按键：报到 stdout，测试拿它断言「鼠标事件到底有没有
+				 * 到客户端」——「看得见、点不着」只有这条能分开是合成器没
+				 * 送到还是客户端自己不理。坐标是窗口局部坐标。 */
+				if ((ev->response_type & ~0x80) ==
+						XCB_BUTTON_PRESS) {
+					xcb_button_press_event_t *be = (void *)ev;
+					printf("click %d,%d btn%d\n",
+						be->event_x, be->event_y,
+						be->detail);
+					fflush(stdout);
+				}
 				if ((ev->response_type & ~0x80) ==
 						XCB_CONFIGURE_NOTIFY) {
 					xcb_configure_notify_event_t *ce = (void *)ev;
@@ -253,6 +291,16 @@ int main(int argc, char **argv) {
 						y = ce->y;
 						w = ce->width;
 						h = ce->height;
+						/* 有上下限的窗口：合成器给越界尺寸就自己夹回来
+						 * （真客户端就是这么干的，夹完再发 ConfigureRequest
+						 * 告诉 WM「我改不了那么大 / 那么小」）。 */
+						int cw = w, ch = h;
+						if (min_w > 0 && cw < min_w) cw = min_w;
+						if (min_h > 0 && ch < min_h) ch = min_h;
+						if (max_w > 0 && cw > max_w) cw = max_w;
+						if (max_h > 0 && ch > max_h) ch = max_h;
+						w = cw;
+						h = ch;
 						uint32_t geom[4] = {
 							(uint32_t)x, (uint32_t)y,
 							(uint32_t)w, (uint32_t)h,
