@@ -295,6 +295,13 @@ void vidow_pointer_button(struct vidow_server *server, uint32_t button,
 			} else {
 				vidow_float_end_grab(server);
 			}
+			/* 松手之后指针重新交还给客户端：拖拽期间每一次移动都被 grab 吃掉了，
+			 * 客户端手里那份指针位置还是**起拖之前**的。窗口跟着光标挪过之后，
+			 * 这个旧坐标可能已经落在窗口外（拖到屏幕边被夹住时必然如此），于是
+			 * 「拖完第一下点击」被客户端当成点在别处 —— 用户报的「拖拽之后点不着，
+			 * 鼠标移出去再移回来就好了」（移出去/移回来会触发 enter，位置才刷新）。
+			 * 这里补一次和真实移动同一条路的 motion，坐标当场对上。 */
+			vidow_pointer_motion(server, time_msec);
 		}
 		return;
 	}

@@ -93,16 +93,17 @@ else:
 PY
 }
 
-win_geom() { # -> "x y"
+geom_of() { # <标题> -> "x y"（浮动就用浮动几何）
 	./build/vidowmsg windows 2>/dev/null | python3 -c '
 import sys, json
-w = next((w for w in json.load(sys.stdin) if w["title"] == "w1"), None)
+w = next((w for w in json.load(sys.stdin) if w["title"] == sys.argv[1]), None)
 if w is None:
     print("? ?")
 else:
-    g = w["float_geometry"] if w["floating"] else w["geometry"]
-    print("%d %d" % (g["x"], g["y"]))'
+    g = w.get("float_geometry") or w.get("geometry")
+    print("%d %d" % (g["x"], g["y"]))' "$1"
 }
+win_geom() { geom_of w1; }
 
 shot() { grim -o HEADLESS-1 "$1" 2>/dev/null; }
 
@@ -206,6 +207,49 @@ elif [ "$((AX - FX - OFF_X))" -ge -4 ] && [ "$((AX - FX - OFF_X))" -le 4 ]; then
 	pass "松手后窗口和客户区对齐（偏移回到基准）"
 else
 	fail "松手后偏移不对：$((AX - FX - OFF_X))（基准 $OFF_X）"
+fi
+
+mark "松手之后指针交还给客户端（拖完第一下点击不许点到别处）"
+
+# 拖拽期间每一次移动都被 grab 吃掉了，客户端手里那份指针位置还是**起拖之前**的。
+# 窗口跟着光标挪了 D 像素之后，客户端按旧位置算出来的局部坐标就偏了 D 像素 ——
+# 用户报的「拖完点不着，鼠标移出去再移回来就好了」就是它（移出去/移回来会触发
+# enter，位置才刷新）。这条判据用 X11 客户端当探针：只有 X11 窗口会打「x11: 指针」
+# 那行日志（vidow_pointer_motion 里），拿它看「松手之后有没有补一次位置」。
+XP_DISPLAY=$(grep -ao "DISPLAY=:[0-9]*" "$LOG" | tail -1 | cut -d= -f2)
+setsid nohup env DISPLAY="$XP_DISPLAY" ./build/xpopup popup normal 300 400 400 300 \
+	> "$RUNDIR/xp.log" 2>&1 </dev/null &
+CLIENT_PIDS="$CLIENT_PIDS $!"
+for _ in $(seq 1 40); do
+	./build/vidowmsg windows 2>/dev/null | grep -q '"xp-popup"' && break
+	sleep 0.25
+done
+./build/vidowmsg toggle-floating --title xp-popup >/dev/null 2>&1
+sleep 0.6
+read -r XX XY <<< "$(geom_of xp-popup)"
+if [ "$XX" = "?" ]; then
+	fail "X11 探针窗口没起来（xpopup）"
+else
+	pass "X11 探针窗口在 $XX,$XY"
+	act "pointer-motion $((XX + 150)) $((XY + 150))" 0.5
+	if grep -aq "x11: 指针" "$LOG"; then
+		pass "X11 客户端收得到指针位置（转发这条路是通的）"
+	else
+		fail "X11 客户端一条指针位置都没收到"
+	fi
+	N3=$(wc -l < "$LOG")
+	act "pointer-button left press mod" 0.3
+	for i in 1 2 3 4; do
+		act "pointer-motion $((XX + 150 + i * 50)) $((XY + 150))" 0.12
+	done
+	act "pointer-button left release mod" 0.5
+	N4=$(wc -l < "$LOG")
+	HAND=$(sed -n "$((N3 + 1)),${N4}p" "$LOG" | grep -c "x11: 指针" || true)
+	if [ "$HAND" -ge 1 ]; then
+		pass "松手之后客户端立刻拿到新的指针位置（$HAND 条 x11: 指针）"
+	else
+		fail "松手之后一条指针位置都没补给客户端 —— 第一下点击会偏掉整段拖拽距离"
+	fi
 fi
 
 exec 9>&-
