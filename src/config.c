@@ -237,6 +237,8 @@ static const struct entry entries[] = {
 		"把 XDG_CURRENT_DESKTOP 设成下面这个名字" },
 	{ "portal_desktop",  K_STRING, OFF(portal_desktop),  SZ(portal_desktop), 11,
 		"XDG_CURRENT_DESKTOP 的值（xdg-desktop-portal 按它选 <名字>-portals.conf）" },
+	{ "portal_capture",  K_STRING, OFF(portal_capture),  SZ(portal_capture), 11,
+		"录屏 / 截图交给谁：auto（默认）/ vidow / kde / wlr / hyprland / none" },
 
 	{ "cursor_shake",    K_BOOL,   OFF(cursor_shake),    SZ(cursor_shake), 12,
 		"摇晃指针就放大一下（快速来回晃几下，指针变大一会儿，好找）" },
@@ -346,6 +348,7 @@ static const struct group_field xwayland_fields[] = {
 static const struct group_field portal_fields[] = {
 	{ "conf_sync", "portal_conf_sync" },
 	{ "desktop",   "portal_desktop" },
+	{ "capture",   "portal_capture" },
 };
 
 #define GROUP(name, scalar, fields) \
@@ -675,6 +678,9 @@ static void defaults(struct vidow_config *cfg) {
 	 * 于是 xdg-desktop-portal 读的是 vidow-portals.conf。 */
 	cfg->portal_conf_sync = true;
 	snprintf(cfg->portal_desktop, sizeof(cfg->portal_desktop), "Vidow");
+	/* 录屏后端默认 auto：vidow-portal 在边上就用自己那个（选源对话框 + 实时
+	 * 预览，不依赖任何外部后端），没有才退到 wlr / hyprland。 */
+	snprintf(cfg->portal_capture, sizeof(cfg->portal_capture), "auto");
 
 	/* 自定义 shader 的默认目录：跟着配置文件走（$XDG_CONFIG_HOME/vidow/shaders）。 */
 	char dir[PATH_MAX - 16];

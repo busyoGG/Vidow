@@ -48,7 +48,8 @@ struct conf_line {
  * Access / Account / Email / DynamicLauncher / Lockdown / Settings。
  * KDE 补齐 GTK 没有的接口 —— 注意 ScreenCast / Screenshot / RemoteDesktop /
  * InputCapture 的 KDE 实现走 KWin 私有 IPC，在 vidow 上会失败，所以故意不列；
- * 录屏 / 截图交给 capture_backend() 探测出来的那个后端（见下面）。 */
+ * 录屏 / 截图交给 capture_backend() 挑出来的那个后端（见下面）：默认是 vidow
+ * 自己的 vidow-portal（tools/vidowportal.c），没有才退到 wlr / hyprland。 */
 static const char *default_lines[] = {
 	"default=gtk",
 	"org.freedesktop.impl.portal.FileChooser=kde",
@@ -71,20 +72,55 @@ static const char *default_lines[] = {
  * vidow 自己实现了 zwlr_screencopy_manager_v1（screencopy.c），两个都能用。
  * 装了哪个用哪个，wlr 优先（更轻，就是为这个场景写的）；一个都没装就一个字都不
  * 写 —— 写了等于骗客户端。用户仍可在 ~/.config/vidow/portals.conf 里覆盖。 */
+static bool helper_path(char *out, size_t cap);
+
+/* ScreenCast / Screenshot 该给谁。GTK 后端根本没有这两个接口；KDE 的建在 KWin
+ * 私有协议上，而且只在 XDG_CURRENT_DESKTOP 整串等于 KDE 时才注册（desktopportal.cpp），
+ * 用它就得骗整个会话或者给它塞 systemd drop-in —— 两条路都把 vidow 的录屏绑死在
+ * KDE 上。所以：
+ *   - vidow      自己人（tools/vidowportal.c，装/建在 vidow 二进制边上）。它自己
+ *                弹选源对话框（带实时预览）、自己跟合成器要流，不依赖任何外部后端，
+ *                也不碰任何环境变量。**默认就用它**。
+ *   - wlr        专为 wlroots 写，走 zwlr_screencopy_manager_v1（没有对话框，
+ *                直接给第一块屏）。
+ *   - hyprland   它的 ScreenCast 在非 Hyprland 的 wlroots 合成器上同样退到
+ *                zwlr_screencopy_manager_v1（二进制里有 "compositor doesn't support
+ *                zwlr_screencopy_v1" 这条退路）。
+ * vidow 自己实现了 zwlr_screencopy_manager_v1（screencopy.c）和 zkde_screencast
+ * （screencast.c），三个都能用。配置 portal_capture 写死优先；auto（默认）按上面
+ * 的顺序挑；一个都没有就一个字都不写 —— 写了等于骗客户端。
+ * 用户仍可在 ~/.config/vidow/portals.conf 里覆盖这两行。 */
 static const char *capture_backend(const struct vidow_config *cfg) {
 	static const char *const files[] = { "wlr.portal", "hyprland.portal" };
 	static const char *const names[] = { "wlr", "hyprland" };
 	static const char *const fallback_dirs = "/usr/local/share:/usr/share";
 
-	/* 会话名写成 KDE 的话，KDE 后端就是可用的那个（它那套 KWin 私有 portal 只在
-	 * XDG_CURRENT_DESKTOP 整串等于 KDE 时才注册，见 desktopportal.cpp），而
-	 * vidow 这边提供了它要的 zkde_screencast_unstable_v1 —— 那就直接用 KDE，
-	 * 别去借 hyprland 的后端。用户想要「KDE 的录屏」时只需要配置里写一行
-	 * portal_desktop = "KDE"。 */
-	if (strcasecmp(cfg->portal_desktop, "KDE") == 0) {
-		return "kde";
+	/* 1. 配置里写死的优先。 */
+	const char *want = cfg->portal_capture;
+	if (want[0] != '\0' && strcasecmp(want, "auto") != 0) {
+		if (strcasecmp(want, "none") == 0) {
+			return NULL;
+		}
+		for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+			if (strcasecmp(want, names[i]) == 0) {
+				return names[i];
+			}
+		}
+		if (strcasecmp(want, "kde") == 0 || strcasecmp(want, "vidow") == 0) {
+			return strcasecmp(want, "kde") == 0 ? "kde" : "vidow";
+		}
+		wlr_log(WLR_ERROR, "portal: portal_capture=\"%s\" 不认识"
+			"（auto/vidow/kde/wlr/hyprland/none），按 auto 来", want);
 	}
 
+	/* 2. auto：自己人优先 —— vidow-portal 在边上就是它，合成器这边它要的协议
+	 * （zkde_screencast + screencopy）都有，不依赖外部后端。 */
+	char helper[PATH_MAX];
+	if (helper_path(helper, sizeof(helper))) {
+		return "vidow";
+	}
+
+	/* 3. 没有自己的后端，就借装了的那一个（见上面那段注释）。 */
 	const char *dirs = getenv("XDG_DATA_DIRS");
 	if (dirs == NULL || *dirs == '\0') {
 		dirs = fallback_dirs;
@@ -339,6 +375,7 @@ static const char *const restore_keys[] = {
 };
 #define RESTORE_N ((int)(sizeof(restore_keys) / sizeof(restore_keys[0])))
 
+
 static char restore_value[RESTORE_N][VAL_LEN];
 static bool restore_present[RESTORE_N];
 static bool restore_armed;
@@ -398,28 +435,179 @@ static void append(char *buf, size_t cap, const char *fmt, ...) {
 	va_end(ap);
 }
 
-/* 把 vidow 的环境推进 systemd 用户管理器。restart_frontend 只在 portals.conf
- * 真的变了时才需要（换了选谁，前端得重新读一遍配置）。 */
-static void portal_env_import(bool restart_frontend) {
+/* ------------------------------------------------- vidow 自己的录屏后端 */
+
+/* vidow 自己的 portal 后端的总线名（tools/vidowportal.c 里占的就是它）。 */
+#define PORTAL_BUS_NAME "org.freedesktop.impl.portal.desktop.vidow"
+
+/* vidow-portal 在哪：和 vidow 二进制放一起。从 /proc/self/exe 反推目录，
+ * build/ 里直接跑和装到 /usr/bin 都对。 */
+static bool helper_path(char *out, size_t cap) {
+	char exe[PATH_MAX];
+	ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+	if (n <= 0) {
+		return false;
+	}
+	exe[n] = '\0';
+	char *slash = strrchr(exe, '/');
+	if (slash == NULL) {
+		return false;
+	}
+	*slash = '\0';
+	snprintf(out, cap, "%s/vidow-portal", exe);
+	return access(out, X_OK) == 0;
+}
+
+/* $XDG_DATA_HOME/xdg-desktop-portal/portals/vidow.portal（默认 ~/.local/share/…）。
+ * 前端就是扫这个目录知道有哪些后端的。 */
+static void portal_file_path(char *out, size_t cap) {
+	const char *base = getenv("XDG_DATA_HOME");
+	char fallback[PATH_MAX];
+	if (base == NULL || *base == '\0') {
+		const char *home = getenv("HOME");
+		snprintf(fallback, sizeof(fallback), "%s/.local/share",
+			home != NULL ? home : ".");
+		base = fallback;
+	}
+	snprintf(out, cap, "%s/xdg-desktop-portal/portals/vidow.portal", base);
+}
+
+#define PORTAL_FILE_MARK "# 由 vidow 生成"
+
+/* 写 / 删 vidow.portal：告诉前端「有个叫 org.freedesktop.impl.portal.desktop.vidow
+ * 的后端，支持 ScreenCast」。全是用户级文件，不要 root、不碰系统目录。
+ * need=false 时只删自己写过的那份（第一行有标记）。 */
+static void portal_file_sync(const struct vidow_config *cfg, bool need) {
+	char path[PATH_MAX];
+	portal_file_path(path, sizeof(path));
+
+	if (!need) {
+		size_t len = 0;
+		char *old = slurp(path, &len);
+		if (old == NULL) {
+			return;
+		}
+		if (strncmp(old, PORTAL_FILE_MARK, strlen(PORTAL_FILE_MARK)) == 0) {
+			if (unlink(path) == 0) {
+				wlr_log(WLR_INFO, "portal: 删掉 %s（不再用 vidow 自己的后端）",
+					path);
+			}
+		}
+		free(old);
+		return;
+	}
+
+	char content[512];
+	snprintf(content, sizeof(content),
+		PORTAL_FILE_MARK "，改它没用：要换后端改 config 里的 portal_capture。\n"
+		"[portal]\n"
+		"DBusName=%s\n"
+		"Interfaces=org.freedesktop.impl.portal.ScreenCast;\n"
+		"UseIn=%s;\n",
+		PORTAL_BUS_NAME, cfg->portal_desktop);
+
+	size_t old_len = 0;
+	char *old = slurp(path, &old_len);
+	if (old != NULL) {
+		bool same = old_len == strlen(content) && memcmp(old, content, old_len) == 0;
+		free(old);
+		if (same) {
+			return;
+		}
+	}
+	ensure_parent(path);
+	if (write_atomic(path, content)) {
+		wlr_log(WLR_INFO, "portal: 写 %s（vidow 自己的录屏后端）", path);
+	}
+}
+
+/* 把 vidow-portal 起起来。它占住总线名等前端来调；合成器退出 → 它的 wayland
+ * 连接断 → 自己退。日志留在 $XDG_RUNTIME_DIR/vidow-portal.log（测试要看它）。 */
+static void helper_start(void) {
+	char path[PATH_MAX];
+	if (!helper_path(path, sizeof(path))) {
+		wlr_log(WLR_ERROR, "portal: 找不到 vidow-portal（要跟 vidow 放一起），"
+			"录屏起不来");
+		return;
+	}
+	/* 日志默认在 $XDG_RUNTIME_DIR 下（测试要读它，所以留个覆盖口子）。 */
+	const char *runtime = getenv("XDG_RUNTIME_DIR");
+	const char *override = getenv("VIDOW_PORTAL_LOG");
+	char logpath[PATH_MAX];
+	if (override != NULL && *override != '\0') {
+		snprintf(logpath, sizeof(logpath), "%s", override);
+	} else {
+		snprintf(logpath, sizeof(logpath), "%s/vidow-portal.log",
+			runtime != NULL && *runtime != '\0' ? runtime : "/tmp");
+	}
+
+	char qpath[PATH_MAX + 8], qlog[PATH_MAX + 8];
+	shell_quote(path, qpath, sizeof(qpath));
+	shell_quote(logpath, qlog, sizeof(qlog));
+
+	char cmd[2 * PATH_MAX + 64];
+	snprintf(cmd, sizeof(cmd), "%s >%s 2>&1", qpath, qlog);
+	wlr_log(WLR_INFO, "portal: 起 %s（日志 %s）", path, logpath);
+	vidow_exec_detached(cmd);
+}
+
+/* 把 vidow 的环境推进 systemd 用户管理器，必要时把前端重启一遍。
+ *
+ * import-environment 必须在前：后端（gtk / kde / 我们自己那个）是 dbus 激活起来的，
+ * 环境从 systemd 用户管理器拿。不导入的话它们连的还是宿主合成器，对话框会画到别的
+ * 桌面上。
+ *
+ * 前端（xdg-desktop-portal 本身）另说：它的环境和 portals.conf 都是**进程起来那一刻**
+ * 定的，配置读一次就缓存住。从宿主合成器切过来时，光 import 环境不够 —— 正在跑的
+ * 那个前端还是老环境、老配置，录屏会被指到宿主那份 <host>-portals.conf 上的后端去。
+ * 所以判据是「配置内容变了，或者跑着的那个前端的 XDG_CURRENT_DESKTOP /
+ * WAYLAND_DISPLAY 不是我们的」，后者用 /proc/<MainPID>/environ 查。 */
+static void portal_env_import(const struct vidow_config *cfg, bool conf_changed) {
 	if (getenv("VIDOW_PORTAL_NO_RESTART") != NULL) {
 		wlr_log(WLR_INFO, "portal: VIDOW_PORTAL_NO_RESTART 已设，不碰用户管理器");
 		return;
 	}
 
 	/* import-environment 必须在前：后端是 dbus 激活起来的，环境从 systemd
-	 * 用户管理器拿。不导入的话 xdg-desktop-portal-gtk 连的还是宿主合成器，
-	 * 对话框会画到别的桌面上。 */
+	 * 用户管理器拿。 */
 	restore_armed = true;
-	if (restart_frontend) {
-		vidow_exec_detached(
-			"systemctl --user import-environment "
-			"XDG_CURRENT_DESKTOP WAYLAND_DISPLAY XDG_RUNTIME_DIR 2>/dev/null; "
-			"systemctl --user restart xdg-desktop-portal 2>/dev/null");
-	} else {
-		vidow_exec_detached(
-			"systemctl --user import-environment "
-			"XDG_CURRENT_DESKTOP WAYLAND_DISPLAY XDG_RUNTIME_DIR 2>/dev/null");
+
+	const char *import =
+		"systemctl --user import-environment "
+		"XDG_CURRENT_DESKTOP WAYLAND_DISPLAY XDG_RUNTIME_DIR 2>/dev/null";
+	const char *restart = "systemctl --user restart xdg-desktop-portal 2>/dev/null";
+
+	char cmd[2 * (VAL_LEN + 512)];
+	if (conf_changed) {
+		snprintf(cmd, sizeof(cmd), "%s; %s", import, restart);
+		vidow_exec_detached(cmd);
+		return;
 	}
+
+	/* 想在前端的 environ 里看到的两行（grep -F 用整行匹配，值里带空格也不怕）。 */
+	char want_desktop[VAL_LEN + 32];
+	char want_display[VAL_LEN + 32];
+	const char *wd = getenv("WAYLAND_DISPLAY");
+	snprintf(want_desktop, sizeof(want_desktop), "XDG_CURRENT_DESKTOP=%s",
+		cfg->portal_desktop);
+	snprintf(want_display, sizeof(want_display), "WAYLAND_DISPLAY=%s",
+		wd != NULL ? wd : "");
+	char qd[sizeof(want_desktop) + 8];
+	char qw[sizeof(want_display) + 8];
+	shell_quote(want_desktop, qd, sizeof(qd));
+	shell_quote(want_display, qw, sizeof(qw));
+
+	snprintf(cmd, sizeof(cmd),
+		"%s; "
+		"p=$(systemctl --user show -p MainPID --value xdg-desktop-portal.service "
+		"2>/dev/null); "
+		"if [ -n \"$p\" ] && [ \"$p\" != 0 ] && "
+		"! (e=$(tr '\\0' '\\n' < /proc/$p/environ 2>/dev/null); "
+		"printf '%%s\\n' \"$e\" | grep -qxF %s && "
+		"printf '%%s\\n' \"$e\" | grep -qxF %s); "
+		"then %s; fi",
+		import, qd, qw, restart);
+	vidow_exec_detached(cmd);
 }
 
 /* ------------------------------------------------------------ public API */
@@ -617,6 +805,15 @@ void vidow_portal_conf_sync(const struct vidow_config *cfg) {
 		return;
 	}
 
+	/* 录屏交给 vidow 自己的后端时：先把 vidow.portal 落地（前端按它找后端），
+	 * 再把 vidow-portal 起起来占住总线名。顺序有讲究 —— 前端是被下面
+	 * portal_env_import 重启的，它起来的时候文件和名字都得在。 */
+	bool own = capture != NULL && strcmp(capture, "vidow") == 0;
+	portal_file_sync(cfg, own);
+	if (own) {
+		helper_start();
+	}
+
 	if (changed) {
 		ensure_parent(target);
 		if (!write_atomic(target, content)) {
@@ -629,5 +826,5 @@ void vidow_portal_conf_sync(const struct vidow_config *cfg) {
 	}
 	free(content);
 
-	portal_env_import(changed);
+	portal_env_import(cfg, changed);
 }

@@ -691,7 +691,8 @@ ninja -C build
 依赖：`wlroots-0.20`（Arch: `wlroots0.20`）、`wayland-server`、`wayland-client`、
 `xkbcommon`、`wayland-scanner`、`xcb`（XWayland 的诊断走 X 连接）、`pixman-1`、
 `egl` + `glesv2`（装饰 / 模糊 / 自定义 shader 走 GLES2）、`lua5.4`、
-`libpipewire-0.3`（KDE 的录屏 portal 要合成器自己建 PipeWire 流，见 `src/screencast.c`）。
+`libpipewire-0.3`（录屏 portal 要合成器自己建 PipeWire 流，见 `src/screencast.c`）、
+`gtk+-3.0`（vidow 自己的 portal 后端 `vidow-portal` 用它画选择器，见 `tools/vidowportal.c`）。
 运行 X11 程序还需要 `xorg-xwayland`（Arch 的 `xorg-xwayland`）。
 
 注意：Arch 的 `wlroots0.20` 包没有安装 `wlr-layer-shell-unstable-v1-protocol.h`（而
@@ -2200,8 +2201,9 @@ portal 相关的两个键：
 
 | 键 | 默认 | 作用 |
 | --- | --- | --- |
-| `portal_desktop` | `Vidow` | vidow 设给自己的 `XDG_CURRENT_DESKTOP`，也是 `<name>-portals.conf` 的那个 name。留空 = 完全不碰 portal。写 `"KDE"` 才会让 KDE 后端注册它那批 KWin 私有的 portal（含录屏），代价是所有应用都以为自己在 Plasma 里 |
-| `portal_conf_sync` | `true` | 把生效的 portals.conf 写到 portal 的配置目录，并每次把环境 import 进 systemd 用户管理器（配置真的变了才重启 portal）；`false` = 只算不写、不碰环境 |
+| `portal_desktop` | `Vidow` | vidow 设给自己的 `XDG_CURRENT_DESKTOP`，也是 `<name>-portals.conf` 的那个 name。留空 = 完全不碰 portal。**只影响「会话叫什么」**，选哪个录屏后端看下面那个键 |
+| `portal_capture` | `auto` | 录屏 / 截图交给谁：`auto`（默认：自己那个 `vidow-portal` 在二进制边上就用它，否则装了哪个外部后端用哪个，wlr > hyprland）/ `vidow` / `kde` / `wlr` / `hyprland` / `none`。写 `kde` 还要 `portal_desktop = "KDE"`（见下面「录屏」那节） |
+| `portal_conf_sync` | `true` | 把生效的 portals.conf 写到 portal 的配置目录，并每次把环境 import 进 systemd 用户管理器（前端环境不对才重启它）；`false` = 只算不写、不碰环境、不起后端 |
 实测：配置里 `grim /tmp/shot-cfg.png` → `code=0`，产出的 1280x720 PNG 四象限颜色正确；
 `grim --nope` → `code=1`，`err="grim: invalid option -- '-'"`。
 
@@ -2235,24 +2237,38 @@ portal 相关的两个键：
 录屏实测：`wf-recorder -f /tmp/rec.mp4 -c h264_vaapi` 在 headless 下正常出流
 （h264 / 1280x720 / nv12），停录后文件可被 `ffprobe` 正常解析。
 
-**给 portal 用的录屏（KDE）**：上面四个协议是给「客户端自己抓帧」用的。桌面 portal 那条路
-（浏览器 / OBS 的「共享屏幕」）走的是另一套 —— 应用问 `org.freedesktop.portal.ScreenCast`，
-后端负责建 PipeWire 流。KDE 那个后端（`xdg-desktop-portal-kde`）用的是 **KWin 的私有协议
-`zkde_screencast_unstable_v1`**，vidow 现在实现了它（`src/screencast.c`）：
+**给 portal 用的录屏（vidow 自己的后端）**：上面四个协议是给「客户端自己抓帧」用的。
+桌面 portal 那条路（浏览器 / OBS 的「共享屏幕」）走的是另一套 —— 应用问
+`org.freedesktop.portal.ScreenCast`，**后端**负责弹选择器、建 PipeWire 流。vidow 现在自己
+就是那个后端（`tools/vidowportal.c` → `build/vidow-portal`），**默认就用它**：
 
 | 谁 | 干什么 |
 | --- | --- |
-| 客户端（KDE 后端） | `stream_output(stream, wl_output, pointer_mode)`，然后等 `serial` + `created(node)` |
-| vidow | 建一个 PipeWire 流（memfd 缓冲、BGRx），把 **node id** 通过 `created` 告诉客户端 |
-| 客户端 | `pw_stream_connect(PW_DIRECTION_INPUT, node)` 消费；vidow 在输出提交时抓帧推给它 |
+| vidow 启动时 | 写 `~/.local/share/xdg-desktop-portal/portals/vidow.portal`（总线名 + 接口清单）、把 `<会话名>-portals.conf` 里的 ScreenCast / Screenshot 指向 `vidow`、把 `vidow-portal` 起起来占住那个总线名 |
+| 前端（xdg-desktop-portal） | 只做转发；PipeWire 的 fd 也是它自己连的（`OpenPipeWireRemote` 在前端里，`nm -D` 能看到 `pw_context_connect` / `pw_core_steal_fd`） |
+| vidow-portal | 实现 `org.freedesktop.impl.portal.ScreenCast`（CreateSession / SelectSources / Start）；Start 时弹 GTK3 选择器，每块屏一行**实时缩略图**（`zwlr_screencopy_manager_v1` 抓帧，输出名来自 `wl_output.name`）；点「共享」后 `stream_output(stream, wl_output, pointer_mode)`，等 `created(node)` 把 node id 报回前端 |
+| vidow | 建一路 PipeWire 流（memfd 缓冲、BGRx），输出提交时抓帧推进去 |
 
-要开这一路，配置里得有一行 `portal_desktop = "KDE"` —— KDE 后端只在
-`XDG_CURRENT_DESKTOP` **整串等于** `KDE` 时才注册它那批 KWin 私有的 portal（见
-`xdg-desktop-portal-kde` 的 `desktopportal.cpp`，`KDE:Vidow` 这种写法不算）。代价是所有应用
-都会以为自己在 Plasma 会话里，不想要就别设。实测：选择器对话框画在 vidow 上、`Start` 返回
-`node=57` / `size=(1280,720)`、`gst-launch-1.0 pipewiresrc path=57` 拿到 6 帧 6 种画面
-（`./test-screencast.sh`）。按窗口 / 按区域 / 虚拟输出录屏还没做（回 `failed`），光标模式
-`hidden` / `embedded` 支持、`metadata` 没做。
+这样录屏**不依赖 KDE**、也不用把 `XDG_CURRENT_DESKTOP` 说成 KDE —— 会话名还是 `Vidow`，
+别的应用一点都不受影响。想换后端就配置里写一行：
+
+```lua
+portal_capture = "kde"   -- 借 KDE 的：要配 portal_desktop = "KDE"（代价是所有应用以为在 Plasma 里）
+portal_capture = "wlr"   -- 借 xdg-desktop-portal-wlr：没有选择器，直接给第一块屏
+portal_capture = "none"  -- ScreenCast / Screenshot 两行都不写
+```
+
+实测（`./test-portal-own.sh`，15 项）：私有 dbus + headless vidow → `vidow.portal` 落地、
+`vidow-portal` 占住总线名 → 前端把 ScreenCast 指到它 → 选择器画在 vidow 上（标题「共享屏幕」，
+第一块屏默认选中）→ 点「共享」→ `Start` 返回 `node=114`、`size=(1280, 720)` →
+`gst-launch-1.0 pipewiresrc path=114` 拿到 6 帧 6 种画面、静止画面靠 1Hz 心跳也有帧。
+
+按窗口 / 按区域 / 虚拟输出录屏还没做（回 `failed`），光标模式 `hidden` / `embedded` 支持、
+`metadata` 没做。KDE 后端那条路（`portal_capture = "kde"`）仍然可用，见 `./test-screencast.sh`。
+
+**注意**：`zkde_screencast_unstable_v1` 是对所有客户端开放的（KWin 那份也是），也就是说不经过
+portal 的客户端也能自己绑它录屏 —— 和 KWin 同一个模型。要收紧的话得在 `bind` 里按 PID / app_id
+白名单（自己的后端是 vidow 的子进程，认得出），还没做。
 
 ### 输入法（text-input-v3 + input-method-v2）
 
@@ -2743,12 +2759,17 @@ src/clipboard.c X11 <-> Wayland 剪贴板桥（自己接管，不用 wlroots 那
 src/portal.c   portal 要的协议：xdg-foreign v1+v2（共用 registry）、
                foreign-toplevel-management、ext-foreign-toplevel-list + 截图源
                （xdg-activation 在 activation.c）
-src/screencast.c  KDE 的录屏 portal 要的 zkde_screencast_unstable_v1（KWin 私有协议）
-               + 合成器侧的 PipeWire 生产者（见 README 的「截图 / 录屏」）
-src/portalconf.c  portal 后端选择：内置默认（含录屏 / 截图后端探测）→
-               ~/.config/vidow/portals.conf 逐键覆盖 → 同步到 portal 的配置目录；
+src/screencast.c  zkde_screencast_unstable_v1（KWin 私有协议，KDE 的 portal 和 vidow
+               自己的 portal 都靠它要流）+ 合成器侧的 PipeWire 生产者
+               （见 README 的「截图 / 录屏」）
+src/portalconf.c  portal 后端选择：内置默认 → ~/.config/vidow/portals.conf 逐键覆盖
+               → 同步到 portal 的配置目录；录屏 / 截图后端按 portal_capture 挑
+               （auto 优先自己那个 vidow-portal），顺手写 vidow.portal、把它起起来；
                启动时把环境 import 进 systemd 用户管理器、退出时还原（先快照）
 shaders/       示例片段着色器（zoom / genie / wave / round / passthru）
+tools/vidowportal.c  vidow 自己的 xdg-desktop-portal 后端（ScreenCast）：GTK3 选择器
+               （每块屏一行实时缩略图，zwlr_screencopy 抓帧）+ 跟合成器要 PipeWire 流
+               （zkde_screencast）；`--probe` 自检、`--dialog` 直接弹选择器看排版
 tools/vdrag.c  虚拟指针拖拽测试工具
 tools/xpopup.c 按绝对坐标造 X11 窗口（owner / or / tooltip / menu / combo / utility），
                可指定 WM_TRANSIENT_FOR、晚设窗口类型、自声明固定尺寸、延后自己挪位 ——
@@ -2790,8 +2811,12 @@ test-portal.sh    私有 dbus 里起 portal + 真实 FileChooser 请求
                   gtk/kde 验证协议链路，switch-gtk/switch-kde 验证配置生成链路
 test-portalenv.sh 假 systemctl 记下每次调用：启动 import 环境 / 配置没变也 import /
                   退出把环境还原（原来没有的就 unset）/ NO_RESTART 不碰用户管理器 /
-                  ScreenCast-Screenshot 按装了哪个后端探测
-test-screencast.sh KDE 的录屏 portal：vidow 暴露 zkde_screencast_unstable_v1 →
+                  auto 优先自己那个后端并写 vidow.portal / 没有自己人时退回探测外部后端 /
+                  portal_capture 写死与 none / 前端环境不对就重启它（查 MainPID）
+test-portal-own.sh vidow 自己的录屏 portal（不依赖 KDE）：vidow.portal + portals.conf
+                  落地 → vidow-portal 占住总线名 → 前端把 ScreenCast 指给它 → 选择器
+                  对话框画在 vidow 上 → 点「共享」→ Start 返回 node → gst 消费者拿到会变的帧
+test-screencast.sh KDE 的录屏 portal（portal_capture = "kde" 那条路）：vidow 暴露 zkde_screencast_unstable_v1 →
                   XDG_CURRENT_DESKTOP=KDE 时后端才注册 ScreenCast → 点选择器 →
                   Start 返回 PipeWire node → gst 消费者拿到会变的帧
 tools/screencastprobe.py  发一次真的 ScreenCast 请求（CreateSession → SelectSources
@@ -3682,6 +3707,69 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
      没有**（不误报）；②掐断帧链 + 追踪开：客户端确实交过帧，追踪报出 ERROR 且点名
      HEADLESS-1、写明「客户端还在交帧，屏幕却不更新」；③掐断帧链 + 追踪**关**：一条 trace
      日志都没有、vidow 照样活着（诊断不改变行为）。
+
+164. **录屏 portal 改成 vidow 自己做 —— 效果和 KDE 一样，但谁都不骗**。
+
+     上一轮把 KDE 的录屏 portal 跑通，代价是 `portal_desktop = "KDE"`：所有应用都以为自己在
+     Plasma 会话里（GTK / Qt 主题、Chromium 的对话框选择都跟着变）。用户问「能不能只用 KDE
+     录屏 portal 而不影响别的」，评估了三条路（全局改环境 / 只给 KDE 后端一个 systemd
+     drop-in / 自己出一个后端），选了最后一条：**vidow 自己当 portal 后端**
+     （`tools/vidowportal.c` → `build/vidow-portal`）。
+
+     **链路**（每一环都能单独验证）：
+
+     - vidow 启动时写 `~/.local/share/xdg-desktop-portal/portals/vidow.portal`
+       （`DBusName=org.freedesktop.impl.portal.desktop.vidow` + 支持哪些接口），把
+       `<会话名>-portals.conf` 里的 ScreenCast / Screenshot 指向 `vidow`，再把
+       `vidow-portal` 起起来（和 vidow 二进制同目录，`/proc/self/exe` 反推）占住那个总线名。
+     - 前端（xdg-desktop-portal）只做转发。**PipeWire 的 fd 是它自己连的** ——
+       `OpenPipeWireRemote` 在前端实现里（`nm -D` 能看到 `pw_context_connect` /
+       `pw_core_steal_fd`），所以后端只要「报 node id」。
+     - `vidow-portal` 实现 `org.freedesktop.impl.portal.ScreenCast` 三个方法
+       （CreateSession / SelectSources / Start，接口版本报 2：有 `cursor_mode`，不碰
+       restore_data / persist_mode）+ Request / Session 两个小对象（Close / Closed）。
+       Start 时弹 GTK3 选择器：每块屏一行**实时缩略图**（`zwlr_screencopy_manager_v1` 抓帧，
+       500ms 一轮）+ 输出名（`wl_output.name`，vidow 报的是 `HEADLESS-1` 这种）+ 单选/多选
+       （按 `multiple`），第一块屏默认选中；挂到发起请求的窗口上（xdg-foreign，GDK 自己 import）。
+     - 点「共享」→ `stream_output(stream, wl_output, pointer_mode)` → 等 `created(node)` →
+       把 `streams = [(node, {position, size, source_type})]` 回给前端。**合成器那边一行没改**
+       （`src/screencast.c` 的 zkde_screencast 本来就是「客户端要流、合成器建 node」）。
+
+     **顺手修掉的真 bug**：
+
+     - **`zwlr_screencopy_manager_v1` 的 wl_shm 路径一直是坏的**：`copy` 里拿
+       `wlr_buffer_begin_data_ptr_access()` 的 `format`（**DRM** fourcc，和
+       `wlr_texture_read_pixels` 一个口径）去比 `frame->shm_format`（**wl_shm** 枚举），
+       两个数永远不等 → 走 shm 的客户端一律被 `invalid buffer format` 拒掉。一直没暴露是因为
+       老客户端都走 dmabuf（wf-recorder）或干脆换了 ext-image-copy-capture（新版 grim 实测
+       绑的是 ext 那条路），shm 那条路没人踩。我们的选择器缩略图正好走它，一上来就被拒。
+       修法是比之前先 `shm_format_to_drm()` 转一下，并把两个值都写进错误日志。
+     - **前端要不要重启，判据以前是错的**：前端的 `portals.conf` 是**进程起来那一刻**读的、
+       读一次缓存住，而它的环境也是被 systemd 激活那一刻定死的。以前只在「配置内容变了」时
+       重启它 —— 从宿主合成器切过来时配置往往没变（文件是上一轮写的），于是前端还按宿主那份
+       `<host>-portals.conf` 选后端，录屏会被指到 hyprland 上去。现在改成：配置变了，**或者
+       正在跑的那个前端的 `XDG_CURRENT_DESKTOP` / `WAYLAND_DISPLAY` 不是我们的**（查
+       `/proc/<MainPID>/environ`）就重启；前端没在跑就不管（下次被激活时环境就是新的）。
+     - **自己踩的三个坑**（都记在代码注释里了）：① 对话框刚弹出来就被自己回成失败 ——
+       `wl_ready` 每个 wayland 事件都会调 `start_maybe_finish()`，那时 streams 是空的，
+       「全都 settled」真空成立，直接回了 code=2；现在有 `starting` 标志。② 把 streams 数组
+       当结果字典回 —— GDBus 当场 `g_variant_new: expected GVariant of type 'a{sv}' but
+       received value has type 'a(ua{sv})'` 然后 abort，前端只看到「对端没回就断线」。
+       ③ 没选任何输出时「共享」是灰的（KDE 的选择器进来就选中第一块屏），点它等于没点。
+
+     **新增 `./test-portal-own.sh`（15 项断言全绿，不依赖 xdg-desktop-portal-kde）**：
+     `vidow.portal` 内容 / `ScreenCast=vidow` / 没写任何 systemd drop-in → `vidow-portal`
+     占住总线名 → 前端把 ScreenCast 指给它（`gdbus introspect` 两边都查）→ 选择器真出现在
+     vidow 的窗口列表里（`vidowmsg windows` 查到标题「共享屏幕」）→ 点「共享」→ `Start`
+     返回 `node=114`、`size=(1280, 720)` → gst 消费者 6 帧 6 种画面、静止画面靠 1Hz 心跳也有帧
+     → 全程没出现过 `XDG_CURRENT_DESKTOP=KDE`。`test-portalenv.sh` 也跟着扩了：
+     auto 优先自己人 / 没有自己人时退回探测 / `portal_capture` 写死与 `none` / 前端环境不对
+     就重启（用假 systemctl 回答 MainPID）。`test-screencast.sh`（KDE 那条路）照旧全绿。
+
+     **没做的**：按窗口 / 按区域 / 虚拟输出录屏（回 `failed`）、光标模式 `metadata`、
+     Screenshot 接口（这两行现在写的是 `vidow`，Screenshot 调用会失败 —— 下一步补）、
+     以及把 `zkde_screencast_unstable_v1` 的 bind 收紧到「只给自己那个后端」（现在和 KWin
+     一样对所有客户端开放）。
 
 163. **KDE 的录屏 portal 在 vidow 上跑通了：实现 KWin 私有协议 `zkde_screencast_unstable_v1`**。
 

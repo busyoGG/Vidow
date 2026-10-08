@@ -223,6 +223,9 @@ struct vidow_config {
 	 * 留空 = 完全不碰 portal 那一摊。 */
 	bool portal_conf_sync;
 	char portal_desktop[32];
+	/* 录屏 / 截图交给哪个后端：auto（默认，自己人优先）/ vidow / kde / wlr /
+	 * hyprland / none。跟 portal_desktop（会话名）是两件事。 */
+	char portal_capture[32];
 };
 
 /* gap 的唯一算法：单独设了就用它，没设（-1）跟随统一值 gaps；其余负值当 0

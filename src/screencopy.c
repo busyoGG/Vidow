@@ -178,6 +178,21 @@ static struct vidow_screencopy_client *client_from_resource(
 
 /* ------------------------------------------------------------ 格式换算 */
 
+/* wl_shm 的枚举值 → DRM fourcc。两边只差一个数字，但比错了就永远不等：
+ * wlr_buffer_begin_data_ptr_access 给出来的 format 是 **DRM** 的（跟
+ * wlr_texture_read_pixels 的 format 参数一个口径），frame->shm_format 是
+ * wl_shm 的。 */
+static uint32_t shm_format_to_drm(uint32_t shm_format) {
+	switch (shm_format) {
+	case WL_SHM_FORMAT_ARGB8888:
+		return DRM_FORMAT_ARGB8888;
+	case WL_SHM_FORMAT_XRGB8888:
+		return DRM_FORMAT_XRGB8888;
+	default:
+		return DRM_FORMAT_INVALID;
+	}
+}
+
 static uint32_t drm_format_to_shm(uint32_t format) {
 	switch (format) {
 	case DRM_FORMAT_ARGB8888:
@@ -454,7 +469,10 @@ static void frame_handle_copy(struct wl_client *wl_client,
 	} else if (wlr_buffer_begin_data_ptr_access(buffer,
 			WLR_BUFFER_DATA_PTR_ACCESS_WRITE, &data, &format, &stride)) {
 		wlr_buffer_end_data_ptr_access(buffer);
-		if (format != frame->shm_format) {
+		uint32_t want = shm_format_to_drm(frame->shm_format);
+		if (format != want) {
+			wlr_log(WLR_ERROR, "screencopy: 客户端缓冲格式 0x%x，要的是 0x%x"
+				"（wl_shm 枚举 %u）", format, want, frame->shm_format);
 			wl_resource_post_error(frame_resource,
 				ZWLR_SCREENCOPY_FRAME_V1_ERROR_INVALID_BUFFER,
 				"invalid buffer format");

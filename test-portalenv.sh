@@ -62,8 +62,23 @@ cleanup() {
 trap cleanup EXIT
 
 rm -rf "$RUNDIR"
-mkdir -p "$HOME_DIR" "$LOG" "$FAKE" "$RUNDIR/run"
+mkdir -p "$HOME_DIR/.config/vidow" "$LOG" "$FAKE" "$RUNDIR/run"
 chmod 700 "$RUNDIR/run"
+
+# 只改 portal_capture 的一份配置（空 = 没有配置文件）
+set_capture() {
+	if [ -z "${1:-}" ]; then
+		rm -f "$HOME_DIR/.config/vidow/config.lua"
+		return 0
+	fi
+	printf 'portal_capture = "%s"\n' "$1" >"$HOME_DIR/.config/vidow/config.lua"
+}
+
+# 把这一轮生成的 portals.conf / vidow.portal 留一份给断言用
+snap_conf() {
+	cp "$HOME_DIR/.config/xdg-desktop-portal/vidow-portals.conf" "$LOG/$1.conf" 2>/dev/null
+	cp "$HOME_DIR/.local/share/xdg-desktop-portal/portals/vidow.portal" "$LOG/$1.portal" 2>/dev/null
+}
 
 # 假 systemctl：只干两件事 —— 记下被怎么调的；show-environment 按 FAKE_ENV 回答。
 cat >"$FAKE/systemctl" <<'FAKE_SH'
@@ -73,6 +88,12 @@ case "$*" in
 "--user show-environment")
 	[ -f "${FAKE_ENV:-}" ] || exit 1
 	cat "$FAKE_ENV"
+	exit 0
+	;;
+"--user show -p MainPID --value xdg-desktop-portal.service")
+	# 「前端现在跑着吗、是哪个进程」。FAKE_MAINPID 空 = 没跑（0 也当没跑）。
+	[ -n "${FAKE_MAINPID:-}" ] || exit 0
+	echo "$FAKE_MAINPID"
 	exit 0
 	;;
 esac
@@ -88,9 +109,10 @@ run_round() {
 	env $extra \
 		HOME="$HOME_DIR" XDG_RUNTIME_DIR="$RUNDIR/run" \
 		PATH="$FAKE:$PATH" FAKE_LOG="$FAKELOG" FAKE_ENV="$FAKE_ENV" \
+		FAKE_MAINPID="${FAKE_MAINPID:-}" \
 		WLR_BACKENDS=headless WLR_HEADLESS_OUTPUTS=1 WLR_RENDERER=pixman \
 		VIDOW_LOG=debug \
-		./build/vidow >"$LOG/$name.log" 2>&1 &
+		"${VIDOW_BIN:-./build/vidow}" >"$LOG/$name.log" 2>&1 &
 	VIDOW_PID=$!
 
 	local i
@@ -143,6 +165,7 @@ EOF
 run_round A || exit 1
 stop_round A
 cp "$HOME_DIR/.config/xdg-desktop-portal/vidow-portals.conf" "$LOG/A.conf"
+cp "$HOME_DIR/.local/share/xdg-desktop-portal/portals/vidow.portal" "$LOG/A.portal" 2>/dev/null
 
 if has "$LOG/A.start" "--user show-environment"; then
 	pass "启动前问了 show-environment（记快照）"
@@ -251,12 +274,67 @@ else
 fi
 
 # ------------------------------------------- E 录屏 / 截图该给哪个后端
-# GTK 没有 ScreenCast / Screenshot 这两个接口，KDE 的实现走 KWin 私有协议
-# （zkde_screencast_unstable_v1），在 vidow 上跑不通。能干活的只有 wlr 和
-# hyprland 两个后端 —— 它们都走 zwlr_screencopy_manager_v1，而 vidow 自己实现了
-# 这个协议（src/screencopy.c）。所以按「装了哪个用哪个」写进去；一个都没装就不写，
-# 免得客户端以为支持、一调用就失败。
-mark "E 录屏 / 截图后端"
+# 默认 auto：vidow-portal 就在 vidow 二进制边上 → 用它（自己弹选择器 + 实时预览，
+# 不依赖任何外部后端、也不碰任何环境变量）。它靠两个文件让前端找到自己：
+#   $XDG_DATA_HOME/xdg-desktop-portal/portals/vidow.portal（总线名 + 接口清单）
+#   <会话名>-portals.conf 里的 ScreenCast=vidow
+# portal_capture 写死优先；写 none 就一个字都不写；自己那个不在边上时才退回探测
+# 装了哪个外部后端（wlr > hyprland）。
+mark "E auto 优先自己人"
+if grep -aqx "org.freedesktop.impl.portal.ScreenCast=vidow" "$LOG/A.conf" &&
+		grep -aqx "org.freedesktop.impl.portal.Screenshot=vidow" "$LOG/A.conf"; then
+	pass "auto：ScreenCast / Screenshot 指向 vidow 自己的后端"
+else
+	fail "auto 没指向自己人：$(grep -a ScreenCast "$LOG/A.conf" 2>/dev/null | head -1)"
+fi
+if grep -aq "DBusName=org.freedesktop.impl.portal.desktop.vidow" "$LOG/A.portal" 2>/dev/null &&
+		grep -aq "Interfaces=.*ScreenCast" "$LOG/A.portal"; then
+	pass "写了 vidow.portal（前端按它找后端）"
+else
+	fail "vidow.portal 没写对：$(cat "$LOG/A.portal" 2>/dev/null | tr '\n' ' ')"
+fi
+if grep -aqx "UseIn=Vidow;" "$LOG/A.portal" 2>/dev/null; then
+	pass "vidow.portal 的 UseIn 跟会话名一致"
+else
+	fail "UseIn 不对：$(grep -a UseIn "$LOG/A.portal" 2>/dev/null)"
+fi
+
+# ------------------------------------------------- F 前端环境不对就重启它
+# 前端的 portals.conf 是**进程起来那一刻**读的，读一次就缓存住。配置内容没变、
+# 但正在跑的那个前端还是宿主的环境（从宿主合成器切过来就是这样），不重启它就会
+# 按宿主那份 <host>-portals.conf 选后端 —— 录屏会被指到 hyprland 上去。
+mark "F 前端跑着但环境不是我们的 → 重启它"
+env -u XDG_CURRENT_DESKTOP -u WAYLAND_DISPLAY sleep 60 &
+FRONT_PID=$!
+FAKE_MAINPID=$FRONT_PID
+run_round F || exit 1
+stop_round F
+if has "$LOG/F.start" "show -p MainPID"; then
+	pass "查了前端的 MainPID（不是瞎猜）"
+else
+	fail "没查前端进程"
+fi
+if has "$LOG/F.start" "restart xdg-desktop-portal"; then
+	pass "环境不对 → 重启前端"
+else
+	fail "前端环境不对却没重启（录屏会指到宿主那个后端上）"
+fi
+
+mark "F2 前端没在跑 → 不重启"
+FAKE_MAINPID=0
+run_round F2 || exit 1
+stop_round F2
+if has "$LOG/F2.start" "restart xdg-desktop-portal"; then
+	fail "前端没跑还去重启（白起一个）"
+else
+	pass "前端没跑 → 不重启（下次被激活时环境就是新的）"
+fi
+FAKE_MAINPID=""
+kill "$FRONT_PID" 2>/dev/null
+
+mark "E2 没有 vidow-portal 时退回探测外部后端"
+mkdir -p "$RUNDIR/bin"
+cp ./build/vidow "$RUNDIR/bin/vidow"   # 边上没有 vidow-portal
 DETECT=""
 for c in wlr hyprland; do
 	for d in $(echo "${XDG_DATA_DIRS:-/usr/local/share:/usr/share}" | tr ':' ' '); do
@@ -266,27 +344,57 @@ for c in wlr hyprland; do
 		fi
 	done
 done
-
+VIDOW_BIN="$RUNDIR/bin/vidow" run_round E2 || exit 1
+stop_round E2
+snap_conf E2
 if [ -n "$DETECT" ]; then
-	if grep -aqx "org.freedesktop.impl.portal.ScreenCast=$DETECT" "$LOG/A.conf" \
-			&& grep -aqx "org.freedesktop.impl.portal.Screenshot=$DETECT" "$LOG/A.conf"; then
-		pass "ScreenCast / Screenshot 指向装了的那一个后端（$DETECT）"
+	if grep -aqx "org.freedesktop.impl.portal.ScreenCast=$DETECT" "$LOG/E2.conf" &&
+			grep -aqx "org.freedesktop.impl.portal.Screenshot=$DETECT" "$LOG/E2.conf"; then
+		pass "没有自己人时指向装了的外部后端（$DETECT）"
 	else
-		fail "生成的 portals.conf 里录屏后端不对（本机装的是 $DETECT）：$(grep -a ScreenCast "$LOG/A.conf" | head -1)"
+		fail "退回探测不对（本机装的是 $DETECT）：$(grep -a ScreenCast "$LOG/E2.conf" 2>/dev/null | head -1)"
 	fi
 else
-	fail "本机没装 wlr / hyprland 后端，这一节没得测"
+	fail "本机没装 wlr / hyprland 后端，这一条没得测"
+fi
+if [ -e "$HOME_DIR/.local/share/xdg-desktop-portal/portals/vidow.portal" ]; then
+	fail "不用自己人了却没把 vidow.portal 删掉"
+else
+	pass "不用自己人了 → vidow.portal 删掉"
 fi
 
-mkdir -p "$RUNDIR/nodata"
-run_round E XDG_DATA_DIRS="$RUNDIR/nodata" || exit 1
-stop_round E
-if grep -aq "ScreenCast\|Screenshot" "$HOME_DIR/.config/xdg-desktop-portal/vidow-portals.conf"; then
-	fail "一个录屏后端都没装却还是写了：$(grep -a "ScreenCast\|Screenshot" "$HOME_DIR/.config/xdg-desktop-portal/vidow-portals.conf" | head -1)"
+mark "E3 portal_capture 写死 / none"
+set_capture wlr
+run_round E3 || exit 1
+stop_round E3
+snap_conf E3
+if grep -aqx "org.freedesktop.impl.portal.ScreenCast=wlr" "$LOG/E3.conf"; then
+	pass "portal_capture=wlr 写死了就是 wlr（配置优先于 auto）"
 else
-	pass "一个录屏后端都没装 → 一个字都不写"
+	fail "写死 wlr 没用：$(grep -a ScreenCast "$LOG/E3.conf" 2>/dev/null | head -1)"
 fi
-if has "$LOG/E.log" "ScreenCast / Screenshot 不写"; then
+set_capture none
+run_round E4 || exit 1
+stop_round E4
+snap_conf E4
+if grep -aq "ScreenCast\|Screenshot" "$LOG/E4.conf"; then
+	fail "portal_capture=none 却还是写了：$(grep -a "ScreenCast\|Screenshot" "$LOG/E4.conf" | head -1)"
+else
+	pass "portal_capture=none → 一个字都不写"
+fi
+set_capture ""
+
+mark "E5 自己人和外部后端都没有"
+mkdir -p "$RUNDIR/nodata"
+VIDOW_BIN="$RUNDIR/bin/vidow" run_round E5 XDG_DATA_DIRS="$RUNDIR/nodata" || exit 1
+stop_round E5
+snap_conf E5
+if grep -aq "ScreenCast\|Screenshot" "$LOG/E5.conf"; then
+	fail "一个后端都没有却还是写了：$(grep -a "ScreenCast\|Screenshot" "$LOG/E5.conf" | head -1)"
+else
+	pass "一个后端都没有 → 一个字都不写"
+fi
+if has "$LOG/E5.log" "ScreenCast / Screenshot 不写"; then
 	pass "日志说明白为什么不写"
 else
 	fail "日志没说明为什么不写"

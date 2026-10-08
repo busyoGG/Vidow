@@ -306,6 +306,35 @@ executable('foreign',
   include_directories: include_directories('.'),
   install: false)
 
+# vidow 自己的 portal 后端（录屏选择器）：GTK3 画界面 + 一条自己的 wayland 连接
+# 抓缩略图（wlr-screencopy）和要流（zkde_screencast）。这两个协议的服务端在 src/，
+# 客户端侧的代码这里现生成 —— vidow-portal 就是个普通 wayland 客户端，和 KDE 那个
+# 后端一样，只是自己人。
+sc_client_header = custom_target('wlr-screencopy-unstable-v1-client-protocol.h',
+  input: sc_xml,
+  output: 'wlr-screencopy-unstable-v1-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'])
+sc_client_code = custom_target('wlr-screencopy-unstable-v1-client-protocol.c',
+  input: sc_xml,
+  output: 'wlr-screencopy-unstable-v1-client-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
+zkde_client_header = custom_target('zkde-screencast-unstable-v1-client-protocol.h',
+  input: zkde_xml,
+  output: 'zkde-screencast-unstable-v1-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'])
+zkde_client_code = custom_target('zkde-screencast-unstable-v1-client-protocol.c',
+  input: zkde_xml,
+  output: 'zkde-screencast-unstable-v1-client-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
+
+gtk3_dep = dependency('gtk+-3.0')
+executable('vidow-portal',
+  ['tools/vidowportal.c', sc_client_header, sc_client_code,
+   zkde_client_header, zkde_client_code],
+  dependencies: [wayland_client_dep, gtk3_dep],
+  include_directories: include_directories('.'),
+  install: false)
+
 # IPC 客户端：往 vidow 的 unix socket 上发一行 JSON，把应答打出来
 # （纯 socket 客户端，不依赖 wayland，也不依赖 json.c —— 它只做漂亮的缩进）。
 executable('vidowmsg',
