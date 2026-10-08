@@ -108,21 +108,28 @@ static struct vidow_capture *capture_for_output(struct vidow_server *server,
 	return output->capture;
 }
 
-/* 渲染一帧，返回**加锁的**缓冲（调用方负责 wlr_buffer_unlock）。遮挡由调用方
- * 负责压好（vidow_capturemask_hold/release）。 */
-static struct wlr_buffer *capture_render(struct vidow_capture *cap) {
-	struct wlr_output *output = cap->output;
-	int width = output->width, height = output->height;
+/* 渲染场景里的一个矩形，返回**加锁的**缓冲（调用方负责 wlr_buffer_unlock）。遮挡
+ * 由调用方负责压好（vidow_capturemask_hold/release）。
+ *
+ * box 是**布局坐标**（逻辑坐标，不是像素），scale 是「逻辑 → 像素」的换算，
+ * 出图尺寸 = round(box.width * scale) × round(box.height * scale)。整屏抓帧就是
+ * 「box = 这块屏在布局里的框、scale = 这块屏的缩放」，按区域 / 按窗口抓帧是别的框
+ * （见 vidow_capture_grab_box / vidow_capture_grab_view）。 */
+static struct wlr_buffer *capture_render_box(struct vidow_capture *cap,
+		const struct wlr_box *box, double scale) {
+	if (scale <= 0) {
+		return NULL;
+	}
+	int width = (int)lround(box->width * scale);
+	int height = (int)lround(box->height * scale);
 	if (width <= 0 || height <= 0) {
 		return NULL;
 	}
 
 	/* 缩放决定「逻辑坐标 → 像素」的换算，和真输出不一致的话抓出来的图会错位
 	 * （高分屏上最明显）。位置同理：场景是按布局坐标排的。 */
-	cap->grab_output.scale = output->scale;
-	struct wlr_box box;
-	wlr_output_layout_get_box(cap->server->output_layout, output, &box);
-	wlr_scene_output_set_position(cap->scene_output, box.x, box.y);
+	cap->grab_output.scale = scale;
+	wlr_scene_output_set_position(cap->scene_output, box->x, box->y);
 
 	/* 假输出的尺寸得手动跟上：场景的 damage 记账是按 output->width/height 裁的
 	 * （scene_output_damage 里 intersect），假输出从来没提交过模式，这两个值
@@ -155,8 +162,148 @@ static struct wlr_buffer *capture_render(struct vidow_capture *cap) {
 	wlr_output_state_finish(&state);
 
 	if (buffer == NULL) {
-		wlr_log(WLR_ERROR, "抓帧: %s 渲染失败", output->name);
+		wlr_log(WLR_ERROR, "抓帧: %s 渲染失败", cap->output->name);
 	}
+	return buffer;
+}
+
+/* 整块输出（屏幕那一帧的大小）。 */
+static struct wlr_buffer *capture_render(struct vidow_capture *cap) {
+	struct wlr_output *output = cap->output;
+	if (output->width <= 0 || output->height <= 0) {
+		return NULL;
+	}
+	struct wlr_box box;
+	wlr_output_layout_get_box(cap->server->output_layout, output, &box);
+	return capture_render_box(cap, &box, output->scale);
+}
+
+/* ------------------------------------------- 「只留一个窗口」的抓帧（按窗口录屏）
+ *
+ * 场景是一整棵树，wlr_scene 没有「只渲染某个子树」的口子 —— 想抓单个窗口，只能
+ * 在渲染那一瞬间把**别的东西关掉**：别的窗口、各个 layer（背景 / 状态栏 / 通知 /
+ * 输入法 / X11 菜单）。
+ *
+ * 用 wlr_scene_node_set_enabled(false) 而不是压透明度（capturemask 用的是压透明度）：
+ * 这里的窗口是**全部**关掉、只留一个，关掉会影响命中测试，但抓帧的渲染是同步的
+ * ——压上、渲染、放开都在同一次调用里，中间不会派发输入事件，所以没人能观察到。
+ * 另外被 solo 关掉的东西抓出来是透明的（黑底），正好当信箱边。
+ */
+static struct {
+	struct wlr_scene_node *node;
+	bool was_enabled;
+} solo_saved[256];
+static size_t solo_n;
+static bool solo_on;
+
+static void solo_hide(struct wlr_scene_node *node) {
+	if (node == NULL || solo_n >= sizeof(solo_saved) / sizeof(solo_saved[0])) {
+		return;
+	}
+	solo_saved[solo_n].node = node;
+	solo_saved[solo_n].was_enabled = node->enabled;
+	solo_n++;
+	wlr_scene_node_set_enabled(node, false);
+}
+
+static void solo_begin(struct vidow_server *server, struct vidow_view *keep) {
+	if (solo_on) {
+		return;
+	}
+	solo_on = true;
+	solo_n = 0;
+	struct wlr_scene_tree *layers[] = {
+		server->layer_background,
+		server->layer_overview_dim,
+		server->layer_bottom,
+		server->layer_popups,
+		server->layer_top,
+		server->layer_overlay,
+		server->layer_im,
+	};
+	for (size_t i = 0; i < sizeof(layers) / sizeof(layers[0]); i++) {
+		solo_hide(layers[i] != NULL ? &layers[i]->node : NULL);
+	}
+	struct vidow_view *view;
+	wl_list_for_each(view, &server->views, link) {
+		if (view == keep) {
+			continue;
+		}
+		solo_hide(&view->scene_tree->node);
+	}
+}
+
+static void solo_end(void) {
+	if (!solo_on) {
+		return;
+	}
+	/* 倒着放开：同一棵树里父子都关过时，先开父再开子，中间不会有半开的瞬间。 */
+	for (size_t i = solo_n; i > 0; i--) {
+		wlr_scene_node_set_enabled(solo_saved[i - 1].node,
+			solo_saved[i - 1].was_enabled);
+	}
+	solo_n = 0;
+	solo_on = false;
+}
+
+/* 抓一块屏幕上的任意矩形（布局坐标）。给「按区域录屏 / 截图」用。 */
+struct wlr_buffer *vidow_capture_grab_box(struct vidow_server *server,
+		struct wlr_output *output, const struct wlr_box *box, double scale) {
+	if (output == NULL || box == NULL || box->width <= 0 || box->height <= 0) {
+		return NULL;
+	}
+	struct vidow_capture *cap = capture_for_output(server, output);
+	if (cap == NULL) {
+		return NULL;
+	}
+	vidow_capturemask_hold(server);
+	struct wlr_buffer *buffer = capture_render_box(cap, box, scale);
+	vidow_capturemask_release(server);
+	return buffer;
+}
+
+/* 抓一个窗口（只它自己，不带背景 / 别的窗口）。按 out_w × out_h 等比缩放进流里，
+ * 缩放比取小的那个方向 —— 窗口比流小就放大、比流大就缩小，剩下的是黑边（关掉的
+ * 东西本来就是黑的）。窗口改尺寸时流的分辨率不变（消费者不用跟着重协商）。 */
+struct wlr_buffer *vidow_capture_grab_view(struct vidow_server *server,
+		struct vidow_view *view, int out_w, int out_h) {
+	if (view == NULL || out_w <= 0 || out_h <= 0) {
+		return NULL;
+	}
+	struct wlr_box geom = vidow_view_geometry(view);
+	if (geom.width <= 0 || geom.height <= 0) {
+		return NULL;
+	}
+	/* 渲染器都是同一个，用窗口中心所在那块屏的抓帧器就行。 */
+	struct wlr_output *output = wlr_output_layout_output_at(
+		server->output_layout, geom.x + geom.width / 2, geom.y + geom.height / 2);
+	if (output == NULL) {
+		output = view->output;
+	}
+	if (output == NULL) {
+		return NULL;
+	}
+	struct vidow_capture *cap = capture_for_output(server, output);
+	if (cap == NULL) {
+		return NULL;
+	}
+	double sx = (double)out_w / geom.width;
+	double sy = (double)out_h / geom.height;
+	double scale = sx < sy ? sx : sy;
+	int cw = (int)lround(out_w / scale);
+	int ch = (int)lround(out_h / scale);
+	struct wlr_box box = {
+		.x = geom.x + geom.width / 2 - cw / 2,
+		.y = geom.y + geom.height / 2 - ch / 2,
+		.width = cw,
+		.height = ch,
+	};
+
+	vidow_capturemask_hold(server);
+	solo_begin(server, view);
+	struct wlr_buffer *buffer = capture_render_box(cap, &box, scale);
+	solo_end();
+	vidow_capturemask_release(server);
 	return buffer;
 }
 
@@ -165,12 +312,29 @@ static struct wlr_buffer *capture_render(struct vidow_capture *cap) {
  * 或者后端在提交时合上去的，所以要光标的客户端得我们自己画。
  *
  * 直接拿 wlr_output_cursor 的贴图（硬件平面上的那个也是它），所以放大摇晃那种
- * 大光标、客户端自己设的光标都照样画得出来，和屏幕上看到的一致。 */
-void vidow_capture_paint_cursor(struct wlr_output *output, struct wlr_buffer *dst) {
-	double scale = output->scale > 0 ? output->scale : 1.0;
+ * 大光标、客户端自己设的光标都照样画得出来，和屏幕上看到的一致。
+ *
+ * box 是**这块屏自己的逻辑坐标**里的框（整屏抓帧就是 {0, 0, 屏的逻辑宽, 屏的逻辑
+ * 高}），scale 是「逻辑 → 像素」；光标在框外就不画（按区域 / 按窗口抓帧时，光标
+ * 跑到别处去了就不该出现在这张图里）。 */
+void vidow_capture_paint_cursor_box(struct wlr_output *output,
+		struct wlr_buffer *dst, const struct wlr_box *box, double scale) {
+	if (scale <= 0) {
+		scale = 1.0;
+	}
 	struct wlr_output_cursor *oc;
 	wl_list_for_each(oc, &output->cursors, link) {
 		if (!oc->enabled || !oc->visible || oc->texture == NULL) {
+			continue;
+		}
+		struct wlr_box dst_box = {
+			.x = (int)lround((oc->x - box->x) * scale) - oc->hotspot_x,
+			.y = (int)lround((oc->y - box->y) * scale) - oc->hotspot_y,
+			.width = (int)oc->width,
+			.height = (int)oc->height,
+		};
+		if (dst_box.x + dst_box.width <= 0 || dst_box.y + dst_box.height <= 0 ||
+				dst_box.x >= dst->width || dst_box.y >= dst->height) {
 			continue;
 		}
 		struct wlr_render_pass *pass = wlr_renderer_begin_buffer_pass(
@@ -181,16 +345,21 @@ void vidow_capture_paint_cursor(struct wlr_output *output, struct wlr_buffer *ds
 		wlr_render_pass_add_texture(pass, &(struct wlr_render_texture_options){
 			.texture = oc->texture,
 			.src_box = oc->src_box,
-			.dst_box = (struct wlr_box){
-				.x = (int)lround(oc->x * scale) - oc->hotspot_x,
-				.y = (int)lround(oc->y * scale) - oc->hotspot_y,
-				.width = (int)oc->width,
-				.height = (int)oc->height,
-			},
+			.dst_box = dst_box,
 			.transform = oc->transform,
 		});
 		wlr_render_pass_submit(pass);
 	}
+}
+
+/* 整屏抓帧那条路（box 就是整块屏）。 */
+void vidow_capture_paint_cursor(struct wlr_output *output, struct wlr_buffer *dst) {
+	double scale = output->scale > 0 ? output->scale : 1.0;
+	struct wlr_box box = {
+		.width = output->width,
+		.height = output->height,
+	};
+	vidow_capture_paint_cursor_box(output, dst, &box, scale);
 }
 
 /* --------------------------------------------------------------- 马赛克 */

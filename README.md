@@ -2246,8 +2246,8 @@ portal 相关的两个键：
 | --- | --- |
 | vidow 启动时 | 写 `~/.local/share/xdg-desktop-portal/portals/vidow.portal`（总线名 + 接口清单）、把 `<会话名>-portals.conf` 里的 ScreenCast / Screenshot 指向 `vidow`、把 `vidow-portal` 起起来占住那个总线名 |
 | 前端（xdg-desktop-portal） | 只做转发；PipeWire 的 fd 也是它自己连的（`OpenPipeWireRemote` 在前端里，`nm -D` 能看到 `pw_context_connect` / `pw_core_steal_fd`） |
-| vidow-portal | 实现 `org.freedesktop.impl.portal.ScreenCast`（CreateSession / SelectSources / Start）；Start 时弹 GTK3 选择器，每块屏一行**实时缩略图**（`zwlr_screencopy_manager_v1` 抓帧，输出名来自 `wl_output.name`）；点「共享」后 `stream_output(stream, wl_output, pointer_mode)`，等 `created(node)` 把 node id 报回前端 |
-| vidow | 建一路 PipeWire 流（memfd 缓冲、BGRx），输出提交时抓帧推进去 |
+| vidow-portal | 实现 `org.freedesktop.impl.portal.ScreenCast`（CreateSession / SelectSources / Start）和 `Screenshot`（Screenshot / PickColor）。Start 时弹 GTK3 选择器，**按来源分组**：每块屏一行（`zwlr_screencopy_manager_v1` 抓帧的实时缩略图 + `wl_output.name`）、每个窗口一行（`ext-foreign-toplevel-list-v1` 拿列表、`ext-image-copy-capture` 的窗口源抓缩略图）、虚拟屏幕一行；点「共享」后按行发 `stream_output` / `stream_window` / `stream_virtual_output`，等 `created(node)` 把 node id 报回前端 |
+| vidow | 建一路 PipeWire 流（memfd 缓冲、BGRx），抓帧走 vidow 自己那条路：整块输出 / 输出上的任意矩形（`stream_region`）/ 单个窗口（渲染时把别的窗口和 layer 关掉）/ 现场加的虚拟输出（headless 后端 + 一块真输出，能摆窗口、进布局） |
 
 这样录屏**不依赖 KDE**、也不用把 `XDG_CURRENT_DESKTOP` 说成 KDE —— 会话名还是 `Vidow`，
 别的应用一点都不受影响。想换后端就配置里写一行：
@@ -2258,13 +2258,20 @@ portal_capture = "wlr"   -- 借 xdg-desktop-portal-wlr：没有选择器，直�
 portal_capture = "none"  -- ScreenCast / Screenshot 两行都不写
 ```
 
-实测（`./test-portal-own.sh`，15 项）：私有 dbus + headless vidow → `vidow.portal` 落地、
-`vidow-portal` 占住总线名 → 前端把 ScreenCast 指到它 → 选择器画在 vidow 上（标题「共享屏幕」，
-第一块屏默认选中）→ 点「共享」→ `Start` 返回 `node=114`、`size=(1280, 720)` →
-`gst-launch-1.0 pipewiresrc path=114` 拿到 6 帧 6 种画面、静止画面靠 1Hz 心跳也有帧。
+实测（`./test-portal-own.sh`，32 项）：私有 dbus + headless vidow → `vidow.portal` 落地、
+`vidow-portal` 占住总线名 → 前端把 ScreenCast / Screenshot 指到它 → 选择器画在 vidow 上
+（标题「共享屏幕」，第一行默认选中）→ 回车确认 → `Start` 返回 `node` / `size`：
+整屏（1280x720）、**窗口**（`source_type=2`，尺寸报窗口的）、**虚拟输出**（合成器里真多出
+一块 `HEADLESS-N`，流结束又拔掉）三种都出帧；`Screenshot` 回一个真 PNG（1280x720）、
+`PickColor` 回 `(ddd)` 颜色。
 
-按窗口 / 按区域 / 虚拟输出录屏还没做（回 `failed`），光标模式 `hidden` / `embedded` 支持、
-`metadata` 没做。KDE 后端那条路（`portal_capture = "kde"`）仍然可用，见 `./test-screencast.sh`。
+截图（`Screenshot` / `PickColor`）**不走 PipeWire**：后端自己就是客户端，抓一帧像素、
+写个 PNG、把文件 URI 回给前端（写在 `$XDG_CACHE_HOME/vidow-portal/`）。
+`options.interactive = true`（或者 `PickColor`）会把那一帧冻住铺满屏，让用户框一块 / 点一下。
+
+光标模式 `hidden` / `embedded` 支持；`metadata`（往 PipeWire 缓冲里塞 `SPA_META_Cursor`）
+还没做，所以 `AvailableCursorModes` 报的是 1|2 —— 客户端要 metadata 时拿不到，别的地方不受影响。
+KDE 后端那条路（`portal_capture = "kde"`）仍然可用，见 `./test-screencast.sh`。
 
 **注意**：`zkde_screencast_unstable_v1` 是对所有客户端开放的（KWin 那份也是），也就是说不经过
 portal 的客户端也能自己绑它录屏 —— 和 KWin 同一个模型。要收紧的话得在 `bind` 里按 PID / app_id
@@ -3707,6 +3714,44 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
      没有**（不误报）；②掐断帧链 + 追踪开：客户端确实交过帧，追踪报出 ERROR 且点名
      HEADLESS-1、写明「客户端还在交帧，屏幕却不更新」；③掐断帧链 + 追踪**关**：一条 trace
      日志都没有、vidow 照样活着（诊断不改变行为）。
+
+165. **录屏 portal 补齐来源（窗口 / 区域 / 虚拟输出）+ 截图接口，顺手修了三个真 bug**。
+
+     上一轮 164 里「没做的」那几项这轮全补上了；补的过程踩出来的 bug 比新功能本身更值钱。
+
+     - **合成器侧四种抓帧来源**（`src/capture.c` / `src/screencast.c`）：
+       `vidow_capture_grab_box()` 渲染场景里的任意矩形（`stream_region` 用它，输出尺寸 =
+       round(矩形 × 缩放)）；`vidow_capture_grab_view()` 只渲染一个窗口 —— 渲染那一瞬间把别的
+       窗口和各个 layer `wlr_scene_node_set_enabled(false)`（同步渲染，中间不派发输入事件，
+       所以没人观察得到），再等比缩放填进流，剩下的边是黑的；虚拟输出是现建 headless 后端 +
+       一块**真输出**（进布局、能摆窗口、能当窗口的主输出），这一路流结束时拔掉。
+       `stream_window` 的 `window_uuid` 就是 `ext-foreign-toplevel-list-v1` 的 identifier，
+       合成器拿它反查 view；窗口关掉时给客户端发 `closed`。
+     - **选择器按来源分组**：屏幕（screencopy 缩略图）/ 窗口（窗口抓帧缩略图）/ 虚拟屏幕三段，
+       `AvailableSourceTypes` 报 1|2|4，单选/多选看 `multiple`，**第一行默认选中**。
+     - **截图接口**：`Screenshot` / `PickColor` **不走 PipeWire** —— 后端自己当客户端抓一帧、
+       写 PNG（libpng）、回文件 URI（`$XDG_CACHE_HOME/vidow-portal/`）；`interactive = true`
+       或者取色会把那一帧冻住铺满屏，让用户框一块 / 点一下（按控件尺寸换算回像素再裁）。
+     - **修掉的真 bug**：
+       ① **libwayland 的 NULL listener**：`zwlr_screencopy_frame_v1` 有 7 个事件，helper 只填了
+          5 个，GLES2 会话上合成器一发 `linux_dmabuf` 就 `abort`（libwayland 的原话是
+          "listener function for opcode %u of %s is NULL"）—— 之前所有测试都在 pixman 上跑
+          （没有 dmabuf、不发那个事件），真机上开一次对话框就崩。
+       ② **一次性抓帧的请求没 flush**：`copy` 是在「收到事件」的回调里发的，而 libwayland 只在
+          下一次 dispatch 时 flush —— 没有下一轮事件就永远等不到 `ready`（缩略图那条路靠 500ms
+          的 tick 顺带 flush 才没露）。
+       ③ **缩略图每 500ms 新建一个窗口抓帧会话**：合成器那边每个会话配一块 scene_output，而一个
+          场景最多 64 块 → 半分钟撞上限，`wlr_scene_output_create: Assertion scene_output->index
+          < 64 failed`，vidow 当场崩（用户的会话跟着没了）。现在一个窗口一个会话、反复要帧。
+       还有几个小的：shm 格式要按 DRM fourcc 认（GLES2 上报的是 `XBGR8888`，只认 0/1 的话
+       缩略图和截图红蓝颠倒）、impl `Screenshot` 的签名没有 `session_handle`（多写一个，前端
+       转发过来就是「类型不匹配」直接 code=2）、`dialog_accept` 不幂等（连点两下「共享」会建
+       两路流，虚拟输出那种还会多留一块屏）。
+     - `./test-portal-own.sh` 从 15 项扩到 32 项：整屏 / 窗口 / 虚拟输出三种来源各自出帧、
+       虚拟输出用完拔掉、`Screenshot` 回真 PNG（1280x720）、`PickColor` 回颜色。确认选择器改成
+       **回车**（点坐标会随内容飘：对话框的窗口几何和按钮实际位置差着几十像素）。
+     - **仍然没做**：光标模式 `metadata`（`AvailableCursorModes` 只报 1|2）、
+       `zkde_screencast_unstable_v1` 的 bind 还没收紧到「只给自己那个后端」。
 
 164. **录屏 portal 改成 vidow 自己做 —— 效果和 KDE 一样，但谁都不骗**。
 

@@ -28,11 +28,16 @@
 
 #include "server.h"
 
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include <wayland-server-core.h>
+#include <wlr/backend/headless.h>
+#include <wlr/backend/multi.h>
+#include <wlr/types/wlr_ext_foreign_toplevel_list_v1.h>
 #include <wlr/types/wlr_output.h>
+#include <wlr/types/wlr_output_layout.h>
 #include <wlr/util/log.h>
 
 #include <drm_fourcc.h>
@@ -401,19 +406,52 @@ static void pw_stream_fill(struct vidow_sc_pw_stream *ps,
 	buf->datas[0].chunk->stride = (int32_t)stride;
 }
 
-/* 抓当前这一帧（遮挡 / 马赛克都盖到了），要光标就画上。返回加锁的缓冲。 */
+/* 抓当前这一帧（遮挡 / 马赛克都盖到了），要光标就画上。返回加锁的缓冲。
+ *
+ * 四种来源各抓各的：
+ *   OUTPUT / VIRTUAL  整块输出那一帧（虚拟输出也是一块真输出）
+ *   REGION            这块屏上的一个矩形（布局坐标 + 缩放）
+ *   WINDOW            只这一个窗口（等比缩放填满流，见 vidow_capture_grab_view）
+ */
 static struct wlr_buffer *stream_grab(struct vidow_sc_pw_stream *ps) {
 	struct vidow_screencast_stream *stream = ps->stream;
 	if (stream->output == NULL) {
 		return NULL;
 	}
-	struct wlr_buffer *frame = vidow_capture_grab(stream->sc->server,
-		stream->output);
+	struct wlr_buffer *frame = NULL;
+	struct wlr_box cursor_box = {0};
+	double cursor_scale = 0;
+	switch (stream->kind) {
+	case VIDOW_SC_REGION:
+		frame = vidow_capture_grab_box(stream->sc->server, stream->output,
+			&stream->box, stream->scale);
+		cursor_box = stream->box;
+		cursor_scale = stream->scale;
+		break;
+	case VIDOW_SC_WINDOW:
+		frame = vidow_capture_grab_view(stream->sc->server, stream->view,
+			stream->out_w, stream->out_h);
+		break;
+	case VIDOW_SC_OUTPUT:
+	case VIDOW_SC_VIRTUAL:
+	default:
+		frame = vidow_capture_grab(stream->sc->server, stream->output);
+		break;
+	}
 	if (frame == NULL) {
 		return NULL;
 	}
 	if (stream->pointer_mode == ZKDE_SCREENCAST_UNSTABLE_V1_POINTER_EMBEDDED) {
-		vidow_capture_paint_cursor(stream->output, frame);
+		if (stream->kind == VIDOW_SC_REGION) {
+			/* 区域抓帧：光标位置是**这块屏的逻辑坐标**，区域框也是，
+			 * 直接把框给出去（框外的光标不画）。 */
+			vidow_capture_paint_cursor_box(stream->output, frame, &cursor_box,
+				cursor_scale);
+		} else if (stream->kind == VIDOW_SC_OUTPUT ||
+				stream->kind == VIDOW_SC_VIRTUAL) {
+			vidow_capture_paint_cursor(stream->output, frame);
+		}
+		/* 窗口抓帧不画光标：窗口是等比缩放进流的，光标跟窗口不在一个坐标系里。 */
 	}
 	return frame;
 }
@@ -467,18 +505,42 @@ void vidow_sc_pw_stream_start(struct vidow_screencast_stream *stream) {
 	ps->node_id = SPA_ID_INVALID;
 	stream->pw = ps;
 
-	int width = output->width;
-	int height = output->height;
+	/* 流的像素尺寸：整块输出 / 虚拟输出就是输出的像素尺寸，区域 / 窗口是调用方
+	 * 在请求里算好的（见 handle_stream_region / handle_stream_window）。 */
+	int width = stream->out_w > 0 ? stream->out_w : output->width;
+	int height = stream->out_h > 0 ? stream->out_h : output->height;
+	if (width <= 0 || height <= 0) {
+		stream->pw = NULL;
+		free(ps);
+		vidow_screencast_stream_fail(stream, "vidow: 要录的东西没有尺寸");
+		return;
+	}
+	stream->out_w = width;
+	stream->out_h = height;
 	size_t stride = (size_t)width * 4;
 
 	char name[128];
 	snprintf(name, sizeof(name), "vidow-screencast-%s", output->name);
+	const char *desc = "vidow 屏幕";
+	switch (stream->kind) {
+	case VIDOW_SC_WINDOW:
+		desc = "vidow 窗口";
+		break;
+	case VIDOW_SC_REGION:
+		desc = "vidow 区域";
+		break;
+	case VIDOW_SC_VIRTUAL:
+		desc = "vidow 虚拟输出";
+		break;
+	default:
+		break;
+	}
 	struct pw_properties *props = pw_properties_new(
 		PW_KEY_MEDIA_TYPE, "Video",
 		PW_KEY_MEDIA_CATEGORY, "Capture",
 		PW_KEY_MEDIA_ROLE, "Screen",
 		PW_KEY_NODE_NAME, name,
-		PW_KEY_NODE_DESCRIPTION, "vidow 屏幕",
+		PW_KEY_NODE_DESCRIPTION, desc,
 		NULL);
 	ps->pw_stream = pw_stream_new(sc->pw->core, name, props);
 	if (ps->pw_stream == NULL) {
@@ -622,9 +684,18 @@ static void stream_destroy(struct vidow_screencast_stream *stream) {
 		stream->resource = NULL;
 	}
 	vidow_sc_pw_stream_destroy(stream);
+	/* 虚拟输出是我们建的：这一路结束就把它拔掉（不留在布局里）。 */
+	struct wlr_output *owned = stream->owns_output ? stream->output : NULL;
 	if (stream->output != NULL) {
 		wl_list_remove(&stream->output_destroy.link);
 		stream->output = NULL;
+	}
+	if (stream->view != NULL) {
+		wl_list_remove(&stream->view_destroy.link);
+		stream->view = NULL;
+	}
+	if (owned != NULL) {
+		wlr_output_destroy(owned);
 	}
 	wl_list_remove(&stream->link);
 	free(stream);
@@ -644,6 +715,7 @@ static struct vidow_screencast_stream *stream_create(struct wl_client *client,
 	stream->output = output;
 	stream->pointer_mode = pointer_mode;
 	wl_list_init(&stream->output_destroy.link);
+	wl_list_init(&stream->view_destroy.link);
 	wl_list_insert(&sc->streams, &stream->link);
 
 	stream->resource = wl_resource_create(client,
@@ -692,12 +764,10 @@ static void handle_stream_output(struct wl_client *client,
 	vidow_sc_pw_stream_start(stream);
 }
 
-/* 协议的其余几个来源（窗口 / 区域 / 虚拟输出）：现在只做整块输出 —— KDE 的
- * 「共享整个屏幕」走的就是 stream_output。其余一律回 failed（不是什么都不回：
- * 客户端会一直等 created）。 */
-static void reply_unsupported(struct wl_client *client,
-		struct vidow_screencast *sc, struct wl_resource *resource,
-		uint32_t stream_id, const char *what) {
+/* 来源不支持 / 找不到时也要建出这一路，然后在上面回 failed —— 协议里没有 error
+ * code，回 failed 才是客户端认的方式（什么都不回的话客户端会一直等 created）。 */
+static void reply_failed(struct wl_client *client, struct vidow_screencast *sc,
+		struct wl_resource *resource, uint32_t stream_id, const char *what) {
 	struct vidow_screencast_stream *stream = stream_create(client, sc,
 		stream_id, (uint32_t)wl_resource_get_version(resource), NULL, 0);
 	if (stream != NULL) {
@@ -705,54 +775,260 @@ static void reply_unsupported(struct wl_client *client,
 	}
 }
 
+/* ------------------------------------------------------------ 按窗口录屏 */
+
+/* window_uuid 是 ext-foreign-toplevel-list 给的 identifier（wlroots 建 handle 时
+ * 生成的，一个窗口一个、不复用）。portal 那边（我们的 vidow-portal）从同一个协议
+ * 拿到它，原样传回来，这里反查成 vidow 的 view。 */
+static struct vidow_view *view_by_identifier(struct vidow_server *server,
+		const char *identifier) {
+	if (identifier == NULL || identifier[0] == '\0') {
+		return NULL;
+	}
+	struct vidow_view *view;
+	wl_list_for_each(view, &server->views, link) {
+		if (view->ftl_handle != NULL && view->ftl_handle->identifier != NULL &&
+				strcmp(view->ftl_handle->identifier, identifier) == 0) {
+			return view;
+		}
+	}
+	return NULL;
+}
+
+/* 窗口没了（关掉 / 崩了）→ 这一路流结束。协议里管这个叫 closed（「合成器这边
+ * 停了，你 close 掉吧」），KWin 也是这么干的。 */
+static void stream_handle_view_destroy(struct wl_listener *listener, void *data) {
+	(void)data;
+	struct vidow_screencast_stream *stream =
+		wl_container_of(listener, stream, view_destroy);
+	stream->view = NULL;
+	wl_list_remove(&stream->view_destroy.link);
+	wl_list_init(&stream->view_destroy.link);
+	if (stream->resource != NULL) {
+		zkde_screencast_stream_unstable_v1_send_closed(stream->resource);
+	}
+}
+
+/* 按窗口录屏：流的尺寸取窗口**当下**的大小（协议没说窗口改了尺寸怎么办，KDE 那边
+ * 是重新协商；我们固定流的分辨率、把窗口等比缩放填进去，消费者不用跟着重协商）。 */
 static void handle_stream_window(struct wl_client *client,
 		struct wl_resource *resource, uint32_t stream_id,
 		const char *window_uuid, uint32_t pointer_mode) {
-	(void)window_uuid;
-	(void)pointer_mode;
-	reply_unsupported(client, wl_resource_get_user_data(resource), resource,
-		stream_id, "vidow: 按窗口录屏还不支持（现在只能录整块输出）");
+	struct vidow_screencast *sc = wl_resource_get_user_data(resource);
+	if (sc == NULL) {
+		return;
+	}
+	uint32_t version = (uint32_t)wl_resource_get_version(resource);
+	struct vidow_view *view = view_by_identifier(sc->server, window_uuid);
+	if (view == NULL) {
+		wlr_log(WLR_INFO, "screencast: 找不到窗口 identifier=%s（手上这些：）",
+			window_uuid != NULL ? window_uuid : "(空)");
+		struct vidow_view *v;
+		wl_list_for_each(v, &sc->server->views, link) {
+			wlr_log(WLR_INFO, "screencast:   「%s」=%s", vidow_view_title(v),
+				v->ftl_handle != NULL && v->ftl_handle->identifier != NULL
+					? v->ftl_handle->identifier : "(没有 handle)");
+		}
+		reply_failed(client, sc, resource, stream_id,
+			"vidow: 没有这个窗口（它可能已经关了）");
+		return;
+	}
+	if (view->ftl_handle == NULL) {
+		reply_failed(client, sc, resource, stream_id,
+			"vidow: 窗口列表没建起来，没法盯住这个窗口");
+		return;
+	}
+	struct wlr_box geom = vidow_view_geometry(view);
+	if (geom.width <= 0 || geom.height <= 0) {
+		reply_failed(client, sc, resource, stream_id,
+			"vidow: 这个窗口还没有大小");
+		return;
+	}
+	struct wlr_output *output = wlr_output_layout_output_at(sc->server->output_layout,
+		geom.x + geom.width / 2, geom.y + geom.height / 2);
+	if (output == NULL) {
+		output = view->output;
+	}
+	if (output == NULL) {
+		reply_failed(client, sc, resource, stream_id,
+			"vidow: 这个窗口不在任何一块屏上");
+		return;
+	}
+
+	struct vidow_screencast_stream *stream = stream_create(client, sc,
+		stream_id, version, output, pointer_mode);
+	if (stream == NULL) {
+		return;
+	}
+	stream->kind = VIDOW_SC_WINDOW;
+	stream->view = view;
+	stream->out_w = (int)lround(geom.width * output->scale);
+	stream->out_h = (int)lround(geom.height * output->scale);
+	stream->view_destroy.notify = stream_handle_view_destroy;
+	wl_signal_add(&view->ftl_handle->events.destroy, &stream->view_destroy);
+	wlr_log(WLR_INFO, "screencast: 请求录窗口「%s」（%s，%dx%d）",
+		vidow_view_title(view), vidow_view_app_id(view),
+		stream->out_w, stream->out_h);
+
+	vidow_sc_pw_stream_start(stream);
+}
+
+/* ------------------------------------------------------------ 按区域录屏 */
+
+static void handle_stream_region(struct wl_client *client,
+		struct wl_resource *resource, uint32_t stream_id, int32_t x, int32_t y,
+		uint32_t width, uint32_t height, wl_fixed_t scale,
+		uint32_t pointer_mode) {
+	struct vidow_screencast *sc = wl_resource_get_user_data(resource);
+	if (sc == NULL) {
+		return;
+	}
+	uint32_t version = (uint32_t)wl_resource_get_version(resource);
+	if (width == 0 || height == 0) {
+		reply_failed(client, sc, resource, stream_id, "vidow: 区域是空的");
+		return;
+	}
+	/* 这块区域压在哪块屏上（取中心）：渲染用它那块屏的抓帧器。跨屏的区域只
+	 * 会抓到中心那块屏上的部分 —— 按区域录屏本来就是「工作区里的一块」，
+	 * 跨屏取景先不做。 */
+	struct wlr_output *output = wlr_output_layout_output_at(sc->server->output_layout,
+		x + (int)width / 2, y + (int)height / 2);
+	if (output == NULL) {
+		reply_failed(client, sc, resource, stream_id,
+			"vidow: 这块区域不在任何一块屏上");
+		return;
+	}
+	double s = wl_fixed_to_double(scale);
+	if (s <= 0) {
+		s = output->scale > 0 ? output->scale : 1.0;
+	}
+
+	struct vidow_screencast_stream *stream = stream_create(client, sc,
+		stream_id, version, output, pointer_mode);
+	if (stream == NULL) {
+		return;
+	}
+	stream->kind = VIDOW_SC_REGION;
+	stream->box = (struct wlr_box){.x = x, .y = y, .width = (int)width,
+		.height = (int)height};
+	stream->scale = s;
+	stream->out_w = (int)lround(width * s);
+	stream->out_h = (int)lround(height * s);
+	wlr_log(WLR_INFO, "screencast: 请求录区域 %d,%d %ux%u（%.2fx → %dx%d）",
+		x, y, width, height, s, stream->out_w, stream->out_h);
+
+	vidow_sc_pw_stream_start(stream);
+}
+
+/* ------------------------------------------------------------ 虚拟输出 */
+
+/* 现场加一块虚拟输出：headless 后端 + 一块输出。它是一块**真输出** —— 进布局、
+ * 能摆窗口、能当窗口的主输出，录的就是它自己那一帧（和真屏走同一条路）。
+ *
+ * 第一次要的时候才建 headless 后端（一个进程一个，建完留着）。 */
+struct wlr_output *vidow_screencast_virtual_output(struct vidow_screencast *sc,
+		const char *name, int width, int height, double scale, const char **why) {
+	struct wlr_backend *backend = sc->virtual_backend;
+	if (backend == NULL) {
+		if (wlr_backend_is_headless(sc->server->backend)) {
+			/* 整个会话本来就是 headless（测试 / 无头机器）：直接用。 */
+			backend = sc->server->backend;
+		} else if (wlr_backend_is_multi(sc->server->backend)) {
+			struct wlr_backend *headless = wlr_headless_backend_create(
+				wl_display_get_event_loop(sc->server->display));
+			if (headless == NULL ||
+					!wlr_multi_backend_add(sc->server->backend, headless) ||
+					!wlr_backend_start(headless)) {
+				*why = "vidow: 起不了 headless 后端（虚拟输出要它）";
+				return NULL;
+			}
+			backend = headless;
+		} else {
+			*why = "vidow: 这个后端不支持虚拟输出";
+			return NULL;
+		}
+		sc->virtual_backend = backend;
+	}
+	struct wlr_output *output = wlr_headless_add_output(backend,
+		(unsigned)width, (unsigned)height);
+	if (output == NULL) {
+		*why = "vidow: 建不出虚拟输出";
+		return NULL;
+	}
+	if (name != NULL && name[0] != '\0') {
+		/* 名字已经公布出去了，改不了（wl_output.name 是「公布之后不能变」的）：
+		 * 客户端看到的是 HEADLESS-N。请求里那个名字拿去当 PipeWire 节点的描述。 */
+		wlr_log(WLR_INFO, "screencast: 虚拟输出叫 %s（请求的名字是「%s」）",
+			output->name, name);
+	}
+	if (scale > 0 && scale != output->scale) {
+		struct wlr_output_state state;
+		wlr_output_state_init(&state);
+		wlr_output_state_set_scale(&state, scale);
+		wlr_output_commit_state(output, &state);
+		wlr_output_state_finish(&state);
+	}
+	wlr_log(WLR_INFO, "screencast: 加了块虚拟输出 %s（%dx%d，%.2fx）",
+		output->name, width, height, scale);
+	return output;
+}
+
+static void handle_virtual_output(struct wl_client *client,
+		struct wl_resource *resource, uint32_t stream_id, const char *name,
+		int32_t width, int32_t height, wl_fixed_t scale, uint32_t pointer_mode) {
+	struct vidow_screencast *sc = wl_resource_get_user_data(resource);
+	if (sc == NULL) {
+		return;
+	}
+	uint32_t version = (uint32_t)wl_resource_get_version(resource);
+	if (width <= 0 || height <= 0) {
+		reply_failed(client, sc, resource, stream_id, "vidow: 虚拟输出没有尺寸");
+		return;
+	}
+	double s = wl_fixed_to_double(scale);
+	if (s <= 0) {
+		s = 1.0;
+	}
+	const char *why = NULL;
+	struct wlr_output *output = vidow_screencast_virtual_output(sc,
+		name != NULL && name[0] != '\0' ? name : "VIDOW-VIRTUAL",
+		(int)lround(width * s), (int)lround(height * s), s, &why);
+	if (output == NULL) {
+		reply_failed(client, sc, resource, stream_id,
+			why != NULL ? why : "vidow: 建不出虚拟输出");
+		return;
+	}
+	struct vidow_screencast_stream *stream = stream_create(client, sc,
+		stream_id, version, output, pointer_mode);
+	if (stream == NULL) {
+		wlr_output_destroy(output);
+		return;
+	}
+	stream->kind = VIDOW_SC_VIRTUAL;
+	stream->owns_output = true;
+	stream->out_w = output->width;
+	stream->out_h = output->height;
+	wlr_log(WLR_INFO, "screencast: 请求录虚拟输出 %s（%dx%d）",
+		output->name, stream->out_w, stream->out_h);
+
+	vidow_sc_pw_stream_start(stream);
 }
 
 static void handle_stream_virtual_output(struct wl_client *client,
 		struct wl_resource *resource, uint32_t stream_id, const char *name,
 		int32_t width, int32_t height, wl_fixed_t scale,
 		uint32_t pointer_mode) {
-	(void)name;
-	(void)width;
-	(void)height;
-	(void)scale;
-	(void)pointer_mode;
-	reply_unsupported(client, wl_resource_get_user_data(resource), resource,
-		stream_id, "vidow: 虚拟输出还不支持");
+	handle_virtual_output(client, resource, stream_id, name, width, height,
+		scale, pointer_mode);
 }
 
 static void handle_stream_virtual_output_with_description(struct wl_client *client,
 		struct wl_resource *resource, uint32_t stream_id, const char *name,
 		const char *description, int32_t width, int32_t height,
 		wl_fixed_t scale, uint32_t pointer_mode) {
-	(void)name;
 	(void)description;
-	(void)width;
-	(void)height;
-	(void)scale;
-	(void)pointer_mode;
-	reply_unsupported(client, wl_resource_get_user_data(resource), resource,
-		stream_id, "vidow: 虚拟输出还不支持");
-}
-
-static void handle_stream_region(struct wl_client *client,
-		struct wl_resource *resource, uint32_t stream_id, int32_t x, int32_t y,
-		uint32_t width, uint32_t height, wl_fixed_t scale,
-		uint32_t pointer_mode) {
-	(void)x;
-	(void)y;
-	(void)width;
-	(void)height;
-	(void)scale;
-	(void)pointer_mode;
-	reply_unsupported(client, wl_resource_get_user_data(resource), resource,
-		stream_id, "vidow: 按区域录屏还不支持");
+	handle_virtual_output(client, resource, stream_id, name, width, height,
+		scale, pointer_mode);
 }
 
 static void handle_destroy(struct wl_client *client,

@@ -166,6 +166,47 @@ else
 	fail "前端没暴露 ScreenCast"
 fi
 
+# 等选择器出现，回车确认（「共享」按钮在右下角，但对话框的窗口几何和按钮实际
+# 位置差着几十像素 —— 点坐标在内容不同的几轮里会飘；回车走的是同一个 accept 路径，
+# 而且默认选中第一行，稳）。
+wait_and_share() {
+	local geo="" i
+	for i in $(seq 1 40); do
+		sleep 1
+		geo=$($VM --socket "$IPC" windows 2>/dev/null | python3 -c '
+import json,sys
+try:
+    ws=json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for w in ws:
+    if "共享屏幕" in (w.get("title") or ""):
+        g=w["geometry"]
+        print("%d %d %d %d" % (g["x"], g["y"], g["width"], g["height"]))
+        break
+')
+		[ -n "$geo" ] && break
+	done
+	[ -z "$geo" ] && return 1
+	sleep 1
+	for i in $(seq 1 20); do
+		$VM --socket "$IPC" send-key tap Return >/dev/null 2>&1
+		sleep 0.5
+		$VM --socket "$IPC" windows 2>/dev/null | grep -aq "共享屏幕" || return 0
+	done
+	return 0
+}
+
+# 等探针那边把 node 打出来（探针自己会等 Response）。
+wait_node() { # <探针输出文件>
+	local i
+	for i in $(seq 1 40); do
+		grep -aq "node=" "$1" 2>/dev/null && break
+		sleep 1
+	done
+	grep -ao "node=[0-9]*" "$1" 2>/dev/null | head -1 | cut -d= -f2
+}
+
 # --- 5/6 真请求：CreateSession → SelectSources → Start ---------------------
 timeout 150 python3 /home/busyo/Dev/Vidow/tools/screencastprobe.py \
 	--types 1 --timeout 60 --hold 45 >"$R/probe.txt" 2>&1 &
@@ -257,6 +298,195 @@ if [ -n "${NODE:-}" ]; then
 	fi
 else
 	fail "没有 node，消费那几条测不了"
+fi
+
+# --- 6b 按窗口录屏（stream_window） ----------------------------------------
+# 对话框这一轮只列窗口（types=2），第一个窗口默认选中 —— 点「共享」就是「录这个
+# 窗口」。窗口的 identifier 由 ext-foreign-toplevel-list 给，原样回给合成器。
+echo; echo "== 6b. 按窗口录屏 =="
+python3 /home/busyo/Dev/Vidow/tools/pattern.py >"$R/pattern.log" 2>&1 &
+PWIN=$!
+for i in $(seq 1 20); do
+	$VM --socket "$IPC" windows 2>/dev/null | grep -aq '"pattern"' && break
+	sleep 0.5
+done
+WGEO=$($VM --socket "$IPC" windows 2>/dev/null | python3 -c '
+import json,sys
+for w in json.load(sys.stdin):
+    if w.get("title") == "pattern":
+        g=w["geometry"]
+        print("%d %d" % (g["width"], g["height"]))
+        break
+')
+timeout 150 python3 /home/busyo/Dev/Vidow/tools/screencastprobe.py --types 2 \
+	--timeout 60 --hold 20 >"$R/probe2.txt" 2>&1 &
+if wait_and_share; then
+	pass "窗口那轮的选择器弹出来了（只列窗口）"
+else
+	fail "窗口那轮没等到选择器"
+fi
+NODE2=$(wait_node "$R/probe2.txt")
+if [ -n "${NODE2:-}" ]; then
+	pass "窗口流拿到了 node（node=$NODE2）"
+else
+	fail "窗口流没拿到 node：$(tail -3 "$R/probe2.txt" 2>/dev/null | tr '\n' ' ')"
+fi
+WSIZE=$(grep -ao "size': ([0-9]*, [0-9]*)" "$R/probe2.txt" 2>/dev/null | head -1 |
+	grep -o "[0-9]*, [0-9]*")
+if [ -n "${WSIZE:-}" ] && [ "${WSIZE%%,*}" != "0" ]; then
+	pass "窗口流报了窗口尺寸（$WSIZE，vidow 里那个窗口是 ${WGEO:-?}）"
+else
+	fail "窗口流没报尺寸：${WSIZE:-没拿到}"
+fi
+if grep -aq "录窗口：identifier=" "$R/helper.log" 2>/dev/null &&
+	grep -aq "screencast: 请求录窗口" "$R/vidow.log" 2>/dev/null; then
+	pass "两边日志都记着「录的是窗口」（helper 发 identifier，合成器反查到了 view）"
+else
+	fail "日志里看不到按窗口录屏的痕迹"
+fi
+if [ -n "${NODE2:-}" ]; then
+	timeout 40 gst-launch-1.0 -q pipewiresrc path="$NODE2" num-buffers=4 \
+		! videoconvert ! pngenc ! multifilesink location="$R/w-%02d.png" \
+		>"$R/gst-win.log" 2>&1
+	NW=$(ls "$R"/w-*.png 2>/dev/null | wc -l)
+	NDW=$(md5sum "$R"/w-*.png 2>/dev/null | awk '{print $1}' | sort -u | wc -l)
+	if [ "$NW" -ge 3 ]; then
+		pass "窗口流真出帧（$NW 帧，$NDW 种画面 —— 窗口里那个动画在动）"
+	else
+		fail "窗口流只拿到 $NW 帧：$(head -2 "$R/gst-win.log" 2>/dev/null | tr '\n' ' ')"
+	fi
+fi
+kill $PWIN 2>/dev/null
+
+# --- 6c 虚拟输出（stream_virtual_output） ----------------------------------
+echo; echo "== 6c. 虚拟输出（现场加一块 headless 输出） =="
+timeout 150 python3 /home/busyo/Dev/Vidow/tools/screencastprobe.py --types 4 \
+	--timeout 60 --hold 8 >"$R/probe3.txt" 2>&1 &
+if wait_and_share; then
+	pass "虚拟屏幕那轮的选择器弹出来了"
+else
+	fail "虚拟屏幕那轮没等到选择器"
+fi
+NODE3=$(wait_node "$R/probe3.txt")
+if [ -n "${NODE3:-}" ]; then
+	pass "虚拟输出流拿到了 node（node=$NODE3）"
+else
+	fail "虚拟输出没拿到 node：$(tail -3 "$R/probe3.txt" 2>/dev/null | tr '\n' ' ')"
+fi
+# 数**输出个数**（不是「有几行写着 HEADLESS-」：一个输出的 JSON 里名字会出现
+# 好几次，数行会把 2 块输出数成 4 块）。
+count_outputs() {
+	$VM --socket "$IPC" outputs 2>/dev/null | python3 -c '
+import json,sys
+try:
+    print(len(json.load(sys.stdin)))
+except Exception:
+    print(-1)'
+}
+for i in $(seq 1 20); do
+	[ "$(count_outputs)" -ge 2 ] && break
+	sleep 0.5
+done
+NOUT=$(count_outputs)
+if [ "${NOUT:-0}" -ge 2 ]; then
+	pass "合成器里真多出来一块输出（$NOUT 块 HEADLESS）"
+else
+	fail "输出没变多（$NOUT 块）"
+fi
+if grep -aq "加了块虚拟输出" "$R/vidow.log" 2>/dev/null; then
+	pass "合成器日志记着加了虚拟输出"
+else
+	fail "合成器没记虚拟输出"
+fi
+if [ -n "${NODE3:-}" ]; then
+	timeout 40 gst-launch-1.0 -q pipewiresrc path="$NODE3" num-buffers=2 \
+		! videoconvert ! pngenc ! multifilesink location="$R/v-%02d.png" \
+		>"$R/gst-virt.log" 2>&1
+	NV=$(ls "$R"/v-*.png 2>/dev/null | wc -l)
+	if [ "$NV" -ge 2 ]; then
+		pass "虚拟输出真出帧（$NV 帧，空屏靠心跳）"
+	else
+		fail "虚拟输出只拿到 $NV 帧：$(head -2 "$R/gst-virt.log" 2>/dev/null | tr '\n' ' ')"
+	fi
+fi
+# 探针退出 → 会话关掉 → 这一路流结束 → 虚拟输出该被拔掉。
+for i in $(seq 1 45); do
+	[ "$(count_outputs)" -le 1 ] && break
+	sleep 1
+done
+NOUT2=$(count_outputs)
+if [ "${NOUT2:-9}" -eq 1 ]; then
+	pass "这一路流结束之后虚拟输出被拔掉了（回到 $NOUT2 块）"
+else
+	fail "虚拟输出没拔掉（还有 $NOUT2 块输出）"
+fi
+
+# --- 6d 截图 / 取色（Screenshot / PickColor） ------------------------------
+echo; echo "== 6d. 截图接口（Screenshot / PickColor） =="
+if gdbus introspect --session --dest org.freedesktop.impl.portal.desktop.vidow \
+	--object-path /org/freedesktop/portal/desktop 2>/dev/null |
+	grep -q "interface org.freedesktop.impl.portal.Screenshot"; then
+	pass "vidow 的后端导出了 Screenshot 接口"
+else
+	fail "后端没导出 Screenshot"
+fi
+timeout 60 python3 /home/busyo/Dev/Vidow/tools/screenshotprobe.py \
+	--timeout 30 >"$R/shot.txt" 2>&1
+SHOT_URI=$(grep -ao "uri=file://[^ ]*" "$R/shot.txt" 2>/dev/null | head -1 | cut -d= -f2-)
+if [ -n "${SHOT_URI:-}" ] && [ -f "${SHOT_URI#file://}" ]; then
+	SHOT_SIZE=$(python3 -c '
+import sys
+from PIL import Image
+print("%dx%d" % Image.open(sys.argv[1]).size)' "${SHOT_URI#file://}" 2>/dev/null)
+	pass "整屏截图回了个真文件（$SHOT_URI，$SHOT_SIZE）"
+	if [ "${SHOT_SIZE:-}" = "1280x720" ]; then
+		pass "截图尺寸 = 输出像素尺寸（1280x720）"
+	else
+		fail "截图尺寸不对：${SHOT_SIZE:-读不出来}"
+	fi
+else
+	fail "截图没回 uri：$(tail -3 "$R/shot.txt" 2>/dev/null | tr '\n' ' ')"
+fi
+timeout 90 python3 /home/busyo/Dev/Vidow/tools/screenshotprobe.py --pick-color \
+	--timeout 60 >"$R/pick.txt" 2>&1 &
+for i in $(seq 1 30); do
+	PICK_GEO=$($VM --socket "$IPC" windows 2>/dev/null | python3 -c '
+import json,sys
+for w in json.load(sys.stdin):
+    if "取色" in (w.get("title") or ""):
+        g=w["geometry"]
+        print("%d %d" % (g["x"] + g["width"] // 2, g["y"] + g["height"] // 2))
+        break
+')
+	[ -n "$PICK_GEO" ] && break
+	sleep 1
+done
+if [ -n "$PICK_GEO" ]; then
+	pass "取色的全屏取色窗口弹出来了（点中间一下）"
+else
+	fail "没等到取色窗口"
+fi
+# 点一下取色（点空了就再点：取色窗口刚上屏那一下可能还没拿到尺寸）
+for i in 1 2 3 4 5; do
+	[ -n "$PICK_GEO" ] || break
+	set -- $PICK_GEO
+	$VM --socket "$IPC" move-cursor "$1" "$2" >/dev/null 2>&1
+	sleep 0.4
+	$VM --socket "$IPC" pointer-button click >/dev/null 2>&1
+	for _ in $(seq 1 6); do
+		grep -aq "color=(" "$R/pick.txt" 2>/dev/null && break
+		sleep 1
+	done
+	grep -aq "color=(" "$R/pick.txt" 2>/dev/null && break
+done
+for i in $(seq 1 30); do
+	grep -aq "color=" "$R/pick.txt" 2>/dev/null && break
+	sleep 1
+done
+if grep -aq "color=(" "$R/pick.txt" 2>/dev/null; then
+	pass "取色回了个颜色（$(grep -ao "color=.*" "$R/pick.txt" | head -1)）"
+else
+	fail "取色没回颜色：$(tail -3 "$R/pick.txt" 2>/dev/null | tr '\n' ' ')"
 fi
 
 # --- 9 KDE 后端在这条私有总线上根本没被拉起来 ------------------------------

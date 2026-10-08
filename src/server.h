@@ -1735,6 +1735,14 @@ bool vidow_screencopy_has_pending(struct vidow_screencopy *manager);
  * 负责 wlr_buffer_unlock()。渲染不出来返回 NULL。 */
 struct wlr_buffer *vidow_capture_grab(struct vidow_server *server,
 		struct wlr_output *output);
+/* 抓这块屏上的任意一个矩形（box 是**布局坐标**，scale 是「逻辑 → 像素」，出图
+ * 尺寸 = round(w*scale) × round(h*scale)）。按区域录屏 / 按区域截图用它。 */
+struct wlr_buffer *vidow_capture_grab_box(struct vidow_server *server,
+		struct wlr_output *output, const struct wlr_box *box, double scale);
+/* 抓一个窗口（只有它自己：别的窗口和各个 layer 在渲染那一瞬间被关掉），等比缩放
+ * 填进 out_w × out_h（窗口比流小就放大、大就缩小，剩下的边是黑的）。 */
+struct wlr_buffer *vidow_capture_grab_view(struct vidow_server *server,
+		struct vidow_view *view, int out_w, int out_h);
 
 /* layer 的内容节点（surface 的 buffer）：wlroots 把它包在 subsurface tree 里，
  * 所以要递归找。抓帧遮挡（capturemask.c）和马赛克（capture.c）都要用它。 */
@@ -1751,6 +1759,10 @@ void vidow_capture_paint_mosaic(struct vidow_server *server,
  * PAINT_CURSORS / screencopy 的 overlay_cursor）。抓帧是场景渲染，场景里没有
  * 光标，所以要光标的客户端得我们自己画上去。 */
 void vidow_capture_paint_cursor(struct wlr_output *output, struct wlr_buffer *dst);
+/* 同上，但只画落在 box 里（**这块屏自己的逻辑坐标**，整屏就是 {0,0,逻辑宽,逻辑高}）
+ * 的光标：按区域 / 按窗口录屏时，光标跑到别处去就不该出现在这张图里。 */
+void vidow_capture_paint_cursor_box(struct wlr_output *output,
+		struct wlr_buffer *dst, const struct wlr_box *box, double scale);
 
 /* ------------------------------------------------------------------ 录屏 */
 
@@ -1761,15 +1773,34 @@ void vidow_capture_paint_cursor(struct wlr_output *output, struct wlr_buffer *ds
  *
  * 协议要求**合成器自己建 PipeWire 流**、把 node id 通过 created 事件告诉客户端，
  * 所以这个模块同时是个 PipeWire 生产者：抓帧走 vidow 自己那条路
- * （vidow_capture_grab），像素进 memfd 缓冲。实现见 screencast.c。 */
+ * （vidow_capture_grab / _box / _view），像素进 memfd 缓冲。实现见 screencast.c。
+ *
+ * 四种来源都实现了（对应协议里四个请求）：
+ *   stream_output          整块输出
+ *   stream_window          一个窗口（window_uuid = ext-foreign-toplevel-list 的
+ *                          identifier，vidow 拿它反查自己的 view）
+ *   stream_region          工作区里的一块矩形（布局坐标）
+ *   stream_virtual_output  现场加一块**虚拟输出**（headless 后端 + 输出），它是一块
+ *                          真输出：能摆窗口、能进布局，录的是它自己那一帧
+ */
 struct vidow_sc_pw;
 struct vidow_sc_pw_stream;
+
+/* 这一路流在录什么。 */
+enum vidow_sc_kind {
+	VIDOW_SC_OUTPUT = 0,  /* 整块输出 */
+	VIDOW_SC_WINDOW,      /* 一个窗口 */
+	VIDOW_SC_REGION,      /* 一块矩形 */
+	VIDOW_SC_VIRTUAL,     /* 现场加的虚拟输出（output 指向它） */
+};
 
 struct vidow_screencast {
 	struct vidow_server *server;
 	struct wl_global *global;
 	struct wl_list streams; /* vidow_screencast_stream.link */
 	struct vidow_sc_pw *pw;
+	/* 虚拟输出用的 headless 后端（第一次要虚拟输出时才建，进程里只建一个）。 */
+	struct wlr_backend *virtual_backend;
 };
 
 /* 一路流（客户端手上那个 zkde_screencast_stream_unstable_v1）。 */
@@ -1778,6 +1809,17 @@ struct vidow_screencast_stream {
 	struct wl_resource *resource;
 	struct vidow_screencast *sc;
 	struct wlr_output *output;
+	enum vidow_sc_kind kind;
+	/* 渲染出图的目标像素尺寸（PipeWire 协商的那个）。 */
+	int out_w, out_h;
+	/* kind == WINDOW：录哪个窗口（窗口没了就结束这一路）。 */
+	struct vidow_view *view;
+	struct wl_listener view_destroy;
+	/* kind == REGION / WINDOW：抓哪一块（布局坐标）+ 逻辑→像素的缩放。 */
+	struct wlr_box box;
+	double scale;
+	/* kind == VIRTUAL：这块输出是我们建的，这一路结束时得销毁。 */
+	bool owns_output;
 	uint32_t pointer_mode;
 	bool closed;
 	struct wl_listener output_destroy;
@@ -1792,6 +1834,9 @@ struct vidow_screencast *vidow_screencast_create(struct wl_display *display,
  * 认的报错方式（回完它，客户端会 close 掉这一路）。 */
 void vidow_screencast_stream_fail(struct vidow_screencast_stream *stream,
 		const char *why);
+/* 现场加一块虚拟输出（headless 后端 + 输出），返回 NULL 时 *why 里是原因。 */
+struct wlr_output *vidow_screencast_virtual_output(struct vidow_screencast *sc,
+		const char *name, int width, int height, double scale, const char **why);
 
 /* PipeWire 那一半（screencast.c 内部用）。 */
 struct vidow_sc_pw *vidow_sc_pw_create(struct vidow_screencast *sc,

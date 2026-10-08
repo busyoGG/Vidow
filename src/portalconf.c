@@ -502,7 +502,8 @@ static void portal_file_sync(const struct vidow_config *cfg, bool need) {
 		PORTAL_FILE_MARK "，改它没用：要换后端改 config 里的 portal_capture。\n"
 		"[portal]\n"
 		"DBusName=%s\n"
-		"Interfaces=org.freedesktop.impl.portal.ScreenCast;\n"
+		"Interfaces=org.freedesktop.impl.portal.ScreenCast;"
+		"org.freedesktop.impl.portal.Screenshot;\n"
 		"UseIn=%s;\n",
 		PORTAL_BUS_NAME, cfg->portal_desktop);
 

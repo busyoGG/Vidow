@@ -328,10 +328,15 @@ zkde_client_code = custom_target('zkde-screencast-unstable-v1-client-protocol.c'
   command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
 
 gtk3_dep = dependency('gtk+-3.0')
+# 截图要写 PNG（portal 的 Screenshot 接口回的是个文件 URI）。
+png_dep = dependency('libpng')
+# 窗口列表（选窗口录屏）和按窗口抓帧（缩略图 / 截窗口）的客户端协议头已经给
+# tools/capture.c 生成过了（etl_* / eics_* / eicc_*），这里直接复用。
 executable('vidow-portal',
   ['tools/vidowportal.c', sc_client_header, sc_client_code,
-   zkde_client_header, zkde_client_code],
-  dependencies: [wayland_client_dep, gtk3_dep],
+   zkde_client_header, zkde_client_code,
+   etl_header, etl_code, eics_header, eics_code, eicc_header, eicc_code],
+  dependencies: [wayland_client_dep, gtk3_dep, png_dep],
   include_directories: include_directories('.'),
   install: false)
 
