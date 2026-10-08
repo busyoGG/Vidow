@@ -51,6 +51,7 @@ static void *pixels;
 static int buf_w, buf_h;
 static uint32_t shm_format = WL_SHM_FORMAT_XRGB8888;
 static bool session_ready;
+static int alloc_w, alloc_h;
 
 static int captures;
 static int interval_us = 33333; /* 30fps */
@@ -98,6 +99,8 @@ static bool make_buffer(void) {
 	buffer = wl_shm_pool_create_buffer(pool, 0, buf_w, buf_h, stride, shm_format);
 	wl_shm_pool_destroy(pool);
 	close(fd);
+	alloc_w = buf_w;
+	alloc_h = buf_h;
 	return true;
 }
 
@@ -223,7 +226,20 @@ static void session_done(void *data,
 	session_ready = true;
 	fprintf(stderr, "capture: 约束齐了（%dx%d, format %u）\n", buf_w, buf_h,
 		shm_format);
-	if (buffer == NULL) {
+	/* 约束会**重发**：窗口尺寸 / 倍率一变，合成器就重来一遍 buffer_size +
+	 * done。这时候手上那一帧可能还在飞 —— 再建一帧是协议错（wlroots 那边报
+	 * "session already has a frame object"，客户端当场断线，录到的帧数是 0）。
+	 * 有在飞的就等它回来，它回来会自己接着建下一帧。 */
+	if (frame != NULL) {
+		return;
+	}
+	if (buffer == NULL || buf_w != alloc_w || buf_h != alloc_h) {
+		if (buffer != NULL) {
+			wl_buffer_destroy(buffer);
+			buffer = NULL;
+			munmap(pixels, (size_t)alloc_w * (size_t)alloc_h * 4);
+			pixels = NULL;
+		}
 		if (!make_buffer()) {
 			fprintf(stderr, "capture: 建不出缓冲\n");
 			return;

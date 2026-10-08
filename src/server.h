@@ -429,6 +429,12 @@ struct vidow_fx_target {
 	bool active;  /* decoration or shader is in use */
 	bool blur;    /* sample the blurred backdrop */
 
+	/* 越界裁剪（见 view.c 的 vidow_view_apply_clip）：这块窗口只画自己那块屏
+	 * 里的那部分。clip = 那块屏的框（布局逻辑坐标），clip_on 为 false 时整块
+	 * 都画。裁剪只作用在**显示**上：几何、客户端、录屏抓帧都不动。 */
+	bool clip_on;
+	struct wlr_box clip;
+
 	/* Blur backdrop. Either the server's shared wallpaper pyramid (borrowed)
 	 * or a private one captured with this window taken out (owned). The
 	 * texture only changes when the backdrop really changed, so a still
@@ -2016,6 +2022,11 @@ bool vidow_view_capture_held(const struct vidow_view *view);
 /* 这个窗口的矩形和它自己那块屏有交集吗（滚出视口的列要按它剔除，见 view.c）。 */
 bool vidow_view_in_output_box(struct vidow_server *server,
 		const struct vidow_view *view);
+/* 把窗口**显示**的部分裁到自己那块屏里。场景图是一张全局坐标的图，跨过屏边界的
+ * 窗口，越出去的那一块会落进隔壁屏的框里被它画出来（用户报的「滚动后超出视口的
+ * 窗口跑到另一个显示器里面」）。裁的是显示：几何、客户端、录屏抓帧都不动。浮窗 /
+ * 正被拖的窗口 / overview / 有人录屏的窗口不裁（它们本来就允许跨屏）。 */
+void vidow_view_apply_clip(struct vidow_view *view);
 /* 视口外强制渲染：这一帧给「不在画面上但要保活」的窗口补帧回调（详见 view.c）。 */
 void vidow_view_render_pump(struct vidow_server *server,
 		struct vidow_output *output, uint32_t msec);

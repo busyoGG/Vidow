@@ -13,6 +13,10 @@
 #   3) 再滚回去，第三列重新显示、第一列又藏起（不是一次性关掉）
 #   4) 藏起来的窗口照样在出帧（视口外补帧，不是被冻住）
 #   5) 浮动窗口 / 拖拽不受这条规则管（允许跨屏）—— 见 test-drag.sh
+#   6) **半块越界**：还看得见一部分、另一部分跨过屏边界的那种列，跨过去的那一块
+#      也不许画到隔壁屏上（修之前只有「整块滚出去」才被摘掉，半块越界的照样串屏：
+#      用户报的「滚动后超出视口的窗口会跑到另一个显示器里面」）。判据是**像素**：
+#      隔壁那块屏的截图里一个窗口色像素都没有，而自己这块屏上那半块还在。
 #
 # 用法：./test-scrollcull.sh   （VIDOW_TEST_KEEP=1 保留运行目录）
 set -u
@@ -155,7 +159,71 @@ after=$(grep -c "^frame " "$RUNDIR/beat-1.log" 2>/dev/null || echo 0)
 	pass "cull-1 藏起来之后还在出帧（$before → $after 帧）" ||
 	fail "cull-1 被冻住了（帧数 $before → $after）"
 
-mark "5) 没崩、没断言"
+mark "5) 半块越界：跨过屏边界的那一块不画到隔壁屏上"
+# 把中间那列调成 2/3 宽（853）：布局变成 634 + 853 + 634 装不下 1280 —— 右边的
+# 那列就从屏里伸出去一截，跨过 1280 这条屏边界。修之前越出去的那一截正好落在
+# HEADLESS-1（x=1280..2560）的框里、被它画出来。
+./build/vidowmsg focus-column -1 >/dev/null 2>&1
+sleep 0.3
+./build/vidowmsg action cycle-column-width >/dev/null 2>&1
+sleep 1.2
+# 哪一列跨过了边界（按日志里最后一次 place 算）
+straddler=$(python3 - "$LOG" <<'PY'
+import re, sys
+log = open(sys.argv[1], 'rb').read().decode('utf-8', 'replace')
+last = {}
+for m in re.finditer(r"place (cull-\d) -> (-?\d+),(-?\d+) (\d+)x(\d+)", log):
+    last[m.group(1)] = (int(m.group(2)), int(m.group(4)))
+out = [t for t, (x, w) in sorted(last.items()) if x < 1280 and x + w > 1280]
+print(" ".join(out))
+PY
+)
+if [ -n "$straddler" ]; then
+	pass "有列跨过了屏边界（$straddler）—— 要测的就是它"
+else
+	fail "没有列跨过屏边界（布局没变？）"
+fi
+echo "      $(grep -a 'place cull-' "$LOG" | tail -3 | sed 's/.*place //' | tr '\n' '|')"
+
+grim -o HEADLESS-1 "$RUNDIR/neighbor.png" 2>/dev/null
+grim -o HEADLESS-2 "$RUNDIR/own.png" 2>/dev/null
+python3 - "$RUNDIR" <<'PY'
+import sys
+from PIL import Image
+
+
+def window_pixels(path):
+    """heartbeat.py 画的是一块蓝底：g≈89、b≈191（r 在小范围里抖）。"""
+    im = Image.open(path).convert("RGB")
+    px = im.load()
+    n = 0
+    for y in range(0, im.size[1], 4):
+        for x in range(0, im.size[0], 4):
+            r, g, b = px[x, y]
+            if abs(g - 89) <= 24 and abs(b - 191) <= 24:
+                n += 1
+    return n
+
+
+neighbor = window_pixels(sys.argv[1] + "/neighbor.png")
+own = window_pixels(sys.argv[1] + "/own.png")
+print("      隔壁屏 %d 个窗口色像素，自己那块屏 %d 个" % (neighbor, own))
+ok = True
+if neighbor != 0:
+    print("  FAIL  隔壁屏上画着越界的那一块（%d 个像素）" % neighbor)
+    ok = False
+else:
+    print("  PASS  隔壁屏上一个窗口色像素都没有（越界的那块被裁掉了）")
+if own == 0:
+    print("  FAIL  自己这块屏上那半块也没了（裁过头了）")
+    ok = False
+else:
+    print("  PASS  自己这块屏上那半块还在（裁的是越界那一块，不是整个窗口）")
+sys.exit(0 if ok else 1)
+PY
+[ $? -eq 0 ] || FAILED=1
+
+mark "6) 没崩、没断言"
 pgrep -x vidow >/dev/null && pass "合成器还活着" || fail "合成器挂了"
 grep -aq "Assertion" "$LOG" && fail "日志里有 assert" || pass "日志里没有 assert"
 

@@ -2792,9 +2792,43 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 	if (dst_h < 1) {
 		dst_h = 1;
 	}
-	wlr_scene_node_set_position(&fx->node->node,
-		x - pad_ov + (dst_w0 - dst_w) / 2,
-		y - pad_ov + (dst_h0 - dst_h) / 2);
+	int node_x = x - pad_ov + (dst_w0 - dst_w) / 2;
+	int node_y = y - pad_ov + (dst_h0 - dst_h) / 2;
+	/* 越界裁剪：这块窗口只有一部分在自己那块屏里（另一半跨过了屏边界，场景图是
+	 * 全局坐标，不裁就会被隔壁那块屏画出来）。裁的是**显示**：离屏缓冲照旧按整块
+	 * 窗口烘，只是这张图上只采「框里的那一块」、铺到框里的那点地方。 */
+	bool cropped = false;
+	struct wlr_fbox crop_src = {0};
+	if (fx->clip_on) {
+		/* fx->clip 是**布局坐标**里的那块屏；这个节点的位置是相对父树的
+		 * （父树就是窗口的场景树，摆在窗口的位置上）—— 减掉父树的原点才
+		 * 在同一个坐标系里。 */
+		struct wlr_box clip = fx->clip;
+		if (fx->node->node.parent != NULL) {
+			clip.x -= fx->node->node.parent->node.x;
+			clip.y -= fx->node->node.parent->node.y;
+		}
+		struct wlr_box node_box = {.x = node_x, .y = node_y,
+			.width = dst_w, .height = dst_h};
+		struct wlr_box inter;
+		if (wlr_box_intersection(&inter, &node_box, &clip) &&
+				(inter.width < dst_w || inter.height < dst_h)) {
+			double kx = (double)fx->w / (double)dst_w;
+			double ky = (double)fx->h / (double)dst_h;
+			crop_src = (struct wlr_fbox){
+				.x = (double)(inter.x - node_x) * kx,
+				.y = (double)(inter.y - node_y) * ky,
+				.width = (double)inter.width * kx,
+				.height = (double)inter.height * ky,
+			};
+			node_x = inter.x;
+			node_y = inter.y;
+			dst_w = inter.width;
+			dst_h = inter.height;
+			cropped = true;
+		}
+	}
+	wlr_scene_node_set_position(&fx->node->node, node_x, node_y);
 	wlr_scene_buffer_set_dest_size(fx->node, dst_w, dst_h);
 	/* 被抓帧遮挡压着的窗口，这一帧也照样压着（抓帧随时可能在两帧之间渲染）。
 	 * 正在被拖出果冻形变的窗口也一样：内容由 jelly.c 那个节点画（同一块缓冲，
@@ -2803,10 +2837,18 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 		(fx->masked || fx->jelly) ? 0.0f : 1.0f);
 
 	/* Full-buffer damage: the node is re-rendered every frame of the effect. */
+	/* 损伤按**缓冲像素**记（wlroots 的约定），裁过之后 dst_w/dst_h 只是源框那
+	 * 一块的尺寸 —— 整块缓冲都可能变，就照整块缓冲报。 */
 	pixman_region32_t damage;
-	pixman_region32_init_rect(&damage, 0, 0, dst_w, dst_h);
+	if (cropped) {
+		pixman_region32_init_rect(&damage, 0, 0, fx->w, fx->h);
+	} else {
+		pixman_region32_init_rect(&damage, 0, 0, dst_w, dst_h);
+	}
 	wlr_scene_buffer_set_buffer_with_damage(fx->node, displayed, &damage);
 	pixman_region32_fini(&damage);
+	/* 源框要**最后**设：换缓冲（这一路每帧在两张目标之间来回换）会把它抹掉。 */
+	wlr_scene_buffer_set_source_box(fx->node, cropped ? &crop_src : NULL);
 
 	/* This buffer now contains this blur version: the frame loop only has to
 	 * redraw when a later frame hands the window a different backdrop. */

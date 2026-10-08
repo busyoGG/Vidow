@@ -844,6 +844,94 @@ bool vidow_view_in_output_box(struct vidow_server *server,
 		view->geom.y + view->geom.height > box.y;
 }
 
+/* 这块窗口现在该不该裁到自己那块屏里，裁的话边界是哪块屏的框。 */
+static bool view_clip_box(const struct vidow_view *view, struct wlr_box *out) {
+	struct vidow_server *server = view->server;
+	if (!view->mapped || view->float_mode != VIDOW_FLOAT_NONE ||
+			view->dragging || vidow_overview_active(server) ||
+			vidow_view_capture_held(view) || view->output == NULL ||
+			view->geom.width <= 0 || view->geom.height <= 0) {
+		return false;
+	}
+	/* 弹出物先不裁：它的位置是相对父窗口算的，越界那点（菜单探出去一条）
+	 * 先留着。 */
+	if (view->popup) {
+		return false;
+	}
+	struct wlr_box box = {0};
+	wlr_output_layout_get_box(server->output_layout, view->output, &box);
+	if (box.width < 1 || box.height < 1) {
+		return false;
+	}
+	/* 窗口**本体**整块都在自己那块屏里就不裁。装饰的阴影内边距那点越界
+	 * （窗口贴着屏边时探出去十几个像素）先留着：裁它要把场景节点的显示尺寸
+	 * 改小，而窗口截图源（portal 的按窗口录屏）盯着这棵树，节点一变形它就
+	 * 重发一次约束 —— 客户端那边正好在等第一帧，撞上「session already has a
+	 * frame object」直接断线（踩过：test-force-render.sh 的录屏那节）。窗口
+	 * 本体越界才是要修的那个 bug，那一档照裁。 */
+	struct wlr_box inter;
+	if (wlr_box_intersection(&inter, &view->geom, &box) &&
+			inter.width == view->geom.width &&
+			inter.height == view->geom.height) {
+		return false;
+	}
+	*out = box;
+	return true;
+}
+
+void vidow_view_apply_clip(struct vidow_view *view) {
+	if (view == NULL) {
+		return;
+	}
+	struct wlr_box box = {0};
+	bool on = view_clip_box(view, &box);
+	bool was_on = view->fx.clip_on;
+	if (on != view->fx.clip_on || (on && !wlr_box_equal(&box, &view->fx.clip))) {
+		/* 裁掉的 / 放出来的那一块得重画。场景那边只按节点几何记损伤，我们
+		 * 裁的是同一块节点里的显示范围，它看不见 —— 这里自己补一笔。 */
+		vidow_backdrop_damage_view_rect(view, NULL);
+	}
+	view->fx.clip_on = on;
+	view->fx.clip = box;
+	if (on != was_on) {
+		wlr_log(WLR_DEBUG, "clip: %s %s（屏框 %d,%d %dx%d，窗口 %d,%d %dx%d）",
+			vidow_view_title(view) != NULL ? vidow_view_title(view) : "(无题)",
+			on ? "裁到自己那块屏里" : "不裁", box.x, box.y, box.width,
+			box.height, view->geom.x, view->geom.y, view->geom.width,
+			view->geom.height);
+	}
+
+	/* 没装饰（着色器也关着）的时候，窗口就是客户端表面自己在画 —— 那一份也得
+	 * 裁。有装饰的时候画的是 fx 那块离屏缓冲（表面是 0 透明度），由 fx.c 按
+	 * 同一个 box 裁，这里就不用管了（裁了也无害）。
+	 *
+	 * 这一份要调 wlroots 的 wlr_scene_subsurface_tree_set_clip()，它**只认
+	 * subsurface 树**，别的树上找不到就直接 assert（`found` failed，vidow 当场
+	 * abort，踩过两次：X11 的对话框窗口、X11 的弹出物）。所以只给 Wayland 的
+	 * xdg toplevel —— X11 / 弹出物那两份靠 fx 那块离屏缓冲（默认配置装饰开着，
+	 * 窗口画的就是它）。 */
+	if (view->xdg_toplevel == NULL) {
+		return;
+	}
+	struct wlr_scene_node *node = view->scene_surface != NULL &&
+		view->scene_surface->buffer != NULL &&
+		view->scene_surface->buffer->node.parent != NULL ?
+		&view->scene_surface->buffer->node.parent->node : NULL;
+	if (node == NULL) {
+		return;
+	}
+	if (on) {
+		/* 表面局部坐标（逻辑单位，wlroots 自己乘缓冲倍率）。 */
+		struct wlr_box local = {
+			.x = box.x - view->geom.x, .y = box.y - view->geom.y,
+			.width = box.width, .height = box.height,
+		};
+		wlr_scene_subsurface_tree_set_clip(node, &local);
+	} else {
+		wlr_scene_subsurface_tree_set_clip(node, NULL);
+	}
+}
+
 /* 这个窗口现在画得到吗：所在工作区显示着 **而且** 它的矩形和这块屏有交集。
  * 画得到就不该补帧（wlr_scene 已经给过回调了，再补一次会让客户端多画一遍）。 */
 static bool view_on_screen(struct vidow_server *server,
@@ -1102,6 +1190,10 @@ void vidow_view_anim_bake(struct vidow_view *view) {
 	if (view->scene_tree == NULL) {
 		return;
 	}
+	/* 裁不裁、裁到哪儿，**这一帧**就得是最新的：重烘（下面 vidow_fx_frame）
+	 * 把裁剪算进场景节点里，烘完再改就晚了一帧 —— 那一帧里越界的那一块照样
+	 * 画在隔壁屏上（而且静止下来之后再也没有下一帧来纠正）。 */
+	vidow_view_apply_clip(view);
 	int wx = view->geom.x + (int)lround(view->anim_off_x);
 	int wy = view->geom.y + (int)lround(view->anim_off_y);
 	struct vidow_server *server = view->server;

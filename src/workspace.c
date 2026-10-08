@@ -781,6 +781,9 @@ int vidow_workspace_apply_visibility(struct vidow_server *server) {
 		if (want) {
 			shown++;
 		}
+		/* 越界的那一块裁掉：上面那条是「整块滚出自己那块屏」，这里是「还看得见
+		 * 一部分、另一部分跨过了屏边界」—— 跨过去的那半块不能画到隔壁屏上。 */
+		vidow_view_apply_clip(view);
 		if (node_enabled(view->scene_tree) != want) {
 			/* 它自己进/出场景了：底衬的合成结果变了。账记在它头上（它自己的
 			 * 私有底衬不受影响），别的窗口因为世界代次前进而重抓。 */

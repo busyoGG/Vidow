@@ -403,6 +403,10 @@ end
 
 - **只在没画到的时候补**：窗口在画面上时场景那边已经给过回调，再补一次会让客户端白画一遍
   （判断用「所在工作区显示着」+「矩形和这块屏有交集」）。
+- **半块越界的窗口裁到自己那块屏里**：还看得见一部分、另一部分跨过屏边界的那种列，
+  越出去的那一块按屏框裁掉（`vidow_view_apply_clip`，fx 那块离屏缓冲只采交集那一块）——
+  不裁的话隔壁那块屏会把它画出来（用户报的「滚动后超出视口的窗口跑到另一个显示器里」）。
+  浮窗 / 正被拖的窗口 / overview / 有人录屏的窗口不裁。
 - **滚出视口的列会被摘出场景**（同一个「矩形和这块屏有交集」的判据）：`wlr_scene` 是
   一张**全局坐标**的场景图，每块屏的场景输出画的是「落在自己那块坐标里的所有节点」——
   列往右滚出屏宽之后坐标正好落进右边那块屏的框里，不摘掉就画到隔壁显示器上了
@@ -703,11 +707,33 @@ ninja -C build
 
 ## 运行
 
-嵌套在现有 Wayland 会话里跑（推荐，随时可关）：
+一个脚本起（推荐，两个后端都行，退出时自己收干净）：
 
 ```bash
-WLR_BACKENDS=wayland ./build/vidow
+./run.sh                     # 真机会话（tty / DRM 后端；WAYLAND_DISPLAY 没设时的默认）
+./run.sh --nested            # 嵌在当前 Wayland 会话里（一个窗口）
+./run.sh --portal            # 起来之后跑 ./portaltest.sh（体检 + 一个真请求）
+./run.sh --portal-check      # 只体检，不动屏幕
+./run.sh --debug             # VIDOW_LOG=debug（日志不过滤，要过滤用 ./dbg.sh）
+./run.sh --no-portal-env     # 用临时配置起：不碰 portal（代价：你的 config.lua 也不生效）
+./run.sh --print             # 只打印要跑的命令
 ```
+
+退出时（Ctrl+C、vidow 自己退、脚本被杀）它会做三件事：**收 vidow**（SIGTERM → 5 秒 →
+SIGKILL，连进程组）、**扫残留客户端**（环境里 `WAYLAND_DISPLAY` 正好是它那个 socket 的
+进程 —— 这类孤儿会把整台机器拖慢，实测两个 `wev` 各 100% CPU 烧了 25 分钟）、**看有没有
+新 coredump**（有就把栈的前几帧打出来，免得它悄悄崩）。日志默认 `/tmp/vidow-run.log`，
+`tail -f` 跟。
+
+手动起也行。嵌套在现有 Wayland 会话里跑（随时可关）：
+
+```bash
+WLR_BACKENDS=wayland WLR_RENDER_DRM_DEVICE=/dev/dri/renderD128 ./build/vidow
+```
+
+`WLR_RENDER_DRM_DEVICE` 这一半不能省：wlroots 0.20.2 的 GLES2 渲染器要一个 DRM fd，而
+wayland 后端自己不提供 —— 只写 `WLR_BACKENDS=wayland` 会停在
+`Cannot create GLES2 renderer: no DRM FD available`（`./run.sh --nested` 会自动补上）。
 
 真机（tty，DRM 后端，不带 `WLR_BACKENDS`）上 **Ctrl+Alt+F1..F12 切 tty**：内核一般
 自己就把这个键处理掉了（合成器不 `EVIOCGRAB`，控制台键盘那一侧也收得到），所以这条
@@ -732,6 +758,7 @@ Ctrl+Alt+F2 不会被吃掉（那是宿主 Hyprland 的）。回归判据 `test-
 一键验证（嵌套启动 + 3 个客户端 + waybar 顶栏）：
 
 ```bash
+./run.sh --nested --portal-check     # 起 vidow（嵌套）+ 体检 portal 那条链，退出时收残留客户端
 ./run-nested.sh              # 默认 kitty，可换 ./run-nested.sh alacritty
 ./test-keys.sh               # wtype 注入按键，验证焦点/滚动/列宽
 python3 test-float.py        # 三个真实 GTK 窗口，验证浮动模式自动识别
@@ -744,7 +771,7 @@ python3 test-float.py        # 三个真实 GTK 窗口，验证浮动模式自�
 ./test-screencast.sh                 # KDE 的录屏 portal 全链路：协议 → 对话框 → PipeWire node → 真出帧（9 项断言）
 ./test-dpi.sh                        # 混合 DPI + XWayland（全 headless，15 项断言；含「QT_SCALE_FACTOR 不许设」）
 ./test-x11scale.sh                   # X11 逐窗口缩放桥 x11_scale=1（全 headless，16 项断言）
-./test-scrollcull.sh                 # 滚出视口的列不画到隔壁显示器（全 headless，11 项断言）
+./test-scrollcull.sh                 # 滚出视口的列 / 半块越界的列都不画到隔壁显示器（全 headless，14 项断言）
 ./test-floatstack.sh                 # 层级：浮窗永远压平铺、点浮窗换层级（全 headless + grim 逐像素，12 项断言）
 ./test-mixdpi.sh                     # 跨屏拖窗口：拖着的那段就按对面那块屏的倍率烘（全 headless，7 项断言）
 ./test-vt.sh                         # tty 的 VT 切换（Ctrl+Alt+F1..F12 / switch-vt 动作）（全 headless，11 项断言）
@@ -3793,6 +3820,63 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
        口子（screencopy / ext-image-copy-capture 同样对所有客户端开放，grim / OBS 靠它），
        而要收就得连它一起收 —— 那会把 grim / wf-recorder / OBS 全废掉。要边界得靠 sandbox
        那一层（别的进程拿不到 wayland socket），不是合成器。
+
+170. **半块越界的窗口不再画到隔壁屏上；录屏 portal 的选择器改成 KDE 那种卡片**。
+
+     ①「滚动后超出视口的窗口会跑到另一个显示器里面」（用户报的）。场景图是一张**全局
+     坐标**的图，每块屏的场景输出画的是「落在自己那块坐标里的所有节点」—— 之前只有
+     **整块**滚出自己那块屏的列才被摘掉（`vidow_view_in_output_box`），还看得见一部分、
+     另一部分跨过屏边界的那种列，越出去的那半块照样被隔壁那块屏画出来（headless 实测：
+     两块 1280 宽的屏并排，第二列 646..1491，隔壁屏的截图里 x=0..205 全是它的右半块
+     —— 绿上白下，正是那个窗口）。现在按「窗口**连装饰内边距**整块都在自己那块屏里吗」
+     判一次，不在就把**显示**裁到自己那块屏里（`src/view.c` 的 `vidow_view_apply_clip`）：
+     装饰那块离屏缓冲（fx 节点）改成只采交集那一块、铺到交集那点地方
+     （`wlr_scene_buffer_set_source_box` + `set_dest_size`），几何、客户端、录屏抓帧
+     一个都不动。回归判据 `test-scrollcull.sh` 第 5 节：隔壁屏截图里窗口色像素 **0** 个，
+     而自己那块屏上那半块还在（裁的是越界那一块，不是整个窗口）。
+
+     三个坑记在这：①裁剪必须在**重烘那一帧**算（`vidow_view_anim_bake` 开头）—— 烘完
+     再算就晚一帧，而静止下来之后没有下一帧来纠正，屏幕上就一直挂着那一块（查了半天：
+     `clip_on` 明明是 true，fx 那边却看不见）；②客户端表面那一份要调
+     `wlr_scene_subsurface_tree_set_clip()`，它**只认 subsurface 树**，X11 窗口和弹出物
+     那两棵树上找不到就直接 assert（`found` failed，vidow 当场 abort，test-dpi.sh 抓到
+     两次）。所以表面那一份只给 Wayland 的 xdg toplevel；X11 / 弹出物靠 fx 那块离屏
+     缓冲（默认配置装饰开着，窗口画的就是它）；③裁剪会改场景节点的显示尺寸，而
+     **窗口截图源**（portal 的按窗口录屏走 `wlr_ext_image_capture_source_v1_create_with_
+     scene_node(view->scene_tree)`）盯着这棵树 —— 节点一变它就重发约束，客户端那边正好
+     在等第一帧，撞上 wlroots 的「session already has a frame object」直接断线（录到的
+     帧数 0）。所以判据收成「窗口**本体**跨过屏边界才裁」：贴着屏边时装饰阴影内边距探出
+     去的那十几个像素不裁（那点阴影越界先留着），常见情形下节点一动不动，录屏不受影响。
+     顺带把 `tools/capture.c` 的收帧逻辑补严：约束重发时手上还有一帧在飞就先不建新帧
+     （协议只允许一帧在飞），缓冲尺寸变了就重开一块。
+
+     ②录屏 portal 的选择器原来是一行「缩略图 + 右边一个大按钮」的列表，和 KDE 的选择器
+     长得不一样（用户报的「变成左边预览右边按钮了」）。改成 KDE 那种一格一格的卡片：
+     预览占主要面积、名字（就是选择开关）在预览上面、下面一行小字写分辨率 / app_id，
+     一行三张（`tools/vidowportal.c` 的 `add_card` / `card_place`，缩略图 320×200 缩到
+     240×150；KDE 那边是 `Kirigami.AbstractCard`，header 放名字 + 单选、content 放预览）。
+
+169. **`./run.sh`：一键起 vidow（tty / 嵌套），顺手验 portal，退出时收干净**。
+
+     以前起法散在三处：真机手敲 `./build/vidow`、嵌套手敲 `WLR_BACKENDS=wayland …`、调试
+     用 `./dbg.sh`。这个脚本把它们合成一条路，并且补上「起来之后」和「退出之后」两件事
+     —— 后者才是重点：
+
+     - **起来之后**：`--portal` / `--portal-check` 直接跑 `./portaltest.sh`（体检 + 一个真
+       的文件选择器请求），并先把「现在 portal 指向谁」打一行出来。
+     - **退出之后**：① 收 vidow（SIGTERM → 5 秒 → SIGKILL，连进程组）；② **扫残留客户端**
+       —— 环境里 `WAYLAND_DISPLAY` 正好是它那个 socket 的进程。这类孤儿是真事故：vidow 死
+       了它们本该跟着走，可 `wev` 不会，**两个进程各 100% CPU 空转了 25 分钟**，同一台机器
+       上另一个会话里的游戏掉帧、加载变慢就是它（`test-input-inject.sh` 的收尾按 cmdline
+       匹配 `*/wev*`，而进程实际是 `stdbuf -o0 -e0 wev` —— 匹配不上，漏杀。脚本按环境变量
+       收，SIGTERM 不走才 SIGKILL）；③ 看有没有新 coredump（`coredumpctl --since "@启动
+       时刻"`），有就把栈的前几帧打出来 —— vidow 退出时段错误是老 bug（一次 2MB，机器上
+       已经堆了一百多个），不看着它就会一直悄悄崩。
+     - **`--nested` 自动补 `WLR_RENDER_DRM_DEVICE`**：少了它 wlroots 0.20.2 起不了 GLES2
+       渲染器（见上面「运行」那节）。
+     - **`--no-portal-env`**：临时 `XDG_CONFIG_HOME`（vidow 没有 `--config` 参数，只能换
+       目录）里放一份 `portal = { conf_sync = false, desktop = "" }`，用于「只想跑 vidow、
+       不碰 portal 环境」的场合；代价是那份临时配置里没有你的 `config.lua`。
 
 168. **跨屏拖窗口「先模糊后清晰」：离屏缓冲按「画在哪块屏上」的倍率烘，不是按归属**。
 

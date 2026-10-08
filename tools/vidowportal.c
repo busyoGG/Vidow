@@ -80,8 +80,11 @@
 #define OBJECT_PATH "/org/freedesktop/portal/desktop"
 
 /* 缩略图多大（像素）。抓回来的是整屏原图，缩到这么大再给 GTK。 */
-#define THUMB_W 320
-#define THUMB_H 200
+#define THUMB_W 240
+#define THUMB_H 150
+/* 一行最多几张卡片（KDE 的选择器是一格一格的卡片，不是「缩略图 + 右边一个按钮」
+ * 的列表）。 */
+#define CARD_COLS 3
 /* 缩略图刷新间隔。KDE 的选择器也是这个量级（每秒一两帧）。 */
 #define PREVIEW_MS 500
 /* 等合成器把 node 建出来最多等多久。 */
@@ -1504,9 +1507,12 @@ static void on_toggle(GtkToggleButton *button, gpointer data) {
 	}
 }
 
-/* 加一行（缩略图 + 可选的标签）。grid 的第 row 行。 */
-static struct row *add_row(GtkWidget *grid, int row, enum row_kind kind, void *ptr,
-		const char *text) {
+/* 加一张卡片：名字（就是选择开关）+ 预览图 + 一行小字（分辨率 / app_id）。
+ * 布局照 KDE 的选择器：一格一张卡片、预览占主要面积、名字和单选在预览上面
+ * （Kirigami.AbstractCard 的 header + content）。以前是「缩略图在左、右边一个
+ * 大按钮」的列表，用户看着不像 KDE。grid 的第 line 行第 col 列。 */
+static struct row *add_card(GtkWidget *grid, int col, int line, enum row_kind kind,
+		void *ptr, const char *title, const char *sub) {
 	struct row *r = calloc(1, sizeof(*r));
 	if (r == NULL) {
 		return NULL;
@@ -1514,29 +1520,55 @@ static struct row *add_row(GtkWidget *grid, int row, enum row_kind kind, void *p
 	r->kind = kind;
 	r->ptr = ptr;
 
+	GtkWidget *card = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+	gtk_widget_set_margin_bottom(card, 4);
+	gtk_grid_attach(GTK_GRID(grid), card, col, line, 1, 1);
+
+	GtkWidget *toggle = gtk_toggle_button_new_with_label(title);
+	gtk_widget_set_tooltip_text(toggle, title);
+	g_signal_connect(toggle, "toggled", G_CALLBACK(on_toggle), NULL);
+	gtk_box_pack_start(GTK_BOX(card), toggle, FALSE, FALSE, 0);
+	r->toggle = toggle;
+
 	GtkWidget *image = gtk_image_new();
 	gtk_widget_set_size_request(image, THUMB_W, THUMB_H);
-	gtk_grid_attach(GTK_GRID(grid), image, 0, row, 1, 1);
+	gtk_box_pack_start(GTK_BOX(card), image, FALSE, FALSE, 0);
 	r->image = image;
 
-	GtkWidget *toggle = gtk_toggle_button_new_with_label(text);
-	gtk_widget_set_size_request(toggle, 220, -1);
-	g_signal_connect(toggle, "toggled", G_CALLBACK(on_toggle), NULL);
-	gtk_grid_attach(GTK_GRID(grid), toggle, 1, row, 1, 1);
-	r->toggle = toggle;
+	if (sub != NULL && sub[0] != '\0') {
+		GtkWidget *label = gtk_label_new(sub);
+		gtk_label_set_xalign(GTK_LABEL(label), 0.0);
+		gtk_label_set_ellipsize(GTK_LABEL(label), PANGO_ELLIPSIZE_END);
+		gtk_widget_set_size_request(label, THUMB_W, -1);
+		gtk_box_pack_start(GTK_BOX(card), label, FALSE, FALSE, 0);
+	}
 
 	rows = g_list_append(rows, r);
 	return r;
 }
 
 /* 一段的标题（"屏幕" / "窗口" / "虚拟屏幕"）。 */
-static void add_section(GtkWidget *grid, int row, const char *title) {
+static void add_section(GtkWidget *grid, int line, const char *title) {
 	char text[128];
 	snprintf(text, sizeof(text), "<b>%s</b>", title);
 	GtkWidget *label = gtk_label_new(NULL);
 	gtk_label_set_markup(GTK_LABEL(label), text);
 	gtk_label_set_xalign(GTK_LABEL(label), 0.0);
-	gtk_grid_attach(GTK_GRID(grid), label, 0, row, 2, 1);
+	gtk_widget_set_margin_top(label, 6);
+	gtk_widget_set_margin_bottom(label, 2);
+	gtk_grid_attach(GTK_GRID(grid), label, 0, line, CARD_COLS, 1);
+}
+
+/* 往网格里摆一张卡片，摆满一行就换行。 */
+static int card_place(GtkWidget *grid, int *col, int line, enum row_kind kind,
+		void *ptr, const char *title, const char *sub) {
+	if (*col >= CARD_COLS) {
+		*col = 0;
+		line++;
+	}
+	add_card(grid, *col, line, kind, ptr, title, sub);
+	(*col)++;
+	return line;
 }
 
 /* 弹对话框。多选（multiple）时用复选，否则单选（点一个就把别的取消）。 */
@@ -1545,7 +1577,7 @@ static void dialog_show(struct request *req) {
 	uint32_t types = s->types != 0 ? s->types : SOURCE_TYPE_MONITOR;
 	GtkWidget *win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
 	gtk_window_set_title(GTK_WINDOW(win), "共享屏幕");
-	gtk_window_set_default_size(GTK_WINDOW(win), 720, 620);
+	gtk_window_set_default_size(GTK_WINDOW(win), 3 * THUMB_W + 4 * 12, 640);
 	gtk_window_set_position(GTK_WINDOW(win), GTK_WIN_POS_CENTER_ALWAYS);
 	gtk_window_set_type_hint(GTK_WINDOW(win), GDK_WINDOW_TYPE_HINT_DIALOG);
 	gtk_container_set_border_width(GTK_CONTAINER(win), 12);
@@ -1573,16 +1605,22 @@ static void dialog_show(struct request *req) {
 	g_list_free_full(rows, g_free);
 	rows = NULL;
 
-	int row = 0;
+	int line = 0;
+	int col = 0;
 	struct row *first = NULL;
 	if ((types & SOURCE_TYPE_MONITOR) != 0 && outputs != NULL) {
-		add_section(grid, row++, "屏幕");
+		add_section(grid, line++, "屏幕");
+		col = 0;
 		for (GList *it = outputs; it != NULL; it = it->next) {
 			struct output *out = it->data;
 			char text[128];
-			snprintf(text, sizeof(text), "%s\n%d × %d",
-				out->name[0] != '\0' ? out->name : "输出", out->w, out->h);
-			(void)add_row(grid, row++, ROW_OUTPUT, out, text);
+			snprintf(text, sizeof(text), "%d × %d", out->w, out->h);
+			line = card_place(grid, &col, line, ROW_OUTPUT, out,
+				out->name[0] != '\0' ? out->name : "输出", text);
+		}
+		if (col != 0) {
+			line++;
+			col = 0;
 		}
 	}
 	if ((types & SOURCE_TYPE_WINDOW) != 0) {
@@ -1593,14 +1631,17 @@ static void dialog_show(struct request *req) {
 				continue;
 			}
 			if (n == 0) {
-				add_section(grid, row++, "窗口");
+				add_section(grid, line++, "窗口");
+				col = 0;
 			}
-			char text[192];
-			snprintf(text, sizeof(text), "%s\n%s",
+			line = card_place(grid, &col, line, ROW_WINDOW, tl,
 				tl->title != NULL && tl->title[0] != '\0' ? tl->title : "(没标题)",
 				tl->app_id != NULL ? tl->app_id : "");
-			add_row(grid, row++, ROW_WINDOW, tl, text);
 			n++;
+		}
+		if (col != 0) {
+			line++;
+			col = 0;
 		}
 	}
 	if ((types & SOURCE_TYPE_VIRTUAL) != 0) {
@@ -1614,10 +1655,13 @@ static void dialog_show(struct request *req) {
 				vh = out->h;
 			}
 		}
-		add_section(grid, row++, "虚拟屏幕");
+		add_section(grid, line++, "虚拟屏幕");
+		col = 0;
 		char text[128];
-		snprintf(text, sizeof(text), "新建一块虚拟屏幕\n%d × %d", vw, vh);
-		struct row *r = add_row(grid, row++, ROW_VIRTUAL, NULL, text);
+		snprintf(text, sizeof(text), "%d × %d", vw, vh);
+		struct row *r = add_card(grid, col, line, ROW_VIRTUAL, NULL,
+			"新建一块虚拟屏幕", text);
+		line++;
 		if (r != NULL) {
 			r->vw = vw;
 			r->vh = vh;
