@@ -2278,9 +2278,11 @@ portal_capture = "none"  -- ScreenCast / Screenshot 两行都不写
 `./build/cursorprobe --declare`）。KDE 后端那条路（`portal_capture = "kde"`）仍然可用，
 见 `./test-screencast.sh`。
 
-**注意**：`zkde_screencast_unstable_v1` 是对所有客户端开放的（KWin 那份也是），也就是说不经过
-portal 的客户端也能自己绑它录屏 —— 和 KWin 同一个模型。要收紧的话得在 `bind` 里按 PID / app_id
-白名单（自己的后端是 vidow 的子进程，认得出），还没做。
+**注意**：`zkde_screencast_unstable_v1` 是对所有客户端开放的，也就是说不经过 portal 的客户端
+也能自己绑它录屏 —— **这是有意和 KDE 保持一致的策略**，KWin 那份也一样开放（它只用客户端的
+可执行路径当 HACK，判断要不要把 portal / plasmashell 自己的窗口从录屏里藏掉，不是权限检查）。
+想真收紧得连 screencopy / ext-image-copy-capture 一起收，那会把 grim / wf-recorder / OBS
+全废掉，不值；真要边界得靠「别的进程拿不到你的 wayland socket」那一层（sandbox），不是合成器。
 
 ### 输入法（text-input-v3 + input-method-v2）
 
@@ -3768,6 +3770,12 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
      - `./test-portal-own.sh` 从 32 项扩到 41 项：`AvailableCursorModes=7`、metadata 流里
        消费者拿到位图（`id=1` / `pos=100,100` / 有尺寸有内容）、**缩放 2 倍时位置 = 200,200**、
        以及反证（hidden 模式下同一个消费者连元数据都拿不到）。
+     - **165 里「仍然没做」的另一项（bind 收紧）决定不做**：`zkde_screencast_unstable_v1`
+       保持对所有客户端开放 —— 和 KDE 的策略一致（KWin 也不检查客户端，它只用可执行路径当
+       HACK 判断要不要把 portal / plasmashell 自己的窗口从画面里藏掉）。收紧它挡不住真正的
+       口子（screencopy / ext-image-copy-capture 同样对所有客户端开放，grim / OBS 靠它），
+       而要收就得连它一起收 —— 那会把 grim / wf-recorder / OBS 全废掉。要边界得靠 sandbox
+       那一层（别的进程拿不到 wayland socket），不是合成器。
 
 165. **录屏 portal 补齐来源（窗口 / 区域 / 虚拟输出）+ 截图接口，顺手修了三个真 bug**。
 
@@ -5163,9 +5171,9 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
 22. portal 的 `ScreenCast` / `Screenshot` 现在是 **vidow 自己的后端**（`vidow-portal`，见
     「录屏 portal」那节）：屏幕 / 窗口 / 虚拟屏幕 / 区域四种来源、`hidden` / `embedded` /
     `metadata` 三种光标模式、`Screenshot` / `PickColor` 都通了。剩下的口子：
-    `zkde_screencast_unstable_v1` 对所有客户端开放（和 KWin 同一个模型，要收紧得按
-    PID / app_id 白名单）；`stream_region` 合成器侧实现了，但前端不通过 ScreenCast 要区域
-    （只有交互式截图走它）。
+    `stream_region` 合成器侧实现了，但前端不通过 ScreenCast 要区域（只有交互式截图走它）。
+    `zkde_screencast_unstable_v1` 对所有客户端开放是**故意的**（和 KDE 一致，见上面那节的
+    「注意」）。
 23. portal 的 activation：`set_serial(0)` 的 token 被 wlroots 拒绝，而 GTK / Qt 的
     portal 对话框就是这么发的（能聚焦是因为我们 map 新窗口时无条件给焦点）。
     另外没有给 vidow 自己启动的子进程发 `XDG_ACTIVATION_TOKEN`
@@ -5208,5 +5216,3 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
 3. workspace / 多显示器列组
 4. X11 的 `_NET_WM_STATE`（最大化/最小化）与 `_NET_WM_STRUT`（面板预留），
    以及按屏幕边界夹菜单的客户端（把 X 屏幕也改成 `逻辑 × S`）
-5. `zkde_screencast_unstable_v1` 的 bind 收紧到「只给自己那个后端」（按 PID / app_id 白名单），
-   现在和 KWin 一样对所有客户端开放
