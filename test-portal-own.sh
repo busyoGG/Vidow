@@ -19,7 +19,11 @@
 #   5) CreateSession / SelectSources / Start 全 code=0，拿到 1 路流
 #   6) 选择器对话框真弹出来了（vidow 的窗口列表里看得到），点「共享」就出流
 #   7) 流尺寸 = 输出像素尺寸；gst 消费者拿到帧、帧跟着画面变、静止时靠心跳也有帧
-#   8) 全程 vidow 没崩
+#   8) **按窗口录屏**（types=2）：选择器只列窗口、合成器按 identifier 反查到 view、
+#      窗口流出帧（size 报的是窗口尺寸）
+#   9) **虚拟输出**（types=4）：合成器里真多出一块 HEADLESS-N，流结束后又拔掉
+#  10) **截图接口**：Screenshot 回一个真 PNG（尺寸 = 输出像素尺寸）、PickColor 回 (ddd)
+#  11) 全程 vidow 没崩
 #
 # 需要：pipewire 在跑、gst-launch-1.0 + gst-plugin-pipewire、python3-gobject、
 #       gtk3、wayland-info、build/vidowmsg、build/vidow-portal。
