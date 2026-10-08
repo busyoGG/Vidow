@@ -1,0 +1,816 @@
+/*
+ * screencast.c — zkde_screencast_unstable_v1：KWin 的私有录屏协议。
+ *
+ * 为什么 vidow 要实现一个 KDE 的私有协议：xdg-desktop-portal-kde 的 ScreenCast
+ * 就建在它上面 —— 绑不到这个 global，它**连 org.freedesktop.impl.portal.ScreenCast
+ * 接口都不注册**（实测：在 Hyprland 上那个后端也只导出 10 个接口，没有 ScreenCast /
+ * Screenshot / RemoteDesktop）。所以「KDE 的录屏 portal」在非 KWin 的合成器上不是
+ * 配错了，是根本不存在。想让它可用，只有让合成器把这套协议和它背后的 PipeWire 流
+ * 提供出来。
+ *
+ * 协议的形状（protocols/zkde-screencast-unstable-v1.xml，v6）：
+ *
+ *     客户端 --stream_output(stream, wl_output, pointer_mode)--> 合成器
+ *     客户端 <--serial(hi, lo)--- 合成器     （v6，先发）
+ *     客户端 <--created(node)---- 合成器     （node = 合成器进程里的 PipeWire node id）
+ *     客户端 <--failed(msg)------ 合成器     （出错；跟 created 二选一）
+ *
+ * 关键点：**PipeWire 流是合成器建的**（created 给的是合成器自己那个 node 的 id），
+ * 客户端拿这个 id 去 pw_stream_connect(PW_DIRECTION_INPUT, node) 消费。所以这个模块
+ * 同时是个 PipeWire 生产者：把输出的一帧渲染出来，喂进一个 memfd 缓冲。
+ *
+ * 线程模型：PipeWire 的 loop 直接挂进 wl_event_loop（pw_loop_get_fd + pw_loop_iterate），
+ * 全程在合成器主线程上跑 —— 不用锁、不用跨线程往 Wayland 资源上写事件。代价是喂帧
+ * 那一下（一次 read_pixels）会占住主线程，跟 screencopy 的行为一致。
+ *
+ * 光标模式（pointer_mode，协议里的 enum pointer）：hidden / embedded / metadata。
+ */
+
+#include "server.h"
+
+#include <stdlib.h>
+#include <string.h>
+
+#include <wayland-server-core.h>
+#include <wlr/types/wlr_output.h>
+#include <wlr/util/log.h>
+
+#include <drm_fourcc.h>
+#include <pipewire/pipewire.h>
+#include <spa/param/buffers.h>
+#include <spa/param/video/format-utils.h>
+#include <spa/param/video/raw-utils.h>
+#include <spa/pod/builder.h>
+#include <spa/utils/result.h>
+
+#include "zkde-screencast-unstable-v1-server-protocol.h"
+
+/* 协议 XML 里的 interface version（v6 才有 serial 事件）。 */
+#define VIDOW_SC_VERSION 6
+
+/* ------------------------------------------------------- PipeWire 生产者 */
+
+/* 一个进程一份：loop 的 fd 挂进 wl_event_loop，所有 PipeWire 回调都在合成器
+ * 主线程上跑。 */
+struct vidow_sc_pw {
+	struct vidow_screencast *sc;
+	struct pw_loop *loop;
+	struct pw_context *context;
+	struct pw_core *core;
+	struct spa_hook core_listener;
+	struct pw_core_events core_events;
+	struct wl_event_source *source;
+	/* 心跳：每 1s 给每路流催一次图。屏幕静止时没有任何输出提交，而消费者可能
+	 * 是「刚连上」的 —— 不催的话它要等到下一次画面变化才有第一帧（实测：负载
+	 * 高的时候 gst 连上来晚了，一帧都拿不到）。1Hz 的代价是静止画面上每路流
+	 * 每秒多渲染一帧，可以接受。 */
+	struct wl_event_source *tick;
+	int sync_seq;
+	bool ready;
+	/* created 之前要报的 object.serial（v6）。node id 会复用，所以客户端要的是
+	 * 这个 64 位序列号 —— 从 registry 的 global 事件里拿（node id → serial）。 */
+	struct pw_registry *registry;
+	struct spa_hook registry_listener;
+	struct {
+		uint32_t node;
+		uint64_t serial;
+	} known[64];
+	size_t n_known;
+};
+
+/* 一路流。抓帧走 vidow 自己那条路（vidow_capture_grab：遮挡 / 马赛克都盖到了），
+ * 像素进 PipeWire 的 memfd 缓冲。 */
+struct vidow_sc_pw_stream {
+	struct vidow_screencast_stream *stream;
+	struct vidow_sc_pw *pw;
+	struct pw_stream *pw_stream;
+	struct spa_hook listener;
+	struct spa_video_info_raw video;
+	uint32_t node_id;
+	uint64_t serial;
+	bool have_serial;
+	bool announced;
+	bool have_format;
+	/* 输出提交时抓好的那一帧，等 process 来取（拿的是加锁的缓冲）。 */
+	struct wlr_buffer *pending;
+	struct wl_listener output_commit;
+};
+
+static void pw_stream_fill(struct vidow_sc_pw_stream *ps,
+		struct pw_buffer *buffer);
+static void stream_announce(struct vidow_sc_pw_stream *ps);
+static struct wlr_buffer *stream_grab(struct vidow_sc_pw_stream *ps);
+
+/* loop 可读 → 跑一轮 PipeWire 的事件循环。 */
+static int pw_loop_ready(int fd, uint32_t mask, void *data) {
+	(void)fd;
+	struct vidow_sc_pw *pw = data;
+	if (mask & (WL_EVENT_READABLE | WL_EVENT_HANGUP | WL_EVENT_ERROR)) {
+		pw_loop_iterate(pw->loop, 0);
+	}
+	return 0;
+}
+
+#define VIDOW_SC_TICK_MS 1000
+
+static int pw_tick(void *data) {
+	struct vidow_sc_pw *pw = data;
+	struct vidow_screencast_stream *stream;
+	wl_list_for_each(stream, &pw->sc->streams, link) {
+		if (stream->pw != NULL && stream->pw->pw_stream != NULL) {
+			pw_stream_trigger_process(stream->pw->pw_stream);
+		}
+	}
+	wl_event_source_timer_update(pw->tick, VIDOW_SC_TICK_MS);
+	return 0;
+}
+
+static void on_core_done(void *data, uint32_t id, int seq) {
+	struct vidow_sc_pw *pw = data;
+	if (id == PW_ID_CORE && seq == pw->sync_seq) {
+		pw->ready = true;
+		wlr_log(WLR_INFO, "screencast: PipeWire core 就绪");
+	}
+}
+
+static void on_core_error(void *data, uint32_t id, int seq, int res,
+		const char *message) {
+	(void)data;
+	(void)seq;
+	wlr_log(WLR_ERROR, "screencast: PipeWire 出错（id=%u res=%d）：%s", id, res,
+		message != NULL ? message : "?");
+}
+
+/* registry：只为了把「node id → object.serial」记下来（created 之前要报 serial）。 */
+static void on_registry_global(void *data, uint32_t id, uint32_t permissions,
+		const char *type, uint32_t version, const struct spa_dict *props) {
+	(void)permissions;
+	(void)version;
+	struct vidow_sc_pw *pw = data;
+	if (props == NULL || type == NULL || strcmp(type, PW_TYPE_INTERFACE_Node) != 0) {
+		return;
+	}
+	const char *serial = spa_dict_lookup(props, PW_KEY_OBJECT_SERIAL);
+	if (serial == NULL || pw->n_known >= 64) {
+		return;
+	}
+	pw->known[pw->n_known].node = id;
+	pw->known[pw->n_known].serial = strtoull(serial, NULL, 10);
+	pw->n_known++;
+	/* 有流正等着这个 node 的 serial 就顺手报出去。 */
+	struct vidow_screencast_stream *stream;
+	wl_list_for_each(stream, &pw->sc->streams, link) {
+		if (stream->pw != NULL && stream->pw->node_id == id) {
+			stream_announce(stream->pw);
+		}
+	}
+}
+
+static void on_registry_global_remove(void *data, uint32_t id) {
+	(void)data;
+	(void)id;
+}
+
+static const struct pw_registry_events registry_events = {
+	PW_VERSION_REGISTRY_EVENTS,
+	.global = on_registry_global,
+	.global_remove = on_registry_global_remove,
+};
+
+static const struct pw_core_events pw_core_events = {
+	PW_VERSION_CORE_EVENTS,
+	.done = on_core_done,
+	.error = on_core_error,
+};
+
+struct vidow_sc_pw *vidow_sc_pw_create(struct vidow_screencast *sc,
+		struct wl_display *display) {
+	struct vidow_sc_pw *pw = calloc(1, sizeof(*pw));
+	if (pw == NULL) {
+		return NULL;
+	}
+	pw->sc = sc;
+	pw->sync_seq = -1;
+
+	/* 进程级初始化，幂等；后面 pw_* 的报错走 PipeWire 自己的日志（stderr）。 */
+	pw_init(NULL, NULL);
+
+	pw->loop = pw_loop_new(NULL);
+	if (pw->loop == NULL) {
+		free(pw);
+		return NULL;
+	}
+	pw->context = pw_context_new(pw->loop, NULL, 0);
+	if (pw->context == NULL) {
+		pw_loop_destroy(pw->loop);
+		free(pw);
+		return NULL;
+	}
+
+	/* loop 的 fd 交给 wl_event_loop：一条线程跑到底，不用锁，也不存在
+	 * 「从 PipeWire 线程往 Wayland 资源上写事件」这种麻烦。 */
+	pw->source = wl_event_loop_add_fd(wl_display_get_event_loop(display),
+		pw_loop_get_fd(pw->loop), WL_EVENT_READABLE, pw_loop_ready, pw);
+	if (pw->source == NULL) {
+		pw_context_destroy(pw->context);
+		pw_loop_destroy(pw->loop);
+		free(pw);
+		return NULL;
+	}
+
+	pw->tick = wl_event_loop_add_timer(wl_display_get_event_loop(display),
+		pw_tick, pw);
+	if (pw->tick != NULL) {
+		wl_event_source_timer_update(pw->tick, VIDOW_SC_TICK_MS);
+	}
+
+	pw->core = pw_context_connect(pw->context, NULL, 0);
+	if (pw->core == NULL) {
+		/* INFO 不是 ERROR：录屏是可选功能，没有 PipeWire 的会话（测试环境就是）
+		 * 不该在日志里留一条 ERROR —— 一堆测试都断言「日志里没有 ERROR」。 */
+		wlr_log(WLR_INFO, "screencast: 连不上 PipeWire（会话里没跑 pipewire？）");
+		/* 心跳也必须摘掉：它的 data 是 pw，下面 free(pw) 之后定时器一响就是
+		 * 野指针（实测：没 PipeWire 的会话里 vidow 一秒后必崩）。 */
+		if (pw->tick != NULL) {
+			wl_event_source_remove(pw->tick);
+			pw->tick = NULL;
+		}
+		wl_event_source_remove(pw->source);
+		pw_context_destroy(pw->context);
+		pw_loop_destroy(pw->loop);
+		free(pw);
+		return NULL;
+	}
+	pw_core_add_listener(pw->core, &pw->core_listener, &pw_core_events, pw);
+	pw->registry = pw_core_get_registry(pw->core, PW_VERSION_REGISTRY, 0);
+	if (pw->registry != NULL) {
+		pw_registry_add_listener(pw->registry, &pw->registry_listener,
+			&registry_events, pw);
+	}
+	pw->sync_seq = pw_core_sync(pw->core, PW_ID_CORE, 0);
+	return pw;
+}
+
+/* ------------------------------------------------------------ 流的事件 */
+
+static uint64_t serial_for_node(struct vidow_sc_pw *pw, uint32_t node) {
+	for (size_t i = 0; i < pw->n_known; i++) {
+		if (pw->known[i].node == node) {
+			return pw->known[i].serial;
+		}
+	}
+	return 0;
+}
+
+static void stream_announce(struct vidow_sc_pw_stream *ps) {
+	struct vidow_screencast_stream *stream = ps->stream;
+	if (ps->announced || stream->resource == NULL) {
+		return;
+	}
+	if (ps->node_id == SPA_ID_INVALID) {
+		return;
+	}
+	uint32_t version = (uint32_t)wl_resource_get_version(stream->resource);
+	/* v6 起客户端优先认 object.serial（node id 会复用），而它是 registry 报的
+	 * 属性 —— 可能比流的状态变化晚到，等它。 */
+	if (version >= 6 && !ps->have_serial) {
+		uint64_t serial = serial_for_node(ps->pw, ps->node_id);
+		if (serial == 0) {
+			return;
+		}
+		ps->serial = serial;
+		ps->have_serial = true;
+	}
+	ps->announced = true;
+	if (version >= 6) {
+		zkde_screencast_stream_unstable_v1_send_serial(stream->resource,
+			(uint32_t)(ps->serial >> 32), (uint32_t)(ps->serial & 0xffffffffu));
+	}
+	zkde_screencast_stream_unstable_v1_send_created(stream->resource,
+		ps->node_id);
+	wlr_log(WLR_INFO, "screencast: %s → PipeWire node %u",
+		stream->output != NULL ? stream->output->name : "?", ps->node_id);
+}
+
+static void pw_stream_state_changed(void *data, enum pw_stream_state old,
+		enum pw_stream_state state, const char *error) {
+	(void)old;
+	struct vidow_sc_pw_stream *ps = data;
+	if (state == PW_STREAM_STATE_ERROR) {
+		vidow_screencast_stream_fail(ps->stream,
+			error != NULL ? error : "vidow: PipeWire 流出错");
+		return;
+	}
+	if (state == PW_STREAM_STATE_PAUSED || state == PW_STREAM_STATE_STREAMING) {
+		ps->node_id = pw_stream_get_node_id(ps->pw_stream);
+		stream_announce(ps);
+	}
+}
+
+static void pw_stream_param_changed(void *data, uint32_t id,
+		const struct spa_pod *param) {
+	struct vidow_sc_pw_stream *ps = data;
+	if (param == NULL || id != SPA_PARAM_Format) {
+		return;
+	}
+	if (spa_format_video_raw_parse(param, &ps->video) < 0) {
+		return;
+	}
+	ps->have_format = true;
+	wlr_log(WLR_INFO, "screencast: 协商到 %ux%u（spa 格式 %u）",
+		ps->video.size.width, ps->video.size.height, ps->video.format);
+}
+
+/* 图转起来了 → 把手上那一帧填进去。手上没有（流刚建好、或者消费者刚连上来）
+ * 就当场抓一帧：屏幕静止时没有任何输出提交，不这么做消费者一个缓冲都拿不到 ——
+ * 表现是「连上了但一直是黑的」。 */
+static void pw_stream_process(void *data) {
+	struct vidow_sc_pw_stream *ps = data;
+	struct pw_buffer *buffer = pw_stream_dequeue_buffer(ps->pw_stream);
+	if (buffer == NULL) {
+		return;
+	}
+	if (ps->pending == NULL) {
+		ps->pending = stream_grab(ps);
+	}
+	if (ps->pending != NULL) {
+		pw_stream_fill(ps, buffer);
+		wlr_buffer_unlock(ps->pending);
+		ps->pending = NULL;
+	}
+	pw_stream_queue_buffer(ps->pw_stream, buffer);
+}
+
+static const struct pw_stream_events pw_stream_events = {
+	PW_VERSION_STREAM_EVENTS,
+	.state_changed = pw_stream_state_changed,
+	.param_changed = pw_stream_param_changed,
+	.process = pw_stream_process,
+};
+
+/* ------------------------------------------------------------ 抓帧 → 缓冲 */
+
+/* 把 ps->pending 那一帧写进 PipeWire 的缓冲。格式固定 BGRx（= DRM XRGB8888），
+ * 尺寸取协商结果（我们只报了输出像素尺寸一种，所以协商结果就是它）。 */
+static void pw_stream_fill(struct vidow_sc_pw_stream *ps,
+		struct pw_buffer *buffer) {
+	struct spa_buffer *buf = buffer->buffer;
+	if (buf->n_datas < 1 || buf->datas[0].data == NULL) {
+		return;
+	}
+	struct wlr_buffer *src = ps->pending;
+	uint32_t width = (uint32_t)src->width;
+	uint32_t height = (uint32_t)src->height;
+	if (ps->have_format) {
+		width = ps->video.size.width;
+		height = ps->video.size.height;
+	}
+	size_t stride = (size_t)width * 4;
+	size_t size = stride * height;
+	if (buf->datas[0].maxsize < size) {
+		wlr_log(WLR_ERROR, "screencast: PipeWire 缓冲太小（%u < %zu）",
+			buf->datas[0].maxsize, size);
+		return;
+	}
+
+	struct wlr_texture *texture = wlr_texture_from_buffer(
+		ps->stream->output->renderer, src);
+	if (texture == NULL) {
+		return;
+	}
+	bool ok = wlr_texture_read_pixels(texture,
+		&(struct wlr_texture_read_pixels_options){
+			.data = buf->datas[0].data,
+			.format = DRM_FORMAT_XRGB8888,
+			.stride = stride,
+			.src_box = (struct wlr_box){
+				.width = (int)width,
+				.height = (int)height,
+			},
+		});
+	wlr_texture_destroy(texture);
+	if (!ok) {
+		return;
+	}
+
+	if (buf->datas[0].chunk == NULL) {
+		return;
+	}
+	buf->datas[0].chunk->offset = 0;
+	buf->datas[0].chunk->size = size;
+	buf->datas[0].chunk->stride = (int32_t)stride;
+}
+
+/* 抓当前这一帧（遮挡 / 马赛克都盖到了），要光标就画上。返回加锁的缓冲。 */
+static struct wlr_buffer *stream_grab(struct vidow_sc_pw_stream *ps) {
+	struct vidow_screencast_stream *stream = ps->stream;
+	if (stream->output == NULL) {
+		return NULL;
+	}
+	struct wlr_buffer *frame = vidow_capture_grab(stream->sc->server,
+		stream->output);
+	if (frame == NULL) {
+		return NULL;
+	}
+	if (stream->pointer_mode == ZKDE_SCREENCAST_UNSTABLE_V1_POINTER_EMBEDDED) {
+		vidow_capture_paint_cursor(stream->output, frame);
+	}
+	return frame;
+}
+
+/* 输出提交了（有新画面）→ 抓一帧存着，催一次 PipeWire 的图。 */
+static void stream_handle_output_commit(struct wl_listener *listener, void *data) {
+	struct vidow_sc_pw_stream *ps =
+		wl_container_of(listener, ps, output_commit);
+	struct vidow_screencast_stream *stream = ps->stream;
+	struct wlr_output_event_commit *event = data;
+
+	if (stream->output == NULL) {
+		return;
+	}
+	if (!(event->state->committed & WLR_OUTPUT_STATE_BUFFER)) {
+		return;
+	}
+	if (ps->pending != NULL) {
+		/* 上一帧还没被取走：丢掉它，用新的（录屏要的是最新画面）。 */
+		wlr_buffer_unlock(ps->pending);
+		ps->pending = NULL;
+	}
+	ps->pending = stream_grab(ps);
+	if (ps->pending == NULL) {
+		return;
+	}
+	pw_stream_trigger_process(ps->pw_stream);
+}
+
+/* ------------------------------------------------------------ 流的生命周期 */
+
+void vidow_sc_pw_stream_start(struct vidow_screencast_stream *stream) {
+	struct vidow_screencast *sc = stream->sc;
+	if (sc->pw == NULL) {
+		vidow_screencast_stream_fail(stream,
+			"vidow: PipeWire 没连上（会话里没有 pipewire？）");
+		return;
+	}
+	if (stream->output == NULL) {
+		vidow_screencast_stream_fail(stream, "vidow: 没有输出可录");
+		return;
+	}
+	struct wlr_output *output = stream->output;
+	struct vidow_sc_pw_stream *ps = calloc(1, sizeof(*ps));
+	if (ps == NULL) {
+		vidow_screencast_stream_fail(stream, "vidow: 内存不够");
+		return;
+	}
+	ps->stream = stream;
+	ps->pw = sc->pw;
+	ps->node_id = SPA_ID_INVALID;
+	stream->pw = ps;
+
+	int width = output->width;
+	int height = output->height;
+	size_t stride = (size_t)width * 4;
+
+	char name[128];
+	snprintf(name, sizeof(name), "vidow-screencast-%s", output->name);
+	struct pw_properties *props = pw_properties_new(
+		PW_KEY_MEDIA_TYPE, "Video",
+		PW_KEY_MEDIA_CATEGORY, "Capture",
+		PW_KEY_MEDIA_ROLE, "Screen",
+		PW_KEY_NODE_NAME, name,
+		PW_KEY_NODE_DESCRIPTION, "vidow 屏幕",
+		NULL);
+	ps->pw_stream = pw_stream_new(sc->pw->core, name, props);
+	if (ps->pw_stream == NULL) {
+		stream->pw = NULL;
+		free(ps);
+		vidow_screencast_stream_fail(stream, "vidow: 建不了 PipeWire 流");
+		return;
+	}
+	pw_stream_add_listener(ps->pw_stream, &ps->listener, &pw_stream_events, ps);
+
+	/* 只报一种格式（BGRx + 输出像素尺寸），协商没得选 —— 消费者要别的尺寸
+	 * 自己加 filter。缓冲走 memfd：合成器这边直接 read_pixels 进去，零拷贝做不到
+	 * （要 dmabuf 得让 renderer 导出，先不做）。 */
+	uint8_t pod_buffer[1024];
+	struct spa_pod_builder builder = SPA_POD_BUILDER_INIT(pod_buffer,
+		sizeof(pod_buffer));
+	const struct spa_pod *params[2];
+	struct spa_rectangle size = SPA_RECTANGLE((uint32_t)width, (uint32_t)height);
+	struct spa_fraction rate = SPA_FRACTION(0, 1);
+	struct spa_fraction min_rate = SPA_FRACTION(0, 1);
+	struct spa_fraction max_rate = SPA_FRACTION(1000, 1);
+
+	struct spa_pod_frame frame;
+	spa_pod_builder_push_object(&builder, &frame, SPA_TYPE_OBJECT_Format,
+		SPA_PARAM_EnumFormat);
+	spa_pod_builder_add(&builder,
+		SPA_FORMAT_mediaType, SPA_POD_Id(SPA_MEDIA_TYPE_video),
+		SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
+		SPA_FORMAT_VIDEO_format, SPA_POD_Id(SPA_VIDEO_FORMAT_BGRx),
+		/* 尺寸给死值：给了范围消费者会挑最小（实测协商出 1x1，喂帧全被
+		 * 「缓冲太小」挡掉）。要别的尺寸让它自己加 filter。 */
+		SPA_FORMAT_VIDEO_size, SPA_POD_Rectangle(&size),
+		SPA_FORMAT_VIDEO_framerate, SPA_POD_CHOICE_RANGE_Fraction(&rate,
+			&min_rate, &max_rate),
+		0);
+	params[0] = spa_pod_builder_pop(&builder, &frame);
+
+	spa_pod_builder_push_object(&builder, &frame, SPA_TYPE_OBJECT_ParamBuffers,
+		SPA_PARAM_Buffers);
+	spa_pod_builder_add(&builder,
+		SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(8, 2, 32),
+		SPA_PARAM_BUFFERS_blocks, SPA_POD_Int(1),
+		SPA_PARAM_BUFFERS_size, SPA_POD_Int((int)(stride * (size_t)height)),
+		SPA_PARAM_BUFFERS_stride, SPA_POD_Int((int)stride),
+		SPA_PARAM_BUFFERS_dataType,
+			SPA_POD_CHOICE_FLAGS_Int(1 << SPA_DATA_MemFd),
+		0);
+	params[1] = spa_pod_builder_pop(&builder, &frame);
+
+	int res = pw_stream_connect(ps->pw_stream, PW_DIRECTION_OUTPUT, PW_ID_ANY,
+		PW_STREAM_FLAG_DRIVER | PW_STREAM_FLAG_MAP_BUFFERS, params, 2);
+	if (res < 0) {
+		vidow_screencast_stream_fail(stream, "vidow: 连不上 PipeWire 图");
+		return;
+	}
+
+	ps->output_commit.notify = stream_handle_output_commit;
+	wl_signal_add(&output->events.commit, &ps->output_commit);
+}
+
+void vidow_sc_pw_stream_destroy(struct vidow_screencast_stream *stream) {
+	struct vidow_sc_pw_stream *ps = stream->pw;
+	if (ps == NULL) {
+		return;
+	}
+	stream->pw = NULL;
+	if (ps->pending != NULL) {
+		wlr_buffer_unlock(ps->pending);
+		ps->pending = NULL;
+	}
+	if (ps->output_commit.link.prev != NULL) {
+		wl_list_remove(&ps->output_commit.link);
+	}
+	if (ps->pw_stream != NULL) {
+		spa_hook_remove(&ps->listener);
+		pw_stream_destroy(ps->pw_stream);
+		ps->pw_stream = NULL;
+	}
+	free(ps);
+}
+
+/* ------------------------------------------------------------ 资源生命周期 */
+
+static void stream_destroy(struct vidow_screencast_stream *stream);
+
+static void stream_resource_destroy(struct wl_resource *resource) {
+	struct vidow_screencast_stream *stream =
+		wl_resource_get_user_data(resource);
+	if (stream == NULL) {
+		return;
+	}
+	stream->resource = NULL;
+	stream_destroy(stream);
+}
+
+/* 客户端说「我不要了」。close 在协议里是 destructor，但 wl_resource 也可能被
+ * 直接销毁（客户端断线），两条路都收敛到 stream_destroy。 */
+static void stream_handle_close(struct wl_client *client,
+		struct wl_resource *resource) {
+	(void)client;
+	struct vidow_screencast_stream *stream =
+		wl_resource_get_user_data(resource);
+	if (stream != NULL) {
+		stream->closed = true;
+	}
+	wl_resource_destroy(resource);
+}
+
+static const struct zkde_screencast_stream_unstable_v1_interface stream_impl = {
+	.close = stream_handle_close,
+};
+
+/* 输出没了（热插拔 / 切 VT）：协议没规定，KWin 是给个 failed，照做 —— 客户端
+ * （portal）会把它当成「这一路流结束了」。 */
+static void stream_handle_output_destroy(struct wl_listener *listener,
+		void *data) {
+	(void)data;
+	struct vidow_screencast_stream *stream =
+		wl_container_of(listener, stream, output_destroy);
+	if (stream->resource != NULL) {
+		zkde_screencast_stream_unstable_v1_send_failed(stream->resource,
+			"vidow: 输出没了（热插拔 / 切 VT）");
+	}
+	stream->output = NULL;
+	wl_list_remove(&stream->output_destroy.link);
+	wl_list_init(&stream->output_destroy.link);
+}
+
+void vidow_screencast_stream_fail(struct vidow_screencast_stream *stream,
+		const char *why) {
+	if (stream->resource == NULL) {
+		return;
+	}
+	wlr_log(WLR_INFO, "screencast: 这一路流失败：%s", why);
+	zkde_screencast_stream_unstable_v1_send_failed(stream->resource, why);
+}
+
+static void stream_destroy(struct vidow_screencast_stream *stream) {
+	if (stream->resource != NULL) {
+		wl_resource_set_user_data(stream->resource, NULL);
+		stream->resource = NULL;
+	}
+	vidow_sc_pw_stream_destroy(stream);
+	if (stream->output != NULL) {
+		wl_list_remove(&stream->output_destroy.link);
+		stream->output = NULL;
+	}
+	wl_list_remove(&stream->link);
+	free(stream);
+}
+
+/* 建一路流（输出可以是 NULL：来源不支持时也建出来，然后在上面回 failed ——
+ * 协议里没有 error code，回 failed 才是客户端认的方式）。 */
+static struct vidow_screencast_stream *stream_create(struct wl_client *client,
+		struct vidow_screencast *sc, uint32_t stream_id, uint32_t version,
+		struct wlr_output *output, uint32_t pointer_mode) {
+	struct vidow_screencast_stream *stream = calloc(1, sizeof(*stream));
+	if (stream == NULL) {
+		wl_client_post_no_memory(client);
+		return NULL;
+	}
+	stream->sc = sc;
+	stream->output = output;
+	stream->pointer_mode = pointer_mode;
+	wl_list_init(&stream->output_destroy.link);
+	wl_list_insert(&sc->streams, &stream->link);
+
+	stream->resource = wl_resource_create(client,
+		&zkde_screencast_stream_unstable_v1_interface, (int)version, stream_id);
+	if (stream->resource == NULL) {
+		wl_list_remove(&stream->link);
+		free(stream);
+		wl_client_post_no_memory(client);
+		return NULL;
+	}
+	wl_resource_set_implementation(stream->resource, &stream_impl, stream,
+		stream_resource_destroy);
+
+	if (output != NULL) {
+		stream->output_destroy.notify = stream_handle_output_destroy;
+		wl_signal_add(&output->events.destroy, &stream->output_destroy);
+	}
+	return stream;
+}
+
+/* ------------------------------------------------------------ 协议请求 */
+
+static void handle_stream_output(struct wl_client *client,
+		struct wl_resource *resource, uint32_t stream_id,
+		struct wl_resource *output_resource, uint32_t pointer_mode) {
+	struct vidow_screencast *sc = wl_resource_get_user_data(resource);
+	if (sc == NULL) {
+		return;
+	}
+	uint32_t version = (uint32_t)wl_resource_get_version(resource);
+	struct wlr_output *output = wlr_output_from_resource(output_resource);
+
+	struct vidow_screencast_stream *stream = stream_create(client, sc,
+		stream_id, version, output, pointer_mode);
+	if (stream == NULL) {
+		return;
+	}
+	if (output == NULL) {
+		vidow_screencast_stream_fail(stream,
+			"vidow: 这个 wl_output 不是我们的");
+		return;
+	}
+	wlr_log(WLR_INFO, "screencast: 请求录 %s（pointer_mode=%u，协议 v%u）",
+		output->name, pointer_mode, version);
+
+	vidow_sc_pw_stream_start(stream);
+}
+
+/* 协议的其余几个来源（窗口 / 区域 / 虚拟输出）：现在只做整块输出 —— KDE 的
+ * 「共享整个屏幕」走的就是 stream_output。其余一律回 failed（不是什么都不回：
+ * 客户端会一直等 created）。 */
+static void reply_unsupported(struct wl_client *client,
+		struct vidow_screencast *sc, struct wl_resource *resource,
+		uint32_t stream_id, const char *what) {
+	struct vidow_screencast_stream *stream = stream_create(client, sc,
+		stream_id, (uint32_t)wl_resource_get_version(resource), NULL, 0);
+	if (stream != NULL) {
+		vidow_screencast_stream_fail(stream, what);
+	}
+}
+
+static void handle_stream_window(struct wl_client *client,
+		struct wl_resource *resource, uint32_t stream_id,
+		const char *window_uuid, uint32_t pointer_mode) {
+	(void)window_uuid;
+	(void)pointer_mode;
+	reply_unsupported(client, wl_resource_get_user_data(resource), resource,
+		stream_id, "vidow: 按窗口录屏还不支持（现在只能录整块输出）");
+}
+
+static void handle_stream_virtual_output(struct wl_client *client,
+		struct wl_resource *resource, uint32_t stream_id, const char *name,
+		int32_t width, int32_t height, wl_fixed_t scale,
+		uint32_t pointer_mode) {
+	(void)name;
+	(void)width;
+	(void)height;
+	(void)scale;
+	(void)pointer_mode;
+	reply_unsupported(client, wl_resource_get_user_data(resource), resource,
+		stream_id, "vidow: 虚拟输出还不支持");
+}
+
+static void handle_stream_virtual_output_with_description(struct wl_client *client,
+		struct wl_resource *resource, uint32_t stream_id, const char *name,
+		const char *description, int32_t width, int32_t height,
+		wl_fixed_t scale, uint32_t pointer_mode) {
+	(void)name;
+	(void)description;
+	(void)width;
+	(void)height;
+	(void)scale;
+	(void)pointer_mode;
+	reply_unsupported(client, wl_resource_get_user_data(resource), resource,
+		stream_id, "vidow: 虚拟输出还不支持");
+}
+
+static void handle_stream_region(struct wl_client *client,
+		struct wl_resource *resource, uint32_t stream_id, int32_t x, int32_t y,
+		uint32_t width, uint32_t height, wl_fixed_t scale,
+		uint32_t pointer_mode) {
+	(void)x;
+	(void)y;
+	(void)width;
+	(void)height;
+	(void)scale;
+	(void)pointer_mode;
+	reply_unsupported(client, wl_resource_get_user_data(resource), resource,
+		stream_id, "vidow: 按区域录屏还不支持");
+}
+
+static void handle_destroy(struct wl_client *client,
+		struct wl_resource *resource) {
+	(void)client;
+	wl_resource_destroy(resource);
+}
+
+static const struct zkde_screencast_unstable_v1_interface manager_impl = {
+	.stream_output = handle_stream_output,
+	.stream_window = handle_stream_window,
+	.destroy = handle_destroy,
+	.stream_virtual_output = handle_stream_virtual_output,
+	.stream_region = handle_stream_region,
+	.stream_virtual_output_with_description =
+		handle_stream_virtual_output_with_description,
+};
+
+/* ------------------------------------------------------------ global */
+
+static void manager_bind(struct wl_client *client, void *data,
+		uint32_t version, uint32_t id) {
+	struct vidow_screencast *sc = data;
+	struct wl_resource *resource = wl_resource_create(client,
+		&zkde_screencast_unstable_v1_interface, (int)version, id);
+	if (resource == NULL) {
+		wl_client_post_no_memory(client);
+		return;
+	}
+	wl_resource_set_implementation(resource, &manager_impl, sc, NULL);
+}
+
+struct vidow_screencast *vidow_screencast_create(struct wl_display *display,
+		struct vidow_server *server) {
+	struct vidow_screencast *sc = calloc(1, sizeof(*sc));
+	if (sc == NULL) {
+		return NULL;
+	}
+	sc->server = server;
+	wl_list_init(&sc->streams);
+
+	sc->global = wl_global_create(display, &zkde_screencast_unstable_v1_interface,
+		VIDOW_SC_VERSION, sc, manager_bind);
+	if (sc->global == NULL) {
+		free(sc);
+		return NULL;
+	}
+
+	/* PipeWire 那一半（生产者）。连不上也照样暴露协议：KDE 的 portal 会因此看到
+	 * ScreenCast 接口，每一路流拿到一个明确的 failed 原因（比「接口根本不存在」
+	 * 好排查），而且录屏之外的接口不受影响。 */
+	sc->pw = vidow_sc_pw_create(sc, display);
+	if (sc->pw == NULL) {
+		wlr_log(WLR_INFO, "screencast: PipeWire 没接上 —— 协议照样暴露，但每路流"
+			"都会 failed（会话里跑着 pipewire 吗？）");
+	}
+
+	wlr_log(WLR_INFO, "screencast: zkde_screencast_unstable_v1 就绪"
+		"（xdg-desktop-portal-kde 的录屏靠它）");
+	return sc;
+}

@@ -1194,6 +1194,9 @@ struct vidow_server {
 	 * 里消失，屏幕上照常显示。 */
 	struct vidow_capture_manager *capture_manager;
 	struct vidow_screencopy *screencopy;
+	/* 录屏：zkde_screencast_unstable_v1（KWin 私有协议，KDE 的录屏 portal
+	 * 建在它上面），见 screencast.c。NULL = 没建成，不致命。 */
+	struct vidow_screencast *screencast;
 	/* 新标准抓帧（ext-image-copy-capture）的会话管理器 —— 用 wlroots 那份
 	 * （协议管线 / 约束 / dmabuf feedback 都靠它），只有「输出抓帧源」换成
 	 * vidow 自己的（见 capture.c）。窗口抓帧源仍是 wlroots 的，抓帧遮挡要靠
@@ -1745,6 +1748,53 @@ void vidow_capture_paint_mosaic(struct vidow_server *server,
  * PAINT_CURSORS / screencopy 的 overlay_cursor）。抓帧是场景渲染，场景里没有
  * 光标，所以要光标的客户端得我们自己画上去。 */
 void vidow_capture_paint_cursor(struct wlr_output *output, struct wlr_buffer *dst);
+
+/* ------------------------------------------------------------------ 录屏 */
+
+/* zkde_screencast_unstable_v1：KWin 的私有录屏协议。xdg-desktop-portal-kde 的
+ * ScreenCast 就建在它上面 —— 绑不到这个 global，那个后端**连
+ * org.freedesktop.impl.portal.ScreenCast 接口都不注册**（实测：Hyprland 上也没有），
+ * 所以「KDE 的录屏 portal」在非 KWin 的合成器上不是配错了，是根本不存在。
+ *
+ * 协议要求**合成器自己建 PipeWire 流**、把 node id 通过 created 事件告诉客户端，
+ * 所以这个模块同时是个 PipeWire 生产者：抓帧走 vidow 自己那条路
+ * （vidow_capture_grab），像素进 memfd 缓冲。实现见 screencast.c。 */
+struct vidow_sc_pw;
+struct vidow_sc_pw_stream;
+
+struct vidow_screencast {
+	struct vidow_server *server;
+	struct wl_global *global;
+	struct wl_list streams; /* vidow_screencast_stream.link */
+	struct vidow_sc_pw *pw;
+};
+
+/* 一路流（客户端手上那个 zkde_screencast_stream_unstable_v1）。 */
+struct vidow_screencast_stream {
+	struct wl_list link; /* vidow_screencast.streams */
+	struct wl_resource *resource;
+	struct vidow_screencast *sc;
+	struct wlr_output *output;
+	uint32_t pointer_mode;
+	bool closed;
+	struct wl_listener output_destroy;
+	struct vidow_sc_pw_stream *pw;
+};
+
+/* 建 zkde_screencast_unstable_v1。返回 NULL = 没建成（不致命：录屏用不了，
+ * 别的照常）。 */
+struct vidow_screencast *vidow_screencast_create(struct wl_display *display,
+		struct vidow_server *server);
+/* 这一路流给客户端一个失败原因。协议里没有 error code，failed 事件才是客户端
+ * 认的报错方式（回完它，客户端会 close 掉这一路）。 */
+void vidow_screencast_stream_fail(struct vidow_screencast_stream *stream,
+		const char *why);
+
+/* PipeWire 那一半（screencast.c 内部用）。 */
+struct vidow_sc_pw *vidow_sc_pw_create(struct vidow_screencast *sc,
+		struct wl_display *display);
+void vidow_sc_pw_stream_start(struct vidow_screencast_stream *stream);
+void vidow_sc_pw_stream_destroy(struct vidow_screencast_stream *stream);
 
 /* 这个抓帧源是不是 vidow 自己出的帧（是的话「有人抓帧」不该惊动屏幕 —— 屏幕那
  * 一帧本来就不受影响）。 */

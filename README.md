@@ -690,7 +690,8 @@ ninja -C build
 
 依赖：`wlroots-0.20`（Arch: `wlroots0.20`）、`wayland-server`、`wayland-client`、
 `xkbcommon`、`wayland-scanner`、`xcb`（XWayland 的诊断走 X 连接）、`pixman-1`、
-`egl` + `glesv2`（装饰 / 模糊 / 自定义 shader 走 GLES2）、`lua5.4`。
+`egl` + `glesv2`（装饰 / 模糊 / 自定义 shader 走 GLES2）、`lua5.4`、
+`libpipewire-0.3`（KDE 的录屏 portal 要合成器自己建 PipeWire 流，见 `src/screencast.c`）。
 运行 X11 程序还需要 `xorg-xwayland`（Arch 的 `xorg-xwayland`）。
 
 注意：Arch 的 `wlroots0.20` 包没有安装 `wlr-layer-shell-unstable-v1-protocol.h`（而
@@ -737,6 +738,7 @@ python3 test-float.py        # 三个真实 GTK 窗口，验证浮动模式自�
 ./test-portal.sh raw-gtk             # vidow 不碰 portal 配置，手写一份单独验证协议
 ./test-portal.sh raw-kde             # 同上，换成 KDE
 ./test-portalenv.sh                 # 启动推进 / 退出还原 systemd 用户管理器环境 + 录屏后端探测（19 项断言）
+./test-screencast.sh                 # KDE 的录屏 portal 全链路：协议 → 对话框 → PipeWire node → 真出帧（9 项断言）
 ./test-dpi.sh                        # 混合 DPI + XWayland（全 headless，15 项断言；含「QT_SCALE_FACTOR 不许设」）
 ./test-x11scale.sh                   # X11 逐窗口缩放桥 x11_scale=1（全 headless，16 项断言）
 ./test-scrollcull.sh                 # 滚出视口的列不画到隔壁显示器（全 headless，11 项断言）
@@ -2198,7 +2200,7 @@ portal 相关的两个键：
 
 | 键 | 默认 | 作用 |
 | --- | --- | --- |
-| `portal_desktop` | `Vidow` | vidow 设给自己的 `XDG_CURRENT_DESKTOP`，也是 `<name>-portals.conf` 的那个 name。留空 = 完全不碰 portal |
+| `portal_desktop` | `Vidow` | vidow 设给自己的 `XDG_CURRENT_DESKTOP`，也是 `<name>-portals.conf` 的那个 name。留空 = 完全不碰 portal。写 `"KDE"` 才会让 KDE 后端注册它那批 KWin 私有的 portal（含录屏），代价是所有应用都以为自己在 Plasma 里 |
 | `portal_conf_sync` | `true` | 把生效的 portals.conf 写到 portal 的配置目录，并每次把环境 import 进 systemd 用户管理器（配置真的变了才重启 portal）；`false` = 只算不写、不碰环境 |
 实测：配置里 `grim /tmp/shot-cfg.png` → `code=0`，产出的 1280x720 PNG 四象限颜色正确；
 `grim --nope` → `code=1`，`err="grim: invalid option -- '-'"`。
@@ -2232,6 +2234,25 @@ portal 相关的两个键：
 
 录屏实测：`wf-recorder -f /tmp/rec.mp4 -c h264_vaapi` 在 headless 下正常出流
 （h264 / 1280x720 / nv12），停录后文件可被 `ffprobe` 正常解析。
+
+**给 portal 用的录屏（KDE）**：上面四个协议是给「客户端自己抓帧」用的。桌面 portal 那条路
+（浏览器 / OBS 的「共享屏幕」）走的是另一套 —— 应用问 `org.freedesktop.portal.ScreenCast`，
+后端负责建 PipeWire 流。KDE 那个后端（`xdg-desktop-portal-kde`）用的是 **KWin 的私有协议
+`zkde_screencast_unstable_v1`**，vidow 现在实现了它（`src/screencast.c`）：
+
+| 谁 | 干什么 |
+| --- | --- |
+| 客户端（KDE 后端） | `stream_output(stream, wl_output, pointer_mode)`，然后等 `serial` + `created(node)` |
+| vidow | 建一个 PipeWire 流（memfd 缓冲、BGRx），把 **node id** 通过 `created` 告诉客户端 |
+| 客户端 | `pw_stream_connect(PW_DIRECTION_INPUT, node)` 消费；vidow 在输出提交时抓帧推给它 |
+
+要开这一路，配置里得有一行 `portal_desktop = "KDE"` —— KDE 后端只在
+`XDG_CURRENT_DESKTOP` **整串等于** `KDE` 时才注册它那批 KWin 私有的 portal（见
+`xdg-desktop-portal-kde` 的 `desktopportal.cpp`，`KDE:Vidow` 这种写法不算）。代价是所有应用
+都会以为自己在 Plasma 会话里，不想要就别设。实测：选择器对话框画在 vidow 上、`Start` 返回
+`node=57` / `size=(1280,720)`、`gst-launch-1.0 pipewiresrc path=57` 拿到 6 帧 6 种画面
+（`./test-screencast.sh`）。按窗口 / 按区域 / 虚拟输出录屏还没做（回 `failed`），光标模式
+`hidden` / `embedded` 支持、`metadata` 没做。
 
 ### 输入法（text-input-v3 + input-method-v2）
 
@@ -2722,6 +2743,8 @@ src/clipboard.c X11 <-> Wayland 剪贴板桥（自己接管，不用 wlroots 那
 src/portal.c   portal 要的协议：xdg-foreign v1+v2（共用 registry）、
                foreign-toplevel-management、ext-foreign-toplevel-list + 截图源
                （xdg-activation 在 activation.c）
+src/screencast.c  KDE 的录屏 portal 要的 zkde_screencast_unstable_v1（KWin 私有协议）
+               + 合成器侧的 PipeWire 生产者（见 README 的「截图 / 录屏」）
 src/portalconf.c  portal 后端选择：内置默认（含录屏 / 截图后端探测）→
                ~/.config/vidow/portals.conf 逐键覆盖 → 同步到 portal 的配置目录；
                启动时把环境 import 进 systemd 用户管理器、退出时还原（先快照）
@@ -2768,6 +2791,12 @@ test-portal.sh    私有 dbus 里起 portal + 真实 FileChooser 请求
 test-portalenv.sh 假 systemctl 记下每次调用：启动 import 环境 / 配置没变也 import /
                   退出把环境还原（原来没有的就 unset）/ NO_RESTART 不碰用户管理器 /
                   ScreenCast-Screenshot 按装了哪个后端探测
+test-screencast.sh KDE 的录屏 portal：vidow 暴露 zkde_screencast_unstable_v1 →
+                  XDG_CURRENT_DESKTOP=KDE 时后端才注册 ScreenCast → 点选择器 →
+                  Start 返回 PipeWire node → gst 消费者拿到会变的帧
+tools/screencastprobe.py  发一次真的 ScreenCast 请求（CreateSession → SelectSources
+                  → Start），把每步的 Response / 流尺寸 / node id 打出来；
+                  --hold N 拿到流后别退出（留时间让消费者连上来）
 test-dpi.sh       1x + 2x 两块 headless 屏，量 X11 / Wayland 客户端的缓冲区与
                   落屏设备像素（只准缩小不准放大）、X 全局缩放、指针命中坐标
 test-xwayland-popup.sh  弹出物：识别（含属性晚到）、绝对定位、不套 toplevel 样式
@@ -3653,6 +3682,78 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
      没有**（不误报）；②掐断帧链 + 追踪开：客户端确实交过帧，追踪报出 ERROR 且点名
      HEADLESS-1、写明「客户端还在交帧，屏幕却不更新」；③掐断帧链 + 追踪**关**：一条 trace
      日志都没有、vidow 照样活着（诊断不改变行为）。
+
+163. **KDE 的录屏 portal 在 vidow 上跑通了：实现 KWin 私有协议 `zkde_screencast_unstable_v1`**。
+
+     用户要「KDE 的录屏 portal」。上一轮我判断做不到（KDE 后端的 ScreenCast 建在 KWin 私有
+     协议上），这轮把两条路都走通了 —— 一条在 vidow 里，一条在配置里，缺一不可。
+
+     **① vidow 现在提供 `zkde_screencast_unstable_v1`（v6）**，`src/screencast.c` 新文件，
+     协议 XML 抄自 `plasma-wayland-protocols`（本机 `/usr/share/plasma-wayland-protocols/`，
+     `protocols/zkde-screencast-unstable-v1.xml`）。协议的关键点：**PipeWire 流是合成器建的**，
+     `created(node)` 里那个 node id 指的是合成器进程里的节点，客户端拿它
+     `pw_stream_connect(PW_DIRECTION_INPUT, node)` 消费。所以这个模块同时是个 PipeWire 生产者：
+
+     - PipeWire 的 loop 直接挂进 `wl_event_loop`（`pw_loop_get_fd` + `pw_loop_iterate`）——
+       全程合成器主线程，不用锁、不存在「从 PipeWire 线程往 Wayland 资源上写事件」这种麻烦；
+     - 一路流一个 `pw_stream`（输出方向、`PW_STREAM_FLAG_DRIVER`、memfd 缓冲、格式写死
+       `SPA_VIDEO_FORMAT_BGRx`），`created` 之前按 v6 的要求先发 `serial`（object serial 从
+       registry 的 global 事件里拿，node id 会复用）；
+     - 抓帧走 vidow 自己那条路（`vidow_capture_grab`：`capture = "hide"` 的窗口照样藏得掉），
+       输出提交就抓一帧推进去。
+
+     踩到两个坑，都是「客户端一直黑屏 / 一个缓冲都拿不到」那一类：
+     - **格式给成范围，消费者会挑最小值** —— `SPA_FORMAT_VIDEO_size` 用
+       `SPA_POD_CHOICE_RANGE_Rectangle` 时实测协商出 **1x1**，喂帧全被「缓冲太小」挡掉；改成
+       写死的 `SPA_POD_Rectangle` 之后是 1280x720。要别的尺寸让消费者自己加 filter。
+     - **只在损伤时推帧，静止的屏幕一帧都没有** —— 消费者连上来之后一直是黑的（gst 那边
+       0 个缓冲）。现在图转起来而手上没有帧时当场抓一帧，保证「连上就有画面」。
+
+     **② 还要 `XDG_CURRENT_DESKTOP` 整串等于 `KDE`** —— 这条在 `xdg-desktop-portal-kde` 的
+     `src/desktopportal.cpp` 里写死了：
+
+     ```cpp
+     if (qgetenv("XDG_CURRENT_DESKTOP").compare("KDE", Qt::CaseInsensitive) == 0) {
+         ... ScreenCastPortal / ScreenshotPortal / RemoteDesktopPortal / Clipboard / Wallpaper ...
+     }
+     ```
+
+     是**整串相等**，不是「包含」：实测 `KDE:Vidow`、`Vidow:KDE`、`Vidow:kde`、`VidowXKDE`
+     全都拿不到 ScreenCast 接口（`gdbus introspect` 数出来的）。所以在 vidow 里用 KDE 那套
+     portal，配置写一行就够：
+
+     ```lua
+     portal_desktop = "KDE"
+     ```
+
+     这一行同时把「录屏 / 截图交给谁」也定了：会话名是 KDE 时 `capture_backend()` 直接选
+     `kde`（vidow 这边已经提供它要的协议了），生成的配置是
+     `$XDG_CONFIG_HOME/xdg-desktop-portal/kde-portals.conf`。代价要知道：**所有应用都会以为
+     自己在 Plasma 会话里**（GTK / Qt 的主题、Chromium 的文件对话框选择都会跟着变），不想要
+     就别设。
+
+     **实测（新增 `./test-screencast.sh`，9 项断言全绿）**：私有 dbus + headless vidow
+     （真 `XDG_RUNTIME_DIR`，portal 要连用户会话里的 PipeWire）→ KDE 后端导出 ScreenCast →
+     选择器对话框画在 vidow 上（截图确认过：标题「选择要与发出请求的应用程序共享的屏幕：」，
+     卡片里还有**屏幕缩略图**，那也是走我们这条协议抓的）→ 点卡片 → `Start` 返回
+     `node=57`、`size=(1280, 720)` → `gst-launch-1.0 pipewiresrc path=57` 拿到 **6 帧、
+     6 种不同画面**（开一个纯蓝窗口 + 开关一次 overview 制造变化）。
+
+     **还没做的**（都回 `failed`，不是静默失败）：按窗口 / 按区域 / 虚拟输出录屏。按窗口那条
+     还差一层：KDE 的窗口列表来自 `org_kde_plasma_window_management`（KWin 私有），vidow 没
+     实现，所以对话框里那栏写的是「没有打开的窗口」。光标模式 `hidden` / `embedded` 都实现了，
+     `metadata`（把光标位置当 PipeWire 元数据发）还没做。
+
+     还有两件小事，都是「只在没有 PipeWire 的会话里才露头」的（测试环境正好就是）：
+
+     - **不该在日志里留 ERROR**。第一版把「连不上 PipeWire」打成了 ERROR，
+       `test-blur2out.sh` 立刻红了（它断言日志里没有 ERROR）—— 录屏是可选功能，起不来是
+       INFO，不是 ERROR。
+     - **心跳定时器的 data 是 `pw`，失败路径里 `free(pw)` 之后它还在响** —— 野指针，
+       一秒后必崩（`test-ipc.sh` 报「段错误」，`coredumpctl` 里栈顶就是 `pw_tick`）。
+       失败路径里必须把定时器也摘掉。
+
+     **新增依赖**：`libpipewire-0.3`（meson 里 `dependency('libpipewire-0.3', version: '>=0.3.60')`）。
 
 162. **退出 vidow 要把 portal 的环境还回去；录屏后端不是 KDE**。
 

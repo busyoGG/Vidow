@@ -19,6 +19,8 @@ pixman_dep = dependency('pixman-1')
 xcb_dep = dependency('xcb')
 # 输出缓冲的格式常量（DRM_FORMAT_XRGB8888 / XRGB2101010）：vidow.output 的 depth。
 drm_dep = dependency('libdrm')
+# 录屏（KDE 的 portal 要合成器自己建 PipeWire 流，见 src/screencast.c）
+pipewire_dep = dependency('libpipewire-0.3', version: '>=0.3.60')
 # 剪贴板桥（clipboard.c）靠 XFixes 监听 X 侧的 owner 变化。
 xcb_xfixes_dep = dependency('xcb-xfixes')
 # 配置语言：Lua 5.4（Arch 的 lua54 包）。没有就退回系统默认 lua。
@@ -89,6 +91,21 @@ sc_server_code = custom_target('wlr-screencopy-unstable-v1-server-protocol.c',
   output: 'wlr-screencopy-unstable-v1-server-protocol.c',
   command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
 
+# 录屏（KWin 私有协议 zkde_screencast_unstable_v1）：xdg-desktop-portal-kde 的
+# ScreenCast 建在它上面 —— 拿不到这个 global，它连 org.freedesktop.impl.portal.ScreenCast
+# 接口都不注册（实测：Hyprland 上也没有），所以非 KWin 的合成器上「KDE 的录屏」根本
+# 不存在。协议要求**合成器自己建 PipeWire 流**并把 node 告诉客户端，所以这个模块
+# 同时是个 PipeWire 生产者（见 src/screencast.c）。
+zkde_xml = 'protocols/zkde-screencast-unstable-v1.xml'
+zkde_server_header = custom_target('zkde-screencast-unstable-v1-server-protocol.h',
+  input: zkde_xml,
+  output: 'zkde-screencast-unstable-v1-server-protocol.h',
+  command: [wayland_scanner, 'server-header', '@INPUT@', '@OUTPUT@'])
+zkde_server_code = custom_target('zkde-screencast-unstable-v1-protocol.c',
+  input: zkde_xml,
+  output: 'zkde-screencast-unstable-v1-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
+
 sources = files(
   'src/main.c',
   'src/output.c',
@@ -126,8 +143,9 @@ sources = files(
   'src/capture.c',
   'src/jelly.c',
   'src/screencopy.c',
+  'src/screencast.c',
 ) + [layer_shell_header, bgeffect_header, xa_server_header,
-     eics_server_header, sc_server_header]
+     eics_server_header, sc_server_header, zkde_server_header]
 
 # 测试工具：用虚拟指针模拟鼠标拖拽
 vp_xml = 'protocols/wlr-virtual-pointer-unstable-v1.xml'
@@ -326,10 +344,10 @@ executable('vidow',
   # ext_foreign_toplevel_handle_v1_interface（窗口抓帧源的参数类型），那个
   # interface 结构在这个协议的 private-code 里（libwlroots 没导出这些符号）。
   sources + [bgeffect_code, xa_server_code, eics_server_code, sc_server_code,
-             etl_code],
+             etl_code, zkde_server_code],
   dependencies: [wlroots_dep, xkbcommon_dep, wayland_server_dep, math_dep,
                  egl_dep, gles2_dep, pixman_dep, lua_dep, xcb_dep,
-                 xcb_xfixes_dep, drm_dep],
+                 xcb_xfixes_dep, drm_dep, pipewire_dep],
   include_directories: include_directories('.'),
   install: false)
 

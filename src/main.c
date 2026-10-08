@@ -339,6 +339,9 @@ int main(int argc, char *argv[]) {
 	 * vidow 另外渲染的一帧 —— 藏起来的东西屏幕上照常显示，只在抓帧里没有。 */
 	server.capture_manager = vidow_capture_manager_create(server.display, &server);
 	server.screencopy = vidow_screencopy_create(server.display, &server);
+	/* 录屏：KDE 的录屏 portal（xdg-desktop-portal-kde）只认 KWin 这个私有协议，
+	 * 拿不到它连 ScreenCast 接口都不注册。见 screencast.c。 */
+	server.screencast = vidow_screencast_create(server.display, &server);
 	/* 会话管线（约束 / dmabuf feedback / 帧回调）仍用 wlroots 那份，只有
 	 * 「输出抓帧源」换成 vidow 的；窗口抓帧源（ext-foreign-toplevel-*）也是
 	 * wlroots 的，所以那边还要靠 capturemask.c 的会话监听兜着。 */

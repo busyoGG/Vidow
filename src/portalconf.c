@@ -26,6 +26,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <strings.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -70,10 +71,19 @@ static const char *default_lines[] = {
  * vidow 自己实现了 zwlr_screencopy_manager_v1（screencopy.c），两个都能用。
  * 装了哪个用哪个，wlr 优先（更轻，就是为这个场景写的）；一个都没装就一个字都不
  * 写 —— 写了等于骗客户端。用户仍可在 ~/.config/vidow/portals.conf 里覆盖。 */
-static const char *capture_backend(void) {
+static const char *capture_backend(const struct vidow_config *cfg) {
 	static const char *const files[] = { "wlr.portal", "hyprland.portal" };
 	static const char *const names[] = { "wlr", "hyprland" };
 	static const char *const fallback_dirs = "/usr/local/share:/usr/share";
+
+	/* 会话名写成 KDE 的话，KDE 后端就是可用的那个（它那套 KWin 私有 portal 只在
+	 * XDG_CURRENT_DESKTOP 整串等于 KDE 时才注册，见 desktopportal.cpp），而
+	 * vidow 这边提供了它要的 zkde_screencast_unstable_v1 —— 那就直接用 KDE，
+	 * 别去借 hyprland 的后端。用户想要「KDE 的录屏」时只需要配置里写一行
+	 * portal_desktop = "KDE"。 */
+	if (strcasecmp(cfg->portal_desktop, "KDE") == 0) {
+		return "kde";
+	}
 
 	const char *dirs = getenv("XDG_DATA_DIRS");
 	if (dirs == NULL || *dirs == '\0') {
@@ -537,7 +547,7 @@ void vidow_portal_conf_sync(const struct vidow_config *cfg) {
 
 	/* 录屏 / 截图按装了哪个后端来定（GTK 没有这两个接口，KDE 的走 KWin 私有
 	 * IPC），见 capture_backend()。用户覆盖在下一步，仍能改掉这两行。 */
-	const char *capture = capture_backend();
+	const char *capture = capture_backend(cfg);
 	if (capture != NULL && n + 2 <= MAX_LINES) {
 		snprintf(eff[n].key, KEY_LEN, "%s", "org.freedesktop.impl.portal.ScreenCast");
 		snprintf(eff[n].value, VAL_LEN, "%s", capture);
