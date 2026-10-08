@@ -107,6 +107,10 @@ struct vidow_sc_pw_stream {
 	bool cursor_hashed;
 	/* 光标元数据报过了（只在 metadata 模式、协商到格式之后报一次）。 */
 	bool meta_announced;
+	/* 给消费者发过多少帧；第一帧顺手看一眼是不是黑的（「有流但黑屏」这类报告
+	 * 光靠日志分不清是**我们发的就是黑的**还是消费者那边没画）。 */
+	uint64_t frames;
+	bool first_checked;
 };
 
 /* SPA_META_Cursor 的元数据空间大小：位置 / 热点每帧都给，位图最多
@@ -435,6 +439,24 @@ static void pw_stream_fill(struct vidow_sc_pw_stream *ps,
 	buf->datas[0].chunk->offset = 0;
 	buf->datas[0].chunk->size = size;
 	buf->datas[0].chunk->stride = (int32_t)stride;
+
+	ps->frames++;
+	if (!ps->first_checked) {
+		/* 第一帧报一句：黑屏那类报告（「第一次录是黑的」）看这一行就知道是我们
+		 * 发的图就是黑的，还是消费者没画。每 64 个像素采一个，代价可以忽略。 */
+		ps->first_checked = true;
+		const uint8_t *px = buf->datas[0].data;
+		size_t n = 0, lit = 0;
+		for (size_t i = 0; i + 3 < size; i += 4 * 64) {
+			n++;
+			if (px[i] > 8 || px[i + 1] > 8 || px[i + 2] > 8) {
+				lit++;
+			}
+		}
+		wlr_log(WLR_INFO,
+			"screencast: 第一帧 %ux%u（非黑 %zu%%，采样 %zu 点）",
+			width, height, n > 0 ? 100 * lit / n : 0, n);
+	}
 
 	if (ps->stream->pointer_mode == ZKDE_SCREENCAST_UNSTABLE_V1_POINTER_METADATA) {
 		stream_fill_cursor(ps, buf);
@@ -818,6 +840,10 @@ void vidow_sc_pw_stream_destroy(struct vidow_screencast_stream *stream) {
 		wlr_buffer_unlock(ps->pending);
 		ps->pending = NULL;
 	}
+	/* 这路流一共给了多少帧：跟「第一帧」那条对着看，「有流但黑屏 / 不动」是
+	 * 帧不够还是帧本身有问题，一眼分得出来。 */
+	wlr_log(WLR_INFO, "screencast: 这路流给了 %llu 帧",
+		(unsigned long long)ps->frames);
 	if (ps->output_commit.link.prev != NULL) {
 		wl_list_remove(&ps->output_commit.link);
 	}
@@ -1057,8 +1083,15 @@ static void handle_stream_window(struct wl_client *client,
 			"vidow: 这个窗口还没有大小");
 		return;
 	}
+	/* 窗口在哪块屏上：按**布局坐标**里那块框找（view->geom + 动画偏移），不能用
+	 * vidow_view_geometry() —— 那是客户端声明的窗口几何，它的 x/y 是**表面内部**
+	 * 的偏移（一般就是 0,0），拿来当布局坐标使，反查出来永远是布局左上角那块屏。
+	 * 窗口在非 0 那块屏上时，后果是三件（实测）：① 光标元数据在错的那块屏上找
+	 * 光标 → 永远 id=0（「非 0 显示器上采集不到光标」）；② 流尺寸乘的是错那块屏
+	 * 的 scale（缩放屏上分辨率不对）；③ 输出提交那条抓帧路盯的也是错那块屏。 */
+	struct wlr_box at = vidow_view_screen_box(view);
 	struct wlr_output *output = wlr_output_layout_output_at(sc->server->output_layout,
-		geom.x + geom.width / 2, geom.y + geom.height / 2);
+		at.x + at.width / 2, at.y + at.height / 2);
 	if (output == NULL) {
 		output = view->output;
 	}
@@ -1094,8 +1127,9 @@ static void handle_stream_window(struct wl_client *client,
 	}
 	stream->view_destroy.notify = stream_handle_view_destroy;
 	wl_signal_add(&view->ftl_handle->events.destroy, &stream->view_destroy);
-	wlr_log(WLR_INFO, "screencast: 请求录窗口「%s」（%s，%dx%d）",
-		vidow_view_title(view), vidow_view_app_id(view),
+	wlr_log(WLR_INFO, "screencast: 请求录窗口「%s」（%s，%s scale %.2f → %dx%d）",
+		vidow_view_title(view), vidow_view_app_id(view), output->name,
+		output->scale > 0 ? output->scale : 1.0,
 		stream->out_w, stream->out_h);
 
 	vidow_sc_pw_stream_start(stream);

@@ -177,7 +177,7 @@ fi
 # 等选择器出现，回车确认（「共享」按钮在右下角，但对话框的窗口几何和按钮实际
 # 位置差着几十像素 —— 点坐标在内容不同的几轮里会飘；回车走的是同一个 accept 路径，
 # 而且默认选中第一行，稳）。
-wait_and_share() {
+wait_dialog() {
 	local geo="" i
 	for i in $(seq 1 40); do
 		sleep 1
@@ -195,6 +195,12 @@ for w in ws:
 ')
 		[ -n "$geo" ] && break
 	done
+	echo "$geo"
+}
+
+wait_and_share() {
+	local geo i
+	geo=$(wait_dialog)
 	[ -z "$geo" ] && return 1
 	sleep 1
 	for i in $(seq 1 20); do
@@ -388,8 +394,21 @@ for i in $(seq 1 30); do
 done
 timeout 150 python3 /home/busyo/Dev/Vidow/tools/screencastprobe.py --types 2 \
 	--cursor-mode 4 --timeout 60 --hold 30 >"$R/probe6.txt" 2>&1 &
-if wait_and_share; then
-	pass "窗口 + metadata 那轮的选择器弹出来了（cursor_mode=4 透传）"
+# 这一轮走**双击卡片预览**那条交互（用户要的：预览在上、名字在下，点预览就是选，
+# 双击直接确认），顺带把它钉住。第一张卡片的预览中心 = 对话框原点 +（108, 182）：
+# 边框 12 + 标题一行 + 段落标题一行 + 预览 176x110 的中心。
+DGEO=$(wait_dialog)
+if [ -n "${DGEO:-}" ]; then
+	set -- $DGEO
+	$VM --socket "$IPC" move-cursor $(( $1 + 108 )) $(( $2 + 182 )) >/dev/null 2>&1
+	sleep 0.6
+	$VM --socket "$IPC" pointer-button click left 2 >/dev/null 2>&1
+	sleep 2
+	if $VM --socket "$IPC" windows 2>/dev/null | grep -aq "共享屏幕"; then
+		fail "双击卡片预览没确认（对话框还开着；对话框在 $DGEO）"
+	else
+		pass "双击第一张卡片的预览直接确认了（对话框关了）"
+	fi
 else
 	fail "窗口 + metadata 那轮没等到选择器"
 fi

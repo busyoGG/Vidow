@@ -79,9 +79,10 @@
 #define BUS_NAME "org.freedesktop.impl.portal.desktop.vidow"
 #define OBJECT_PATH "/org/freedesktop/portal/desktop"
 
-/* 缩略图多大（像素）。抓回来的是整屏原图，缩到这么大再给 GTK。 */
-#define THUMB_W 240
-#define THUMB_H 150
+/* 缩略图多大（像素）。抓回来的是整屏原图，缩到这么大再给 GTK。卡片是「预览在上、
+ * 名字在下」，用户要预览小一点，所以比 KDE 那个尺寸还收了一圈。 */
+#define THUMB_W 176
+#define THUMB_H 110
 /* 一行最多几张卡片（KDE 的选择器是一格一格的卡片，不是「缩略图 + 右边一个按钮」
  * 的列表）。 */
 #define CARD_COLS 3
@@ -1507,10 +1508,24 @@ static void on_toggle(GtkToggleButton *button, gpointer data) {
 	}
 }
 
-/* 加一张卡片：名字（就是选择开关）+ 预览图 + 一行小字（分辨率 / app_id）。
- * 布局照 KDE 的选择器：一格一张卡片、预览占主要面积、名字和单选在预览上面
- * （Kirigami.AbstractCard 的 header + content）。以前是「缩略图在左、右边一个
- * 大按钮」的列表，用户看着不像 KDE。grid 的第 line 行第 col 列。 */
+/* 双击一格 = 直接确认（用户要的「双击直接确认」）。单击只是选中，那是开关按钮
+ * 自己的事（toggled）。双击那一下 GTK 也会当成一次点击，所以这里先把它显式选上，
+ * 再走「共享」那条路 —— 对话框当场关掉，后面那个 release 落不到东西上了。 */
+static gboolean on_card_press(GtkWidget *widget, GdkEventButton *event,
+		gpointer data) {
+	(void)data;
+	if (event->type != GDK_2BUTTON_PRESS || event->button != 1) {
+		return FALSE;
+	}
+	gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(widget), TRUE);
+	dialog_accept();
+	return TRUE;
+}
+
+/* 加一张卡片：**预览在上、名字在下**，整张卡片就是一个开关按钮 —— 点预览（或者
+ * 名字、小字，反正在卡片上）就是选中这一格，双击直接确认。以前是「缩略图在左、
+ * 右边一个大按钮」的列表，再早是「名字在上、预览在下」，用户要的是现在这样。
+ * grid 的第 line 行第 col 列。 */
 static struct row *add_card(GtkWidget *grid, int col, int line, enum row_kind kind,
 		void *ptr, const char *title, const char *sub) {
 	struct row *r = calloc(1, sizeof(*r));
@@ -1520,28 +1535,35 @@ static struct row *add_card(GtkWidget *grid, int col, int line, enum row_kind ki
 	r->kind = kind;
 	r->ptr = ptr;
 
-	GtkWidget *card = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
-	gtk_widget_set_margin_bottom(card, 4);
-	gtk_grid_attach(GTK_GRID(grid), card, col, line, 1, 1);
-
-	GtkWidget *toggle = gtk_toggle_button_new_with_label(title);
-	gtk_widget_set_tooltip_text(toggle, title);
-	g_signal_connect(toggle, "toggled", G_CALLBACK(on_toggle), NULL);
-	gtk_box_pack_start(GTK_BOX(card), toggle, FALSE, FALSE, 0);
-	r->toggle = toggle;
+	GtkWidget *toggle = gtk_toggle_button_new();
+	GtkWidget *card = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+	gtk_container_add(GTK_CONTAINER(toggle), card);
+	gtk_widget_set_margin_bottom(toggle, 4);
+	gtk_grid_attach(GTK_GRID(grid), toggle, col, line, 1, 1);
 
 	GtkWidget *image = gtk_image_new();
 	gtk_widget_set_size_request(image, THUMB_W, THUMB_H);
 	gtk_box_pack_start(GTK_BOX(card), image, FALSE, FALSE, 0);
 	r->image = image;
 
+	GtkWidget *label = gtk_label_new(title);
+	gtk_label_set_xalign(GTK_LABEL(label), 0.0);
+	gtk_label_set_ellipsize(GTK_LABEL(label), PANGO_ELLIPSIZE_END);
+	gtk_widget_set_size_request(label, THUMB_W, -1);
+	gtk_box_pack_start(GTK_BOX(card), label, FALSE, FALSE, 0);
+
 	if (sub != NULL && sub[0] != '\0') {
-		GtkWidget *label = gtk_label_new(sub);
-		gtk_label_set_xalign(GTK_LABEL(label), 0.0);
-		gtk_label_set_ellipsize(GTK_LABEL(label), PANGO_ELLIPSIZE_END);
-		gtk_widget_set_size_request(label, THUMB_W, -1);
-		gtk_box_pack_start(GTK_BOX(card), label, FALSE, FALSE, 0);
+		GtkWidget *sub_label = gtk_label_new(sub);
+		gtk_label_set_xalign(GTK_LABEL(sub_label), 0.0);
+		gtk_label_set_ellipsize(GTK_LABEL(sub_label), PANGO_ELLIPSIZE_END);
+		gtk_widget_set_size_request(sub_label, THUMB_W, -1);
+		gtk_box_pack_start(GTK_BOX(card), sub_label, FALSE, FALSE, 0);
 	}
+
+	gtk_widget_set_tooltip_text(toggle, title);
+	g_signal_connect(toggle, "toggled", G_CALLBACK(on_toggle), NULL);
+	g_signal_connect(toggle, "button-press-event", G_CALLBACK(on_card_press), NULL);
+	r->toggle = toggle;
 
 	rows = g_list_append(rows, r);
 	return r;
@@ -1577,7 +1599,7 @@ static void dialog_show(struct request *req) {
 	uint32_t types = s->types != 0 ? s->types : SOURCE_TYPE_MONITOR;
 	GtkWidget *win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
 	gtk_window_set_title(GTK_WINDOW(win), "共享屏幕");
-	gtk_window_set_default_size(GTK_WINDOW(win), 3 * THUMB_W + 4 * 12, 640);
+	gtk_window_set_default_size(GTK_WINDOW(win), 3 * THUMB_W + 4 * 12, 520);
 	gtk_window_set_position(GTK_WINDOW(win), GTK_WIN_POS_CENTER_ALWAYS);
 	gtk_window_set_type_hint(GTK_WINDOW(win), GDK_WINDOW_TYPE_HINT_DIALOG);
 	gtk_container_set_border_width(GTK_CONTAINER(win), 12);
