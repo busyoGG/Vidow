@@ -2307,12 +2307,13 @@ portal_capture = "wlr"   -- 借 xdg-desktop-portal-wlr：没有选择器，直�
 portal_capture = "none"  -- ScreenCast / Screenshot 两行都不写
 ```
 
-实测（`./test-portal-own.sh`，41 项）：私有 dbus + headless vidow → `vidow.portal` 落地、
+实测（`./test-portal-own.sh`，47 项）：私有 dbus + headless vidow → `vidow.portal` 落地、
 `vidow-portal` 占住总线名 → 前端把 ScreenCast / Screenshot 指到它 → 选择器画在 vidow 上
 （标题「共享屏幕」，第一行默认选中）→ 回车确认 → `Start` 返回 `node` / `size`：
 整屏（1280x720）、**窗口**（`source_type=2`，尺寸报窗口的）、**虚拟输出**（合成器里真多出
 一块 `HEADLESS-N`，流结束又拔掉）三种都出帧；`Screenshot` 回一个真 PNG（1280x720）、
-`PickColor` 回 `(ddd)` 颜色；光标元数据那条路消费者能拿到 `SPA_META_Cursor`。
+`PickColor` 回 `(ddd)` 颜色；光标元数据那条路消费者能拿到 `SPA_META_Cursor`（整屏和
+**窗口**两条路都验：光标放在窗口中间时元数据里的位置就在流的中间，见 173）。
 
 截图（`Screenshot` / `PickColor`）**不走 PipeWire**：后端自己就是客户端，抓一帧像素、
 写个 PNG、把文件 URI 回给前端（写在 `$XDG_CACHE_HOME/vidow-portal/`）。
@@ -2883,7 +2884,8 @@ test-portal-own.sh vidow 自己的录屏 portal（不依赖 KDE）：vidow.porta
                   对话框画在 vidow 上 → 点「共享」→ Start 返回 node → gst 消费者拿到会变的帧；
                   窗口 / 虚拟输出 / 截图取色 / 光标元数据（含缩放 2 倍的坐标换算与 hidden 反证）
                   —— 窗口那一轮的流尺寸要和 portal 报的一致（消费者按报的尺寸协商时，
-                  对不上就是一帧都拿不到，见 172 的 ⑥）（41 项）
+                  对不上就是一帧都拿不到，见 172 的 ⑥）；窗口 + metadata（OBS 那个组合）
+                  那轮光标元数据要有 id=1 + 位图 + 位置落在流的中间（见 173）（47 项）
 test-screencast.sh KDE 的录屏 portal（portal_capture = "kde" 那条路）：vidow 暴露 zkde_screencast_unstable_v1 →
                   XDG_CURRENT_DESKTOP=KDE 时后端才注册 ScreenCast → 点选择器 →
                   Start 返回 PipeWire node → gst 消费者拿到会变的帧
@@ -3816,6 +3818,8 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
           2 倍的屏上位置翻倍。现在统一走 `cursor_dst_pos()`（先减布局原点再乘 scale），嵌入
           光标和元数据位置共用它。`vidow_capture_grab_view()` 的取景也抽成
           `vidow_capture_view_box()`，窗口流的元数据位置和渲染取景用的是同一份换算。
+          （**173 把这条推翻了**：172 ⑥ 之后窗口流改走取景器，`vidow_capture_view_box`
+          的换算跟流对不上 —— 窗口流的光标元数据因此永远是 `id=0`，两个函数一起删了。）
        ② **screencopy 的引用计数**（`src/screencopy.c`）：`capture_output()` 里 `sc_client->ref++`
           排在「输出不可用就回 failed」**后面**，可 `frame_destroy()` 一律会 unref —— 抓到一块
           正在销毁的输出（比如录屏对话框的缩略图赶上虚拟输出被拔掉）就白扣一次，把 manager
@@ -3831,6 +3835,60 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
        口子（screencopy / ext-image-copy-capture 同样对所有客户端开放，grim / OBS 靠它），
        而要收就得连它一起收 —— 那会把 grim / wf-recorder / OBS 全废掉。要边界得靠 sandbox
        那一层（别的进程拿不到 wayland socket），不是合成器。
+
+173. **按窗口录屏的光标元数据修好了**（OBS 那个 `cursor_mode=4`）：有画面了，光标不进来
+      （用户报的「有画面了，但光标没进来，无法控制光标的显示隐藏」）。
+
+      ① **根因：窗口流的取景框还在用旧的坐标系。** OBS 的 SelectSources 里
+      `cursor_mode=4`（metadata）= 光标不进画面，位置 / 热点 / 位图走 PipeWire 缓冲的
+      `SPA_META_Cursor`，消费者（OBS）自己合成。我们这边算「光标在流里的哪儿」用的是
+      `vidow_capture_view_box`（**窗口的布局几何 + 屏的缩放**，172 ⑥ 之前那条
+      「把别的窗口关掉、按布局框渲染一屏」的取景）。172 ⑥ 之后窗口流改成了取景器
+      （窗口**等比缩放进流**），两个坐标系就分家了：674×748 的流里，取景框被算成
+      944×708、缩放 0.42，光标位置一算就落到流外面 —— 元数据里 `id=0`
+      （spa 里 `id=0` 就是「没有可见光标」），OBS 一个光标都不画。
+      实测（真 portal 链路 + `tools/cursorprobe` 当消费者，指针放在窗口中间）：
+      修之前 `meta=1 buffers=1 id=0 pos=0,0 hotspot=0,0 bitmap=0`。
+      **OBS 那边的行为也查清了**（`plugins/linux-pipewire/screencast-portal.c`）：
+      `if (available_cursor_modes & PORTAL_CURSOR_MODE_METADATA) → 要 metadata` —— 只要
+      合成器**报得出** metadata（我们报 7 = hidden|embedded|metadata），OBS 就**永远**
+      选 metadata，跟它自己那个「显示光标」（`settings["ShowCursor"]`）无关；那个开关
+      只管它**要不要把元数据里的光标画上去**（`cursor.visible`）。所以「无法控制光标的
+      显示隐藏」正是这条：报得出 metadata 就得给对，不然勾上勾下都没光标。
+
+      ② **修法：让取景器自己报框。** 新增 `vidow_win_grab_frame_box()`，和
+      `vidow_win_grab_render` 里那次「等比摆进 out_w × out_h」是**同一套算法**：返回
+      「流像素 0..out_w / 0..out_h 对应的那块布局矩形」+「布局逻辑 → 流像素」的缩放，
+      于是 `(布局坐标 - 框原点) × 缩放 = 流里的像素位置`（那圈黑边也算在框里，所以
+      光标落在信箱边上照样报得出来）。窗口停到屏外（藏起来的工作区 / 滚出视口）返回
+      false —— 那种窗口不在屏上，没有「光标指着它」这回事。
+
+      ③ **光标坐标的换算也修了**（`capture.c` 的 `cursor_dst_pos`）：原来把
+      `wlr_output_cursor` 的 **输出像素** 坐标直接当布局坐标用（`oc->x + (obox.x -
+      box.x) * scale`），只有在「抓帧缩放 == 屏的缩放」时才对 —— 整屏 / 区域抓帧正好
+      是这样，所以一直没暴露。现在先把光标换回布局坐标、再乘抓帧的缩放。
+      实测（test-portal-own 6e 那条「缩放 2 倍时逻辑 100,100 → 像素 200,200」照旧过）。
+
+      ④ 顺带两件：**embedded 模式的窗口流以前根本不画光标**（代码里写着「窗口是等比
+      缩放进流的，光标跟窗口不在一个坐标系里」—— 现在有坐标系了），一起补上；
+      `stream_grab` 里 `win_grab == NULL`（录着的时候把窗口关了）补了守卫 —— 抓帧那条
+      路（输出提交 / 1Hz 心跳）还会再来问一次，不挡的话下一次输出提交就在
+      `mirror_extents` 里空指针崩（coredump 栈：`mirror_extents ← vidow_win_grab_render
+      ← stream_grab ← stream_handle_output_commit`；反证：把守卫摘掉重跑，关窗口后
+      vidow 当场挂，带上守卫「还活着」）。
+
+      ⑤ 顺手清掉死代码：`vidow_capture_grab_view` / `vidow_capture_view_box` 和那套
+      `solo_begin/solo_end`（渲染那一瞬间把别的窗口和 layer 全关掉）—— 172 ⑥ 之后
+      窗口抓帧都走取景器，没人用了。
+
+      ⑥ 回归判据（`test-portal-own.sh` 从 42 项到 47 项）：新增 6b2「按窗口录屏 +
+      cursor_mode=4」（复用 6b 那个窗口，等上一路流收摊再开），断言 `id=1` + 有位图 +
+      位置落在流的中间。实测：`meta=1 buffers=1 id=1 pos=317,354 hotspot=3,1 bitmap=1
+      fmt=11 size=24x24 stride=96`（流 674×748，中心 337,374 —— 指针放在窗口格子中心，
+      差那 20px 是客户端阴影边距的一半：表面 674×748 比窗口几何 634×708 大 40）。
+      **坑**：6b2 一开始自己又开了一个 pattern 窗口，而 6b 那个刚被 kill（关窗有动画，
+      还在窗口列表里）—— 选择器默认选中正在消失的那个，Start 一直不回，后面虚拟输出
+      那轮也跟着 `code=2`；改成复用同一个窗口 + 等上一路流退出就稳了。
 
 172. **按窗口录屏 / 预览换成 vidow 自己的截图源**：要一帧就渲染一帧，跟窗口在屏幕上
       摆在哪没关系（用户报的「窗口录制还是不对：状态 streaming → pause → streaming，

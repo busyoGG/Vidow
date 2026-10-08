@@ -515,12 +515,14 @@ static void stream_fill_cursor(struct vidow_sc_pw_stream *ps, struct spa_buffer 
 		scale = stream->scale;
 		break;
 	case VIDOW_SC_WINDOW: {
-		double s = 0;
-		if (vidow_capture_view_box(stream->sc->server, stream->view,
-				stream->out_w, stream->out_h, &box, &s) == NULL) {
+		/* 取景框按**取景器**算：流里的画面是「窗口等比缩放进 out_w × out_h」，
+		 * 跟屏的缩放不是一回事（见 vidow_win_grab_frame_box）。以前拿布局几何
+		 * 和屏的缩放换算，光标位置落到流外面，元数据里永远是 id=0 —— OBS 那条
+		 * 路（cursor_mode=4）的表现就是「有画面、光标不进来」。 */
+		if (!vidow_win_grab_frame_box(stream->win_grab, stream->out_w,
+				stream->out_h, &box, &scale)) {
 			return;
 		}
-		scale = s;
 		break;
 	}
 	case VIDOW_SC_OUTPUT:
@@ -592,7 +594,7 @@ static void stream_fill_cursor(struct vidow_sc_pw_stream *ps, struct spa_buffer 
  * 四种来源各抓各的：
  *   OUTPUT / VIRTUAL  整块输出那一帧（虚拟输出也是一块真输出）
  *   REGION            这块屏上的一个矩形（布局坐标 + 缩放）
- *   WINDOW            只这一个窗口（等比缩放填满流，见 vidow_capture_grab_view）
+ *   WINDOW            只这一个窗口（取景器渲染，见 wincapture.c）
  */
 static struct wlr_buffer *stream_grab(struct vidow_sc_pw_stream *ps) {
 	struct vidow_screencast_stream *stream = ps->stream;
@@ -613,6 +615,12 @@ static struct wlr_buffer *stream_grab(struct vidow_sc_pw_stream *ps) {
 		/* 走窗口自己的取景器（私有场景 + 镜像，见 wincapture.c）：跟它在屏幕上
 		 * 摆在哪没关系 —— 按布局坐标抓的话，窗口滚出视口 / 停到屏外之后那块坐标
 		 * 里什么都没有，录到的是**一片黑**。 */
+		if (stream->win_grab == NULL) {
+			/* 窗口没了（取景器跟着拆了）：这路流没内容了。抓帧那条路（输出
+			 * 提交 / 1Hz 心跳）还会再来问一次 —— 实测：不挡的话下一次输出
+			 * 提交就在 mirror_extents 里空指针崩了。 */
+			return NULL;
+		}
 		frame = vidow_win_grab_render(stream->win_grab, stream->out_w,
 			stream->out_h);
 		break;
@@ -626,16 +634,29 @@ static struct wlr_buffer *stream_grab(struct vidow_sc_pw_stream *ps) {
 		return NULL;
 	}
 	if (stream->pointer_mode == ZKDE_SCREENCAST_UNSTABLE_V1_POINTER_EMBEDDED) {
-		if (stream->kind == VIDOW_SC_REGION) {
+		switch (stream->kind) {
+		case VIDOW_SC_REGION:
 			/* 区域抓帧：光标位置和区域框都在布局坐标里，直接把框给出去
 			 * （框外的光标不画）。 */
 			vidow_capture_paint_cursor_box(stream->sc->server, stream->output,
 				frame, &cursor_box, cursor_scale);
-		} else if (stream->kind == VIDOW_SC_OUTPUT ||
-				stream->kind == VIDOW_SC_VIRTUAL) {
+			break;
+		case VIDOW_SC_WINDOW:
+			/* 窗口抓帧也画：取景框和缩放有了（vidow_win_grab_frame_box），
+			 * 光标跟窗口在同一个坐标系里了。停到屏外的窗口不算 —— 那时没有
+			 * 「光标指着它」这回事。 */
+			if (vidow_win_grab_frame_box(stream->win_grab, stream->out_w,
+					stream->out_h, &cursor_box, &cursor_scale)) {
+				vidow_capture_paint_cursor_box(stream->sc->server,
+					stream->output, frame, &cursor_box, cursor_scale);
+			}
+			break;
+		case VIDOW_SC_OUTPUT:
+		case VIDOW_SC_VIRTUAL:
+		default:
 			vidow_capture_paint_cursor(stream->sc->server, stream->output, frame);
+			break;
 		}
-		/* 窗口抓帧不画光标：窗口是等比缩放进流的，光标跟窗口不在一个坐标系里。 */
 	}
 	return frame;
 }

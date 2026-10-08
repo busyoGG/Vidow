@@ -96,20 +96,25 @@ struct vidow_win_grab {
 	struct wl_listener scene_output_destroy;
 };
 
-/* 日志里那个名字。窗口可能已经没了（表面销毁和我们这一趟在同一个事件循环轮次里，
- * 视图先走一步）—— 那就不碰它，别在日志上读一块已经 free 的内存。 */
-static const char *grab_label(struct vidow_win_grab *grab) {
+/* 视图还在不在。窗口可能已经没了（表面销毁和我们这一趟在同一个事件循环轮次里，
+ * 视图先走一步）—— 碰 grab->view 之前先在这儿认一下，别读一块已经 free 的内存。 */
+static bool grab_view_alive(const struct vidow_win_grab *grab) {
 	struct vidow_view *view;
-	bool alive = false;
-	if (grab->view != NULL) {
-		wl_list_for_each(view, &grab->server->views, link) {
-			if (view == grab->view) {
-				alive = true;
-				break;
-			}
+	if (grab->view == NULL) {
+		return false;
+	}
+	wl_list_for_each(view, &grab->server->views, link) {
+		if (view == grab->view) {
+			return true;
 		}
 	}
-	const char *title = alive ? vidow_view_title(grab->view) : NULL;
+	return false;
+}
+
+/* 日志里那个名字。 */
+static const char *grab_label(struct vidow_win_grab *grab) {
+	const char *title = grab_view_alive(grab) ?
+		vidow_view_title(grab->view) : NULL;
 	return title != NULL ? title : "(无题)";
 }
 
@@ -203,6 +208,53 @@ bool vidow_win_grab_box(struct vidow_win_grab *grab, int *width, int *height) {
 
 struct wlr_swapchain *vidow_win_grab_swapchain(struct vidow_win_grab *grab) {
 	return grab->output.swapchain;
+}
+
+/* 抓帧框（**布局坐标**）+「布局逻辑 → 流像素」的缩放：跟 vidow_win_grab_render
+ * 里那次「等比摆进 out_w × out_h」是同一套算法（那圈黑边也算在框里）。返回的框
+ * 就是**流像素 0..out_w / 0..out_h 对应的那块布局矩形**，于是
+ *
+ *     (布局坐标 - 框原点) × 缩放 = 流里的像素位置
+ *
+ * 按窗口录屏的光标要按它换算：那条路是「窗口等比缩放进流」，缩放跟屏的缩放不是
+ * 一回事（窗口 400x300 摆进 400x300 的流是 1 倍，窗口 954x1068 摆进 674x748 的流
+ * 是 0.7 倍），拿屏的框去换算，位置会整个落到流外面 —— 表现就是「有画面、光标不
+ * 进来」（OBS 的 cursor_mode=4 那条路，实测元数据里 id=0）。
+ *
+ * 窗口停到屏外（藏起来的工作区 / 滚出视口）时返回 false：那种窗口不在屏上，没有
+ * 「光标指着它」这回事。 */
+bool vidow_win_grab_frame_box(struct vidow_win_grab *grab, int out_w, int out_h,
+		struct wlr_box *box, double *scale) {
+	if (grab == NULL || box == NULL || scale == NULL) {
+		return false;
+	}
+	struct wlr_box ext = {0};
+	if (!mirror_extents(grab, &ext) || !grab_view_alive(grab) ||
+			grab->view->scene_parked) {
+		return false;
+	}
+	struct wlr_box at = vidow_view_screen_box(grab->view);
+	if (out_w <= 0 || out_h <= 0) {
+		out_w = ext.width;
+		out_h = ext.height;
+	}
+	double sx = (double)out_w / ext.width;
+	double sy = (double)out_h / ext.height;
+	double s = sx < sy ? sx : sy;
+	if (s <= 0) {
+		return false;
+	}
+	/* 外接框等比缩放后居中 → 反推回「整块流对应的布局矩形」。 */
+	double lw = (double)out_w / s;
+	double lh = (double)out_h / s;
+	*box = (struct wlr_box){
+		.x = (int)lround(at.x + ext.x - (lw - ext.width) / 2.0),
+		.y = (int)lround(at.y + ext.y - (lh - ext.height) / 2.0),
+		.width = (int)lround(lw),
+		.height = (int)lround(lh),
+	};
+	*scale = s;
+	return true;
 }
 
 /* 渲染一帧：窗口等比缩放摆进 out_w × out_h（剩下的边是黑的），返回**加锁的**

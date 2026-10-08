@@ -1761,16 +1761,6 @@ struct wlr_buffer *vidow_capture_grab(struct vidow_server *server,
  * 尺寸 = round(w*scale) × round(h*scale)）。按区域录屏 / 按区域截图用它。 */
 struct wlr_buffer *vidow_capture_grab_box(struct vidow_server *server,
 		struct wlr_output *output, const struct wlr_box *box, double scale);
-/* 抓一个窗口（只有它自己：别的窗口和各个 layer 在渲染那一瞬间被关掉），等比缩放
- * 填进 out_w × out_h（窗口比小就放大、大就缩小，剩下的边是黑的）。 */
-struct wlr_buffer *vidow_capture_grab_view(struct vidow_server *server,
-		struct vidow_view *view, int out_w, int out_h);
-/* 窗口抓帧的取景：把窗口几何等比塞进 out_w × out_h（letterbox）后要渲染的那块
- * （**布局坐标**）和「逻辑 → 像素」的缩放。按窗口录屏时，光标也要按这个框换算。
- * 返回这块屏（窗口不在任何一块屏上时返回 NULL）。 */
-struct wlr_output *vidow_capture_view_box(struct vidow_server *server,
-		struct vidow_view *view, int out_w, int out_h, struct wlr_box *box,
-		double *scale);
 
 /* layer 的内容节点（surface 的 buffer）：wlroots 把它包在 subsurface tree 里，
  * 所以要递归找。抓帧遮挡（capturemask.c）和马赛克（capture.c）都要用它。 */
@@ -2085,6 +2075,12 @@ bool vidow_win_grab_box(struct vidow_win_grab *grab, int *width, int *height);
 struct wlr_buffer *vidow_win_grab_render(struct vidow_win_grab *grab,
 		int out_w, int out_h);
 struct wlr_swapchain *vidow_win_grab_swapchain(struct vidow_win_grab *grab);
+/* 抓帧框（**布局坐标**）+「布局逻辑 → 流像素」的缩放，和 render 里那次等比摆放
+ * 是同一套算法：`(布局坐标 - 框原点) × 缩放` = 流里的像素位置。录屏的光标按它
+ * 换算（按窗口录屏的缩放跟屏的缩放不是一回事）。窗口停到屏外 / 已经没了返回
+ * false。 */
+bool vidow_win_grab_frame_box(struct vidow_win_grab *grab, int out_w, int out_h,
+		struct wlr_box *box, double *scale);
 void vidow_place_view(struct vidow_view *view, int x, int y, int w, int h);
 
 /* 最小化 / 放回（见 view.c）：

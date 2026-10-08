@@ -312,6 +312,11 @@ fi
 # 对话框这一轮只列窗口（types=2），第一个窗口默认选中 —— 点「共享」就是「录这个
 # 窗口」。窗口的 identifier 由 ext-foreign-toplevel-list 给，原样回给合成器。
 echo; echo "== 6b. 按窗口录屏 =="
+# 第 7 节起的 bluewin 到这儿没用了，先收掉：按窗口录屏这几轮靠 pattern，列表里只剩
+# 一个窗口，「第一行是谁」就没歧义（留着它的话被录的是 bluewin —— 尺寸恰好一样，
+# 断言会「碰巧对」）。
+pkill -f "tools/bluewin.py" 2>/dev/null
+sleep 1
 python3 /home/busyo/Dev/Vidow/tools/pattern.py >"$R/pattern.log" 2>&1 &
 PWIN=$!
 for i in $(seq 1 20); do
@@ -363,6 +368,99 @@ if [ -n "${NODE2:-}" ]; then
 	else
 		fail "窗口流只拿到 $NW 帧：$(head -2 "$R/gst-win.log" 2>/dev/null | tr '\n' ' ')"
 	fi
+fi
+
+# --- 6b2 按窗口录屏 + 光标元数据（metadata） --------------------------------
+# 用户报的 OBS 那条路就是这个组合：SelectSources 里 cursor_mode=4（metadata）+
+# 录的是**窗口**。窗口流的画面是「窗口等比缩放进流」，那个缩放跟屏的缩放不是一回事
+# （跟窗口在屏上多大无关）。光标要是按屏的框换算，位置整个落到流外面 —— 元数据里
+# 永远是 id=0，表现就是「有画面、光标不进来」。
+#
+# 这一轮**复用 6b 那个窗口**（6b 的 kill 挪到后面）：窗口只剩一个，选择器里第一个
+# 就是它。不然刚 kill 掉的那个还在窗口列表里（关窗有动画），选择器默认选中它，
+# Start 会卡在那个正在消失的窗口上（实测：Start 一直不回，后面的虚拟输出那轮也跟着
+# 报 code=2）。
+echo; echo "== 6b2. 按窗口录屏 + 光标元数据（OBS 那个组合） =="
+# 6b 那路流还挂着（--hold 20）：等它自己收摊再开这一路，别两条会话叠着。
+for i in $(seq 1 30); do
+	pgrep -f "screencastprobe.py --types 2" >/dev/null 2>&1 || break
+	sleep 1
+done
+timeout 150 python3 /home/busyo/Dev/Vidow/tools/screencastprobe.py --types 2 \
+	--cursor-mode 4 --timeout 60 --hold 30 >"$R/probe6.txt" 2>&1 &
+if wait_and_share; then
+	pass "窗口 + metadata 那轮的选择器弹出来了（cursor_mode=4 透传）"
+else
+	fail "窗口 + metadata 那轮没等到选择器"
+fi
+NODE6=$(wait_node "$R/probe6.txt")
+if [ -n "${NODE6:-}" ]; then
+	pass "窗口 + metadata 流拿到了 node（node=$NODE6）"
+else
+	fail "窗口 + metadata 流没拿到 node：$(tail -3 "$R/probe6.txt" 2>/dev/null | tr '\n' ' ')"
+fi
+WSIZE6=$(grep -ao "size': ([0-9]*, [0-9]*)" "$R/probe6.txt" 2>/dev/null | head -1 |
+	grep -o "[0-9]*, [0-9]*" | tr -d ' ')
+# 光标要放到**真被录的那个窗口**中间：列表里第一行才是被录的，别按标题猜
+# （这一轮录的是谁，合成器日志里写着）。
+REC6=$(grep -a "screencast: 请求录窗口" "$R/vidow.log" 2>/dev/null | tail -1 |
+	sed -n 's/.*请求录窗口「\([^」]*\)」.*/\1/p')
+WGEO2=$($VM --socket "$IPC" windows 2>/dev/null | python3 -c '
+import json,sys
+want = sys.argv[1]
+try:
+    ws=json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for w in ws:
+    if (w.get("title") or "") == want:
+        g=w["geometry"]
+        print("%d %d %d %d" % (g["x"], g["y"], g["width"], g["height"]))
+        break
+' "${REC6:-}")
+# 光标放到窗口**中间**：窗口铺满它那一格，取景框就是窗口表面，中心对中心。
+if [ -n "${WGEO2:-}" ] && [ -n "${NODE6:-}" ]; then
+	set -- $WGEO2
+	CX=$(( $1 + $3 / 2 ))
+	CY=$(( $2 + $4 / 2 ))
+	$VM --socket "$IPC" move-cursor "$CX" "$CY" >/dev/null 2>&1
+	sleep 1
+	./build/cursorprobe "$NODE6" --declare --timeout 15 >"$R/cursor6.txt" 2>&1
+	CL6=$(grep -a "bitmap=1" "$R/cursor6.txt" 2>/dev/null | head -1)
+	if [ -n "${CL6:-}" ]; then
+		pass "窗口流也拿到了光标位图：$CL6"
+	else
+		fail "窗口流没拿到光标位图：$(head -2 "$R/cursor6.txt" 2>/dev/null | tr '\n' ' ')"
+	fi
+	if echo "${CL6:-}" | grep -q "id=1"; then
+		pass "窗口流的元数据里 id=1（有可见光标）"
+	else
+		fail "窗口流的元数据里 id≠1：${CL6:-没数据}"
+	fi
+	POS6=$(python3 - "$R/cursor6.txt" "${WSIZE6:-0,0}" <<'PY6'
+import re, sys
+line = ""
+for l in open(sys.argv[1], errors="replace"):
+    if "bitmap=1" in l:
+        line = l
+        break
+w, h = (int(x) for x in sys.argv[2].split(","))
+m = re.search(r"pos=(-?\d+),(-?\d+)", line)
+if not m or w <= 0:
+    print("没读到位置（流 %dx%d）" % (w, h))
+else:
+    x, y = int(m.group(1)), int(m.group(2))
+    mid = (abs(x - w / 2) <= 40 and abs(y - h / 2) <= 40)
+    print("%s pos=%d,%d 流 %dx%d 中心 %d,%d" %
+          ("OK" if mid else "BAD", x, y, w, h, w // 2, h // 2))
+PY6
+)
+	case "$POS6" in
+	OK*) pass "光标在窗口中间 → 元数据里的位置就在流的中间（$POS6）" ;;
+	*) fail "光标位置不对：$POS6" ;;
+	esac
+else
+	fail "窗口几何 / node 没拿到，光标那几条测不了（录的是 ${REC6:-?}，WGEO2=${WGEO2:-空}，node=${NODE6:-空}）"
 fi
 kill $PWIN 2>/dev/null
 
