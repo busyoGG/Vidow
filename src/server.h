@@ -2032,16 +2032,18 @@ void vidow_closing_start(struct vidow_server *server,
 /* ------------------------------------------------------------------ layout */
 
 void vidow_arrange(struct vidow_server *server);
-/* 有人正拿着这个窗口的画面吗（窗口截图源 / 录屏 / 预览）：拿着的时候不剔除它 ——
- * 剔除是把场景节点关掉，抓画面那条路读的就是场景节点，关了就抓不到帧（见 view.c）。 */
+/* 有人正拿着这个窗口的画面吗（窗口截图源 / 录屏 / 预览）：拿着的时候照样剔除
+ * （停到屏外）—— 抓帧渲染的是窗口自己的一份镜像，跟它在屏幕上摆在哪没关系；
+ * 拿着只影响一件事：视口外补帧那条路会一直给它补帧回调（见 view.c）。 */
 bool vidow_view_capture_held(const struct vidow_view *view);
 /* 这个窗口的矩形和它自己那块屏有交集吗（滚出视口的列要按它剔除，见 view.c）。 */
 bool vidow_view_in_output_box(struct vidow_server *server,
 		const struct vidow_view *view);
 /* 把窗口**显示**的部分裁到自己那块屏里。场景图是一张全局坐标的图，跨过屏边界的
  * 窗口，越出去的那一块会落进隔壁屏的框里被它画出来（用户报的「滚动后超出视口的
- * 窗口跑到另一个显示器里面」）。裁的是显示：几何、客户端、录屏抓帧都不动。浮窗 /
- * 正被拖的窗口 / overview / 有人录屏的窗口不裁（它们本来就允许跨屏）。 */
+ * 窗口跑到另一个显示器里面」）。裁的是显示：几何、客户端、录屏抓帧都不动 ——
+ * 按窗口录屏渲染的是窗口自己的一份镜像（wincapture.c），不在这棵树上。浮窗 /
+ * 正被拖的窗口 / overview / 停到屏外的窗口不裁（它们本来就允许跨屏）。 */
 void vidow_view_apply_clip(struct vidow_view *view);
 /* 「它现在该停到所有输出框外面吗」：滚出自己那块屏 / 工作区藏起来 / 最小化 → 该停。
  * 判据只有这一份（view_anim_place 每帧现算，workspace.c 的可见性那一趟也问它）。 */
@@ -2057,6 +2059,12 @@ void vidow_view_render_pump(struct vidow_server *server,
 void vidow_view_capture_hold(struct vidow_view *view,
 		struct vidow_server *server,
 		struct wlr_ext_image_capture_source_v1 *source, struct wl_client *client);
+/* 给这个窗口建一个截图源（按窗口录屏 / 预览）。**自己的实现**，不是 wlroots 那份
+ * 场景节点的：那份按损伤出帧、抓的是「这块坐标里的一切」、还跟着节点位置走，三个
+ * 都出过问题（详见 src/wincapture.c 开头）。这里渲染的是窗口自己的一份镜像，
+ * 跟它在屏幕上摆在哪、被谁压着、裁没裁都没关系。 */
+struct wlr_ext_image_capture_source_v1 *vidow_win_capture_source_create(
+		struct vidow_server *server, struct vidow_view *view);
 void vidow_place_view(struct vidow_view *view, int x, int y, int w, int h);
 
 /* 最小化 / 放回（见 view.c）：

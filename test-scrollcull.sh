@@ -20,6 +20,11 @@
 #   7) **挂着截图源（选择器预览 / OBS 录屏）时，视口外的窗口照样不串屏**：隔壁屏
 #      还是 0 个窗口色像素，同时录屏那头拿得到帧、画面在校验和上是变的 ——
 #      「藏」必须做成停到屏外（不是关场景节点），关了的话录到 / 预览到的就是黑。
+#   8) **半块越界 + 挂着截图源**：也不许漏到隔壁屏（抓帧渲染的是窗口自己的一份
+#      镜像，跟屏幕上那份裁没裁没关系，见 src/wincapture.c）。
+#   9) **静止的窗口滚到视口外照样出帧**：窗口不重绘时场景里没有任何损伤，按损伤
+#      出帧的截图源给不出帧（选择器的预览卡在「等第一帧」，OBS 的流一会儿
+#      streaming 一会儿 paused）—— 客户端要一帧就渲染一帧。
 #
 # 用法：./test-scrollcull.sh   （VIDOW_TEST_KEEP=1 保留运行目录）
 set -u
@@ -105,10 +110,13 @@ hidden() { grep -a "workspace: cull-$1 藏起" "$LOG" | wc -l; }
 # 不看日志计数：开窗 / 滚动的动画里窗口会从屏边界上扫过去，路上被停过一次，计数
 # 会把那些瞬态也算进来。
 vis() { # vis <列号> -> true / false
+	vis_raw "cull-$1"
+}
+vis_raw() { # vis_raw <标题> -> true / false（它现在画在屏幕上没有）
 	./build/vidowmsg windows 2>/dev/null | python3 -c '
 import sys, json
 w = next((w for w in json.load(sys.stdin)
-          if w.get("title") == "cull-" + sys.argv[1]), None)
+          if w.get("title") == sys.argv[1]), None)
 print("true" if w and w.get("visible") else "false")' "$1"
 }
 count() { grep -ac "$1" "$LOG" 2>/dev/null || true; }
@@ -174,6 +182,27 @@ after=$(grep -c "^frame " "$RUNDIR/beat-1.log" 2>/dev/null || echo 0)
 	pass "cull-1 藏起来之后还在出帧（$before → $after 帧）" ||
 	fail "cull-1 被冻住了（帧数 $before → $after）"
 
+winpix() { # winpix <png> -> 窗口色像素个数（heartbeat.py 的蓝底：g≈89、b≈191）
+	python3 - "$1" <<'PY'
+import sys
+from PIL import Image
+
+im = Image.open(sys.argv[1]).convert("RGB")
+px = im.load()
+n = 0
+for y in range(0, im.size[1], 4):
+    for x in range(0, im.size[0], 4):
+        r, g, b = px[x, y]
+        if abs(g - 89) <= 24 and abs(b - 191) <= 24:
+            n += 1
+print(n)
+PY
+}
+cap_frames() { grep -ac "^capture " "$1" 2>/dev/null || true; }
+cap_sums() {
+	grep -a "^capture " "$1" 2>/dev/null | awk '{print $3}' | sort -u | wc -l
+}
+
 mark "5) 半块越界：跨过屏边界的那一块不画到隔壁屏上"
 # 把中间那列调成 2/3 宽（853）：布局变成 634 + 853 + 634 装不下 1280 —— 右边的
 # 那列就从屏里伸出去一截，跨过 1280 这条屏边界。修之前越出去的那一截正好落在
@@ -238,6 +267,28 @@ sys.exit(0 if ok else 1)
 PY
 [ $? -eq 0 ] || FAILED=1
 
+# 5b) 同一列，这次挂着截图源（选择器预览 / OBS 正在录它）：隔壁屏照样一个像素都
+# 不许有。裁的是**显示**那一份，抓帧渲染的是窗口自己的一份镜像 —— 两边互不影响。
+# 以前这里是个取舍：裁的是场景节点，而 wlroots 那份窗口截图源渲染的就是同一棵树，
+# 一裁录到的窗口就少一块，于是「有人录屏就不裁」→ 越界那半块照样串屏。
+straddler_one=$(echo $straddler | awk '{print $1}')
+if [ -n "$straddler_one" ]; then
+	setsid nohup ./build/capture "$straddler_one" 20 10 > "$RUNDIR/cap-5b.txt" 2>&1 &
+	CAP_5B=$!
+	CLIENT_PIDS="$CLIENT_PIDS $CAP_5B"
+	sleep 1.8
+	grim -o HEADLESS-1 "$RUNDIR/neighbor-5b.png" 2>/dev/null
+	sleep 0.8
+	kill "$CAP_5B" 2>/dev/null
+	n5b=$(winpix "$RUNDIR/neighbor-5b.png")
+	f5b=$(cap_frames "$RUNDIR/cap-5b.txt")
+	echo "      挂着截图源的 $straddler_one：隔壁屏 $n5b 个窗口色像素，录到 ${f5b:-0} 帧"
+	[ "$n5b" = 0 ] && pass "挂着截图源，越界那半块也不画到隔壁屏上" ||
+		fail "挂着截图源就漏到隔壁屏上了（$n5b 个像素）"
+	[ "${f5b:-0}" -ge 8 ] && pass "挂着截图源照样录到 ${f5b} 帧" ||
+		fail "挂着截图源录不到帧（${f5b:-0} 帧）"
+fi
+
 mark "6) 有人录屏 / 预览时，视口外的窗口照样不串屏（两头都对）"
 # 选择器一打开就给每个窗口挂一个预览用的截图源（OBS 点共享也是同一条路）。挂着
 # 截图源的窗口进「强制渲染」那条路 —— 以前那条路会**跳过剔除**（怕录到一片黑），
@@ -248,22 +299,6 @@ mark "6) 有人录屏 / 预览时，视口外的窗口照样不串屏（两头�
 #
 # 两个顺序都要测：先挂上再滚出去（OBS 先开、再滚窗口），以及窗口已经在视口外
 # 才挂上（选择器预览 / OBS 选的就是一个当前看不见的窗口）。
-winpix() { # winpix <png> -> 窗口色像素个数（heartbeat.py 的蓝底：g≈89、b≈191）
-	python3 - "$1" <<'PY'
-import sys
-from PIL import Image
-
-im = Image.open(sys.argv[1]).convert("RGB")
-px = im.load()
-n = 0
-for y in range(0, im.size[1], 4):
-    for x in range(0, im.size[0], 4):
-        r, g, b = px[x, y]
-        if abs(g - 89) <= 24 and abs(b - 191) <= 24:
-            n += 1
-print(n)
-PY
-}
 out_of_view() { # out_of_view <列号> -> 0 = 它整个滚出自己那块屏了
 	python3 - "$LOG" "$1" <<'PY'
 import re, sys
@@ -278,11 +313,6 @@ print("  %s  cull-%s 整个滚出自己那块屏（x=%d，宽 %d）" % (
 sys.exit(0 if x >= 1280 else 1)
 PY
 }
-cap_frames() { grep -ac "^capture " "$1" 2>/dev/null || true; }
-cap_sums() {
-	grep -a "^capture " "$1" 2>/dev/null | awk '{print $3}' | sort -u | wc -l
-}
-
 # 6a) 先挂上截图源（窗口还在画面上，跟 OBS 点共享一样），再把窗口滚出视口
 ./build/vidowmsg focus-column 1 >/dev/null 2>&1
 sleep 1.0
@@ -375,10 +405,8 @@ echo "      动画中途四张：隔壁屏窗口色像素 =$mid_px"
 [ "$mid_bad" = 0 ] && pass "滚回来的路上隔壁屏一直是 0 个窗口色像素" ||
 	fail "滚回来的路上串屏了（$mid_px）"
 
-# 6e) 有人在录它的时候滚回来：录屏那一份要完整（不裁），隔壁屏这一档**已知**会漏
-# 一点（见 README 的「已知的取舍」：裁剪作用在场景节点上，而窗口截图源渲染的就是
-# 同一棵树 —— 裁了录到的窗口就少一块）。这里只断言「录屏没被搞坏」，隔壁屏的像素
-# 数打出来当参考。
+# 6e) 录着它滚出视口：录屏那头帧不能断，隔壁屏这一档也不许漏 —— 抓帧渲染的是窗口
+# 自己的一份镜像，跟屏幕上那份裁没裁没关系（以前这里是个取舍，见 5b 的说明）。
 setsid nohup ./build/capture cull-3 20 10 > "$RUNDIR/cap-e.txt" 2>&1 &
 CAP_E=$!
 CLIENT_PIDS="$CLIENT_PIDS $CAP_E"
@@ -392,13 +420,50 @@ grim -o HEADLESS-1 "$RUNDIR/mid-e.png" 2>/dev/null
 kill "$CAP_E" 2>/dev/null
 fe=$(cap_frames "$RUNDIR/cap-e.txt")
 se=$(cap_sums "$RUNDIR/cap-e.txt")
-echo "      录着它滚出视口：隔壁屏 $(winpix "$RUNDIR/mid-e.png") 个窗口色像素（已知取舍）"
+ne=$(winpix "$RUNDIR/mid-e.png")
+echo "      录着它滚出视口：隔壁屏 $ne 个窗口色像素，录到 ${fe:-0} 帧"
+[ "$ne" = 0 ] && pass "录着它滚出视口，隔壁屏一个窗口色像素都没有" ||
+	fail "录着它滚出视口又漏到隔壁屏上了（$ne 个像素）"
 [ "${fe:-0}" -ge 10 ] && pass "录着它滚出视口照样录到 $fe 帧" ||
 	fail "录着它滚出视口录不到帧（$fe 帧）"
 [ "${se:-0}" -ge 2 ] && pass "抓到的画面在校验和上有 $se 种（是活的）" ||
 	fail "抓到的画面不变（$se 种校验和）"
 ./build/vidowmsg set-config window_move_ms 200 >/dev/null 2>&1
 sleep 0.5
+
+mark "6f) 静止的窗口滚到视口外：照样出帧（按损伤出帧那条路的老毛病）"
+# bluewin 是一块纯色、画完就歇的窗口：它滚到视口外之后场景里**没有任何损伤**。
+# wlroots 那份窗口截图源只在场景有损伤时才渲染（"We can only emit frames with
+# damage"），客户端 `capture` 要的那一帧就永远不来 —— 选择器的预览卡在「等第一帧」
+# 而且不再重试（把窗口挪回视口也还是没预览），OBS 的流一会儿 streaming 一会儿
+# paused（error 是 none：协议里没这个错，就是没帧）。量过：修之前 3 秒只出 1 帧。
+setsid nohup python3 ./tools/bluewin.py > "$RUNDIR/blue.log" 2>&1 &
+BLUE_PID=$!
+CLIENT_PIDS="$CLIENT_PIDS $BLUE_PID"
+for _ in $(seq 1 60); do grep -aq "place bluewin -> " "$LOG" && break; sleep 0.2; done
+sleep 0.8
+for _ in 1 2 3 4; do
+	[ "$(vis_raw bluewin)" = false ] && break
+	./build/vidowmsg focus-column 1 >/dev/null 2>&1
+	sleep 0.4
+done
+sleep 1.0
+echo "      $(grep -a 'place bluewin -> ' "$LOG" | tail -1 | sed 's/.*place //')"
+if [ "$(vis_raw bluewin)" = false ]; then
+	pass "bluewin 停到屏外了（静止窗口，没人给它补帧）"
+else
+	fail "bluewin 还在画面上，这一节测不到"
+fi
+setsid nohup ./build/capture bluewin 3 30 > "$RUNDIR/cap-f.txt" 2>&1 &
+CAP_F=$!
+CLIENT_PIDS="$CLIENT_PIDS $CAP_F"
+sleep 4.0
+kill "$CAP_F" 2>/dev/null
+ff=$(cap_frames "$RUNDIR/cap-f.txt")
+echo "      静止窗口在视口外抓 3 秒：$(grep -a 'buffer_size' "$RUNDIR/cap-f.txt" | tail -1 | sed 's/.*buffer_size/buffer_size/')，${ff:-0} 帧"
+[ "${ff:-0}" -ge 30 ] && pass "静止窗口滚到视口外照样出 ${ff} 帧（要一帧渲染一帧）" ||
+	fail "静止窗口滚到视口外只有 ${ff:-0} 帧 —— 客户端要的那一帧被丢了（修之前是 1 帧）"
+kill "$BLUE_PID" 2>/dev/null
 
 mark "7) 没崩、没断言"
 pgrep -x vidow >/dev/null && pass "合成器还活着" || fail "合成器挂了"

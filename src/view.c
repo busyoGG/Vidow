@@ -853,16 +853,19 @@ static bool view_clip_box(struct vidow_view *view, struct wlr_box *out) {
 	struct vidow_server *server = view->server;
 	if (!view->mapped || view->float_mode != VIDOW_FLOAT_NONE ||
 			view->dragging || vidow_overview_active(server) ||
-			vidow_view_capture_held(view) || view->output == NULL ||
+			view->output == NULL ||
 			view->geom.width <= 0 || view->geom.height <= 0) {
 		return false;
 	}
 	/* 弹出物先不裁：它的位置是相对父窗口算的，越界那点（菜单探出去一条）
-	 * 先留着。停到停车位上的窗口也不裁：它本来就不在任何一块屏里（不用裁），
-	 * 而且裁的是场景节点的显示范围 —— 按窗口录屏的截图源渲染的是同一棵树，
-	 * 一裁录到的窗口就少一块。判据现算（跟摆位那份同一份，见
-	 * vidow_view_should_park）：只看存下来的标志会在「这一帧刚从停车位摆回来、
-	 * 还没走 arrange」的时候落后一帧。 */
+	 * 先留着。停到停车位上的窗口也不裁：它本来就不在任何一块屏里（不用裁）。
+	 * 判据现算（跟摆位那份同一份，见 vidow_view_should_park）：只看存下来的
+	 * 标志会在「这一帧刚从停车位摆回来、还没走 arrange」的时候落后一帧。
+	 *
+	 * **有人录屏 / 预览也照裁**（以前这儿会跳过）：按窗口录屏的截图源现在渲染的
+	 * 是这个窗口自己的一份镜像（src/wincapture.c），跟这块节点裁没裁没关系 ——
+	 * 不裁的话，跨屏那半块会一直画在隔壁显示器上（用户报的「开了 obs 就完全没
+	 * 藏住」）。 */
 	if (vidow_view_should_park(server, view)) {
 		return false;
 	}
@@ -918,7 +921,9 @@ void vidow_view_apply_clip(struct vidow_view *view) {
 	 * subsurface 树**，别的树上找不到就直接 assert（`found` failed，vidow 当场
 	 * abort，踩过两次：X11 的对话框窗口、X11 的弹出物）。所以只给 Wayland 的
 	 * xdg toplevel —— X11 / 弹出物那两份靠 fx 那块离屏缓冲（默认配置装饰开着，
-	 * 窗口画的就是它）。 */
+	 * 窗口画的就是它）。
+	 *
+	 * 裁的是**显示**：截图源抓的是窗口自己那份镜像，不在这一棵树上。 */
 	if (view->xdg_toplevel == NULL) {
 		/* X11 / 弹出物：表面那一份裁不了（见上），记成「没裁过」—— 免得
 		 * 以后哪天真拿到一棵能裁的树时，被一个过期的局部框挡掉。 */

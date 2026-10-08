@@ -144,6 +144,7 @@ sources = files(
   'src/jelly.c',
   'src/screencopy.c',
   'src/screencast.c',
+  'src/wincapture.c',
 ) + [layer_shell_header, bgeffect_header, xa_server_header,
      eics_server_header, sc_server_header, zkde_server_header]
 

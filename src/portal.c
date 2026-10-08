@@ -106,13 +106,11 @@ static void capture_request(struct wl_listener *listener, void *data) {
 		return;
 	}
 
-	/* 按窗口录屏：source 直接指向窗口的场景节点，跟随窗口移动和重绘。
-	 * 它的生命周期挂在场景节点上，节点没了 source 也就没了。 */
+	/* 按窗口录屏：我们自己那份截图源（见 src/wincapture.c）—— 它渲染的是这个
+	 * 窗口自己的一份镜像，跟窗口在屏幕上摆在哪、有没有被裁、停没停到屏外都没
+	 * 关系，客户端要一帧就出一帧。生命周期挂在窗口表面上：表面没了源也就没了。 */
 	struct wlr_ext_image_capture_source_v1 *source =
-		wlr_ext_image_capture_source_v1_create_with_scene_node(
-			&view->scene_tree->node,
-			wl_display_get_event_loop(server->display),
-			server->allocator, server->renderer);
+		vidow_win_capture_source_create(server, view);
 	if (source == NULL) {
 		wlr_log(WLR_ERROR, "portal: 无法为窗口创建截图源");
 		return;
