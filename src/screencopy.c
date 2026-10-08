@@ -397,7 +397,7 @@ static void frame_handle_output_commit(struct wl_listener *listener, void *data)
 	}
 
 	if (frame->overlay_cursor) {
-		vidow_capture_paint_cursor(output, src);
+		vidow_capture_paint_cursor(frame->manager->server, output, src);
 	}
 
 	bool ok = frame->buffer_cap == WLR_BUFFER_CAP_DMABUF
@@ -544,11 +544,19 @@ static void capture_output(struct wl_client *client,
 	frame->output = output;
 	frame->overlay_cursor = overlay_cursor != 0;
 	frame->dmabuf_format = DRM_FORMAT_INVALID;
+	/* 引用**先拿住**：frame_destroy() 一律会 unref，下面每条路（包括「输出不可用」
+	 * 直接回 failed）都会走到它。放在后面的话，「输出不可用」那条路会白扣一次，
+	 * 把 manager 资源还指着的这个 client 提前 free 掉 —— 下一次 capture_output
+	 * 就在 wl_list_insert(&manager->frames) 上段错误（踩过：录屏 dialog 的缩略图
+	 * 抓到一块正在销毁的输出，之后整个合成器崩）。 */
+	sc_client->ref++;
 
 	frame->resource = wl_resource_create(client,
 		&zwlr_screencopy_frame_v1_interface, version, id);
 	if (frame->resource == NULL) {
 		wl_client_post_no_memory(client);
+		frame->client = NULL;
+		sc_client->ref--;
 		free(frame);
 		return;
 	}
@@ -563,8 +571,6 @@ static void capture_output(struct wl_client *client,
 		frame_destroy(frame);
 		return;
 	}
-
-	sc_client->ref++;
 
 	frame->output_destroy.notify = frame_handle_output_destroy;
 	wl_signal_add(&output->events.destroy, &frame->output_destroy);
