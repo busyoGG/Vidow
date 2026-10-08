@@ -2258,20 +2258,25 @@ portal_capture = "wlr"   -- 借 xdg-desktop-portal-wlr：没有选择器，直�
 portal_capture = "none"  -- ScreenCast / Screenshot 两行都不写
 ```
 
-实测（`./test-portal-own.sh`，32 项）：私有 dbus + headless vidow → `vidow.portal` 落地、
+实测（`./test-portal-own.sh`，41 项）：私有 dbus + headless vidow → `vidow.portal` 落地、
 `vidow-portal` 占住总线名 → 前端把 ScreenCast / Screenshot 指到它 → 选择器画在 vidow 上
 （标题「共享屏幕」，第一行默认选中）→ 回车确认 → `Start` 返回 `node` / `size`：
 整屏（1280x720）、**窗口**（`source_type=2`，尺寸报窗口的）、**虚拟输出**（合成器里真多出
 一块 `HEADLESS-N`，流结束又拔掉）三种都出帧；`Screenshot` 回一个真 PNG（1280x720）、
-`PickColor` 回 `(ddd)` 颜色。
+`PickColor` 回 `(ddd)` 颜色；光标元数据那条路消费者能拿到 `SPA_META_Cursor`。
 
 截图（`Screenshot` / `PickColor`）**不走 PipeWire**：后端自己就是客户端，抓一帧像素、
 写个 PNG、把文件 URI 回给前端（写在 `$XDG_CACHE_HOME/vidow-portal/`）。
 `options.interactive = true`（或者 `PickColor`）会把那一帧冻住铺满屏，让用户框一块 / 点一下。
 
-光标模式 `hidden` / `embedded` 支持；`metadata`（往 PipeWire 缓冲里塞 `SPA_META_Cursor`）
-还没做，所以 `AvailableCursorModes` 报的是 1|2 —— 客户端要 metadata 时拿不到，别的地方不受影响。
-KDE 后端那条路（`portal_capture = "kde"`）仍然可用，见 `./test-screencast.sh`。
+光标三种模式都支持（`AvailableCursorModes` 报 7）：`hidden` 不带光标、`embedded` 按屏幕上的
+样子画进画面（放大摇晃那种大光标也一样）、`metadata` **不进画面**，改成每帧往 PipeWire 缓冲的
+`SPA_META_Cursor` 里写位置 + 热点，光标图变了才附上位图（`bitmap_offset=0` = 沿用上一次那张），
+消费者自己合成 —— 光标永远清晰、跟着消费者的缩放走，Firefox / OBS 这类客户端就是这么要的。
+注意元数据是**双方协商**的：消费者得自己声明 `SPA_META_Cursor`（GStreamer 的 `pipewiresrc`
+声明的是范围，我们的固定值落在里面），否则缓冲里压根没有这个元数据（验证工具见
+`./build/cursorprobe --declare`）。KDE 后端那条路（`portal_capture = "kde"`）仍然可用，
+见 `./test-screencast.sh`。
 
 **注意**：`zkde_screencast_unstable_v1` 是对所有客户端开放的（KWin 那份也是），也就是说不经过
 portal 的客户端也能自己绑它录屏 —— 和 KWin 同一个模型。要收紧的话得在 `bind` 里按 PID / app_id
@@ -2814,6 +2819,8 @@ tools/bgblur.c    半透明窗口 + 指定模糊区域，用来验证 ext-backgr
 tools/foreign.c   xdg-foreign 导出端：打印 v1 / v2 两个 handle，给 portal 当 parent_window
 tools/foreign-app.py  GTK4 客户端版本（export_handle + set_transient_for_exported），
                   验证真实客户端的 xdg-foreign 路径
+tools/cursorprobe.c 当 screencast 流的消费者，把缓冲里的 SPA_META_Cursor 读出来
+                  （GStreamer 不解这个元数据）：验证 pointer_mode=metadata
 test-portal.sh    私有 dbus 里起 portal + 真实 FileChooser 请求
                   gtk/kde 验证协议链路，switch-gtk/switch-kde 验证配置生成链路
 test-portalenv.sh 假 systemctl 记下每次调用：启动 import 环境 / 配置没变也 import /
@@ -2822,7 +2829,9 @@ test-portalenv.sh 假 systemctl 记下每次调用：启动 import 环境 / 配�
                   portal_capture 写死与 none / 前端环境不对就重启它（查 MainPID）
 test-portal-own.sh vidow 自己的录屏 portal（不依赖 KDE）：vidow.portal + portals.conf
                   落地 → vidow-portal 占住总线名 → 前端把 ScreenCast 指给它 → 选择器
-                  对话框画在 vidow 上 → 点「共享」→ Start 返回 node → gst 消费者拿到会变的帧
+                  对话框画在 vidow 上 → 点「共享」→ Start 返回 node → gst 消费者拿到会变的帧；
+                  窗口 / 虚拟输出 / 截图取色 / 光标元数据（含缩放 2 倍的坐标换算与 hidden 反证）
+                  （41 项）
 test-screencast.sh KDE 的录屏 portal（portal_capture = "kde" 那条路）：vidow 暴露 zkde_screencast_unstable_v1 →
                   XDG_CURRENT_DESKTOP=KDE 时后端才注册 ScreenCast → 点选择器 →
                   Start 返回 PipeWire node → gst 消费者拿到会变的帧
@@ -3714,6 +3723,51 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
      没有**（不误报）；②掐断帧链 + 追踪开：客户端确实交过帧，追踪报出 ERROR 且点名
      HEADLESS-1、写明「客户端还在交帧，屏幕却不更新」；③掐断帧链 + 追踪**关**：一条 trace
      日志都没有、vidow 照样活着（诊断不改变行为）。
+
+166. **录屏 portal 的光标元数据（`cursor_mode=metadata`）：光标不进画面，走 PipeWire 的
+     `SPA_META_Cursor` 交给消费者自己合成**。
+
+     165 里「仍然没做」的第一项。做完才知道卡在哪：**能不能拿到这个元数据不是生产者一个人
+     说了算的**。
+
+     - **合成器侧**（`src/capture.c` / `src/screencast.c`）：`pointer_mode=metadata` 时画面里
+       不带光标（和 hidden 一样不画），改成每帧往缓冲的 `SPA_META_Cursor` 里写位置 + 热点，
+       光标图变了才附上位图（`bitmap_offset=0` = 「沿用上一次那张」，和 KWin 一样；指纹用读回来
+       的像素算 —— 拿 `wlr_output_cursor` 的贴图指针当身份会撞上「释放再分配」）。
+       位图从贴图读回（`wlr_texture_read_pixels` + 字节序换算成预乘 RGBA8888），缩放屏上按
+       输出像素尺寸重采样；`oc->transform` 不是 NORMAL 时不报位图（只报位置，旋转过的光标图
+       自己转回来容易转错方向）。上限 256×256（`VIDOW_CURSOR_MAX_PX`），比这大的光标只报位置。
+     - **两个真坑**：
+       ① **元数据要等格式协商完再报**（`pw_stream_update_params`，`param_changed` 里）——
+          `pw_stream_connect` 时一起报的 meta 进不了缓冲（缓冲是消费者连上来、格式定下来的
+          那一刻按双方参数一起分配的）。xdpw / KWin 都是这个顺序。
+       ② **消费者也得要**：`pw_buffers_negotiate` 里 meta 是「消费者声明的参数在生产者那边
+          过滤一遍」（`param_filter`，`src/pipewire/buffers.c`），两边都给**固定值**又不一样
+          的话这个元数据会被整个丢掉 —— 表现是消费者缓冲里连 `SPA_META_Cursor` 都没有。
+          GStreamer 的 `pipewiresrc` 声明的是**范围**（默认 384×384、最小只要结构体），我们的
+          固定值落在范围里所以对得上；只给死值的客户端（写死 64×64 之类）拿不到，这反而是
+          安全的：我们声明多少就写多少，不会溢出。
+     - **`AvailableCursorModes` 现在报 7**（hidden|embedded|metadata），helper 按前端给的
+       `cursor_mode` 映射到协议的 `pointer`（未知值按 hidden，不透传）。
+     - **新工具 `build/cursorprobe`**：GStreamer **不解** `SPA_META_Cursor`（`libgstpipewire.so`
+       里连这个名字都没有），所以验证得自己当消费者。它按 gst 那样声明元数据，把每帧的
+       `id / pos / hotspot / 位图尺寸 / 像素指纹` 打出来。`--declare` 就是那个声明。
+     - **顺手修掉两个真 bug**：
+       ① `wlr_output_cursor` 的 `x/y` 是**这块屏自己的像素坐标**（wlroots 在
+          `wlr_output_cursor_move` 里已经乘过 scale 了），而抓帧框是**布局坐标**。旧代码按
+          「逻辑 × scale」算，于是：光标在第二块屏上时整个画不出来（算出来远在框外）、缩放
+          2 倍的屏上位置翻倍。现在统一走 `cursor_dst_pos()`（先减布局原点再乘 scale），嵌入
+          光标和元数据位置共用它。`vidow_capture_grab_view()` 的取景也抽成
+          `vidow_capture_view_box()`，窗口流的元数据位置和渲染取景用的是同一份换算。
+       ② **screencopy 的引用计数**（`src/screencopy.c`）：`capture_output()` 里 `sc_client->ref++`
+          排在「输出不可用就回 failed」**后面**，可 `frame_destroy()` 一律会 unref —— 抓到一块
+          正在销毁的输出（比如录屏对话框的缩略图赶上虚拟输出被拔掉）就白扣一次，把 manager
+          资源还指着的那个 client 提前 free 掉；下一次 `capture_output` 直接段错误在
+          `wl_list_insert(&manager->frames)` 上（core dump 的栈就是它）。改成本轮新增的
+          metadata 那一轮**必崩**（多一轮对话框预览 = 多一次机会），修完全套 41 项过。
+     - `./test-portal-own.sh` 从 32 项扩到 41 项：`AvailableCursorModes=7`、metadata 流里
+       消费者拿到位图（`id=1` / `pos=100,100` / 有尺寸有内容）、**缩放 2 倍时位置 = 200,200**、
+       以及反证（hidden 模式下同一个消费者连元数据都拿不到）。
 
 165. **录屏 portal 补齐来源（窗口 / 区域 / 虚拟输出）+ 截图接口，顺手修了三个真 bug**。
 
@@ -5106,10 +5160,12 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
     区域取包围盒，任意形状（比如挖洞的 region）会被当成它的外接矩形
 21. 客户端指定区域后，窗口其余部分就不模糊了（哪怕 `blur_all` 开着）。想要「区域只做
     补充、其余照旧模糊」的话得把两者取并集，目前是客户端说了算
-22. portal 的 `ScreenCast` / `Screenshot` 接口没接上：KDE 的实现走 KWin 私有 IPC，
-    在 vidow 上必然失败。vidow 实现的是 wlr-screencopy + ext-image-copy-capture，
-    这两个接口该交给 `xdg-desktop-portal-wlr`（当前机器上没装，装了把
-    `vidow-portals.conf` 里那两行注释打开即可）
+22. portal 的 `ScreenCast` / `Screenshot` 现在是 **vidow 自己的后端**（`vidow-portal`，见
+    「录屏 portal」那节）：屏幕 / 窗口 / 虚拟屏幕 / 区域四种来源、`hidden` / `embedded` /
+    `metadata` 三种光标模式、`Screenshot` / `PickColor` 都通了。剩下的口子：
+    `zkde_screencast_unstable_v1` 对所有客户端开放（和 KWin 同一个模型，要收紧得按
+    PID / app_id 白名单）；`stream_region` 合成器侧实现了，但前端不通过 ScreenCast 要区域
+    （只有交互式截图走它）。
 23. portal 的 activation：`set_serial(0)` 的 token 被 wlroots 拒绝，而 GTK / Qt 的
     portal 对话框就是这么发的（能聚焦是因为我们 map 新窗口时无条件给焦点）。
     另外没有给 vidow 自己启动的子进程发 `XDG_ACTIVATION_TOKEN`
@@ -5152,5 +5208,5 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
 3. workspace / 多显示器列组
 4. X11 的 `_NET_WM_STATE`（最大化/最小化）与 `_NET_WM_STRUT`（面板预留），
    以及按屏幕边界夹菜单的客户端（把 X 屏幕也改成 `逻辑 × S`）
-5. 装 `xdg-desktop-portal-wlr`，把 portal 的 ScreenCast / Screenshot 接到 vidow 已有的
-   screencopy 上（`vidow-portals.conf` 里留了位置）
+5. `zkde_screencast_unstable_v1` 的 bind 收紧到「只给自己那个后端」（按 PID / app_id 白名单），
+   现在和 KWin 一样对所有客户端开放

@@ -99,10 +99,26 @@ struct vidow_sc_pw_stream {
 	/* 输出提交时抓好的那一帧，等 process 来取（拿的是加锁的缓冲）。 */
 	struct wlr_buffer *pending;
 	struct wl_listener output_commit;
+	/* pointer_mode=metadata：光标位图的读回缓冲 + 上一次发出去的位图指纹。
+	 * 指纹一样就不重发（bitmap_offset=0 = 消费者沿用上一次那张图），光标形状 /
+	 * 大小变了才重发。 */
+	uint8_t *cursor_pixels;
+	uint32_t cursor_hash;
+	bool cursor_hashed;
+	/* 光标元数据报过了（只在 metadata 模式、协商到格式之后报一次）。 */
+	bool meta_announced;
 };
+
+/* SPA_META_Cursor 的元数据空间大小：位置 / 热点每帧都给，位图最多
+ * VIDOW_CURSOR_MAX_PX² × 4 字节（跟消费者在建流时一次性声明，之后不能改）。 */
+#define VIDOW_SC_CURSOR_META_SIZE \
+	(sizeof(struct spa_meta_cursor) + sizeof(struct spa_meta_bitmap) + \
+	 (size_t)VIDOW_CURSOR_MAX_PX * VIDOW_CURSOR_MAX_PX * 4)
 
 static void pw_stream_fill(struct vidow_sc_pw_stream *ps,
 		struct pw_buffer *buffer);
+static void stream_fill_cursor(struct vidow_sc_pw_stream *ps, struct spa_buffer *buf);
+static void stream_announce_cursor_meta(struct vidow_sc_pw_stream *ps);
 static void stream_announce(struct vidow_sc_pw_stream *ps);
 static struct wlr_buffer *stream_grab(struct vidow_sc_pw_stream *ps);
 
@@ -324,6 +340,7 @@ static void pw_stream_param_changed(void *data, uint32_t id,
 	ps->have_format = true;
 	wlr_log(WLR_INFO, "screencast: 协商到 %ux%u（spa 格式 %u）",
 		ps->video.size.width, ps->video.size.height, ps->video.format);
+	stream_announce_cursor_meta(ps);
 }
 
 /* 图转起来了 → 把手上那一帧填进去。手上没有（流刚建好、或者消费者刚连上来）
@@ -404,6 +421,156 @@ static void pw_stream_fill(struct vidow_sc_pw_stream *ps,
 	buf->datas[0].chunk->offset = 0;
 	buf->datas[0].chunk->size = size;
 	buf->datas[0].chunk->stride = (int32_t)stride;
+
+	if (ps->stream->pointer_mode == ZKDE_SCREENCAST_UNSTABLE_V1_POINTER_METADATA) {
+		stream_fill_cursor(ps, buf);
+	}
+}
+
+/* -------------------------------------------------- 光标元数据（metadata）
+
+ * pointer_mode=metadata：画面里不带光标（stream_grab 不画），改成往缓冲的
+ * SPA_META_Cursor 里塞位置 / 热点 / 位图，消费者自己合成。
+ *
+ * 元数据得**等格式协商完再报**（pw_stream_update_params，见 stream_announce_cursor_meta）：
+ * 缓冲是消费者连上来、格式定下来的那一刻按双方的参数一起分配的，连接前报的 meta
+ * 进不了缓冲（xdpw / KWin 都是这个顺序 —— connect 只给格式，param_changed 里再
+ * update）。报晚了的表现就是「消费者拿到的缓冲里压根没有 SPA_META_Cursor」。
+ *
+ * 位置和热点**每帧都给**（id=1），位图只在变了的时候给（bitmap_offset=0 表示
+ * 「没有新位图，沿用上一次那张」，和 KWin 一样）。指纹用读回来的像素算，比拿
+ * wlr_output_cursor 的贴图指针当身份靠谱：贴图会释放再分配，指针能撞上。
+ *
+ * 抓帧框按来源换算（和 stream_grab 一一对应）：整屏 / 虚拟输出是这块屏在布局里
+ * 占的那一块，区域是请求里那个框，窗口是等比缩放后的取景框。 */
+static void stream_announce_cursor_meta(struct vidow_sc_pw_stream *ps) {
+	struct vidow_screencast_stream *stream = ps->stream;
+	if (stream->pointer_mode != ZKDE_SCREENCAST_UNSTABLE_V1_POINTER_METADATA ||
+			ps->meta_announced) {
+		return;
+	}
+	ps->meta_announced = true;
+	size_t stride = (size_t)stream->out_w * 4;
+	uint8_t pod_buffer[512];
+	struct spa_pod_builder builder = SPA_POD_BUILDER_INIT(pod_buffer,
+		sizeof(pod_buffer));
+	const struct spa_pod *params[2];
+	/* 缓冲参数跟着重报一遍：xdpw 也是这么干的（格式定下来之后两样一起 update）。 */
+	params[0] = spa_pod_builder_add_object(&builder,
+		SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
+		SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(8, 2, 32),
+		SPA_PARAM_BUFFERS_blocks, SPA_POD_Int(1),
+		SPA_PARAM_BUFFERS_size, SPA_POD_Int((int)(stride * (size_t)stream->out_h)),
+		SPA_PARAM_BUFFERS_stride, SPA_POD_Int((int)stride),
+		SPA_PARAM_BUFFERS_dataType,
+			SPA_POD_CHOICE_FLAGS_Int(1 << SPA_DATA_MemFd),
+		0);
+	params[1] = spa_pod_builder_add_object(&builder,
+		SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta,
+		SPA_PARAM_META_type, SPA_POD_Id(SPA_META_Cursor),
+		SPA_PARAM_META_size, SPA_POD_Int((int)VIDOW_SC_CURSOR_META_SIZE));
+	pw_stream_update_params(ps->pw_stream, params, 2);
+	wlr_log(WLR_INFO, "screencast: 报了光标元数据（SPA_META_Cursor，%zu 字节）",
+		VIDOW_SC_CURSOR_META_SIZE);
+}
+
+static void stream_fill_cursor(struct vidow_sc_pw_stream *ps, struct spa_buffer *buf) {
+	struct vidow_screencast_stream *stream = ps->stream;
+	struct spa_meta_cursor *meta = spa_buffer_find_meta_data(buf, SPA_META_Cursor,
+		sizeof(*meta));
+	if (meta == NULL) {
+		wlr_log(WLR_DEBUG, "screencast: 缓冲里没有 SPA_META_Cursor（n_metas=%u）",
+			buf->n_metas);
+		return; /* 消费者没要这个元数据（老版本 / 自己拼的流） */
+	}
+	/* 先摆成「没有光标」：消费者看到 id=0 就不画。 */
+	meta->id = 0;
+	meta->flags = 0;
+	meta->position = (struct spa_point){0, 0};
+	meta->hotspot = (struct spa_point){0, 0};
+	meta->bitmap_offset = 0;
+
+	if (stream->output == NULL) {
+		return;
+	}
+	struct wlr_box box;
+	double scale = 1.0;
+	switch (stream->kind) {
+	case VIDOW_SC_REGION:
+		box = stream->box;
+		scale = stream->scale;
+		break;
+	case VIDOW_SC_WINDOW: {
+		double s = 0;
+		if (vidow_capture_view_box(stream->sc->server, stream->view,
+				stream->out_w, stream->out_h, &box, &s) == NULL) {
+			return;
+		}
+		scale = s;
+		break;
+	}
+	case VIDOW_SC_OUTPUT:
+	case VIDOW_SC_VIRTUAL:
+	default:
+		wlr_output_layout_get_box(stream->sc->server->output_layout,
+			stream->output, &box);
+		scale = stream->output->scale > 0 ? stream->output->scale : 1.0;
+		break;
+	}
+
+	if (ps->cursor_pixels == NULL) {
+		ps->cursor_pixels = malloc((size_t)VIDOW_CURSOR_MAX_PX *
+			VIDOW_CURSOR_MAX_PX * 4);
+		if (ps->cursor_pixels == NULL) {
+			return;
+		}
+	}
+	struct vidow_cursor_info info;
+	if (!vidow_capture_cursor_info(stream->sc->server, stream->output, &box, scale,
+			&info, ps->cursor_pixels,
+			(size_t)VIDOW_CURSOR_MAX_PX * VIDOW_CURSOR_MAX_PX * 4)) {
+		wlr_log(WLR_DEBUG, "screencast: metadata：这块屏上没有可见光标");
+		ps->cursor_hashed = false; /* 光标没了：下次再出现要重发位图 */
+		return;
+	}
+	wlr_log(WLR_DEBUG, "screencast: metadata：光标 %d,%d 热点 %d,%d 位图 %dx%d",
+		info.x, info.y, info.hotspot_x, info.hotspot_y, info.width, info.height);
+	/* 光标完全在框外（区域 / 窗口流里最常见）：不报，消费者也别画。 */
+	if (info.x + info.hotspot_x < 0 || info.y + info.hotspot_y < 0 ||
+			info.x - info.hotspot_x >= stream->out_w ||
+			info.y - info.hotspot_y >= stream->out_h) {
+		return;
+	}
+
+	meta->id = 1;
+	meta->position.x = info.x;
+	meta->position.y = info.y;
+	meta->hotspot.x = info.hotspot_x;
+	meta->hotspot.y = info.hotspot_y;
+	if (info.width <= 0 || info.height <= 0) {
+		return; /* 只有位置（位图太大 / 带旋转 / 读不出来） */
+	}
+
+	size_t bitmap_size = (size_t)info.width * info.height * 4;
+	uint32_t hash = 2166136261u; /* FNV-1a */
+	for (size_t i = 0; i < bitmap_size; i++) {
+		hash = (hash ^ ps->cursor_pixels[i]) * 16777619u;
+	}
+	if (ps->cursor_hashed && hash == ps->cursor_hash) {
+		return; /* 位图没变：只说位置 */
+	}
+	ps->cursor_hash = hash;
+	ps->cursor_hashed = true;
+
+	meta->bitmap_offset = sizeof(struct spa_meta_cursor);
+	struct spa_meta_bitmap *bitmap = SPA_PTROFF(meta, meta->bitmap_offset,
+		struct spa_meta_bitmap);
+	bitmap->format = info.format;
+	bitmap->size.width = (uint32_t)info.width;
+	bitmap->size.height = (uint32_t)info.height;
+	bitmap->stride = (int32_t)(info.width * 4);
+	bitmap->offset = sizeof(struct spa_meta_bitmap);
+	memcpy(SPA_PTROFF(bitmap, bitmap->offset, void), ps->cursor_pixels, bitmap_size);
 }
 
 /* 抓当前这一帧（遮挡 / 马赛克都盖到了），要光标就画上。返回加锁的缓冲。
@@ -443,13 +610,13 @@ static struct wlr_buffer *stream_grab(struct vidow_sc_pw_stream *ps) {
 	}
 	if (stream->pointer_mode == ZKDE_SCREENCAST_UNSTABLE_V1_POINTER_EMBEDDED) {
 		if (stream->kind == VIDOW_SC_REGION) {
-			/* 区域抓帧：光标位置是**这块屏的逻辑坐标**，区域框也是，
-			 * 直接把框给出去（框外的光标不画）。 */
-			vidow_capture_paint_cursor_box(stream->output, frame, &cursor_box,
-				cursor_scale);
+			/* 区域抓帧：光标位置和区域框都在布局坐标里，直接把框给出去
+			 * （框外的光标不画）。 */
+			vidow_capture_paint_cursor_box(stream->sc->server, stream->output,
+				frame, &cursor_box, cursor_scale);
 		} else if (stream->kind == VIDOW_SC_OUTPUT ||
 				stream->kind == VIDOW_SC_VIRTUAL) {
-			vidow_capture_paint_cursor(stream->output, frame);
+			vidow_capture_paint_cursor(stream->sc->server, stream->output, frame);
 		}
 		/* 窗口抓帧不画光标：窗口是等比缩放进流的，光标跟窗口不在一个坐标系里。 */
 	}
@@ -590,6 +757,8 @@ void vidow_sc_pw_stream_start(struct vidow_screencast_stream *stream) {
 		0);
 	params[1] = spa_pod_builder_pop(&builder, &frame);
 
+	/* 光标元数据不在这里报：得等格式协商完（见 stream_announce_cursor_meta）。 */
+
 	int res = pw_stream_connect(ps->pw_stream, PW_DIRECTION_OUTPUT, PW_ID_ANY,
 		PW_STREAM_FLAG_DRIVER | PW_STREAM_FLAG_MAP_BUFFERS, params, 2);
 	if (res < 0) {
@@ -619,6 +788,7 @@ void vidow_sc_pw_stream_destroy(struct vidow_screencast_stream *stream) {
 		pw_stream_destroy(ps->pw_stream);
 		ps->pw_stream = NULL;
 	}
+	free(ps->cursor_pixels);
 	free(ps);
 }
 

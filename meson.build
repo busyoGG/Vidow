@@ -346,6 +346,13 @@ executable('vidowmsg',
   ['tools/vidowmsg.c'],
   install: false)
 
+# 测试工具：当 screencast 流的消费者，把 SPA_META_Cursor 读出来（GStreamer 不解它）。
+# 验证 pointer_mode=metadata 用：./build/cursorprobe <node-id>。
+executable('cursorprobe',
+  ['tools/cursorprobe.c'],
+  dependencies: [pipewire_dep],
+  install: false)
+
 # 离线自检：JSON 写出 / 读入（纯函数，不开合成器）
 executable('jsontest',
   ['tools/jsontest.c', 'src/json.c'],

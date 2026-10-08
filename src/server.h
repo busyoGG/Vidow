@@ -1740,9 +1740,15 @@ struct wlr_buffer *vidow_capture_grab(struct vidow_server *server,
 struct wlr_buffer *vidow_capture_grab_box(struct vidow_server *server,
 		struct wlr_output *output, const struct wlr_box *box, double scale);
 /* 抓一个窗口（只有它自己：别的窗口和各个 layer 在渲染那一瞬间被关掉），等比缩放
- * 填进 out_w × out_h（窗口比流小就放大、大就缩小，剩下的边是黑的）。 */
+ * 填进 out_w × out_h（窗口比小就放大、大就缩小，剩下的边是黑的）。 */
 struct wlr_buffer *vidow_capture_grab_view(struct vidow_server *server,
 		struct vidow_view *view, int out_w, int out_h);
+/* 窗口抓帧的取景：把窗口几何等比塞进 out_w × out_h（letterbox）后要渲染的那块
+ * （**布局坐标**）和「逻辑 → 像素」的缩放。按窗口录屏时，光标也要按这个框换算。
+ * 返回这块屏（窗口不在任何一块屏上时返回 NULL）。 */
+struct wlr_output *vidow_capture_view_box(struct vidow_server *server,
+		struct vidow_view *view, int out_w, int out_h, struct wlr_box *box,
+		double *scale);
 
 /* layer 的内容节点（surface 的 buffer）：wlroots 把它包在 subsurface tree 里，
  * 所以要递归找。抓帧遮挡（capturemask.c）和马赛克（capture.c）都要用它。 */
@@ -1758,11 +1764,32 @@ void vidow_capture_paint_mosaic(struct vidow_server *server,
 /* 把这块屏上的光标合成到抓帧图上（要光标的客户端才调：ext-copy 的
  * PAINT_CURSORS / screencopy 的 overlay_cursor）。抓帧是场景渲染，场景里没有
  * 光标，所以要光标的客户端得我们自己画上去。 */
-void vidow_capture_paint_cursor(struct wlr_output *output, struct wlr_buffer *dst);
-/* 同上，但只画落在 box 里（**这块屏自己的逻辑坐标**，整屏就是 {0,0,逻辑宽,逻辑高}）
- * 的光标：按区域 / 按窗口录屏时，光标跑到别处去就不该出现在这张图里。 */
-void vidow_capture_paint_cursor_box(struct wlr_output *output,
-		struct wlr_buffer *dst, const struct wlr_box *box, double scale);
+void vidow_capture_paint_cursor(struct vidow_server *server,
+		struct wlr_output *output, struct wlr_buffer *dst);
+/* 同上，但只画落在 box 里（**布局坐标**；整屏就是这块屏在布局里占的那一块）的
+ * 光标：按区域 / 按窗口录屏时，光标跑到别处去就不该出现在这张图里。 */
+void vidow_capture_paint_cursor_box(struct vidow_server *server,
+		struct wlr_output *output, struct wlr_buffer *dst,
+		const struct wlr_box *box, double scale);
+
+/* 光标位图的上限（像素，边长）。SPA_META_Cursor 的元数据空间在建流时按这个上限
+ * 一次性声明，比这大的光标（客户端能设任意大的 cursor surface）就只报位置。 */
+#define VIDOW_CURSOR_MAX_PX 256
+
+/* 光标元数据（录屏 pointer_mode=metadata 用）：位置 / 热点是**抓帧图里的像素**
+ * （框外的光标位置会是负的 / 超出图），位图是预乘 RGBA8888（SPA_VIDEO_FORMAT_RGBA），
+ * 写进调用方给的 pixels（至少 VIDOW_CURSOR_MAX_PX² × 4 字节）。
+ * 返回 false = 这块屏上没有可见光标；返回 true 但 width/height 为 0 = 只有位置
+ * 没有位图（贴图太大 / 带旋转 / 读不出来）。 */
+struct vidow_cursor_info {
+	int x, y;
+	int hotspot_x, hotspot_y;
+	int width, height;
+	uint32_t format;
+};
+bool vidow_capture_cursor_info(struct vidow_server *server, struct wlr_output *output,
+		const struct wlr_box *box, double scale, struct vidow_cursor_info *info,
+		void *pixels, size_t pixels_size);
 
 /* ------------------------------------------------------------------ 录屏 */
 

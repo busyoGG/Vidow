@@ -22,6 +22,13 @@
  * src/screencast.c）—— 它本来就是「客户端要一路流，合成器建 node 再告诉客户端」。
  * KDE 的后端是这么用的，这里也这么用，只是客户端换成了自己人。
  *
+ * 光标模式（应用在 SelectSources 里要的 cursor_mode，原样传给协议的 pointer）：
+ *   hidden(1)   画面里不带光标
+ *   embedded(2) 按屏幕上的样子画进画面
+ *   metadata(4) 不进画面，走 PipeWire 缓冲的 SPA_META_Cursor（位置 / 热点 / 位图），
+ *               消费者自己合成 —— 消费者也得自己声明这个元数据才拿得到
+ * 三种都报在 AvailableCursorModes 里（= 7），前端按它校验应用的请求。
+ *
  * 四种来源（和 KDE 的选择器一样，按前端给的 types 分组显示）：
  *   屏幕      每块输出一行，实时缩略图（zwlr_screencopy）
  *   窗口      每个窗口一行（ext-foreign-toplevel-list 拿列表，实时缩略图走
@@ -90,8 +97,34 @@
 #define SOURCE_TYPE_WINDOW 2u
 #define SOURCE_TYPE_VIRTUAL 4u
 #define SOURCE_TYPES (SOURCE_TYPE_MONITOR | SOURCE_TYPE_WINDOW | SOURCE_TYPE_VIRTUAL)
-/* AvailableCursorModes：hidden=1 | embedded=2。metadata=4 合成器那边还没实现。 */
-#define CURSOR_MODES (1u | 2u)
+/* AvailableCursorModes：hidden=1 | embedded=2 | metadata=4（和 KDE 一样报 7）。
+ * metadata = 光标不进画面，走 PipeWire 缓冲的 SPA_META_Cursor 交给消费者合成。 */
+#define CURSOR_MODES (1u | 2u | 4u)
+
+/* 前端给的 cursor_mode（portal 的枚举值）→ zkde 协议的 pointer（两边的数值一样，
+ * 但还是显式映射一遍：对不上的值按 hidden 处理，别把未知值原样透传给合成器）。 */
+static uint32_t cursor_mode_to_pointer(uint32_t cursor_mode) {
+	switch (cursor_mode) {
+	case 2:
+		return ZKDE_SCREENCAST_UNSTABLE_V1_POINTER_EMBEDDED;
+	case 4:
+		return ZKDE_SCREENCAST_UNSTABLE_V1_POINTER_METADATA;
+	default:
+		return ZKDE_SCREENCAST_UNSTABLE_V1_POINTER_HIDDEN;
+	}
+}
+
+static const char *cursor_mode_name(uint32_t cursor_mode) {
+	switch (cursor_mode) {
+	case 2:
+		return "embedded";
+	case 4:
+		return "metadata";
+	default:
+		return "hidden";
+	}
+}
+
 /* impl ScreenCast 的接口版本：2 = 有 cursor_mode，没有 restore_data / persist_mode。 */
 #define SC_VERSION 2u
 
@@ -1307,9 +1340,7 @@ static void dialog_accept(void) {
 	gtk_widget_hide(dialog);
 	preview_stop();
 
-	uint32_t pointer = s->cursor_mode == 2
-		? ZKDE_SCREENCAST_UNSTABLE_V1_POINTER_EMBEDDED
-		: ZKDE_SCREENCAST_UNSTABLE_V1_POINTER_HIDDEN;
+	uint32_t pointer = cursor_mode_to_pointer(s->cursor_mode);
 	for (GList *it = rows; it != NULL; it = it->next) {
 		struct row *row = it->data;
 		if (row->toggle == NULL ||
@@ -1379,7 +1410,7 @@ static void dialog_accept(void) {
 		zkde_screencast_stream_unstable_v1_add_listener(st->obj, &stream_listener, st);
 		g_ptr_array_add(s->streams, st);
 		log_info("%s: 要一路流（cursor=%s）", st->label,
-			s->cursor_mode == 2 ? "embedded" : "hidden");
+			cursor_mode_name(s->cursor_mode));
 	}
 	wl_display_flush(wl);
 
@@ -1879,8 +1910,8 @@ static void on_select_sources(GDBusConnection *conn, const gchar *sender,
 		s->multiple = multiple;
 		s->cursor_mode = cursor;
 	}
-	log_info("%s: SelectSources types=0x%x multiple=%d cursor=%u",
-		app_id, types, multiple ? 1 : 0, cursor);
+	log_info("%s: SelectSources types=0x%x multiple=%d cursor=%u（%s）",
+		app_id, types, multiple ? 1 : 0, cursor, cursor_mode_name(cursor));
 	g_dbus_method_invocation_return_value(invocation,
 		g_variant_new("(u@a{sv})", RESPONSE_SUCCESS, empty_results()));
 }
@@ -2796,7 +2827,10 @@ static void debug_dialog(void) {
 	const char *types_env = getenv("VIDOW_PORTAL_TYPES");
 	s->types = types_env != NULL ? (uint32_t)strtoul(types_env, NULL, 0)
 		: SOURCE_TYPES;
-	s->cursor_mode = 1;
+	/* 光标模式（前端平时从 SelectSources 的 cursor_mode 传进来，这里手动试：
+	 * VIDOW_PORTAL_CURSOR=2 内嵌 / 4 元数据）。 */
+	const char *cursor_env = getenv("VIDOW_PORTAL_CURSOR");
+	s->cursor_mode = cursor_env != NULL ? (uint32_t)strtoul(cursor_env, NULL, 0) : 1;
 	s->streams = g_ptr_array_new();
 	req->path = strdup("/debug/request");
 	req->session = s;

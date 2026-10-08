@@ -23,10 +23,13 @@
 #      窗口流出帧（size 报的是窗口尺寸）
 #   9) **虚拟输出**（types=4）：合成器里真多出一块 HEADLESS-N，流结束后又拔掉
 #  10) **截图接口**：Screenshot 回一个真 PNG（尺寸 = 输出像素尺寸）、PickColor 回 (ddd)
-#  11) 全程 vidow 没崩
+#  11) **光标元数据**（cursor_mode=4）：消费者按 GStreamer 那样要 SPA_META_Cursor 就
+#      拿得到（位置 = 指针位置、热点、真位图）；缩放 2 倍时位置仍是像素坐标；
+#      反证：hidden 模式下同一个消费者一个字节都拿不到
+#  12) 全程 vidow 没崩
 #
 # 需要：pipewire 在跑、gst-launch-1.0 + gst-plugin-pipewire、python3-gobject、
-#       gtk3、wayland-info、build/vidowmsg、build/vidow-portal。
+#       gtk3、wayland-info、build/vidowmsg、build/vidow-portal、build/cursorprobe。
 #
 # 用法：./test-portal-own.sh    （VIDOW_TEST_KEEP=1 保留运行目录）
 set -u
@@ -72,6 +75,7 @@ done
 pgrep -x pipewire >/dev/null || { echo "test-portal-own.sh: 需要 pipewire 在跑"; exit 1; }
 [ -x ./build/vidowmsg ] || { echo "test-portal-own.sh: 需要 ./build/vidowmsg"; exit 1; }
 [ -x ./build/vidow-portal ] || { echo "test-portal-own.sh: 需要 ./build/vidow-portal"; exit 1; }
+[ -x ./build/cursorprobe ] || { echo "test-portal-own.sh: 需要 ./build/cursorprobe"; exit 1; }
 
 rm -rf "$RUNDIR"
 mkdir -p "$HOME_DIR/.config" "$LOG"
@@ -491,6 +495,95 @@ if grep -aq "color=(" "$R/pick.txt" 2>/dev/null; then
 	pass "取色回了个颜色（$(grep -ao "color=.*" "$R/pick.txt" | head -1)）"
 else
 	fail "取色没回颜色：$(tail -3 "$R/pick.txt" 2>/dev/null | tr '\n' ' ')"
+fi
+
+# --- 6e 光标元数据（pointer_mode=metadata） ---------------------------------
+echo; echo "== 6e. 光标元数据（SPA_META_Cursor） =="
+# 后端得先报出 metadata（前端按 AvailableCursorModes 校验应用要的 cursor_mode）。
+CM=$(gdbus call --session --dest org.freedesktop.impl.portal.desktop.vidow \
+	--object-path /org/freedesktop/portal/desktop \
+	--method org.freedesktop.DBus.Properties.Get \
+	org.freedesktop.impl.portal.ScreenCast AvailableCursorModes 2>/dev/null)
+if echo "${CM:-}" | grep -q "uint32 7"; then
+	pass "AvailableCursorModes 报了 hidden|embedded|metadata（${CM}）"
+else
+	fail "AvailableCursorModes 没报 metadata：${CM:-读不出来}"
+fi
+# 光标得在画面上：把指针挪到逻辑 (100,100)（headless 里默认在左上角）。
+$VM --socket "$IPC" move-cursor 100 100 >/dev/null 2>&1
+timeout 150 python3 /home/busyo/Dev/Vidow/tools/screencastprobe.py --types 1 \
+	--cursor-mode 4 --timeout 60 --hold 30 >"$R/probe4.txt" 2>&1 &
+if wait_and_share; then
+	pass "metadata 那轮的选择器弹出来了（cursor_mode=4 透传给了后端）"
+else
+	fail "metadata 那轮没等到选择器"
+fi
+NODE4=$(wait_node "$R/probe4.txt")
+if [ -n "${NODE4:-}" ]; then
+	pass "metadata 流拿到了 node（node=$NODE4）"
+else
+	fail "metadata 流没拿到 node：$(tail -3 "$R/probe4.txt" 2>/dev/null | tr '\n' ' ')"
+fi
+# 消费者要按**生产者声明的那样**去要这个元数据（固定值 / 范围取交集，见
+# pipewire 的 pw_buffers_negotiate）：GStreamer 的 pipewiresrc 是这么要的，
+# cursorprobe --declare 照抄它。要不到的话缓冲里连 SPA_META_Cursor 都没有。
+if [ -n "${NODE4:-}" ]; then
+	./build/cursorprobe "$NODE4" --declare --timeout 15 >"$R/cursor.txt" 2>&1
+	CLINE=$(grep -a "bitmap=1" "$R/cursor.txt" 2>/dev/null | head -1)
+	if [ -n "${CLINE:-}" ]; then
+		pass "消费者拿到了光标元数据 + 位图：$CLINE"
+	else
+		fail "没拿到光标位图：$(tail -2 "$R/cursor.txt" 2>/dev/null | tr '\n' ' ')"
+	fi
+	if echo "${CLINE:-}" | grep -q "id=1"; then
+		pass "元数据里 id=1（有可见光标）"
+	else
+		fail "元数据里 id≠1：${CLINE:-没数据}"
+	fi
+	if echo "${CLINE:-}" | grep -qE "pos=100,100 hotspot=[0-9]+,[0-9]+"; then
+		pass "光标位置 = 指针位置（pos=100,100，热点也报出来了）"
+	else
+		fail "光标位置不对：${CLINE:-没数据}（期望 pos=100,100）"
+	fi
+	if echo "${CLINE:-}" | grep -qE "size=[1-9][0-9]*x[1-9][0-9]* stride=[1-9][0-9]* hash=0x0*[1-9a-f]"; then
+		pass "位图有尺寸有内容（$(echo "$CLINE" | grep -o 'size=[0-9x]* stride=[0-9]* hash=0x[0-9a-f]*')）"
+	else
+		fail "位图是空的：${CLINE:-没数据}"
+	fi
+	# 缩放屏上的换算：wlr_output_cursor 的 x/y 本来就是**输出像素**，早先按
+	# 「逻辑坐标 × scale」算会翻一倍（第二块屏上更离谱，直接画到框外）。
+	$VM --socket "$IPC" output-scale HEADLESS-1 2 >/dev/null 2>&1
+	sleep 1
+	$VM --socket "$IPC" move-cursor 100 100 >/dev/null 2>&1
+	sleep 0.5
+	./build/cursorprobe "$NODE4" --declare --timeout 15 >"$R/cursor2.txt" 2>&1
+	if grep -aq "pos=200,200" "$R/cursor2.txt" 2>/dev/null; then
+		pass "缩放 2 倍时元数据位置也是像素坐标（逻辑 100,100 → 200,200）"
+	else
+		fail "缩放 2 倍时位置不对：$(grep -a 'meta=1' "$R/cursor2.txt" | head -1)"
+	fi
+	$VM --socket "$IPC" output-scale HEADLESS-1 1 >/dev/null 2>&1
+	sleep 1
+fi
+# 反证：hidden 模式下**同样**要元数据的消费者一个字节都拿不到（元数据是照
+# pointer_mode 报的，不是无脑塞）。
+timeout 150 python3 /home/busyo/Dev/Vidow/tools/screencastprobe.py --types 1 \
+	--cursor-mode 1 --timeout 60 --hold 8 >"$R/probe5.txt" 2>&1 &
+if wait_and_share; then
+	pass "反证那轮（cursor_mode=1）的选择器弹出来了"
+else
+	fail "反证那轮没等到选择器"
+fi
+NODE5=$(wait_node "$R/probe5.txt")
+if [ -n "${NODE5:-}" ]; then
+	./build/cursorprobe "$NODE5" --declare --timeout 8 >"$R/cursor5.txt" 2>&1
+	if grep -aq "RESULT=none" "$R/cursor5.txt" 2>/dev/null; then
+		pass "反证：hidden 模式不报光标元数据（消费者要了也没有）"
+	else
+		fail "hidden 模式居然报了元数据：$(head -1 "$R/cursor5.txt" 2>/dev/null)"
+	fi
+else
+	fail "反证那轮没拿到 node"
 fi
 
 # --- 9 KDE 后端在这条私有总线上根本没被拉起来 ------------------------------

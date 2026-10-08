@@ -49,6 +49,7 @@
 #include <wlr/types/wlr_ext_image_copy_capture_v1.h>
 #include <wlr/types/wlr_output.h>
 #include <wlr/util/log.h>
+#include <spa/param/video/raw.h>
 
 #include "ext-image-capture-source-v1-server-protocol.h"
 
@@ -286,7 +287,32 @@ struct wlr_buffer *vidow_capture_grab_box(struct vidow_server *server,
  * 东西本来就是黑的）。窗口改尺寸时流的分辨率不变（消费者不用跟着重协商）。 */
 struct wlr_buffer *vidow_capture_grab_view(struct vidow_server *server,
 		struct vidow_view *view, int out_w, int out_h) {
-	if (view == NULL || out_w <= 0 || out_h <= 0) {
+	struct wlr_box box;
+	double scale = 0;
+	struct wlr_output *output = vidow_capture_view_box(server, view, out_w, out_h,
+		&box, &scale);
+	if (output == NULL) {
+		return NULL;
+	}
+	struct vidow_capture *cap = capture_for_output(server, output);
+	if (cap == NULL) {
+		return NULL;
+	}
+
+	vidow_capturemask_hold(server);
+	solo_begin(server, view);
+	struct wlr_buffer *buffer = capture_render_box(cap, &box, scale);
+	solo_end();
+	vidow_capturemask_release(server);
+	return buffer;
+}
+
+/* 上面那个的取景部分：窗口几何居中塞进 out_w × out_h（等比，剩下的边是黑的），
+ * 返回要渲染的那块（布局坐标）+ 缩放 + 这块屏。 */
+struct wlr_output *vidow_capture_view_box(struct vidow_server *server,
+		struct vidow_view *view, int out_w, int out_h, struct wlr_box *box,
+		double *scale) {
+	if (view == NULL || box == NULL || scale == NULL || out_w <= 0 || out_h <= 0) {
 		return NULL;
 	}
 	struct wlr_box geom = vidow_view_geometry(view);
@@ -302,42 +328,54 @@ struct wlr_buffer *vidow_capture_grab_view(struct vidow_server *server,
 	if (output == NULL) {
 		return NULL;
 	}
-	struct vidow_capture *cap = capture_for_output(server, output);
-	if (cap == NULL) {
-		return NULL;
-	}
 	double sx = (double)out_w / geom.width;
 	double sy = (double)out_h / geom.height;
-	double scale = sx < sy ? sx : sy;
-	int cw = (int)lround(out_w / scale);
-	int ch = (int)lround(out_h / scale);
-	struct wlr_box box = {
+	*scale = sx < sy ? sx : sy;
+	int cw = (int)lround(out_w / *scale);
+	int ch = (int)lround(out_h / *scale);
+	*box = (struct wlr_box){
 		.x = geom.x + geom.width / 2 - cw / 2,
 		.y = geom.y + geom.height / 2 - ch / 2,
 		.width = cw,
 		.height = ch,
 	};
+	return output;
+}
 
-	vidow_capturemask_hold(server);
-	solo_begin(server, view);
-	struct wlr_buffer *buffer = capture_render_box(cap, &box, scale);
-	solo_end();
-	vidow_capturemask_release(server);
-	return buffer;
+/* --------------------------------------------------------------- 光标 */
+
+/* 光标的两种用法都从 wlr_output_cursor 取状态（硬件平面上的那个也是它），所以放大
+ * 摇晃那种大光标、客户端自己设的光标都拿得到，和屏幕上看到的一致：
+ *   1. 合成进画面（ext-copy 的 PAINT_CURSORS / screencopy 的 overlay_cursor /
+ *      录屏的 pointer_mode=embedded）—— vidow_capture_paint_cursor*；
+ *   2. 只报「在哪、长什么样」（录屏的 pointer_mode=metadata，走 PipeWire 缓冲的
+ *      SPA_META_Cursor），画面里不带光标 —— vidow_capture_cursor_info。
+ *
+ * 坐标有两套，混起来就是错位：
+ *   - wlr_output_cursor 的 x/y 是**这块屏自己的像素坐标**（wlroots 在
+ *     wlr_output_cursor_move 里已经乘过 output->scale 了）；
+ *   - 这里的 box 是**布局坐标**里的抓帧框。
+ * 两者差一个布局原点：多屏 / 非整数缩放的屏上不换算就会画到框外去（光标在第二块
+ * 屏上时整个不画、缩放屏上位置偏）。 */
+static void cursor_dst_pos(struct vidow_server *server, struct wlr_output *output,
+		const struct wlr_box *box, double scale, struct wlr_output_cursor *oc,
+		int *x, int *y) {
+	struct wlr_box obox;
+	wlr_output_layout_get_box(server->output_layout, output, &obox);
+	*x = (int)lround(oc->x + (obox.x - box->x) * scale);
+	*y = (int)lround(oc->y + (obox.y - box->y) * scale);
 }
 
 /* 把这块屏上的光标合成到抓帧图上（ext-copy 的 PAINT_CURSORS、screencopy 的
  * overlay_cursor）。抓帧是场景渲染，场景里没有光标 —— 光标是输出自己的光标平面
  * 或者后端在提交时合上去的，所以要光标的客户端得我们自己画。
  *
- * 直接拿 wlr_output_cursor 的贴图（硬件平面上的那个也是它），所以放大摇晃那种
- * 大光标、客户端自己设的光标都照样画得出来，和屏幕上看到的一致。
- *
- * box 是**这块屏自己的逻辑坐标**里的框（整屏抓帧就是 {0, 0, 屏的逻辑宽, 屏的逻辑
- * 高}），scale 是「逻辑 → 像素」；光标在框外就不画（按区域 / 按窗口抓帧时，光标
- * 跑到别处去了就不该出现在这张图里）。 */
-void vidow_capture_paint_cursor_box(struct wlr_output *output,
-		struct wlr_buffer *dst, const struct wlr_box *box, double scale) {
+ * box 是**布局坐标**里的框（整屏抓帧 = 这块屏在布局里占的那一块），scale 是
+ * 「逻辑 → 像素」；光标在框外就不画（按区域 / 按窗口抓帧时，光标跑到别处去了就
+ * 不该出现在这张图里）。 */
+void vidow_capture_paint_cursor_box(struct vidow_server *server,
+		struct wlr_output *output, struct wlr_buffer *dst,
+		const struct wlr_box *box, double scale) {
 	if (scale <= 0) {
 		scale = 1.0;
 	}
@@ -346,9 +384,11 @@ void vidow_capture_paint_cursor_box(struct wlr_output *output,
 		if (!oc->enabled || !oc->visible || oc->texture == NULL) {
 			continue;
 		}
+		int cx, cy;
+		cursor_dst_pos(server, output, box, scale, oc, &cx, &cy);
 		struct wlr_box dst_box = {
-			.x = (int)lround((oc->x - box->x) * scale) - oc->hotspot_x,
-			.y = (int)lround((oc->y - box->y) * scale) - oc->hotspot_y,
+			.x = cx - oc->hotspot_x,
+			.y = cy - oc->hotspot_y,
 			.width = (int)oc->width,
 			.height = (int)oc->height,
 		};
@@ -371,14 +411,134 @@ void vidow_capture_paint_cursor_box(struct wlr_output *output,
 	}
 }
 
-/* 整屏抓帧那条路（box 就是整块屏）。 */
-void vidow_capture_paint_cursor(struct wlr_output *output, struct wlr_buffer *dst) {
+/* 整屏抓帧那条路：框就是这块屏在布局里占的那一块。 */
+void vidow_capture_paint_cursor(struct vidow_server *server,
+		struct wlr_output *output, struct wlr_buffer *dst) {
 	double scale = output->scale > 0 ? output->scale : 1.0;
-	struct wlr_box box = {
-		.width = output->width,
-		.height = output->height,
-	};
-	vidow_capture_paint_cursor_box(output, dst, &box, scale);
+	struct wlr_box box;
+	wlr_output_layout_get_box(server->output_layout, output, &box);
+	vidow_capture_paint_cursor_box(server, output, dst, &box, scale);
+}
+
+/* ------------------------------------------------- 光标元数据（录屏 metadata）
+
+ * pointer_mode=metadata：画面里不带光标，改成把「在哪 + 热点 + 长什么样」交给
+ * 消费者自己合成（PipeWire 缓冲的 SPA_META_Cursor）。位置 / 热点好办，位图得从
+ * 贴图里读回来：
+ *   - oc->src_box 是**贴图像素**里的源矩形（surface 带 viewport / buffer_scale 时
+ *     它不等于整张贴图）；
+ *   - oc->width/height 是**输出像素**里的目标尺寸（wlroots 已经乘过 scale）。
+ * 常见情况两者一样大（1:1），缩放了就按最近邻重采样。
+ *
+ * 已知取舍：oc->transform 不是 NORMAL（客户端给光标 surface 设了
+ * wl_surface.set_buffer_transform）时不报位图，只报位置 / 热点 —— 旋转过的光标图
+ * 自己转回来容易转错方向，宁可不给（位置还是对的）。真实客户端都不设这个。 */
+static bool cursor_read_pixels(struct wlr_texture *texture, const struct wlr_fbox *src,
+		void *data, int w, int h, uint32_t format) {
+	return wlr_texture_read_pixels(texture, &(struct wlr_texture_read_pixels_options){
+		.data = data,
+		.format = format,
+		.stride = (uint32_t)w * 4,
+		.src_box = (struct wlr_box){
+			.x = (int)src->x,
+			.y = (int)src->y,
+			.width = w,
+			.height = h,
+		},
+	});
+}
+
+/* 读回来的字节序 → SPA_VIDEO_FORMAT_RGBA（内存里 R,G,B,A，预乘）。
+ * 8888 那四个 fourcc 在内存里的排列：ARGB/XRGB = B,G,R,A/X；ABGR/XBGR = R,G,B,A/X
+ * （fourcc 的第一个字母是低位，小端下就落在最后一个字节）。 */
+static void cursor_to_rgba(uint8_t *dst, const uint8_t *src, size_t n,
+		uint32_t format) {
+	bool swap_rb = format == DRM_FORMAT_ARGB8888 || format == DRM_FORMAT_XRGB8888;
+	bool has_alpha = format == DRM_FORMAT_ARGB8888 || format == DRM_FORMAT_ABGR8888;
+	for (size_t i = 0; i < n; i++, dst += 4, src += 4) {
+		dst[0] = swap_rb ? src[2] : src[0];
+		dst[1] = src[1];
+		dst[2] = swap_rb ? src[0] : src[2];
+		dst[3] = has_alpha ? src[3] : 0xff;
+	}
+}
+
+bool vidow_capture_cursor_info(struct vidow_server *server, struct wlr_output *output,
+		const struct wlr_box *box, double scale, struct vidow_cursor_info *info,
+		void *pixels, size_t pixels_size) {
+	if (server == NULL || output == NULL || box == NULL || info == NULL) {
+		return false;
+	}
+	if (scale <= 0) {
+		scale = 1.0;
+	}
+	memset(info, 0, sizeof(*info));
+
+	struct wlr_output_cursor *oc = NULL, *it;
+	wl_list_for_each(it, &output->cursors, link) {
+		if (it->enabled && it->visible && it->texture != NULL) {
+			oc = it;
+			break;
+		}
+	}
+	if (oc == NULL) {
+		return false;
+	}
+
+	cursor_dst_pos(server, output, box, scale, oc, &info->x, &info->y);
+	info->hotspot_x = oc->hotspot_x;
+	info->hotspot_y = oc->hotspot_y;
+
+	int dw = (int)oc->width, dh = (int)oc->height;
+	int sw = (int)lround(oc->src_box.width > 0 ? oc->src_box.width : dw);
+	int sh = (int)lround(oc->src_box.height > 0 ? oc->src_box.height : dh);
+	if (dw <= 0 || dh <= 0 || sw <= 0 || sh <= 0) {
+		return true; /* 位置 / 热点有，位图没有 */
+	}
+	if (oc->transform != WL_OUTPUT_TRANSFORM_NORMAL) {
+		return true;
+	}
+	/* 位图上限：SPA_META_Cursor 的空间在建流时按 256×256 一次性声明，比这大的
+	 * 光标（客户端能设任意大的 cursor surface）就只报位置。 */
+	if (dw > VIDOW_CURSOR_MAX_PX || dh > VIDOW_CURSOR_MAX_PX ||
+			sw > VIDOW_CURSOR_MAX_PX || sh > VIDOW_CURSOR_MAX_PX) {
+		return true;
+	}
+	if ((size_t)dw * dh * 4 > pixels_size) {
+		return true;
+	}
+
+	/* 先按 1:1 读进临时缓冲（贴图像素），再重采样到输出像素尺寸。 */
+	uint8_t *tmp = malloc((size_t)sw * sh * 4);
+	if (tmp == NULL) {
+		return true;
+	}
+	uint32_t format = wlr_texture_preferred_read_format(oc->texture);
+	bool ok = cursor_read_pixels(oc->texture, &oc->src_box, tmp, sw, sh, format);
+	if (!ok && format != DRM_FORMAT_ARGB8888) {
+		format = DRM_FORMAT_ARGB8888;
+		ok = cursor_read_pixels(oc->texture, &oc->src_box, tmp, sw, sh, format);
+	}
+	if (!ok) {
+		free(tmp);
+		return true;
+	}
+
+	uint8_t *out = pixels;
+	for (int y = 0; y < dh; y++) {
+		int sy = y * sh / dh;
+		for (int x = 0; x < dw; x++) {
+			int sx = x * sw / dw;
+			cursor_to_rgba(out + ((size_t)y * dw + x) * 4,
+				tmp + ((size_t)sy * sw + sx) * 4, 1, format);
+		}
+	}
+	free(tmp);
+
+	info->width = dw;
+	info->height = dh;
+	info->format = SPA_VIDEO_FORMAT_RGBA;
+	return true;
 }
 
 /* --------------------------------------------------------------- 马赛克 */
@@ -624,7 +784,8 @@ static void source_copy_frame(struct wlr_ext_image_capture_source_v1 *base,
 	}
 
 	if (src->paint_cursors) {
-		vidow_capture_paint_cursor(src->cap->output, src->pending);
+		vidow_capture_paint_cursor(src->cap->server, src->cap->output,
+			src->pending);
 	}
 
 	if (wlr_ext_image_copy_capture_frame_v1_copy_buffer(frame, src->pending,
