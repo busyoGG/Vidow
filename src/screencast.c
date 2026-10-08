@@ -338,6 +338,20 @@ static void pw_stream_param_changed(void *data, uint32_t id,
 		return;
 	}
 	ps->have_format = true;
+	/* 尺寸**跟着消费者走**：我们只报一种尺寸，可消费者（OBS / 浏览器）会挑它
+	 * 自己要的那个，挑不到就整个协商失败（实测：让 gst 按 portal 报的尺寸
+	 * 协商，直接 flow-return=-4、一帧都拿不到）。消费者挑了什么，就按什么渲染 ——
+	 * 出图尺寸和协商尺寸不一致的话，读像素那一步要么读越界、要么写不进缓冲，
+	 * 表现就是「连上了但一片黑」。 */
+	struct vidow_screencast_stream *stream = ps->stream;
+	uint32_t nw = ps->video.size.width, nh = ps->video.size.height;
+	if (nw > 0 && nh > 0 && ((int)nw != stream->out_w || (int)nh != stream->out_h)) {
+		wlr_log(WLR_INFO,
+			"screencast: 消费者要 %ux%u，跟着它改（原来是 %dx%d）",
+			nw, nh, stream->out_w, stream->out_h);
+		stream->out_w = (int)nw;
+		stream->out_h = (int)nh;
+	}
 	wlr_log(WLR_INFO, "screencast: 协商到 %ux%u（spa 格式 %u）",
 		ps->video.size.width, ps->video.size.height, ps->video.format);
 	stream_announce_cursor_meta(ps);
@@ -596,8 +610,11 @@ static struct wlr_buffer *stream_grab(struct vidow_sc_pw_stream *ps) {
 		cursor_scale = stream->scale;
 		break;
 	case VIDOW_SC_WINDOW:
-		frame = vidow_capture_grab_view(stream->sc->server, stream->view,
-			stream->out_w, stream->out_h);
+		/* 走窗口自己的取景器（私有场景 + 镜像，见 wincapture.c）：跟它在屏幕上
+		 * 摆在哪没关系 —— 按布局坐标抓的话，窗口滚出视口 / 停到屏外之后那块坐标
+		 * 里什么都没有，录到的是**一片黑**。 */
+		frame = vidow_win_grab_render(stream->win_grab, stream->out_w,
+			stream->out_h);
 		break;
 	case VIDOW_SC_OUTPUT:
 	case VIDOW_SC_VIRTUAL:
@@ -864,6 +881,9 @@ static void stream_destroy(struct vidow_screencast_stream *stream) {
 		wl_list_remove(&stream->view_destroy.link);
 		stream->view = NULL;
 	}
+	/* 取景器得在窗口还活着的时候拆（它按表面销毁自己收尾，见 wincapture.c）。 */
+	vidow_win_grab_destroy(stream->win_grab);
+	stream->win_grab = NULL;
 	if (owned != NULL) {
 		wlr_output_destroy(owned);
 	}
@@ -974,6 +994,8 @@ static void stream_handle_view_destroy(struct wl_listener *listener, void *data)
 	stream->view = NULL;
 	wl_list_remove(&stream->view_destroy.link);
 	wl_list_init(&stream->view_destroy.link);
+	vidow_win_grab_destroy(stream->win_grab);
+	stream->win_grab = NULL;
 	if (stream->resource != NULL) {
 		zkde_screencast_stream_unstable_v1_send_closed(stream->resource);
 	}
@@ -1032,8 +1054,23 @@ static void handle_stream_window(struct wl_client *client,
 	}
 	stream->kind = VIDOW_SC_WINDOW;
 	stream->view = view;
-	stream->out_w = (int)lround(geom.width * output->scale);
-	stream->out_h = (int)lround(geom.height * output->scale);
+	stream->win_grab = vidow_win_grab_create(sc->server, view);
+	if (stream->win_grab == NULL) {
+		stream_destroy(stream);
+		reply_failed(client, sc, resource, stream_id,
+			"vidow: 建不了窗口的取景器");
+		return;
+	}
+	/* 尺寸取**窗口表面**那块（= 选择器里预览缩略图的尺寸）—— 两边对不上的话，
+	 * 消费者按 portal 报的尺寸来协商就会整个失败（见 param_changed 里那段）。 */
+	int gw = 0, gh = 0;
+	if (vidow_win_grab_box(stream->win_grab, &gw, &gh)) {
+		stream->out_w = (int)lround(gw * output->scale);
+		stream->out_h = (int)lround(gh * output->scale);
+	} else {
+		stream->out_w = (int)lround(geom.width * output->scale);
+		stream->out_h = (int)lround(geom.height * output->scale);
+	}
 	stream->view_destroy.notify = stream_handle_view_destroy;
 	wl_signal_add(&view->ftl_handle->events.destroy, &stream->view_destroy);
 	wlr_log(WLR_INFO, "screencast: 请求录窗口「%s」（%s，%dx%d）",

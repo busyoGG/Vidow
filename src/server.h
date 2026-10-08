@@ -1864,6 +1864,9 @@ struct vidow_screencast_stream {
 	/* kind == WINDOW：录哪个窗口（窗口没了就结束这一路）。 */
 	struct vidow_view *view;
 	struct wl_listener view_destroy;
+	/* kind == WINDOW：窗口的取景器（私有场景 + 镜像，见 wincapture.c）。
+	 * 跟窗口在屏幕上摆在哪没关系，所以滚出视口 / 被裁也不影响出帧。 */
+	struct vidow_win_grab *win_grab;
 	/* kind == REGION / WINDOW：抓哪一块（布局坐标）+ 逻辑→像素的缩放。 */
 	struct wlr_box box;
 	double scale;
@@ -2065,6 +2068,23 @@ void vidow_view_capture_hold(struct vidow_view *view,
  * 跟它在屏幕上摆在哪、被谁压着、裁没裁都没关系。 */
 struct wlr_ext_image_capture_source_v1 *vidow_win_capture_source_create(
 		struct vidow_server *server, struct vidow_view *view);
+
+/* 窗口的「取景器」：私有场景 + 一份窗口镜像 + 假输出。按窗口录屏那条路
+ * （screencast.c 的 stream_window）也用它出帧 —— 屏幕上是全局坐标，窗口滚到视口外
+ * 之后按布局坐标抓就是一片黑，镜像跟位置无关。 */
+struct vidow_win_grab;
+struct vidow_win_grab *vidow_win_grab_create(struct vidow_server *server,
+		struct vidow_view *view);
+/* 必须在**表面**的 destroy 里调（见 wincapture.c 里 grab_handle_surface_destroy
+ * 上面那段：不能在镜像节点自己的 destroy 信号里拆整棵场景）。 */
+void vidow_win_grab_destroy(struct vidow_win_grab *grab);
+/* 镜像的外接框（逻辑尺寸）。没内容（客户端还没提交过缓冲）返回 false。 */
+bool vidow_win_grab_box(struct vidow_win_grab *grab, int *width, int *height);
+/* 渲染一帧：窗口等比缩放摆进 out_w × out_h（剩下的边是黑的），返回**加锁的**缓冲
+ * （调用方 unlock）。out_w / out_h 给 0 = 按窗口自己的尺寸（1:1）。不看损伤。 */
+struct wlr_buffer *vidow_win_grab_render(struct vidow_win_grab *grab,
+		int out_w, int out_h);
+struct wlr_swapchain *vidow_win_grab_swapchain(struct vidow_win_grab *grab);
 void vidow_place_view(struct vidow_view *view, int x, int y, int w, int h);
 
 /* 最小化 / 放回（见 view.c）：

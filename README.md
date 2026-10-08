@@ -2882,7 +2882,8 @@ test-portal-own.sh vidow 自己的录屏 portal（不依赖 KDE）：vidow.porta
                   落地 → vidow-portal 占住总线名 → 前端把 ScreenCast 指给它 → 选择器
                   对话框画在 vidow 上 → 点「共享」→ Start 返回 node → gst 消费者拿到会变的帧；
                   窗口 / 虚拟输出 / 截图取色 / 光标元数据（含缩放 2 倍的坐标换算与 hidden 反证）
-                  （41 项）
+                  —— 窗口那一轮的流尺寸要和 portal 报的一致（消费者按报的尺寸协商时，
+                  对不上就是一帧都拿不到，见 172 的 ⑥）（41 项）
 test-screencast.sh KDE 的录屏 portal（portal_capture = "kde" 那条路）：vidow 暴露 zkde_screencast_unstable_v1 →
                   XDG_CURRENT_DESKTOP=KDE 时后端才注册 ScreenCast → 点选择器 →
                   Start 返回 PipeWire node → gst 消费者拿到会变的帧
@@ -3894,6 +3895,24 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
       ⑤ 回归判据（`test-scrollcull.sh` 从 29 项到 36 项）：新增「静止窗口滚到视口外
       照样出帧」（3 秒 ≥ 30 帧，修之前 1 帧）、「挂着截图源的半块越界窗口不串屏」、
       6e 那条从「只断言录屏没坏」改成**断言隔壁屏 0 个窗口色像素**。
+
+      ⑥ **OBS 那条路（portal 的 `stream_window`）单独还有两个 bug**，同一个「取景器」
+      一起修掉了（用户报的「点共享之后没有流 / 就是黑的」「状态 streaming → pause →
+      streaming，error 是 none」）：
+        - **流的尺寸和 portal 报的尺寸对不上**：`handle_stream_window` 按窗口的
+          **布局几何**算（634×708），而选择器给 portal 报的是预览缩略图的尺寸
+          （= 窗口**表面**那块，含客户端自己的阴影边距，674×748）。消费者（OBS /
+          浏览器）按报出来的尺寸协商时，我们这边只有另一个尺寸 —— 协商整个失败。
+          实测：让 gst 按 portal 报的 674×748 协商，直接 `flow-return=-4`、**一帧都
+          拿不到**（按我们报的尺寸协商则正常）。现在流的尺寸取窗口表面那块（和预览
+          一致），并且**跟着消费者协商出来的尺寸走**（`param_changed` 里改
+          `stream->out_w/h`，按它渲染）—— 消费者要什么尺寸都给得出来。
+        - **按布局坐标抓**：那条路原来是「把别的窗口和 layer 全关掉、按窗口的布局框
+          渲染一屏」（`vidow_capture_grab_view`）。窗口滚出视口 / 停到屏外之后，那个
+          坐标里什么都没有 —— 录到的是**一片黑**。现在窗口流也用同一个取景器
+          （`vidow_win_grab_*`，私有场景 + 镜像），跟窗口在屏幕上摆在哪没关系。
+        实测（真 portal 链路 + 真 PipeWire 消费者）：修之前帧是 634×708、强制按
+        674×748 协商 0 帧；修之后 674×748、强制协商 3 帧、画面 84% 是窗口的蓝。
 
 171. **「藏起来的窗口」不再关场景节点，改成停到所有输出框外面**：录屏 / 预览终于两头都对
       （用户报的「开了 OBS 然后 portal 选择开启的时候，视口外的窗口就完全没藏住」+
