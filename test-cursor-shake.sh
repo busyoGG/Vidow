@@ -27,6 +27,11 @@
 #  11) cursor_shake_scale：1.5 → 1.5 倍；20 → 被屏幕尺寸封顶
 #  12) 日志里没有 assert / abort
 #
+# 判据 7 / 8 里「拍到的光标图」走 magnify_and_grab：放大的保持期只有 700ms，而
+# grim 从启动到跟合成器握完手要 200~600ms —— 晃完随手抓，抓到的是「保持期过了、
+# 正在缩回去」的中间尺寸（实测 36x57 / 44x70 / 52x83 / 23x37 都出现过）。这是
+# **测试自己的时序问题**，不是合成器的：屏幕上那个光标本来就是活的。
+#
 # 用法：./test-cursor-shake.sh   （VIDOW_TEST_KEEP=1 保留运行目录）
 # 注意：别和别的测试**并行**跑 —— 收尾按 cmdline 杀 pattern.py / frames / wev。
 set -u
@@ -184,6 +189,43 @@ scale_size() { # <w> <h> <倍数>
 	python3 -c 'import sys
 w,h,f = int(sys.argv[1]), int(sys.argv[2]), float(sys.argv[3])
 print("%dx%d" % (round(w*f), round(h*f)))' "$1" "$2" "$3"
+}
+
+# 晃到 <倍数> 倍，**当场**抓一张图，返回抓的那一下的光标尺寸。
+#
+# 为什么不能「晃完随手抓」：放大的保持期只有 700ms（cursorfx.c 的 SHAKE_HOLD_MS），
+# 而 grim 从启动到跟合成器握完手要 200~600ms（随机器负载飘）—— 稍微慢一点，抓到
+# 的就是「保持期过了、正在缩回去」的中间尺寸（实测 36x57 / 44x70 / 52x83 / 23x37
+# 都出现过）。这是**测试自己的时序问题**，不是合成器的：屏幕上那个光标本来就是
+# 活的，grim 抓到的就是它抓的那一刻的尺寸。
+#
+# 所以：等到 1x → 晃到目标倍数 → 等它到位 → 抓 → 抓完再对一次尺寸；两次不一样
+# 说明抓的过程中它在动，等它缩回去从头再来（最多 5 轮）。
+# 用法：magnify_and_grab <png> <倍数> <基础尺寸> [grim 参数…]
+magnify_and_grab() { # <png> <倍数> <基础尺寸> [grim 参数…]
+	local png=$1 want=$2 base=$3
+	shift 3
+	local img target i attempt
+	for attempt in 1 2 3 4 5; do
+		for _ in $(seq 1 60); do
+			[ "$(cfield image)" = "$base" ] && break
+			sleep 0.1
+		done
+		for i in $(seq 2 "$want"); do
+			msg cursor-shake >/dev/null
+			sleep 0.05
+		done
+		target=$(scale_size "${base%x*}" "${base#*x}" "$want")
+		for _ in $(seq 1 40); do
+			[ "$(cfield image)" = "$target" ] && break
+			sleep 0.05
+		done
+		img=$(cfield image)
+		grim "$@" "$png" >/dev/null 2>&1
+		[ "$(cfield image)" = "$img" ] && { echo "$img"; return 0; }
+	done
+	echo "$img"
+	return 1
 }
 
 # ------------------------------------------------------------ 1) 基本状态
@@ -363,19 +405,14 @@ read -r N1 X1 Y1 W1 H1 <<< "$(ink "$RUNDIR/cur.png")"
 [ "$W1" = "${IMG0%x*}" ] && [ "$H1" = "${IMG0#*x}" ] \
 	&& pass "没放大时外接矩形就是光标图大小（$IMG0）" \
 	|| fail "外接矩形是 $W1 x $H1，期望 $IMG0"
-msg cursor-shake >/dev/null
-# 等放大补间走完再拍：固定 sleep 0.35 是抢跑（IPC 那一下什么时候被处理掉、补间
-# 走到哪，都随机器快慢飘 —— 实测拍到的外接矩形 31x49 / 35x56 / 52x83 都有）。
-# 判据是「放大后正好是 $BIG」，那就等到它就是 $BIG 为止。
-for _ in $(seq 1 40); do
-	[ "$(cfield image)" = "$BIG" ] && break
-	sleep 0.05
-done
-grim -c "$RUNDIR/cur-mag.png" >/dev/null 2>&1
+# 放大后拍一张：等补间走到位、而且拍的过程中尺寸不许变（见 magnify_and_grab）。
+IMG_MAG=$(magnify_and_grab "$RUNDIR/cur-mag.png" 2 "$IMG0" -c)
+[ "$IMG_MAG" = "$BIG" ] && pass "放大后光标图是 $BIG（正好 2 倍）" \
+	|| fail "放大后光标图是 $IMG_MAG，期望 $BIG"
 read -r N2 X2 Y2 W2 H2 <<< "$(ink "$RUNDIR/cur-mag.png")"
-[ "$W2" = "${BIG%x*}" ] && [ "$H2" = "${BIG#*x}" ] \
-	&& pass "放大后外接矩形是 $BIG（正好 2 倍）" \
-	|| fail "放大后外接矩形是 $W2 x $H2，期望 $BIG"
+[ "$W2" = "${IMG_MAG%x*}" ] && [ "$H2" = "${IMG_MAG#*x}" ] \
+	&& pass "放大后外接矩形是 $IMG_MAG（和拍到的光标图一样大）" \
+	|| fail "放大后外接矩形是 $W2 x $H2，期望 $IMG_MAG"
 [ "$N2" -gt "$N1" ] && pass "像素更多了（$N1 → $N2）" \
 	|| fail "放大后像素没变多（$N1 → $N2）"
 EXP_X=$(( 2 * X1 - 300 ))
@@ -398,15 +435,15 @@ grim "$RUNDIR/soft.png" >/dev/null 2>&1
 read -r N0 X0 Y0 W0B H0B <<< "$(ink "$RUNDIR/soft.png")"
 [ "$N0" = "0" ] && pass "普通抓帧里没有光标（抓帧是 vidow 自己渲染的一帧，本来就不含光标）" \
 	|| fail "普通抓帧里有 $N0 个非背景像素（$W0B x $H0B）"
-for _ in 1 2 3 4 5; do msg cursor-shake >/dev/null; sleep 0.3; done
-IMG_S=$(cfield image)
+# 放大到 6 倍再拍（晃 5 下）。两张图都要在保持期内拍完，所以都用
+# magnify_and_grab：等补间到位 + 拍的过程中尺寸不许变。
+IMG_S=$(magnify_and_grab "$RUNDIR/soft-mag.png" 6 "$IMG0")
 grep -aq "摇晃: 光标放大.*软光标" "$LOG" \
 	&& pass "日志说明是软光标（$IMG_S）" || fail "日志没说软光标"
-grim "$RUNDIR/soft-mag.png" >/dev/null 2>&1
 read -r N1 X1 Y1 W1 H1 <<< "$(ink "$RUNDIR/soft-mag.png")"
 [ "$N1" = "0" ] && pass "**放大中的普通抓帧里也没有光标**（软光标也一样）" \
 	|| fail "放大中的抓帧里还有 $N1 个像素（$W1 x $H1）"
-grim -c "$RUNDIR/soft-c.png" >/dev/null 2>&1
+IMG_S=$(magnify_and_grab "$RUNDIR/soft-c.png" 6 "$IMG0" -c)
 read -r N2 X2 Y2 W2 H2 <<< "$(ink "$RUNDIR/soft-c.png")"
 [ "$W2" = "${IMG_S%x*}" ] && [ "$H2" = "${IMG_S#*x}" ] \
 	&& pass "grim -c（显式要）抓到的是放大图 $IMG_S" \
