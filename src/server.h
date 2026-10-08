@@ -2119,6 +2119,10 @@ void vidow_focus_view(struct vidow_view *view);
  * top 非空 = 「这一个刚被抬起来」，它落在自己那一组的最上面；没人站错队时一个
  * 节点都不碰（见 src/view.c）。 */
 void vidow_restack(struct vidow_server *server, struct vidow_view *top);
+/* 窗口现在**画在**哪块屏上：它看得见的那些屏里缩放最大的那块（跨屏拖动时布局归属
+ * 还没换，人已经在对面那块屏上了）。装饰离屏缓冲的倍率和私有模糊底衬归哪块屏都走
+ * 这一个判据。看不见任何屏时返回 NULL。 */
+struct wlr_output *vidow_view_display_output(const struct vidow_view *view);
 /* 「把这个窗口端到人面前」：先让它那块工作区亮起来（在别的屏上就把焦点挪过去 /
  * 整块工作区搬过来），再给键盘焦点。xdg-activation（点通知）、任务栏按钮、
  * X11 的 _NET_ACTIVE_WINDOW 都走这里 —— 光调 vidow_focus_view 的话，窗口要是

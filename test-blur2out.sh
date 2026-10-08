@@ -152,9 +152,14 @@ mark "动窗口：金字塔缓冲必须复用"
 # 动 wA（1 倍屏）让那块屏也渲染一帧 —— 两趟 blur_update 都跑了，才能看出
 # 「同一个窗口被两块屏轮流重建」。wB 每步挪 130 逻辑像素（>128 的网格），
 # 保证区域原点真的换格子（否则走的是「形状没变」的快路，测不出东西）。
+#
+# 挪动范围**留在 HEADLESS-2 自己那块屏里**（逻辑 960 宽，窗口 412 宽）：整块挪到
+# 隔壁那块屏上会换掉烘窗口的倍率（离屏缓冲按「看得见的那块屏里最大的倍率」烘，
+# 见 view.c 的 view_scale），那一下重建缓冲是**该发生的**，不在这个测试的判据里
+# —— 跨屏换倍率由 test-mixdpi.sh 管。
 N1=$(wc -l < "$LOG")
-for i in $(seq 1 10); do
-	./build/vidowmsg set-window-position --title wB $((200 + i * 130)) 200 >/dev/null 2>&1
+for i in $(seq 0 3); do
+	./build/vidowmsg set-window-position --title wB $((40 + i * 130)) 200 >/dev/null 2>&1
 	./build/vidowmsg set-window-position --title wA $((100 + i * 20)) 100 >/dev/null 2>&1
 	sleep 0.12
 done

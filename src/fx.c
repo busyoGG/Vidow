@@ -2226,6 +2226,14 @@ void vidow_blur_output_finish(struct vidow_output *output) {
 	}
 }
 
+/* 这块窗口的私有模糊底衬归哪块屏：它现在**画在**哪块屏上（跨屏拖动时布局归属还没
+ * 换，人已经在对面那块屏上了）；看不见任何屏就退回归属那块。和装饰离屏缓冲的倍率
+ * （view.c 的 view_scale）用同一个判据 —— 倍率和区域必须落在同一块屏的坐标系里。 */
+static struct wlr_output *view_blur_owner(struct vidow_view *view) {
+	struct wlr_output *out = vidow_view_display_output(view);
+	return out != NULL ? out : view->output;
+}
+
 /* Called once per frame before anything is drawn, so the decorations can
  * sample this frame's backdrop. Everything is cached: a frame where nothing
  * moved behind a window touches no GPU buffer at all. */
@@ -2238,7 +2246,7 @@ void vidow_blur_update(struct vidow_output *output) {
 		h > 0 && w <= MAX_TARGET_PX && h <= MAX_TARGET_PX;
 	if (!usable) {
 		wl_list_for_each(view, &server->views, link) {
-			if (view->output != output->wlr_output) {
+			if (view_blur_owner(view) != output->wlr_output) {
 				continue; /* 别的屏上的窗口归那一趟收 */
 			}
 			blur_target_release(&view->fx);
@@ -2297,8 +2305,13 @@ void vidow_blur_update(struct vidow_output *output) {
 		 * 每帧互相把对方的缓冲丢掉重建 —— 一次十几块 GBM 缓冲（最大那块
 		 * 2304x2560 = 23 MB），拖窗口时每秒几千次分配，屏幕上一顿一顿的。
 		 * 顺带也修了「区域和贴图归哪块屏」：以前最后写进 fx 的是哪一趟算的
-		 * 就归谁，跨屏的窗口可能采到另一块屏的底衬。 */
-		if (view->output != output->wlr_output) {
+		 * 就归谁，跨屏的窗口可能采到另一块屏的底衬。
+		 *
+		 * 归属判据和装饰离屏缓冲的倍率是**同一个**（view_blur_owner ——
+		 * 「窗口现在画在哪块屏上」）：两个地方各算各的话，拖到对面那块屏上时
+		 * 倍率对不上，模糊贴图的采样坐标就落错地方（那块区域是按底衬这块屏的
+		 * 设备像素记的）。 */
+		if (view_blur_owner(view) != output->wlr_output) {
 			continue;
 		}
 		if (!view_wants_blur(view) || view->fx.node == NULL) {

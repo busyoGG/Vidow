@@ -734,14 +734,65 @@ static struct wlr_scene_surface *find_scene_surface(struct wlr_scene_node *node,
 
 /* ------------------------------------------------------------ animation */
 
-/* 窗口所在输出的缩放。装饰着色器的离屏缓冲按它分配 —— 「同一块窗口在不同 DPI
- * 的屏上都清晰」的另一半：客户端那边靠 buffer_scale 声明自己画了多大，这边靠
- * 渲染倍率保证装饰和着色器也是按设备像素画的。 */
+/* 窗口**画在哪块屏上**：它现在看得见的那些屏里，缩放最大的那块（跨在两块屏上时
+ * 取大的那个，理由见下面 view_scale 的注释）。看不见任何屏（藏起来的工作区、还没
+ * 摆过）时返回 NULL。
+ *
+ * 装饰的离屏缓冲倍率（view_scale）和私有模糊底衬归哪块屏（fx.c 的
+ * vidow_blur_update）都走这一个判据 —— 「这块窗口现在算在哪块屏上」只能有一个
+ * 答案，两个地方各算各的就会错位（模糊贴图的采样坐标是按底衬那块屏的设备像素算
+ * 的，倍率对不上就采错地方）。 */
+struct wlr_output *vidow_view_display_output(const struct vidow_view *view) {
+	if (!view->mapped) {
+		return NULL;
+	}
+	struct wlr_box box = vidow_view_screen_box(view);
+	struct wlr_output *best = NULL;
+	double best_scale = 0.0;
+	struct vidow_output *output;
+	wl_list_for_each(output, &view->server->outputs, link) {
+		struct wlr_output *wlr_output = output->wlr_output;
+		if (wlr_output == NULL || !wlr_output->enabled) {
+			continue;
+		}
+		struct wlr_box obox;
+		wlr_output_layout_get_box(view->server->output_layout, wlr_output,
+			&obox);
+		struct wlr_box hit;
+		if (!wlr_box_intersection(&hit, &box, &obox)) {
+			continue;
+		}
+		double scale = wlr_output->scale > 0.0 ? wlr_output->scale : 1.0;
+		if (scale > best_scale) {
+			best_scale = scale;
+			best = wlr_output;
+		}
+	}
+	return best;
+}
+
+/* 窗口**画在哪块屏上**，就按那块屏的缩放烘（取可见的那些屏里**最大**的倍率）。
+ * 装饰着色器的离屏缓冲按它分配 —— 「同一块窗口在不同 DPI 的屏上都清晰」的另一半：
+ * 客户端那边靠 buffer_scale 声明自己画了多大，这边靠渲染倍率保证装饰和着色器也是
+ * 按设备像素画的。
+ *
+ * 判据是「画在哪块屏上」，不是「属于哪块屏的工作区」（view->output）：拖着窗口跨屏
+ * 的那一段，归属要到**松手**才换，可它已经在对面那块屏上画着了。按 view->output 算，
+ * 离屏缓冲还是旧倍率（实测：拖到 4K 屏上还是 2076x1236 的 1 倍缓冲），整块窗口被放大
+ * 到新屏上 —— 4K 屏上一直糊着，松手（归属换了）才清楚。
+ *
+ * 跨在两块屏上时取大的那个倍率：客户端（GTK 那类）一碰到 2 倍屏就按 2 倍重画了，
+ * 我们按 1 倍烘的话它交上来的 2 倍缓冲还得先缩下去、屏幕上再放大 —— 还是糊。宁可
+ * 多烘（画到 1 倍屏上时是缩下去，仍然清晰），不能少烘（画到 4K 屏上是放大，糊）。 */
 static double view_scale(const struct vidow_view *view) {
-	if (view->output == NULL) {
+	struct wlr_output *out = vidow_view_display_output(view);
+	if (out == NULL) {
+		out = view->output;
+	}
+	if (out == NULL) {
 		return 1.0;
 	}
-	double scale = view->output->scale;
+	double scale = out->scale;
 	return scale > 0.0 ? scale : 1.0;
 }
 
