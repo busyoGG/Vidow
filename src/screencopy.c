@@ -178,18 +178,23 @@ static struct vidow_screencopy_client *client_from_resource(
 
 /* ------------------------------------------------------------ 格式换算 */
 
-/* wl_shm 的枚举值 → DRM fourcc。两边只差一个数字，但比错了就永远不等：
- * wlr_buffer_begin_data_ptr_access 给出来的 format 是 **DRM** 的（跟
- * wlr_texture_read_pixels 的 format 参数一个口径），frame->shm_format 是
- * wl_shm 的。 */
+/* wl_shm 的枚举值和 DRM fourcc 是两套编号，只有两个是特例：协议里
+ * ARGB8888 = 0、XRGB8888 = 1 是硬编码的，**其余格式的值就是 DRM fourcc**
+ * （WL_SHM_FORMAT_XBGR8888 == DRM_FORMAT_XBGR8888 == 0x34324258）。
+ *
+ * 而 wlr_buffer_begin_data_ptr_access() 给的 format 一律是 **DRM** 的（跟
+ * wlr_texture_read_pixels 的 format 参数一个口径）。所以要比较这两个东西，就得
+ * 先把特例那两个换过去；换错的表现是「有的客户端能用、有的永远 invalid buffer
+ * format」：GLES2 的读回格式是 XBGR8888（值相同，蒙对了），pixman 是 XRGB8888
+ * （1 vs 0x34325258，永远不等）。 */
 static uint32_t shm_format_to_drm(uint32_t shm_format) {
 	switch (shm_format) {
-	case WL_SHM_FORMAT_ARGB8888:
+	case WL_SHM_FORMAT_ARGB8888: /* 0：协议特例，不是 DRM fourcc */
 		return DRM_FORMAT_ARGB8888;
-	case WL_SHM_FORMAT_XRGB8888:
+	case WL_SHM_FORMAT_XRGB8888: /* 1：同上 */
 		return DRM_FORMAT_XRGB8888;
 	default:
-		return DRM_FORMAT_INVALID;
+		return shm_format;
 	}
 }
 
@@ -199,12 +204,9 @@ static uint32_t drm_format_to_shm(uint32_t format) {
 		return WL_SHM_FORMAT_ARGB8888;
 	case DRM_FORMAT_XRGB8888:
 		return WL_SHM_FORMAT_XRGB8888;
-	case DRM_FORMAT_ABGR8888:
-		return WL_SHM_FORMAT_ABGR8888;
-	case DRM_FORMAT_XBGR8888:
-		return WL_SHM_FORMAT_XBGR8888;
 	default:
-		return 0;
+		/* 其余 32 位格式（XBGR8888 / ABGR8888 …）两边同值，原样发。 */
+		return format;
 	}
 }
 
@@ -583,11 +585,12 @@ static void capture_output(struct wl_client *client,
 	uint32_t read_format = wlr_texture_preferred_read_format(texture);
 	wlr_texture_destroy(texture);
 
-	frame->shm_format = drm_format_to_shm(read_format);
-	if (frame->shm_format == 0) {
-		wlr_log(WLR_ERROR, "screencopy: 渲染器给不出能放进 wl_shm 的读回格式");
+	if (read_format == DRM_FORMAT_INVALID) {
+		/* 注意别拿 shm_format == 0 当「没有」判：ARGB8888 在 wl_shm 里就是 0。 */
+		wlr_log(WLR_ERROR, "screencopy: 渲染器给不出读回格式");
 		goto error;
 	}
+	frame->shm_format = drm_format_to_shm(read_format);
 	if (output->allocator != NULL &&
 			(output->allocator->buffer_caps & WLR_BUFFER_CAP_DMABUF)) {
 		frame->dmabuf_format = output->render_format;

@@ -3737,13 +3737,20 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
 
      **顺手修掉的真 bug**：
 
-     - **`zwlr_screencopy_manager_v1` 的 wl_shm 路径一直是坏的**：`copy` 里拿
-       `wlr_buffer_begin_data_ptr_access()` 的 `format`（**DRM** fourcc，和
-       `wlr_texture_read_pixels` 一个口径）去比 `frame->shm_format`（**wl_shm** 枚举），
-       两个数永远不等 → 走 shm 的客户端一律被 `invalid buffer format` 拒掉。一直没暴露是因为
-       老客户端都走 dmabuf（wf-recorder）或干脆换了 ext-image-copy-capture（新版 grim 实测
-       绑的是 ext 那条路），shm 那条路没人踩。我们的选择器缩略图正好走它，一上来就被拒。
-       修法是比之前先 `shm_format_to_drm()` 转一下，并把两个值都写进错误日志。
+     - **`zwlr_screencopy_manager_v1` 的格式比较是错的，而且错法挑客户端**：wl_shm 的枚举值
+       只有 `ARGB8888 = 0` / `XRGB8888 = 1` 是协议特例，**其余格式的值就是 DRM fourcc**
+       （`WL_SHM_FORMAT_XBGR8888 == DRM_FORMAT_XBGR8888 == 0x34324258`）；而
+       `wlr_buffer_begin_data_ptr_access()` 给的 format 一律是 DRM 的。老代码直接拿两个数比：
+       渲染器读回格式是 XBGR8888 时（GLES2，实测 wf-recorder 的 `buffer` 事件报的就是
+       `0x34324258`）值恰好相同 → 蒙对；是 XRGB8888 时（pixman）1 vs 0x34325258 → 永远不等，
+       客户端被 `invalid buffer format` 拒掉。我们的选择器缩略图正好跑在 pixman 上，一上来
+       就被拒。修法是两边都按「特例那两个换一下、其余同值」处理（`shm_format_to_drm()` /
+       `drm_format_to_shm()`），并把两个值都写进错误日志。
+       **第一版修反了**：只把「wl_shm 枚举 → DRM」这半边换过去、把另外半边当非法，于是 GLES2
+       那侧（走 shm 的 wf-recorder）反而红了 —— `test-capture-hide.sh` 报「录像文件 ffprobe
+       读不出时长」（帧格式中途变化，ffmpeg 的 filtergraph 直接报错退出，MKV 没写完）。
+       顺手把「`shm_format == 0` 当没有」那个守卫也改了：ARGB8888 在 wl_shm 里就是 0，那个
+       守卫会把合法的 ARGB8888 读回当成失败（现在看 `read_format == DRM_FORMAT_INVALID`）。
      - **前端要不要重启，判据以前是错的**：前端的 `portals.conf` 是**进程起来那一刻**读的、
        读一次缓存住，而它的环境也是被 systemd 激活那一刻定死的。以前只在「配置内容变了」时
        重启它 —— 从宿主合成器切过来时配置往往没变（文件是上一轮写的），于是前端还按宿主那份

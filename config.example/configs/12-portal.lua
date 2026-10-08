@@ -8,4 +8,6 @@
 portal_conf_sync = true
 -- XDG_CURRENT_DESKTOP 的值（xdg-desktop-portal 按它选 <名字>-portals.conf）
 portal_desktop = "Vidow"
--- 这一族也能写成一张表，只写要改的项（portal = { conf_sync = true, desktop = "Vidow" }）
+-- 录屏 / 截图交给谁：auto（默认）/ vidow / kde / wlr / hyprland / none
+portal_capture = "auto"
+-- 这一族也能写成一张表，只写要改的项（portal = { conf_sync = true, desktop = "Vidow", capture = "auto" }）
