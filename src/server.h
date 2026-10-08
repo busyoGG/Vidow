@@ -434,6 +434,11 @@ struct vidow_fx_target {
 	 * 都画。裁剪只作用在**显示**上：几何、客户端、录屏抓帧都不动。 */
 	bool clip_on;
 	struct wlr_box clip;
+	/* 没装饰（着色器也关着）时窗口是客户端表面自己在画，那一份裁的是表面树
+	 * （wlr_scene_subsurface_tree_set_clip，见 view.c）。存的是**上一次真的
+	 * 调进场景**的那个局部框：动画帧里窗口每帧都在动，只按 clip_on 判断会漏
+	 * —— 裁出来的是上一帧位置的那一块。宽 0 = 没裁。 */
+	struct wlr_box clip_local;
 
 	/* Blur backdrop. Either the server's shared wallpaper pyramid (borrowed)
 	 * or a private one captured with this window taken out (owned). The
@@ -717,6 +722,17 @@ struct vidow_view {
 	 * minimized_seq：什么时候收起来的（单调递增），「放回最近收起来的那个」按它挑。 */
 	bool minimized;
 	uint64_t minimized_seq;
+	/* 滚出自己那块屏 / 所在工作区藏起来：**不关场景节点**，而是把它停到所有输出
+	 * 框外面的「停车位」（见 view.c 的 view_park_pos、view_anim_place 里的用法）。
+	 *
+	 * 为什么不用 wlr_scene_node_set_enabled(false)（以前就是这么干的）：按窗口录屏
+	 * 和选择器里的预览走的是 wlroots 的窗口截图源，它渲染的就是这棵场景子树 ——
+	 * 节点一关，录到 / 预览到的就是一片黑（「滚出视口的窗口在 portal 里没预览」
+	 * 就是这么来的）。停到输出框外面：哪块屏的框里都没有它，屏幕上照样看不见；
+	 * 截图源那个虚拟输出是按节点自己的位置摆的（见 wlroots 的
+	 * ext_image_capture_source_v1/scene.c），节点停哪儿它跟到哪儿，录到的是完整
+	 * 窗口。 */
+	bool scene_parked;
 	/* 帧追踪用：上一次记 commit 的时间（VIDOW_TRACE_FRAMES=1 才写） */
 	int64_t trace_commit_ns;
 
@@ -2027,6 +2043,12 @@ bool vidow_view_in_output_box(struct vidow_server *server,
  * 窗口跑到另一个显示器里面」）。裁的是显示：几何、客户端、录屏抓帧都不动。浮窗 /
  * 正被拖的窗口 / overview / 有人录屏的窗口不裁（它们本来就允许跨屏）。 */
 void vidow_view_apply_clip(struct vidow_view *view);
+/* 「它现在该停到所有输出框外面吗」：滚出自己那块屏 / 工作区藏起来 / 最小化 → 该停。
+ * 判据只有这一份（view_anim_place 每帧现算，workspace.c 的可见性那一趟也问它）。 */
+bool vidow_view_should_park(struct vidow_server *server,
+		struct vidow_view *view);
+/* 停到屏外 / 放回屏里：改 scene_parked 的唯一入口（日志、损伤都在这儿）。 */
+void vidow_view_set_parked(struct vidow_view *view, bool park);
 /* 视口外强制渲染：这一帧给「不在画面上但要保活」的窗口补帧回调（详见 view.c）。 */
 void vidow_view_render_pump(struct vidow_server *server,
 		struct vidow_output *output, uint32_t msec);

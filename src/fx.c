@@ -2826,6 +2826,18 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 			dst_w = inter.width;
 			dst_h = inter.height;
 			cropped = true;
+		} else if (!wlr_box_intersection(&inter, &node_box, &clip)) {
+			/* 这一帧整个身子都在自己那块屏外面：一个像素都不该画（画了就是
+			 * 画到隔壁屏上 —— 场景图是全局坐标，那边正画着这块框）。把落点
+			 * 甩到所有输出框外面去：整块缓冲照旧传进去（空的源框 wlroots 会
+			 * 当成「整块」，那是另一个意思），但没有任何一块屏的框里有它。
+			 * 别指望「没停到屏外就一定有交集」：判据比的是**这一帧画在哪儿**，
+			 * 这里用的是节点自己的落点，两者在动画帧里可能错开一拍 —— 错过
+			 * 一拍就是一块窗口闪在隔壁屏上（用户报的「回来的瞬间」）。 */
+			node_x = -1000000;
+			node_y = -1000000;
+			dst_w = 1;
+			dst_h = 1;
 		}
 	}
 	wlr_scene_node_set_position(&fx->node->node, node_x, node_y);

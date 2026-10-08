@@ -825,6 +825,11 @@ static void pump_surface(struct wlr_surface *surface, int sx, int sy, void *data
  * 框里 —— 于是就画到隔壁显示器上了（niri 不会：它每块屏各渲染自己那棵，屏外的
  * 自然被 framebuffer 裁掉）。所以这里按框判一次，越界的干脆不画。
  *
+ * 比的是**这一帧画在哪儿**（几何 + 动画偏移，见 vidow_view_screen_box），不是布局
+ * 目标位置：滚动 / 开窗动画里窗口是从屏边界上扫过去的，按目标位置判的话，滑回来的
+ * 那一路（目标已经落在屏里、画面还在屏外）会被当成「在屏里」，越界的那一块就画到
+ * 隔壁屏上了（用户报的「视口外的窗口回来的瞬间会显示在另一个显示器上」）。
+ *
  * 还没摆放（几何是空的）和不知道归哪块屏的都当「画得到」：宁可多画一帧，也别把
  * 一个刚 map 的窗口藏没了。 */
 bool vidow_view_in_output_box(struct vidow_server *server,
@@ -838,14 +843,13 @@ bool vidow_view_in_output_box(struct vidow_server *server,
 	if (box.width < 1 || box.height < 1) {
 		return true;
 	}
-	return view->geom.x < box.x + box.width &&
-		view->geom.x + view->geom.width > box.x &&
-		view->geom.y < box.y + box.height &&
-		view->geom.y + view->geom.height > box.y;
+	struct wlr_box at = vidow_view_screen_box(view);
+	return at.x < box.x + box.width && at.x + at.width > box.x &&
+		at.y < box.y + box.height && at.y + at.height > box.y;
 }
 
 /* 这块窗口现在该不该裁到自己那块屏里，裁的话边界是哪块屏的框。 */
-static bool view_clip_box(const struct vidow_view *view, struct wlr_box *out) {
+static bool view_clip_box(struct vidow_view *view, struct wlr_box *out) {
 	struct vidow_server *server = view->server;
 	if (!view->mapped || view->float_mode != VIDOW_FLOAT_NONE ||
 			view->dragging || vidow_overview_active(server) ||
@@ -854,8 +858,12 @@ static bool view_clip_box(const struct vidow_view *view, struct wlr_box *out) {
 		return false;
 	}
 	/* 弹出物先不裁：它的位置是相对父窗口算的，越界那点（菜单探出去一条）
-	 * 先留着。 */
-	if (view->popup) {
+	 * 先留着。停到停车位上的窗口也不裁：它本来就不在任何一块屏里（不用裁），
+	 * 而且裁的是场景节点的显示范围 —— 按窗口录屏的截图源渲染的是同一棵树，
+	 * 一裁录到的窗口就少一块。判据现算（跟摆位那份同一份，见
+	 * vidow_view_should_park）：只看存下来的标志会在「这一帧刚从停车位摆回来、
+	 * 还没走 arrange」的时候落后一帧。 */
+	if (vidow_view_should_park(server, view)) {
 		return false;
 	}
 	struct wlr_box box = {0};
@@ -863,16 +871,17 @@ static bool view_clip_box(const struct vidow_view *view, struct wlr_box *out) {
 	if (box.width < 1 || box.height < 1) {
 		return false;
 	}
-	/* 窗口**本体**整块都在自己那块屏里就不裁。装饰的阴影内边距那点越界
-	 * （窗口贴着屏边时探出去十几个像素）先留着：裁它要把场景节点的显示尺寸
+	/* 窗口**本体**整块都在自己那块屏里就不裁（比的是这一帧画在哪儿，动画偏移
+	 * 算在内 —— 见 vidow_view_in_output_box 上面那段）。装饰的阴影内边距那点
+	 * 越界（窗口贴着屏边时探出去十几个像素）先留着：裁它要把场景节点的显示尺寸
 	 * 改小，而窗口截图源（portal 的按窗口录屏）盯着这棵树，节点一变形它就
 	 * 重发一次约束 —— 客户端那边正好在等第一帧，撞上「session already has a
 	 * frame object」直接断线（踩过：test-force-render.sh 的录屏那节）。窗口
 	 * 本体越界才是要修的那个 bug，那一档照裁。 */
+	struct wlr_box at = vidow_view_screen_box(view);
 	struct wlr_box inter;
-	if (wlr_box_intersection(&inter, &view->geom, &box) &&
-			inter.width == view->geom.width &&
-			inter.height == view->geom.height) {
+	if (wlr_box_intersection(&inter, &at, &box) &&
+			inter.width == at.width && inter.height == at.height) {
 		return false;
 	}
 	*out = box;
@@ -911,23 +920,36 @@ void vidow_view_apply_clip(struct vidow_view *view) {
 	 * xdg toplevel —— X11 / 弹出物那两份靠 fx 那块离屏缓冲（默认配置装饰开着，
 	 * 窗口画的就是它）。 */
 	if (view->xdg_toplevel == NULL) {
+		/* X11 / 弹出物：表面那一份裁不了（见上），记成「没裁过」—— 免得
+		 * 以后哪天真拿到一棵能裁的树时，被一个过期的局部框挡掉。 */
+		view->fx.clip_local = (struct wlr_box){0};
 		return;
 	}
+	/* 这一帧画在哪儿（几何 + 动画偏移）：表面树挂在那个位置上。 */
+	struct wlr_box at = vidow_view_screen_box(view);
 	struct wlr_scene_node *node = view->scene_surface != NULL &&
 		view->scene_surface->buffer != NULL &&
 		view->scene_surface->buffer->node.parent != NULL ?
 		&view->scene_surface->buffer->node.parent->node : NULL;
 	if (node == NULL) {
+		view->fx.clip_local = (struct wlr_box){0};
 		return;
 	}
 	if (on) {
-		/* 表面局部坐标（逻辑单位，wlroots 自己乘缓冲倍率）。 */
+		/* 表面局部坐标（逻辑单位，wlroots 自己乘缓冲倍率）。原点取**这一帧
+		 * 画在哪儿**（几何 + 动画偏移）：表面树挂在那个位置上，减布局目标
+		 * 位置的话，滚动动画里裁出来的那块会跟着偏移。位置变了就得重调一次
+		 * —— 这个函数每帧都跑（重烘那一帧开头），别只按 clip_on 判断。 */
 		struct wlr_box local = {
-			.x = box.x - view->geom.x, .y = box.y - view->geom.y,
+			.x = box.x - at.x, .y = box.y - at.y,
 			.width = box.width, .height = box.height,
 		};
-		wlr_scene_subsurface_tree_set_clip(node, &local);
-	} else {
+		if (!wlr_box_equal(&local, &view->fx.clip_local)) {
+			view->fx.clip_local = local;
+			wlr_scene_subsurface_tree_set_clip(node, &local);
+		}
+	} else if (view->fx.clip_local.width > 0) {
+		view->fx.clip_local = (struct wlr_box){0};
 		wlr_scene_subsurface_tree_set_clip(node, NULL);
 	}
 }
@@ -1130,6 +1152,60 @@ static void view_capture_holds_clear(struct vidow_view *view) {
 	}
 }
 
+/* 「它现在该停到所有输出框外面吗」—— 判据只有这一份：workspace.c 的可见性那一趟
+ * 和 view_anim_place（每帧现算）都问它。
+ *
+ * 为什么每帧要现算、不能只在 arrange 里存一个标志：滚动 / 开窗的动画帧会自己摆
+ * 位置（不经过 arrange），窗口从屏边界上扫过去的时候存下来的标志就过期了 ——
+ * 摆回屏里之后还停在停车位上，那个窗口就再也不出现了。 */
+bool vidow_view_should_park(struct vidow_server *server,
+		struct vidow_view *view) {
+	if (view->popup || !view->mapped || view->scene_tree == NULL) {
+		return false; /* 弹出物 / 还没上屏的：各有各的路（见 workspace.c） */
+	}
+	if (!vidow_workspace_view_visible(server, view)) {
+		return true; /* 最小化 / 工作区被藏起来：也不画 */
+	}
+	if (view->float_mode != VIDOW_FLOAT_NONE || view->dragging ||
+			vidow_overview_active(server)) {
+		return false; /* 浮窗、正被拖的窗口本来就允许跨屏；overview 全缩进画面 */
+	}
+	return !vidow_view_in_output_box(server, view);
+}
+
+/* 停到屏外 / 放回屏里。**只有这一个入口**改这个标志：日志和损伤都在这儿 ——
+ * 「藏起 / 显示」这行状态是给人和测试看「它现在是什么样」的，所以每次翻转都得
+ * 写一行（view_map 里那次翻转也算）。 */
+void vidow_view_set_parked(struct vidow_view *view, bool park) {
+	if (view->scene_parked == park) {
+		return;
+	}
+	view->scene_parked = park;
+	/* 它自己进/出画面了：底衬的合成结果变了。账记在它头上（它自己的私有底衬
+	 * 不受影响），别的窗口因为世界代次前进而重抓。 */
+	vidow_backdrop_damage_view(view);
+	wlr_log(WLR_DEBUG, "workspace: %s %s（%s）",
+		vidow_view_title(view) != NULL ? vidow_view_title(view) : "(无题)",
+		park ? "藏起（停到屏外）" : "显示",
+		view->ws != NULL ? view->ws->name : "-");
+}
+
+/* 停到哪儿：所有输出框外面的「停车位」—— 左上角再往外挪 64K，按窗口编号横着
+ * 排开（一格 16384 逻辑像素，够 16K 宽的窗口）。为什么按编号排开：按窗口录屏的
+ * 虚拟输出框就是节点自己那块框，两个停着的窗口挨在一起的话，录一个会连旁边那个
+ * 一起录进去。 */
+static void view_park_pos(const struct vidow_view *view, int *px, int *py) {
+	struct wlr_box all = {0};
+	wlr_output_layout_get_box(view->server->output_layout, NULL, &all);
+	if (all.width < 1 || all.height < 1) {
+		all.x = 0;
+		all.y = 0;
+	}
+	int slot = (int)(view->id % 64);
+	*px = all.x - 65536 - slot * 16384;
+	*py = all.y - 65536;
+}
+
 /* 「摆在哪」落到场景节点上：位置 / 透明度 / overview 的显示尺寸 / 装饰的采样
  * 偏移和 ext-background-effect 的区域。**便宜**，拖动跟手时每个指针事件都走这条。
  * 装饰图的重烘（贵：整块窗口那么大的离屏渲染）在 vidow_view_anim_bake 里，一帧
@@ -1156,6 +1232,15 @@ static void view_anim_place(struct vidow_view *view) {
 	vidow_overview_map(server, wx, wy, &sx_mapped, &sy_mapped);
 	int x = (int)lround(sx_mapped);
 	int y = (int)lround(sy_mapped);
+
+	/* 停车：滚出自己那块屏 / 工作区藏起来的窗口不关节点，改成停到所有输出框外面
+	 * （见 server.h 的 scene_parked）。位置只有这一个出口 —— 藏不藏、摆哪儿都在
+	 * 这儿定，别在别处再 wlr_scene_node_set_position 一次。判据每帧现算（动画帧
+	 * 里窗口会扫过屏边界，存下来的标志会过期）。 */
+	vidow_view_set_parked(view, vidow_view_should_park(server, view));
+	if (view->scene_parked) {
+		view_park_pos(view, &x, &y);
+	}
 
 	wlr_scene_node_set_position(&view->scene_tree->node, x, y);
 	vidow_fx_set_alpha(&view->scene_tree->node, alpha);
@@ -2763,12 +2848,20 @@ static void view_map(struct wl_listener *listener, void *data) {
 			view->ws = vidow_workspace_shown(server);
 		}
 	}
-	/* 弹出物不进工作区，它跟父窗口走：父窗口在显示着的那块工作区里，它才显示。 */
+	/* 弹出物不进工作区，它跟父窗口走：父窗口在显示着的那块工作区里，它才显示。
+	 * 普通窗口不靠「关节点」藏起来（关了按窗口录屏 / 预览就是黑的），节点一直
+	 * 开着，藏不藏由 scene_parked 定 —— 这一帧的 arrange 里就会算准（见
+	 * workspace.c 的 vidow_workspace_apply_visibility）。 */
 	bool show = view->popup ?
 		(view->parent == NULL ||
 			vidow_workspace_view_visible(server, view->parent)) :
 		vidow_workspace_view_visible(server, view);
-	wlr_scene_node_set_enabled(&view->scene_tree->node, show);
+	if (view->popup) {
+		wlr_scene_node_set_enabled(&view->scene_tree->node, show);
+	} else {
+		vidow_view_set_parked(view, !show);
+		wlr_scene_node_set_enabled(&view->scene_tree->node, true);
+	}
 	vidow_backdrop_damage_view(view);
 
 	struct wlr_box geo = vidow_view_geometry(view);

@@ -199,8 +199,10 @@ void vidow_ipc_json_window(struct jbuf *b, struct vidow_server *server,
 	 * 不参与焦点。任务栏 / 状态栏拿它决定画不画那个「收起来」的条目。 */
 	jb_kv_bool(b, "minimized", view->minimized);
 	jb_kv_bool(b, "focused", server->focused == view);
+	/* 画在屏幕上没有：滚出视口 / 工作区藏起来的窗口现在是「停到屏外」而不是
+	 * 关节点（见 server.h 的 scene_parked），所以不能再看节点那个 enabled。 */
 	jb_kv_bool(b, "visible", view->scene_tree != NULL &&
-		view->scene_tree->node.enabled);
+		view->scene_tree->node.enabled && !view->scene_parked);
 	jb_kv_str(b, "output", view->output != NULL ? view->output->name : NULL);
 	jb_kv_str(b, "home", view->home != NULL ? view->home->key : NULL);
 	jb_kv_str(b, "workspace", view->ws != NULL ? view->ws->name : NULL);

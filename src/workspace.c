@@ -760,23 +760,28 @@ int vidow_workspace_apply_visibility(struct vidow_server *server) {
 		}
 		bool want;
 		if (view->popup) {
-			/* 弹出物跟父窗口：父窗口藏起来了（换了工作区），菜单也得收。 */
+			/* 弹出物跟父窗口：父窗口藏起来了（换了工作区），菜单也得收。父窗口
+			 * 滚出自己那块屏（停到停车位上）时也一样收 —— 弹出物不在父窗口那棵
+			 * 树里（X11 的在单独一层上），位置是按父窗口的**布局坐标**算的，
+			 * 父窗口都停到屏外了它还会留在原地。 */
 			if (view->parent == NULL) {
 				continue;
 			}
 			want = view->mapped &&
-				vidow_workspace_view_visible(server, view->parent);
+				vidow_workspace_view_visible(server, view->parent) &&
+				!view->parent->scene_parked &&
+				vidow_view_in_output_box(server, view);
 		} else {
-			want = view->mapped && vidow_workspace_view_visible(server, view);
 			/* 滚出自己那块屏的列不画：场景图是全局坐标，它的坐标会落进隔壁
 			 * 那块屏的框里 —— 于是就画到隔壁显示器上了。浮动窗口、正被拖的
 			 * 窗口本来就允许跨屏（拖过去就是要跨），overview 里所有窗口都被
-			 * 缩进画面 —— 这三种照旧显示。 */
-			if (want && view->float_mode == VIDOW_FLOAT_NONE &&
-					!view->dragging && !vidow_overview_active(server) &&
-					!vidow_view_capture_held(view)) {
-				want = vidow_view_in_output_box(server, view);
-			}
+			 * 缩进画面 —— 这三种照旧显示。判据就这一份（vidow_view_should_park，
+			 * view_anim_place 每帧也问它）。
+			 *
+			 * 「不画」= 停到停车位（scene_parked），**不是**关节点：关了的话按
+			 * 窗口录屏 / 选择器里的预览（它们渲染的就是这棵子树）拿到的是黑的。
+			 * 见 server.h 的 scene_parked。 */
+			want = !vidow_view_should_park(server, view);
 		}
 		if (want) {
 			shown++;
@@ -784,16 +789,28 @@ int vidow_workspace_apply_visibility(struct vidow_server *server) {
 		/* 越界的那一块裁掉：上面那条是「整块滚出自己那块屏」，这里是「还看得见
 		 * 一部分、另一部分跨过了屏边界」—— 跨过去的那半块不能画到隔壁屏上。 */
 		vidow_view_apply_clip(view);
-		if (node_enabled(view->scene_tree) != want) {
-			/* 它自己进/出场景了：底衬的合成结果变了。账记在它头上（它自己的
-			 * 私有底衬不受影响），别的窗口因为世界代次前进而重抓。 */
-			vidow_backdrop_damage_view(view);
-			wlr_log(WLR_DEBUG, "workspace: %s %s（%s）",
-				vidow_view_title(view) != NULL ?
-					vidow_view_title(view) : "(无题)",
-				want ? "显示" : "藏起",
-				view->ws != NULL ? view->ws->name : "-");
-			wlr_scene_node_set_enabled(&view->scene_tree->node, want);
+		if (view->popup) {
+			/* 弹出物照旧关节点：它们不是截图源（窗口截图源指的一定是 toplevel
+			 * 那棵树），关掉不影响录屏；而且它们挂在单独一层上，跟着父窗口
+			 * 停车那套走不了。 */
+			if (node_enabled(view->scene_tree) != want) {
+				vidow_backdrop_damage_view(view);
+				wlr_log(WLR_DEBUG, "workspace: 弹出物 %s %s",
+					vidow_view_title(view) != NULL ?
+						vidow_view_title(view) : "(无题)",
+					want ? "显示" : "藏起");
+				wlr_scene_node_set_enabled(&view->scene_tree->node, want);
+			}
+			continue;
+		}
+		if (view->scene_parked == want) {
+			/* 该画却停着（或该停着却还画着）：立刻摆到位、**并且把这一帧的装饰
+			 * 重烘掉** —— 滚回视口的那一瞬间节点还在停车位上（下一帧才摆回来的
+			 * 话屏幕上会闪一下「没有」），而且半块越界的那种窗口必须在同一帧里
+			 * 就裁好，否则它整个身子会先画在隔壁屏上、等下一帧才收回来（就是
+			 * 那个「回来的瞬间跑到另一块屏上」）。翻转本身（含日志 / 损伤）在
+			 * place 那一份判据里做，见 vidow_view_set_parked。 */
+			vidow_view_apply_anim(view);
 		}
 	}
 	return shown;
