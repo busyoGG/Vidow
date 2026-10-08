@@ -142,6 +142,11 @@ void vidow_float_set_mode(struct vidow_view *view,
 	/* Floating windows pick their own size (0x0 = client's choice). */
 	vidow_view_set_size(view, 0, 0);
 	vidow_arrange(server);
+	/* 刚变成浮动的那个摆到浮窗组最上面：它正是用户刚动过的那个。不抬的话它可能
+	 * 停在「平铺时候」的位置上（平铺的那些节点本来就在浮窗下面，它从下面翻上来
+	 * 之后是组里最低的那个），看起来就像「切成浮动了但还是被别的浮窗压着」。
+	 * arrange 里的收口只保证「浮动在平铺之上」，组内的先后得在这里点一下。 */
+	vidow_restack(server, view);
 	vidow_ipc_emit_window(server, "window-floating-changed", view);
 }
 

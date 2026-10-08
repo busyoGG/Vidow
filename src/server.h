@@ -2115,6 +2115,10 @@ struct vidow_view *vidow_view_at(struct vidow_server *server,
 		double lx, double ly, struct wlr_surface **surface,
 		double *sx, double *sy);
 void vidow_focus_view(struct vidow_view *view);
+/* 层级收口：平铺 < 浮动 < 全屏（浮动永远压在平铺之上，浮窗之间靠点击换层级）。
+ * top 非空 = 「这一个刚被抬起来」，它落在自己那一组的最上面；没人站错队时一个
+ * 节点都不碰（见 src/view.c）。 */
+void vidow_restack(struct vidow_server *server, struct vidow_view *top);
 /* 「把这个窗口端到人面前」：先让它那块工作区亮起来（在别的屏上就把焦点挪过去 /
  * 整块工作区搬过来），再给键盘焦点。xdg-activation（点通知）、任务栏按钮、
  * X11 的 _NET_ACTIVE_WINDOW 都走这里 —— 光调 vidow_focus_view 的话，窗口要是

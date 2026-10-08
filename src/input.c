@@ -395,6 +395,12 @@ void vidow_pointer_button(struct vidow_server *server, uint32_t button,
 
 	if (view != NULL && view != server->focused) {
 		vidow_focus_view(view);
+	} else if (view != NULL) {
+		/* 已经拿着键盘的那个也要抬一下：浮窗之间靠点击换层级，而它可能正被
+		 * 后开（或者刚被点过）的另一个浮窗压着 —— 这时候焦点没变，不抬就等于
+		 * 「点了没反应」。平铺窗口不用管：它们本来就该在浮窗下面（见
+		 * vidow_restack）。 */
+		vidow_restack(server, view);
 	}
 }
 

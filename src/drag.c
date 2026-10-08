@@ -81,7 +81,9 @@ void vidow_tile_grab_begin(struct vidow_server *server,
 	view->drag_dx = (int)(server->cursor->x - view->geom.x);
 	view->drag_dy = (int)(server->cursor->y - view->geom.y);
 	if (view->scene_tree != NULL) {
-		wlr_scene_node_raise_to_top(&view->scene_tree->node);
+		/* 飘起来的平铺窗口压住别的平铺窗口，浮窗照旧在它上面（见
+		 * vidow_restack）。 */
+		vidow_restack(server, view);
 	}
 	if (view != server->focused) {
 		vidow_focus_view(view);

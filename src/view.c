@@ -1600,6 +1600,11 @@ void vidow_arrange(struct vidow_server *server) {
 	 * （见 vidow_view_in_output_box）。 */
 	vidow_workspace_apply_visibility(server);
 
+	/* 摆完了收口一次层级：新窗口是「挂到最后」建出来的（在场景树里就是最上面），
+	 * 浮窗得重新压回平铺之上；浮 ⇄ 平铺切换、全屏进出也都在这一趟里摆正（见
+	 * vidow_restack —— 没人站错队时它一个节点都不碰）。 */
+	vidow_restack(server, NULL);
+
 	if (!server->arrange_self_only) {
 		vidow_backdrop_damage(server, false);
 	}
@@ -1858,6 +1863,145 @@ void vidow_view_output_added(struct vidow_server *server,
 	}
 }
 
+/* --------------------------------------------------------------- 层级 */
+
+/* 场景节点 → 窗口：窗口自己那棵树的 node.data 指向它的 tag（见 vidow_view_at
+ * 往上走的那一段）。不是窗口节点（关闭动画的替身、别的层的节点）返回 NULL。 */
+static struct vidow_view *view_from_node(struct wlr_scene_node *node) {
+	struct vidow_view_tag *tag = node != NULL ? node->data : NULL;
+	if (tag == NULL || tag->magic != VIDOW_VIEW_TAG_MAGIC) {
+		return NULL;
+	}
+	return tag->view;
+}
+
+/* 场景树里同一层的先后就是层级（wlr_scene_node_at 也是从最上面那个往下找），
+ * 这里维持一条不变量：
+ *
+ *     平铺 < 浮动 < 全屏
+ *
+ * 为什么要专门收口：`wlr_scene_tree_create()` 一律把新节点挂到最后，所以新开的
+ * 平铺窗口会盖住已有的浮窗；聚焦那边又是无差别 raise_to_top，点一下平铺窗口浮窗
+ * 就被压下去。两处都没在管「谁该在谁上面」。
+ *
+ * top 非空 = 「这一个刚被抬起来」（点了它 / 聚焦到它）：它落在自己那一组的最上面
+ * —— 浮窗之间就是靠这一条换层级的（点哪个哪个上来）。
+ *
+ * 只在真有人站错队时才动手：raise 会让那块区域重画，站对了就一个节点都不碰。
+ * 全屏单列一组压在最后：它是「占满整屏」，不该被浮窗盖住（老代码在 arrange 里
+ * 抬全屏，这里接着保证它一直是最上面那个）。 */
+void vidow_restack(struct vidow_server *server, struct vidow_view *top) {
+	if (server == NULL || server->layer_toplevels == NULL) {
+		return;
+	}
+	/* 弹出物（X11 的菜单 / 提示）挂在 layer_popups 那棵树上：它本来就在所有窗口
+	 * 之上，这里只需要把自己抬起来（老行为）。 */
+	if (top != NULL && top->popup) {
+		if (top->scene_tree != NULL) {
+			wlr_scene_node_raise_to_top(&top->scene_tree->node);
+		}
+		return;
+	}
+
+	/* 第一遍：按现在的层级（底 → 顶）把两组节点收下来，顺手看有没有人站错队。
+	 * 收成数组是因为第二遍要动节点：wlr_scene_node_raise_to_top() 会把当前节点
+	 * 挪到链表尾，边遍历边动会在同一个链表里绕圈。 */
+	struct wl_array floats; /* struct wlr_scene_node * */
+	struct wl_array fulls;
+	wl_array_init(&floats);
+	wl_array_init(&fulls);
+
+	struct wlr_scene_node *node;
+	struct wlr_scene_node *last_tile = NULL, *last_float = NULL;
+	struct wlr_scene_node *last_full = NULL;
+	bool float_seen = false, broken = false;
+	wl_list_for_each(node, &server->layer_toplevels->children, link) {
+		struct vidow_view *view = view_from_node(node);
+		if (view == NULL) {
+			continue;
+		}
+		bool full = view->fullscreen && view->mapped;
+		if (!full && view->float_mode == VIDOW_FLOAT_NONE) {
+			/* 平铺：它上面既不该有浮窗，也不该有全屏 */
+			if (float_seen || last_full != NULL) {
+				broken = true;
+			}
+			last_tile = node;
+			continue;
+		}
+		struct wlr_scene_node **slot = wl_array_add(full ? &fulls : &floats,
+			sizeof(*slot));
+		if (slot != NULL) {
+			*slot = node;
+		}
+		if (full) {
+			last_full = node;
+		} else {
+			float_seen = true;
+			last_float = node;
+			if (last_full != NULL) {
+				broken = true; /* 浮窗压在全屏上面 */
+			}
+		}
+	}
+
+	struct wlr_scene_node *top_node = top != NULL && top->scene_tree != NULL ?
+		&top->scene_tree->node : NULL;
+	bool top_full = top != NULL && top->fullscreen && top->mapped;
+	bool top_float = top != NULL && !top_full &&
+		top->float_mode != VIDOW_FLOAT_NONE;
+
+	bool need = broken;
+	if (top_node != NULL) {
+		if (top_full) {
+			need = need || last_full != top_node;
+		} else if (top_float) {
+			need = need || last_float != top_node;
+		} else {
+			/* 平铺的那个：只要它在平铺组里最上面就行 —— 浮窗 / 全屏在它上面
+			 * 是应该的，不算站错队（否则点一下平铺窗口就会白抬一遍、白记一次
+			 * 底衬过期）。 */
+			need = need || last_tile != top_node;
+		}
+	}
+	if (!need) {
+		wl_array_release(&floats);
+		wl_array_release(&fulls);
+		return;
+	}
+
+	/* 第二遍：抬的顺序就是层级 —— 平铺的那个先（它在平铺组里最上面），浮窗按
+	 * 现在的顺序跟上，全屏最后。top 在自己那一组里最后抬，所以它落在组的最上面。 */
+	if (top_node != NULL && !top_full && !top_float) {
+		wlr_scene_node_raise_to_top(top_node);
+	}
+	for (size_t i = 0; i < floats.size / sizeof(struct wlr_scene_node *); i++) {
+		struct wlr_scene_node *n = ((struct wlr_scene_node **)floats.data)[i];
+		if (n != top_node) {
+			wlr_scene_node_raise_to_top(n);
+		}
+	}
+	if (top_node != NULL && top_float) {
+		wlr_scene_node_raise_to_top(top_node);
+	}
+	for (size_t i = 0; i < fulls.size / sizeof(struct wlr_scene_node *); i++) {
+		struct wlr_scene_node *n = ((struct wlr_scene_node **)fulls.data)[i];
+		if (n != top_node) {
+			wlr_scene_node_raise_to_top(n);
+		}
+	}
+	if (top_node != NULL && top_full) {
+		wlr_scene_node_raise_to_top(top_node);
+	}
+	wl_array_release(&floats);
+	wl_array_release(&fulls);
+
+	/* 层级动了 = 「谁在谁后面」变了：底下那些窗口的私有底衬得重抓一遍。
+	 * arrange 那条路本来就会记这一笔（除非它在「只有被拖的那个在动」的省电
+	 * 模式里），这里管的是不经过 arrange 的那些调用（点一下浮窗换层级）。 */
+	vidow_backdrop_damage(server, false);
+}
+
 /* --------------------------------------------------------------- focus */
 
 void vidow_focus_view(struct vidow_view *view) {
@@ -1903,7 +2047,9 @@ void vidow_focus_view(struct vidow_view *view) {
 	/* 焦点变了，把 text-input 的 enter/leave 转给客户端输入框 */
 	vidow_im_focus(server, seat->keyboard_state.focused_surface);
 
-	wlr_scene_node_raise_to_top(&view->scene_tree->node);
+	/* 抬起来：浮动永远在平铺之上、全屏压一切，同一组里谁被点谁在上（层级规则
+	 * 见 vidow_restack）。 */
+	vidow_restack(server, view);
 	vidow_view_set_activated(view, true);
 	vidow_portal_view_activated(view, true);
 
@@ -3213,6 +3359,11 @@ static void x11_refresh_popup(struct vidow_view *view) {
 		wlr_scene_node_reparent(&view->scene_tree->node, popup ?
 			view->server->layer_popups : view->server->layer_toplevels);
 		view_swap_decor(view);
+		/* 搬回 layer_toplevels 的节点落在那一层的**最上面**：它要是个平铺窗口，
+		 * 这会儿就压在浮窗头上了 —— 层级收口一次（见 vidow_restack）。 */
+		if (!popup) {
+			vidow_restack(view->server, NULL);
+		}
 	}
 	wlr_log(WLR_INFO, "x11: %s 归类为%s",
 		vidow_view_title(view) != NULL ? vidow_view_title(view) : "(无题)",
