@@ -115,13 +115,18 @@ static struct vidow_capture *capture_for_output(struct vidow_server *server,
  * 出图尺寸 = round(box.width * scale) × round(box.height * scale)。整屏抓帧就是
  * 「box = 这块屏在布局里的框、scale = 这块屏的缩放」，按区域 / 按窗口抓帧是别的框
  * （见 vidow_capture_grab_box / vidow_capture_grab_view）。 */
-static struct wlr_buffer *capture_render_box(struct vidow_capture *cap,
-		const struct wlr_box *box, double scale) {
+/* 同上，但出图尺寸**给死**（<=0 表示按 box × scale 算）。整屏抓帧用给死的那条：
+ * 缩放不是整数时「逻辑框 × 缩放」round 回来可能差一两个像素，而客户端缓冲是照
+ * 输出尺寸建的（见 capture_render）。 */
+static struct wlr_buffer *capture_render_box_size(struct vidow_capture *cap,
+		const struct wlr_box *box, double scale, int width, int height) {
 	if (scale <= 0) {
 		return NULL;
 	}
-	int width = (int)lround(box->width * scale);
-	int height = (int)lround(box->height * scale);
+	if (width <= 0 || height <= 0) {
+		width = (int)lround(box->width * scale);
+		height = (int)lround(box->height * scale);
+	}
 	if (width <= 0 || height <= 0) {
 		return NULL;
 	}
@@ -167,7 +172,14 @@ static struct wlr_buffer *capture_render_box(struct vidow_capture *cap,
 	return buffer;
 }
 
-/* 整块输出（屏幕那一帧的大小）。 */
+/* 整块输出（屏幕那一帧的大小）。
+ *
+ * 出图尺寸**直接取 output->width/height**，不从「布局里的逻辑框 × 缩放」倒算：
+ * 缩放不是整数时（比如 1.7）逻辑框是取整过的（1280/1.7 = 753），753 × 1.7 = 1280.1
+ * 再 round 回去可能差一两个像素（1278），而客户端缓冲是照 `buffer` 事件里报的
+ * 1280x720 建的 —— 尺寸对不上，拷贝那一步就失败（踩过：scale=1.7 的屏上
+ * grim 全挂，test-blurscale.sh 第一条断言红）。按区域 / 按窗口抓帧没这个问题：
+ * 那种流的尺寸本来就是「框 × 缩放」算出来的，两边同一个来源。 */
 static struct wlr_buffer *capture_render(struct vidow_capture *cap) {
 	struct wlr_output *output = cap->output;
 	if (output->width <= 0 || output->height <= 0) {
@@ -175,7 +187,14 @@ static struct wlr_buffer *capture_render(struct vidow_capture *cap) {
 	}
 	struct wlr_box box;
 	wlr_output_layout_get_box(cap->server->output_layout, output, &box);
-	return capture_render_box(cap, &box, output->scale);
+	return capture_render_box_size(cap, &box, output->scale, output->width,
+		output->height);
+}
+
+/* 按 box × scale 算出图尺寸的那条（区域 / 窗口抓帧用）。 */
+static struct wlr_buffer *capture_render_box(struct vidow_capture *cap,
+		const struct wlr_box *box, double scale) {
+	return capture_render_box_size(cap, box, scale, 0, 0);
 }
 
 /* ------------------------------------------- 「只留一个窗口」的抓帧（按窗口录屏）
