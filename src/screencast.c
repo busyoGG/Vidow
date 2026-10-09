@@ -105,6 +105,9 @@ struct vidow_sc_pw_stream {
 	uint8_t *cursor_pixels;
 	uint32_t cursor_hash;
 	bool cursor_hashed;
+	/* 位图一共发出去过几张（只在变了的时候发）：日志里跟「光标在这一路里」
+	 * 对着看，能分清是「我们没发位图」还是「消费者没画」。 */
+	uint64_t cursor_bitmaps;
 	/* 光标在这一路里的状态（0 还没看过 / 1 报出去了 / 2 这块屏上没有可见光标 /
 	 * 3 有光标但在取景框外）。**只在变的那一帧**记一条 INFO —— 每帧记会刷屏，
 	 * 只记第一次又看不出「后来到底有没有」：用户报「录屏里看不到光标」时，日志
@@ -640,6 +643,14 @@ static void stream_fill_cursor(struct vidow_sc_pw_stream *ps, struct spa_buffer 
 	ps->cursor_hash = hash;
 	ps->cursor_hashed = true;
 
+	/* 位图真的发出去时记一条（只在变了的时候发，所以不会刷屏）：「消费者那边没
+	 * 光标」这类报告里，日志必须能分清**我们到底发没发过位图** —— 只报位置
+	 * （bitmap_offset=0）的话，消费者手上没有图可画。 */
+	ps->cursor_bitmaps++;
+	wlr_log(WLR_INFO, "screencast: 光标位图发过去了（%dx%d，第 %llu 张，%s）",
+		info.width, info.height, (unsigned long long)ps->cursor_bitmaps,
+		ps->cursor_bitmaps == 1 ? "第一次" : "形状 / 大小换了");
+
 	meta->bitmap_offset = sizeof(struct spa_meta_cursor);
 	struct spa_meta_bitmap *bitmap = SPA_PTROFF(meta, meta->bitmap_offset,
 		struct spa_meta_bitmap);
@@ -746,6 +757,62 @@ static void stream_handle_output_commit(struct wl_listener *listener, void *data
 		return;
 	}
 	pw_stream_trigger_process(ps->pw_stream);
+}
+
+/* 指针动了 → 光标不在画面里的那几路流推一帧。
+ *
+ * 为什么必须推：metadata 模式下光标**不画进画面**，它的位置 / 位图是每帧的元数据
+ * —— 跟画面内容一样属于「这一帧长什么样」。而帧的推手只有两个：输出提交（屏幕上
+ * 有东西重画）和 1 秒一次的心跳。指针在**静止的窗口**上移动时这两个都不发生，消费
+ * 者（OBS）手里就一直是上一次那一帧的光标状态 —— 那一次很可能正好是「光标在取景框
+ * 外面」（id=0 → 不画）或者位置早就过期了。用户报的「录屏里光标时有时无 / 现在又
+ * 看不到光标了」就是这么来的：光标移动跟不跟得上，全看窗口自己在不在重画。
+ *
+ * embedded 模式同理（光标是画进画面的，指针一动画面就变了），hidden 模式不用
+ * （画面里根本没有光标）。
+ *
+ * 节流到 ~60Hz：指针事件可以几百 Hz，每个都抓一整帧没必要（消费者取缓冲也就这个
+ * 速率）。 */
+#define VIDOW_SC_CURSOR_PUSH_NS (16 * 1000 * 1000)
+
+void vidow_screencast_cursor_moved(struct vidow_server *server) {
+	if (server == NULL || server->screencast == NULL) {
+		return;
+	}
+	struct vidow_screencast_stream *stream;
+	bool any = false;
+	wl_list_for_each(stream, &server->screencast->streams, link) {
+		if (stream->pw != NULL && stream->pw->pw_stream != NULL &&
+				stream->pointer_mode != ZKDE_SCREENCAST_UNSTABLE_V1_POINTER_HIDDEN) {
+			any = true;
+			break;
+		}
+	}
+	if (!any) {
+		return; /* 没人在录光标：一次都不往下走 */
+	}
+	struct timespec now;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	int64_t ns = (int64_t)now.tv_sec * 1000000000 + now.tv_nsec;
+	wl_list_for_each(stream, &server->screencast->streams, link) {
+		if (stream->pw == NULL || stream->pw->pw_stream == NULL ||
+				stream->pointer_mode == ZKDE_SCREENCAST_UNSTABLE_V1_POINTER_HIDDEN) {
+			continue;
+		}
+		if (stream->cursor_push_ns != 0 &&
+				ns - stream->cursor_push_ns < VIDOW_SC_CURSOR_PUSH_NS) {
+			continue;
+		}
+		stream->cursor_push_ns = ns;
+		if (stream->cursor_pushes == 0) {
+			/* 只记第一次：这条日志是给「录屏里光标不动 / 时有时无」这类报告
+			 * 看的（有它 = 这一路真的在跟着指针推帧），每 16ms 记一条会刷屏。 */
+			wlr_log(WLR_INFO, "screencast: 指针动了 —— 这一路开始跟着指针推帧"
+				"（pointer_mode=%u）", stream->pointer_mode);
+		}
+		stream->cursor_pushes++;
+		pw_stream_trigger_process(stream->pw->pw_stream);
+	}
 }
 
 /* ------------------------------------------------------------ 流的生命周期 */
@@ -882,8 +949,9 @@ void vidow_sc_pw_stream_destroy(struct vidow_screencast_stream *stream) {
 	}
 	/* 这路流一共给了多少帧：跟「第一帧」那条对着看，「有流但黑屏 / 不动」是
 	 * 帧不够还是帧本身有问题，一眼分得出来。 */
-	wlr_log(WLR_INFO, "screencast: 这路流给了 %llu 帧",
-		(unsigned long long)ps->frames);
+	wlr_log(WLR_INFO, "screencast: 这路流给了 %llu 帧（其中 %llu 帧是指针动了催的）",
+		(unsigned long long)ps->frames,
+		(unsigned long long)(stream->cursor_pushes));
 	if (ps->output_commit.link.prev != NULL) {
 		wl_list_remove(&ps->output_commit.link);
 	}

@@ -2045,6 +2045,12 @@ struct vidow_screencast_stream {
 	/* kind == VIRTUAL：这块输出是我们建的，这一路结束时得销毁。 */
 	bool owns_output;
 	uint32_t pointer_mode;
+	/* 指针动了之后催上一帧的时刻（CLOCK_MONOTONIC 纳秒，0 = 还没催过）：
+	 * 光标不在画面里（metadata / embedded）时，光标的位置 / 位图就是这一帧的
+	 * 内容 —— 指针移动本身也得推帧（见 vidow_screencast_cursor_moved）。 */
+	int64_t cursor_push_ns;
+	/* 其中多少帧是「指针动了」催出来的（见 vidow_screencast_cursor_moved）。 */
+	uint64_t cursor_pushes;
 	bool closed;
 	struct wl_listener output_destroy;
 	struct vidow_sc_pw_stream *pw;
@@ -2067,6 +2073,11 @@ struct vidow_sc_pw *vidow_sc_pw_create(struct vidow_screencast *sc,
 		struct wl_display *display);
 void vidow_sc_pw_stream_start(struct vidow_screencast_stream *stream);
 void vidow_sc_pw_stream_destroy(struct vidow_screencast_stream *stream);
+
+/* 指针动了：光标不在画面里的那几路（metadata / embedded）得跟着推一帧 —— 那种
+ * 流的「这一帧长什么样」包含光标位置 / 位图，指针移动本身就是内容变了。只在真的
+ * 有这种流的时候做（没有就是一次链表遍历）。 */
+void vidow_screencast_cursor_moved(struct vidow_server *server);
 
 /* 这个抓帧源是不是 vidow 自己出的帧（是的话「有人抓帧」不该惊动屏幕 —— 屏幕那
  * 一帧本来就不受影响）。 */

@@ -264,6 +264,12 @@ static void pointer_grab_update(struct vidow_server *server) {
 }
 
 void vidow_pointer_motion(struct vidow_server *server, uint32_t time_msec) {
+	/* 有人在录「光标不进画面」的流（metadata / embedded）：光标的位置就是那一帧
+	 * 的内容，指针一动就得推一帧（否则录进去的光标停在上一帧 —— 静止的窗口上
+	 * 移动指针时尤其明显）。放在最前面：拖着东西 / 摇晃那些分支提前 return 也
+	 * 一样要推（拖拽时光标也在动）。 */
+	vidow_screencast_cursor_moved(server);
+
 	/* 指针约束（游戏锁鼠标 / 夹光标）：先把这一步的位移发出去（relative_pointer），
 	 * 锁定的把光标钉回去、夹住的夹进围栏。必须在命中测试**之前** —— 位置定下来
 	 * 之后，指针焦点 / enter / motion 才对得上（见 pointerconstraint.c）。 */
