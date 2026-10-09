@@ -12,6 +12,30 @@
 #include <wlr/backend/headless.h>
 #include <wlr/util/log.h>
 
+/* 环境变量只问一次。
+ *
+ * 这两个变量以前是**每帧**问一遍（渲染统计两次、帧追踪钩子一次），而 getenv 要
+ * 遍历 environ 做 strcmp —— 实测 profile 里它占 0.39%，比我们自己一帧的模糊代码
+ * （vidow_blur_update 0.26%）还显眼。进程起来之后环境不会变，缓存住就行。 */
+static bool render_stats_on(void) {
+	static int on = -1;
+	if (on < 0) {
+		on = getenv("VIDOW_RENDER_STATS") != NULL ? 1 : 0;
+	}
+	return on != 0;
+}
+
+/* 帧事件掐断的测试钩子（VIDOW_TEST_STALL_OUTPUT=<屏名>），同样只问一次。 */
+static const char *stall_output_name(void) {
+	static int done = 0;
+	static const char *name = NULL;
+	if (!done) {
+		name = getenv("VIDOW_TEST_STALL_OUTPUT");
+		done = 1;
+	}
+	return name;
+}
+
 /* Advance the animation clock and present one frame. */
 void vidow_output_render(struct vidow_output *output) {
 	struct vidow_server *server = output->server;
@@ -51,7 +75,7 @@ void vidow_output_render(struct vidow_output *output) {
 	/* 探针：拖拽的「指针事件 -> 出帧」延迟（这一帧要出帧了，把从最后一个事件到现在
 	 * 的时间记一笔）。嵌套在别的合成器里时，光标是**上层**画的、窗口是我们画的，
 	 * 这个延迟直接决定「跟不跟手」。 */
-	if (getenv("VIDOW_RENDER_STATS") != NULL && server->grab_ev_ns != 0 &&
+	if (render_stats_on() && server->grab_ev_ns != 0 &&
 			(server->grab_dirty || server->arrange_dirty)) {
 		int64_t lat = vidow_now_ns() - server->grab_ev_ns;
 		vidow_stats.grab_lat_ns += lat;
@@ -117,7 +141,7 @@ void vidow_output_render(struct vidow_output *output) {
 	vidow_fx_flush(server);
 	wlr_scene_output_commit(output->scene_output, NULL);
 	int64_t st_t4 = vidow_now_ns();
-	if (getenv("VIDOW_RENDER_STATS") != NULL) {
+	if (render_stats_on()) {
 		vidow_stats.blur_ns += st_t1 - st_t0;
 		vidow_stats.decor_ns += st_t2 - st_t1;
 		vidow_stats.jelly_ns += st_t3 - st_t2;
@@ -245,18 +269,32 @@ static int pump_timer_cb(void *data) {
 /* A screen capture is answered on an output commit, and a still screen never
  * commits: the nested backend will not even send us a frame callback, because
  * the host only composites on damage. Poll gently while a capture is
- * outstanding and render for it directly. */
+ * outstanding and render for it directly.
+ *
+ * 只在**真的有人等着**的时候转：这个定时器原来是建好就 50ms 一次永远转下去，
+ * 空载也要每秒醒 20 次（实测 strace：21 秒里 epoll_wait 返回 427 次、
+ * timerfd_settime 852 次 —— 期间一次抓帧都没有）。现在由抓帧请求踢一脚
+ * （见 vidow_output_capture_kick），抓完没人等着就自己停 —— 空载零唤醒。 */
 static int capture_watchdog(void *data) {
 	struct vidow_server *server = data;
-	bool pending = vidow_screencopy_has_pending(server->screencopy);
-	if (pending) {
-		struct vidow_output *output;
-		wl_list_for_each(output, &server->outputs, link) {
-			vidow_output_render(output);
-		}
+	if (!vidow_screencopy_has_pending(server->screencopy)) {
+		return 0; /* 没人等着：不续期 */
+	}
+	struct vidow_output *output;
+	wl_list_for_each(output, &server->outputs, link) {
+		vidow_output_render(output);
 	}
 	wl_event_source_timer_update(server->capture_timer, 50);
 	return 0;
+}
+
+/* 有人要抓帧了：把上面的看门狗叫起来（它是「静止的屏幕永远不提交」的兜底，
+ * 见 capture_watchdog）。请求进来时踢一次就够 —— 它会自己续期到抓完。 */
+void vidow_output_capture_kick(struct vidow_server *server) {
+	if (server == NULL || server->capture_timer == NULL) {
+		return;
+	}
+	wl_event_source_timer_update(server->capture_timer, 50);
 }
 
 /* 看门狗自己推帧的节奏：跟着后端**自己**的帧间隔走，比它晚 1/4 才补一帧。
@@ -367,7 +405,7 @@ static void output_frame(struct wl_listener *listener, void *data) {
 	/* 测试钩子：当作「后端不再给这块屏帧事件」= 用户报过的「这块屏上的窗口停在
 	 * 最后一帧，拖到另一块屏就活」。真机上只有 DRM 的 page-flip 不回来才会这样
 	 * （headless 的帧事件和 commit 无关，按不住）；帧追踪的判据靠它验。 */
-	const char *stall = getenv("VIDOW_TEST_STALL_OUTPUT");
+	const char *stall = stall_output_name();
 	if (stall != NULL && strcmp(stall, output->wlr_output->name) == 0) {
 		return;
 	}
@@ -1504,9 +1542,9 @@ bool vidow_output_init(struct vidow_server *server) {
 		wl_display_get_event_loop(server->display), capture_watchdog, server);
 	if (server->capture_timer == NULL) {
 		wlr_log(WLR_ERROR, "failed to create the capture watchdog");
-	} else {
-		wl_event_source_timer_update(server->capture_timer, 50);
 	}
+	/* 这里**不**排第一次：没人在抓帧的时候它一次都不该醒（见 capture_watchdog，
+	 * 由 vidow_output_capture_kick 按需叫起来）。 */
 	server->kick_timer = wl_event_loop_add_timer(
 		wl_display_get_event_loop(server->display), kick_timer_cb, server);
 	if (server->kick_timer == NULL) {

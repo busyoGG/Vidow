@@ -895,8 +895,16 @@ bool vidow_inject_pointer_move(struct vidow_server *server, double x, double y,
 	 * 都收不到，一动鼠标才一起收下（测试里就是这条把时序全带偏了）。滚轮注入
 	 * 一直是这么补的（见 vidow_inject_pointer_scroll），这里跟上。 */
 	wlr_seat_pointer_notify_frame(server->seat);
-	wlr_log(WLR_INFO, "注入: 指针%s移到 %.0f,%.0f", relative ? "相对" : "",
-		server->cursor->x, server->cursor->y);
+	/* 日志按 100ms 节流：注入是给脚本 / 测试用的，注入出来的指针可以比真鼠标还
+	 * 快（基准里灌过 20000 条连发），每条一行 info 既刷屏又拖慢注入本身（一行
+	 * 一次 write + 一次时间格式化）。第一条照打 —— 手点一下、脚本挪一下都看得见。 */
+	static int64_t last_log_ns = 0;
+	int64_t now_ns = vidow_now_ns();
+	if (now_ns - last_log_ns >= 100 * 1000000LL) {
+		last_log_ns = now_ns;
+		wlr_log(WLR_INFO, "注入: 指针%s移到 %.0f,%.0f", relative ? "相对" : "",
+			server->cursor->x, server->cursor->y);
+	}
 	return true;
 }
 

@@ -878,6 +878,7 @@ python3 test-float.py        # 三个真实 GTK 窗口，验证浮动模式自�
 ./test-focusclose.sh                 # 关窗口后焦点落谁身上：右边最近的顶上（21 项断言）
 ./test-lastoutput.sh                  # 屏没了不许留野指针、没屏时开窗不许崩（拔一块 / 最后一块没了，22 项断言）
 ./test-actsurface.sh                  # 激活令牌攥着的 surface 先没了也不能崩（8 项断言）
+./test-idlewake.sh                   # 空载一次都不该醒（抓帧看门狗按需启动）+ 静止屏幕抓帧照样成（7 项）
 ./test-frametrace.sh                 # 帧追踪：某块屏的帧链断了（窗口停在最后一帧）要报出来（17 项断言）
 ./test-dmabuf-update.sh              # dmabuf 客户端（kate）的新画面必须真的上屏（5 项断言）
 ./test-preinit.sh                    # 状态请求抢在第一次 commit 之前（set_maximized /
@@ -1680,6 +1681,8 @@ headless 会话里这个键盘还有个额外好处：座位因此报出 KEYBOAR
 - socket 是 **0600**（只有本用户能连），但连上之后所有命令都能用 —— 包括这五条。
 - 默认**开**（`input_injection = true`）。要收紧就写 `false`：五条命令全部拒绝，理由写清楚。
 - 每次注入都打一条 **info 日志**（`注入: 指针移到 300,200` / `注入: 按键 ctrl+c（按下并松开）`）。
+  指针移动那条按 **100ms 节流**：注入能比真鼠标还快（基准里灌过 20000 条连发），每条一行
+  既刷屏又拖慢注入本身；手点一下、脚本挪一下都还是看得见。
 - 注入的按键不碰 vidow 自己的快捷键（见上面第 2 条），所以它按不动 vidow 的绑定。
 
 ### 测试
@@ -3980,6 +3983,67 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
        口子（screencopy / ext-image-copy-capture 同样对所有客户端开放，grim / OBS 靠它），
        而要收就得连它一起收 —— 那会把 grim / wf-recorder / OBS 全废掉。要边界得靠 sandbox
        那一层（别的进程拿不到 wayland socket），不是合成器。
+
+179. **性能热点复查：vidow 自己的代码只占 2.7%，剩下能省的是「空载每秒醒 20 次」**（用户让
+      「检查还有什么性能热点可以优化」，看完点名要改 1 / 2 / 4 / 5 四条）。
+
+      ① **先量，再说话**。本机 `perf_event_paranoid=2` 挡掉了 `-g`（调用栈）也挡掉了 attach
+      模式（`perf stat -p` 全是 `<not counted>`）—— 只有**启动模式**能采：`perf record -e
+      cycles:u -F 999 -- setsid ./build/vidow`。场景：headless 2560x1440 缩放 2，4 个 kitty +
+      两个互相重叠的模糊浮窗 + 一个不停重画的窗口（`tools/spin.py`），稳在 59fps。**进程 CPU
+      的分布**：
+
+      | 谁 | 占进程 CPU |
+      | --- | --- |
+      | libgallium（mesa 驱动） | 42.2% |
+      | libc（`0x1b1fa0` 那段 `vmovdqu` = AVX2 memcpy） | 19.9% |
+      | 未符号化 | 12.6% |
+      | libwlroots（场景遍历 / addon / box） | 8.2% |
+      | libpixman（`region32_intersect` / `init` / `union`） | 5.8% |
+      | **vidow 自己** | **2.7%**（最高一项 `vidow_blur_update` 0.26%） |
+
+      也就是：**我们自己一帧的代码里没有大热点**，CPU 都花在驱动提交（按趟数走）、驱动侧的
+      整块拷贝和 wlroots 的场景/损伤记账上。vidow 自身 6.7% 单核、GPU busy 7.6%（4K@160 的
+      7900XT 远没吃饱）。**量不到的部分如实记着**：没有调用栈，所以那 20% 的 memcpy 只能定位到
+      「库」这一层；pixman 那 5.8% 是 wlroots 场景损伤算的（我们的 `bgeffect.c` 在这套场景里
+      根本没被触发）。
+
+      ② **改掉的三条**：
+
+      - **空载唤醒：50ms 常开的抓帧看门狗改成按需启动**（`src/output.c` 的 `capture_watchdog`
+        + `vidow_output_capture_kick`，`src/screencopy.c` 插入帧时踢一脚）。它原来是「建好就
+        50ms 一次永远转下去」—— 静止的屏幕永远不提交、抓帧要靠一次提交应答，所以得在；但没
+        人在抓帧的时候它也是每秒醒 20 次。实测（strace，空载 21 秒）：`epoll_wait` 返回 **427
+        次**、`timerfd_settime` **852 次**，期间一次抓帧都没有。改成按需之后：**10 秒 0 次**。
+        空载 CPU 本来就只有 0.05%，所以这条省的不是 CPU，是**进不了深睡**（笔记本 / 掌机上的
+        续航和待机）。
+      - **每帧的 `getenv` 缓存**（`src/output.c` / `src/fx.c`）：`VIDOW_RENDER_STATS`（每帧两次）、
+        `VIDOW_TEST_STALL_OUTPUT`（每帧一次）、`VIDOW_BLUR_NO_PARTIAL`（每次重抓两次）、
+        `VIDOW_BLUR_DUMP` / `VIDOW_FX_DUMP`（重抓路径上）—— 一帧十来次，而 profile 里
+        `getenv` 一个人占 **0.39%**，比我们自己的模糊代码还显眼。进程起来之后环境不会变，缓存住。
+        `VIDOW_BLUR_NO_PARTIAL_FILE` 的**文件存在性每次照看**（`test-blurpartial.sh` 就是跑着跑着
+        把文件建出来切过去的）。
+      - **注入的指针移动日志按 100ms 节流**（`src/input.c`）：注入是给脚本 / 测试用的，能比真
+        鼠标还快（基准里灌过 20000 条连发），每条一行 info 既刷屏又拖慢注入本身。第一条照打。
+
+      ③ **判据 `./test-idlewake.sh`（新，7 项断言）**：用 `/proc/<pid>/status` 的
+      `voluntary_ctxt_switches` 数唤醒 —— 空载 10 秒增量必须 < 20。**反证**：把看门狗临时改回
+      「建好就排、每次都续期」再跑，同一台机器同一个场景量到的是 **200**（正好 20Hz）；改回按需
+      之后是 **0**。另外三条守着「按需启动没把抓帧弄坏」：从没提交过一帧的空屏上 `grim` 照样抓
+      得到（而且确实是全黑）、静止屏幕上连续两次抓帧逐像素一样、抓完之后 5 秒增量仍然 < 10
+      （看门狗自己停了）。
+
+      ④ **第 2 条（每帧 33 趟离屏渲染）查完之后没有安全改法，只把杠杆写进了配置说明**。趟数
+      = 「有多少个互相重叠的模糊元素」×（1 趟抓取 + 级数 + 级数−1 趟 Kawase），实测 A/B
+      （同场景）：4 级 33 趟/帧、6.7% 单核；3 级 25 趟、6.3%；2 级 17 趟、5.8%。唯一能直接降
+      的是 `blur_levels`，但它**明显改观感**（半径 ≈ `blur_offset × (3×2^级数 − 5)` 设备像素：
+      offset=1.5 时 4 级 ≈65px、3 级 ≈29px），所以没动默认值，而是把这个账写进了
+      `blur_levels` 的配置说明（`src/config.c` + 重新生成的 `config.example/configs/03-blur.lua`）。
+      「不重叠的窗口共用整屏那条链」本来就有（`view_overlaps_other`）；再往下要省只能重构
+      「场景抓取在多元素之间共享」，那是另一件事。
+
+      ⑤ 回归：`test-idlewake.sh` 7/7、`test-input-inject.sh` 54/54、`test-blur*` 全绿、
+      `test-frametrace.sh` / `test-drag-stall.sh` / `test-capture-hide.sh` 全绿，全套 **67 项 rc=0**。
 
 178. **配置说明补全：打出来的那份默认配置就是配置项的手册，它得全**（用户报的「配置里面的
       说明不完整，没有列出所有配置项，需要调整」）。

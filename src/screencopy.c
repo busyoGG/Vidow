@@ -565,6 +565,10 @@ static void capture_output(struct wl_client *client,
 	wl_list_init(&frame->output_commit.link);
 	wl_list_init(&frame->output_destroy.link);
 	wl_list_insert(&manager->frames, &frame->link);
+	/* 有帧悬着了：把抓帧看门狗叫起来（见 output.c 的 capture_watchdog ——
+	 * 静止的屏幕永远不提交，这一帧得我们自己推出来）。抓完没人等着它会自己停，
+	 * 所以空载时这个定时器一次都不醒。 */
+	vidow_output_capture_kick(manager->server);
 
 	if (output == NULL || !output->enabled) {
 		zwlr_screencopy_frame_v1_send_failed(frame->resource);

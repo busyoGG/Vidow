@@ -925,9 +925,15 @@ static void dump_buffer(struct vidow_server *server, struct wlr_buffer *buffer,
 	wlr_texture_destroy(tex);
 }
 
+/* VIDOW_BLUR_DUMP=N：把前 N 份底衬 dump 成裸数据（排查「底衬里到底是什么」）。
+ * getenv 只问一次 —— 这个函数在重抓路径上（一帧能问十几次）。 */
 static int blur_dump_limit(void) {
-	const char *env = getenv("VIDOW_BLUR_DUMP");
-	return env != NULL ? atoi(env) : 0;
+	static int limit = -1;
+	if (limit < 0) {
+		const char *env = getenv("VIDOW_BLUR_DUMP");
+		limit = env != NULL ? atoi(env) : 0;
+	}
+	return limit;
 }
 
 static void dump_target(struct vidow_server *server,
@@ -1934,12 +1940,25 @@ static bool view_region_rect(struct vidow_server *server,
 /* 「只重跑受损那一小块」的开关：默认开。设了 VIDOW_BLUR_NO_PARTIAL 就整块重跑；
  * VIDOW_BLUR_NO_PARTIAL_FILE 指的文件一出现也整块重跑（跑着跑着切过去，用来比对
  * 「同一个场景、同一个客户端、同一个进程」下局部和整块的输出 —— 见
- * test-blurpartial.sh）。都只给 A/B 比对用。 */
+ * test-blurpartial.sh）。都只给 A/B 比对用。
+ *
+ * 两个 getenv 各只问一次（每次重抓都要问一遍：一帧里四五个元素重抓就是十来次；
+ * getenv 在 profile 里比我们自己的模糊代码还显眼）。**文件存在性每次都看** ——
+ * test-blurpartial.sh 就是跑着跑着把文件建出来切过去的。 */
 static bool blur_no_partial(void) {
-	if (getenv("VIDOW_BLUR_NO_PARTIAL") != NULL) {
+	static int on = -1;
+	static int file_read = 0;
+	static const char *file = NULL;
+	if (on < 0) {
+		on = getenv("VIDOW_BLUR_NO_PARTIAL") != NULL ? 1 : 0;
+	}
+	if (!file_read) {
+		file = getenv("VIDOW_BLUR_NO_PARTIAL_FILE");
+		file_read = 1;
+	}
+	if (on != 0) {
 		return true;
 	}
-	const char *file = getenv("VIDOW_BLUR_NO_PARTIAL_FILE");
 	return file != NULL && access(file, F_OK) == 0;
 }
 
@@ -2866,9 +2885,9 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 	 * redraw when a later frame hands the window a different backdrop. */
 	fx->blur_drawn = fx->blur_ver;
 
-	if (getenv("VIDOW_FX_DUMP") != NULL) {
-		dump_target(server, fx, displayed);
-	}
+	/* dump_target 自己记得「dump 过几份、上限多少」（VIDOW_FX_DUMP 没设就立刻返回），
+	 * 这里不再每帧问一次 getenv。 */
+	dump_target(server, fx, displayed);
 	return true;
 }
 /* 区域之类「只影响着色器输出、贴图没换」的变化要显式失效一次，

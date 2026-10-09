@@ -136,7 +136,10 @@ static const struct entry entries[] = {
 	{ "blur_all",        K_BOOL,   OFF(blur_all),        SZ(blur_all), 2,
 		"平铺窗口也模糊身后的壁纸；关掉只模糊浮动窗口后面" },
 	{ "blur_levels",     K_INT,    OFF(blur_levels),     SZ(blur_levels), 2,
-		"Kawase 模糊的层级数，越大越糊（也更费 GPU）" },
+		"Kawase 模糊的层级数，越大越糊。每多一级 = 每个模糊元素每帧多两趟离屏"
+		"渲染（实测 2560x1440 缩放 2、四个模糊元素：4 级 33 趟/帧、6.7% 单核；"
+		"3 级 25 趟、6.3%；2 级 17 趟、5.8%），糊的半径约 blur_offset × "
+		"(3×2^级数 − 5) 设备像素（offset=1.5 时 4 级 ≈65px、3 级 ≈29px）" },
 	{ "blur_strength",   K_DOUBLE, OFF(blur_strength),   SZ(blur_strength), 2,
 		"模糊强度倍数" },
 	{ "blur_alpha_min",  K_DOUBLE, OFF(blur_alpha_min),  SZ(blur_alpha_min), 2,

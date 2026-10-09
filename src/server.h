@@ -1478,6 +1478,9 @@ void vidow_output_apply_scale_all(struct vidow_server *server);
 /* 每块屏立刻画一帧（走 1ms 定时器）。会话切回来、输出刚建出来的时候用：这时候
  * 没有任何 damage，后端也不会主动送 frame 事件，不主动画就一直是黑的。 */
 void vidow_output_kick_all(struct vidow_server *server);
+/* 有人要抓帧了：把抓帧看门狗叫起来（静止的屏幕永远不提交，抓帧得自己推帧，
+ * 见 output.c 的 capture_watchdog）。抓帧请求进来时调一次。 */
+void vidow_output_capture_kick(struct vidow_server *server);
 /* 按配置（vidow.output{ name = …, x = …, y = … }）把每块屏摆到它该在的位置；
  * SIGHUP 后对一次账。 */
 void vidow_output_apply_positions_all(struct vidow_server *server);
