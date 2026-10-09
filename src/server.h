@@ -27,8 +27,10 @@
 #include <wlr/types/wlr_xdg_decoration_v1.h>
 #include <wlr/types/wlr_output.h>
 #include <wlr/types/wlr_output_layout.h>
+#include <wlr/types/wlr_pointer_constraints_v1.h>
 #include <wlr/types/wlr_primary_selection.h>
 #include <wlr/types/wlr_primary_selection_v1.h>
+#include <wlr/types/wlr_relative_pointer_v1.h>
 #include <wlr/types/wlr_scene.h>
 #include <wlr/types/wlr_server_decoration.h>
 #include <wlr/types/wlr_screencopy_v1.h>
@@ -1261,6 +1263,23 @@ struct vidow_server {
 	struct vidow_cursor_fx *cursor_fx; /* 摇晃放大（cursorfx.c），可能为 NULL */
 	struct wlr_seat *seat;
 
+	/* 指针约束（pointerconstraint.c）：游戏锁鼠标 / 夹光标要的两个协议。
+	 * active_constraint 非空 = 现在有一个正生效（IPC 会报出来）。 */
+	struct wlr_pointer_constraints_v1 *pointer_constraints;
+	struct wlr_relative_pointer_manager_v1 *relative_pointer;
+	struct wlr_pointer_constraint_v1 *active_constraint;
+	pixman_region32_t confine; /* 生效中那个约束的围栏（表面局部坐标） */
+	bool constraint_listeners; /* 三个监听是不是挂上了（挂上了才敢摘） */
+	/* 上一次处理过的光标位置：位移靠它和当前位置相减得到（见
+	 * vidow_pointer_constraint_motion），锁定时也是「钉住」的基准。 */
+	double pointer_last_x, pointer_last_y;
+	double pointer_lock_x, pointer_lock_y; /* 锁定时钉在哪（布局坐标） */
+	struct wl_listener new_constraint;
+	struct wl_listener constraints_destroy;
+	struct wl_listener constraint_destroy;
+	struct wl_listener constraint_set_region;
+	struct wl_listener constraint_commit;
+
 	struct vidow_config config;
 	struct vidow_decor_prog decor;
 	struct vidow_gl_prog kawase_down, kawase_up;
@@ -1920,6 +1939,24 @@ void vidow_cursor_fx_cursor_changed(struct vidow_server *server);
 /* 光标状态（magnified / scale / image / hardware / hw_max），写进当前 JSON 对象。 */
 struct jbuf;
 void vidow_cursor_fx_json(struct jbuf *b, struct vidow_server *server);
+
+/* ------------------------------------------------------- 指针约束（pointerconstraint.c）
+ *
+ * zwp_pointer_constraints_v1 + zwp_relative_pointer_manager_v1：游戏锁鼠标要的
+ * 那两个协议（Xwayland 拿相对指针做 XInput2 的 raw motion，缺了 X11 游戏转不动
+ * 视角）。wlroots 只给协议对象，夹住 / 钉住光标是合成器的活，实现在这个文件里。
+ * 判据：./test-pointer-lock.sh。 */
+bool vidow_pointer_constraint_init(struct vidow_server *server);
+/* 指针焦点变了（vidow_pointer_motion 里命中测试之后调）：新表面有约束就激活。 */
+void vidow_pointer_constraint_focus(struct vidow_server *server,
+		struct wlr_surface *surface);
+/* 指针动了一下：发相对位移 + 锁定的钉回去 / 夹住的夹住（命中测试之前调）。 */
+void vidow_pointer_constraint_motion(struct vidow_server *server,
+		uint32_t time_msec);
+/* 生效中的约束是哪种（"locked" / "confined" / NULL = 没有）。 */
+const char *vidow_pointer_constraint_type(const struct vidow_server *server);
+/* 约束状态（type / lifetime / window / cursor）写进当前 JSON 对象。 */
+void vidow_pointer_constraint_json(struct jbuf *b, struct vidow_server *server);
 
 /* --------------------------------------------------------------- 注入（IPC）
  *

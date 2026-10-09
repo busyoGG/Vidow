@@ -206,6 +206,11 @@ static void pointer_grab_update(struct vidow_server *server) {
 }
 
 void vidow_pointer_motion(struct vidow_server *server, uint32_t time_msec) {
+	/* 指针约束（游戏锁鼠标 / 夹光标）：先把这一步的位移发出去（relative_pointer），
+	 * 锁定的把光标钉回去、夹住的夹进围栏。必须在命中测试**之前** —— 位置定下来
+	 * 之后，指针焦点 / enter / motion 才对得上（见 pointerconstraint.c）。 */
+	vidow_pointer_constraint_motion(server, time_msec);
+
 	/* 摇晃找光标：先看这一下位移算不算「在晃」（拖拽中也算 —— 拖到一半找不到
 	 * 指针了一样要放大）。 */
 	vidow_cursor_fx_motion(server);
@@ -234,6 +239,9 @@ void vidow_pointer_motion(struct vidow_server *server, uint32_t time_msec) {
 	if (vidow_overview_active(server)) {
 		return;
 	}
+
+	/* 约束跟着指针焦点走：指针底下的表面 == 约束那个表面才生效，移开就解除。 */
+	vidow_pointer_constraint_focus(server, surface);
 
 	if (hit != NULL && hit->kind == VIDOW_VIEW_X11) {
 		wlr_log(WLR_DEBUG, "x11: 指针 %.0f,%.0f -> %s 局部 %.0f,%.0f",

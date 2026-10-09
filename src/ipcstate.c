@@ -816,6 +816,9 @@ void vidow_ipc_json_input(struct jbuf *b, struct vidow_server *server) {
 		jb_null(b);
 	}
 	jb_obj_end(b);
+	/* 指针约束（游戏锁鼠标 / 夹光标）：null = 现在没有生效的约束 */
+	jb_key(b, "pointer_constraint");
+	vidow_pointer_constraint_json(b, server);
 	jb_key(b, "keyboard_layer");
 	jb_str(b, server->keyboard_layer != NULL &&
 		server->keyboard_layer->layer_surface != NULL ?

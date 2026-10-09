@@ -117,6 +117,7 @@ sources = files(
   'src/layer.c',
   'src/float.c',
   'src/drag.c',
+  'src/pointerconstraint.c',
   'src/config.c',
   'src/scale.c',
   'src/hotplug.c',
@@ -379,6 +380,39 @@ xcb_icccm_dep = dependency('xcb-icccm')
 executable('xpopup',
   ['tools/xpopup.c'],
   dependencies: [xcb_dep, xcb_icccm_dep],
+  install: false)
+
+# 测试工具：X11 的 confine 抓取（Xwayland 会把它变成 zwp_confined_pointer_v1）
+executable('xgrab',
+  ['tools/xgrab.c'],
+  dependencies: [xcb_dep],
+  install: false)
+
+# 测试工具：指针约束客户端（锁鼠标 / 夹光标 + 相对位移）
+pc_xml = 'protocols/pointer-constraints-unstable-v1.xml'
+pc_header = custom_target('pointer-constraints-unstable-v1-client-protocol.h',
+  input: pc_xml,
+  output: 'pointer-constraints-unstable-v1-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'])
+pc_code = custom_target('pointer-constraints-unstable-v1-protocol.c',
+  input: pc_xml,
+  output: 'pointer-constraints-unstable-v1-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
+rp_xml = 'protocols/relative-pointer-unstable-v1.xml'
+rp_header = custom_target('relative-pointer-unstable-v1-client-protocol.h',
+  input: rp_xml,
+  output: 'relative-pointer-unstable-v1-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'])
+rp_code = custom_target('relative-pointer-unstable-v1-protocol.c',
+  input: rp_xml,
+  output: 'relative-pointer-unstable-v1-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
+
+executable('pointerlock',
+  ['tools/pointerlock.c', pc_header, pc_code, rp_header, rp_code,
+   xs_header, xs_code],
+  dependencies: [wayland_client_dep],
+  include_directories: include_directories('.'),
   install: false)
 
 executable('vidow',

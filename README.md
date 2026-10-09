@@ -34,8 +34,9 @@
 - 输入：键盘（xkb + 快捷键）、指针（移动/点击/滚轮/拖动）、虚拟键盘与虚拟指针（可自动化测试）
 - 输出：热插拔、`request_state` 尺寸变更后自动重排、`wl_output` + `zxdg_output_manager_v1`
 - 协议：wl_compositor、wl_subcompositor、xdg-shell、zxdg-decoration-v1、wlr-layer-shell、wl_data_device、
-  primary-selection、virtual-keyboard、virtual-pointer、linux-dmabuf、wlr-screencopy、
-  ext-image-copy-capture、wlr-export-dmabuf（grim / slurp / wf-recorder / OBS）
+  primary-selection、pointer-constraints（锁鼠标 / 夹光标）、relative-pointer（相对位移，
+  Xwayland 的 XInput2 raw motion 靠它）、virtual-keyboard、virtual-pointer、linux-dmabuf、
+  wlr-screencopy、ext-image-copy-capture、wlr-export-dmabuf（grim / slurp / wf-recorder / OBS）
 - 输入法：text-input-v3 + input-method-v2（fcitx5 / ibus），候选框由合成器渲染摆位
 - 背景效果：ext-background-effect-v1（客户端自己指定哪块要模糊）
 - 渲染：`wlr_scene` 场景图（损伤跟踪 + 硬件光标）
@@ -783,6 +784,7 @@ python3 test-float.py        # 三个真实 GTK 窗口，验证浮动模式自�
 ./test-focus.sh                      # 焦点规则 + 激活请求（全 headless，61 项断言）
 ./test-ipc.sh                        # IPC：状态输出 / 命令 / 事件 / 多屏（全 headless，162 项断言）
 ./test-input-inject.sh               # 输入注入：鼠标 / 键盘合成事件到客户端（全 headless，54 项断言）
+./test-pointer-lock.sh               # 指针约束：锁鼠标 / 夹光标 / 相对位移，X11 的 XGrabPointer 也认（全 headless，27 项断言）
 ./test-cursor-shake.sh              # 摇晃找光标：线性加 + 补间、晃到屏幕那么大，截图里没有它（全 headless，55 项断言）
 ./test-geometry.sh                   # 窗口几何和表面尺寸对不上时内容铺满框（chromium 改大小那 1-2 秒）（全 headless，6 项断言）
 ./test-viewport-crop.sh              # 客户端用 wp_viewport 只声明缓冲的一部分时，装饰按那块采（chromium，5 项断言）
@@ -1414,7 +1416,8 @@ vidow 自己的，比如 `vidow-wayland-1.sock`）；`ipc_socket` 可以写死�
 | `layers` | 每个 layer surface：`namespace`、`layer`、`output`、`mapped`、`exclusive_zone`、`keyboard_interactivity`、`anchor`、`margin`、想要 / 实际尺寸、几何 |
 | `config` | **配置表的全部键值**（跟 `config.lua` 里 `vidow.get` 读到的是同一个东西）；`config` + `key` 只取一个 |
 | `keybinds` / `rules` | 键位表（触发串 + 动作串）、窗口规则（含「这一条到底写没写」的 null 语义） |
-| `seats` / `input` | seat 的能力列表、当前键盘的布局 / repeat / LED、所有键盘（含虚拟键盘和 vidow 自己的注入键盘 `vidow-inject`）、光标位置、当前的交互式 grab、拿着键盘的 layer surface |
+| `seats` / `input` | seat 的能力列表、当前键盘的布局 / repeat / LED、所有键盘（含虚拟键盘和 vidow 自己的注入键盘 `vidow-inject`）、光标位置、当前的交互式 grab、指针约束（`pointer_constraint`：`type` / `lifetime` / `window` /
+`cursor`）、拿着键盘的 layer surface |
 | `tokens` | 活着的 xdg-activation 令牌（app_id、serial 校验过没过、活了多久） |
 | `memories` | 热插拔记忆（每块见过的屏：在不在、上次的布局位置、离开时的滚动位置和焦点） |
 | `anims` | 正在跑的动画（tag / 进度 / 时长 / 缓动）+ 正在淡出的关闭快照 |
@@ -2807,6 +2810,10 @@ src/configwatch.c 配置自动重载：inotify 盯目录 + stat 比对，盯的�
 src/anim.c     动画引擎：单调时钟进度、缓动函数、每帧 tick
 src/fx.c       SSD 装饰着色器、kawase 模糊链（共享/私有 backdrop + 世代缓存）、离屏渲染、关闭快照
 src/im.c       输入法中继：text-input-v3 <-> input-method-v2、候选框摆位、键盘抢占用与回注防环
+src/pointerconstraint.c 指针约束：zwp_pointer_constraints_v1 + zwp_relative_pointer_manager_v1
+               （游戏锁鼠标 / 夹光标要的那两个）。wlroots 只给协议对象，钉住 / 夹住光标是合成器
+               的活：跟随指针焦点激活、locked 钉住位置 + 相对位移照发、confined 用
+               wlr_region_confine 夹进区域、cursor_hint 只在锁生效和解除时用
 src/bgeffect.c ext-background-effect-v1 服务端（wlroots 没实现）：区域双缓冲、按区域裁模糊
 src/activation.c xdg-activation-v1 服务端**自己实现**（不用 wlroots 那份）：令牌生命周期
                （按 activation_token_timeout 作废、客户端一断就作废）、serial 校验结果怎么
@@ -2938,6 +2945,13 @@ test-input-inject.sh 输入注入：`move-cursor` / `pointer-button` / `pointer-
                   `ctrl+shift+t` 的顺序、`Hi!` 里每个字符的 Shift、注入 super+t 不触发
                   绑定但客户端照样收到、按住 super 滚轮不转发给客户端、
                   `input_injection = false` 之后全部拒绝
+test-pointer-lock.sh 指针约束（游戏锁鼠标 / 夹画笔要的那两个协议）：合成器日志里两个 global 都
+                  在、客户端 bind 得到；锁定时客户端收到 `locked` + 相对位移（`reltotal 120.0
+                  80.0`）而合成器光标和客户端的绝对坐标都不动（钉住）；夹住时把光标往区域外推
+                  400,400，客户端停在区域中心、合成器光标停在区域里、相对位移照发；
+                  锁之前给的 `cursor_hint` 在锁生效时把光标摆过去；X11 那边 `XGrabPointer`
+                  之后 IPC 里真的出现一个约束（就是「Xwayland bind 上了协议」的直接证据），
+                  光标钉住的同时 X 客户端照样收到位移；客户端退出后约束解除、光标能动
 test-cursor-shake.sh 摇晃找光标：来回晃一会儿才触发 / 慢速不误触 / 顺手一甩不触发 / 到点缩回（补间）/ 线性加
                   （2→4→8→16→32→45，屏幕尺寸封顶）；**截图**由像素作证 —— grim 不带 -c
                   时画面里没有光标（放大到 450x720 也没有），`grim -c` 抓到的外接矩形是
@@ -3835,6 +3849,50 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
        口子（screencopy / ext-image-copy-capture 同样对所有客户端开放，grim / OBS 靠它），
        而要收就得连它一起收 —— 那会把 grim / wf-recorder / OBS 全废掉。要边界得靠 sandbox
        那一层（别的进程拿不到 wayland socket），不是合成器。
+
+175. **补上 XWayland 缺的那两个协议：`zwp_pointer_constraints_v1` + `zwp_relative_pointer_manager_v1`**
+      （用户报的「xwayland 我记得之前说好像缺了什么协议 补一下」）。
+
+      ① **缺的是什么、怎么确认的**：看本机 `/usr/bin/Xwayland` 的字符串 —— 它 bind 的就是这两个
+      （`lock_pointer` / `confine_pointer` 两个请求 + `zwp_relative_pointer_manager_v1`），而
+      vidow 之前一个都没建（`src/main.c` 的 global 清单里只有 compositor / xdg-shell /
+      layer-shell / linux-dmabuf / screencopy 那一串）。缺了的后果分两条：
+        - **相对位移没了**：Xwayland 的 XInput2 raw motion 建在 `zwp_relative_pointer_v1` 上，
+          没有它，X11 游戏（Steam 上 Proton 那批基本都是 X11）转视角只能靠绝对坐标反推 ——
+          鼠标顶到屏幕边、或者被别的窗口吃掉，视角就转不动 / 抖；
+        - **锁 / 夹没了**：`XGrabPointer`（游戏锁鼠标、绘图软件把画笔夹在画布上）在 Xwayland
+          那边就是 `lock_pointer` / `confine_pointer`，合成器不提供，请求发都发不出去。
+      wlroots 只给协议对象（建 global、按表面查、发 activated/deactivated），**钉住 / 夹住光标
+      是合成器的活**，所以新开了 `src/pointerconstraint.c`（策略和 sway 一致）：指针底下的表面
+      == 约束那个表面才激活、焦点走了就解除；locked 钉在激活那一刻的位置、位移走
+      `relative_pointer` 发给客户端；confined 用 `wlr_region_confine` 夹进区域（旧位置已经在
+      区域外就先挪回区域中心）；`cursor_hint` 只在「锁生效那一刻」和「解除」时用 —— 锁着的时候
+      不跟（Xwayland 会不停更新 hint 来表达「X 那边的指针在哪」，跟上去光标就满屏跑，实测过）。
+
+      ② **判据 `./test-pointer-lock.sh`（新，27 项）**：headless 一块 1280x720 屏，两个新客户端
+      工具 —— `tools/pointerlock.c`（Wayland：锁 / 夹 + 收相对位移）和 `tools/xgrab.c`
+      （X11：`XGrabPointer`）。实测数据：
+        - **锁定**：客户端收到 `locked`、IPC `input.pointer_constraint = {type: locked,
+          window: 1, lifetime: persistent}`；`move-cursor 120 80 --relative` 之后客户端
+          `reltotal 120.0 80.0`（相对位移**到客户端了**），而合成器光标还在 `206,156`、
+          客户端那边的绝对坐标还在 `200,150` —— 三条一起才是「锁住了」；
+        - **夹住**：区域 `100x100+50+50`，往区域外推 400,400 → 客户端的 motion 停在
+          `100,100`（区域中心）、合成器光标停在 `106,106`（= 窗口原点 6,6 + 100,100）、
+          相对位移照发（`reltotal 400.0 400.0`）；
+        - **cursor_hint**：锁之前给 `--hint=40,60`，锁生效时光标落在 `46,66`（= 窗口原点 + hint）；
+        - **X11**：`XGrabPointer` 之后 IPC 里**真的**出现了一个约束（`window` = xgrab 那个窗口，
+          `locked`）—— 这就是「Xwayland bind 上了协议」的直接证据；把光标往窗口外推，合成器
+          光标钉在 `323,360` 不动、而 X 客户端照样收到位移（`317,354 → 617,554`，只有相对
+          指针那条路通了才可能出现）。
+      反证（把 `vidow_pointer_constraint_init` 那一句摘掉重跑同一条）：27 项只剩 9 项通过 ——
+      B/C/D 全红（没有 locked / confined、光标跟着动、hint 不生效），X11 那条「出现约束」也红。
+
+      ③ 顺手修掉一个自己踩的坑：`wlr_pointer_constraints_v1` 在 display 销毁时会断言
+      `events.new_constraint` 上没人挂着，我们挂了自己的监听却没人摘 —— 退出时直接 abort
+      （`types/wlr_pointer_constraints_v1.c:339`）。修法：在协议对象的 `events.destroy` 里摘干净。
+
+      ④ IPC 的 `input` 多了 `pointer_constraint`（`type` / `lifetime` / `window` / `cursor`）：
+      `vidowmsg input` 一眼能看出现在谁锁着指针。
 
 174. **窗口在非 0 那块屏上时录屏取错了输出**（光标 / 分辨率 / 抓帧触发一起错），
       选择器改成「预览在上、名字在下、双击确认」（用户报的三条：「1. 窗口打开录屏光标在非 0
@@ -5641,6 +5699,13 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
     另外 AT-SPI 报的坐标是**窗口相对的**，全局坐标要合成器补窗口位置 —— 这是 vidow 在这件事里
     唯一不可替代的部分。调研、实测数据（含覆盖率与「操作路径未验证」）与补齐路线见
     [`docs/ui-tree-feasibility.md`](docs/ui-tree-feasibility.md)
+
+31. 指针约束只做了鼠标那对（`zwp_pointer_constraints_v1` + `zwp_relative_pointer_manager_v1`）。
+    键盘那两个还没接：`zwp_keyboard_shortcuts_inhibit_manager_v1`（「这个窗口自己吃掉快捷键」，
+    Wine / 全屏游戏要的）wlroots 0.20 **有**实现（`wlr_keyboard_shortcuts_inhibit_v1_create`），
+    只是没接进键位那条路；`zwp_xwayland_keyboard_grab_manager_v1`（X11 的 `XGrabKeyboard`）
+    wlroots 里没有，要做就得像 `src/bgeffect.c` 那样自己写服务端。本机 `/usr/bin/Xwayland`
+    两个都会 bind。
 
 ## 下一步建议顺序
 
