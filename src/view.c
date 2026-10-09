@@ -674,6 +674,22 @@ static bool column_has_shown_views(struct vidow_column *col) {
 	return column_first_shown_view(col) != NULL;
 }
 
+/* 这条列里有全屏窗口吗。
+ *
+ * 有的话这条列在条带上占**一整屏**宽（不是它自己的 width_fraction）：全屏的窗口
+ * 画出来就是整块屏那么大，滚走它自然也该滚一整屏 —— 否则滚一下只挪几个像素，
+ * 它照样糊在整块屏上（用户报「全屏的窗口也要参与滚动」）。判据只认「全屏 + 已上屏
+ * + 没最小化」，跟摆放那一趟用的完全一致（见 output_arrange 的 Pass 3）。 */
+static bool column_has_fullscreen(struct vidow_column *col) {
+	struct vidow_view *view;
+	wl_list_for_each(view, &col->views, column_link) {
+		if (view->fullscreen && view->mapped && view_shows(view)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 /* 这块屏上现在该摆哪些列：有特殊工作区开着就摆它的（普通工作区让位），否则摆
  * 活动的那块普通工作区。空指针（还没建过工作区）返回空链表，arrange 就当没列。 */
 static struct wl_list *output_shown_columns(struct vidow_server *server,
@@ -1964,6 +1980,16 @@ static void output_arrange(struct vidow_server *server,
 		return;
 	}
 
+	/* 全屏窗口占的那块 = **整块屏**（不吃 gap、也不理状态栏的占位）—— niri 的
+	 * 「全屏窗口盖住整个屏幕」。取布局框：它和窗口摆位是同一个坐标系（逻辑坐标，
+	 * 缩放 / 旋转已经算进去了），view_clip_box / vidow_work_area 用的也是它。 */
+	struct wlr_box full_box = {0};
+	wlr_output_layout_get_box(server->output_layout, output->wlr_output,
+		&full_box);
+	if (full_box.width < 1 || full_box.height < 1) {
+		full_box = work; /* 布局里还查不到这块屏：退回工作区，别给个空框 */
+	}
+
 	/* 窗口之间（列与列、同列上下）的间距 = gaps_inner，没设就跟 gaps 一样。 */
 	int inner = vidow_gap_inner(&server->config);
 
@@ -1985,7 +2011,10 @@ static void output_arrange(struct vidow_server *server,
 		}
 		col->width = width;
 		col->offset = cursor;
-		cursor += width + inner;
+		/* 全屏的那条列在条带上占**一整屏**：它画出来就是整块屏那么大，让位 /
+		 * 滚走的距离自然也该是整块屏（用户报的「全屏的窗口也要参与滚动」）。
+		 * 列自己的 width_fraction 不动 —— 退出全屏回来还是那个宽度。 */
+		cursor += (column_has_fullscreen(col) ? work.width : width) + inner;
 	}
 	int total_width = cursor > 0 ? cursor - inner : 0;
 
@@ -2005,7 +2034,12 @@ static void output_arrange(struct vidow_server *server,
 	struct vidow_column *focused_col =
 		focus != NULL ? focus->column : NULL;
 	if (focused_col != NULL && focused_col->output == output->wlr_output) {
-		int right = focused_col->offset + focused_col->width;
+		/* 聚焦的这条列「在条带上多宽」—— 全屏的那条算一整屏，所以聚焦它时
+		 * 视口正好落在它的 offset 上（= 全屏窗口左边缘贴着屏左边缘），聚焦
+		 * 它旁边那条时才把全屏整块推到屏外（并排露出来）。 */
+		int cw = column_has_fullscreen(focused_col) ? work.width :
+			focused_col->width;
+		int right = focused_col->offset + cw;
 		if (right > viewport + work.width) {
 			viewport = right - work.width;
 		}
@@ -2028,6 +2062,12 @@ static void output_arrange(struct vidow_server *server,
 	struct vidow_view *fullscreen = NULL;
 	wl_list_for_each(col, shown, link) {
 		int x = work.x + col->offset - (int)viewport;
+		/* 全屏的那块也**跟着条带走**：左边缘 = 它自己那条列画在屏上的位置，
+		 * 尺寸给整块屏。它在条带上占一整屏宽（见 Pass 1 那个 slot），所以
+		 * 聚焦旁边那条列时它整块滑到屏外、旁边的列并排露出来；它自己那条列
+		 * 被聚焦时视口正好落在它的 offset 上 —— 左边缘 0，严丝合缝盖住整屏。
+		 * 滑出去那半块由 view_clip_box 裁在自己那块屏里（不会画到隔壁显示器）。 */
+		int fx = full_box.x + col->offset - (int)viewport;
 
 		int n = 0;
 		struct vidow_view *view;
@@ -2037,6 +2077,8 @@ static void output_arrange(struct vidow_server *server,
 			}
 			if (view->fullscreen && view->mapped) {
 				fullscreen = view;
+				vidow_place_view(view, fx, full_box.y, full_box.width,
+					full_box.height);
 				continue;
 			}
 			n++;
@@ -2074,10 +2116,15 @@ static void output_arrange(struct vidow_server *server,
 				break;
 			}
 		}
+		/* 只有**浮动**的全屏在这儿摆：列里那些在上面的 Pass 3 就摆完了（它们
+		 * 的位置跟着条带走、尺寸给整块屏），这里再摆一次会把那一份盖掉。 */
+		if (fullscreen != NULL) {
+			vidow_place_view(fullscreen, work.x, work.y, work.width,
+				work.height);
+		}
 	}
 
 	if (fullscreen != NULL) {
-		vidow_place_view(fullscreen, work.x, work.y, work.width, work.height);
 		/* 压在别人上面 / 从别人上面挪开：底衬的合成结果变了，账记在它头上。 */
 		vidow_backdrop_damage_view(fullscreen);
 		wlr_scene_node_raise_to_top(&fullscreen->scene_tree->node);

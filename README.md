@@ -399,7 +399,7 @@ X11 那边多一层小心：`wlr_xwayland_surface_set_maximized()` 写下去之�
 
 |  | `Mod+F` 全屏 | `Mod+Shift+F` 列最大化 |
 | --- | --- | --- |
-| 几何 | 占满工作区、置顶压过别的列 | 整列撑满工作区宽度（其他列还在条带上，被推到视口外） |
+| 几何 | 占满**整块屏**（不吃 gap、也不给状态栏留位置）、跟着条带滚动、置顶压过别的列 | 整列撑满工作区宽度（其他列还在条带上，被推到视口外） |
 | 客户端知道吗 | 知道（`set_fullscreen`：播放器会真全屏、藏 UI） | 知道（`set_maximized`，但客户端仍按普通窗口画） |
 | 同列别的窗口 | 让位（不参与高度均分） | 照旧（列宽变了，高度还是均分） |
 
@@ -886,6 +886,7 @@ python3 test-float.py        # 三个真实 GTK 窗口，验证浮动模式自�
 ./test-x11scale.sh                   # X11 逐窗口缩放桥 x11_scale=1（全 headless，16 项断言）
 ./test-scrollcull.sh                 # 滚出视口的列 / 半块越界的列都不画到隔壁显示器；有人录屏 / 预览时也一样；静止窗口滚到视口外照样出帧（全 headless + grim 逐像素，36 项断言）
 ./test-floatstack.sh                 # 层级：浮窗永远压平铺、点浮窗换层级（全 headless + grim 逐像素，12 项断言）
+./test-fullscreen-scroll.sh          # 全屏占**整块屏**（不吃 gap）+ 参与滚动：滑出去 / 隔壁列并排 / 整块滚出屏藏起 / 退全屏列宽回来（全 headless + grim 逐像素，24 项断言）
 ./test-mixdpi.sh                     # 跨屏拖窗口：拖着的那段就按对面那块屏的倍率烘（全 headless，7 项断言）
 ./test-vt.sh                         # tty 的 VT 切换（Ctrl+Alt+F1..F12 / switch-vt 动作）（全 headless，11 项断言）
 ./test-focus.sh                      # 焦点规则 + 激活请求（全 headless，61 项断言）
@@ -4108,6 +4109,42 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
        口子（screencopy / ext-image-copy-capture 同样对所有客户端开放，grim / OBS 靠它），
        而要收就得连它一起收 —— 那会把 grim / wf-recorder / OBS 全废掉。要边界得靠 sandbox
        那一层（别的进程拿不到 wayland socket），不是合成器。
+
+191. **全屏的窗口现在参与滚动，占的也是整块屏**（用户报「全屏的窗口也要参与滚动。现在的全屏
+      好像不是真全屏，之前 obs 不小心全屏的时候看起来和普通窗口也差不多」）。
+
+      两条都是 niri 的规矩（官方文档 Fullscreen and Maximize）：一是「Fullscreen windows cover
+      the entire screen」，二是「fullscreen and maximized windows remain a normal participant of
+      the layout: you can scroll left and right from them and see other windows」。vidow 以前两条
+      都不对：
+
+      - **几何给的是工作区**（`work` = 可用区再缩进一圈 gap）——只有一条列、列宽 1.0 的时候，
+        它和普通平铺窗口**一模一样**（都是 10,10 1260x700 那种），这就是用户看到的「看起来和
+        普通窗口也差不多、不是真全屏」。
+      - **摆好之后钉在屏幕上不动**（`continue` 掉、摆在 work 上），滚动只挪别人 —— 全屏窗口
+        盖着整块屏，怎么滚都还是它，看着像「滚动没反应」。
+
+      改法都在 `output_arrange()`：
+
+      - 全屏的那块按**整块屏**摆（`wlr_output_layout_get_box()`：不吃 gap、也不给状态栏的占位
+        留空间），左边缘跟着条带走 = `full_box.x + col->offset - viewport`。落在自己那条列上
+        时视口正好等于它的 offset —— 左边缘 0、严丝合缝盖住整屏。
+      - 那条列在条带上占**一整屏宽**（`column_has_fullscreen()`）：Pass 1 推进 cursor、Pass 2
+        算「聚焦那条列要多宽」都用 `work.width`。于是往旁边滚一列，全屏那块整块滑出去、隔壁的
+        列并排露出来（niri 文档里那张「全屏和别的窗口并排」的图）。列自己的 `width_fraction`
+        不动 —— 退出全屏回来还是那么宽。
+      - 滚到屏外那半块照样**裁在自己那块屏里**（`view_clip_box()`，多屏时不会画到隔壁显示器
+        上）；整块滚出屏 → 停到停车位（日志 `A 藏起（停到屏外）`），滚回来又原样出现。
+      - 尾巴上那句「浮动的全屏占满工作区」以前对**列里的**全屏也照摆一遍（把它刚摆好的整屏
+        几何盖回工作区）—— 现在只摆浮动的那个。浮动的全屏本身没变（仍是占满工作区 + 永远压
+        在最上面；niri 是把它收进滚动布局，这一版没跟）。
+
+      - **回归**：新增 `test-fullscreen-scroll.sh` 24 项（headless 1280x720、gaps 10、四条 0.4
+        宽的列：全屏占 0,0 1280x720 且屏幕最左边那条 gap 被盖上；右移一列 → 全屏 -514、
+        隔壁列并排 766，两块同时在屏上；再右移 → -1028 → -1542 整块滚出屏并藏起；左移回来
+        又严丝合缝；退全屏 → 列宽回 504、后面的列合拢；滑出去那半块有 `clip:` 那行）；
+        `test-floatstack.sh`（全屏压浮窗那一节）、`test-workspace.sh`、`test-maximize.sh`
+        （条带 / 视口那套判据共用）都照旧过。
 
 190. **窗口滚出视口之后，客户端被叫去按隔壁那块屏的缩放重画**（用户报「窗口滚动出去后，
       又按照另一个屏幕的缩放变化了」）。
