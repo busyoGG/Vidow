@@ -4043,7 +4043,13 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
       「场景抓取在多元素之间共享」，那是另一件事。
 
       ⑤ 回归：`test-idlewake.sh` 7/7、`test-input-inject.sh` 54/54、`test-blur*` 全绿、
-      `test-frametrace.sh` / `test-drag-stall.sh` / `test-capture-hide.sh` 全绿，全套 **67 项 rc=0**。
+      `test-frametrace.sh` / `test-drag-stall.sh` / `test-capture-hide.sh` 全绿。全套 67 项里
+      **66 项 rc=0**，唯一一条红的是 `test-maximize.sh` 最后那句「收尾还剩 1 个 vidow」——
+      **单跑 60/60 全过**，把可能挨着的那一串重跑一遍（`test-lastoutput` → `layerblur` /
+      `layerdestroy` / `layerghost` / `layermask` / `layerwin` → `test-maximize`，每步都数
+      `pgrep -x vidow`）**全程 0 残留**，复现不出来。这条断言是「进程计数」，和这次改的
+      抓帧看门狗 / getenv / 注入日志三条路都不搭界（它们不碰列最大化），先按 harness 的偶发
+      记在这儿。
 
 178. **配置说明补全：打出来的那份默认配置就是配置项的手册，它得全**（用户报的「配置里面的
       说明不完整，没有列出所有配置项，需要调整」）。
