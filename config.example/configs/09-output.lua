@@ -13,8 +13,20 @@ scale = "auto"
 -- （写几行就是几块屏；只写要管的字段，没写的 vidow 一概不动）：
 --
 --     vidow.output{ name = "DP-3", scale = 2, x = 0, y = 0 }
---     vidow.output{ name = "DP-2", scale = 2, x = 1920, y = 0, vrr = true, depth = 10 }
+--     vidow.output{ name = "DP-2", scale = 2, x = 1920, y = 0,
+--                   mode = "3840x2160@144", vrr = true, depth = 10 }
 --     vidow.output{ name = "HDMI-A-1", enabled = false }
+--
+-- 能写的字段（只有 name 必写，其余不写就是「不管这一项」）：
+--     name       连接器名（`vidowmsg outputs` 里那个，比如 DP-3）
+--     enabled    这块屏开不开（false = 关掉，拔线那套记忆不受影响）
+--     scale      "auto"（按 EDID 的 ppi 推）/ "off"（不缩放）/ 一个正数（2 = 两倍）
+--     x, y       摆在布局的哪个逻辑坐标（写哪个算哪个；只写 x = 0 = 摆到最左边）
+--     mode       "3840x2160@144" / "3840x2160"（刷新率不挑）/ "…@59.94"（小数也行）
+--     vrr        true / false（自适应同步，屏不支持就忽略）
+--     depth      位深，只能 8 或 10
+--     transform  方向：normal / 90 / 180 / 270 / flipped / flipped-90 / flipped-180 /
+--                flipped-270（也认 "0" 当 normal）
 --
 -- 模式有哪些先看 `vidowmsg outputs`。老写法（outputs / output_positions）已经
 -- 没了，写了会在日志里喊一声。

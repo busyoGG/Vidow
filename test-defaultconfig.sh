@@ -8,6 +8,9 @@
 #      （入口 + configs/ 那一套、以及 all 拼出来的单文件，两条路都验）
 #   3) 仓库里的 config.example/ 和 --default-config 打出来的一套逐字一致
 #      （入口 + 每一份分类文件，文件清单也要一致 —— 少一份就是漂移）
+#   3b) 这份打出来的配置就是配置项的手册，它得全：源码里能配的东西（config.c 的
+#      entries[] 平铺键、*_fields[] 族项、script.c 里注册的 vidow.* 函数、
+#      vidow.rule / vidow.output 读的表字段）逐个都得在 config.example/ 里出现过
 #   4) --write-config 把整套写进配置目录；已存在的不覆盖（除非 --force）
 #   5) 表写法 = 平铺键：gaps = { top=30, inner=20 } → gaps_top/gaps_inner，
 #      而 gaps 自己不变（表只盖写了的项）；border/blur/anim/ipc 同理
@@ -128,6 +131,53 @@ for f in config.example/configs/*.lua; do
 done
 [ "$ONES" -gt 0 ] && pass "每一份分类文件都和仓库里那份一致（$ONES 份）" ||
 	fail "一份分类文件都没比对到"
+
+mark "2b) 配置说明的完整性：源码里能配的东西都写进了这份默认配置"
+# 打出来的那份就是「配置项的手册」—— 它得**全**。这里直接从源码里把能配的东西
+# 抠出来（config.c 的 entries[] 平铺键、*_fields[] 族项、script.c 里注册的 vidow.*
+# 函数、以及 vidow.rule / vidow.output 读的那些表字段），逐个去 config.example/ 里
+# 找：找不到就是「这个配置项没写进说明」。
+python3 - "$RUNDIR" <<'PYCFG'
+import os, re, sys
+rundir = sys.argv[1]
+cfg = open("src/config.c", encoding="utf-8").read()
+script = open("src/script.c", encoding="utf-8").read()
+
+flat = re.findall(r'^\t\{ "([a-zA-Z0-9_]+)",\s*K_', cfg, re.M)
+fields = []
+for m in re.finditer(r'static const struct group_field \w+_fields\[\] = \{', cfg):
+    i = cfg.index("{", m.end() - 1)
+    j = cfg.index("};", i)
+    fields += [f for f, _ in re.findall(r'\{ "([^"]+)",\s*"([^"]+)" \}', cfg[i:j])]
+api = re.findall(r'^\t\t\{ "([a-z_]+)", l_[a-z_]+ \},', script, re.M) + ["include"]
+tbl = re.findall(r'(?:lua_getfield\(L, 1, |table_bool\(L, 1, |'
+                 r'table_string\(L, 1, )"([a-z0-9_]+)"', script)
+tbl += re.findall(r'lua_getfield\(L, 2, "([a-z0-9_]+)"', script)
+
+doc = ""
+for f in sorted(os.listdir("config.example/configs")):
+    doc += open(os.path.join("config.example/configs", f), encoding="utf-8").read()
+doc += open("config.example/config.lua", encoding="utf-8").read()
+
+groups = [
+    ("平铺键（entries[]）", flat),
+    ("族里的项（*_fields[]）", fields),
+    ("vidow.* 的函数", api),
+    ("表参数里的字段（vidow.rule / vidow.output）", tbl),
+]
+bad = 0
+for name, names in groups:
+    miss = sorted({n for n in names
+                   if not re.search(r'\b' + re.escape(n) + r'\b', doc)})
+    if miss:
+        print("  FAIL  %s 里有 %d 项没写进配置说明：%s"
+              % (name, len(miss), " ".join(miss)))
+        bad += len(miss)
+    else:
+        print("  PASS  %s 的 %d 项都写进了配置说明" % (name, len(set(names))))
+sys.exit(1 if bad else 0)
+PYCFG
+[ $? -eq 0 ] || FAILED=1
 
 mark "3) --help 和不认识的参数"
 "$VIDOW" --help 2>&1 | grep -q "default-config" && pass "--help 提到了 --default-config" ||

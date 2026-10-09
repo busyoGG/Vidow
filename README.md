@@ -95,7 +95,7 @@ anim   = { open_ms = 220, easing = "out_quint" }
 | `clipboard` | `enabled` `primary` `max_bytes` | `clipboard = false` |
 | `ipc` | `enabled` `socket` | `ipc = true` |
 | `xwayland` | `enabled` `scale` `env` | `xwayland = false` |
-| `portal` | `conf_sync` `desktop` | — |
+| `portal` | `conf_sync` `desktop` `capture` | — |
 
 显示器（输出）是另一种写法：**一块屏一组**，用 `vidow.output{…}` 声明，因为「哪块屏、
 按几倍、摆在哪」是同一件事 —— 摊成平铺键（老的 `outputs` + `output_positions`）要在
@@ -118,6 +118,12 @@ anim   = { open_ms = 220, easing = "out_quint" }
 仓库里的 `config.example/` 就是 `--write-config` 写出来的那一套（`config.lua` + `configs/`）；
 `./test-defaultconfig.sh` 里有一组断言盯着「这套文件和 `--default-config` 打出来的一模一样，
 文件清单也得一致」，所以它不会跟代码走散。
+
+**这份打出来的配置就是配置项的手册，它得全**：每个平铺键（`config.c` 的 `entries[]`）、
+每个族里的项（`*_fields[]`）、每个 `vidow.*` 函数、以及 `vidow.rule{}` / `vidow.output{}`
+读的每个字段，都得在 `config.example/` 里出现过 —— 那些表字段最容易漏（它们不是配置键，
+`entries[]` 那套「键都在」的检查盯不到），所以 `test-defaultconfig.sh` 另有一组断言直接从
+源码里把这些名字抠出来逐个去找，少一个就红。
 
 ### 间距（gap）：一个数管全部
 
@@ -857,7 +863,7 @@ python3 test-float.py        # 三个真实 GTK 窗口，验证浮动模式自�
 ./test-config.sh                     # 配置系统：一个 Lua 文件 + 改了就自动重载（全 headless，15 项断言）
 ./test-binds.sh                      # 键位全是配置给的：没配置=没有键位、默认那套能用、换键位、动作字符串（全 headless，35 项断言）
 ./test-config-include.sh             # 配置拆成好几份：vidow.include() 的路径/顺序/报错 + 改哪份都自动重载（全 headless，25 项断言）
-./test-defaultconfig.sh              # 默认配置按类别拆成 configs/（--default-config / --write-config）+ 配置族的表写法（全 headless，41 项断言）
+./test-defaultconfig.sh              # 默认配置按类别拆成 configs/（--default-config / --write-config）+ 配置族的表写法 + 说明的完整性（全 headless，45 项断言）
 ./test-gap.sh                        # 间距：一个数管全部 + 单边/内间距覆盖（全 headless，33 项断言）
 ./test-layerblur.sh                  # 半透明状态栏背后的模糊（全 headless，4 项断言）
 ./test-blurscale.sh                  # 模糊在高 DPI 倍率下的底衬覆盖 + 对位（1/1.7/2 倍，7 项断言）
@@ -3974,6 +3980,37 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
        口子（screencopy / ext-image-copy-capture 同样对所有客户端开放，grim / OBS 靠它），
        而要收就得连它一起收 —— 那会把 grim / wf-recorder / OBS 全废掉。要边界得靠 sandbox
        那一层（别的进程拿不到 wayland socket），不是合成器。
+
+178. **配置说明补全：打出来的那份默认配置就是配置项的手册，它得全**（用户报的「配置里面的
+      说明不完整，没有列出所有配置项，需要调整」）。
+
+      ① **先量了一遍**：`config.example/` 里 64 个平铺键一个不缺 —— 缺的全是**不是配置键**的
+      那些，一共 **22 项**：12 个 `vidow.*` 函数（`exec` / `exec_status` / `get` / `log` /
+      `ipc_path` / `rules` / `workspace_active` / `workspace_list` / `workspace_move` /
+      `workspace_special` / `workspace_switch` / `workspace_toggle_special`）、
+      `vidow.rule{…}` 的 8 个字段（`class` / `namespace` / `focus_on_open` /
+      `focus_on_activate` / `honor_invalid_serial` / `hz` / `x11_scale` / `capture_mosaic`）、
+      `vidow.output{…}` 的 2 个字段（`mode` / `transform`）。它们不在 `entries[]` 里，所以原来
+      那套「打出来的键 == IPC 的 config 键」的检查盯不到 —— 这就是漏掉的机制。
+
+      ② **改法**（都在生成配置的 C 字符串里，`src/config.c`）：
+        - `configs/14-keys.lua`：窗口规则那块从「一行例子」扩成完整的字段表（4 个匹配字段 +
+          8 个作用，每个作用带上取值和「至少写一个」这条规矩），下面再加一张 `vidow.*` 函数
+          总表（配置键 / 窗口规则 / 工作区 / 输出 / 跑命令与日志，**18 个函数一个不少**，
+          每个一句话说明，工作区那几个写清是「按名字」而不是序号）；
+        - `configs/09-output.lua`：`vidow.output{…}` 从 3 行例子扩成 9 个字段的说明
+          （`name` / `enabled` / `scale` / `x` / `y` / `mode` / `vrr` / `depth` / `transform`，
+          含 `transform` 的 8 种取值、`mode` 的三种写法、`depth` 只能 8 或 10）。
+        改完 `config.example/` 重新生成（还是 `--write-config` 写出来的那一套，动的就是这两份）。
+
+      ③ **加一组判据，免得再漂**：`test-defaultconfig.sh` 新增一节，直接从源码里抠名字 ——
+      `config.c` 的 `entries[]`（64 个平铺键）、`*_fields[]`（49 个族项）、`script.c` 里注册的
+      `vidow.*`（18 个）、以及 `vidow.rule` / `vidow.output` 读的表字段（19 个，`lua_getfield` /
+      `table_bool` / `table_string` 三种读法都算上）—— 逐个去 `config.example/` 里找，少一个就红。
+      **反证**：改之前这一节正好 22 项红（就是①里那 22 项）。README 的族表也顺手跟代码对了一遍：
+      `portal` 那行少了 `capture`，补上（其余 10 个族一致）。
+
+      ④ 全套 66 项 rc=0；`test-defaultconfig.sh` 从 41 项涨到 **45 项**。
 
 177. **补上列最大化（niri 的 `maximize-column`）**（用户问「现在有没有窗口全屏的功能？顺便补上
       窗口最大化」）。
