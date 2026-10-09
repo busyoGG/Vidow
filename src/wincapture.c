@@ -444,8 +444,24 @@ void vidow_win_grab_destroy(struct vidow_win_grab *grab) {
 
 /* ------------------------------------------- 截图源（ext-copy 的窗口源） */
 
-/* 这个窗口的「取景」算在哪块屏上：**按窗口中心在布局里的位置反查**（跟
- * screencast.c 的 handle_stream_window 同一个判据，找不到就退回 view->output）。
+/* 这个窗口的「取景」算在哪块屏上（跟 screencast.c 的 handle_stream_window 共用
+ * 这一份）：
+ *   平铺的      看**它那条列**挂在哪块屏（view->column->output）—— 跟滚动无关；
+ *   浮动 / 弹窗 它们不参与滚动（geom 就是自己的绝对位置），按现在画在哪块屏上
+ *               反查（拖着跨屏时 view->output 还停在原来那块屏上，见 fx.c 里
+ *               「窗口画在哪块屏上」那段）。
+ *
+ * 为什么平铺的不能也按「现在画在哪」反查：平铺窗口的 geom 里含着**滚动视口的
+ * 偏移**（view.c 的 output_arrange：x = 工作区 + 列偏移 - 视口）。窗口滚出视口
+ * 之后它画的那些像素落在隔壁屏的范围里，中心反查出来就是隔壁那块 —— 这一路流
+ * （和窗口抓帧源）就挂到错那块屏上，后果三件（用户报的「非 0 那块屏上录屏看不到
+ * 光标」，实测）：
+ *   ① 光标去错那块屏的光标列表里找：指针明明在窗口上，也永远找不到，元数据里
+ *      一直 id=0 —— 消费者那边就是「有画面、光标不进来」；
+ *   ② 流尺寸乘的是错那块屏的 scale（2 倍屏上分辨率只有一半，图是糊的）；
+ *   ③ 输出提交那条抓帧路盯的也是错那块屏。
+ * 窗口滚回视口、重新对齐到自己那块屏之后，**已经建好的流不会跟着换回来** ——
+ * 所以判据必须是跟滚动无关的那一个。
  *
  * 为什么两边必须一致：合成器给 zkde 窗口流开的缓冲尺寸是「窗口逻辑尺寸 × 这块屏
  * 的 scale」（设备像素），而 portal 报给前端的 size 是从**窗口抓帧源的约束**来的
@@ -456,6 +472,10 @@ struct wlr_output *vidow_win_grab_output(struct vidow_server *server,
 		struct vidow_view *view) {
 	if (server == NULL || view == NULL) {
 		return NULL;
+	}
+	if (!view->popup && view->float_mode == VIDOW_FLOAT_NONE &&
+			view->column != NULL && view->column->output != NULL) {
+		return view->column->output;
 	}
 	struct wlr_box at = vidow_view_screen_box(view);
 	struct wlr_output *output = wlr_output_layout_output_at(
