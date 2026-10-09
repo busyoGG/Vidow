@@ -175,8 +175,24 @@ static const struct ext_image_copy_capture_frame_v1_listener frame_listener = {
 };
 
 static void capture_next(void) {
-	if (!session_ready || buffer == NULL) {
+	if (!session_ready) {
 		return;
+	}
+	/* 约束尺寸中途变了（窗口挪到缩放不同的屏上，合成器重发 buffer_size）：
+	 * 手上这块缓冲得换掉 —— 不换的话合成器每一帧都回 failed（缓冲约束对不上），
+	 * 而它回 failed 的那一帧不会再补一句（二次 fail 会让合成器崩，见
+	 * src/wincapture.c 的 source_copy_frame）。 */
+	if (buffer == NULL || buf_w != alloc_w || buf_h != alloc_h) {
+		if (buffer != NULL) {
+			wl_buffer_destroy(buffer);
+			buffer = NULL;
+			munmap(pixels, (size_t)alloc_w * (size_t)alloc_h * 4);
+			pixels = NULL;
+		}
+		if (!make_buffer()) {
+			fprintf(stderr, "capture: 建不出缓冲\n");
+			return;
+		}
 	}
 	frame = ext_image_copy_capture_session_v1_create_frame(session);
 	ext_image_copy_capture_frame_v1_add_listener(frame, &frame_listener, NULL);

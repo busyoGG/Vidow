@@ -617,6 +617,15 @@ blit 进客户端缓冲，ext-copy 的输出源监听 `output->events.commit` �
                          # 屏幕和基线一样、块边长可配）→ 配置报错 → 日志干净
 ```
 
+```bash
+./test-wincapture-scale.sh  # 17 项断言：窗口抓帧源（ext-image-copy-capture 的窗口源）
+                         # 的尺寸中途变了怎么办 —— 两块屏（1 倍 + 2 倍）之间挪窗口，
+                         # 这一路流的像素尺寸跟着变（逻辑 × scale），合成器重发
+                         # buffer_size：验它只回一次 failed（回第二次就是拿 free 掉
+                         # 的内存 post_event，合成器当场段错误）、客户端换掉缓冲之后
+                         # 接着出帧、合成器没崩也没新 coredump
+```
+
 ## 焦点：谁抢焦点、激活请求理不理（窗口规则）
 
 两件事共用一个开关面：**开窗口时抢不抢焦点**，和**别人请求激活它时理不理**。
@@ -4062,6 +4071,37 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
        口子（screencopy / ext-image-copy-capture 同样对所有客户端开放，grim / OBS 靠它），
        而要收就得连它一起收 —— 那会把 grim / wf-recorder / OBS 全废掉。要边界得靠 sandbox
        那一层（别的进程拿不到 wayland socket），不是合成器。
+
+183. **窗口抓帧源尺寸中途变了 = 合成器段错误（`copy_buffer` 之后二次 `fail` 的 use-after-free）**
+      （用户报「直接崩溃」，`./dbg.sh` 的 coredump 栈：`wl_resource_post_event ←
+      wlr_ext_image_copy_capture_frame_v1_fail ← source_copy_frame ← source_request_frame`）。
+
+      - **根因**：`wlr_ext_image_copy_capture_frame_v1_copy_buffer()` 在**尺寸对不上**时自己就
+        `fail(frame)` + `return false`，而 `fail` 会把 frame 销毁掉（wlroots
+        `types/wlr_ext_image_copy_capture_v1.c` 三条失败路都是 `fail(); return false;` ——
+        返回 false 就等于「我已经回过了」）。`src/wincapture.c` 的 `source_copy_frame` 看到返回
+        false 又补了一句 fail：拿一块已经 free 掉的内存去 `wl_resource_post_event`，si_code
+        SEGV_MAPERR，当场崩。触发条件是 182 之后才有的：窗口源的尺寸是「窗口逻辑尺寸 × 那块屏的
+        scale」，窗口在缩放不同的两块屏之间挪一下尺寸就变（用户日志里的现场：新窗口一开 → 焦点
+        变 → 布局重排 → obs 那个窗口从 4K 缩放 2 那块屏挪到 1 倍那块，尺寸 1908x2136 → 954x1068，
+        紧接着一次新的 `WINDOW-CAPTURE` 交换链分配），选择器那一路缩略图抓帧手上那块缓冲立刻
+        对不上 → 必崩。
+      - 修：`source_copy_frame` 拷不进去时**什么都不做**（客户端已经收到 failed 了），只在尺寸
+        对不上时先记一条 INFO（`wincapture: X 这一帧 WxH，客户端缓冲 WxH —— 尺寸变了，这一帧回
+        failed`），免得日志里只剩一句「拷不进去」。合成器那三个抓帧源（窗口源 / 输出源 / 光标源）
+        都过了一遍，只有窗口源这一处多补了 fail。
+      - 客户端侧也得跟着换缓冲（不然合成器每一帧都回 failed）：`tools/vidowportal.c` 的选择器
+        缩略图会话以前只在「还没缓冲」时建（约束变了不换），预览就一直是空的（用户说的黑屏）。
+        现在 `win_shot_alloc_buffer/free_buffer` 抽出来，`done` 里发现尺寸变了就换 —— 有帧在飞就
+        等它回来再换（那块缓冲还挂在它身上）；`tools/capture.c`（测试客户端）同样在
+        `capture_next` 里按新约束换缓冲。
+      - **回归**：新增 `test-wincapture-scale.sh`（两块屏 1 倍 + 2 倍，窗口在两者之间挪）：验
+        「合成器重发 `buffer_size`」「2 倍屏上的尺寸正好是 1 倍屏的两倍」「整个换屏只回一次
+        failed」「failed 之后接着出帧（换缓冲自愈）」「合成器没崩、没新 coredump」。**修之前这一套
+        必挂**（跑了一遍旧代码：换屏那一刻段错误 + 新 coredump），现在 17 项全过。相关：
+        test-force-render 28 项、test-scrollcull 34 项、test-capture-hide 30 项、test-portal-own
+        50 项全过，test-screencast / test-portal / test-mixdpi 全 rc=0。
+      - 还没验的：真实 OBS 会话里把窗口在 DP-3 / DP-2 之间拖一次（选择器的缩略图那条路）。
 
 182. **录屏：portal 报的流尺寸改成「像素」，跟合成器开的缓冲一个口径**（用户报「2 倍屏上录屏
       看不到光标、OBS 第一次弹选择器不管选什么都黑屏」）。

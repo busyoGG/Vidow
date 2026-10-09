@@ -610,6 +610,18 @@ static void source_copy_frame(struct wlr_ext_image_capture_source_v1 *base,
 			EXT_IMAGE_COPY_CAPTURE_FRAME_V1_FAILURE_REASON_UNKNOWN);
 		return;
 	}
+	/* 客户端缓冲跟这一帧对不上：多半是窗口挪到缩放不同的屏上了（尺寸跟着
+	 * 变，见 win_source_size），而它手上那块缓冲是按上一版约束建的。约束我们
+	 * 在 source_render 里已经重发过了，客户端换掉缓冲、再要一帧就好 —— 这一帧
+	 * 由 copy_buffer 内部回 failed。这里先记一笔，免得日志里只剩一句「拷不进去」。 */
+	if (frame->buffer != NULL &&
+			(frame->buffer->width != src->pending->width ||
+			 frame->buffer->height != src->pending->height)) {
+		wlr_log(WLR_INFO,
+			"wincapture: %s 这一帧 %dx%d，客户端缓冲 %dx%d —— 尺寸变了，这一帧回 failed（等它换缓冲）",
+			grab_label(src->grab), src->pending->width, src->pending->height,
+			frame->buffer->width, frame->buffer->height);
+	}
 	if (wlr_ext_image_copy_capture_frame_v1_copy_buffer(frame, src->pending,
 			src->grab->output.renderer)) {
 		struct timespec now;
@@ -619,9 +631,11 @@ static void source_copy_frame(struct wlr_ext_image_capture_source_v1 *base,
 			WL_OUTPUT_TRANSFORM_NORMAL, &now);
 		return;
 	}
-	/* 拷不进去（客户端缓冲尺寸对不上之类）：也得回一句，不然它一直等。 */
-	wlr_ext_image_copy_capture_frame_v1_fail(frame,
-		EXT_IMAGE_COPY_CAPTURE_FRAME_V1_FAILURE_REASON_UNKNOWN);
+	/* 走到这儿 copy_buffer 已经回过 failed 并且**把 frame 销毁了**，不能再补一句：
+	 * 那是拿一块已经 free 的内存去 wl_resource_post_event，当场 SEGV（wlroots
+	 * types/wlr_ext_image_copy_capture_v1.c：尺寸对不上、格式不在约束里、缓冲拷不动
+	 * 三条路都是 `fail(); return false;` —— 返回 false 就等于「已经回过了」）。
+	 * 踩过：选择器里缩略图抓帧正撞上窗口换屏（尺寸变），合成器直接崩。 */
 }
 
 static const struct wlr_ext_image_capture_source_v1_interface source_impl = {

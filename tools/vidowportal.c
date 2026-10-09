@@ -214,10 +214,12 @@ struct win_shot {
 	size_t map_size;
 	int fd;
 	int w, h, stride;
+	int alloc_w, alloc_h; /* 手上这块缓冲是按哪个尺寸建的（0 = 没缓冲） */
 	uint32_t format;
 	bool have_size, have_format;
 	bool ready;   /* 约束齐了（buffer_size + shm_format），可以要帧了 */
 	bool busy;    /* 手上有一帧还没回来 */
+	bool need_alloc; /* 尺寸变了要换缓冲，但还有一帧在飞（等它回来再换） */
 	bool failed;  /* 会话停了（窗口关了 / 合成器不给），下次重建 */
 	void (*on_pixbuf)(GdkPixbuf *pix, void *user);
 	void *user;
@@ -439,10 +441,68 @@ static GdkPixbuf *thumb_of(GdkPixbuf *pix) {
 
 /* ------------------------------------------------- 窗口抓帧（缩略图 / 截窗口）
  *
- * 走 ext-image-copy-capture-v1 的**窗口源**：合成器把那个窗口的场景子树渲染成
- * 一帧，我们拷进自己的 shm 缓冲。vidow 那边这个源是 wlroots 那份（见
- * src/capture.c 的说明），vidow-portal 就是个普通客户端。
+ * 走 ext-image-copy-capture-v1 的**窗口源**：合成器把那个窗口单独渲染成一帧
+ * （见 src/wincapture.c），我们拷进自己的 shm 缓冲。vidow-portal 就是个普通
+ * 客户端。
+ *
+ * **约束尺寸会中途变**：窗口挪到缩放不同的屏上，这一路流的像素尺寸就跟着变
+ * （逻辑尺寸 × 那块屏的 scale），合成器会重发 buffer_size —— 缓冲得跟着换，
+ * 不换的话它每一帧都回 failed（缓冲约束对不上），预览就一直是空的。而且它回
+ * failed 的那一帧**不能**再补一次（那是二次 fail，合成器会崩，见 wincapture.c）。
  */
+
+static void win_shot_free_buffer(struct win_shot *s) {
+	if (s->buffer != NULL) {
+		wl_buffer_destroy(s->buffer);
+		s->buffer = NULL;
+	}
+	if (s->map != NULL) {
+		munmap(s->map, s->map_size);
+		s->map = NULL;
+		s->map_size = 0;
+	}
+	if (s->fd >= 0) {
+		close(s->fd);
+		s->fd = -1;
+	}
+	s->alloc_w = s->alloc_h = 0;
+}
+
+/* 按当前约束（s->w / s->h / s->format）建一块 shm 缓冲。失败返回 false。 */
+static bool win_shot_alloc_buffer(struct win_shot *s) {
+	if (!s->have_size || !s->have_format || s->buffer != NULL) {
+		return false;
+	}
+	s->stride = s->w * 4;
+	size_t size = (size_t)s->stride * (size_t)s->h;
+	s->fd = create_shm_file(size);
+	if (s->fd < 0) {
+		return false;
+	}
+	s->map = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, s->fd, 0);
+	if (s->map == MAP_FAILED) {
+		s->map = NULL;
+		close(s->fd);
+		s->fd = -1;
+		return false;
+	}
+	s->map_size = size;
+	struct wl_shm_pool *pool = wl_shm_create_pool(shm, s->fd, (int)size);
+	s->buffer = wl_shm_pool_create_buffer(pool, 0, s->w, s->h, s->stride,
+		s->format);
+	wl_shm_pool_destroy(pool);
+	if (s->buffer == NULL) {
+		munmap(s->map, s->map_size);
+		s->map = NULL;
+		s->map_size = 0;
+		close(s->fd);
+		s->fd = -1;
+		return false;
+	}
+	s->alloc_w = s->w;
+	s->alloc_h = s->h;
+	return true;
+}
 
 static void win_shot_release(struct win_shot *s) {
 	if (s == NULL) {
@@ -463,19 +523,21 @@ static void win_shot_release(struct win_shot *s) {
 		ext_image_capture_source_v1_destroy(s->source);
 		s->source = NULL;
 	}
-	if (s->buffer != NULL) {
-		wl_buffer_destroy(s->buffer);
-		s->buffer = NULL;
-	}
-	if (s->map != NULL) {
-		munmap(s->map, s->map_size);
-		s->map = NULL;
-	}
-	if (s->fd >= 0) {
-		close(s->fd);
-		s->fd = -1;
-	}
+	win_shot_free_buffer(s);
 	free(s);
+}
+
+/* 换缓冲（尺寸变了）之后，把「手上那一帧回来了」这件事做掉：帧回来了才能安全
+ * 拆掉旧缓冲 —— 它可能还挂在那帧身上。 */
+static void win_shot_after_frame(struct win_shot *s) {
+	if (!s->need_alloc) {
+		return;
+	}
+	s->need_alloc = false;
+	win_shot_free_buffer(s);
+	if (!win_shot_alloc_buffer(s)) {
+		s->failed = true;
+	}
 }
 
 static void win_shot_request_frame(struct win_shot *s);
@@ -483,8 +545,9 @@ static void win_shot_request_frame(struct win_shot *s);
 static void win_shot_frame_ready(void *data,
 		struct ext_image_copy_capture_frame_v1 *frame) {
 	struct win_shot *s = data;
-	GdkPixbuf *pix = pixbuf_from_shm(s->map, s->w, s->h, s->stride, s->format,
-		false);
+	/* 按**这块缓冲自己的**尺寸读（s->w/h 可能已经被新约束改过了）。 */
+	GdkPixbuf *pix = pixbuf_from_shm(s->map, s->alloc_w, s->alloc_h, s->stride,
+		s->format, false);
 	void (*cb)(GdkPixbuf *, void *) = s->on_pixbuf;
 	void *user = s->user;
 	s->on_pixbuf = NULL;
@@ -492,6 +555,8 @@ static void win_shot_frame_ready(void *data,
 	s->busy = false;
 	s->frame = NULL;
 	ext_image_copy_capture_frame_v1_destroy(frame);
+	/* pix 是拷出来的（pixbuf_from_shm 逐像素拷），所以这之后换缓冲是安全的。 */
+	win_shot_after_frame(s);
 	if (cb != NULL) {
 		cb(pix, user);
 	}
@@ -509,6 +574,7 @@ static void win_shot_frame_failed(void *data,
 	s->on_pixbuf = NULL;
 	s->user = NULL;
 	ext_image_copy_capture_frame_v1_destroy(frame);
+	win_shot_after_frame(s);
 }
 
 static void win_shot_frame_transform(void *data,
@@ -549,7 +615,9 @@ static void win_shot_request_frame(struct win_shot *s) {
 	ext_image_copy_capture_frame_v1_add_listener(s->frame,
 		&win_shot_frame_listener, s);
 	ext_image_copy_capture_frame_v1_attach_buffer(s->frame, s->buffer);
-	ext_image_copy_capture_frame_v1_damage_buffer(s->frame, 0, 0, s->w, s->h);
+	/* 损伤按**这块缓冲自己的**尺寸报（s->w/h 可能已经被新约束改过了）。 */
+	ext_image_copy_capture_frame_v1_damage_buffer(s->frame, 0, 0, s->alloc_w,
+		s->alloc_h);
 	ext_image_copy_capture_frame_v1_capture(s->frame);
 	/* 立刻送出去：请求是在「收到事件」的回调里发的，不 flush 就等不到下一轮
 	 * 事件（libwayland 只在下一次 dispatch 时 flush）。 */
@@ -566,29 +634,18 @@ static void win_shot_session_done(void *data,
 		s->failed = true;
 		return;
 	}
-	if (s->buffer == NULL) {
-		s->stride = s->w * 4;
-		size_t size = (size_t)s->stride * (size_t)s->h;
-		s->fd = create_shm_file(size);
-		if (s->fd < 0) {
-			s->failed = true;
-			return;
+	/* 尺寸变了（窗口挪到缩放不同的屏上）：缓冲得跟着换，不换合成器每一帧都回
+	 * failed。还有一帧在飞就先记着 —— 那块缓冲还挂在它身上，等它回来再拆。 */
+	if (s->buffer != NULL && (s->alloc_w != s->w || s->alloc_h != s->h)) {
+		if (s->frame != NULL) {
+			s->need_alloc = true;
+		} else {
+			win_shot_free_buffer(s);
 		}
-		s->map = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, s->fd, 0);
-		if (s->map == MAP_FAILED) {
-			s->map = NULL;
-			s->failed = true;
-			return;
-		}
-		s->map_size = size;
-		struct wl_shm_pool *pool = wl_shm_create_pool(shm, s->fd, (int)size);
-		s->buffer = wl_shm_pool_create_buffer(pool, 0, s->w, s->h, s->stride,
-			s->format);
-		wl_shm_pool_destroy(pool);
-		if (s->buffer == NULL) {
-			s->failed = true;
-			return;
-		}
+	}
+	if (s->buffer == NULL && !win_shot_alloc_buffer(s)) {
+		s->failed = true;
+		return;
 	}
 	s->ready = true;
 	/* 有人在等图（对话框刚开、或者这一轮 tick）→ 马上抓一帧。 */
