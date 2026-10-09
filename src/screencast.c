@@ -105,16 +105,26 @@ struct vidow_sc_pw_stream {
 	uint8_t *cursor_pixels;
 	uint32_t cursor_hash;
 	bool cursor_hashed;
-	/* 第一次查光标的结果报过没：这条走 INFO（每路流一次），后面每帧那些走
-	 * DEBUG。用户报「录屏里看不到光标」时，日志里有没有这一行就是分水岭 ——
-	 * 是合成器这边就没找到光标，还是找到了、消费者没画。 */
-	bool cursor_logged;
+	/* 光标在这一路里的状态（0 还没看过 / 1 报出去了 / 2 这块屏上没有可见光标 /
+	 * 3 有光标但在取景框外）。**只在变的那一帧**记一条 INFO —— 每帧记会刷屏，
+	 * 只记第一次又看不出「后来到底有没有」：用户报「录屏里看不到光标」时，日志
+	 * 里要一眼看出是「指针在别的屏上」「光标在流外面」还是「有光标没报出去」。 */
+	int cursor_state;
 	/* 光标元数据报过了（只在 metadata 模式、协商到格式之后报一次）。 */
 	bool meta_announced;
 	/* 给消费者发过多少帧；第一帧顺手看一眼是不是黑的（「有流但黑屏」这类报告
 	 * 光靠日志分不清是**我们发的就是黑的**还是消费者那边没画）。 */
 	uint64_t frames;
 	bool first_checked;
+};
+
+/* 光标在这一路里的状态（见 vidow_sc_pw_stream 的 cursor_state）。 */
+enum {
+	VIDOW_SC_CURSOR_NONE = 0,     /* 还没看过 */
+	VIDOW_SC_CURSOR_REPORTED,     /* 报出去了 */
+	VIDOW_SC_CURSOR_NONE_SCREEN,  /* 这块屏上没有可见光标（指针在别的屏上） */
+	VIDOW_SC_CURSOR_OUTSIDE,      /* 有光标，但在取景框外面 */
+	VIDOW_SC_CURSOR_NO_FRAME,     /* 取景框算不出来（窗口停到屏外 / 已经没了） */
 };
 
 /* SPA_META_Cursor 的元数据空间大小：位置 / 热点每帧都给，位图最多
@@ -547,6 +557,11 @@ static void stream_fill_cursor(struct vidow_sc_pw_stream *ps, struct spa_buffer 
 		 * 路（cursor_mode=4）的表现就是「有画面、光标不进来」。 */
 		if (!vidow_win_grab_frame_box(stream->win_grab, stream->out_w,
 				stream->out_h, &box, &scale)) {
+			if (ps->cursor_state != VIDOW_SC_CURSOR_NO_FRAME) {
+				ps->cursor_state = VIDOW_SC_CURSOR_NO_FRAME;
+				wlr_log(WLR_INFO, "screencast: 光标不在这一路里 —— 取景框算不出来"
+					"（窗口停到屏外了 / 已经没了）");
+			}
 			return;
 		}
 		break;
@@ -571,23 +586,15 @@ static void stream_fill_cursor(struct vidow_sc_pw_stream *ps, struct spa_buffer 
 	if (!vidow_capture_cursor_info(stream->sc->server, stream->output, &box, scale,
 			&info, ps->cursor_pixels,
 			(size_t)VIDOW_CURSOR_MAX_PX * VIDOW_CURSOR_MAX_PX * 4)) {
-		if (!ps->cursor_logged) {
-			ps->cursor_logged = true;
-			wlr_log(WLR_INFO, "screencast: metadata 第一次：这块屏（%s）上没有"
-				"可见光标 —— 消费者这边也就没有光标可画",
+		if (ps->cursor_state != VIDOW_SC_CURSOR_NONE_SCREEN) {
+			ps->cursor_state = VIDOW_SC_CURSOR_NONE_SCREEN;
+			wlr_log(WLR_INFO, "screencast: 光标不在这一路里 —— 这块屏（%s）上"
+				"没有可见光标（指针在别的屏上？）",
 				stream->output != NULL ? stream->output->name : "?");
 		}
 		wlr_log(WLR_DEBUG, "screencast: metadata：这块屏上没有可见光标");
 		ps->cursor_hashed = false; /* 光标没了：下次再出现要重发位图 */
 		return;
-	}
-	if (!ps->cursor_logged) {
-		ps->cursor_logged = true;
-		wlr_log(WLR_INFO, "screencast: metadata 第一次：光标在流里 %d,%d"
-			"（热点 %d,%d，位图 %dx%d，流 %dx%d，框 %d,%d %dx%d 缩放 %.3f）",
-			info.x, info.y, info.hotspot_x, info.hotspot_y, info.width,
-			info.height, stream->out_w, stream->out_h, box.x, box.y,
-			box.width, box.height, scale);
 	}
 	wlr_log(WLR_DEBUG, "screencast: metadata：光标 %d,%d 热点 %d,%d 位图 %dx%d",
 		info.x, info.y, info.hotspot_x, info.hotspot_y, info.width, info.height);
@@ -595,7 +602,22 @@ static void stream_fill_cursor(struct vidow_sc_pw_stream *ps, struct spa_buffer 
 	if (info.x + info.hotspot_x < 0 || info.y + info.hotspot_y < 0 ||
 			info.x - info.hotspot_x >= stream->out_w ||
 			info.y - info.hotspot_y >= stream->out_h) {
+		if (ps->cursor_state != VIDOW_SC_CURSOR_OUTSIDE) {
+			ps->cursor_state = VIDOW_SC_CURSOR_OUTSIDE;
+			wlr_log(WLR_INFO, "screencast: 光标不在这一路里 —— 它在取景框外面"
+				"（流里的位置 %d,%d 热点 %d,%d，流 %dx%d，框 %d,%d %dx%d 缩放 %.3f）",
+				info.x, info.y, info.hotspot_x, info.hotspot_y, stream->out_w,
+				stream->out_h, box.x, box.y, box.width, box.height, scale);
+		}
 		return;
+	}
+	if (ps->cursor_state != VIDOW_SC_CURSOR_REPORTED) {
+		ps->cursor_state = VIDOW_SC_CURSOR_REPORTED;
+		wlr_log(WLR_INFO, "screencast: 光标在这一路里 —— 流里 %d,%d（热点 %d,%d，"
+			"位图 %dx%d，流 %dx%d，框 %d,%d %dx%d 缩放 %.3f）",
+			info.x, info.y, info.hotspot_x, info.hotspot_y, info.width,
+			info.height, stream->out_w, stream->out_h, box.x, box.y, box.width,
+			box.height, scale);
 	}
 
 	meta->id = 1;

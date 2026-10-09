@@ -618,6 +618,13 @@ blit 进客户端缓冲，ext-copy 的输出源监听 `output->events.commit` �
 ```
 
 ```bash
+./test-portal-queue.sh   # 18 项断言：两个 Start 同时来（OBS 两条「屏幕采集(PipeWire)」源
+                         # 开机都去问 portal）→ 第二个**排队**不秒回也不报 denied → 关掉第一个
+                         # 它的选择器接着弹、两个都拿到答复 → 排着队时关会话那个请求被收掉、
+                         # 不多弹一个对话框（旧代码必挂：先拒了 + RESPONSE_OTHER）
+```
+
+```bash
 ./test-wincapture-scale.sh  # 17 项断言：窗口抓帧源（ext-image-copy-capture 的窗口源）
                          # 的尺寸中途变了怎么办 —— 两块屏（1 倍 + 2 倍）之间挪窗口，
                          # 这一路流的像素尺寸跟着变（逻辑 × scale），合成器重发
@@ -4071,6 +4078,34 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
        口子（screencopy / ext-image-copy-capture 同样对所有客户端开放，grim / OBS 靠它），
        而要收就得连它一起收 —— 那会把 grim / wf-recorder / OBS 全废掉。要边界得靠 sandbox
        那一层（别的进程拿不到 wayland socket），不是合成器。
+
+184. **两个 Start 同时来：排队，不拒**（用户报「第一次无法录制 / 第一次弹出来的选择器不管选
+      什么都黑屏」）。
+
+      - **根因**：OBS 的场景里有两条「屏幕采集(PipeWire)」源（`VTS` 和 `屏幕采集(PipeWire)`），
+        开机时两条都去问 portal。OBS 自己的日志就是现场：两条 `[pipewire] Screencast session
+        created` + 两条 `Asking for monitor and window`，然后一条
+        `Failed to start screencast, denied or cancelled by user` —— 被拒的那条源就黑着，得用户
+        手动再点一次「选择屏幕」。vidow-portal 以前是「已经有一个对话框开着，先拒了」，回
+        `RESPONSE_OTHER`，前端翻成「denied or cancelled by user」。
+      - 修：**排队**（KDE 的 portal 也是排队）：第二个 Start 挂在 `queued_starts` 里不答复，
+        当前这个选完 / 关掉之后接着弹下一个（`start_show_next`）。配套三处：`request_finish`
+        只在**正在弹的那个**请求上拆对话框 / 停建流计时器（排队里那个被收掉时不能顺手把别人
+        的对话框拆了 —— 拆了那个请求就收不到答复）；请求对象上的 `Close` 按注册时挂的
+        `user_data` 认是**哪个**请求（以前不看，排队的一被 Close 就把正在弹的收掉）；
+        `session_close` 把该会话排着队的请求先摘下来再收（`request_finish` 会动队列，边遍历
+        边收要踩链）。
+      - 光标那边**加诊断**（还没定论）：`stream_fill_cursor` 以前只在「第一次查光标」时打一条
+        INFO，现在改成**状态一变就打**（`光标在这一路里 —— 流里 x,y…` / `光标不在这一路里 ——
+        这块屏上没有可见光标（指针在别的屏上？）` / `…在取景框外面…` / `…取景框算不出来（窗口
+        停到屏外了）`）。用户那次 run 日志里是「这块屏（DP-3）上没有可见光标」—— 录的是 DP-3
+        上的窗口、鼠标当时在 DP-2 上；按窗口录屏的语义（KWin 同）光标只在它压在**被录的那个
+        窗口**上时才进画面，这一条待跟用户确认要哪种。
+      - **回归**：新增 `test-portal-queue.sh`（直接调后端 impl 的 DBus 接口：两个会话同时
+        Start → 第二个排队不秒回；关掉第一个 → 第二个的选择器接着弹、两个都拿到答复；排着队
+        的时候关会话 → 那个请求被收掉、不多弹一个对话框）。18 项全过；**旧代码跑同一套必挂**
+        （`已经有一个对话框开着，先拒了` + `(uint32 2, …)`）。相关：test-portal-own 50 项、
+        test-screencast 10 项、test-portal 全过。
 
 183. **窗口抓帧源尺寸中途变了 = 合成器段错误（`copy_buffer` 之后二次 `fail` 的 use-after-free）**
       （用户报「直接崩溃」，`./dbg.sh` 的 coredump 栈：`wl_resource_post_event ←

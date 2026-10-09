@@ -266,6 +266,10 @@ static GList *rows;    /* struct row *：对话框里当前排着的行 */
 static GDBusConnection *bus;
 
 static struct request *pending; /* 正在弹对话框的那个 Start */
+/* 排队等着弹对话框的 Start（struct request *）。见 screencast_start 里那段说明：
+ * 一次只弹一个对话框，但**不能拒** —— OBS 一开机两条「屏幕采集(PipeWire)」源
+ * 会同时来 Start，被拒的那条直接黑着，用户得手动再点一次。 */
+static GQueue queued_starts = G_QUEUE_INIT;
 static GtkWidget *dialog;
 static GtkWidget *flow;
 static GtkWidget *share_button;
@@ -1140,6 +1144,38 @@ static bool stream_all_settled(struct session *s) {
 
 static void request_finish(struct request *req, uint32_t response, GVariant *results);
 static void session_close(struct session *s, const char *why);
+static void dialog_show(struct request *req);
+static void start_show_next(void);
+
+/* 当前这个 Start 处理完了（选完 / 取消 / 超时）：接着弹排队里的下一个。
+ *
+ * 为什么要排队而不是拒（以前是「已经有一个对话框开着，先拒了」）：OBS 的场景里
+ * 两条「屏幕采集(PipeWire)」源开机时都会去问 portal（它的日志里就是两条
+ * Screencast session created + 两条 Asking for monitor and window），被拒的那条
+ * 收到 RESPONSE_OTHER，前端翻成「Failed to start screencast, denied or cancelled
+ * by user」—— 那一路就黑着，用户得手动再点一次「选择屏幕」（用户报的「第一次
+ * 无法录制」就是这个）。KDE 的 portal 也是排队：选完一个接着弹下一个。 */
+static void start_show_next(void) {
+	if (pending != NULL && !pending->done) {
+		return;
+	}
+	while (!g_queue_is_empty(&queued_starts)) {
+		struct request *req = g_queue_pop_head(&queued_starts);
+		if (req == NULL || req->done) {
+			continue; /* 排着队的时候被撤了（会话关了 / 客户端 Close） */
+		}
+		pending = req;
+		log_info("%s: 轮到排队里的 Start，弹选择器", req->session != NULL &&
+			req->session->app_id != NULL ? req->session->app_id : "?");
+		if (g_list_length(outputs) == 0) {
+			log_info("一块输出都没有，没法选");
+			request_finish(req, RESPONSE_OTHER, NULL);
+			continue; /* request_finish 会再叫一次，接着排下一个 */
+		}
+		dialog_show(req);
+		return;
+	}
+}
 
 static void stream_created(void *data, struct zkde_screencast_stream_unstable_v1 *obj, uint32_t node) {
 	struct stream *st = data;
@@ -1299,10 +1335,15 @@ static void request_finish(struct request *req, uint32_t response, GVariant *res
 		g_dbus_connection_unregister_object(bus, req->reg_id);
 		req->reg_id = 0;
 	}
-	dialog_destroy();
-	if (stream_timer != 0) {
-		g_source_remove(stream_timer);
-		stream_timer = 0;
+	/* 对话框 / 建流计时器只属于**正在弹的那个**请求：排队里那个被收掉（会话关了 /
+	 * 客户端 Close）时不能顺手把别人正在弹的对话框拆了 —— 拆了那个请求就收不到
+	 * 答复，而且对话框是被 destroy 信号收掉的，看起来就像「关不掉」。 */
+	if (pending == req) {
+		dialog_destroy();
+		if (stream_timer != 0) {
+			g_source_remove(stream_timer);
+			stream_timer = 0;
+		}
 	}
 
 	if (response != RESPONSE_SUCCESS) {
@@ -1328,6 +1369,8 @@ static void request_finish(struct request *req, uint32_t response, GVariant *res
 	free(req->path);
 	free(req->parent_window);
 	free(req);
+	/* 这个 Start 处理完了：排队里的下一个接着弹（没有就是空转一下）。 */
+	start_show_next();
 }
 
 /* 所有流都有结果了（成或败）→ 回 Start。 */
@@ -1858,9 +1901,16 @@ static void request_method_call(GDBusConnection *conn, const gchar *sender,
 	(void)user_data;
 	if (g_strcmp0(method_name, "Close") == 0) {
 		g_dbus_method_invocation_return_value(invocation, NULL);
-		if (pending != NULL && !pending->done) {
+		/* 关的是**这个**请求对象（注册时把 req 当 user_data 挂上了）——
+		 * 以前不看 user_data，直接收掉 pending：排着队的请求被 Close 会把
+		 * 正在弹的那个对话框收掉。 */
+		struct request *req = user_data;
+		if (req != NULL && !req->done) {
 			log_info("客户端撤回了请求");
-			request_finish(pending, RESPONSE_CANCELLED, NULL);
+			if (pending != req) {
+				g_queue_remove(&queued_starts, req);
+			}
+			request_finish(req, RESPONSE_CANCELLED, NULL);
 		}
 		return;
 	}
@@ -1876,9 +1926,26 @@ static void session_close(struct session *s, const char *why) {
 	if (s == NULL) {
 		return;
 	}
+	/* 排在队里还没轮到的：这个会话没了，等它没意义。**先全摘下来再收** ——
+	 * request_finish 里会叫 start_show_next，那会动这个队列，边遍历边收要踩到
+	 * 正在遍历的那条链。 */
+	GList *doomed = NULL;
+	for (GList *it = queued_starts.head; it != NULL; ) {
+		GList *next = it->next;
+		struct request *req = it->data;
+		if (req != NULL && req->session == s && !req->done) {
+			g_queue_delete_link(&queued_starts, it);
+			doomed = g_list_prepend(doomed, req);
+		}
+		it = next;
+	}
 	if (pending != NULL && pending->session == s && !pending->done) {
 		request_finish(pending, RESPONSE_CANCELLED, NULL);
 	}
+	for (GList *it = doomed; it != NULL; it = it->next) {
+		request_finish(it->data, RESPONSE_CANCELLED, NULL);
+	}
+	g_list_free(doomed);
 	if (s->started) {
 		/* 会话真开过 → 告诉前端它没了（前端再转告客户端）。 */
 		GVariant *sig = g_variant_new("()");
@@ -2072,14 +2139,6 @@ static void on_start(GDBusConnection *conn, const gchar *sender,
 		return;
 	}
 
-	if (pending != NULL && !pending->done) {
-		/* 一次只弹一个对话框。KDE 会排队，这里先直接拒 —— 客户端会重试。 */
-		log_info("%s: 已经有一个对话框开着，先拒了", app_id);
-		g_dbus_method_invocation_return_value(invocation,
-			g_variant_new("(u@a{sv})", RESPONSE_OTHER, empty_results()));
-		return;
-	}
-
 	struct request *req = calloc(1, sizeof(*req));
 	if (req == NULL) {
 		g_dbus_method_invocation_return_value(invocation,
@@ -2103,6 +2162,15 @@ static void on_start(GDBusConnection *conn, const gchar *sender,
 	}
 	if (req->reg_id == 0) {
 		log_info("注册请求对象失败（%s），照常弹对话框", handle);
+	}
+
+	if (pending != NULL && !pending->done) {
+		/* 一次只弹一个对话框，但**不能拒**（见 start_show_next 上面那段）：
+		 * 排队，当前这个选完 / 关掉之后接着弹。 */
+		g_queue_push_tail(&queued_starts, req);
+		log_info("%s: 已经有一个对话框开着，排队等（队里 %u 个）", app_id,
+			g_queue_get_length(&queued_starts));
+		return;
 	}
 
 	pending = req;
