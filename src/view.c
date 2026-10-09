@@ -963,8 +963,7 @@ void vidow_view_apply_clip(struct vidow_view *view) {
 	}
 
 	/* 没装饰（着色器也关着）的时候，窗口就是客户端表面自己在画 —— 那一份也得
-	 * 裁。有装饰的时候画的是 fx 那块离屏缓冲（表面是 0 透明度），由 fx.c 按
-	 * 同一个 box 裁，这里就不用管了（裁了也无害）。
+	 * 裁。
 	 *
 	 * 这一份要调 wlroots 的 wlr_scene_subsurface_tree_set_clip()，它**只认
 	 * subsurface 树**，别的树上找不到就直接 assert（`found` failed，vidow 当场
@@ -987,6 +986,28 @@ void vidow_view_apply_clip(struct vidow_view *view) {
 		&view->scene_surface->buffer->node.parent->node : NULL;
 	if (node == NULL) {
 		view->fx.clip_local = (struct wlr_box){0};
+		return;
+	}
+	/* 装饰管线（fx）在画这个窗口的时候，表面那一份是隐藏的（0 透明度，见
+	 * view_anim_bake 里那次 set_opacity）：那一份**不能**裁。
+	 *
+	 * 为什么不能：wlroots 的 wlr_scene_subsurface_tree_set_clip() 是靠改场景
+	 * 节点的 src_box（+ 显示尺寸）实现的，而装饰采源缓冲的哪一块正是从
+	 * src_box 算出来的（fx_geo_tex_map 把它当成「客户端声明的有效区」）。一裁，
+	 * fx 就把「裁剩下的一小条」当成整块有效内容，把那一小条**拉伸铺满整块
+	 * 窗口** —— 用户报的「窗口只有一点在视口里的时候，表面横向拉伸变扁、黑边
+	 * 随着在视口里的范围大小变」。以前这里写着「裁了也无害」，害就在 src_box
+	 * 这一条上。
+	 *
+	 * 装饰那份离屏缓冲本来就按同一个框裁（上面设的 fx->clip_on / fx->clip，
+	 * 见 fx.c 里那段 crop_src）—— 所以这里让开，屏幕上的裁剪一点不少。 */
+	if (view->fx.active) {
+		if (view->fx.clip_local.width > 0) {
+			/* 装饰是后接上的（decor_enabled 被改回来 / 窗口从弹出物变回来）：
+			 * 之前裁过的那一刀得撤掉，不然 src_box 一直是被裁过的那一版。 */
+			view->fx.clip_local = (struct wlr_box){0};
+			wlr_scene_subsurface_tree_set_clip(node, NULL);
+		}
 		return;
 	}
 	if (on) {
