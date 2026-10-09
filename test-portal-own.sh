@@ -78,7 +78,15 @@ pgrep -x pipewire >/dev/null || { echo "test-portal-own.sh: 需要 pipewire 在�
 [ -x ./build/cursorprobe ] || { echo "test-portal-own.sh: 需要 ./build/cursorprobe"; exit 1; }
 
 rm -rf "$RUNDIR"
-mkdir -p "$HOME_DIR/.config" "$LOG"
+mkdir -p "$HOME_DIR/.config/vidow" "$LOG"
+
+# 两块屏**位置钉死**（自动排的话谁在 0 是不确定的，6b2 要验「窗口在非 0 那块屏上」，
+# 6e 又假定光标放在逻辑 100,100 时落在 HEADLESS-1 上）。缩放都 1，免得跟坐标换算
+# 搅在一起（缩放那条路 6e 自己会临时改成 2 再改回来）。
+cat > "$HOME_DIR/.config/vidow/config.lua" <<'CFG'
+vidow.output{ name = "HEADLESS-1", x = 0, y = 0, scale = 1 }
+vidow.output{ name = "HEADLESS-2", x = 1280, y = 0, scale = 1 }
+CFG
 
 # 一条私有 dbus 会话里跑全套：vidow（它自己会把 vidow-portal 起在同一条总线上）、
 # 前端、真请求、真消费。不手动起任何 impl 后端 —— 这就是这个测试要证明的事。
@@ -98,7 +106,7 @@ export XDG_RUNTIME_DIR=/run/user/1000
 export VIDOW_PORTAL_NO_RESTART=1
 export VIDOW_PORTAL_LOG="$R/helper.log"
 
-WLR_BACKENDS=headless WLR_HEADLESS_OUTPUTS=1 WLR_RENDERER=pixman VIDOW_LOG=info \
+WLR_BACKENDS=headless WLR_HEADLESS_OUTPUTS=2 WLR_RENDERER=pixman VIDOW_LOG=info \
 	"$B/vidow" >"$R/vidow.log" 2>&1 &
 VPID=$!
 for i in $(seq 1 60); do
@@ -220,6 +228,25 @@ wait_node() { # <探针输出文件>
 	done
 	grep -ao "node=[0-9]*" "$1" 2>/dev/null | head -1 | cut -d= -f2
 }
+
+# 数**输出个数**（不是「有几行写着 HEADLESS-」：一个输出的 JSON 里名字会出现好几次，
+# 数行会把 2 块输出数成 4 块）。
+count_outputs() {
+	$VM --socket "$IPC" outputs 2>/dev/null | python3 -c '
+import json,sys
+try:
+    print(len(json.load(sys.stdin)))
+except Exception:
+    print(-1)'
+}
+
+# 这个测试从**两块** headless 屏起步（6b2 要验「窗口在非 0 那块屏上」那条路）。
+NOUT0=$(count_outputs)
+if [ "${NOUT0:-0}" -ge 2 ]; then
+	pass "两块 headless 屏都在（$NOUT0 块）"
+else
+	fail "只起了 ${NOUT0:-0} 块输出（期望 2 块）"
+fi
 
 # --- 5/6 真请求：CreateSession → SelectSources → Start ---------------------
 timeout 150 python3 /home/busyo/Dev/Vidow/tools/screencastprobe.py \
@@ -392,6 +419,58 @@ for i in $(seq 1 30); do
 	pgrep -f "screencastprobe.py --types 2" >/dev/null 2>&1 || break
 	sleep 1
 done
+# **把窗口搬到非 0 那块屏**：视频流的 output 是按窗口在布局里的位置反查的。以前拿
+# 客户端声明的窗口几何（x/y 是表面内部的偏移）当布局坐标，反查出来永远是布局左上角
+# 那一块 —— 窗口在另一块屏上时，光标元数据就在错的那块屏上找光标，永远 id=0
+# （用户报的「非 0 显示器上采集不到光标」）。两块屏谁在 0 是自动排的，按 x 现查。
+OUT0=$($VM --socket "$IPC" outputs 2>/dev/null | python3 -c '
+import json,sys
+try:
+    outs=json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+outs=outs.get("outputs",outs) if isinstance(outs,dict) else outs
+for o in outs:
+    if o["layout"]["x"] == 0:
+        print(o["name"])
+        break
+')
+OUT_OTHER=$($VM --socket "$IPC" outputs 2>/dev/null | python3 -c '
+import json,sys
+try:
+    outs=json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+outs=outs.get("outputs",outs) if isinstance(outs,dict) else outs
+for o in outs:
+    if o["layout"]["x"] != 0:
+        print(o["name"])
+        break
+')
+# 现查窗口**当下**的位置（列表滚动 / 6b 那一轮可能把它挪过），再点它一下聚焦
+# （move-window-to-output 作用于聚焦窗口）。
+WGEO_PRE=$($VM --socket "$IPC" windows 2>/dev/null | python3 -c '
+import json,sys
+try:
+    ws=json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for w in ws:
+    if w.get("title") == "pattern":
+        g=w["geometry"]
+        print("%d %d %d %d" % (g["x"], g["y"], g["width"], g["height"]))
+        break
+')
+if [ -n "${OUT_OTHER:-}" ] && [ -n "${WGEO_PRE:-}" ]; then
+	set -- $WGEO_PRE
+	$VM --socket "$IPC" pick-window $(( $1 + $3 / 2 )) $(( $2 + $4 / 2 )) >/dev/null 2>&1
+	sleep 0.5
+	$VM --socket "$IPC" move-window-to-output "$OUT_OTHER" >/dev/null 2>&1
+	sleep 1.5
+	echo "== 窗口搬到 $OUT_OTHER（原来在 ${WGEO_PRE}）"
+else
+	fail "没找到非 0 那块屏（只有 $OUT0）或窗口几何（${WGEO_PRE:-空}）—— 6b2 这条测不了"
+fi
 timeout 150 python3 /home/busyo/Dev/Vidow/tools/screencastprobe.py --types 2 \
 	--cursor-mode 4 --timeout 60 --hold 30 >"$R/probe6.txt" 2>&1 &
 # 这一轮走**双击卡片预览**那条交互（用户要的：预览在上、名字在下，点预览就是选，
@@ -399,11 +478,25 @@ timeout 150 python3 /home/busyo/Dev/Vidow/tools/screencastprobe.py --types 2 \
 # 边框 12 + 标题一行 + 段落标题一行 + 预览 176x110 的中心。
 DGEO=$(wait_dialog)
 if [ -n "${DGEO:-}" ]; then
+	# 对话框上屏之后还会被客户端「居中」一次（GTK 的 GTK_WIN_POS_CENTER_ALWAYS）：
+	# 位置会从浮动默认位置挪到那块屏的中间（实测 1286 -> 1920）。点之前重新读一遍。
+	sleep 1
+	DGEO=$(wait_dialog)
 	set -- $DGEO
-	$VM --socket "$IPC" move-cursor $(( $1 + 108 )) $(( $2 + 182 )) >/dev/null 2>&1
-	sleep 0.6
-	$VM --socket "$IPC" pointer-button click left 2 >/dev/null 2>&1
-	sleep 2
+	CARD_X=$(( $1 + 108 ))
+	CARD_Y=$(( $2 + 182 ))
+	# 落点得真在对话框里（偏移写错了会点到别的窗口上，静默不确认，很难查）。
+	if [ "$CARD_X" -lt "$1" ] || [ "$CARD_X" -gt $(( $1 + $3 )) ] ||
+			[ "$CARD_Y" -lt "$2" ] || [ "$CARD_Y" -gt $(( $2 + $4 )) ]; then
+		fail "第一张卡片的落点跑到对话框外面了（对话框 $DGEO，落点 $CARD_X,$CARD_Y）"
+		CARD_X=""
+	fi
+	[ -z "${CARD_X:-}" ] || {
+		$VM --socket "$IPC" move-cursor "$CARD_X" "$CARD_Y" >/dev/null 2>&1
+		sleep 0.6
+		$VM --socket "$IPC" pointer-button click left 2 >/dev/null 2>&1
+		sleep 2
+	}
 	if $VM --socket "$IPC" windows 2>/dev/null | grep -aq "共享屏幕"; then
 		fail "双击卡片预览没确认（对话框还开着；对话框在 $DGEO）"
 	else
@@ -420,6 +513,25 @@ else
 fi
 WSIZE6=$(grep -ao "size': ([0-9]*, [0-9]*)" "$R/probe6.txt" 2>/dev/null | head -1 |
 	grep -o "[0-9]*, [0-9]*" | tr -d ' ')
+# 流选的那块输出得是**窗口真正所在**的那块（就是上面 6b2 开头搬到的那块）。
+WOUT=$($VM --socket "$IPC" windows 2>/dev/null | python3 -c '
+import json,sys
+try:
+    ws=json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for w in ws:
+    if w.get("title") == "pattern":
+        print(w.get("output") or "")
+        break
+')
+RECLINE=$(grep -a "screencast: 请求录窗口" "$R/vidow.log" 2>/dev/null | tail -1)
+case "${RECLINE:-}" in
+*"$OUT_OTHER scale"*)
+	pass "流选的输出 = 窗口所在那块屏（$OUT_OTHER；$WOUT）" ;;
+*)
+	fail "流选的输出不对：${RECLINE:-没日志}（窗口在 $OUT_OTHER）" ;;
+esac
 # 光标要放到**真被录的那个窗口**中间：列表里第一行才是被录的，别按标题猜
 # （这一轮录的是谁，合成器日志里写着）。
 REC6=$(grep -a "screencast: 请求录窗口" "$R/vidow.log" 2>/dev/null | tail -1 |
@@ -498,25 +610,15 @@ if [ -n "${NODE3:-}" ]; then
 else
 	fail "虚拟输出没拿到 node：$(tail -3 "$R/probe3.txt" 2>/dev/null | tr '\n' ' ')"
 fi
-# 数**输出个数**（不是「有几行写着 HEADLESS-」：一个输出的 JSON 里名字会出现
-# 好几次，数行会把 2 块输出数成 4 块）。
-count_outputs() {
-	$VM --socket "$IPC" outputs 2>/dev/null | python3 -c '
-import json,sys
-try:
-    print(len(json.load(sys.stdin)))
-except Exception:
-    print(-1)'
-}
 for i in $(seq 1 20); do
-	[ "$(count_outputs)" -ge 2 ] && break
+	[ "$(count_outputs)" -gt "${NOUT0:-1}" ] && break
 	sleep 0.5
 done
 NOUT=$(count_outputs)
-if [ "${NOUT:-0}" -ge 2 ]; then
-	pass "合成器里真多出来一块输出（$NOUT 块 HEADLESS）"
+if [ "${NOUT:-0}" -gt "${NOUT0:-1}" ]; then
+	pass "合成器里真多出来一块输出（$NOUT0 块 → $NOUT 块）"
 else
-	fail "输出没变多（$NOUT 块）"
+	fail "输出没变多（$NOUT0 块 → $NOUT 块）"
 fi
 if grep -aq "加了块虚拟输出" "$R/vidow.log" 2>/dev/null; then
 	pass "合成器日志记着加了虚拟输出"
@@ -536,14 +638,14 @@ if [ -n "${NODE3:-}" ]; then
 fi
 # 探针退出 → 会话关掉 → 这一路流结束 → 虚拟输出该被拔掉。
 for i in $(seq 1 45); do
-	[ "$(count_outputs)" -le 1 ] && break
+	[ "$(count_outputs)" -le "${NOUT0:-1}" ] && break
 	sleep 1
 done
 NOUT2=$(count_outputs)
-if [ "${NOUT2:-9}" -eq 1 ]; then
+if [ "${NOUT2:-9}" -eq "${NOUT0:-1}" ]; then
 	pass "这一路流结束之后虚拟输出被拔掉了（回到 $NOUT2 块）"
 else
-	fail "虚拟输出没拔掉（还有 $NOUT2 块输出）"
+	fail "虚拟输出没拔掉（还有 $NOUT2 块输出，基线 $NOUT0 块）"
 fi
 
 # --- 6d 截图 / 取色（Screenshot / PickColor） ------------------------------
@@ -626,8 +728,8 @@ if echo "${CM:-}" | grep -q "uint32 7"; then
 else
 	fail "AvailableCursorModes 没报 metadata：${CM:-读不出来}"
 fi
-# 光标得在画面上：把指针挪到逻辑 (100,100)（headless 里默认在左上角）。
-$VM --socket "$IPC" move-cursor 100 100 >/dev/null 2>&1
+# 光标得在画面上。**哪块屏是「第一张卡片」跟谁在 0 无关**（输出列表的顺序是自动的），
+# 所以指针放到「流那块屏」上的 (100,100)：等流建起来之后按日志里的输出名现查（下面）。
 timeout 150 python3 /home/busyo/Dev/Vidow/tools/screencastprobe.py --types 1 \
 	--cursor-mode 4 --timeout 60 --hold 30 >"$R/probe4.txt" 2>&1 &
 if wait_and_share; then
@@ -641,6 +743,24 @@ if [ -n "${NODE4:-}" ]; then
 else
 	fail "metadata 流没拿到 node：$(tail -3 "$R/probe4.txt" 2>/dev/null | tr '\n' ' ')"
 fi
+# 流是哪块屏的（日志里写着），光标就往那块屏上放：元数据里的位置是**这块屏**的
+# 输出像素坐标，放错屏就一个光标都找不到（id=0）。
+SOUT=$(grep -a "screencast: 请求录 " "$R/vidow.log" 2>/dev/null | tail -1 |
+	sed 's/.*请求录 \([^（]*\)（.*/\1/')
+SOX=$($VM --socket "$IPC" outputs 2>/dev/null | python3 -c '
+import json,sys
+want = sys.argv[1]
+try:
+    outs=json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for o in outs:
+    if o["name"] == want:
+        print(o["layout"]["x"])
+        break
+' "${SOUT:-}")
+echo "      （流是 $SOUT 那块屏，x=${SOX:-?}）"
+[ -n "${SOX:-}" ] && { $VM --socket "$IPC" move-cursor $(( SOX + 100 )) 100 >/dev/null 2>&1; sleep 0.5; }
 # 消费者要按**生产者声明的那样**去要这个元数据（固定值 / 范围取交集，见
 # pipewire 的 pw_buffers_negotiate）：GStreamer 的 pipewiresrc 是这么要的，
 # cursorprobe --declare 照抄它。要不到的话缓冲里连 SPA_META_Cursor 都没有。
@@ -669,9 +789,9 @@ if [ -n "${NODE4:-}" ]; then
 	fi
 	# 缩放屏上的换算：wlr_output_cursor 的 x/y 本来就是**输出像素**，早先按
 	# 「逻辑坐标 × scale」算会翻一倍（第二块屏上更离谱，直接画到框外）。
-	$VM --socket "$IPC" output-scale HEADLESS-1 2 >/dev/null 2>&1
+	$VM --socket "$IPC" output-scale "${SOUT:-HEADLESS-1}" 2 >/dev/null 2>&1
 	sleep 1
-	$VM --socket "$IPC" move-cursor 100 100 >/dev/null 2>&1
+	$VM --socket "$IPC" move-cursor $(( ${SOX:-0} + 100 )) 100 >/dev/null 2>&1
 	sleep 0.5
 	./build/cursorprobe "$NODE4" --declare --timeout 15 >"$R/cursor2.txt" 2>&1
 	if grep -aq "pos=200,200" "$R/cursor2.txt" 2>/dev/null; then
@@ -679,7 +799,7 @@ if [ -n "${NODE4:-}" ]; then
 	else
 		fail "缩放 2 倍时位置不对：$(grep -a 'meta=1' "$R/cursor2.txt" | head -1)"
 	fi
-	$VM --socket "$IPC" output-scale HEADLESS-1 1 >/dev/null 2>&1
+	$VM --socket "$IPC" output-scale "${SOUT:-HEADLESS-1}" 1 >/dev/null 2>&1
 	sleep 1
 fi
 # 反证：hidden 模式下**同样**要元数据的消费者一个字节都拿不到（元数据是照
