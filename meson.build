@@ -106,6 +106,18 @@ zkde_server_code = custom_target('zkde-screencast-unstable-v1-protocol.c',
   output: 'zkde-screencast-unstable-v1-protocol.c',
   command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
 
+# zwp_xwayland_keyboard_grab_manager_v1：wlroots 0.20 里没有（连头文件都没有），
+# 服务端自己实现（见 src/keyboardgrab.c），所以头 + 代码都现场生成。
+xkg_xml = 'protocols/xwayland-keyboard-grab-unstable-v1.xml'
+xkg_server_header = custom_target('xwayland-keyboard-grab-unstable-v1-server-protocol.h',
+  input: xkg_xml,
+  output: 'xwayland-keyboard-grab-unstable-v1-server-protocol.h',
+  command: [wayland_scanner, 'server-header', '@INPUT@', '@OUTPUT@'])
+xkg_server_code = custom_target('xwayland-keyboard-grab-unstable-v1-protocol.c',
+  input: xkg_xml,
+  output: 'xwayland-keyboard-grab-unstable-v1-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
+
 sources = files(
   'src/main.c',
   'src/output.c',
@@ -118,6 +130,7 @@ sources = files(
   'src/float.c',
   'src/drag.c',
   'src/pointerconstraint.c',
+  'src/keyboardgrab.c',
   'src/config.c',
   'src/scale.c',
   'src/hotplug.c',
@@ -147,7 +160,8 @@ sources = files(
   'src/screencast.c',
   'src/wincapture.c',
 ) + [layer_shell_header, bgeffect_header, xa_server_header,
-     eics_server_header, sc_server_header, zkde_server_header]
+     eics_server_header, sc_server_header, zkde_server_header,
+     xkg_server_header]
 
 # 测试工具：用虚拟指针模拟鼠标拖拽
 vp_xml = 'protocols/wlr-virtual-pointer-unstable-v1.xml'
@@ -415,12 +429,36 @@ executable('pointerlock',
   include_directories: include_directories('.'),
   install: false)
 
+# 测试工具：键盘抑制客户端（zwp_keyboard_shortcuts_inhibit_manager_v1 —— 客户端
+# 说「这窗口在的时候别吃我的快捷键」，虚拟机的窗口就这么要键）
+ksi_xml = 'protocols/keyboard-shortcuts-inhibit-unstable-v1.xml'
+ksi_header = custom_target('keyboard-shortcuts-inhibit-unstable-v1-client-protocol.h',
+  input: ksi_xml,
+  output: 'keyboard-shortcuts-inhibit-unstable-v1-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'])
+ksi_code = custom_target('keyboard-shortcuts-inhibit-unstable-v1-protocol.c',
+  input: ksi_xml,
+  output: 'keyboard-shortcuts-inhibit-unstable-v1-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
+
+executable('keyinhibit',
+  ['tools/keyinhibit.c', ksi_header, ksi_code, xs_header, xs_code],
+  dependencies: [wayland_client_dep],
+  include_directories: include_directories('.'),
+  install: false)
+
+# 测试工具：X11 的键盘抓取（Xwayland 会把它变成 zwp_xwayland_keyboard_grab_v1）
+executable('xkeygrab',
+  ['tools/xkeygrab.c'],
+  dependencies: [xcb_dep],
+  install: false)
+
 executable('vidow',
   # etl_code：ext-image-capture-source-v1 的服务端代码要引
   # ext_foreign_toplevel_handle_v1_interface（窗口抓帧源的参数类型），那个
   # interface 结构在这个协议的 private-code 里（libwlroots 没导出这些符号）。
   sources + [bgeffect_code, xa_server_code, eics_server_code, sc_server_code,
-             etl_code, zkde_server_code],
+             etl_code, zkde_server_code, xkg_server_code],
   dependencies: [wlroots_dep, xkbcommon_dep, wayland_server_dep, math_dep,
                  egl_dep, gles2_dep, pixman_dep, lua_dep, xcb_dep,
                  xcb_xfixes_dep, drm_dep, pipewire_dep],

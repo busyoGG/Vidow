@@ -274,8 +274,17 @@ static int l_bind(lua_State *L) {
 	struct vidow_script *s = script_of(L);
 	const char *trigger = luaL_checkstring(L, 1);
 	const char *action = luaL_checkstring(L, 2);
+	/* 第三个参数（可选）：{ inhibited = true } = 焦点那个表面抑制着快捷键时
+	 * 这条绑定照样生效（逃生口，见 keybind.h / keyboardgrab.c）。 */
+	bool inhibited = false;
+	if (lua_istable(L, 3)) {
+		lua_getfield(L, 3, "inhibited");
+		inhibited = lua_toboolean(L, -1) != 0;
+		lua_pop(L, 1);
+	}
 	char err[160];
-	if (vidow_keybind_add(s->server, trigger, action, err, sizeof(err)) == NULL) {
+	if (vidow_keybind_add(s->server, trigger, action, inhibited, err,
+			sizeof(err)) == NULL) {
 		return luaL_error(L, "%s", err);
 	}
 	lua_pushboolean(L, 1);

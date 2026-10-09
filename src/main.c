@@ -381,6 +381,7 @@ int main(int argc, char *argv[]) {
 
 	if (!vidow_output_init(&server) || !vidow_input_init(&server) ||
 			!vidow_pointer_constraint_init(&server) ||
+			!vidow_keyboard_grab_init(&server) ||
 			!vidow_view_init(&server) || !vidow_layer_init(&server) ||
 			!vidow_decoration_init(&server) ||
 			!vidow_overview_init(&server) ||

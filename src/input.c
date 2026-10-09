@@ -51,12 +51,18 @@ static void keyboard_key(struct wl_listener *listener, void *data) {
 
 	bool handled = false;
 	uint32_t mods = wlr_keyboard_get_modifiers(kb->wlr_keyboard);
+	/* 焦点那个表面上有个生效中的「快捷键抑制」（虚拟机的窗口要原样收 Super /
+	 * Alt+Tab，见 keyboardgrab.c）时，vidow 自己的键位全部让路 —— 客户端要的
+	 * 就是这些键。绑定里写了 { inhibited = true } 的那几条是逃生口，照样生效
+	 * （不然抑制着的窗口能把用户锁死在里面，连关窗都关不了）。 */
+	bool inhibited = vidow_shortcuts_inhibited(server);
 	/* config.lua 里 vidow.bind() 声明的键位（动作字符串见 README 的动作表）：
 	 * 工作区切换 / 窗口与列的方向移动 / 浮动 / 全屏 / 全景 / 起命令 / 切 tty …
 	 * 一个内置的都不预设，绑什么是什么；没命中的按键透传给客户端。 */
 	if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
 		for (int i = 0; i < nsyms; i++) {
-			handled = vidow_keybind_key(server, syms[i], mods) || handled;
+			handled = vidow_keybind_key(server, syms[i], mods, inhibited) ||
+				handled;
 		}
 	}
 
@@ -79,6 +85,9 @@ static void keyboard_key(struct wl_listener *listener, void *data) {
 	}
 
 	if (!handled) {
+		/* X11 抓着键盘时按键一律给抓着它的那个表面（XGrabKeyboard 的语义：谁抓
+		 * 谁收，用户点了别的窗口也照给）—— 见 keyboardgrab.c。 */
+		vidow_xwayland_grab_assert(server);
 		wlr_seat_set_keyboard(server->seat, kb->wlr_keyboard);
 		wlr_seat_keyboard_notify_key(server->seat, event->time_msec,
 			event->keycode, event->state);
@@ -633,6 +642,9 @@ static void inject_key(struct vidow_server *server, uint32_t keycode,
 		wlr_seat_keyboard_notify_modifiers(server->seat, &kb->modifiers);
 	}
 
+	/* 注入的键也走「X11 抓着键盘就给它」那条规矩（不然测试里没法验证抓取：
+	 * 真按键不好造，注入的键又不触发键位，正好拿来量「键送给了谁」）。 */
+	vidow_xwayland_grab_assert(server);
 	wlr_seat_keyboard_notify_key(server->seat, inject_now_ms(), keycode,
 		pressed ? WL_KEYBOARD_KEY_STATE_PRESSED
 			: WL_KEYBOARD_KEY_STATE_RELEASED);

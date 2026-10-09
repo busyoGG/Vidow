@@ -35,8 +35,11 @@
 - 输出：热插拔、`request_state` 尺寸变更后自动重排、`wl_output` + `zxdg_output_manager_v1`
 - 协议：wl_compositor、wl_subcompositor、xdg-shell、zxdg-decoration-v1、wlr-layer-shell、wl_data_device、
   primary-selection、pointer-constraints（锁鼠标 / 夹光标）、relative-pointer（相对位移，
-  Xwayland 的 XInput2 raw motion 靠它）、virtual-keyboard、virtual-pointer、linux-dmabuf、
-  wlr-screencopy、ext-image-copy-capture、wlr-export-dmabuf（grim / slurp / wf-recorder / OBS）
+  Xwayland 的 XInput2 raw motion 靠它）、keyboard-shortcuts-inhibit（客户端说「别吃我的
+  快捷键」：虚拟机的窗口要原样收 Super / Alt+Tab）、xwayland-keyboard-grab（X11 的
+  `XGrabKeyboard`，wlroots 没实现，服务端自己写的）、virtual-keyboard、virtual-pointer、
+  linux-dmabuf、wlr-screencopy、ext-image-copy-capture、wlr-export-dmabuf
+  （grim / slurp / wf-recorder / OBS）
 - 输入法：text-input-v3 + input-method-v2（fcitx5 / ibus），候选框由合成器渲染摆位
 - 背景效果：ext-background-effect-v1（客户端自己指定哪块要模糊）
 - 渲染：`wlr_scene` 场景图（损伤跟踪 + 硬件光标）
@@ -785,6 +788,7 @@ python3 test-float.py        # 三个真实 GTK 窗口，验证浮动模式自�
 ./test-ipc.sh                        # IPC：状态输出 / 命令 / 事件 / 多屏（全 headless，162 项断言）
 ./test-input-inject.sh               # 输入注入：鼠标 / 键盘合成事件到客户端（全 headless，54 项断言）
 ./test-pointer-lock.sh               # 指针约束：锁鼠标 / 夹光标 / 相对位移，X11 的 XGrabPointer 也认（全 headless，27 项断言）
+./test-keyboard-grab.sh              # 键盘那两个协议：快捷键抑制（含逃生口）+ X11 的 XGrabKeyboard（全 headless，30 项断言）
 ./test-cursor-shake.sh              # 摇晃找光标：线性加 + 补间、晃到屏幕那么大，截图里没有它（全 headless，55 项断言）
 ./test-geometry.sh                   # 窗口几何和表面尺寸对不上时内容铺满框（chromium 改大小那 1-2 秒）（全 headless，6 项断言）
 ./test-viewport-crop.sh              # 客户端用 wp_viewport 只声明缓冲的一部分时，装饰按那块采（chromium，5 项断言）
@@ -864,6 +868,18 @@ vidow.bind("Mod+Q", "close-window")        -- 动作字符串见下面那张表
 vidow.bind("Mod+Return", "spawn kitty")    -- spawn 后面跟一条 shell 命令
 ```
 
+第三个参数（可选，选项表）现在只有一个字段 `inhibited`：
+
+```lua
+vidow.bind("Mod+Escape", "quit", { inhibited = true })
+```
+
+意思是「焦点那个表面**抑制着快捷键**时这条照样生效」（默认 `false`）。抑制来自
+`zwp_keyboard_shortcuts_inhibit_manager_v1` —— 虚拟机的窗口 / 远程桌面客户端会说
+「别吃我的快捷键」，好让客人系统收到 Super、Alt+Tab 这些键（见「快捷键抑制」一节）。
+抑制期间默认**所有**键位让路（不然那个客户端要抑制就没意义了），所以退出这类救命键
+最好留个逃生口 —— 默认配置里 `Mod+Escape` 就是这么绑的。
+
 | 按键（默认配置给的） | 动作 |
 | `Mod+H` / `Mod+L` | 焦点左/右移一列（视口跟随滚动） |
 | `Mod+J` / `Mod+K` | 焦点在列内下/上移；单窗口列则跳到下/上一列 |
@@ -879,7 +895,7 @@ vidow.bind("Mod+Return", "spawn kitty")    -- spawn 后面跟一条 shell 命令
 | `Mod+M` / `Mod+Shift+M` | 收起当前窗口 / 放回最近收起来的那个（见「最小化」一节） |
 | `Mod+Enter` | 启动终端 |
 | `Mod+滚轮` | 焦点左/右移一列 |
-| `Mod+Escape` | 退出合成器 |
+| `Mod+Escape` | 退出合成器（绑成 `{ inhibited = true }`：抑制期间也生效，见下节） |
 | `Mod+U` / `Mod+I` | 工作区上/下切一块（niri 的默认键位） |
 | `Mod+Shift+U` / `Mod+Shift+I` | 把当前窗口搬到上/下一块工作区 |
 | `Mod+Ctrl+U` / `Mod+Ctrl+I` | 整块工作区上/下移一位（重排） |
@@ -896,6 +912,35 @@ overview 里：左键点窗口 = 选中它并缩回去，点空白 = 取消，`E
 （`Mod+H/L` 照样换列，换列会把相机平移清零、改回跟着焦点走）。
 
 普通滚轮事件转发给客户端，不用于滚动视口（用 `Mod+滚轮` 或 `Mod+H/L`）。
+
+## 快捷键抑制与 X11 的键盘抓取
+
+两个协议，都在 `src/keyboardgrab.c`，判据 `./test-keyboard-grab.sh`（30 项）：
+
+**`zwp_keyboard_shortcuts_inhibit_manager_v1`** —— 客户端说「我这个表面有焦点的时候别吃我的
+快捷键」。虚拟机的窗口（looking-glass 那类）、远程桌面客户端要的就是这个：客人系统里按
+`Super`、`Alt+Tab`、`Ctrl+Alt+...` 得原样进去。策略：
+
+- 客户端一要就给（`wlr_keyboard_shortcuts_inhibitor_v1_activate`），**但只有抑制的那个表面
+  正是键盘焦点时才算数**（协议原话：inhibitors 只在它的表面有焦点时生效）。IPC 里看
+  `input.shortcuts_inhibited`。
+- 算数的时候 vidow 自己的键位**全部让路**，按键原样送给客户端。要留逃生口就
+  `vidow.bind(键, 动作, { inhibited = true })` —— 默认配置里 `Mod+Escape`（退出）就是这么绑的，
+  不然一个抑制着的窗口能把用户锁死在里面。
+
+**`zwp_xwayland_keyboard_grab_manager_v1`** —— X11 的 `XGrabKeyboard`。wlroots 0.20 里连头文件
+都没有，所以服务端自己写（协议 XML 在 `protocols/xwayland-keyboard-grab-unstable-v1.xml`，
+和 ext-background-effect 一样现场生成 server-header + private-code）。策略：
+
+- Xwayland 建一个 grab 对象 → 把**座位键盘焦点**按到它那个表面上（只挪 seat 焦点，
+  `server->focused` 和焦点边框不动，和弹出物抓键盘一个规矩）。IPC 里看
+  `input.keyboard_grab`（`{type: xwayland, window}`）。
+- 之后每次要送按键都再确认一遍：**谁抓谁收，不管焦点在谁身上**（X11 的语义）—— 用户点了别的
+  窗口，键还是给抓着键盘的那个 X 客户端。vidow 自己的键位照常生效（协议明说合成器可以过滤
+  一部分自己用）。
+- 抓取对象销毁（客户端 `XUngrabKeyboard` / 连接断了 / 窗口没了）→ 焦点还给 `server->focused`。
+- 访问限制：协议要求「只给 Xwayland」，所以只接受 Xwayland 的表面
+  （`wlr_xwayland_surface_try_from_wlr_surface`），别的客户端来要就回协议错误。
 
 ## 混合 DPI 与 XWayland
 
@@ -1417,7 +1462,7 @@ vidow 自己的，比如 `vidow-wayland-1.sock`）；`ipc_socket` 可以写死�
 | `config` | **配置表的全部键值**（跟 `config.lua` 里 `vidow.get` 读到的是同一个东西）；`config` + `key` 只取一个 |
 | `keybinds` / `rules` | 键位表（触发串 + 动作串）、窗口规则（含「这一条到底写没写」的 null 语义） |
 | `seats` / `input` | seat 的能力列表、当前键盘的布局 / repeat / LED、所有键盘（含虚拟键盘和 vidow 自己的注入键盘 `vidow-inject`）、光标位置、当前的交互式 grab、指针约束（`pointer_constraint`：`type` / `lifetime` / `window` /
-`cursor`）、拿着键盘的 layer surface |
+`cursor`）、键盘那两个（`shortcuts_inhibited`：焦点那个表面有没有生效中的抑制；`keyboard_grab`：`null` 或 `{type: xwayland, window}`，X11 抓着键盘时）、拿着键盘的 layer surface |
 | `tokens` | 活着的 xdg-activation 令牌（app_id、serial 校验过没过、活了多久） |
 | `memories` | 热插拔记忆（每块见过的屏：在不在、上次的布局位置、离开时的滚动位置和焦点） |
 | `anims` | 正在跑的动画（tag / 进度 / 时长 / 缓动）+ 正在淡出的关闭快照 |
@@ -2814,6 +2859,11 @@ src/pointerconstraint.c 指针约束：zwp_pointer_constraints_v1 + zwp_relative
                （游戏锁鼠标 / 夹光标要的那两个）。wlroots 只给协议对象，钉住 / 夹住光标是合成器
                的活：跟随指针焦点激活、locked 钉住位置 + 相对位移照发、confined 用
                wlr_region_confine 夹进区域、cursor_hint 只在锁生效和解除时用
+src/keyboardgrab.c 键盘那两个协议：zwp_keyboard_shortcuts_inhibit_manager_v1（wlroots 有对象，
+               策略是合成器的活：焦点那个表面抑制着时自己的键位全部让路，`{ inhibited = true }`
+               的绑定是逃生口）+ zwp_xwayland_keyboard_grab_manager_v1（wlroots 没实现，服务端
+               自己写：X11 的 XGrabKeyboard → 按键一律送给抓着键盘的那个表面，对象没了焦点还给
+               焦点窗口；只服务 Xwayland 的表面）
 src/bgeffect.c ext-background-effect-v1 服务端（wlroots 没实现）：区域双缓冲、按区域裁模糊
 src/activation.c xdg-activation-v1 服务端**自己实现**（不用 wlroots 那份）：令牌生命周期
                （按 activation_token_timeout 作废、客户端一断就作废）、serial 校验结果怎么
@@ -2952,6 +3002,15 @@ test-pointer-lock.sh 指针约束（游戏锁鼠标 / 夹画笔要的那两个�
                   锁之前给的 `cursor_hint` 在锁生效时把光标摆过去；X11 那边 `XGrabPointer`
                   之后 IPC 里真的出现一个约束（就是「Xwayland bind 上了协议」的直接证据），
                   光标钉住的同时 X 客户端照样收到位移；客户端退出后约束解除、光标能动
+test-keyboard-grab.sh 键盘那两个协议（虚拟机的窗口要原样收 Super / Alt+Tab 那件事）：对照组
+                  （同一个窗口、没有抑制）Mod+F 的键位生效、窗口全屏；客户端要了抑制之后
+                  IPC `shortcuts_inhibited = true`、同一个 Mod+F **不再生效**而按键到了客户端
+                  （keycount 涨）；配置里 `{ inhibited = true }` 的那条绑定在抑制期间照样生效
+                  （逃生口）；客户端销毁 inhibitor → 回到 false、键位又生效；X11 那边
+                  `XGrabKeyboard` 之后 IPC `keyboard_grab = {type: xwayland, window}`（就是
+                  「Xwayland bind 上了协议」的直接证据），**把焦点点回 Wayland 窗口**之后按键
+                  还是送给抓着键盘的 X 客户端（X11 的语义：谁抓谁收），撤销抓取后焦点和按键
+                  都还给焦点窗口
 test-cursor-shake.sh 摇晃找光标：来回晃一会儿才触发 / 慢速不误触 / 顺手一甩不触发 / 到点缩回（补间）/ 线性加
                   （2→4→8→16→32→45，屏幕尺寸封顶）；**截图**由像素作证 —— grim 不带 -c
                   时画面里没有光标（放大到 450x720 也没有），`grim -c` 抓到的外接矩形是
@@ -3849,6 +3908,63 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
        口子（screencopy / ext-image-copy-capture 同样对所有客户端开放，grim / OBS 靠它），
        而要收就得连它一起收 —— 那会把 grim / wf-recorder / OBS 全废掉。要边界得靠 sandbox
        那一层（别的进程拿不到 wayland socket），不是合成器。
+
+176. **键盘那两个协议也接上：`zwp_keyboard_shortcuts_inhibit_manager_v1` + `zwp_xwayland_keyboard_grab_manager_v1`**
+      （用户接着 175 说「键盘的也接上」）。
+
+      ① **缺的是什么、怎么确认的**：还是 `strings /usr/bin/Xwayland` —— 175 里补掉的那两个之外，
+      剩下的两个就是它们（`zwp_keyboard_shortcuts_inhibit_manager_v1`、`zwp_xwayland_keyboard_grab_manager_v1`，
+      也是 175 的注释里写的「那两个 wlroots 0.20 也没实现，是另一件事」）。缺了的后果：
+        - **抑制传不出去**：虚拟机的窗口 / 远程桌面客户端要不到「别吃我的快捷键」，
+          `Super` / `Alt+Tab` 全被合成器的键位吃掉，进不了客人系统；
+        - **X11 的 `XGrabKeyboard` 传不出去**：Xwayland 只能在 X 那边假装抓到了，焦点一换
+          （用户点了别的窗口）按键就跑到别处去，抓着键盘的那个客户端再也收不到键。
+
+      ② **两个协议在 wlroots 0.20 里情况不一样**，所以做法也不一样：
+        - 抑制：wlroots **有**（`wlr_keyboard_shortcuts_inhibit_v1_create`），它管 global 和
+          active/inactive 事件，「抑制到底抑制了什么」是合成器的活 —— 新文件
+          `src/keyboardgrab.c` 里接上键位那条路；
+        - X11 抓取：wlroots 里**连头文件都没有**，所以服务端自己写：协议 XML 进
+          `protocols/`（wayland-protocols 里的那份），meson 现场生成 server-header +
+          private-code（和 `ext-background-effect-v1` 一个做法），global 自己建。
+
+      ③ **策略**（都在 `src/keyboardgrab.c`，细节见 README「快捷键抑制与 X11 的键盘抓取」一节）：
+        - 抑制：客户端一要就给，但**只有抑制那个表面正是键盘焦点时才算数**（协议原话），
+          IPC 报 `input.shortcuts_inhibited`；算数时 vidow 自己的键位全部让路，按键原样给客户端。
+        - **逃生口**：`vidow.bind(键, 动作, { inhibited = true })` 的那条绑定在抑制期间照样生效
+          —— 不给这个口子，一个抑制着的窗口就能把用户锁死在里面（连关窗都关不了）。默认配置里
+          的 `Mod+Escape`（退出）就绑成了逃生口（`configs/14-keys.lua` 与 `--default-config`
+          两处同步改，`test-defaultconfig.sh` 会逐字比这两份）。
+        - X11 抓取：把**座位键盘焦点**按到抓取那个表面上（只挪 seat 焦点，`server->focused`
+          和焦点边框不动 —— 和弹出物抓键盘一个规矩）；之后每次要送按键都再确认一遍，**谁抓谁收，
+          不管焦点在谁身上**（X11 的语义）；对象销毁就把焦点还给 `server->focused`。vidow 自己的
+          键位照常生效（协议明说合成器可以过滤一部分自己用）。访问限制：只接受 Xwayland 的表面
+          （协议要求「只给 Xwayland」），别的客户端来要就回协议错误。
+        - IPC 的 `input` 多了 `shortcuts_inhibited`（bool）与 `keyboard_grab`
+          （`null` 或 `{type: xwayland, window}`）。
+
+      ④ **判据 `./test-keyboard-grab.sh`（新，30 项，16.6 秒）**：headless 一块 1280x720 屏，两个新
+      客户端 `tools/keyinhibit.c`（Wayland：要抑制 / 收按键 / 打 keycount）、`tools/xkeygrab.c`
+      （X11：`XGrabKeyboard` + 收按键），真按键用 `wtype` 走虚拟键盘造（注入的键不触发键位，
+      量不了抑制）。实测：
+        - 对照组（同一个窗口、没有抑制）：`Mod+F` 生效 → 窗口全屏，再按一次退回来；
+        - 抑制：客户端收到 `active`、IPC `shortcuts_inhibited = true`、同一个 `Mod+F`
+          **不再生效**（还是不全屏）而按键到了客户端（keycount 0 → 2）；
+        - 逃生口：抑制期间 `Mod+O`（绑成 `{ inhibited = true }`）照样生效（floating false → true）；
+        - 撤销：客户端销毁 inhibitor → IPC 回到 false、`Mod+F` 又生效；
+        - X11：`XGrabKeyboard` 之后 IPC `keyboard_grab = {type: xwayland, window: 5}`（就是
+          「Xwayland bind 上了这个协议」的直接证据）；**把焦点点回 Wayland 窗口**（#3）之后
+          注入 `Return`，X 客户端照样收到（keycount 0 → 2、X 键码 36 = evdev 28 + 8）、焦点窗口
+          一个键都没收到；撤销抓取 → IPC 回到 `null`、焦点回到 #3、按键也回到 #3（keycount 0 → 2）。
+      反证（把 `vidow_keyboard_grab_init` 那一句摘掉重跑同一条）：30 项只剩 **5 项**通过。
+
+      ⑤ **顺手修掉的两个自己踩的坑**：
+        - `wlr_keyboard_shortcuts_inhibit_manager_v1` 在 display 销毁时同样会断言
+          `events.new_inhibitor` 上没人挂着（175 里指针约束踩过一次），所以 manager 的
+          `events.destroy` 里把监听摘干净；
+        - grab 对象销毁时我一开始先 `grab_restore_focus()` 再从名单上摘自己 —— 于是
+          「还有没有别的 grab」把自己算进去了，焦点留在刚没的那个表面上不还给焦点窗口
+          （测试第 26 项红的就是它）。改成**先摘再算**。
 
 175. **补上 XWayland 缺的那两个协议：`zwp_pointer_constraints_v1` + `zwp_relative_pointer_manager_v1`**
       （用户报的「xwayland 我记得之前说好像缺了什么协议 补一下」）。
@@ -5700,12 +5816,11 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
     唯一不可替代的部分。调研、实测数据（含覆盖率与「操作路径未验证」）与补齐路线见
     [`docs/ui-tree-feasibility.md`](docs/ui-tree-feasibility.md)
 
-31. 指针约束只做了鼠标那对（`zwp_pointer_constraints_v1` + `zwp_relative_pointer_manager_v1`）。
-    键盘那两个还没接：`zwp_keyboard_shortcuts_inhibit_manager_v1`（「这个窗口自己吃掉快捷键」，
-    Wine / 全屏游戏要的）wlroots 0.20 **有**实现（`wlr_keyboard_shortcuts_inhibit_v1_create`），
-    只是没接进键位那条路；`zwp_xwayland_keyboard_grab_manager_v1`（X11 的 `XGrabKeyboard`）
-    wlroots 里没有，要做就得像 `src/bgeffect.c` 那样自己写服务端。本机 `/usr/bin/Xwayland`
-    两个都会 bind。
+31. ~~指针约束只做了鼠标那对，键盘那两个还没接~~ **已做（changelog 176）**：
+    `zwp_keyboard_shortcuts_inhibit_manager_v1` 接进了键位那条路（焦点那个表面抑制着时让路，
+    `{ inhibited = true }` 的绑定是逃生口），`zwp_xwayland_keyboard_grab_manager_v1` 像
+    `src/bgeffect.c` 那样自己写了服务端（X11 的 `XGrabKeyboard`，谁抓谁收）。判据
+    `./test-keyboard-grab.sh`。本机 `/usr/bin/Xwayland` 两个都会 bind。
 
 ## 下一步建议顺序
 

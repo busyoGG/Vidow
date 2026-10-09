@@ -158,7 +158,8 @@ bool vidow_keybind_init(struct vidow_server *server) {
 }
 
 struct vidow_keybind *vidow_keybind_add(struct vidow_server *server,
-		const char *trigger, const char *action, char *err, size_t errlen) {
+		const char *trigger, const char *action, bool inhibited,
+		char *err, size_t errlen) {
 	if (err != NULL && errlen > 0) {
 		err[0] = '\0';
 	}
@@ -187,8 +188,10 @@ struct vidow_keybind *vidow_keybind_add(struct vidow_server *server,
 	snprintf(bind->action, sizeof(bind->action), "%s", action);
 	bind->mods = mods;
 	bind->keysym = sym;
+	bind->inhibited = inhibited;
 	wl_list_insert(server->keybinds.prev, &bind->link);
-	wlr_log(WLR_INFO, "keybind: %s -> %s", bind->trigger, bind->action);
+	wlr_log(WLR_INFO, "keybind: %s -> %s%s", bind->trigger, bind->action,
+		inhibited ? "（抑制期间也生效）" : "");
 	return bind;
 }
 
@@ -201,13 +204,18 @@ void vidow_keybind_clear(struct vidow_server *server) {
 }
 
 bool vidow_keybind_key(struct vidow_server *server, xkb_keysym_t sym,
-		uint32_t mods) {
+		uint32_t mods, bool inhibited) {
 	const uint32_t interesting = WLR_MODIFIER_LOGO | WLR_MODIFIER_ALT |
 		WLR_MODIFIER_CTRL | WLR_MODIFIER_SHIFT;
 	xkb_keysym_t lower = xkb_keysym_to_lower(sym);
 
 	struct vidow_keybind *bind;
 	wl_list_for_each(bind, &server->keybinds, link) {
+		/* 焦点那个表面抑制着快捷键时只有标记过的那几条生效（逃生口：
+		 * 不然虚拟机窗口一抑制，用户连关窗都关不了）。 */
+		if (inhibited && !bind->inhibited) {
+			continue;
+		}
 		if ((mods & interesting) != bind->mods) {
 			continue;
 		}

@@ -23,6 +23,7 @@
 #include <wlr/types/wlr_input_method_v2.h>
 #include <wlr/types/wlr_keyboard.h>
 #include <wlr/types/wlr_keyboard_group.h>
+#include <wlr/types/wlr_keyboard_shortcuts_inhibit_v1.h>
 #include <wlr/types/wlr_layer_shell_v1.h>
 #include <wlr/types/wlr_xdg_decoration_v1.h>
 #include <wlr/types/wlr_output.h>
@@ -937,6 +938,28 @@ struct vidow_keyboard {
 	struct wl_listener destroy;
 };
 
+/* 客户端要的一个「快捷键抑制」（zwp_keyboard_shortcuts_inhibitor_v1）。一个表面
+ * 一个，见 keyboardgrab.c —— 抑制只在它的表面拿着键盘焦点时生效。 */
+struct vidow_shortcuts_inhibitor {
+	struct wl_list link; /* vidow_server.inhibitors */
+	struct wlr_keyboard_shortcuts_inhibitor_v1 *inhibitor;
+
+	struct wl_listener destroy;
+};
+
+/* Xwayland 替 X11 的 XGrabKeyboard 要的一次键盘抓取
+ * （zwp_xwayland_keyboard_grab_v1，协议服务端自己写的，见 keyboardgrab.c）。
+ * 生效期间按键一律送给 surface（X11 语义：谁抓谁收），对象没了就还给焦点窗口。 */
+struct vidow_xwayland_grab {
+	struct wl_list link; /* vidow_server.xwayland_grabs */
+	struct vidow_server *server;
+	struct wl_resource *resource;
+	struct wlr_surface *surface;
+	bool linked; /* 还在 xwayland_grabs 名单上（摘过就别再摘，见 keyboardgrab.c） */
+
+	struct wl_listener surface_destroy;
+};
+
 /* ------------------------------------------------------------ input method */
 
 /* 客户端的一个输入框（zwp_text_input_v3）。一个客户端可以同时开好几个，
@@ -1279,6 +1302,15 @@ struct vidow_server {
 	struct wl_listener constraint_destroy;
 	struct wl_listener constraint_set_region;
 	struct wl_listener constraint_commit;
+
+	/* 键盘那两个协议（keyboardgrab.c）：快捷键抑制 + X11 的键盘抓取。
+	 * xwayland_grabs 非空 = 现在有 X 客户端抓着键盘（IPC 会报出来）。 */
+	struct wlr_keyboard_shortcuts_inhibit_manager_v1 *shortcuts_inhibit;
+	struct wl_list inhibitors; /* vidow_shortcuts_inhibitor.link */
+	struct wl_listener new_inhibitor;
+	struct wl_listener inhibit_destroy; /* manager 销毁时摘监听 */
+	struct wl_global *xwayland_grab_global;
+	struct wl_list xwayland_grabs; /* vidow_xwayland_grab.link */
 
 	struct vidow_config config;
 	struct vidow_decor_prog decor;
@@ -1957,6 +1989,20 @@ void vidow_pointer_constraint_motion(struct vidow_server *server,
 const char *vidow_pointer_constraint_type(const struct vidow_server *server);
 /* 约束状态（type / lifetime / window / cursor）写进当前 JSON 对象。 */
 void vidow_pointer_constraint_json(struct jbuf *b, struct vidow_server *server);
+
+/* ------------------------------------------- 键盘协议（keyboardgrab.c）
+ *
+ * zwp_keyboard_shortcuts_inhibit_manager_v1（客户端说「别吃我的快捷键」，
+ * 虚拟机 / 远程桌面要的）+ zwp_xwayland_keyboard_grab_manager_v1（Xwayland 替
+ * X11 的 XGrabKeyboard 要键盘；wlroots 0.20 没有这个，服务端自己写）。判据：
+ * ./test-keyboard-grab.sh。 */
+bool vidow_keyboard_grab_init(struct vidow_server *server);
+/* 键盘焦点那个表面上有没有生效中的抑制（keyboard_key 用它决定跳不跳自己的键位）。 */
+bool vidow_shortcuts_inhibited(struct vidow_server *server);
+/* X11 抓着键盘时按键一律给它：每次要送按键前调（焦点被别的窗口抢走了也按回来）。 */
+void vidow_xwayland_grab_assert(struct vidow_server *server);
+/* 键盘状态（shortcuts_inhibited / keyboard_grab）写进当前 JSON 对象。 */
+void vidow_keyboard_grab_json(struct jbuf *b, struct vidow_server *server);
 
 /* --------------------------------------------------------------- 注入（IPC）
  *

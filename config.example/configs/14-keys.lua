@@ -27,7 +27,10 @@ vidow.bind("Mod+R", "cycle-column-width")
 vidow.bind("Mod+M", "minimize-window")
 vidow.bind("Mod+Shift+M", "restore-window")
 vidow.bind("Mod+O", "toggle-overview")
-vidow.bind("Mod+Escape", "quit")
+-- 第三个参数 { inhibited = true }：焦点那个表面抑制着快捷键（虚拟机的窗口要原样
+-- 收 Super / Alt+Tab，见 README 的「快捷键抑制」）时这条照样生效。退出这条留个
+-- 逃生口，不然抑制着的窗口能把用户锁死在里面。
+vidow.bind("Mod+Escape", "quit", { inhibited = true })
 
 -- 工作区（niri 那套：动态、按屏、按序号）
 --
