@@ -200,6 +200,50 @@ msg toggle-fullscreen --title tile1
 sleep 0.8
 expect_color unfullscreen 蓝 "退出全屏之后浮窗又回到上面"
 
+# ------------------------------------------------- 4b) 全屏的窗口按 Mod+V 变浮窗
+mark "全屏的窗口 Mod+V 变浮窗：全屏先退掉（用户报「一直叠在最上面，不管平铺还是浮动」）"
+# 用户报的现场：他那个窗口是全屏状态（层级 平铺 < 浮动 < 全屏，全屏永远压在最上面），
+# Mod+V 只换了浮动标志、全屏标志还在 —— 于是「不管平铺还是浮动都压着别人」。
+msg toggle-fullscreen --title tile1
+sleep 0.8
+C=$(shot fs-before-float)
+if [ "$C" != "蓝" ]; then
+	pass "全屏的平铺窗口又压住了浮窗（取样点是$C）"
+else
+	fail "全屏没压住浮窗（取样点是蓝）—— 这一节测不到东西"
+fi
+msg toggle-floating --title tile1
+sleep 0.8
+read -r FM FS <<< "$(./build/vidowmsg windows 2>/dev/null | python3 -c '
+import json, sys
+for w in json.load(sys.stdin):
+    if w["title"] == "tile1":
+        print(w["float_mode"], "true" if w["fullscreen"] else "false")
+        break
+else:
+    print("? ?")')"
+if [ "$FM" = "fixed" ] || [ "$FM" = "follow" ]; then
+	pass "Mod+V 之后 tile1 是浮窗了（float_mode=$FM）"
+else
+	fail "Mod+V 之后 tile1 还是 $FM"
+fi
+if [ "$FS" = "false" ]; then
+	pass "全屏标志被清掉了（fullscreen=false）"
+else
+	fail "全屏标志还在（fullscreen=$FS）"
+fi
+if grep -aq "全屏: tile1 关（变浮窗）" "$LOG"; then
+	pass "日志里写着「全屏: tile1 关（变浮窗）」"
+else
+	fail "日志里没有全屏那行：$(grep -a '全屏:' "$LOG" | tail -2 | tr '\n' ' ')"
+fi
+# 它现在是**浮窗**：缩小它，底下那个浮窗 A 就露出来了（全屏状态下缩不动、也永远压着）。
+msg set-window-size 300 200 --title tile1
+sleep 0.8
+expect_color fs-after-float 蓝 "缩小它之后浮窗 A 露出来了（不再无条件压着别人）"
+msg toggle-floating --title tile1
+sleep 0.8
+
 # ------------------------------------------------------------ 5) 新开的平铺窗口
 mark "新开的平铺窗口也不许盖住浮窗"
 start_client pattern.py tile2

@@ -2202,6 +2202,8 @@ void vidow_view_set_fullscreen(struct vidow_view *view, bool fullscreen);
 /* 把「你这列最大化了」告诉客户端（xdg 的 set_maximized / X11 的 _NET_WM_STATE_*）。
  * 状态没变就不再发（同 set_tiled，见 vidow_view.cfg_maximized）。 */
 void vidow_view_set_maximized(struct vidow_view *view, bool maximized);
+/* 退出全屏（最小化 / 变浮窗这类「整屏状态跟它冲突」的操作先走这一步）。why 进日志。 */
+void vidow_view_unfullscreen(struct vidow_view *view, const char *why);
 void vidow_view_set_tiled(struct vidow_view *view, bool tiled);
 void vidow_view_close(struct vidow_view *view);
 /* 把当前标题 / app_id 记一份（事件用，见 vidow_view.last_title）。 */

@@ -220,6 +220,11 @@ void vidow_float_toggle(struct vidow_view *view) {
 		vidow_float_set_mode(view, VIDOW_FLOAT_NONE);
 		return;
 	}
+	/* 变浮窗之前先退出全屏：全屏在层级上永远压着所有窗口（平铺 < 浮动 < 全屏，
+	 * 见 vidow_restack），留着它「浮起来」也还是压在最上面 —— 用户报的「这个窗口
+	 * 一直叠在最上面，不管平铺还是浮动」就是这么来的：它本来是全屏状态，Mod+V
+	 * 只换了浮动标志，全屏标志还在。 */
+	vidow_view_unfullscreen(view, "变浮窗");
 	vidow_float_set_mode(view, vidow_view_parent_surface(view) != NULL ?
 		VIDOW_FLOAT_FOLLOW : VIDOW_FLOAT_FIXED);
 }
@@ -234,6 +239,12 @@ void vidow_float_on_commit(struct vidow_view *view) {
 	 * 把它挪到错的地方），摆位统一走 vidow_popup_place()。 */
 	if (view->popup) {
 		vidow_popup_place(view);
+		return;
+	}
+	/* 全屏期间不采纳客户端尺寸：整屏大小是**我们** configure 给它的（见 arrange
+	 * 的全屏分支），不是「它想要的浮窗尺寸」。记进 float_geom 的话，退出全屏之后
+	 * 浮窗就停在整屏那么大 —— Mod+F 开一下、再关一下，浮窗就回不去了。 */
+	if (view->fullscreen) {
 		return;
 	}
 

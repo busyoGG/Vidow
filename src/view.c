@@ -433,6 +433,32 @@ void vidow_view_set_fullscreen(struct vidow_view *view, bool fullscreen) {
 	wlr_xdg_toplevel_set_fullscreen(view->xdg_toplevel, fullscreen);
 }
 
+/* 改全屏状态：设标志 → 告诉客户端 → 重排 → 发 IPC 事件 → 记一行 INFO。
+ *
+ * **全屏状态只有这一个入口**。为什么专门记日志：层级是「平铺 < 浮动 < 全屏」
+ * （见 vidow_restack），全屏的窗口永远压在所有窗口上面 —— 用户报「这个窗口一直
+ * 叠在最上面，不管平铺还是浮动」时，第一件要看的就是它是不是全屏。这条状态以前
+ * 只有 IPC 事件、日志里一个字都没有，run.sh 的日志根本看不出来。 */
+static void view_apply_fullscreen(struct vidow_view *view, bool want,
+		const char *why) {
+	if (view == NULL || view->fullscreen == want) {
+		return;
+	}
+	view->fullscreen = want;
+	vidow_view_set_fullscreen(view, want);
+	vidow_arrange(view->server);
+	vidow_ipc_emit_window(view->server, "window-fullscreen-changed", view);
+	wlr_log(WLR_INFO, "全屏: %s %s（%s）",
+		vidow_view_title(view) != NULL ? vidow_view_title(view) : "?",
+		want ? "开" : "关", why);
+}
+
+/* 退出全屏。最小化 / 变浮窗这类「整屏状态跟它冲突」的操作要先走这一步：全屏那条
+ * 分支在布局里不看占位、在层级里永远在最上面，留着它那些操作都白做。 */
+void vidow_view_unfullscreen(struct vidow_view *view, const char *why) {
+	view_apply_fullscreen(view, false, why);
+}
+
 void vidow_view_set_maximized(struct vidow_view *view, bool maximized) {
 	if (!vidow_view_configure_ready(view)) {
 		return;
@@ -1837,6 +1863,24 @@ static void output_arrange(struct vidow_server *server,
 
 	vidow_float_place_all(server, output);
 
+	/* 浮动的全屏窗口也要占满整块工作区：以前只有「列里的全屏」会被摆成整屏，浮动
+	 * 的那种「全屏」在层级上照样永远压在最上面（vidow_restack 只认 fullscreen
+	 * 标志），画面上却还是它自己那一小块 —— 用户看到的就是「它一直叠在最上面，
+	 * 还不占满屏」。几何只进 geom（vidow_place_view 不碰 float_geom），退出全屏
+	 * 时照旧回原尺寸。 */
+	if (fullscreen == NULL) {
+		struct vidow_view *v;
+		wl_list_for_each(v, &server->views, link) {
+			if (v->fullscreen && v->mapped && view_shows(v) &&
+					v->float_mode != VIDOW_FLOAT_NONE && !v->popup &&
+					v->output == output->wlr_output &&
+					vidow_workspace_view_visible(server, v)) {
+				fullscreen = v;
+				break;
+			}
+		}
+	}
+
 	if (fullscreen != NULL) {
 		vidow_place_view(fullscreen, work.x, work.y, work.width, work.height);
 		/* 压在别人上面 / 从别人上面挪开：底衬的合成结果变了，账记在它头上。 */
@@ -2569,10 +2613,7 @@ void vidow_view_set_minimized(struct vidow_view *view, bool minimized) {
 	if (minimized) {
 		/* 全屏的先退出全屏：布局里 fullscreen 那条分支不看占位，留着它会一直
 		 * 占着整块屏。 */
-		if (view->fullscreen) {
-			view->fullscreen = false;
-			vidow_view_set_fullscreen(view, false);
-		}
+		vidow_view_unfullscreen(view, "最小化");
 		view->minimized_seq = ++server->next_minimize_seq;
 	}
 	view->minimized = minimized;
@@ -2868,10 +2909,7 @@ void vidow_column_toggle_maximized(struct vidow_server *server) {
 }
 
 void vidow_view_toggle_fullscreen(struct vidow_view *view) {
-	view->fullscreen = !view->fullscreen;
-	vidow_view_set_fullscreen(view, view->fullscreen);
-	vidow_arrange(view->server);
-	vidow_ipc_emit_window(view->server, "window-fullscreen-changed", view);
+	view_apply_fullscreen(view, !view->fullscreen, "toggle-fullscreen（Mod+F / IPC）");
 }
 
 /* ------------------------------------------------------------- events */
@@ -3237,8 +3275,7 @@ static void view_commit(struct wl_listener *listener, void *data) {
 		 * configure，只把请求留在 wlroots 那边。现在 surface initialized 了，
 		 * 在 arrange 之前兑现它 —— 晚了 arrange 就按「不是全屏」排过一遍了。 */
 		if (view->xdg_toplevel->requested.fullscreen && !view->fullscreen) {
-			view->fullscreen = true;
-			vidow_view_set_fullscreen(view, true);
+			view_apply_fullscreen(view, true, "客户端开窗时就要全屏");
 		}
 		vidow_float_update_mode(view);
 		if (view->float_mode == VIDOW_FLOAT_NONE) {
@@ -3429,10 +3466,7 @@ static void view_request_fullscreen(struct wl_listener *listener, void *data) {
 		return;
 	}
 
-	view->fullscreen = want;
-	vidow_view_set_fullscreen(view, want);
-	vidow_arrange(view->server);
-	vidow_ipc_emit_window(view->server, "window-fullscreen-changed", view);
+	view_apply_fullscreen(view, want, "客户端请求（xdg_toplevel.set_fullscreen）");
 }
 
 static void view_request_maximize(struct wl_listener *listener, void *data) {
@@ -4008,9 +4042,7 @@ static void x11_request_fullscreen(struct wl_listener *listener, void *data) {
 	if (view->x11 == NULL) {
 		return;
 	}
-	view->fullscreen = view->x11->fullscreen;
-	vidow_view_set_fullscreen(view, view->fullscreen);
-	vidow_arrange(view->server);
+	view_apply_fullscreen(view, view->x11->fullscreen, "X11 请求（_NET_WM_STATE_FULLSCREEN）");
 }
 
 static void x11_request_maximize(struct wl_listener *listener, void *data) {
