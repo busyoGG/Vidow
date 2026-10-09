@@ -256,6 +256,10 @@ static void pointer_grab_update(struct vidow_server *server) {
 		vidow_tile_grab_update(server, server->cursor->x, server->cursor->y);
 		return;
 	}
+	if (server->grab_mode == VIDOW_GRAB_RESIZE_TILE) {
+		vidow_tile_resize_update(server, server->cursor->x, server->cursor->y);
+		return;
+	}
 	vidow_float_grab_update(server, server->cursor->x, server->cursor->y);
 }
 
@@ -358,6 +362,8 @@ void vidow_pointer_button(struct vidow_server *server, uint32_t button,
 			bool client_saw_press = server->grab_client_press;
 			if (server->grab_mode == VIDOW_GRAB_TILE) {
 				vidow_tile_grab_end(server);
+			} else if (server->grab_mode == VIDOW_GRAB_RESIZE_TILE) {
+				vidow_tile_resize_end(server);
 			} else {
 				vidow_float_end_grab(server);
 			}
@@ -449,6 +455,14 @@ void vidow_pointer_button(struct vidow_server *server, uint32_t button,
 	if (mod && button == BTN_LEFT && view != NULL && !view->popup &&
 			view->float_mode == VIDOW_FLOAT_NONE && view->column != NULL) {
 		vidow_tile_grab_begin(server, view);
+		return;
+	}
+
+	/* Mod+右键按住**平铺**窗口 = 改这一列的宽度（niri 的 interactive resize）。
+	 * 浮窗那条在上面（Mod+右键 = 改浮窗自己的几何），这里只接平铺的。 */
+	if (mod && button == BTN_RIGHT && view != NULL && !view->popup &&
+			view->float_mode == VIDOW_FLOAT_NONE && view->column != NULL) {
+		vidow_tile_resize_begin(server, view);
 		return;
 	}
 

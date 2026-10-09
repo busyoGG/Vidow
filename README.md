@@ -184,7 +184,9 @@ vidowmsg set-config gaps_left -1            # 左边界回到「跟随统一值�
 - `FOLLOW` 的子窗初始居中于父窗口格；拖动它改的是相对偏移，父窗口一动它就跟
 - 手动切换：`Mod+V` / `Mod+Shift+Space`（平铺 ⇄ 浮动）；拖动平铺窗口的标题栏也会把它
   变成浮动（客户端发 `xdg_toplevel.move` 请求）
-- 交互：`Mod+左键拖动`移动、`Mod+右键拖动`缩放（缩放从右下角开始，最小 64px）
+- 交互：`Mod+左键拖动`移动、`Mod+右键拖动`缩放（浮动窗口从右下角开始，最小 64px；
+  平铺窗口改的是**这一列的宽度** —— 列宽的右边缘跟着光标走，niri 的 interactive
+  resize 那条，见 changelog 185）
 - **层级**：浮动窗口**永远**在平铺窗口之上，浮窗之间靠**点击**换层级（点哪个哪个上来）；
   全屏压在最后（平铺 < 浮动 < 全屏，见 changelog 167 与 `vidow_restack()`）
 - 父窗口销毁时，子窗留在原地转成 `FIXED`，不会跟着消失
@@ -618,6 +620,11 @@ blit 进客户端缓冲，ext-copy 的输出源监听 `output->events.commit` �
 ```
 
 ```bash
+./test-tile-resize.sh    # 14 项断言：平铺窗口 Mod+右键拖 = 改列宽（按光标位移、松手留着、
+                         # 两头夹在 5%…100%、浮窗那条路没被抢）
+```
+
+```bash
 ./test-portal-queue.sh   # 18 项断言：两个 Start 同时来（OBS 两条「屏幕采集(PipeWire)」源
                          # 开机都去问 portal）→ 第二个**排队**不秒回也不报 denied → 关掉第一个
                          # 它的选择器接着弹、两个都拿到答复 → 排着队时关会话那个请求被收掉、
@@ -966,7 +973,7 @@ vidow.bind("Mod+Escape", "quit", { inhibited = true })
 | `Mod+Shift+J` / `Mod+Shift+K` | 列内窗口下/上移；单窗口列则塞进下/上一列 |
 | `Mod+V` / `Mod+Shift+Space` | 当前窗口 平铺 ⇄ 浮动 |
 | `Mod+左键拖动` | 拖窗口：浮动窗口跟着走（松手在哪块屏上就归那块屏的工作区）；平铺窗口整条列飘起来，松手按**落点**插到那块屏工作区的列带里（拖到别的屏上 = 跨屏搬过去） |
-| `Mod+右键拖动` | 缩放浮动窗口 |
+| `Mod+右键拖动` | 浮动窗口：缩放它自己（从右下角开始）；平铺窗口：改这一列的宽度（列宽右边缘跟着光标走，两头夹在 5%…100%） |
 | `Mod+R` | 列宽循环 1/3 → 1/2 → 2/3 |
 | `Mod+F` | 当前窗口全屏切换 |
 | `Mod+Shift+F` | 当前列最大化 ⇄ 还原（见「列最大化」一节） |
@@ -986,7 +993,9 @@ vidow.bind("Mod+Escape", "quit", { inhibited = true })
 | — | 特殊工作区 / 具名工作区**默认不绑**，要就自己 `vidow.bind("Mod+C", "workspace chat")` |
 
 指针手势（`Mod+左键拖动` / `Mod+右键拖动` / `Mod+滚轮`）不是键位：它们要的是「按着
-Mod 用鼠标」，改不了键（要改就是改 `src/input.c` 里的 `MOD_KEY`）。
+Mod 用鼠标」，改不了键（要改就是改 `src/input.c` 里的 `MOD_KEY`）。`Mod+右键拖动`
+在浮动窗口上改的是它自己的几何，在平铺窗口上改的是**列宽**（平铺窗口的高度是布局
+给的：整块可用高，没有「单个窗口的高度」这个概念，所以纵向拖不改东西）。
 
 鼠标左键点击窗口即聚焦并滚动到该列；点击 layer 表面（启动器）时按需交出键盘焦点。
 
@@ -4078,6 +4087,26 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
        口子（screencopy / ext-image-copy-capture 同样对所有客户端开放，grim / OBS 靠它），
        而要收就得连它一起收 —— 那会把 grim / wf-recorder / OBS 全废掉。要边界得靠 sandbox
        那一层（别的进程拿不到 wayland socket），不是合成器。
+
+185. **平铺窗口的 `Mod+右键拖动` = 改列宽（niri 的 interactive resize）**（用户报「右键
+      resize 窗口的快捷方式没有绑定」）。
+
+      - 以前 `Mod+右键拖动` 只对**浮动**窗口有效（`src/input.c` 里那条 `mod && button ==
+        BTN_RIGHT && view->float_mode != VIDOW_FLOAT_NONE`），平铺窗口按下去什么都不发生。
+      - 新增 `VIDOW_GRAB_RESIZE_TILE`（`src/drag.c` 的 `vidow_tile_resize_begin/update/end`）：
+        按住时记下光标 x 和那一列的像素宽，之后每步 `新宽 = 起拖宽 + 光标位移` → 换算成
+        `width_fraction`（夹在 0.05…1.0）→ `vidow_arrange()`，窗口跟着手走；松手留着宽度。
+        **按增量算**而不是「右边缘 = 光标 x」：列一变宽视口就会跟着滚（focused 那列要整个
+        可见），按绝对位置算下一帧光标底下的右边缘就跑了，手会抖。手动给宽度 = 退出「列最大
+        化」（和 `set-column-width` 一个口径）。
+      - 只横向：平铺窗口的高度是布局给的（整块可用高），vidow 没有「单个窗口的高度」这个
+        概念（只有浮窗有自己的几何），纵向拖不改东西、松手也不留副作用。浮窗那条路照旧
+        （先匹配浮窗分支，平铺这条接不到浮窗上）。光标图标换 `ew-resize`；IPC 的
+        `state.grab.mode` 报 `resize-column`。
+      - **回归**：新增 `test-tile-resize.sh`（14 项）：拖 +200/+400 像素列宽正好 ±200/±400、
+        拖动期间 `grab.mode = resize-column`、松手宽度留着、两头夹在 100% / 5%、浮窗那条路
+        没被抢（拖浮窗改的是它自己的几何、列宽一个字不动）。相关：test-drag 11 项、
+        test-floatstack 13 项、test-ipc 162 项、test-binds 35 项全过。
 
 184. **两个 Start 同时来：排队，不拒**（用户报「第一次无法录制 / 第一次弹出来的选择器不管选
       什么都黑屏」）。

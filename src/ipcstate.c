@@ -809,7 +809,10 @@ void vidow_ipc_json_input(struct jbuf *b, struct vidow_server *server) {
 	jb_key(b, "grab");
 	jb_obj(b);
 	jb_kv_str(b, "mode", server->grab_mode == VIDOW_GRAB_MOVE ? "move" :
-		server->grab_mode == VIDOW_GRAB_RESIZE ? "resize" : "none");
+		server->grab_mode == VIDOW_GRAB_RESIZE ? "resize" :
+		server->grab_mode == VIDOW_GRAB_TILE ? "tile" :
+		server->grab_mode == VIDOW_GRAB_RESIZE_TILE ? "resize-column" :
+		"none");
 	jb_key(b, "window");
 	if (view_alive(server, server->grab_view)) {
 		jb_uint(b, server->grab_view->id);

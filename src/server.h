@@ -718,6 +718,9 @@ enum vidow_grab_mode {
 	VIDOW_GRAB_RESIZE,
 	/* 平铺窗口的 Mod+左键拖拽（src/drag.c）：位置只动场景节点，松手才决定归哪 */
 	VIDOW_GRAB_TILE,
+	/* 平铺窗口的 Mod+右键拖拽（src/drag.c）：改这一列的宽度（列宽的右边缘跟着
+	 * 光标走）。vidow 的平铺尺寸模型里没有「单个窗口的高度」，所以只横向。 */
+	VIDOW_GRAB_RESIZE_TILE,
 };
 
 /* niri-style column: a vertical stack of windows, columns are laid out left
@@ -1515,6 +1518,11 @@ struct vidow_server {
 	bool arrange_dirty;
 	/* 探针：最近一次拖拽移动事件的时刻（见 output.c 的拖拽延迟统计） */
 	int64_t grab_ev_ns;
+	/* 平铺改宽（Mod+右键拖）：起拖时的光标 x 和那一列的像素宽。改宽按**增量**
+	 * 算（新宽 = 起拖宽 + 光标位移）—— 按「右边缘 = 光标 x」的绝对算法，列一变宽
+	 * 视口就会跟着滚，下一帧光标底下的右边缘就跑了，手会抖。 */
+	double resize_from_x;
+	int resize_from_width;
 
 	/* overview（niri 风格全景） */
 	struct vidow_overview overview;
@@ -1870,6 +1878,13 @@ void vidow_tile_grab_begin(struct vidow_server *server,
 		struct vidow_view *view);
 void vidow_tile_grab_update(struct vidow_server *server, double lx, double ly);
 void vidow_tile_grab_end(struct vidow_server *server);
+
+/* 平铺窗口的 Mod+右键拖拽：改这一列的宽度（niri 的 interactive resize 那条）。
+ * 只有横向 —— 平铺窗口的高度是布局给的（整块可用高），没有「单个窗口的高度」。 */
+void vidow_tile_resize_begin(struct vidow_server *server,
+		struct vidow_view *view);
+void vidow_tile_resize_update(struct vidow_server *server, double lx, double ly);
+void vidow_tile_resize_end(struct vidow_server *server);
 
 /* 指针按键（真实输入和测试注入走同一条路，见 input.c）。 */
 /* force_mod：假装按着 Mod（测试注入用 —— 拖拽要求按着 Mod，而测试环境里没有

@@ -198,3 +198,94 @@ void vidow_tile_grab_end(struct vidow_server *server) {
 	vidow_focus_view(view);
 	vidow_arrange(server);
 }
+
+/* --------------------------------------------- 平铺改宽（Mod+右键拖）
+ *
+ * niri 的 interactive resize 那条：按住 Mod 用右键拖平铺窗口，改的是**这一列的
+ * 宽度**（列宽的右边缘跟着光标走）。拖的过程里实时改 width_fraction + 重排，窗口
+ * 跟着手走。
+ *
+ * 为什么只横向：vidow 的平铺尺寸模型里窗口宽 = 列宽（width_fraction × 可用宽）、
+ * 高永远是整块可用高 —— 没有「单个窗口的高度」这个概念（只有浮窗有自己的几何）。
+ * 纵向拖动不改任何东西，松手也不留副作用。
+ *
+ * 改宽按**增量**算（新宽 = 起拖宽 + 光标位移），不是「右边缘 = 光标 x」：列一变宽
+ * 视口就会跟着滚（focused 那列要整个可见），按绝对位置算的话下一帧光标底下的右边缘
+ * 就跑了，手会抖。 */
+
+void vidow_tile_resize_begin(struct vidow_server *server,
+		struct vidow_view *view) {
+	if (server == NULL || view == NULL || view->column == NULL ||
+			view->popup || view->float_mode != VIDOW_FLOAT_NONE) {
+		return;
+	}
+	struct wlr_box work = vidow_work_area(server, view->output);
+	int width = view->column->width > 0 ? view->column->width :
+		(int)(work.width * view->column->width_fraction);
+	if (width < 1) {
+		return;
+	}
+	server->grab_mode = VIDOW_GRAB_RESIZE_TILE;
+	server->grab_view = view;
+	/* 按下被合成器吃掉了（没转给客户端），松手也一起吃掉。 */
+	server->grab_client_press = false;
+	server->grab_dirty = false;
+	server->resize_from_x = server->cursor->x;
+	server->resize_from_width = width;
+	wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "ew-resize");
+	wlr_log(WLR_INFO, "grab resize: %s 起拖（列宽 %d 像素，比例 %.3f）",
+		vidow_view_title(view) != NULL ? vidow_view_title(view) : "?",
+		width, view->column->width_fraction);
+}
+
+void vidow_tile_resize_update(struct vidow_server *server, double lx, double ly) {
+	(void)ly;
+	struct vidow_view *view = server->grab_view;
+	struct vidow_column *col = view != NULL ? view->column : NULL;
+	if (col == NULL || view->output == NULL) {
+		return;
+	}
+	struct wlr_box work = vidow_work_area(server, view->output);
+	if (work.width <= 0) {
+		return;
+	}
+	double want = (double)server->resize_from_width +
+		(lx - server->resize_from_x);
+	double fraction = want / (double)work.width;
+	if (fraction < 0.05) {
+		fraction = 0.05;
+	}
+	if (fraction > 1.0) {
+		fraction = 1.0;
+	}
+	/* 动一下不到 0.2%（小于一个像素）就不重排：手停住的时候一个节点都不碰。 */
+	double diff = fraction - col->width_fraction;
+	if (diff < 0.002 && diff > -0.002) {
+		return;
+	}
+	col->width_fraction = fraction;
+	/* 手动给了宽度 = 退出「列最大化」这个状态（见 server.h 的 maximized）。 */
+	col->maximized = false;
+	vidow_arrange(server);
+	/* 拖动时指针比刷新快：一帧里会来好几个移动事件，中间那些宽度屏幕上从来没
+	 * 出现过。重排是便宜的（列宽变了本来就要重排），这里只要保证「要一帧」，
+	 * 让这一帧把最终宽度画出来（同 vidow_tile_grab_update）。 */
+	server->grab_dirty = true;
+	vidow_output_schedule_frame(server, view->output, "改列宽跟手");
+	vidow_output_kick_watchdog(server);
+}
+
+void vidow_tile_resize_end(struct vidow_server *server) {
+	struct vidow_view *view = server->grab_view;
+	struct vidow_column *col = view != NULL ? view->column : NULL;
+	if (col != NULL) {
+		wlr_log(WLR_INFO, "grab resize: %s 松手（列宽 %d 像素，比例 %.3f）",
+			vidow_view_title(view) != NULL ? vidow_view_title(view) : "?",
+			col->width, col->width_fraction);
+		vidow_arrange(server);
+	}
+	server->grab_mode = VIDOW_GRAB_NONE;
+	server->grab_view = NULL;
+	server->grab_dirty = false;
+	wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "left_ptr");
+}
