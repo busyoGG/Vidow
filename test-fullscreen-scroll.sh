@@ -22,6 +22,8 @@
 #   5) 退全屏 → 列宽回到 0.4（10,10 504x700），后面的列跟着合拢（B 524）
 #   6) 滑出去那半块**裁在自己那块屏里**（日志 `clip: A 裁到自己那块屏里（屏框 0,0 1280x720，
 #      窗口 -514,0 1280x720）`）—— 多屏时不许画到隔壁显示器上
+#   7) 客户端**自己**要的全屏（`preinit --after-commit --fullscreen`，OBS 按 F11 那条路）：
+#      同样盖住整块屏（它是个定尺寸客户端，也照样整屏 + 黑底衬）、同样跟着条带走
 #
 # 用法：./test-fullscreen-scroll.sh   （VIDOW_TEST_KEEP=1 保留运行目录）
 # 注意：别和别的测试**并行**跑 —— 收尾按 cmdline 杀 pattern.py / grim。
@@ -54,7 +56,7 @@ stop_clients() {
 		[ "$pid" = "$$" ] && continue
 		cmd=$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null) || continue
 		case "$cmd" in
-		*pattern.py*|*grim*) kill "$pid" 2>/dev/null ;;
+		*pattern.py*|*grim*|*build/preinit*) kill "$pid" 2>/dev/null ;;
 		esac
 	done 2>/dev/null
 }
@@ -114,6 +116,18 @@ for w in json.load(sys.stdin):
 else:
     print("?")
 ' "$1"
+}
+
+field() { # <标题> <字段>
+	./build/vidowmsg windows 2>/dev/null | python3 -c '
+import json, sys
+for w in json.load(sys.stdin):
+    if w["title"] == sys.argv[1]:
+        print(w.get(sys.argv[2]))
+        break
+else:
+    print("?")
+' "$1" "$2"
 }
 
 expect_box() { # <标题> <期望盒子> <说明>
@@ -261,6 +275,43 @@ mark "滑出屏外那半块裁在自己那块屏里"
 grep -aq "clip: A 裁到自己那块屏里（屏框 0,0 1280x720，窗口 -514,0 1280x720）" "$LOG" &&
 	pass "日志里写着 A 裁到自己那块屏里（窗口 -514,0 1280x720）" ||
 	fail "日志里没有那条裁剪：$(grep -a 'clip: A' "$LOG" | tail -3 | tr '\n' '|')"
+
+# ------------------------------------------------------------ 7) 客户端自己请求全屏
+mark "客户端自己要的全屏（preinit --after-commit --fullscreen：OBS 按 F11 / 播放器切全屏那条路）"
+# 先把焦点放到最后一条列 D 上：新窗口的列是插在**聚焦那条**后面的，不这么做 E 会插到 A
+# 后面去（那它左边那条列就不是 D 了，下面按条带算的数字全错）。
+msg focus-window --title D
+sleep 0.6
+expect_box D "766 10 504 700" "先把焦点放最后一条列上（新窗口的列插在它后面）"
+./build/preinit --after-commit --fullscreen --linger=60 preinit E \
+	> "$RUNDIR/preinit.out" 2>&1 &
+CLIENT_PIDS="$CLIENT_PIDS $!"
+for _ in $(seq 1 40); do grep -aq "preinit mapped" "$RUNDIR/preinit.out" && break; sleep 0.25; done
+sleep 1.2
+
+grep -aq "preinit request fullscreen after-commit" "$RUNDIR/preinit.out" &&
+	pass "客户端自己发了 set_fullscreen（上屏之后）" ||
+	fail "客户端没发出全屏请求：$(tail -2 "$RUNDIR/preinit.out" | tr '\n' ' ')"
+[ "$(field E fullscreen)" = "True" ] && pass "vidow 兑现了：窗口 fullscreen=true" ||
+	fail "窗口没进全屏（fullscreen=$(field E fullscreen)）"
+
+msg focus-window --title E
+sleep 0.8
+expect_box E "0 0 1280 720" "客户端要的全屏同样盖住整块屏（它是定尺寸客户端，也照样整屏）"
+[ "$(visible D)" = "false" ] && pass "前面的列被推到屏外（D 藏起）" ||
+	fail "D 还画着（visible=$(visible D)）—— 全屏那条列没占整屏宽"
+
+msg focus-column -1
+sleep 0.8
+expect_box E "514 0 1280 720" "焦点左移一列：全屏的 E 跟着条带往右滑（514）"
+expect_box D "10 10 504 700" "D 回到它自己那条列（10）"
+[ "$(visible E)" = "true" ] && pass "滑出去半块的 E 还画着" ||
+	fail "E 被藏了（visible=$(visible E)）"
+
+msg focus-column 1
+sleep 0.8
+expect_box E "0 0 1280 720" "焦点右移回来：E 又严丝合缝盖住整屏"
+kill "${CLIENT_PIDS##* }" 2>/dev/null   # 收掉 preinit（它按 --linger 还活着）
 
 echo
 if [ "$FAILED" = 0 ]; then
