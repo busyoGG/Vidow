@@ -28,6 +28,12 @@ vidow.bind("Mod+R", "cycle-column-width")
 vidow.bind("Mod+M", "minimize-window")
 vidow.bind("Mod+Shift+M", "restore-window")
 vidow.bind("Mod+O", "toggle-overview")
+-- Alt+Tab：按住修饰键列出最近用过的窗口（一行预览），连点 Tab 换一个，松开就把
+-- 焦点给选中的那个；Esc 取消。样式 / 排版见 configs/15-mru.lua。
+vidow.bind("Alt+Tab", "next-window")
+vidow.bind("Alt+Shift+Tab", "previous-window")
+-- Alt+`（反引号）：只在**当前这个应用**的窗口之间切（niri 的 Alt+` 同此）
+vidow.bind("Alt+grave", "next-window same-app")
 -- 第三个参数 { inhibited = true }：焦点那个表面抑制着快捷键（虚拟机的窗口要原样
 -- 收 Super / Alt+Tab，见 README 的「快捷键抑制」）时这条照样生效。退出这条留个
 -- 逃生口，不然抑制着的窗口能把用户锁死在里面。

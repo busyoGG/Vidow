@@ -34,6 +34,9 @@ enum kind {
 	K_EASING,
 	K_STRING,
 	K_COLOR, /* "RRGGBB" or "RRGGBBAA", straight (non-premultiplied) alpha */
+	/* Alt+Tab 切换器的两个枚举（写字符串，存整数；见 mru.c） */
+	K_MRU_SCOPE,  /* "all" / "workspace" / "output" */
+	K_MRU_LAYOUT, /* "strip" / "grid" */
 };
 
 struct entry {
@@ -74,13 +77,20 @@ static const struct section sections[] = {
 	{ "窗口激活", "11-activation.lua", NULL },
 	{ "xdg-desktop-portal", "12-portal.lua", NULL },
 	{ "指针", "13-cursor.lua", NULL },
-	/* 最后一份不是「键」，是 vidow.* 的调用（键位 / 工作区 / 窗口规则）。 */
+	/* 这一份不是「键」，是 vidow.* 的调用（键位 / 工作区 / 窗口规则）。 */
 	{ "键位 / 工作区 / 规则", "14-keys.lua",
 		"键位是配置给的（合成器不内置），工作区与窗口规则也在这一份里" },
+	/* Alt+Tab 切换器那一族排在它**后面**：文件名只能往后加（15-…），不能往前
+	 * 插 —— 14-keys.lua 这个名字早就写进用户的 config.lua 里了，改名等于把老
+	 * 配置读崩。 */
+	{ "最近窗口（Alt+Tab）", "15-mru.lua",
+		"Alt+Tab 的窗口切换器（niri 的 recent windows）：列哪些窗口、怎么排版、"
+		"选中框长什么样" },
 };
 #define N_SECTIONS ((int)(sizeof(sections) / sizeof(sections[0])))
-/* 最后一份是「调用」不是「键」：entries[] 里没有它，打印也单独一套。 */
-#define SECTION_KEYS (N_SECTIONS - 1)
+/* 「键位 / 工作区 / 规则」那一节：它不是配置键，entries[] 里没有它，打印也
+ * 单独一套。注意它已经不是最后一节了（Alt+Tab 那一族排在它后面）。 */
+#define SECTION_KEYS 13
 /* 缩放与输出那一节多一段 vidow.output{…} 的写法（不是配置键）。 */
 #define SECTION_OUTPUT 8
 
@@ -254,6 +264,46 @@ static const struct entry entries[] = {
 		"每一圈加多少倍：2 = 第一圈就到大一倍，之后每圈再 +1（2x → 3x → 4x …，"
 		"线性加不是乘）。放大走硬件光标那条路（放得下就不进截图），放不下会被降级"
 		"成软光标，所以实际倍数会先按硬件光标尺寸上限夹住" },
+
+	{ "mru_enabled",     K_BOOL,   OFF(mru_enabled),     SZ(mru_enabled), 14,
+		"Alt+Tab 的窗口切换器（niri 的 recent windows，见 src/mru.c）：关掉就不"
+		"记账，那两个动作也不认" },
+	{ "mru_debounce_ms", K_INT,    OFF(mru_debounce_ms), SZ(mru_debounce_ms), 14,
+		"焦点要「待够」多久才算真的用过（毫秒）：键盘一路导航碰到的窗口只算路过，"
+		"0 = 立刻记账" },
+	{ "mru_open_delay_ms", K_INT,  OFF(mru_open_delay_ms), SZ(mru_open_delay_ms), 14,
+		"按住多久面板才显形（毫秒）：快速点一下 Alt+Tab 只想切窗口、不该整屏闪一下，"
+		"0 = 立刻显形" },
+	{ "mru_scope",       K_MRU_SCOPE, OFF(mru_scope),    SZ(mru_scope), 14,
+		"列哪些窗口：all（所有屏所有工作区）/ workspace（当前工作区）/ output"
+		"（当前这块屏）" },
+	{ "mru_layout",      K_MRU_LAYOUT, OFF(mru_layout),  SZ(mru_layout), 14,
+		"排版：strip = 一行，装不下横向滚；grid = 不滚，按 mru_per_row 换行铺在"
+		"屏幕里（装不下就整体缩小预览）" },
+	{ "mru_per_row",     K_INT,    OFF(mru_per_row),     SZ(mru_per_row), 14,
+		"grid 一行最多几个（窗口再多就换行）" },
+	{ "mru_gap",         K_INT,    OFF(mru_gap),         SZ(mru_gap), 14,
+		"预览之间留多少（逻辑像素）" },
+	{ "mru_row_gap",     K_INT,    OFF(mru_row_gap),     SZ(mru_row_gap), 14,
+		"grid 行与行之间留多少（逻辑像素）" },
+	{ "mru_max_scale",   K_DOUBLE, OFF(mru_max_scale),   SZ(mru_max_scale), 14,
+		"预览最多缩到多少（0.5 = 缩一半，1 = 原尺寸）" },
+	{ "mru_max_height",  K_INT,    OFF(mru_max_height),  SZ(mru_max_height), 14,
+		"预览高度上限（逻辑像素）：大屏上别让一个窗口占满整屏" },
+	{ "mru_min_scale",   K_DOUBLE, OFF(mru_min_scale),   SZ(mru_min_scale), 14,
+		"再挤也不能比它更小（grid 里窗口特别多时的下限）" },
+	{ "mru_backdrop_alpha", K_DOUBLE, OFF(mru_backdrop_alpha),
+		SZ(mru_backdrop_alpha), 14,
+		"切换器后面那层压暗的浓度（0 = 不压暗）" },
+	{ "mru_highlight_padding", K_INT, OFF(mru_highlight_padding),
+		SZ(mru_highlight_padding), 14,
+		"选中项背后那块板比预览大多少（逻辑像素）" },
+	{ "mru_highlight_border", K_INT, OFF(mru_highlight_border),
+		SZ(mru_highlight_border), 14,
+		"选中项的边框宽度（0 = 不画边框）" },
+	{ "mru_highlight_color", K_COLOR, OFF(mru_highlight_color),
+		SZ(mru_highlight_color), 14,
+		"选中项那块板和边框的颜色（RRGGBB 或 RRGGBBAA）" },
 };
 
 /* ------------------------------------------------------------ 配置组
@@ -353,6 +403,23 @@ static const struct group_field xwayland_fields[] = {
 	{ "scale",   "xwayland_scale" },
 	{ "env",     "xwayland_env" },
 };
+static const struct group_field mru_fields[] = {
+	{ "enabled",           "mru_enabled" },
+	{ "debounce_ms",       "mru_debounce_ms" },
+	{ "open_delay_ms",     "mru_open_delay_ms" },
+	{ "scope",             "mru_scope" },
+	{ "layout",            "mru_layout" },
+	{ "per_row",           "mru_per_row" },
+	{ "gap",               "mru_gap" },
+	{ "row_gap",           "mru_row_gap" },
+	{ "max_scale",         "mru_max_scale" },
+	{ "max_height",        "mru_max_height" },
+	{ "min_scale",         "mru_min_scale" },
+	{ "backdrop_alpha",    "mru_backdrop_alpha" },
+	{ "highlight_padding", "mru_highlight_padding" },
+	{ "highlight_border",  "mru_highlight_border" },
+	{ "highlight_color",   "mru_highlight_color" },
+};
 static const struct group_field portal_fields[] = {
 	{ "conf_sync", "portal_conf_sync" },
 	{ "desktop",   "portal_desktop" },
@@ -374,6 +441,7 @@ static const struct group groups[] = {
 	GROUP("ipc",       "ipc",            ipc_fields),
 	GROUP("xwayland",  "xwayland",       xwayland_fields),
 	GROUP("portal",    NULL,             portal_fields),
+	GROUP("mru",       "mru_enabled",    mru_fields),
 };
 
 static const struct group *group_named(const char *name) {
@@ -457,6 +525,29 @@ static const char *easing_names[] = {
 	"out_elastic",
 };
 
+static const char *mru_scope_names[] = { "all", "workspace", "output" };
+static const char *mru_layout_names[] = { "strip", "grid" };
+
+static bool parse_mru_scope(const char *value, enum vidow_mru_scope *out) {
+	for (size_t i = 0; i < 3; i++) {
+		if (strcmp(value, mru_scope_names[i]) == 0) {
+			*out = (enum vidow_mru_scope)i;
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool parse_mru_layout(const char *value, enum vidow_mru_layout *out) {
+	for (size_t i = 0; i < 2; i++) {
+		if (strcmp(value, mru_layout_names[i]) == 0) {
+			*out = (enum vidow_mru_layout)i;
+			return true;
+		}
+	}
+	return false;
+}
+
 static bool parse_easing(const char *value, enum vidow_easing *out) {
 	for (size_t i = 0; i < VIDOW_EASE_OUT_ELASTIC + 1; i++) {
 		if (strcmp(value, easing_names[i]) == 0) {
@@ -491,6 +582,20 @@ static bool apply(struct vidow_config *cfg, const char *key, const char *value) 
 		case K_EASING:
 			if (!parse_easing(value, (enum vidow_easing *)field)) {
 				wlr_log(WLR_ERROR, "config: unknown easing '%s'", value);
+				return false;
+			}
+			return true;
+		case K_MRU_SCOPE:
+			if (!parse_mru_scope(value, (enum vidow_mru_scope *)field)) {
+				wlr_log(WLR_ERROR, "config: mru scope 只能是 all / "
+					"workspace / output（给的是 '%s'）", value);
+				return false;
+			}
+			return true;
+		case K_MRU_LAYOUT:
+			if (!parse_mru_layout(value, (enum vidow_mru_layout *)field)) {
+				wlr_log(WLR_ERROR, "config: mru layout 只能是 strip / "
+					"grid（给的是 '%s'）", value);
 				return false;
 			}
 			return true;
@@ -600,6 +705,29 @@ static void defaults(struct vidow_config *cfg) {
 	/* 摇晃找光标默认开：快速来回晃几下指针就放大一会儿，好找。放大是换一张更大
 	 * 的光标图，走硬件光标那条路（不进渲染通道 = 不进截图），所以倍数会先按硬件
 	 * 上限夹一下（见 cursorfx.c）。 */
+	/* Alt+Tab 的窗口切换器（见 mru.c）：默认开。debounce 750ms / open_delay
+	 * 150ms 是 niri 的默认值 —— 前者让「路过」的窗口不进台账，后者让快速点一下
+	 * Alt+Tab 只是切窗口、不闪屏。排版默认一行（strip）；要「不滚动、换行铺在
+	 * 屏幕里」就 mru = { layout = "grid", per_row = 4 }。 */
+	cfg->mru_enabled = true;
+	cfg->mru_debounce_ms = 750;
+	cfg->mru_open_delay_ms = 150;
+	cfg->mru_scope = VIDOW_MRU_ALL;
+	cfg->mru_layout = VIDOW_MRU_STRIP;
+	cfg->mru_per_row = 5;
+	cfg->mru_gap = 16;
+	cfg->mru_row_gap = 16;
+	cfg->mru_max_scale = 0.5;
+	cfg->mru_max_height = 480;
+	cfg->mru_min_scale = 0.05;
+	cfg->mru_backdrop_alpha = 0.8;
+	cfg->mru_highlight_padding = 30;
+	cfg->mru_highlight_border = 2;
+	cfg->mru_highlight_color[0] = 0x99 / 255.0f;
+	cfg->mru_highlight_color[1] = 0x99 / 255.0f;
+	cfg->mru_highlight_color[2] = 0x99 / 255.0f;
+	cfg->mru_highlight_color[3] = 1.0f;
+
 	cfg->cursor_shake = true;
 	cfg->cursor_shake_scale = 2.0;
 	/* 剪贴板默认接管：X11(Xwayland) 和 Wayland 两边共用一份内容，而且不看焦点
@@ -770,6 +898,16 @@ const char *vidow_config_get(const struct vidow_config *cfg,
 		snprintf(buf, 64, "%s",
 			easing_names[*(const enum vidow_easing *)field]);
 		break;
+	case K_MRU_SCOPE: {
+		int v = *(const enum vidow_mru_scope *)field;
+		snprintf(buf, 64, "%s", mru_scope_names[v >= 0 && v < 3 ? v : 0]);
+		break;
+	}
+	case K_MRU_LAYOUT: {
+		int v = *(const enum vidow_mru_layout *)field;
+		snprintf(buf, 64, "%s", mru_layout_names[v >= 0 && v < 2 ? v : 0]);
+		break;
+	}
 	case K_STRING:
 		snprintf(buf, 64, "%s", (const char *)field);
 		break;
@@ -876,6 +1014,7 @@ static const struct {
 	{ 7, "ipc" },
 	{ 9, "xwayland" },
 	{ 11, "portal" },
+	{ 14, "mru" },
 };
 
 /* 少数默认值是「跟着本机配置目录走」的（现在是 shader_dir）：照绝对路径打出来，
@@ -908,7 +1047,8 @@ static void print_lua_value(FILE *f, const struct vidow_config *cfg,
 	if (v == NULL) {
 		v = "";
 	}
-	if (kind != K_STRING && kind != K_COLOR && kind != K_EASING) {
+	if (kind != K_STRING && kind != K_COLOR && kind != K_EASING &&
+			kind != K_MRU_SCOPE && kind != K_MRU_LAYOUT) {
 		fputs(v, f);
 		return;
 	}
@@ -1075,6 +1215,12 @@ static void print_keys_lua(FILE *f) {
 "vidow.bind(\"Mod+M\", \"minimize-window\")\n"
 "vidow.bind(\"Mod+Shift+M\", \"restore-window\")\n"
 "vidow.bind(\"Mod+O\", \"toggle-overview\")\n"
+"-- Alt+Tab：按住修饰键列出最近用过的窗口（一行预览），连点 Tab 换一个，松开就把\n"
+"-- 焦点给选中的那个；Esc 取消。样式 / 排版见 configs/15-mru.lua。\n"
+"vidow.bind(\"Alt+Tab\", \"next-window\")\n"
+"vidow.bind(\"Alt+Shift+Tab\", \"previous-window\")\n"
+"-- Alt+`（反引号）：只在**当前这个应用**的窗口之间切（niri 的 Alt+` 同此）\n"
+"vidow.bind(\"Alt+grave\", \"next-window same-app\")\n"
 "-- 第三个参数 { inhibited = true }：焦点那个表面抑制着快捷键（虚拟机的窗口要原样\n"
 "-- 收 Super / Alt+Tab，见 README 的「快捷键抑制」）时这条照样生效。退出这条留个\n"
 "-- 逃生口，不然抑制着的窗口能把用户锁死在里面。\n"

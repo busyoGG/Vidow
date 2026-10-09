@@ -955,6 +955,8 @@ vidow.bind("Mod+Escape", "quit", { inhibited = true })
 | `Mod+F` | 当前窗口全屏切换 |
 | `Mod+Shift+F` | 当前列最大化 ⇄ 还原（见「列最大化」一节） |
 | `Mod+O` | niri 风格全景（overview）：整条列带缩小铺满这块屏，点谁去谁 |
+| `Alt+Tab` / `Alt+Shift+Tab` | 最近窗口切换器（niri 的 recent windows）：**按住**列出最近用过的窗口预览，连点换一个，**松开**把焦点给选中的那个（见「niri 风格的 Alt+Tab」一节） |
+| `Alt+\`` | 只在**当前这个应用**的窗口之间切（`next-window same-app`） |
 | `Mod+Q` | 关闭当前窗口 |
 | `Mod+M` / `Mod+Shift+M` | 收起当前窗口 / 放回最近收起来的那个（见「最小化」一节） |
 | `Mod+Enter` | 启动终端 |
@@ -974,6 +976,9 @@ Mod 用鼠标」，改不了键（要改就是改 `src/input.c` 里的 `MOD_KEY`
 
 overview 里：左键点窗口 = 选中它并缩回去，点空白 = 取消，`Esc` 退出，滚轮左右平移相机
 （`Mod+H/L` 照样换列，换列会把相机平移清零、改回跟着焦点走）。
+
+切换器开着（按住修饰键）期间：`Tab` 往前走、`Shift+Tab` 往后走、`Esc` 取消、`Enter` 立刻
+确认；这期间键盘不给客户端（窗口马上就要换，给谁都可能给错）。
 
 普通滚轮事件转发给客户端，不用于滚动视口（用 `Mod+滚轮` 或 `Mod+H/L`）。
 
@@ -1464,6 +1469,66 @@ t = 1（展开）   scale = 刚好装下整条列带      → cam = 列带中心
 点某个窗口 → `overview: 选中 X` + 退出 + 那一列被滚进视野；两块屏时只缩当前那块、另一块
 屏上的窗口淡出。
 
+## niri 风格的 Alt+Tab：最近窗口切换器（`src/mru.c`）
+
+`Alt+Tab` **按住** → 列出最近用过的窗口（预览是**活窗口**，不是截图），连点 `Tab` 在清单上
+往前走，**松开修饰键**才把焦点给选中的那个；`Esc` 取消（焦点原地不动）、`Enter` 立刻确认。
+`Alt+\`` 只看当前这个应用的窗口（`next-window same-app`）。
+
+两个阶段是分开的：
+
+| 阶段 | 状态 | 画面 |
+| --- | --- | --- |
+| 按住修饰键、还没到点 | `active = true`、`showing = false` | **一点都不动** —— 快速点一下 Alt+Tab 只是想切窗口，不该整屏闪一下 |
+| 过了 `mru_open_delay_ms` | `showing = true` | 窗口被摆进预览条 / 网格，背景压暗，选中项有板有框 |
+
+### 台账（谁「最近用过」）
+
+**不维护链表**：每个窗口一个时间戳（`vidow_view.mru_ts`），要列的时候现按它排一遍 ——
+窗口开 / 关 / 换工作区 / 销毁都不用同步第二份数据，也就没有悬空指针。
+
+**debounce（`mru_debounce_ms`，默认 750ms）**：拿到焦点不等于「用过」。键盘一路导航
+（`Mod+H/L` 连按）和 focus-follows-mouse 中途扫过的窗口都只是**路过** —— 不 debounce 的话
+`Alt+Tab` 回的是半路上那个，而不是你真正待过的那个。所以焦点一到先记成 `pending`，过了
+debounce 才落到时间戳上；往那个窗口打字算明确使用，debounce 立刻结束（日志里能看到
+`mru: X 只是路过` / `mru: 提交`）。
+
+### 预览怎么画
+
+跟 overview 同一套：**改场景节点的位置和内容缩放**（`view.c` 的 `view_anim_place` 每帧问
+`vidow_mru_place()`），不抓图、不多一趟渲染 —— 预览永远是活的（带装饰、圆角、阴影、模糊）。
+跨工作区 / 跨屏的窗口在切换器开着期间被临时拉进场，清单外的窗口停到屏外；滚出工作区的
+预览不画（场景是全局坐标，不画的话它会落到隔壁那块屏上）。
+
+| 配置键 | 默认 | 意思 |
+| --- | --- | --- |
+| `mru_enabled` | `true` | 总开关：关掉就不记账，那两个动作也不认 |
+| `mru_debounce_ms` | `750` | 焦点要「待够」多久才算用过（0 = 立刻） |
+| `mru_open_delay_ms` | `150` | 按住多久面板才显形（0 = 立刻） |
+| `mru_scope` | `"all"` | 列哪些窗口：`all` / `workspace` / `output` |
+| `mru_layout` | `"strip"` | `strip` = 一行，装不下横向滚；`grid` = 不滚，换行铺在屏幕里 |
+| `mru_per_row` | `5` | `grid` 一行最多几个 |
+| `mru_gap` / `mru_row_gap` | `16` / `16` | 预览之间 / 行与行之间 |
+| `mru_max_scale` | `0.5` | 预览最多缩到多少（1 = 原尺寸） |
+| `mru_max_height` | `480` | 预览高度上限（大屏上别让一个窗口占满屏） |
+| `mru_min_scale` | `0.05` | 再挤也不能比它更小 |
+| `mru_backdrop_alpha` | `0.8` | 后面那层压暗的浓度 |
+| `mru_highlight_padding` / `_border` / `_color` | `30` / `2` / `#999999ff` | 选中项那块板与边框 |
+
+两种排版（`mru = { layout = … }`）：
+
+- **strip（默认）**：一行，装不下就横向滚 —— 滚到「选中的那个完整可见」为止。
+- **grid**：按 `mru_per_row` 换行、不滚动；行数多了**整体缩小**预览，缩到铺进工作区为止
+  （下限 `mru_min_scale`）。窗口特别多时缩得比 `mru_max_scale` 还小是正常的 —— 这正是
+  「一行限制数量 + 窗口多时自适应变小」那件事。
+
+### 测试
+
+```bash
+./test-mru.sh   # 32 项：台账顺序 / 按住不换焦点 / 连点往前走 / 松开提交 / Esc 取消 /
+                #        快速点一下不显形 / strip 滚动 / grid 换行与自适应缩小 / 像素
+```
+
 ## IPC：状态输出与远程操作
 
 一句话：**一行一个 JSON 对象**，问一句答一句；想持续收事件就订阅。客户端是
@@ -1543,7 +1608,7 @@ vidow 自己的，比如 `vidow-wayland-1.sock`）；`ipc_socket` 可以写死�
 | 工作区 | `focus-workspace`（名字 / `next` / `prev` / `index`）、`toggle-special`（= `focus-special`）、`create-workspace`、`move-workspace-to-output` |
 | 输出 | `output-power`（`on` / `off` / `toggle`）、`output-enable` / `output-disable` / `output-toggle`、`output-scale`（数字或 `auto`）、`output-transform`、`output-mode`（宽 高 [刷新率]）、`output-position`、`output-focus` |
 | 剪贴板 | `clipboard`（查状态）、`clipboard-get`（取数据：文本或 base64）、`clipboard-set`（放数据：文本 / base64 / 指定 mime / 指定选区）、`clipboard-clear` |
-| 合成器 | `action`（键位那套动作字符串）、`set-config` / `get-config`、`reload-config`、`toggle-overview`、`move-cursor`、`quit` |
+| 合成器 | `action`（键位那套动作字符串）、`set-config` / `get-config`、`reload-config`、`toggle-overview`、`mru`（最近窗口台账 + 面板几何）、`move-cursor`、`quit` |
 | 输入注入 | `pointer-button`（`click` / `press` / `release` + `button` / `count`）、`pointer-scroll`（`dx` / `dy` / `discrete`）、`send-key`（`state` + `keys`）、`type-text`（`text`）；见下面「输入注入」一节 |
 | 订阅 | `subscribe`（可带 `events` 过滤器）、`unsubscribe` |
 
@@ -3120,6 +3185,10 @@ test-layerwin.sh  top / overlay 层的模糊里必须含窗口（纯蓝窗口 + 
                   量面板那块截屏的 B-R 与区域底衬 dump）
 test-overview.sh  Mod+O 全景：缩放比例/位置/顺序、四象限像素、遮罩只压背景不压窗口、
                   Esc 退出后画面还原、点选、两块屏时只看当前那块
+test-mru.sh       Alt+Tab 的最近窗口切换器：台账顺序、按住期间焦点不动、连点往前走、
+                  松开提交、Esc 取消、快速点一下（按住 < open_delay）不显形但照样切窗口、
+                  strip 装不下横向滚且选中的完整可见、grid 换行 / 每行上限 / 装不下整体
+                  缩小、面板显形时壁纸被压暗（像素）
 portals.conf.example  拷成 ~/.config/vidow/portals.conf
 protocols/     wlr-layer-shell / wlr-virtual-pointer / input-method-v2 /
                ext-background-effect-v1 / xdg-shell / xdg-foreign v1+v2 协议 XML
@@ -3993,6 +4062,39 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
        口子（screencopy / ext-image-copy-capture 同样对所有客户端开放，grim / OBS 靠它），
        而要收就得连它一起收 —— 那会把 grim / wf-recorder / OBS 全废掉。要边界得靠 sandbox
        那一层（别的进程拿不到 wayland socket），不是合成器。
+
+181. **Alt+Tab 的最近窗口切换器（niri 的 recent windows，新增 `src/mru.c`）**（用户要「niri
+      样式」：按住显示、连点 Tab 换窗口、松开提交焦点；样式可配，包括「超出范围不滚动、
+      换行铺在屏幕里、一行限制窗口数量、窗口多时预览自适应变小」）。
+
+      - **先纠正一件事**：niri 的 Alt+Tab **不是** overview。它有自己独立的一套（25.11 起
+        自带：wiki `Configuration:-Recent-Windows`、源码 `src/ui/mru.rs`）—— 一行 MRU 预览条 +
+        选中框 + 80% 黑底 + scope 面板，`Alt+Tab` / `Alt+Shift+Tab` 连点换、松修饰键提交、
+        `open-delay-ms 150`（快速点一下只切窗口、不闪屏）、`debounce-ms 750`（路过的窗口不进
+        台账）、`Alt+\`` 同应用过滤。我先前说「niri 没有 MRU 切换器、overview 就是它的
+        alt+tab」是错的；核了三处（wiki / 源码 / 本机 niri 26.04 的二进制）之后按它抄。
+      - **台账不维护链表**：每个窗口一个 `mru_ts` 时间戳，要列的时候现排一遍 —— 窗口开关 /
+        换工作区 / 销毁都不用同步第二份数据（也就没有悬空指针）。debounce 用「pending +
+        一次性定时器」实现，往窗口里打字立刻落账。
+      - **预览 = 真实窗口 + 缩放变换**（跟 overview 同一套），不抓图、不多一趟渲染；跨工作区 /
+        跨屏的窗口临时拉进场，清单外的窗口停到屏外，滚出工作区的预览不画（场景是全局坐标，
+        不画的话它会落到隔壁屏上）。摆位（`view_anim_place`）和重烘（`view_anim_bake`）都问
+        同一个 `vidow_mru_place()`，保证「画在哪」和「按哪个位置烘」是同一份。
+      - **交互按「松开才提交」**：按住期间焦点**先不动**（`active` / `showing` 分开：`open_delay`
+        到点前面板不显形、画面一点都不动），松开修饰键（modifiers 监听 + 按键路径双保险）才把
+        焦点给选中的那个；`Esc` 取消、`Enter` 确认；切换器开着期间键盘归它管。
+      - **两种排版**：strip（一行 + 横向滚到「选中的那个完整可见」）和 grid（按 `mru_per_row`
+        换行 + 装不下就整体缩小，下限 `mru_min_scale`；取整会溢一两个像素，所以留了 2px 余量）。
+      - **配置**：`mru = { … }` 一族 15 个键（新的一节 `configs/15-mru.lua` —— 排在 `14-keys.lua`
+        之后：那个文件名早就写进用户的 `config.lua` 了，不能往前插），两个枚举（`scope` /
+        `layout`）在 config.c 里新加了 `K_MRU_SCOPE` / `K_MRU_LAYOUT` 两种 kind，写错当场报错。
+        默认键位加进 `configs/14-keys.lua`：`Alt+Tab` / `Alt+Shift+Tab` / `Alt+\``。
+      - `./test-mru.sh`（新，32 项断言，约 40 秒）：台账顺序、按住时焦点不动、连点往前走、
+        松开提交、`Esc` 取消、快速点一下（按住 < open_delay）不显形但窗口照样切、strip 滚动后
+        选中的那个完整可见、grid 3 行 / 每行 ≤2 / 整体缩小 / 全在屏内、面板显形时壁纸被压暗。
+      - IPC 加了 `mru`（台账 + 面板几何，测试的几何断言靠它）。
+      - 顺带：`view_clip_box` / `vidow_view_should_park` 各加了一条「切换器里的预览不按自己
+        那块屏裁 / 不按工作区藏」的判据 —— 否则跨屏、跨工作区的预览会被切掉或根本不画。
 
 180. **`blur_xray`（Hyprland 的 `blur:xray` 同款）+ 默认 `blur_levels` 4 → 3**（用户问「模糊
       路线哪一种比较好」，听完对照后拍板：加这个开关、默认 pass 改成 3）。

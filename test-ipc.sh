@@ -543,7 +543,7 @@ check "im 状态" '{"cmd":"im"}' 'resp["result"]["connected"]' 'False'
 check "anims 结构" '{"cmd":"anims"}' '"running" in resp["result"]' 'True'
 check "state 里带上了一切" '{"cmd":"state"}' \
 	'sorted(resp["result"].keys())' \
-	"['activation_tokens', 'anims', 'clipboard', 'config', 'config_lua', 'counts', 'focused', 'im', 'input', 'keybinds', 'layers', 'log_level', 'output_memories', 'outputs', 'overview', 'pid', 'primary_selection', 'rules', 'seats', 'shaders', 'socket', 'time_ms', 'version', 'wayland_display', 'windows', 'workspaces', 'xwayland']"
+	"['activation_tokens', 'anims', 'clipboard', 'config', 'config_lua', 'counts', 'focused', 'im', 'input', 'keybinds', 'layers', 'log_level', 'mru', 'output_memories', 'outputs', 'overview', 'pid', 'primary_selection', 'rules', 'seats', 'shaders', 'socket', 'time_ms', 'version', 'wayland_display', 'windows', 'workspaces', 'xwayland']"
 
 # ------------------------------------------------------------ 10) 事件订阅
 mark "事件订阅：打开 / 移动 / 浮动 / 关闭 / 工作区 / 输出 / 过滤器"

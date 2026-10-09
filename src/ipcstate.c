@@ -934,6 +934,65 @@ void vidow_ipc_json_overview(struct jbuf *b, struct vidow_server *server) {
 	jb_obj_end(b);
 }
 
+/* Alt+Tab 的切换器 / 最近用过的窗口（见 mru.c）。台账（recent）和面板上的排版
+ * （entries：位置尺寸缩放）都报出来 —— 测试要靠它做几何断言。 */
+void vidow_ipc_json_mru(struct jbuf *b, struct vidow_server *server) {
+	const struct vidow_mru *mru = &server->mru;
+	static const char *scope_names[] = { "all", "workspace", "output" };
+	int scope = server->config.mru_scope;
+	jb_obj(b);
+	jb_kv_bool(b, "enabled", server->config.mru_enabled);
+	jb_kv_bool(b, "active", vidow_mru_active(server));
+	jb_kv_bool(b, "showing", vidow_mru_showing(server));
+	jb_kv_str(b, "layout", server->config.mru_layout == VIDOW_MRU_GRID ?
+		"grid" : "strip");
+	jb_kv_str(b, "scope", scope_names[scope >= 0 && scope < 3 ? scope : 0]);
+	jb_kv_uint(b, "selected", mru->selected != NULL ? mru->selected->id : 0);
+	jb_kv_uint(b, "original", mru->original != NULL ? mru->original->id : 0);
+	jb_kv_uint(b, "pending", mru->pending != NULL ? mru->pending->id : 0);
+	jb_kv_int(b, "count", mru->n);
+	jb_kv_int(b, "slots", mru->slot_n);
+	jb_kv_int(b, "total_w", mru->total_w);
+	jb_kv_int(b, "total_h", mru->total_h);
+	jb_kv_double(b, "scroll", mru->scroll);
+	jb_key(b, "entries");
+	jb_arr(b);
+	for (int i = 0; i < mru->slot_n; i++) {
+		const struct vidow_mru_slot *slot = &mru->slot[i];
+		if (slot->view == NULL) {
+			continue;
+		}
+		jb_obj(b);
+		jb_kv_uint(b, "id", slot->view->id);
+		jb_kv_str(b, "title", vidow_view_title(slot->view));
+		jb_kv_str(b, "app_id", vidow_view_app_id(slot->view));
+		jb_kv_bool(b, "selected", slot->view == mru->selected);
+		jb_kv_int(b, "x", slot->x);
+		jb_kv_int(b, "y", slot->y);
+		jb_kv_int(b, "w", slot->w);
+		jb_kv_int(b, "h", slot->h);
+		jb_kv_double(b, "zoom", slot->zoom);
+		jb_obj_end(b);
+	}
+	jb_arr_end(b);
+	/* 台账（不打开切换器也能看）：最近用过的顺序。 */
+	jb_key(b, "recent");
+	jb_arr(b);
+	struct vidow_view *list[64];
+	size_t n = vidow_mru_collect(server, NULL, list, 64);
+	int64_t now = vidow_mru_now_ns();
+	for (size_t i = 0; i < n; i++) {
+		jb_obj(b);
+		jb_kv_uint(b, "id", list[i]->id);
+		jb_kv_str(b, "title", vidow_view_title(list[i]));
+		jb_kv_int(b, "ago_ms", list[i]->mru_ts > 0 ?
+			(long long)((now - list[i]->mru_ts) / 1000000) : -1);
+		jb_obj_end(b);
+	}
+	jb_arr_end(b);
+	jb_obj_end(b);
+}
+
 void vidow_ipc_json_xwayland(struct jbuf *b, struct vidow_server *server) {
 	jb_obj(b);
 	jb_kv_bool(b, "enabled", server->config.xwayland);
@@ -1079,6 +1138,8 @@ void vidow_ipc_json_state(struct jbuf *b, struct vidow_server *server) {
 	vidow_ipc_json_focused(b, server);
 	jb_key(b, "overview");
 	vidow_ipc_json_overview(b, server);
+	jb_key(b, "mru");
+	vidow_ipc_json_mru(b, server);
 	jb_key(b, "input");
 	vidow_ipc_json_input(b, server);
 	jb_key(b, "outputs");

@@ -39,6 +39,7 @@ void vidow_ipc_json_memories(struct jbuf *b, struct vidow_server *server);
 void vidow_ipc_json_anims(struct jbuf *b, struct vidow_server *server);
 void vidow_ipc_json_im(struct jbuf *b, struct vidow_server *server);
 void vidow_ipc_json_overview(struct jbuf *b, struct vidow_server *server);
+void vidow_ipc_json_mru(struct jbuf *b, struct vidow_server *server);
 void vidow_ipc_json_xwayland(struct jbuf *b, struct vidow_server *server);
 /* 剪贴板：一份选择（CLIPBOARD / PRIMARY）的完整状态。what = 为什么发的这次
  * 事件（x11 / wayland-set / clear / ...），IPC 里能看出来是谁在动。 */

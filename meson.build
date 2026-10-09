@@ -138,6 +138,7 @@ sources = files(
   'src/keybind.c',
   'src/rule.c',
   'src/overview.c',
+  'src/mru.c',
   'src/anim.c',
   'src/fx.c',
   'src/exec.c',

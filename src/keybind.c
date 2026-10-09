@@ -531,6 +531,46 @@ bool vidow_action_run(struct vidow_server *server, const char *action) {
 		log_action(action, "全景开关");
 		return true;
 	}
+	/* Alt+Tab 切换器（niri 的 recent windows，见 mru.c）。
+	 *   vidow.bind("Alt+Tab", "next-window")
+	 *   vidow.bind("Alt+Shift+Tab", "previous-window")
+	 * 参数（可选，空格分隔，可叠加）：
+	 *   same-app       只看当前窗口那个应用（niri 的 Alt+`）
+	 *   scope=workspace / scope=output / scope=all   这次只列这个范围 */
+	if (strcmp(name, "next-window") == 0 ||
+			strcmp(name, "previous-window") == 0) {
+		int dir = strcmp(name, "next-window") == 0 ? 1 : -1;
+		const char *app_id = NULL;
+		enum vidow_mru_scope scope = server->config.mru_scope;
+		if (arg != NULL && arg[0] != '\0') {
+			char buf[128];
+			snprintf(buf, sizeof(buf), "%s", arg);
+			char *save = NULL;
+			for (char *tok = strtok_r(buf, " ,", &save); tok != NULL;
+					tok = strtok_r(NULL, " ,", &save)) {
+				if (strcmp(tok, "same-app") == 0 ||
+						strcmp(tok, "same_app") == 0 ||
+						strcmp(tok, "app") == 0) {
+					app_id = server->focused != NULL ?
+						vidow_view_app_id(server->focused) : NULL;
+				} else if (strcmp(tok, "scope=workspace") == 0) {
+					scope = VIDOW_MRU_WORKSPACE;
+				} else if (strcmp(tok, "scope=output") == 0) {
+					scope = VIDOW_MRU_OUTPUT;
+				} else if (strcmp(tok, "scope=all") == 0) {
+					scope = VIDOW_MRU_ALL;
+				} else {
+					wlr_log(WLR_ERROR, "next-window / previous-window: "
+						"不认识的参数 '%s'（能写：same-app / scope=all|"
+						"workspace|output）", tok);
+					return false;
+				}
+			}
+		}
+		vidow_mru_open(server, dir, app_id, scope);
+		log_action(action, dir > 0 ? "切到下一个窗口" : "切到上一个窗口");
+		return true;
+	}
 	/* 跑一条 shell 命令（默认配置里 Mod+Return 用的就是它）：
 	 *   vidow.bind("Mod+Return", "spawn kitty")
 	 * 双 fork、不等它、输出丢掉 —— 不阻塞渲染，也不留僵尸。 */

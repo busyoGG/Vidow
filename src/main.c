@@ -384,7 +384,7 @@ int main(int argc, char *argv[]) {
 			!vidow_keyboard_grab_init(&server) ||
 			!vidow_view_init(&server) || !vidow_layer_init(&server) ||
 			!vidow_decoration_init(&server) ||
-			!vidow_overview_init(&server) ||
+			!vidow_overview_init(&server) || !vidow_mru_init(&server) ||
 			!vidow_im_init(&server) || !vidow_bgeffect_init(&server) ||
 			!vidow_portal_init(&server) || !vidow_xwayland_init(&server) ||
 			!vidow_clipboard_init(&server)) {

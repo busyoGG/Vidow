@@ -36,6 +36,18 @@ static void keyboard_modifiers(struct wl_listener *listener, void *data) {
 	wlr_seat_set_keyboard(kb->server->seat, kb->wlr_keyboard);
 	wlr_seat_keyboard_notify_modifiers(kb->server->seat,
 		&kb->wlr_keyboard->modifiers);
+
+	/* Alt+Tab 切换器只在「还按着修饰键」的时候开着（niri 同此）：所有修饰键都
+	 * 松开了就是「选好了」—— 把焦点给选中的那个，关掉。按住 Alt 连点 Tab 的
+	 * 手势到这里结束。 */
+	if (vidow_mru_active(kb->server)) {
+		uint32_t held = kb->wlr_keyboard->modifiers.depressed &
+			(WLR_MODIFIER_ALT | WLR_MODIFIER_LOGO | WLR_MODIFIER_CTRL |
+			 WLR_MODIFIER_SHIFT);
+		if (held == 0) {
+			vidow_mru_commit(kb->server);
+		}
+	}
 }
 
 static void keyboard_key(struct wl_listener *listener, void *data) {
@@ -66,6 +78,21 @@ static void keyboard_key(struct wl_listener *listener, void *data) {
 		}
 	}
 
+	/* Alt+Tab 切换器开着（按住修饰键期间）：键盘也归它管 —— 窗口马上就要换，
+	 * 按键给谁都可能给错。Esc 取消、Enter 确认；Alt+Tab 那两条绑定在上面已经
+	 * 处理过了（键会重复，每重复一次就是往前走一格）。 */
+	if (vidow_mru_active(server)) {
+		if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED && nsyms > 0) {
+			if (syms[0] == XKB_KEY_Escape) {
+				vidow_mru_cancel(server);
+			} else if (syms[0] == XKB_KEY_Return ||
+					syms[0] == XKB_KEY_KP_Enter) {
+				vidow_mru_commit(server);
+			}
+		}
+		return;
+	}
+
 	/* overview 开着的时候它接管键盘：Esc 退出，别的键也别漏给客户端
 	 * （窗口都缩没了，按键给谁都不对）。Super+… 的快捷键在上面照常生效。 */
 	if (vidow_overview_active(server)) {
@@ -85,6 +112,11 @@ static void keyboard_key(struct wl_listener *listener, void *data) {
 	}
 
 	if (!handled) {
+		/* 往窗口里打字 = 明确使用它：MRU 的 debounce 立刻结束（见 mru.c）——
+		 * 不然「刚点过去的窗口，马上打字，再 Alt+Tab」会回错地方。 */
+		if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+			vidow_mru_note_key(server);
+		}
 		/* X11 抓着键盘时按键一律给抓着它的那个表面（XGrabKeyboard 的语义：谁抓
 		 * 谁收，用户点了别的窗口也照给）—— 见 keyboardgrab.c。 */
 		vidow_xwayland_grab_assert(server);

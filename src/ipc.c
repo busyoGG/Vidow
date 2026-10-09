@@ -2027,6 +2027,10 @@ static bool ipc_run(struct vidow_server *server, struct ipc_client *c,
 		vidow_ipc_json_overview(out, server);
 		return true;
 	}
+	if (strcmp(cmd, "mru") == 0 || strcmp(cmd, "recent") == 0) {
+		vidow_ipc_json_mru(out, server);
+		return true;
+	}
 	if (strcmp(cmd, "xwayland") == 0) {
 		vidow_ipc_json_xwayland(out, server);
 		return true;

@@ -946,6 +946,9 @@ void vidow_config_sync(struct vidow_server *server) {
 	/* 配置里 vidow.workspace_create() 声明的具名工作区可能是在还没有屏的时候
 	 * 建的（output == NULL）：现在认领到第一块屏上，按声明顺序排在栈顶。 */
 	vidow_workspace_normalize(server);
+	/* Alt+Tab 切换器正开着的话：排版 / 外观那些键（mru = {…}）改完立刻重排，
+	 * 不用等下次打开。 */
+	vidow_mru_update(server);
 }
 
 static void script_apply(struct vidow_script *s) {

@@ -1035,6 +1035,11 @@ static struct vidow_output *output_pick_fallback(struct vidow_server *server,
  * 之前调用：记忆要记下它离开时的视口 / 位置 / 焦点，而 wlr_output 还是活的。 */
 static struct vidow_output *output_gone(struct vidow_server *server,
 		struct vidow_output *output) {
+	/* Alt+Tab 切换器开着、而且它就摆在这块屏上：先关掉 —— 它攥着
+	 * wlr_output 指针，再往下走这块就要被释放了。 */
+	if (server->mru.output == output->wlr_output) {
+		vidow_mru_cancel(server);
+	}
 	/* 名字在 add 的时候就存进 memory 了：到这儿 wlr_output->name 已经被
 	 * wlroots 收走，按名字现找会拿到空串（这块踩过，热插拔整段不生效）。 */
 	struct vidow_output_memory *memory = output->memory;

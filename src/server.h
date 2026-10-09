@@ -92,6 +92,12 @@ enum vidow_easing {
 	VIDOW_EASE_OUT_ELASTIC,
 };
 
+/* Alt+Tab 切换器（见 mru.c）的两个枚举：配置里写字符串
+ * （scope 写 "all" / "workspace" / "output"，layout 写 "strip" / "grid"），
+ * 落到这里就是整数。 */
+enum vidow_mru_scope { VIDOW_MRU_ALL, VIDOW_MRU_WORKSPACE, VIDOW_MRU_OUTPUT };
+enum vidow_mru_layout { VIDOW_MRU_STRIP, VIDOW_MRU_GRID };
+
 struct vidow_config {
 	/* ---- gap ----
 	 * 一个统一值管全部：`gaps = 10` → 屏幕边 10px、窗口之间也是 10px。
@@ -234,6 +240,38 @@ struct vidow_config {
 	/* 录屏 / 截图交给哪个后端：auto（默认，自己人优先）/ vidow / kde / wlr /
 	 * hyprland / none。跟 portal_desktop（会话名）是两件事。 */
 	char portal_capture[32];
+
+	/* Alt+Tab 切换器（niri 的 recent windows，见 mru.c）。
+	 *   enabled        总开关：关掉就不记账、Alt+Tab 不认（那两条绑定变成没动作）
+	 *   debounce_ms    焦点落到台账上之前要「待够」多久 —— 键盘一路走过去碰到的
+	 *                  窗口不该算「用过」（0 = 立刻落账）
+	 *   open_delay_ms  按住多久面板才显形：快速点一下 Alt+Tab 只想切窗口，
+	 *                  不该整屏闪一下（0 = 立刻显形）
+	 *   scope          列哪些窗口：all（所有屏所有工作区）/ output（当前这块屏）
+	 *                  / workspace（当前工作区）
+	 *   layout         strip = 一行，装不下横向滚；grid = 不滚，换行铺在屏幕里
+	 *   per_row        grid 一行最多几个（strip 用不上）
+	 *   gap/row_gap    预览之间 / 行与行之间（逻辑像素）
+	 *   max_scale      预览最多缩到多少（0.5 = 缩一半；1.0 = 原尺寸）
+	 *   max_height     预览高度上限（大屏上别一个窗口占满屏）
+	 *   min_scale      再挤也不能比它更小
+	 *   backdrop_alpha 切换器后面那层压暗的浓度
+	 *   highlight_*    选中项背后那块板 / 边框 */
+	bool mru_enabled;
+	int mru_debounce_ms;
+	int mru_open_delay_ms;
+	enum vidow_mru_scope mru_scope;
+	enum vidow_mru_layout mru_layout;
+	int mru_per_row;
+	int mru_gap;
+	int mru_row_gap;
+	double mru_max_scale;
+	int mru_max_height;
+	double mru_min_scale;
+	double mru_backdrop_alpha;
+	int mru_highlight_padding;
+	int mru_highlight_border;
+	float mru_highlight_color[4];
 };
 
 /* gap 的唯一算法：单独设了就用它，没设（-1）跟随统一值 gaps；其余负值当 0
@@ -373,6 +411,46 @@ struct vidow_overview {
 	struct wlr_output *output;      /* 进入时锁定的那块屏 */
 	struct wlr_scene_rect *dim;     /* 压暗壁纸的遮罩 */
 	struct vidow_anim *anim;
+};
+
+/* Alt+Tab 切换器（niri 的 recent windows）。台账和切换器都在 mru.c，这里只放
+ * 状态：台账一个 pending + 一个 debounce 闹钟；切换器一张清单（order）、一份
+ * 排版（slot）、选中项和面板那几个矩形。 */
+struct vidow_mru_slot {
+	struct vidow_view *view;
+	int x, y, w, h;   /* 预览摆在哪（布局坐标）+ 尺寸，都是屏幕上的值 */
+	double zoom;      /* 内容缩放（1.0 = 原尺寸） */
+};
+
+struct vidow_mru {
+	/* ---- 台账 ---- */
+	struct vidow_view *pending;     /* 拿到焦点、还在 debounce 里的那个 */
+	struct wl_event_source *timer;  /* debounce 到点 */
+	/* ---- 切换器 ---- */
+	bool on;                        /* 按住修饰键期间：键盘被接管，焦点先不动 */
+	bool shown;                     /* 面板显形了（open_delay 到了）：画面才动 */
+	struct vidow_view *selected;
+	struct vidow_view *original;    /* 进来之前焦点在哪 */
+	struct wlr_output *output;      /* 在哪块屏上摆 */
+	struct wl_event_source *open_timer; /* open_delay 闹钟 */
+	char filter_app_id[128];        /* 只看这个 app 的窗口（空 = 全部） */
+	enum vidow_mru_scope scope;     /* 这次列哪些窗口（配置给默认，绑定能覆盖） */
+	struct vidow_view **order;      /* 清单（最近用过在前），MRU_MAX 个 */
+	int n;                          /* 清单里有几个 */
+	struct vidow_mru_slot *slot;    /* 排版结果，slot_n 个 */
+	int slot_n;
+	double scroll;                  /* strip 模式横向滚了多少 */
+	int total_w, total_h;           /* 整条清单占多大（日志 / 断言用） */
+	struct wlr_scene_rect *backdrop; /* 压暗背景 */
+	struct wlr_scene_rect *plate;    /* 选中项背后那块板 */
+	struct wlr_scene_rect *border[4];/* 选中项的边框（四条细矩形） */
+};
+
+/* 切换器里的窗口这一帧该怎么摆（view.c 的 view_anim_place 问它）。 */
+enum vidow_mru_place {
+	VIDOW_MRU_PLACE_NONE,    /* 不归切换器管：照常走布局 / overview */
+	VIDOW_MRU_PLACE_PREVIEW, /* 摆到预览的位置上（x/y/zoom 已填好） */
+	VIDOW_MRU_PLACE_HIDE,    /* 切换器开着、但它不在清单里：收起来 */
 };
 
 /* A window's content rendered through the decoration (and optionally an
@@ -728,6 +806,10 @@ struct vidow_view {
 	char last_app_id[128];
 	struct vidow_view_tag tag;
 	bool mapped;
+	/* 「最近用过」的时间戳（单调时钟 ns；0 = 还没记过）。Alt+Tab 的切换器
+	 * （mru.c）现按它排一份清单 —— 不另维护链表，窗口开关 / 换工作区 / 销毁
+	 * 都不用同步第二份数据。 */
+	int64_t mru_ts;
 	bool configured; /* initial configure already answered */
 	bool fullscreen;
 	/* 最小化：窗口**留在原来的列里**（列宽、上下顺序、滚动位置、归属工作区和屏
@@ -1428,6 +1510,9 @@ struct vidow_server {
 
 	/* overview（niri 风格全景） */
 	struct vidow_overview overview;
+
+	/* Alt+Tab 切换器 / 最近用过的窗口（见 mru.c） */
+	struct vidow_mru mru;
 
 	/* IPC（见 ipc.c / ipcstate.c） */
 	struct wl_event_source *ipc_listen; /* 监听 socket 的 fd 源 */
@@ -2223,6 +2308,43 @@ double vidow_overview_scale(const struct vidow_server *server);
 /* 点一下：选中命中的那列（返回 true = 这次点击被 overview 吃掉了）。 */
 bool vidow_overview_click(struct vidow_server *server, double sx, double sy);
 void vidow_overview_pan(struct vidow_server *server, double dx);
+
+/* -------------------------------------------------- MRU（Alt+Tab 切换器） */
+
+/* 台账（谁最近用过）和切换器都在 mru.c。 */
+int64_t vidow_mru_now_ns(void);
+bool vidow_mru_init(struct vidow_server *server);
+/* 焦点换人了：记账。过了 debounce 才算「用过」（见 mru.c）。 */
+void vidow_mru_note_focus(struct vidow_server *server, struct vidow_view *view);
+/* 往窗口里打字了：明确使用，debounce 立刻结束。 */
+void vidow_mru_note_key(struct vidow_server *server);
+/* 窗口要没了：把它从台账和当前清单里摘掉。 */
+void vidow_mru_forget(struct vidow_server *server, struct vidow_view *view);
+/* 按「最近用过」排一份清单（新的在前），只收能出现在切换器里的窗口。
+ * app_id_filter 非空 = 只收这个 app_id 的（同应用切换）。返回个数。 */
+size_t vidow_mru_collect(struct vidow_server *server, const char *app_id_filter,
+		struct vidow_view **out, size_t max);
+/* 选择阶段开着（按住修饰键期间）：键盘归它管，焦点先不动。 */
+bool vidow_mru_active(const struct vidow_server *server);
+/* 面板显形了（open_delay 到了）：窗口被摆进预览里，画面归它管。 */
+bool vidow_mru_showing(const struct vidow_server *server);
+/* 这个窗口现在是不是切换器里的一个预览。 */
+bool vidow_mru_holds(const struct vidow_server *server,
+		const struct vidow_view *view);
+/* 打开（dir > 0 = 往后走，对应 Alt+Tab；< 0 = 往前，Alt+Shift+Tab）。
+ * 已经开着的时候再调 = 走一格（按住连点 Tab 走的就是这条）。 */
+void vidow_mru_open(struct vidow_server *server, int dir, const char *app_id,
+		enum vidow_mru_scope scope);
+void vidow_mru_step(struct vidow_server *server, int dir);
+/* 松开修饰键：焦点给选中的那个，关掉。 */
+void vidow_mru_commit(struct vidow_server *server);
+/* Esc：关掉，焦点原地不动。 */
+void vidow_mru_cancel(struct vidow_server *server);
+/* 配置 / 屏幕变了：重排一遍（没显示就什么都不做）。 */
+void vidow_mru_update(struct vidow_server *server);
+/* 这一帧这个窗口该摆在哪、缩多少（view.c 的摆位 / 重烘都问它）。 */
+enum vidow_mru_place vidow_mru_place(const struct vidow_view *view, int *x,
+		int *y, double *zoom);
 
 /* ----------------------------------------------------------------- 热插拔 */
 
