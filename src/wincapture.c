@@ -473,9 +473,9 @@ struct wlr_output *vidow_win_grab_output(struct vidow_server *server,
 	if (server == NULL || view == NULL) {
 		return NULL;
 	}
-	if (!view->popup && view->float_mode == VIDOW_FLOAT_NONE &&
-			view->column != NULL && view->column->output != NULL) {
-		return view->column->output;
+	struct wlr_output *owner = vidow_view_owner_output(view);
+	if (owner != NULL) {
+		return owner;
 	}
 	struct wlr_box at = vidow_view_screen_box(view);
 	struct wlr_output *output = wlr_output_layout_output_at(

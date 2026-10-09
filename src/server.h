@@ -525,6 +525,14 @@ struct vidow_fx_target {
 	 * 调进场景**的那个局部框：动画帧里窗口每帧都在动，只按 clip_on 判断会漏
 	 * —— 裁出来的是上一帧位置的那一块。宽 0 = 没裁。 */
 	struct wlr_box clip_local;
+	/* 「客户端声明的有效源区域」（缓冲像素；wp_viewport 的 src 框，没设就是整块
+	 * 缓冲）。**不能**直接读场景节点的 src_box：越界裁剪（wlroots 的
+	 * wlr_scene_subsurface_tree_set_clip）就是改写 src_box 实现的 —— 裁完剩下的
+	 * 那一小条会变成整个 src_box。装饰采源缓冲的哪一块照的就是这一份（view.c 的
+	 * fx_geo_tex_map），读那个字段就会把「裁剩下的一小条」当成整块有效内容。
+	 * 抄的是**没裁过**的那一版（见 view.c 的 view_snapshot_content_box）。
+	 * 宽 0 = 还没抄到，那边按节点 src_box / 整块缓冲兜底。 */
+	struct wlr_fbox content_box;
 
 	/* Blur backdrop. Either the server's shared wallpaper pyramid (borrowed)
 	 * or a private one captured with this window taken out (owned). The
@@ -839,8 +847,15 @@ struct vidow_view {
 	 * 就是这么来的）。停到输出框外面：哪块屏的框里都没有它，屏幕上照样看不见；
 	 * 截图源那个虚拟输出是按节点自己的位置摆的（见 wlroots 的
 	 * ext_image_capture_source_v1/scene.c），节点停哪儿它跟到哪儿，录到的是完整
-	 * 窗口。 */
+	 * 窗口。
+	 *
+	 * 停到停车位上还有一个连带后果：这块窗口就不再「在」任何输出上了，客户端按
+	 * 「进了哪些输出」算倍率的（kitty 那类）会掉回 1 倍重画 —— 所以倍率得靠
+	 * preferred_buffer_scale 钉住，见 view.c 的 view_pin_scale。 */
 	bool scene_parked;
+	/* 上一次钉给客户端的 preferred_buffer_scale（0 = 还没钉过）。只在变了的时候
+	 * 发协议事件，见 view.c 的 view_pin_scale。 */
+	int32_t pref_scale;
 	/* 帧追踪用：上一次记 commit 的时间（VIDOW_TRACE_FRAMES=1 才写） */
 	int64_t trace_commit_ns;
 
@@ -2448,9 +2463,15 @@ void vidow_focus_view(struct vidow_view *view);
  * top 非空 = 「这一个刚被抬起来」，它落在自己那一组的最上面；没人站错队时一个
  * 节点都不碰（见 src/view.c）。 */
 void vidow_restack(struct vidow_server *server, struct vidow_view *top);
-/* 窗口现在**画在**哪块屏上：它看得见的那些屏里缩放最大的那块（跨屏拖动时布局归属
- * 还没换，人已经在对面那块屏上了）。装饰离屏缓冲的倍率和私有模糊底衬归哪块屏都走
- * 这一个判据。看不见任何屏时返回 NULL。 */
+/* 这块窗口**属于**哪块屏：平铺 / 全屏的看它那条列挂在哪块屏（跟滚动视口无关，
+ * 稳定）；浮动 / 弹窗返回 NULL（它们不参与滚动，按「现在画在哪块屏上」算）。
+ * 平铺窗口滚出视口之后「画在哪」会翻到隔壁那块屏去，所以倍率 / 模糊底衬 / 按窗口
+ * 录屏的取景框都得走这一个判据，见 src/view.c。 */
+struct wlr_output *vidow_view_owner_output(const struct vidow_view *view);
+/* 这块窗口**算在哪块屏上**：平铺 / 全屏看归属那块（vidow_view_owner_output），
+ * 浮动 / 弹窗看它看得见的那些屏里缩放最大的那块（跨屏拖动时布局归属还没换，人已经
+ * 在对面那块屏上了）。装饰离屏缓冲的倍率和私有模糊底衬归哪块屏都走这一个判据。
+ * 看不见任何屏时返回 NULL。 */
 struct wlr_output *vidow_view_display_output(const struct vidow_view *view);
 /* 「把这个窗口端到人面前」：先让它那块工作区亮起来（在别的屏上就把焦点挪过去 /
  * 整块工作区搬过来），再给键盘焦点。xdg-activation（点通知）、任务栏按钮、

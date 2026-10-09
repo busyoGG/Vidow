@@ -23,7 +23,15 @@
 #      HEADLESS-1 的范围（0..1280）里」的窗口 —— 就是滚出视口之后那个
 #   4) 抓它：尺寸必须是 S1 × 2（它那块屏的缩放）。修之前这里是 S1（乘了隔壁 1 倍屏）
 #   5) 再把它聚焦回视口里抓一次：两次尺寸必须一样
-#   6) 全程 vidow 没崩、没断言
+#   6) 滚出视口那个窗口：合成器把客户端的 preferred_buffer_scale 钉在**它那块屏**的
+#      缩放上（日志「钉住 preferred_buffer_scale = 2」，且之后不出现 = 1），并且窗口
+#      表面树**真的裁到了自己那块屏里** —— wlroots 的 wlr_scene_surface 是按「可见面积
+#      最大的那块输出」发 preferred_buffer_scale 的，不裁的话隔壁那块屏会赢：客户端被
+#      叫去按它的缩放重画，2 倍屏上录 / 预览这个窗口就一直半分辨率糊着，滚回视口才清楚
+#      （用户报的「窗口滚动出去后，又按照另一个屏幕的缩放变化了」）。
+#      （客户端真按 1 倍重画这件事要真 DRM 会话才看得见，headless 这边钉我们发出去的
+#      那个值 + 表面树确实裁了。）
+#   7) 全程 vidow 没崩、没断言
 #
 # 用法：./test-win-scrolled-output.sh   （VIDOW_TEST_KEEP=1 保留运行目录）
 set -u
@@ -121,8 +129,8 @@ if isinstance(ws, dict):
 for w in ws:
     if (w.get("title") or "") == want:
         g = w["geometry"]
-        print("%d %d %d %d %s" % (g["x"], g["y"], g["width"], g["height"],
-            w.get("output") or ""))
+        print("%d %d %d %d %s %s" % (g["x"], g["y"], g["width"], g["height"],
+            w.get("output") or "", w.get("id") or ""))
         break
 ' "$1"
 }
@@ -250,6 +258,45 @@ if [ -n "$TARGET" ]; then
 	fi
 else
 	fail "没有滚出视口的窗口，第 4 节跳过"
+fi
+
+# --- 4b 客户端按几倍渲染：钉在它那块屏的缩放上 ------------------------------
+mark "4b) 滚出视口时，客户端的 preferred_buffer_scale 钉在窗口那块屏（缩放 2）上"
+if [ -n "$TARGET" ]; then
+	# 钉是在第一次摆放时发生的，那会儿标题还没来 —— 按窗口编号（IPC 的 id）找。
+	WID=$(vm windows 2>/dev/null | python3 -c '
+import json,sys
+want = sys.argv[1]
+try:
+    ws = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+if isinstance(ws, dict):
+    ws = ws.get("windows", [])
+for w in ws:
+    if (w.get("title") or "") == want:
+        print(w.get("id") or "")
+        break
+' "$TARGET")
+	PIN=$(grep -a "surface ${WID:-?} .*: 钉住 preferred_buffer_scale" "$LOG" 2>/dev/null | tail -1)
+	PIN_BAD=$(grep -a "surface ${WID:-?} .*: 钉住 preferred_buffer_scale = 1" "$LOG" 2>/dev/null | tail -1)
+	if echo "${PIN:-}" | grep -q "= 2"; then
+		pass "钉住了 2 倍（$(echo "$PIN" | sed 's/.*钉住/钉住/' | cut -c1-40)…）"
+	else
+		fail "没钉住 2 倍（日志里：${PIN:-没这行}）—— 客户端会被叫去按隔壁 1 倍屏渲染"
+	fi
+	if [ -z "${PIN_BAD:-}" ]; then
+		pass "滚出视口之后没有出现「= 1」的钉法（不跟着隔壁那块屏变）"
+	else
+		fail "出现了一版「= 1」的钉法：$PIN_BAD"
+	fi
+	if grep -aq "clip: $TARGET 裁到自己那块屏里" "$LOG" 2>/dev/null; then
+		pass "窗口表面树裁到自己那块屏里了（「可见面积」不会算到隔壁屏头上）"
+	else
+		fail "日志里没有「clip: $TARGET 裁到自己那块屏里」—— 可见面积算到隔壁屏上了"
+	fi
+else
+	fail "没有滚出视口的窗口，第 4b 节跳过"
 fi
 
 # --- 5 滚回视口再抓一次：两次必须一样 ---------------------------------------

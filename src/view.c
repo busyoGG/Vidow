@@ -145,12 +145,24 @@ struct wlr_box vidow_view_geometry(const struct vidow_view *view) {
  * 而且会一直那样（不是中间态）。场景节点的 src_box 就是 wlroots 画这个表面时用的
  * 源区域（缓冲像素，客户端没设 viewport 时就是整块缓冲），照它换算。 */
 static void fx_geo_tex_map(struct vidow_fx_geo *geo,
-		const struct wlr_scene_buffer *sb, const struct wlr_surface *surface) {
+		const struct wlr_scene_buffer *sb, const struct wlr_surface *surface,
+		const struct vidow_view *view) {
 	if (sb == NULL || surface == NULL) {
 		return;
 	}
-	/* 有效源区域（缓冲像素）。 */
+	/* 有效源区域（缓冲像素）：客户端声明的 viewport src 框，没设就是整块缓冲。
+	 *
+	 * 裁着的时候**不能**读节点那个字段：越界裁剪（wlroots 的 set_clip）改的就是
+	 * 它，裁完剩下的那一小条会变成整个 src_box —— 照它换算就会把那一小条拉伸
+	 * 铺满整块窗口（用户报的「表面横向拉伸变扁 + 黑边随在视口里的范围大小」）。
+	 * 那一种是 view->fx.content_box 里抄下来的**没裁过**的那一版（见
+	 * view_snapshot_content_box）。没裁的时候节点字段就是它本身，直接读。 */
 	struct wlr_fbox box = sb->src_box;
+	if (view != NULL && view->fx.clip_local.width > 0 &&
+			view->fx.content_box.width > 0.0 &&
+			view->fx.content_box.height > 0.0) {
+		box = view->fx.content_box;
+	}
 	int bw = surface->current.buffer_width;
 	int bh = surface->current.buffer_height;
 	int sw = surface->current.width;
@@ -234,7 +246,7 @@ struct vidow_fx_geo vidow_view_fx_geo(const struct vidow_view *view) {
 		geo.h = sh;
 		geo.src_w = sw;
 		geo.src_h = sh;
-		fx_geo_tex_map(&geo, sb, surface);
+		fx_geo_tex_map(&geo, sb, surface, view);
 		return geo;
 	}
 	if (sw <= 0 || sh <= 0) {
@@ -264,7 +276,7 @@ struct vidow_fx_geo vidow_view_fx_geo(const struct vidow_view *view) {
 		geo.src_w = g.width;
 		geo.src_h = g.height;
 	}
-	fx_geo_tex_map(&geo, sb, surface);
+	fx_geo_tex_map(&geo, sb, surface, view);
 	return geo;
 }
 
@@ -780,9 +792,67 @@ static struct wlr_scene_surface *find_scene_surface(struct wlr_scene_node *node,
 
 /* ------------------------------------------------------------ animation */
 
-/* 窗口**画在哪块屏上**：它现在看得见的那些屏里，缩放最大的那块（跨在两块屏上时
- * 取大的那个，理由见下面 view_scale 的注释）。看不见任何屏（藏起来的工作区、还没
- * 摆过）时返回 NULL。
+/* 窗口**属于**哪块屏：平铺 / 全屏的窗口看**它那条列**挂在哪块屏
+ * （view->column->output）—— 跟滚动视口无关，稳定。
+ *
+ * 浮动 / 弹窗返回 NULL：它们不参与滚动（geom 就是自己的绝对位置），按「现在画在
+ * 哪块屏上」算才对 —— 拖着跨屏时 view->output 还停在原来那块屏上（见 view_scale
+ * 的注释）。
+ *
+ * 为什么平铺的不能按「现在画在哪」算：平铺窗口的 geom 里含着**滚动视口的偏移**
+ * （output_arrange: x = 工作区 + 列偏移 - 视口）。窗口滚出视口之后，它画的那些
+ * 像素落在隔壁屏的布局范围里（场景是全局坐标的，见 vidow_view_in_output_box），
+ * 于是「画在哪块屏上」的答案变成隔壁那块 —— 倍率、模糊底衬、窗口录屏的取景框都
+ * 跟着错（越界的那一块本来就被裁掉了、压根不画，隔壁那块屏跟这个窗口没关系）。 */
+struct wlr_output *vidow_view_owner_output(const struct vidow_view *view) {
+	if (view->popup || view->float_mode != VIDOW_FLOAT_NONE) {
+		return NULL;
+	}
+	if (view->column == NULL) {
+		return NULL;
+	}
+	return view->column->output;
+}
+
+static bool view_clip_box(struct vidow_view *view, struct wlr_box *out);
+
+/* 「看得见的那一块」在布局坐标里的框（哪块屏上都没画着时是空的）：
+ *   停到停车位（滚出视口 / 藏起来的工作区）→ 空；
+ *   裁着（平铺窗口有一部分越出自己那块屏）→ 几何框 ∩ 自己那块屏的框；
+ *   其余（浮窗 / 正被拖的窗口 / 整块都在自己屏里）→ 几何框本身。
+ *
+ * 为什么不能直接用几何框：平铺窗口的几何框里含着**滚动视口的偏移**，滚出视口之后
+ * 会跨到隔壁屏的布局范围里 —— 照它算，倍率就落到隔壁那块屏上：2 倍屏上的窗口在
+ * 录屏 / 预览里一直按 1 倍糊着，滚回视口才清楚（用户报的「窗口滚动出去后，又按照
+ * 另一个屏幕的缩放变化了」）。裁剪（view_clip_box）裁掉的正是越界那一块，所以
+ * 「看得见的」= 几何框 ∩ 那块屏的框。 */
+static void view_visible_box(const struct vidow_view *view, struct wlr_box *out) {
+	*out = (struct wlr_box){0};
+	if (!view->mapped) {
+		return;
+	}
+	if (vidow_view_should_park(view->server, (struct vidow_view *)view)) {
+		return; /* 停到停车位：哪块屏上都没有它，判据回退到「它属于哪块屏」 */
+	}
+	struct wlr_box box = vidow_view_screen_box(view);
+	struct wlr_box clip = {0};
+	if (view_clip_box((struct vidow_view *)view, &clip)) {
+		struct wlr_box hit;
+		if (!wlr_box_intersection(&hit, &box, &clip)) {
+			return; /* 裁完不剩什么 */
+		}
+		box = hit;
+	}
+	*out = box;
+}
+
+/* 这块窗口**算在哪块屏上**（倍率 / 模糊底衬都按它）：**看得见的那一块**画在哪块
+ * 屏上 —— 它看得见的那些屏里缩放最大的那块（跨在两块屏上时取大的那个，理由见
+ * 下面 view_scale 的注释）；一点都看不见（滚出视口、藏起来的工作区、还没摆过）时
+ * 回退到「它属于哪块屏」（vidow_view_owner_output，浮动 / 弹窗没有归属时返回 NULL）。
+ *
+ * 「看得见的那一块」是关键：平铺窗口的几何框里含着滚动视口的偏移，滚出视口之后
+ * 会跨到隔壁屏的布局范围里，但那一块被裁掉了（见函数里的说明）。
  *
  * 装饰的离屏缓冲倍率（view_scale）和私有模糊底衬归哪块屏（fx.c 的
  * vidow_blur_update）都走这一个判据 —— 「这块窗口现在算在哪块屏上」只能有一个
@@ -792,44 +862,68 @@ struct wlr_output *vidow_view_display_output(const struct vidow_view *view) {
 	if (!view->mapped) {
 		return NULL;
 	}
-	struct wlr_box box = vidow_view_screen_box(view);
+	/* 判据是「**看得见**的那一块现在画在哪块屏上」：
+	 *   - 平铺窗口滚出视口时，几何框里含着滚动视口的偏移、会跨到隔壁屏的布局范围
+	 *     里 —— 但越界的那一块被裁掉了（view_clip_box / fx.clip），根本没人画。
+	 *     照几何框算，倍率就落到隔壁那块屏上（2 倍屏上的窗口录 / 预览时一直按
+	 *     1 倍糊着，滚回视口才清楚 —— 用户报的「窗口滚动出去后，又按照另一个
+	 *     屏幕的缩放变化了」）。
+	 *   - 拖着窗口跨屏的那一段**不裁**（浮窗、正被拖的窗口允许跨屏，见
+	 *     view_clip_box），可见部分就是几何框 —— 那时候必须按对面那块屏算，
+	 *     不然拖到 4K 屏上整块窗口是放大出来的（test-mixdpi 钉着这一条）。
+	 *   - 一点都看不见（滚出视口 / 藏起来的工作区 / 还没摆过）：回退到「它属于
+	 *     哪块屏」（平铺的看它那条列，浮动 / 弹窗没有归属 → NULL）。
+	 * 「看得见的那一块」由 view_visible_box 现算（不看上一帧存下来的 clip 状态：
+	 * 摆位那份比裁剪那份先跑，读存下来的会落后一帧 —— 于是「刚滚出视口」那一帧
+	 * 按几何框算成隔壁屏、把客户端的倍率钉错，见 view_pin_scale）。
+	 */
+	struct wlr_box box = {0};
+	view_visible_box(view, &box);
 	struct wlr_output *best = NULL;
 	double best_scale = 0.0;
-	struct vidow_output *output;
-	wl_list_for_each(output, &view->server->outputs, link) {
-		struct wlr_output *wlr_output = output->wlr_output;
-		if (wlr_output == NULL || !wlr_output->enabled) {
-			continue;
+	if (box.width > 0 && box.height > 0) {
+		struct vidow_output *output;
+		wl_list_for_each(output, &view->server->outputs, link) {
+			struct wlr_output *wlr_output = output->wlr_output;
+			if (wlr_output == NULL || !wlr_output->enabled) {
+				continue;
+			}
+			struct wlr_box obox;
+			wlr_output_layout_get_box(view->server->output_layout,
+				wlr_output, &obox);
+			struct wlr_box hit;
+			if (!wlr_box_intersection(&hit, &box, &obox)) {
+				continue;
+			}
+			double scale = wlr_output->scale > 0.0 ?
+				wlr_output->scale : 1.0;
+			if (scale > best_scale) {
+				best_scale = scale;
+				best = wlr_output;
+			}
 		}
-		struct wlr_box obox;
-		wlr_output_layout_get_box(view->server->output_layout, wlr_output,
-			&obox);
-		struct wlr_box hit;
-		if (!wlr_box_intersection(&hit, &box, &obox)) {
-			continue;
-		}
-		double scale = wlr_output->scale > 0.0 ? wlr_output->scale : 1.0;
-		if (scale > best_scale) {
-			best_scale = scale;
-			best = wlr_output;
-		}
+	}
+	if (best == NULL) {
+		best = vidow_view_owner_output(view);
 	}
 	return best;
 }
 
-/* 窗口**画在哪块屏上**，就按那块屏的缩放烘（取可见的那些屏里**最大**的倍率）。
- * 装饰着色器的离屏缓冲按它分配 —— 「同一块窗口在不同 DPI 的屏上都清晰」的另一半：
- * 客户端那边靠 buffer_scale 声明自己画了多大，这边靠渲染倍率保证装饰和着色器也是
- * 按设备像素画的。
+/* 窗口**属于**哪块屏就按那块屏的缩放烘（平铺的看它那条列，浮动 / 弹窗看它现在
+ * 画在哪块屏上，见 vidow_view_display_output）。装饰着色器的离屏缓冲按它分配 ——
+ * 「同一块窗口在不同 DPI 的屏上都清晰」的另一半：客户端那边靠 buffer_scale 声明
+ * 自己画了多大，这边靠渲染倍率保证装饰和着色器也是按设备像素画的。
  *
- * 判据是「画在哪块屏上」，不是「属于哪块屏的工作区」（view->output）：拖着窗口跨屏
- * 的那一段，归属要到**松手**才换，可它已经在对面那块屏上画着了。按 view->output 算，
- * 离屏缓冲还是旧倍率（实测：拖到 4K 屏上还是 2076x1236 的 1 倍缓冲），整块窗口被放大
- * 到新屏上 —— 4K 屏上一直糊着，松手（归属换了）才清楚。
+ * 浮动窗口拖着跨屏的那一段，判据是**画在哪**而不是归属（view->output）：归属要到
+ * 松手才换，可它已经在对面那块屏上画着了。按 view->output 算，离屏缓冲还是旧倍率
+ * （实测：拖到 4K 屏上还是 2076x1236 的 1 倍缓冲），整块窗口被放大到新屏上 ——
+ * 4K 屏上一直糊着，松手（归属换了）才清楚。跨在两块屏上时取大的那个倍率：客户端
+ * （GTK 那类）一碰到 2 倍屏就按 2 倍重画了，我们按 1 倍烘的话它交上来的 2 倍缓冲
+ * 还得先缩下去、屏幕上再放大 —— 还是糊。宁可多烘（画到 1 倍屏上时是缩下去，仍然
+ * 清晰），不能少烘（画到 4K 屏上是放大，糊）。
  *
- * 跨在两块屏上时取大的那个倍率：客户端（GTK 那类）一碰到 2 倍屏就按 2 倍重画了，
- * 我们按 1 倍烘的话它交上来的 2 倍缓冲还得先缩下去、屏幕上再放大 —— 还是糊。宁可
- * 多烘（画到 1 倍屏上时是缩下去，仍然清晰），不能少烘（画到 4K 屏上是放大，糊）。 */
+ * 平铺窗口不这么算：它的 geom 里含着滚动视口的偏移，滚出视口之后「画在哪块屏上」
+ * 会翻到隔壁那块去（见 vidow_view_owner_output）。 */
 static double view_scale(const struct vidow_view *view) {
 	struct wlr_output *out = vidow_view_display_output(view);
 	if (out == NULL) {
@@ -840,6 +934,48 @@ static double view_scale(const struct vidow_view *view) {
 	}
 	double scale = out->scale;
 	return scale > 0.0 ? scale : 1.0;
+}
+
+static void pin_scale_surface(struct wlr_surface *surface, int sx, int sy,
+		void *data) {
+	(void)sx;
+	(void)sy;
+	wlr_surface_set_preferred_buffer_scale(surface, *(const int32_t *)data);
+}
+
+/* 客户端按几倍渲染：**钉在它自己那块屏的倍率上**（view_scale）。子表面一起钉
+ * （mpv / vlc 那类把画面放子表面里，只钉顶层的话它们会掉回 1 倍）。
+ *
+ * 不钉会怎样：窗口滚出视口之后会被停到**所有输出框外面**的停车位
+ * （vidow_view_set_parked）—— 它就不再「在」任何输出上了，客户端（kitty 这类按
+ * 进了哪些输出算倍率的）退到 1 倍重画：4K 屏上的窗口在按窗口录屏 / 预览里变成
+ * 半分辨率、糊着，滚回视口才清楚（用户报的「窗口滚动出去后，又按照另一个屏幕的
+ * 缩放变化了」）。wl_surface.preferred_buffer_scale 的优先级**高于**「进了哪些
+ * 输出」（kitty: `integer_scale.preferred` 顶替 `deduced`），钉住它就跟滚动无关。
+ *
+ * 只在真的变了的时候发（滚动每帧都摆位置，不判一下就是每帧一个协议事件）。 */
+static void view_pin_scale(struct vidow_view *view) {
+	struct wlr_surface *surface = vidow_view_surface(view);
+	if (surface == NULL) {
+		return;
+	}
+	int32_t want = (int32_t)lround(view_scale(view));
+	if (want < 1) {
+		want = 1;
+	}
+	if (want == view->pref_scale) {
+		return;
+	}
+	view->pref_scale = want;
+	wlr_surface_set_preferred_buffer_scale(surface, want);
+	wlr_surface_for_each_surface(surface, pin_scale_surface, &want);
+	/* 带上窗口编号（IPC 那个 id）：钉是在**第一次摆放**时发生的，那会儿标题往往
+	 * 还没来 —— 日志按编号认人更稳（测试也按编号找这一行）。 */
+	wlr_log(WLR_INFO, "surface %llu %s: 钉住 preferred_buffer_scale = %d"
+		"（它那块屏的缩放，滚出视口 / 停到屏外也不跟着变）",
+		(unsigned long long)view->id,
+		vidow_view_title(view) != NULL ? vidow_view_title(view) : "(无题)",
+		want);
 }
 
 /* Redraw the view at its animated position/opacity. The tiled geometry itself
@@ -940,6 +1076,44 @@ static bool view_clip_box(struct vidow_view *view, struct wlr_box *out) {
 	return true;
 }
 
+/* 表面树在场景里挂的那个节点（wlroots 的 set_clip 要的就是它）。 */
+static struct wlr_scene_node *view_surface_tree_node(const struct vidow_view *view) {
+	if (view->scene_surface == NULL || view->scene_surface->buffer == NULL ||
+			view->scene_surface->buffer->node.parent == NULL) {
+		return NULL;
+	}
+	return &view->scene_surface->buffer->node.parent->node;
+}
+
+/* 抄一份「客户端声明的有效源区域」（缓冲像素）到 view->fx.content_box。
+ *
+ * 为什么要有这一份：越界裁剪走的是 wlroots 的
+ * wlr_scene_subsurface_tree_set_clip()，而它是**改写节点的 src_box** 实现的
+ * （裁完剩下的那一小条会变成整个 src_box）。装饰采源缓冲的哪一块照的正是这一份
+ * （见 fx_geo_tex_map）—— 直接读那个字段，就会把那一小条当成整块有效内容、
+ * 拉伸铺满整块窗口（用户报的「窗口只有一点在视口里时表面横向拉伸变扁、黑边随
+ * 在视口里的范围大小变」）。
+ *
+ * 抄之前先把上一刀撤掉：wlroots 会按客户端声明的 viewport / 缓冲重算那一次
+ * （它自己就是这么维护这个字段的），抄完再补回去。裁着的时候每来一次 commit
+ * 抄一遍 —— 客户端改 viewport（chromium 那类）之后不用等裁剪自己变。 */
+static void view_snapshot_content_box(struct vidow_view *view) {
+	struct wlr_scene_buffer *sb = view->scene_surface != NULL ?
+		view->scene_surface->buffer : NULL;
+	if (sb == NULL) {
+		return;
+	}
+	struct wlr_scene_node *node = view_surface_tree_node(view);
+	bool reclip = node != NULL && view->fx.clip_local.width > 0;
+	if (reclip) {
+		wlr_scene_subsurface_tree_set_clip(node, NULL);
+	}
+	view->fx.content_box = sb->src_box;
+	if (reclip) {
+		wlr_scene_subsurface_tree_set_clip(node, &view->fx.clip_local);
+	}
+}
+
 void vidow_view_apply_clip(struct vidow_view *view) {
 	if (view == NULL) {
 		return;
@@ -955,7 +1129,10 @@ void vidow_view_apply_clip(struct vidow_view *view) {
 	view->fx.clip_on = on;
 	view->fx.clip = box;
 	if (on != was_on) {
-		wlr_log(WLR_DEBUG, "clip: %s %s（屏框 %d,%d %dx%d，窗口 %d,%d %dx%d）",
+		/* 这是个**状态**（跟「藏起 / 显示」一样）：裁不裁决定客户端被叫去按哪块屏
+		 * 的缩放渲染（wlroots 的 wlr_scene_surface 按「可见面积最大的那块输出」
+		 * 发 preferred_buffer_scale），日志里要看得见。只在翻转时记一行。 */
+		wlr_log(WLR_INFO, "clip: %s %s（屏框 %d,%d %dx%d，窗口 %d,%d %dx%d）",
 			vidow_view_title(view) != NULL ? vidow_view_title(view) : "(无题)",
 			on ? "裁到自己那块屏里" : "不裁", box.x, box.y, box.width,
 			box.height, view->geom.x, view->geom.y, view->geom.width,
@@ -980,36 +1157,26 @@ void vidow_view_apply_clip(struct vidow_view *view) {
 	}
 	/* 这一帧画在哪儿（几何 + 动画偏移）：表面树挂在那个位置上。 */
 	struct wlr_box at = vidow_view_screen_box(view);
-	struct wlr_scene_node *node = view->scene_surface != NULL &&
-		view->scene_surface->buffer != NULL &&
-		view->scene_surface->buffer->node.parent != NULL ?
-		&view->scene_surface->buffer->node.parent->node : NULL;
+	struct wlr_scene_node *node = view_surface_tree_node(view);
 	if (node == NULL) {
 		view->fx.clip_local = (struct wlr_box){0};
 		return;
 	}
-	/* 装饰管线（fx）在画这个窗口的时候，表面那一份是隐藏的（0 透明度，见
-	 * view_anim_bake 里那次 set_opacity）：那一份**不能**裁。
+	/* 装饰管线（fx）画这个窗口的时候，表面那一份是隐藏的（0 透明度，见
+	 * view_anim_bake 里那次 set_opacity）—— 但**照样得裁**。
 	 *
-	 * 为什么不能：wlroots 的 wlr_scene_subsurface_tree_set_clip() 是靠改场景
-	 * 节点的 src_box（+ 显示尺寸）实现的，而装饰采源缓冲的哪一块正是从
-	 * src_box 算出来的（fx_geo_tex_map 把它当成「客户端声明的有效区」）。一裁，
-	 * fx 就把「裁剩下的一小条」当成整块有效内容，把那一小条**拉伸铺满整块
-	 * 窗口** —— 用户报的「窗口只有一点在视口里的时候，表面横向拉伸变扁、黑边
-	 * 随着在视口里的范围大小变」。以前这里写着「裁了也无害」，害就在 src_box
-	 * 这一条上。
+	 * 表面这一份的裁剪不只是"别把内容画到隔壁屏上"：wlroots 的
+	 * wlr_scene_surface 会替我们发 preferred_buffer_scale（客户端按几倍渲染），
+	 * 判据是「**可见面积最大**的那块输出的缩放」（见 wlr_scene.h 里
+	 * wlr_scene_surface_create 的说明）。窗口滚出视口之后它的框跨在隔壁屏上，
+	 * 不裁的话那边算出来的可见面积最大 —— 客户端就被叫去按隔壁那块屏的缩放
+	 * 重画：2 倍屏上录 / 预览这个窗口，它一直按 1 倍糊着，滚回视口才清楚
+	 * （用户报的「窗口滚动出去后，又按照另一个屏幕的缩放变化了」）。
 	 *
-	 * 装饰那份离屏缓冲本来就按同一个框裁（上面设的 fx->clip_on / fx->clip，
-	 * 见 fx.c 里那段 crop_src）—— 所以这里让开，屏幕上的裁剪一点不少。 */
-	if (view->fx.active) {
-		if (view->fx.clip_local.width > 0) {
-			/* 装饰是后接上的（decor_enabled 被改回来 / 窗口从弹出物变回来）：
-			 * 之前裁过的那一刀得撤掉，不然 src_box 一直是被裁过的那一版。 */
-			view->fx.clip_local = (struct wlr_box){0};
-			wlr_scene_subsurface_tree_set_clip(node, NULL);
-		}
-		return;
-	}
+	 * 上一版这里是「fx 开着就让开」—— 因为 set_clip 改的是 src_box，而装饰采源
+	 * 缓冲的哪一块照的正是那个字段（fx_geo_tex_map），一裁就把裁剩下的一小条
+	 * 拉伸铺满整块窗口（187）。现在那边改成认 view->fx.content_box（没裁过的
+	 * 那一版，见 view_snapshot_content_box），裁剪和装饰就互不干扰了。 */
 	if (on) {
 		/* 表面局部坐标（逻辑单位，wlroots 自己乘缓冲倍率）。原点取**这一帧
 		 * 画在哪儿**（几何 + 动画偏移）：表面树挂在那个位置上，减布局目标
@@ -1020,6 +1187,9 @@ void vidow_view_apply_clip(struct vidow_view *view) {
 			.width = box.width, .height = box.height,
 		};
 		if (!wlr_box_equal(&local, &view->fx.clip_local)) {
+			/* 下刀之前先抄一份没裁过的有效区（撤销上一刀 → wlroots 重算
+			 * src_box → 读出来 → 再补回去），装饰那边只认这一份。 */
+			view_snapshot_content_box(view);
 			view->fx.clip_local = local;
 			wlr_scene_subsurface_tree_set_clip(node, &local);
 		}
@@ -1329,6 +1499,10 @@ static void view_anim_place(struct vidow_view *view) {
 
 	wlr_scene_node_set_position(&view->scene_tree->node, x, y);
 	vidow_fx_set_alpha(&view->scene_tree->node, alpha);
+
+	/* 客户端该按几倍渲染也在这儿钉（跟位置一起，每帧一次、只在真的变了时发）：
+	 * 停到停车位之后它就不在任何输出上了，不钉的话客户端会掉回 1 倍。 */
+	view_pin_scale(view);
 
 	if (!view->fx.active || view->scene_surface == NULL) {
 		return;
@@ -3220,6 +3394,11 @@ enum vidow_surface_damage vidow_view_surface_damage(struct vidow_view *view,
 static void view_commit(struct wl_listener *listener, void *data) {
 	(void)data;
 	struct vidow_view *view = wl_container_of(listener, view, commit);
+
+	/* 客户端交帧了：它声明的有效源区域（wp_viewport 的 src 框）可能跟着变了，
+	 * 抄一份没裁过的那一版给装饰用（裁着的时候这个字段是被 set_clip 改过的，
+	 * 见 view_snapshot_content_box）。没裁的时候只是读一下，很便宜。 */
+	view_snapshot_content_box(view);
 
 	/* 帧追踪（VIDOW_TRACE_FRAMES=1）：客户端在这里交帧。只记「真画在这块屏上、
 	 * 还显示着」的那些 —— 视口外的窗口本来就没人给它出帧，记了就是误报。
