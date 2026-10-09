@@ -12,9 +12,10 @@
 # view_request_maximize）。
 #
 # 判据（headless 1280x720 一块屏 + tools/preinit 客户端）：
-#   1) 抢跑 set_maximized：vidow 活着，客户端拿到 configure，且那个 configure 里
-#      **没有** maximized（合成器答的是「不最大化」），窗口正常进列表
-#   2) 对照组：上屏之后再 set_maximized（正常时序）同样活着、同样答「不最大化」
+#   1) 抢跑 set_maximized：vidow 活着，客户端拿到 configure，而且**第一个** configure
+#      就带 maximized（vidow 现在有列最大化了，请求兑现成「它那条列最大化」，见
+#      changelog 177），窗口正常进列表
+#   2) 对照组：上屏之后再 set_maximized（正常时序）同样活着、同样兑现
 #   3) 抢跑 set_minimized：vidow 活着，窗口状态真的是 minimized（请求没被丢掉）
 #   4) 抢跑 set_fullscreen：vidow 活着，而且**兑现**了 —— 窗口 fullscreen=true，
 #      客户端拿到的 configure 里带 fullscreen（不是「布局当它全屏、客户端不知道」）
@@ -161,7 +162,7 @@ else:
 
 # ---------------------------------------------------------------- 1/3 最大化抢跑
 
-mark "1/4 抢跑 set_maximized（第一次 commit 之前）"
+mark "1/4 抢跑 set_maximized（第一次 commit 之前）—— 兑现成列最大化"
 start_vidow
 start_preinit "$RUNDIR/out1" "preinit mapped" --maximize --linger=2 preinit 抢跑
 sleep 0.4
@@ -186,12 +187,13 @@ else
 	fail "客户端一次 configure 都没收到"
 fi
 
-if grep -aq "preinit configure" "$RUNDIR/out1" &&
-		! grep -aq "maximized" "$RUNDIR/out1"; then
-	pass "应答里没有 maximized（合成器说的是「不最大化」，states 只有 activated 之类）"
-else
-	fail "configure 里出现了 maximized：$(grep -a 'preinit configure' "$RUNDIR/out1" | tr '\n' '|')"
-fi
+FIRST1=$(grep -a "preinit configure" "$RUNDIR/out1" | head -1)
+case "$FIRST1" in
+*maximized*)
+	pass "第一个 configure 就带 maximized（抢跑的最大化请求被兑现了：$FIRST1）" ;;
+*)
+	fail "第一个 configure 里没有 maximized：$FIRST1" ;;
+esac
 
 if grep -aq "preinit configure" "$RUNDIR/out1" &&
 		! grep -aq "0x0" "$RUNDIR/out1"; then
@@ -236,10 +238,10 @@ else
 	fail "对照组没走完：$(tr '\n' '|' < "$RUNDIR/out2")"
 fi
 
-if ! grep -aq "maximized" "$RUNDIR/out2"; then
-	pass "应答里没有 maximized"
+if grep -aq "preinit configure.*maximized" "$RUNDIR/out2"; then
+	pass "应答里带 maximized（列最大化被兑现，客户端知道）"
 else
-	fail "configure 里出现了 maximized"
+	fail "configure 里没有 maximized：$(grep -a 'preinit configure' "$RUNDIR/out2" | tr '\n' '|')"
 fi
 
 if [ "$(win_field 对照 visible)" = "true" ]; then

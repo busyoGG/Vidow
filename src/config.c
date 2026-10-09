@@ -1045,6 +1045,7 @@ static void print_keys_lua(FILE *f) {
 "vidow.bind(\"Mod+V\", \"toggle-floating\")\n"
 "vidow.bind(\"Mod+Shift+Space\", \"toggle-floating\")\n"
 "vidow.bind(\"Mod+F\", \"toggle-fullscreen\")\n"
+"vidow.bind(\"Mod+Shift+F\", \"maximize-column\")\n"
 "vidow.bind(\"Mod+R\", \"cycle-column-width\")\n"
 "vidow.bind(\"Mod+M\", \"minimize-window\")\n"
 "vidow.bind(\"Mod+Shift+M\", \"restore-window\")\n"

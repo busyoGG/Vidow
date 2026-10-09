@@ -864,6 +864,9 @@ static bool cmd_set_column_width(struct vidow_server *server, struct jval *req,
 		want = 1.0;
 	}
 	col->width_fraction = want;
+	/* 手动指定宽度 = 退出「列最大化」这个状态（最大化是「记住原宽度再还原」，
+	 * 用户自己给了宽度就以用户的为准，见 server.h 的 vidow_column.maximized）。 */
+	col->maximized = false;
 	vidow_arrange(server);
 	jb_obj(out);
 	jb_key(out, "column");
@@ -880,10 +883,57 @@ static bool cmd_expand_column_to_available_width(struct vidow_server *server,
 		return false;
 	}
 	server->focused->column->width_fraction = 1.0;
+	/* 同上：手动改宽度退出最大化状态（要「记住原宽度、还能还原」就用
+	 * toggle-maximize-column）。 */
+	server->focused->column->maximized = false;
 	vidow_arrange(server);
 	jb_obj(out);
 	jb_key(out, "column");
 	vidow_ipc_json_column(out, server, server->focused->column);
+	jb_obj_end(out);
+	return true;
+}
+
+static bool cmd_toggle_maximize_column(struct vidow_server *server,
+		struct jval *req, struct jbuf *out, char *err, size_t errlen) {
+	/* 指认窗口的选项（--id / --title / …）认；不给就动聚焦的那个。 */
+	struct vidow_view *view = req_view(server, req, err, errlen);
+	if (view == NULL) {
+		return false;
+	}
+	struct vidow_column *col = view->column;
+	if (col == NULL) {
+		snprintf(err, errlen, "这个窗口不在列里（浮窗没有列）");
+		return false;
+	}
+	vidow_column_set_maximized(col, !col->maximized);
+	jb_obj(out);
+	jb_key(out, "column");
+	vidow_ipc_json_column(out, server, col);
+	jb_obj_end(out);
+	return true;
+}
+
+static bool cmd_set_maximize_column(struct vidow_server *server,
+		struct jval *req, struct jbuf *out, char *err, size_t errlen) {
+	struct vidow_view *view = req_view(server, req, err, errlen);
+	if (view == NULL) {
+		return false;
+	}
+	struct vidow_column *col = view->column;
+	if (col == NULL) {
+		snprintf(err, errlen, "这个窗口不在列里（浮窗没有列）");
+		return false;
+	}
+	bool want = false;
+	if (!jget_bool(req, "maximized", &want)) {
+		snprintf(err, errlen, "要 maximized = true / false");
+		return false;
+	}
+	vidow_column_set_maximized(col, want);
+	jb_obj(out);
+	jb_key(out, "column");
+	vidow_ipc_json_column(out, server, col);
 	jb_obj_end(out);
 	return true;
 }
@@ -2075,6 +2125,12 @@ static bool ipc_run(struct vidow_server *server, struct ipc_client *c,
 	}
 	if (strcmp(cmd, "center_column") == 0) {
 		return cmd_center_column(server, req, out, err, errlen);
+	}
+	if (strcmp(cmd, "toggle_maximize_column") == 0) {
+		return cmd_toggle_maximize_column(server, req, out, err, errlen);
+	}
+	if (strcmp(cmd, "set_maximize_column") == 0) {
+		return cmd_set_maximize_column(server, req, out, err, errlen);
 	}
 
 	/* 工作区 */

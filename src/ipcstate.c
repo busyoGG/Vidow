@@ -153,6 +153,7 @@ void vidow_ipc_json_column(struct jbuf *b, struct vidow_server *server,
 	jb_obj(b);
 	jb_kv_uint(b, "id", col->id);
 	jb_kv_double(b, "width_fraction", col->width_fraction);
+	jb_kv_bool(b, "maximized", col->maximized);
 	jb_kv_int(b, "width", col->width);
 	jb_kv_int(b, "offset", col->offset);
 	jb_kv_str(b, "workspace", col->ws != NULL ? col->ws->name : NULL);
@@ -1283,6 +1284,19 @@ void vidow_ipc_emit_layer(struct vidow_server *server, const char *event,
 		return;
 	}
 	emit(server, event, payload_layer, ls);
+}
+
+static void payload_column(struct jbuf *b, struct vidow_server *server,
+		void *data) {
+	vidow_ipc_json_column(b, server, data);
+}
+
+void vidow_ipc_emit_column(struct vidow_server *server, const char *event,
+		struct vidow_column *col) {
+	if (!vidow_ipc_wanted(server) || col == NULL) {
+		return;
+	}
+	emit(server, event, payload_column, col);
 }
 
 void vidow_ipc_emit_note(struct vidow_server *server, const char *event) {

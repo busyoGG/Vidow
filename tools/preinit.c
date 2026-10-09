@@ -18,12 +18,19 @@
  *               [--linger=秒] [--timeout=秒] [app_id] [标题]
  *   --maximize / --minimize / --fullscreen  要发的状态请求（可叠加；缺省 maximize）
  *   --after-commit   改成上屏（第一次 commit）之后再发 —— 对照组：这条本来就好
+ *   --none           什么状态请求都不发（缺省是 --maximize）。用来当「从来没要过
+ *                    最大化」的客户端：它后来随手发的 set_maximized(false) 不该把
+ *                    用户自己按出来的最大化撤掉
+ *   --unmaximize-after=毫秒  上屏之后再等这么久，补一个 set_maximized(false)：
+ *                    用来验「客户端撤销最大化」那条路（用户自己按出来的最大化不该
+ *                    被客户端随手撤掉；客户端自己要来的才理）
  *   --linger=秒       上屏之后再活多久（缺省 3 秒；0 = 上屏就退）
  *   --timeout=秒      总时限，到点无条件退出（缺省 6 秒）—— 最小化那条拿不到
  *                     configure，靠它收尾
  *
  * 输出（一行一条，方便断言）：
  *   preinit request <名字> <before|after>-commit
+ *   preinit request unmaximize after-map
  *   preinit configure <宽>x<高> states=[...]
  *   preinit mapped <毫秒>
  *   preinit exit <毫秒>
@@ -63,8 +70,11 @@ static const char *app_id = "preinit";
 static const char *title = "抢跑";
 static bool want_maximize, want_minimize, want_fullscreen;
 static bool after_commit;
+static bool no_request;
 static int linger_ms = 3000;
 static int timeout_ms = 6000;
+static int unmaximize_after_ms = -1;
+static bool unmaximize_sent;
 
 static bool mapped;
 static int mapped_ms = -1;
@@ -273,6 +283,10 @@ int main(int argc, char *argv[]) {
 			want_fullscreen = true;
 		} else if (strcmp(a, "--after-commit") == 0) {
 			after_commit = true;
+		} else if (strcmp(a, "--none") == 0) {
+			no_request = true;
+		} else if (strncmp(a, "--unmaximize-after=", 19) == 0) {
+			unmaximize_after_ms = atoi(a + 19);
 		} else if (strncmp(a, "--linger=", 9) == 0) {
 			linger_ms = atoi(a + 9) * 1000;
 		} else if (strncmp(a, "--timeout=", 10) == 0) {
@@ -290,7 +304,7 @@ int main(int argc, char *argv[]) {
 	if (argi < argc) {
 		title = argv[argi++];
 	}
-	if (!want_maximize && !want_minimize && !want_fullscreen) {
+	if (!want_maximize && !want_minimize && !want_fullscreen && !no_request) {
 		want_maximize = true;
 	}
 	clock_gettime(CLOCK_MONOTONIC, &start);
@@ -373,6 +387,15 @@ int main(int argc, char *argv[]) {
 			break;
 		}
 		int now = ms_since_start();
+		if (mapped && !unmaximize_sent && unmaximize_after_ms >= 0 &&
+				now >= mapped_ms + unmaximize_after_ms) {
+			/* 上屏之后补一个「撤销最大化」：客户端自己发的那种。 */
+			unmaximize_sent = true;
+			printf("preinit request unmaximize after-map\n");
+			fflush(stdout);
+			xdg_toplevel_unset_maximized(toplevel);
+			wl_display_flush(display);
+		}
 		if (mapped && linger_ms >= 0 && now >= mapped_ms + linger_ms) {
 			break;
 		}

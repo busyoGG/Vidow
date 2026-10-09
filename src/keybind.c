@@ -513,6 +513,18 @@ bool vidow_action_run(struct vidow_server *server, const char *action) {
 		log_action(action, "列宽 1/3 → 1/2 → 2/3");
 		return true;
 	}
+	if (strcmp(name, "maximize-column") == 0 ||
+			strcmp(name, "toggle-maximize-column") == 0) {
+		/* niri 的 maximize-column：整列撑满工作区宽度，再按一次还原成原来那个
+		 * 比例。没有聚焦窗口 / 浮窗（没有列）时什么也不发生。 */
+		if (server->focused != NULL && server->focused->column != NULL) {
+			struct vidow_column *col = server->focused->column;
+			bool want = !col->maximized;
+			vidow_column_toggle_maximized(server);
+			log_action(action, want ? "列最大化" : "列还原");
+		}
+		return true;
+	}
 	if (strcmp(name, "toggle-overview") == 0 ||
 			strcmp(name, "overview") == 0) {
 		vidow_overview_toggle(server);

@@ -61,6 +61,9 @@
 - 新窗口在**焦点列的右侧**新开一列
 - 焦点移动时，视口按「最小滚动量」保证焦点列完整可见
 - 列宽默认占工作区 50%，可按列循环切换 1/3 → 1/2 → 2/3
+- 列可以**最大化**（`Mod+Shift+F`）：整列撑满工作区宽度，再按一次还原成**原来那个比例**
+  （不是写死的 50%）；客户端 `set_maximized` 也映射到它（vidow 没有窗口级最大化 —— 列是
+  布局的最小单位），见「列最大化」一节
 - 窗口在列内纵向均分高度
 
 ### 配置键与配置族
@@ -269,6 +272,7 @@ end
 | `toggle-floating` | 焦点窗口 平铺 ⇄ 浮动 |
 | `toggle-fullscreen`（`fullscreen` 同义） | 焦点窗口全屏开关 |
 | `cycle-column-width` | 列宽 1/3 → 1/2 → 2/3 |
+| `maximize-column`（`toggle-maximize-column` 同义） | 整列最大化：撑满工作区宽度，再按一次还原成原来那个比例 |
 | `toggle-overview`（`overview` 同义） | niri 风格全景开关 |
 | `spawn <命令>`（`exec` 同义） | 撒手跑一条 shell 命令（双 fork、不等它、不阻塞渲染） |
 | `switch-vt <1..12>` | 切 tty（没有会话时只记一行日志，交给宿主） |
@@ -349,6 +353,56 @@ X11 客户端一启动就是图标化状态（托盘类程序会这么开）时�
 `./test-minimize.sh`：IPC 与动作串、条带合拢、同列撑满、焦点交接、放回原位、浮窗、
 整列收起、客户端自己请求（`tools/frames.c` 的 `VIDOW_TEST_MINIMIZE_MS`）、
 `force_render` 的窗口收起来照样出帧、SIGHUP 不改状态、X11 的 `WM_STATE` 来回切。
+
+## 列最大化（niri 的 `maximize-column`）
+
+`Mod+Shift+F`（动作 `maximize-column`，IPC `toggle-maximize-column` / `set-maximize-column`）
+把焦点列撑满工作区宽度，再按一次还原成**原来那个比例**（记在 `vidow_column.maximized_saved`
+里）—— 0.25 改成最大化再还原还是 0.25，不是回到默认的 0.5。状态在 `columns` 的 `maximized`
+里，变化时发 `column-maximize-changed`。
+
+vidow **没有窗口级最大化**：列是布局的最小单位（窗口在列内纵向均分高度），所以「最大化一个
+窗口」只能是「最大化它所在的那条列」。手动改宽度（`cycle-column-width` / `set-column-width` /
+`expand-column-to-available-width`）就是退出这个状态 —— 那几个动作只改宽度、不记原值。
+
+### 客户端 `set_maximized` 怎么映射
+
+| 客户端做的事 | vidow 做的事 |
+| --- | --- |
+| `xdg_toplevel.set_maximized(true)` / X11 的 `_NET_WM_STATE_MAXIMIZED_*` 立起来 | 把它那条列最大化，并记下「这次是它要的」；回一个 `maximized = true` 的 configure（X11 那边写 `_NET_WM_STATE_MAXIMIZED_VERT` + `HORZ`） |
+| 同一个客户端再请求撤销（`false`） | 列还原 —— **只有它自己要来的才理** |
+| **从来没要过**的客户端发 `set_maximized(false)` | 列是用户按出来的，不理它的撤销：照当前实际状态回话（列最大化的照样答「最大化」），不然客户端和布局各说各话 |
+| 浮窗（没有列）请求最大化 | 回一个「不最大化」（浮窗的尺寸是它自己定的，vidow 不替它撑满） |
+
+第一次 commit **之前**就 `set_maximized` 的客户端（Qt/KDE 恢复「上次是最大化」的窗口就是这么
+开窗的，kate 首当其冲）在 `view_commit` 的 `initial_commit` 分支里兑现 —— 那时候列才建出来，
+而且早于第一次 arrange，所以它拿到的**第一个** configure 就带 `maximized`（晚一步就按「没
+最大化」排过一遍，客户端还会先收到一个 `maximized=false`）。这条路上不能直接调
+`wlr_xdg_toplevel_set_maximized()`：surface 还没 initialized 时它内部是
+`assert(surface->initialized)`（wlroots 0.20.2：`types/xdg_shell/wlr_xdg_surface.c:168`），
+当场 abort —— 和全屏那条（changelog 144 / `test-preinit.sh`）是同一个坑。
+
+X11 那边多一层小心：`wlr_xwayland_surface_set_maximized()` 写下去之后，客户端可能把
+`_NET_WM_STATE` 回写过来又触发一次 `request_maximize`（X11 没有「请求-应答」，状态就是属性
+本身）。所以 X11 那条路**状态一致就直接返回**，不给自己回声的机会（不然就是「我们设属性 →
+客户端回写 → 信号又来 → 再设一次」转圈）。
+
+### 和全屏的区别
+
+|  | `Mod+F` 全屏 | `Mod+Shift+F` 列最大化 |
+| --- | --- | --- |
+| 几何 | 占满工作区、置顶压过别的列 | 整列撑满工作区宽度（其他列还在条带上，被推到视口外） |
+| 客户端知道吗 | 知道（`set_fullscreen`：播放器会真全屏、藏 UI） | 知道（`set_maximized`，但客户端仍按普通窗口画） |
+| 同列别的窗口 | 让位（不参与高度均分） | 照旧（列宽变了，高度还是均分） |
+
+两个状态互不干扰，可以叠着用（全屏的窗口同时属于一条最大化的列）。
+
+### 测试
+
+`./test-maximize.sh`（60 项断言，28 秒）：IPC 开关与几何、还原回原比例、手动改宽度退出
+最大化、键位动作名、客户端上屏之后请求 / 抢跑请求（第一个 configure 就带 `maximized`）、
+用户按出来的最大化客户端撤不掉、客户端自己要来的撤销就理、`column-maximize-changed` 事件、
+浮窗当场报错、X11 的 `wmctrl` 请求与 `_NET_WM_STATE` 来回切。
 
 ## 视口外强制渲染（窗口规则 / 录屏 / 窗口预览）
 
@@ -789,6 +843,7 @@ python3 test-float.py        # 三个真实 GTK 窗口，验证浮动模式自�
 ./test-input-inject.sh               # 输入注入：鼠标 / 键盘合成事件到客户端（全 headless，54 项断言）
 ./test-pointer-lock.sh               # 指针约束：锁鼠标 / 夹光标 / 相对位移，X11 的 XGrabPointer 也认（全 headless，27 项断言）
 ./test-keyboard-grab.sh              # 键盘那两个协议：快捷键抑制（含逃生口）+ X11 的 XGrabKeyboard（全 headless，30 项断言）
+./test-maximize.sh                   # 列最大化（niri 的 maximize-column）：客户端 set_maximized 也映射到它（全 headless，60 项断言）
 ./test-cursor-shake.sh              # 摇晃找光标：线性加 + 补间、晃到屏幕那么大，截图里没有它（全 headless，55 项断言）
 ./test-geometry.sh                   # 窗口几何和表面尺寸对不上时内容铺满框（chromium 改大小那 1-2 秒）（全 headless，6 项断言）
 ./test-viewport-crop.sh              # 客户端用 wp_viewport 只声明缓冲的一部分时，装饰按那块采（chromium，5 项断言）
@@ -890,6 +945,7 @@ vidow.bind("Mod+Escape", "quit", { inhibited = true })
 | `Mod+右键拖动` | 缩放浮动窗口 |
 | `Mod+R` | 列宽循环 1/3 → 1/2 → 2/3 |
 | `Mod+F` | 当前窗口全屏切换 |
+| `Mod+Shift+F` | 当前列最大化 ⇄ 还原（见「列最大化」一节） |
 | `Mod+O` | niri 风格全景（overview）：整条列带缩小铺满这块屏，点谁去谁 |
 | `Mod+Q` | 关闭当前窗口 |
 | `Mod+M` / `Mod+Shift+M` | 收起当前窗口 / 放回最近收起来的那个（见「最小化」一节） |
@@ -1455,7 +1511,7 @@ vidow 自己的，比如 `vidow-wayland-1.sock`）；`ipc_socket` 可以写死�
 | --- | --- |
 | `state` | 下面所有的 + 计数（窗口 / 列 / 输出 / 工作区 / layer / 客户端 / 动画 / 订阅者） |
 | `windows` | 每个窗口：`id`、`kind`（xdg / x11）、`title`、`app_id`、`pid`、`geometry`（布局坐标）、`float_geometry`、`surface`（表面尺寸 / 缓冲 / scale / `tex_u0`+`tex_v0`+`tex_du`+`tex_dv` 装饰正在采源缓冲的哪一块 + `frame_width`+`frame_height` 装饰画出来的框——客户端不接受 configure 时会比布局槽位大）、`column`（列 id / 宽比 / 偏移 / 序号）、`workspace`、`output`、`home`、`floating` + `float_mode`、`fullscreen`、`minimized`、`mapped` / `visible`、`rules`（三条规则的实际取值）、`size_hints`、`anim_*`、`force_render`、`capture_holders`、X11 还多一份 `x11` 子对象 |
-| `columns` | 每条列：`id`、`width_fraction`、算出来的 `width` / `offset`、序号、里面的窗口 |
+| `columns` | 每条列：`id`、`width_fraction`、`maximized`（是不是最大化的那条列，最大化时 `width_fraction` 顶到 1.0）、算出来的 `width` / `offset`、序号、里面的窗口 |
 | `workspaces` | 每块工作区：名字、`special`、`active` / `visible` / `shown`、住哪块屏 / 归属哪块屏、滚动位置、列与窗口、离开时的焦点窗口（**特殊工作区也在列表里**，`special = true`；Lua 的 `vidow.workspace_list()` 不给它） |
 | `outputs` | 每块屏：连接器名 / 描述 / make / model、`enabled`、`scale`、`transform`、刷新率、物理尺寸、布局矩形、`usable_area`、`viewport_x`、活动 / 显示着的工作区、它上面的工作区 / 窗口 / layer、**所有可用模式**、`adaptive_sync` / `vrr_supported`、`depth` / `render_format`、`primaries` / `transfer_functions` / `hdr_capable`（这块屏**自己报**的色彩能力，HDR 可行性就看它）、模糊贴图状态 |
 | `layers` | 每个 layer surface：`namespace`、`layer`、`output`、`mapped`、`exclusive_zone`、`keyboard_interactivity`、`anchor`、`margin`、想要 / 实际尺寸、几何 |
@@ -1475,7 +1531,7 @@ vidow 自己的，比如 `vidow-wayland-1.sock`）；`ipc_socket` 可以写死�
 | 类别 | 命令 |
 | --- | --- |
 | 窗口 | `focus-window`、`activate-window`（= 点通知：先把工作区端出来再给焦点）、`close-window`、`minimize-window`、`unminimize-window`（不带参数 = 最近收起来的那个）、`toggle-minimize`、`toggle-floating`、`set-floating`、`toggle-fullscreen`、`set-fullscreen`、`set-window-size`、`set-window-position`、`center-window`、`set-window-force-render`、`focus-window-direction`、`move-window-direction`、`move-window-to-workspace`、`move-window-to-special`、`move-window-to-output` |
-| 列 | `focus-column`、`move-column`、`cycle-column-width`、`set-column-width`（`fraction` 绝对值 / `delta` 相对）、`expand-column-to-available-width`、`center-column` |
+| 列 | `focus-column`、`move-column`、`cycle-column-width`、`set-column-width`（`fraction` 绝对值 / `delta` 相对）、`expand-column-to-available-width`、`center-column`、`toggle-maximize-column`、`set-maximize-column`（`maximized` true/false） |
 | 工作区 | `focus-workspace`（名字 / `next` / `prev` / `index`）、`toggle-special`（= `focus-special`）、`create-workspace`、`move-workspace-to-output` |
 | 输出 | `output-power`（`on` / `off` / `toggle`）、`output-enable` / `output-disable` / `output-toggle`、`output-scale`（数字或 `auto`）、`output-transform`、`output-mode`（宽 高 [刷新率]）、`output-position`、`output-focus` |
 | 剪贴板 | `clipboard`（查状态）、`clipboard-get`（取数据：文本或 base64）、`clipboard-set`（放数据：文本 / base64 / 指定 mime / 指定选区）、`clipboard-clear` |
@@ -1511,6 +1567,7 @@ vidow 自己的，比如 `vidow-wayland-1.sock`）；`ipc_socket` 可以写死�
 | `window-moved` | 布局把它挪了 / 缩了（第一次摆放也报） |
 | `window-focus-changed` | 键盘焦点换人（载荷是新的焦点窗口，没有就是 `null`） |
 | `window-floating-changed` / `window-fullscreen-changed` / `window-workspace-changed` | 浮动 / 全屏 / 工作区变了 |
+| `column-maximize-changed` | 那条列的最大化状态变了（载荷是列的完整对象，带 `maximized`） |
 | `workspace-created` / `workspace-activated` / `workspace-changed` / `workspace-special-changed` | 工作区建了 / 切了 / 换屏了 / 特殊工作区开关了 |
 | `output-added` / `output-removed` / `output-changed` | 屏插拔 / 开关 / 缩放 / 方向 / 模式 / 位置变了 |
 | `layer-mapped` / `layer-unmapped` / `layer-closed` | layer surface 上屏 / 下屏 / 没了 |
@@ -2820,7 +2877,8 @@ o''  = -ω²·(o_i - d_i) - c·o_i'   弹簧把偏移拉向 d_i
 src/server.h   共享类型（view / column / output / layer / keyboard）与前向声明
 src/main.c     启动：display/backend/renderer/scene/seat/layer-shell/vkbd/vptr、socket、事件循环
 src/output.c   output 创建、frame 提交、request_state、usable_area 初始化、动画/捕获看门狗
-src/view.c     列模型、滚动布局、焦点/移动/改宽、激活（vidow_view_activate：先把窗口那块
+src/view.c     列模型、滚动布局、焦点/移动/改宽/列最大化（vidow_column_set_maximized，
+               客户端 set_maximized 也走它）、激活（vidow_view_activate：先把窗口那块
                工作区端出来再给焦点）、窗口生命周期（xdg-toplevel 和 X11 两种壳，差别收在
                vidow_view_* 访问器里）、X11 缓冲区倍数声明、popup
 src/float.c    浮动模式识别与放置、交互式移动/缩放 grab
@@ -2983,12 +3041,20 @@ test-frametrace.sh  帧追踪：某块屏的帧链断了（page-flip 不回来�
                    要过几帧、谁要的、客户端还在交帧）
 test-preinit.sh    状态请求抢跑：客户端在第一次 commit **之前**就 set_maximized /
                    set_minimized / set_fullscreen（xdg-shell 允许），合成器不许在
-                   `assert(surface->initialized)` 上 abort；抢跑的最大化答「不最大化」、
-                   抢跑的最小化真的收起来、抢跑的全屏**兑现**（两边状态一致）
+                   `assert(surface->initialized)` 上 abort；抢跑的最大化**兑现**成列最大化
+                   （第一个 configure 就带 maximized，见 changelog 177）、抢跑的最小化真的
+                   收起来、抢跑的全屏**兑现**（两边状态一致）
 test-minimize.sh   最小化：窗口留在原列里（不占位 / 不显示 / 不参与焦点），条带合拢、
                    同列剩下的撑满、焦点交给邻居、放回回原位、浮窗也认、整列收起、
                    客户端自己请求（`xdg_toplevel.set_minimized`）、`force_render` 的窗口
                    收起来照样出帧、SIGHUP 不改状态、X11 的 `WM_STATE` Iconic ⇄ Normal
+test-maximize.sh   列最大化（niri 的 `maximize-column`）：整列撑满工作区宽度、再按一次还原成
+                   **原来那个比例**（0.25 改了再最大化再还原还是 0.25）、手动改宽度就是退出
+                   最大化状态、`maximize-column` 动作名；客户端 `set_maximized` 映射到它 ——
+                   上屏之后请求的、第一次 commit **之前**抢跑请求的（第一个 configure 就带
+                   `maximized`，合成器不许在 wlroots 那句 assert 上 abort）、**用户**按出来的
+                   最大化客户端随手撤销撤不掉、客户端自己要来的撤销就理；`column-maximize-changed`
+                   事件、浮窗当场报错、X11 的 `wmctrl` 请求与 `_NET_WM_STATE` 来回切
 test-input-inject.sh 输入注入：`move-cursor` / `pointer-button` / `pointer-scroll` /
                   `send-key` / `type-text` 合成的事件**真的到客户端了**（拿 wev 当观察者）：
                   窗口内坐标、相对移动、连点、滚轮的 value120 与连续滚动的区别、
@@ -3908,6 +3974,65 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
        口子（screencopy / ext-image-copy-capture 同样对所有客户端开放，grim / OBS 靠它），
        而要收就得连它一起收 —— 那会把 grim / wf-recorder / OBS 全废掉。要边界得靠 sandbox
        那一层（别的进程拿不到 wayland socket），不是合成器。
+
+177. **补上列最大化（niri 的 `maximize-column`）**（用户问「现在有没有窗口全屏的功能？顺便补上
+      窗口最大化」）。
+
+      ① **全屏本来就有，最大化确实没有**：`toggle-fullscreen`（`Mod+F` / IPC）走的是客户端
+      `set_fullscreen` + 占满工作区 + 置顶；而最大化的两个信号（`view_request_maximize` /
+      `x11_request_maximize`）是**一律回绝**的（回一个「不最大化」，只为了让客户端别卡在等待里）。
+      缺了的后果：想「吃满整块工作区、但别让播放器真的进全屏模式（藏 UI / 换模式）」这件事没别的
+      办法；kate 那种「上次是最大化」的窗口每次开回来都是半宽。
+
+      ② **语义选了 niri 的列最大化**（用户选的）：列是 vidow 布局的最小单位（窗口在列内纵向
+      均分高度），所以「最大化一个窗口」只能是「最大化它所在的那条列」——整列撑满工作区宽度，
+      再按一次还原成**原来那个比例**（`maximized_saved` 记着，0.25 → 最大化 → 还原还是 0.25，
+      不是回到默认的 0.5）。状态入口只有一个：`vidow_column_set_maximized()`（`src/view.c`），
+      IPC `toggle-maximize-column` / `set-maximize-column`、动作 `maximize-column`（默认键位
+      `Mod+Shift+F`，和 `Mod+F` 全屏挨着）、`columns` 里多一个 `maximized`、事件
+      `column-maximize-changed`。**手动改宽度 = 退出这个状态**（`cycle-column-width` /
+      `set-column-width` / `expand-column-to-available-width` 那几个只改宽度、不记原值）。
+      列里每个客户端都会收到 `set_maximized` 的应答（xdg 的 configure / X11 的
+      `_NET_WM_STATE_MAXIMIZED_VERT`+`HORZ`），新开进一条已最大化列的窗口也补一个
+      —— 客户端以为自己是普通尺寸、布局却按整列宽度摆它，那种「一半一半」的状态最难看。
+
+      ③ **客户端 `set_maximized` 照办，但分两种撤销**（用户选的「照办，映射成同一个状态」）：
+      要最大化就最大化它那条列，并记下「这次是它要的」；同一个客户端再撤销就理（列还原）。
+      而**从来没要过**的客户端发 `set_maximized(false)`（有些工具包开完窗顺手来一下）不理它
+      —— 列是用户按 `Mod+Shift+F` 要来的，照当前实际状态回话就行。浮窗（没有列）照旧回
+      「不最大化」。X11 那边还多一层：`wlr_xwayland_surface_set_maximized()` 写下去之后客户端
+      可能把 `_NET_WM_STATE` 回写、又触发一次 `request_maximize`（X11 没有请求-应答，状态就是
+      属性本身），所以 X11 那条路**状态一致就直接返回**，不给自己回声的机会。
+
+      ④ **判据 `./test-maximize.sh`（新，60 项断言，28 秒）**：headless 一块 1280x720 屏，
+      `tools/pattern.py` 造一条对照列，`tools/preinit.c` 当「会报告自己被 configure 成什么状态」
+      的客户端（它本来就有 `--maximize` / `--after-commit`，这轮加了 `--none` = 什么请求都不发、
+      `--unmaximize-after=毫秒` = 上屏之后再补一个 `set_maximized(false)`）。实测：
+        - 0.5 x 1268 = 634 的列按一下 → `maximized=true`、`width_fraction` 1.0、`width` 1268、
+          窗口 place 从 `6,6 634x708` 变成 `6,6 1268x708`；再按一次回到 `6,6 634x708`；
+        - 先 `set-column-width 0.25` 再最大化再还原 → 回到 0.25（317），不是 0.5；
+        - `cycle-column-width` 在最大化状态下按 → `maximized=false` 且宽度是 1/3（满宽再循环
+          回到最窄那一档）；
+        - 客户端上屏之后请求：列最大化 + 它**第一帧**那个 configure 不带 `maximized`、请求之后
+          收到一个带的；抢跑请求（第一次 commit 之前）：合成器没崩，而且**第一个** configure
+          就带 `maximized`；
+        - 用户（IPC）最大化之后，一个从没要过最大化的客户端发 `set_maximized(false)` → 列
+          **还是**最大化的，客户端被告知「你仍然是最大化的」；客户端自己要来的那个撤销 → 列还原、
+          之后的 configure 不带 `maximized`；
+        - X11：`wmctrl -b add,maximized_vert,maximized_horz` → 列最大化 + `xprop` 里
+          `_NET_WM_STATE_MAXIMIZED_VERT/HORZ`；`remove` → 列回到 634、属性撤掉；反向（IPC 最大化
+          X 窗口的列）→ X 那边也知道自己最大化了。
+      反证（把 `vidow_column_set_maximized()` 改成进门就 return，等于这个功能没实现）：60 项
+      只剩 **36 项**通过。
+
+      ⑤ **顺手修掉的三个自己踩的坑**：
+        - `vidow_column_set_maximized()` 一开始会把列里所有窗口的 `maximize_granted` 清掉，而
+          「客户端要的」那条路正是**先立标记再调它** —— 于是客户端自己的撤销请求被当成「没要过」
+          挡回去了（第 9 项红的就是它）。改成只在**关掉**最大化时作废这笔账；
+        - X11 的 `request_maximize` 会读到「我们刚设下去的属性」（客户端回写触发），不设
+          「状态一致就返回」的话就是无限回声；
+        - `vidowmsg` 的位置参数表里没有 `set-maximize-column`，`set-maximize-column true` 的
+          `true` 会掉在地上（服务端报「要 maximized = true / false」，测试里被 `2>&1` 吞了）。
 
 176. **键盘那两个协议也接上：`zwp_keyboard_shortcuts_inhibit_manager_v1` + `zwp_xwayland_keyboard_grab_manager_v1`**
       （用户接着 175 说「键盘的也接上」）。
@@ -5717,8 +5842,9 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
    - 激活请求只在「窗口已经存在」时能兑现：应用还没启动 / 窗口还没建出来时点通知，
      我们不负责把它拉起来（那需要 xdg-activation 的启动令牌 + 会话恢复）
 2. XWayland 的边界（真实 X11 程序能跑，但下面这些没做）：
-   - 没有 `_NET_WM_STATE` 最大化 / 最小化、没有 `_NET_WM_STRUT` 面板预留：任务栏上的
-     最大化按钮点了没反应（请求会被回一个「不最大化」），X11 面板也不会把可用区挤出来
+   - 没有 `_NET_WM_STRUT` 面板预留：X11 面板不会把可用区挤出来（最大化 / 最小化已经在做，
+     见 changelog 177 与「列最大化」「最小化」两节：X11 客户端请求最大化 -> 它那条列最大化 +
+     写 `_NET_WM_STATE_MAXIMIZED_VERT`/`HORZ`）
    - X11 弹出物（菜单 / 提示 / 通知）不装饰、不做动画、不进布局、不抢焦点，按客户端
      给的绝对位置显示，层级在所有托管窗口之上（和 Wayland 的 xdg_popup 一致）；
      `_MOTIF_WM_HINTS` 故意不听，见上文
@@ -5784,8 +5910,9 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
 23. portal 的 activation：`set_serial(0)` 的 token 被 wlroots 拒绝，而 GTK / Qt 的
     portal 对话框就是这么发的（能聚焦是因为我们 map 新窗口时无条件给焦点）。
     另外没有给 vidow 自己启动的子进程发 `XDG_ACTIVATION_TOKEN`
-24. foreign-toplevel 的 `set_maximized` 请求没接（vidow 本来就不支持最大化），
-    任务栏上的最大化按钮点了没反应
+24. foreign-toplevel（任务栏 / waybar）的 `set_maximized` 请求没接：vidow 现在有「列最大化」
+    了（changelog 177），但那条协议上的请求还没接，任务栏上的最大化按钮点了没反应
+    （`set_minimized` / `request_activate` / `request_fullscreen` 都接了，就差它）
 25. `ext_foreign_toplevel_image_capture_source_v1` 的截图源建得出来，但没跑过真实的
     逐窗口录屏客户端（同样缺 xdg-desktop-portal-wlr）
 26. `portal_conf_sync` 那一步是**会话级**的：`import-environment` +
@@ -5824,8 +5951,7 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
 
 ## 下一步建议顺序
 
-1. 浮动窗口的八向缩放边缘 + 双击标题栏最大化
+1. 浮动窗口的八向缩放边缘 + 双击标题栏最大化（列最大化已经有了，见「列最大化」一节）
 2. layer surface 的装饰与模糊（状态栏/启动器也想要圆角）
 3. workspace / 多显示器列组
-4. X11 的 `_NET_WM_STATE`（最大化/最小化）与 `_NET_WM_STRUT`（面板预留），
-   以及按屏幕边界夹菜单的客户端（把 X 屏幕也改成 `逻辑 × S`）
+4. `_NET_WM_STRUT`（面板预留），以及按屏幕边界夹菜单的客户端（把 X 屏幕也改成 `逻辑 × S`）

@@ -25,6 +25,7 @@
 
 struct vidow_server;
 struct vidow_view;
+struct vidow_column;
 struct vidow_clip_selection;
 struct vidow_layer_surface;
 struct vidow_workspace;
@@ -66,6 +67,9 @@ void vidow_ipc_emit_output(struct vidow_server *server, const char *event,
 /* layer-mapped / layer-unmapped / layer-closed */
 void vidow_ipc_emit_layer(struct vidow_server *server, const char *event,
 		struct vidow_layer_surface *ls);
+/* column-maximize-changed：载荷是那条列的完整对象（列最大化的列宽会变成 1.0）。 */
+void vidow_ipc_emit_column(struct vidow_server *server, const char *event,
+		struct vidow_column *col);
 /* clipboard-changed / primary-changed：剪贴板内容或归属变了。 */
 void vidow_ipc_emit_clipboard(struct vidow_server *server,
 		struct vidow_clip_selection *sel, const char *what);

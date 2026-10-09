@@ -433,6 +433,26 @@ void vidow_view_set_fullscreen(struct vidow_view *view, bool fullscreen) {
 	wlr_xdg_toplevel_set_fullscreen(view->xdg_toplevel, fullscreen);
 }
 
+void vidow_view_set_maximized(struct vidow_view *view, bool maximized) {
+	if (!vidow_view_configure_ready(view)) {
+		return;
+	}
+	/* 状态没变就别再排一个 configure：列最大化的时候列里每个窗口都要收到应答，
+	 * 而 arrange / map 会反复走到这儿（同 set_tiled 的去重，见 server.h）。 */
+	if (view->cfg_maximized_sent && view->cfg_maximized == maximized) {
+		return;
+	}
+	view->cfg_maximized = maximized;
+	view->cfg_maximized_sent = true;
+	if (view->kind == VIDOW_VIEW_X11) {
+		/* X11 的「最大化」是 _NET_WM_STATE_MAXIMIZED_HORZ / VERT 两个状态位。
+		 * 列最大化是整列撑满宽度，横竖一起给（和别的 WM 一样）。 */
+		wlr_xwayland_surface_set_maximized(view->x11, maximized, maximized);
+		return;
+	}
+	wlr_xdg_toplevel_set_maximized(view->xdg_toplevel, maximized);
+}
+
 void vidow_view_close(struct vidow_view *view) {
 	if (view->kind == VIDOW_VIEW_X11) {
 		wlr_xwayland_surface_close(view->x11);
@@ -2766,6 +2786,11 @@ void vidow_cycle_column_width(struct vidow_server *server) {
 	const size_t n = sizeof(presets) / sizeof(presets[0]);
 	struct vidow_column *col = view->column;
 
+	/* 手动改宽度 = 退出「列最大化」这个状态：先把它按下来（宽度留在 1.0，
+	 * 于是下面按预设找「当前是第几档」时它落在最后一档之后，循环回到 1/3 ——
+	 * 也就是「满宽再循环一次回到最窄」）。 */
+	col->maximized = false;
+
 	size_t current = n - 1;
 	for (size_t i = 0; i < n; i++) {
 		if (col->width_fraction < presets[i] + 0.01) {
@@ -2776,6 +2801,50 @@ void vidow_cycle_column_width(struct vidow_server *server) {
 	col->width_fraction = presets[(current + 1) % n];
 
 	vidow_arrange(server);
+}
+
+void vidow_column_set_maximized(struct vidow_column *col, bool maximized) {
+	if (col == NULL || col->maximized == maximized) {
+		return;
+	}
+	struct vidow_server *server = col->server;
+
+	if (maximized) {
+		col->maximized_saved = col->width_fraction;
+		col->width_fraction = 1.0;
+		col->maximized = true;
+	} else {
+		col->width_fraction = col->maximized_saved;
+		col->maximized = false;
+	}
+
+	/* 列里每个客户端都被告知一声：它们自己也知道自己现在是不是最大化的
+	 * （xdg 的 set_maximized / X11 的 _NET_WM_STATE_MAXIMIZED_*）—— 客户端
+	 * 以为自己是普通尺寸、布局却当它最大化，那种「一半一半」的状态最难看。
+	 * 状态没变的话 vidow_view_set_maximized 自己会挡掉（去重在它里面）。
+	 *
+	 * 顺带把「谁要的」那笔账理一遍：**关掉**最大化的时候作废（这一轮最大化结束
+	 * 了，下次客户端再撤销就不该算在它头上）；**打开**的时候不动 —— 客户端请求
+	 * 那条路正是先立标记、再调这儿（见 view_request_maximize），在这儿清掉的话
+	 * 它自己的撤销请求就没人理了。 */
+	struct vidow_view *view;
+	wl_list_for_each(view, &col->views, column_link) {
+		if (!maximized) {
+			view->maximize_granted = false;
+		}
+		vidow_view_set_maximized(view, maximized);
+	}
+
+	vidow_arrange(server);
+	vidow_ipc_emit_column(server, "column-maximize-changed", col);
+}
+
+void vidow_column_toggle_maximized(struct vidow_server *server) {
+	struct vidow_view *view = server->focused;
+	if (view == NULL || view->column == NULL) {
+		return;
+	}
+	vidow_column_set_maximized(view->column, !view->column->maximized);
 }
 
 void vidow_view_toggle_fullscreen(struct vidow_view *view) {
@@ -2884,6 +2953,12 @@ static void view_map(struct wl_listener *listener, void *data) {
 
 	if (view->float_mode == VIDOW_FLOAT_NONE) {
 		view_ensure_column(server, view);
+		/* 落进一条已经最大化的列（往最大化的列里又开/搬进来一个窗口）：告诉它
+		 * 一声，别让它以为自己是普通尺寸、而布局把它按整列宽度摆。xdg 那边
+		 * 「抢跑的最大化请求」在 initial_commit 里已经兑过了，这里被去重挡掉。 */
+		if (view->column != NULL && view->column->maximized) {
+			vidow_view_set_maximized(view, true);
+		}
 	} else if (!view->popup) {
 		vidow_workspace_track(view->ws, view, true);
 	}
@@ -3148,6 +3223,15 @@ static void view_commit(struct wl_listener *listener, void *data) {
 		vidow_float_update_mode(view);
 		if (view->float_mode == VIDOW_FLOAT_NONE) {
 			view_ensure_column(view->server, view);
+			/* 抢跑的最大化请求同理（Qt/KDE 恢复「上次是最大化」的窗口就是这么
+			 * 开窗的）：view_request_maximize 里列还没建出来（列是上一行才建的），
+			 * 只能在这儿兑现。放在 arrange 之前 —— 晚了就按「没最大化」排过一遍，
+			 * 客户端还会先收到一个 maximized=false 的初始 configure。 */
+			if (view->xdg_toplevel->requested.maximized &&
+					view->column != NULL) {
+				view->maximize_granted = true;
+				vidow_column_set_maximized(view->column, true);
+			}
 			vidow_arrange(view->server);
 		} else {
 			/* 浮动窗口不进列，arrange 碰不到它，得自己回一个 configure。
@@ -3340,15 +3424,51 @@ static void view_request_maximize(struct wl_listener *listener, void *data) {
 	 * wlr_xdg_toplevel_set_maximized() 内部的 wlr_xdg_surface_schedule_configure()
 	 * 第一句就是 assert(surface->initialized)，直接 abort
 	 * （wlroots 0.20.2：types/xdg_shell/wlr_xdg_surface.c:168）。
-	 * 还没 initialized 就先不应答：初始 configure 由 view_commit 的
-	 * initial_commit 分支发，那一次本来就是 maximized=false，等于把「不接受
-	 * 最大化」这个答复捎过去了（xdg-shell 只要求有应答）。 */
+	 * 所以还没 initialized 就先不碰它：等它的初始 commit（surface initialized
+	 * 之后），在 view_commit 的 initial_commit 分支里兑现这个请求。 */
 	if (!vidow_view_configure_ready(view)) {
 		return;
 	}
 
-	/* Unsupported: still answer with a configure, as xdg-shell requires. */
-	wlr_xdg_toplevel_set_maximized(view->xdg_toplevel, false);
+	/* 客户端自己发起的请求：协议上得有应答，所以把「上次发出去的是什么」这笔账
+	 * 作废一次 —— 即使状态碰巧没变也要真发一个 configure 回去（去重那条路是给
+	 * 布局自己变化用的，见 server.h 的 cfg_maximized_sent）。 */
+	view->cfg_maximized_sent = false;
+
+	bool want = view->xdg_toplevel->requested.maximized;
+	struct vidow_column *col = view->column;
+
+	/* 浮窗（对话框、菜单那种没有列的窗口）：照旧回一个「不最大化」——
+	 * xdg-shell 要求每个状态请求都有应答，不回客户端就卡在等待里。
+	 * 浮窗的尺寸是它自己定的，vidow 不替它撑满工作区。 */
+	if (col == NULL) {
+		view->maximize_granted = false;
+		vidow_view_set_maximized(view, false);
+		return;
+	}
+
+	if (want) {
+		/* vidow 没有「窗口级」的最大化（列是布局的最小单位）：客户端要最大化
+		 * 就把它那条列最大化，并且记下「这次是它要的」。 */
+		view->maximize_granted = true;
+		vidow_column_set_maximized(col, true);
+		/* 列本来就是最大化的时候上面那条是空操作，应答还得自己补。 */
+		vidow_view_set_maximized(view, true);
+		return;
+	}
+
+	if (view->maximize_granted) {
+		/* 它自己撤销：这次最大化本来就是它要的，理。 */
+		view->maximize_granted = false;
+		vidow_column_set_maximized(col, false);
+		vidow_view_set_maximized(view, false);
+		return;
+	}
+
+	/* 列是**用户**最大化的（Mod+Shift+F），客户端这时候随手发一个
+	 * set_maximized(false) 不该把用户的布局撤掉 —— 照当前实际状态回话：
+	 * 列最大化的照样答「最大化」，客户端和布局不会各说各话。 */
+	vidow_view_set_maximized(view, col->maximized);
 }
 
 /* xdg_toplevel.set_minimized：客户端自己要求最小化（xdg-shell v6 起有，wlroots 只把
@@ -3876,10 +3996,50 @@ static void x11_request_maximize(struct wl_listener *listener, void *data) {
 	(void)data;
 	struct vidow_view *view =
 		wl_container_of(listener, view, x11_request_maximize);
-	/* 不支持最大化：回一个不最大化，客户端就不会卡在等待里。 */
-	if (view->x11 != NULL) {
-		wlr_xwayland_surface_set_maximized(view->x11, false, false);
+	if (view->x11 == NULL) {
+		return;
 	}
+
+	/* X11 的请求没有事件结构，状态就在 surface 上（和全屏那条一样：
+	 * x11_request_fullscreen 读的也是 x11->fullscreen）——
+	 * _NET_WM_STATE_MAXIMIZED_HORZ / VERT 只要有一个立起来就算要最大化。 */
+	bool want = view->x11->maximized_horz || view->x11->maximized_vert;
+	struct vidow_column *col = view->column;
+
+	if (col == NULL) {
+		/* 浮窗 / 弹出物没有列：布局不替它撑满，把 X 那边的状态掰回「不最大化」
+		 * —— 只掰真的有偏差的那种，不然「我们设属性 → 客户端回写属性 → 信号
+		 * 又来 → 再设一次」会转圈。 */
+		if (want) {
+			view->maximize_granted = false;
+			vidow_view_set_maximized(view, false);
+		}
+		return;
+	}
+
+	/* 状态已经一致：多半是我们自己 set_maximized 之后客户端把 _NET_WM_STATE
+	 * 回写过来触发的回声（X11 没有「请求-应答」，状态就是属性本身）——
+	 * 什么也不做，不然就是上面说的那个圈。 */
+	if (want == col->maximized) {
+		return;
+	}
+
+	if (want) {
+		view->maximize_granted = true;
+		vidow_column_set_maximized(col, true);
+		return;
+	}
+	if (view->maximize_granted) {
+		view->maximize_granted = false;
+		vidow_column_set_maximized(col, false);
+		return;
+	}
+	/* 列是**用户**最大化的：X 客户端自己把属性撤了，得把它掰回去 —— 不然它以为
+	 * 自己是普通尺寸，我们却按整列宽度摆它。这里把去重作废一次（上次发出去的就是
+	 * true，状态没变的话会被挡掉）；回声由上面的 `want == col->maximized` 兜住，
+	 * 不会转圈。 */
+	view->cfg_maximized_sent = false;
+	vidow_view_set_maximized(view, col->maximized);
 }
 
 /* X11 客户端自己要求最小化 / 放回：`WM_CHANGE_STATE` 的 IconicState / NormalState，

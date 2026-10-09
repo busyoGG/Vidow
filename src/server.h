@@ -651,6 +651,12 @@ struct vidow_column {
 	struct vidow_output_memory *home;
 
 	double width_fraction; /* of the usable width */
+	/* niri 式「列最大化」：整列撑满工作区宽度（width_fraction 顶到 1.0），再按一次
+	 * 还原成原来那个比例（记在 maximized_saved 里）。手动改宽度（cycle-column-width
+	 * / set-column-width / expand-column-to-available-width）就是退出这个状态 ——
+	 * 状态的唯一入口是 vidow_column_set_maximized()（见 view.c）。 */
+	bool maximized;
+	double maximized_saved;
 	int offset;            /* from the usable area's left edge */
 	int width;             /* computed each arrange */
 };
@@ -687,6 +693,10 @@ struct vidow_view {
 	 * 不去重的话每次都会给客户端排一个 configure）。 */
 	int cfg_tiled;
 	bool cfg_tiled_sent;
+	/* 同理，最后一次真的发出去的 maximized（列最大化时列里每个窗口都要收到一个
+	 * set_maximized 应答，arrange / map 会反复调到那儿）。 */
+	bool cfg_maximized;
+	bool cfg_maximized_sent;
 	struct wl_list column_link; /* vidow_column.views, top to bottom */
 	struct wl_list ws_link;     /* 浮窗专属：挂在工作区的 views 上（进列了就不挂） */
 	struct vidow_column *column;
@@ -725,6 +735,11 @@ struct vidow_view {
 	 * minimized_seq：什么时候收起来的（单调递增），「放回最近收起来的那个」按它挑。 */
 	bool minimized;
 	uint64_t minimized_seq;
+	/* 「这次列最大化是客户端自己要的」（xdg 的 set_maximized / X11 的
+	 * _NET_WM_STATE_MAXIMIZED_*）：只有它自己再请求撤销时才理 —— 用户按
+	 * Mod+Shift+F 要来的最大化，客户端随手发一个 set_maximized(false) 撤不掉
+	 * （见 view.c 的 view_request_maximize）。 */
+	bool maximize_granted;
 	/* 滚出自己那块屏 / 所在工作区藏起来：**不关场景节点**，而是把它停到所有输出
 	 * 框外面的「停车位」（见 view.c 的 view_park_pos、view_anim_place 里的用法）。
 	 *
@@ -2068,6 +2083,9 @@ static inline bool vidow_view_configure_ready(const struct vidow_view *view) {
 void vidow_view_set_size(struct vidow_view *view, int w, int h);
 void vidow_view_set_activated(struct vidow_view *view, bool activated);
 void vidow_view_set_fullscreen(struct vidow_view *view, bool fullscreen);
+/* 把「你这列最大化了」告诉客户端（xdg 的 set_maximized / X11 的 _NET_WM_STATE_*）。
+ * 状态没变就不再发（同 set_tiled，见 vidow_view.cfg_maximized）。 */
+void vidow_view_set_maximized(struct vidow_view *view, bool maximized);
 void vidow_view_set_tiled(struct vidow_view *view, bool tiled);
 void vidow_view_close(struct vidow_view *view);
 /* 把当前标题 / app_id 记一份（事件用，见 vidow_view.last_title）。 */
@@ -2273,6 +2291,12 @@ void vidow_focus_window(struct vidow_server *server, int direction);
 void vidow_move_column(struct vidow_server *server, int direction);
 void vidow_move_window(struct vidow_server *server, int direction);
 void vidow_cycle_column_width(struct vidow_server *server);
+/* niri 式列最大化：整列撑满工作区宽度，maximized_saved 记着原来的比例，关掉就还原。
+ * 列里每个客户端都会收到 set_maximized 的应答（它们自己也知道自己最大化了）。
+ * 状态入口只有这一个 —— 别在别处直接改 col->maximized。 */
+void vidow_column_set_maximized(struct vidow_column *col, bool maximized);
+/* 聚焦窗口所在的那条列：最大化 ⇄ 还原。没有聚焦窗口 / 浮窗（没有列）时什么也不做。 */
+void vidow_column_toggle_maximized(struct vidow_server *server);
 void vidow_view_close(struct vidow_view *view);
 /* 把当前标题 / app_id 记一份（事件用，见 vidow_view.last_title）。 */
 void vidow_view_note_names(struct vidow_view *view);

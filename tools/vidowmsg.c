@@ -58,7 +58,8 @@ static void usage(void) {
 "      set-window-position x y / center-window / set-window-force-render on|off /\n"
 "      focus-window-direction -1|1 / move-window-direction -1|1\n"
 "列：  focus-column -1|1 / move-column -1|1 / cycle-column-width /\n"
-"      set-column-width 0.5 / expand-column-to-available-width / center-column\n"
+"      set-column-width 0.5 / expand-column-to-available-width / center-column /\n"
+"      toggle-maximize-column / set-maximize-column true|false\n"
 "工作区：focus-workspace 序号|名字|next|prev|previous / focus-workspace-previous /\n"
 "      toggle-special [名字] / create-workspace [名字] /\n"
 "      move-workspace-up|down [序号|名字] / set-workspace-name 名字 [序号|名字] /\n"
@@ -153,6 +154,7 @@ static const char *positional_key(const char *cmd, int index) {
 		{ "set-floating", { "floating", NULL } },
 		{ "set-fullscreen", { "fullscreen", NULL } },
 		{ "set-column-width", { "fraction", NULL } },
+		{ "set-maximize-column", { "maximized", NULL } },
 		{ "set-config", { "key", "value", NULL } },
 		{ "get-config", { "key", NULL } },
 		{ "config", { "key", NULL } },
