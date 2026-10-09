@@ -135,11 +135,15 @@ static const struct entry entries[] = {
 		"背景模糊总开关" },
 	{ "blur_all",        K_BOOL,   OFF(blur_all),        SZ(blur_all), 2,
 		"平铺窗口也模糊身后的壁纸；关掉只模糊浮动窗口后面" },
+	{ "blur_xray",       K_BOOL,   OFF(blur_xray),       SZ(blur_xray), 2,
+		"重叠时也用整屏那份底衬（壁纸 + layer 那层），忽略别的窗口 —— 糊的是壁纸"
+		"不是压着的那个窗口（Hyprland 的 blur:xray 同款）。省很多：不建私有底衬，"
+		"重叠场景每帧从 N×8 趟降到 ~3 趟、私有底衬的显存全免" },
 	{ "blur_levels",     K_INT,    OFF(blur_levels),     SZ(blur_levels), 2,
 		"Kawase 模糊的层级数，越大越糊。每多一级 = 每个模糊元素每帧多两趟离屏"
-		"渲染（实测 2560x1440 缩放 2、四个模糊元素：4 级 33 趟/帧、6.7% 单核；"
-		"3 级 25 趟、6.3%；2 级 17 趟、5.8%），糊的半径约 blur_offset × "
-		"(3×2^级数 − 5) 设备像素（offset=1.5 时 4 级 ≈65px、3 级 ≈29px）" },
+		"渲染（实测 2560x1440 缩放 2、四个模糊元素：3 级 25 趟/帧、6.3% 单核；"
+		"2 级 17 趟、5.8%；4 级 33 趟、6.7%），糊的半径约 blur_offset × "
+		"(3×2^级数 − 5) 设备像素（offset=1.5 时 3 级 ≈29px、4 级 ≈65px）" },
 	{ "blur_strength",   K_DOUBLE, OFF(blur_strength),   SZ(blur_strength), 2,
 		"模糊强度倍数" },
 	{ "blur_alpha_min",  K_DOUBLE, OFF(blur_alpha_min),  SZ(blur_alpha_min), 2,
@@ -303,6 +307,7 @@ static const struct group_field shadow_fields[] = {
 static const struct group_field blur_fields[] = {
 	{ "enabled",   "blur_enabled" },
 	{ "all",       "blur_all" },
+	{ "xray",      "blur_xray" },
 	{ "levels",    "blur_levels" },
 	{ "strength",  "blur_strength" },
 	{ "alpha_min", "blur_alpha_min" },
@@ -655,7 +660,12 @@ static void defaults(struct vidow_config *cfg) {
 
 	cfg->blur_enabled = true;
 	cfg->blur_all = true; /* tiled windows blur the wallpaper too */
-	cfg->blur_levels = 4;
+	/* 默认关：重叠时各自算私有底衬才是「真背景模糊」（糊的是压着的那个窗口，
+	 * 不是壁纸）。要省就开 blur_xray —— 见 server.h 那段。 */
+	cfg->blur_xray = false;
+	/* 默认 3 级（≈29 设备像素半径）：4 级糊得更狠（≈65px）但每个模糊元素每帧
+	 * 多两趟离屏渲染，实测四个重叠元素下 25 趟/帧 vs 33 趟/帧。要更糊写 4。 */
+	cfg->blur_levels = 3;
 	cfg->blur_strength = 1.0;
 	cfg->blur_alpha_min = 0.15;
 	cfg->blur_offset = 1.5;

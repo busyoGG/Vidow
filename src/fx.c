@@ -2344,11 +2344,16 @@ void vidow_blur_update(struct vidow_output *output) {
 
 		blur_mask_min_changed(&view->fx, server->config.blur_alpha_min);
 
-		if (!view_overlaps_other(view)) {
+		if (server->config.blur_xray || !view_overlaps_other(view)) {
 			/* Tiled and non-overlapping floating windows all share the
 			 * wallpaper backdrop: one capture and one chain for all of them.
 			 * Only drop a private pyramid if there really is one, otherwise
-			 * the identity would change every frame and force a redraw. */
+			 * the identity would change every frame and force a redraw.
+			 *
+			 * blur_xray 也走这条路：重叠时照样用整屏那份（壁纸 + layer 那层），
+			 * 忽略别的窗口 —— 糊的是壁纸而不是压着的那个窗口（Hyprland 的
+			 * blur:xray 同款）。私有底衬一块不建：重叠场景每帧的趟数从
+			 * N×(1+2·级数−1) 掉到 ~3，那块显存也全免。 */
 			if (view->fx.blur_own_tex != NULL) {
 				blur_own_drop(&view->fx);
 			}

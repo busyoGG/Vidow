@@ -89,7 +89,7 @@ anim   = { open_ms = 220, easing = "out_quint" }
 | `decor` | `enabled` `corner_radius` `opacity` `noise` | `decor = false` |
 | `border` | `width` `color` `color_focus` | —（光写一个值没法解释） |
 | `shadow` | `radius` `color` `offset_x` `offset_y` | — |
-| `blur` | `enabled` `all` `levels` `strength` `alpha_min` `offset` | `blur = false` |
+| `blur` | `enabled` `all` `xray` `levels` `strength` `alpha_min` `offset` | `blur = false` |
 | `anim` | `open_ms` `close_ms` `move_ms` `layer_open_ms` `layer_close_ms` `easing` `open_easing` `close_easing` `open_alpha_from` `open_slide_px` `open_scale_from` `close_alpha_to` `close_slide_px` `close_scale_to` `jelly` `jelly_strength` | — |
 | `shader` | `enabled` `dir` `flip_y` `open` `close` `idle` | `shader = false` |
 | `clipboard` | `enabled` `primary` `max_bytes` | `clipboard = false` |
@@ -868,6 +868,7 @@ python3 test-float.py        # 三个真实 GTK 窗口，验证浮动模式自�
 ./test-layerblur.sh                  # 半透明状态栏背后的模糊（全 headless，4 项断言）
 ./test-blurscale.sh                  # 模糊在高 DPI 倍率下的底衬覆盖 + 对位（1/1.7/2 倍，7 项断言）
 ./test-blurlevel.sh                  # 半径随级数扩展（2/4/6 级各跑一轮，3 项断言）
+./test-blurxray.sh                   # blur_xray：重叠时用整屏底衬（不建私有底衬）+ 语义真的变了（6 项断言）
 ./test-layerghost.sh                 # 会被模糊的 layer surface 不进自己的底衬（3 项断言）
 ./test-layerwin.sh                   # top 层模糊里含窗口（纯蓝窗口 + 压在它上面的面板，4 项断言）
 ./test-layermask.sh                  # 按元素自己的 alpha 剔除（透明内边距里的亮点不糊，3 项断言）
@@ -1972,6 +1973,12 @@ GTK 在我这儿走 shm，所以看不出问题 —— 用户报的正是「只�
 链，所有平铺窗口共用结果（`blur_all = true` 因此几乎没有额外开销）。只有真的叠在别人身上的
 浮动窗口才需要单独捕获，因为它的背后必须保留被它压住的那个窗口。
 
+`blur_xray = true` 把第二行也并进第一行：重叠时照样用整屏那份（**忽略别的窗口**）—— 观感上
+「糊的是壁纸，不是压着的那个窗口」（Hyprland 的 `blur:xray` 同款），换来的是**一块私有底衬
+都不建**。实测同一场景（一块纯红浮窗 + 压在它上面的半透明白浮窗）：`chain` 累计 **48 → 3**、
+`own` **45 → 0**，白窗那块区域的 `mean(R−B)` 从 **+148.5** 变成 **−37.6**（红色不再渗进模糊）。
+默认关 —— 真背景模糊才是这个合成器的卖点；弱 GPU / 4K 高刷想再压一压就打开它。
+
 ### 背景不动就不重算
 
 `gen_layer` / `gen_scene` 两个世代计数分别记录「壁纸+layer 变了」和「窗口也变了」。缓存命中时
@@ -2025,8 +2032,10 @@ GTK 在我这儿走 shm，所以看不出问题 —— 用户报的正是「只�
 `blur_alpha_min` 只进装饰着色器、不进模糊金字塔：改它由 `blur_mask_min_changed()`
 （`src/fx.c`）把 `blur_ver` 顶一下，帧循环自然重画 —— 不然运行时改配置会看着「没反应」。
 
-配置：`blur_enabled` / `blur_all` / `blur_levels`(2..6) / `blur_strength` / `blur_offset` /
-`blur_alpha_min`。默认 `blur_all = true`，平铺窗口也模糊。
+配置：`blur_enabled` / `blur_all` / `blur_xray` / `blur_levels`(2..6) / `blur_strength` /
+`blur_offset` / `blur_alpha_min`。默认 `blur_all = true`（平铺窗口也模糊）、
+`blur_xray = false`（重叠时各自算私有底衬 = 真背景模糊）、`blur_levels = 3`（≈29 设备像素
+半径；4 级 ≈65px 更糊，但每个模糊元素每帧多两趟离屏渲染）。
 
 模糊结果按帧缓存，但**只要背景变了就立刻重算**，所以视频、滚动、拖动背后都是实时模糊。
 
@@ -2034,9 +2043,9 @@ GTK 在我这儿走 shm，所以看不出问题 —— 用户报的正是「只�
 
 是。`blur_levels = n` 就是「降采样 n 次」：链上第 i 级的分辨率是 `输出 >> (i+1)`，
 所以 4 级 = 1/2、1/4、1/8、1/16，最终结果是**半分辨率**（`up[0]`，给装饰着色器采样的
-那张）。级数越大模糊半径越大、也越贵（每级一趟 pass）。运行时夹在 2..6
-（`MAX_BLUR_LEVELS`，在 `server.h` 里，数组尺寸也用它），并且最小那一级会小于 4px
-时自动降一级（`blur_levels_for`）。
+那张）。级数越大模糊半径越大、也越贵（每级一趟 pass）。**默认 3 级**（≈29 设备像素半径）；
+运行时夹在 2..6（`MAX_BLUR_LEVELS`，在 `server.h` 里，数组尺寸也用它），并且最小那一级
+会小于 4px 时自动降一级（`blur_levels_for`）。
 
 **半径**（按下表的抽样数学在 numpy 里跑一个 delta 响应量 σ；`blur_offset = 2`）：
 
@@ -3984,6 +3993,43 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
        口子（screencopy / ext-image-copy-capture 同样对所有客户端开放，grim / OBS 靠它），
        而要收就得连它一起收 —— 那会把 grim / wf-recorder / OBS 全废掉。要边界得靠 sandbox
        那一层（别的进程拿不到 wayland socket），不是合成器。
+
+180. **`blur_xray`（Hyprland 的 `blur:xray` 同款）+ 默认 `blur_levels` 4 → 3**（用户问「模糊
+      路线哪一种比较好」，听完对照后拍板：加这个开关、默认 pass 改成 3）。
+
+      ① **先把三条路线摆清楚**（都能落到证据上）：
+
+      | 路线 | 谁在用 | 每帧成本 | 模糊源里有什么 |
+      | --- | --- | --- | --- |
+      | 整屏预模糊、所有窗口共用一份 | Hyprland 的窗口那路（`CPreBlurElement` → `m_blurFB`） | 1~2 趟整屏，不随窗口数翻倍 | 到「平铺层画完」为止的整屏；`xray = true` 连平铺窗口都不要 |
+      | 每个元素私有底衬（场景减掉自己） | vidow / niri | 每个**重叠**元素 1 抓取 + 2·级数−1 趟 | 真·身后内容：重叠窗口的模糊里看得见对方 |
+      | 每个 layer surface 各自当场糊 | Hyprland 的 BACKGROUND / BOTTOM 层（`blockBlurOptimization = true`） | 每 surface 一趟，顺序渲染 | 前一个 surface 的内容会被吃进后一个的模糊源 —— 就是那个接缝 bug（[#15125](https://github.com/hyprwm/Hyprland/discussions/15125)） |
+
+      Hyprland 的默认值取向本身就是「省」：`passes = 1`、`size = 8`、`new_optimizations = true`
+      （wiki 原话「massively improve performance」）、`xray`（「will reduce overhead on floating
+      blur significantly」，[config-options](https://wiki.hypr.land/configuring/core/config-options/)）。
+      两边的趟数不能直接比：vidow 默认的模糊半径比 `size = 8` + 一趟大一个量级，贵的那部分
+      有一半是「糊得更狠」换来的。
+
+      ② **vidow 本来就是混合路线**：不重叠（`view_overlaps_other()` 为假）时所有窗口共用整屏
+      那条链，只在壁纸 / layer 变代次时重算 —— 纯平铺用户付的就是第一条路线的钱。只有真的
+      叠在别人身上的元素才各自开私有底衬。
+
+      ③ **加 `blur_xray`（默认 `false`）**：`fx.c` 里那个 `if (!view_overlaps_other(view))`
+      多一个 `|| server->config.blur_xray` —— 重叠时也用整屏那份底衬（壁纸 + layer 那层），
+      **忽略别的窗口**。观感上「糊的是壁纸，不是压着的那个窗口」（Hyprland 的 `blur:xray`
+      同款），换来的是**一块私有底衬都不建**。默认关：真背景模糊是这个合成器的卖点，弱 GPU /
+      4K 高刷想再压一压的人自己打开。
+
+      ④ **默认 `blur_levels` 4 → 3**（≈65px → ≈29 设备像素半径）：每个模糊元素每帧少两趟
+      离屏渲染（实测四个重叠元素：33 趟/帧 → 25 趟，6.7% → 6.3% 单核）。要更糊写 4 就行。
+      （179 里我说「没动默认值」—— 那时是；这次用户拍板改了。）
+
+      ⑤ **判据 `./test-blurxray.sh`（新，6 项断言）**：同一场景跑两遍，只差 `blur_xray` ——
+      一块纯红浮窗 + 压在它上面的半透明白浮窗。**关**：`own` 累计 **45**、`chain` **48**；
+      **开**：`own` **0**、`chain` **3**（只剩整屏那条链）。语义也真的变了：白窗压着红窗那块
+      区域的 `mean(R−B)` 从 **+148.5** 变成 **−37.6**（红色不再渗进模糊）。也就是说这条开关
+      在这个场景里把链的趟数砍掉 **94%**，而观感代价就是「那圈糊的是壁纸」。
 
 179. **性能热点复查：vidow 自己的代码只占 2.7%，剩下能省的是「空载每秒醒 20 次」**（用户让
       「检查还有什么性能热点可以优化」，看完点名要改 1 / 2 / 4 / 5 四条）。

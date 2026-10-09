@@ -313,7 +313,8 @@ check(table["border_width"] == "0" and table["border_color"] == "#ff0000ff",
 	% (table["border_width"], table["border_color"]))
 check(table["border_color_focus"] == none["border_color_focus"],
 	"border 没写 color_focus → 还是默认值（%s）" % table["border_color_focus"])
-check(table["blur_enabled"] == "false" and table["blur_levels"] == "4",
+check(table["blur_enabled"] == "false"
+	and table["blur_levels"] == none["blur_levels"],
 	"blur = false → blur_enabled=false、levels 没动（%s / %s）"
 	% (table["blur_enabled"], table["blur_levels"]))
 check(table["window_open_ms"] == "77" and table["window_close_ms"] == "140",

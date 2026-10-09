@@ -164,6 +164,11 @@ struct vidow_config {
 	/* kawase blur behind windows */
 	bool blur_enabled;
 	bool blur_all;        /* also blur behind tiled windows */
+	/* 「X 光」：重叠时也用整屏那份底衬（壁纸 + layer 那层），**忽略别的窗口** ——
+	 * Hyprland 的 blur:xray 就是这条。观感上是「糊的是壁纸，不是压着的那个窗口」，
+	 * 换来的是不建私有底衬：重叠场景下每帧从 N×(1+2·levels−1) 趟降到 ~3 趟，
+	 * 每个元素的私有底衬显存也全免。默认关（真背景模糊才是这个合成器的卖点）。 */
+	bool blur_xray;
 	int blur_levels;      /* 2..4 downsample steps */
 	double blur_strength; /* 0 = sharp, 1 = fully blurred */
 	/* 透明度剔除（见 fx.c 的 decor_fragment_src）：元素**自己**的 alpha 低于这个
