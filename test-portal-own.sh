@@ -81,11 +81,17 @@ rm -rf "$RUNDIR"
 mkdir -p "$HOME_DIR/.config/vidow" "$LOG"
 
 # 两块屏**位置钉死**（自动排的话谁在 0 是不确定的，6b2 要验「窗口在非 0 那块屏上」，
-# 6e 又假定光标放在逻辑 100,100 时落在 HEADLESS-1 上）。缩放都 1，免得跟坐标换算
-# 搅在一起（缩放那条路 6e 自己会临时改成 2 再改回来）。
+# 6e 又假定光标放在逻辑 100,100 时落在 HEADLESS-1 上）。
+#
+# **HEADLESS-2 故意做成「2560x1440 模式 + 缩放 2」**（逻辑尺寸还是 1280x720，布局
+# 和以前一样）：这就是用户那台机器的几何（一块 4K 屏缩放 2 摆在 x=1920）。缩放不为 1
+# 的那块屏上，「合成器开的流缓冲（逻辑 × scale 设备像素）」和「portal 报给前端的
+# size」**必须是一个口径** —— 对不上时消费者（OBS）会按比值换算光标位置 / 协商缓冲，
+# 表现就是「2 倍屏上录屏看不到光标、第一次录还是黑的」（用户报的）。6a 的流尺寸、
+# 6b2 的窗口流尺寸 + 光标位置就是钉这一条的。
 cat > "$HOME_DIR/.config/vidow/config.lua" <<'CFG'
 vidow.output{ name = "HEADLESS-1", x = 0, y = 0, scale = 1 }
-vidow.output{ name = "HEADLESS-2", x = 1280, y = 0, scale = 1 }
+vidow.output{ name = "HEADLESS-2", x = 1280, y = 0, scale = 2, mode = "2560x1440" }
 CFG
 
 # 一条私有 dbus 会话里跑全套：vidow（它自己会把 vidow-portal 起在同一条总线上）、
@@ -295,10 +301,29 @@ else
 	fail "Start 没返回 node：$(tail -3 "$R/probe.txt" 2>/dev/null | tr '\n' ' ')"
 fi
 SIZE=$(grep -ao "size': ([0-9]*, [0-9]*)" "$R/probe.txt" 2>/dev/null | head -1 | grep -o "[0-9]*, [0-9]*")
-if [ "${SIZE:-}" = "1280, 720" ]; then
-	pass "流尺寸 = 输出的像素尺寸（$SIZE）"
+# 报出去的 size 必须是**这块屏的像素尺寸**（= 合成器这一路流的缓冲尺寸，见
+# screencast.c 的 stream_output：output->width/height）。缩放屏上写成逻辑尺寸
+# （= 像素 / scale）消费者就按比值换算光标位置 / 协商缓冲，表现是「2 倍屏上录屏
+# 看不到光标、第一次录还黑屏」—— 所以这里现算期望值，不写死。
+SOUT1=$(grep -a "screencast: 请求录 " "$R/vidow.log" 2>/dev/null | tail -1 |
+	sed 's/.*请求录 \([^（]*\)（.*/\1/')
+EXP1=$($VM --socket "$IPC" outputs 2>/dev/null | python3 -c '
+import json,sys
+want = sys.argv[1]
+try:
+    outs = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for o in outs:
+    if o["name"] == want:
+        print("%d, %d" % (o["layout"]["width"] * o["scale"],
+                          o["layout"]["height"] * o["scale"]))
+        break
+' "${SOUT1:-}")
+if [ -n "${SIZE:-}" ] && [ "${SIZE:-}" = "${EXP1:-}" ]; then
+	pass "流尺寸 = 那块屏的像素尺寸（$SIZE = ${SOUT1:-?} 的逻辑尺寸 × scale）"
 else
-	fail "流尺寸不对：${SIZE:-没拿到}（期望 1280, 720）"
+	fail "流尺寸不对：报的是 ${SIZE:-没拿到}，${SOUT1:-?} 的像素尺寸是 ${EXP1:-没算出来}"
 fi
 
 # --- 7 真消费 ---------------------------------------------------------------
@@ -492,10 +517,15 @@ if [ -n "${DGEO:-}" ]; then
 		CARD_X=""
 	fi
 	[ -z "${CARD_X:-}" ] || {
-		$VM --socket "$IPC" move-cursor "$CARD_X" "$CARD_Y" >/dev/null 2>&1
-		sleep 0.6
-		$VM --socket "$IPC" pointer-button click left 2 >/dev/null 2>&1
-		sleep 2
+		# GTK 的双击判定窗口窄，一次点不中很常见（漏一次后面的流就起不来，
+		# 连着虚拟输出那轮也报 code=2）—— 没关就再点一次，最多三次。
+		for _try in 1 2 3; do
+			$VM --socket "$IPC" move-cursor "$CARD_X" "$CARD_Y" >/dev/null 2>&1
+			sleep 0.6
+			$VM --socket "$IPC" pointer-button click left 2 >/dev/null 2>&1
+			sleep 2
+			$VM --socket "$IPC" windows 2>/dev/null | grep -aq "共享屏幕" || break
+		done
 	}
 	if $VM --socket "$IPC" windows 2>/dev/null | grep -aq "共享屏幕"; then
 		fail "双击卡片预览没确认（对话框还开着；对话框在 $DGEO）"
@@ -532,6 +562,17 @@ case "${RECLINE:-}" in
 *)
 	fail "流选的输出不对：${RECLINE:-没日志}（窗口在 $OUT_OTHER）" ;;
 esac
+# **报出去的 size 必须等于这一路流的缓冲尺寸**（日志里「→ WxH」就是合成器给它开的
+# 缓冲）：消费者（OBS）按 size 当元数据换算光标位置 / 协商缓冲，缩放屏上对不上就是
+# 「录屏里看不到光标、第一次录还是黑的」。以前这里报的是窗口的**逻辑**尺寸，2 倍屏上
+# 正好小一半 —— HEADLESS-2 是缩放 2 那块，所以这条能钉住它。
+BUF6=$(echo "${RECLINE:-}" | sed -n 's/.*→ \([0-9]*x[0-9]*\).*/\1/p')
+EXP6=$(echo "${BUF6:-}" | tr 'x' ',')
+if [ -n "${WSIZE6:-}" ] && [ "${WSIZE6:-}" = "${EXP6:-}" ]; then
+	pass "窗口流 size = 这一路流的缓冲尺寸（$WSIZE6 = 日志里的 $BUF6）"
+else
+	fail "窗口流 size 跟缓冲对不上：报的是 ${WSIZE6:-没拿到}，缓冲是 ${BUF6:-没拿到}"
+fi
 # 光标要放到**真被录的那个窗口**中间：列表里第一行才是被录的，别按标题猜
 # （这一轮录的是谁，合成器日志里写着）。
 REC6=$(grep -a "screencast: 请求录窗口" "$R/vidow.log" 2>/dev/null | tail -1 |
@@ -666,10 +707,11 @@ import sys
 from PIL import Image
 print("%dx%d" % Image.open(sys.argv[1]).size)' "${SHOT_URI#file://}" 2>/dev/null)
 	pass "整屏截图回了个真文件（$SHOT_URI，$SHOT_SIZE）"
-	if [ "${SHOT_SIZE:-}" = "1280x720" ]; then
-		pass "截图尺寸 = 输出像素尺寸（1280x720）"
+	# 截图是**输出像素**尺寸（哪块屏取决于截图请求选的那块，两块都算过）。
+	if [ "${SHOT_SIZE:-}" = "1280x720" ] || [ "${SHOT_SIZE:-}" = "2560x1440" ]; then
+		pass "截图尺寸 = 输出像素尺寸（$SHOT_SIZE）"
 	else
-		fail "截图尺寸不对：${SHOT_SIZE:-读不出来}"
+		fail "截图尺寸不对：${SHOT_SIZE:-读不出来}（期望 1280x720 或 2560x1440）"
 	fi
 else
 	fail "截图没回 uri：$(tail -3 "$R/shot.txt" 2>/dev/null | tr '\n' ' ')"
@@ -759,7 +801,21 @@ for o in outs:
         print(o["layout"]["x"])
         break
 ' "${SOUT:-}")
-echo "      （流是 $SOUT 那块屏，x=${SOX:-?}）"
+# 这块屏的 scale：元数据里的位置是**输出像素**（= 逻辑 × scale），所以逻辑 100,100
+# 在缩放 2 的屏上报出来就是 200,200。期望值现算 —— HEADLESS-2 是缩放 2 那块。
+SOSC=$($VM --socket "$IPC" outputs 2>/dev/null | python3 -c '
+import json,sys
+want = sys.argv[1]
+try:
+    outs=json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for o in outs:
+    if o["name"] == want:
+        print(o["scale"])
+        break
+' "${SOUT:-}")
+echo "      （流是 $SOUT 那块屏，x=${SOX:-?} scale=${SOSC:-?}）"
 [ -n "${SOX:-}" ] && { $VM --socket "$IPC" move-cursor $(( SOX + 100 )) 100 >/dev/null 2>&1; sleep 0.5; }
 # 消费者要按**生产者声明的那样**去要这个元数据（固定值 / 范围取交集，见
 # pipewire 的 pw_buffers_negotiate）：GStreamer 的 pipewiresrc 是这么要的，
@@ -777,10 +833,11 @@ if [ -n "${NODE4:-}" ]; then
 	else
 		fail "元数据里 id≠1：${CLINE:-没数据}"
 	fi
-	if echo "${CLINE:-}" | grep -qE "pos=100,100 hotspot=[0-9]+,[0-9]+"; then
-		pass "光标位置 = 指针位置（pos=100,100，热点也报出来了）"
+	EXP4=$(( 100 * ${SOSC:-1} ))
+	if echo "${CLINE:-}" | grep -qE "pos=${EXP4},${EXP4} hotspot=[0-9]+,[0-9]+"; then
+		pass "光标位置 = 指针位置（逻辑 100,100 → 流里 pos=${EXP4},${EXP4}，热点也报出来了）"
 	else
-		fail "光标位置不对：${CLINE:-没数据}（期望 pos=100,100）"
+		fail "光标位置不对：${CLINE:-没数据}（期望 pos=${EXP4},${EXP4}）"
 	fi
 	if echo "${CLINE:-}" | grep -qE "size=[1-9][0-9]*x[1-9][0-9]* stride=[1-9][0-9]* hash=0x0*[1-9a-f]"; then
 		pass "位图有尺寸有内容（$(echo "$CLINE" | grep -o 'size=[0-9x]* stride=[0-9]* hash=0x[0-9a-f]*')）"

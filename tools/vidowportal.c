@@ -1362,8 +1362,15 @@ static void dialog_accept(void) {
 				pointer);
 			st->x = out->x;
 			st->y = out->y;
-			st->w = out->w;
-			st->h = out->h;
+			/* **报像素尺寸，不是逻辑尺寸**：合成器那边这一路流就是
+			 * output->width/height（模式像素），PipeWire 缓冲也是这个大小。
+			 * 前端 / 应用拿 size 当元数据，跟真实缓冲**对不上**的时候消费者会
+			 * 按比值换算光标位置（或干脆判越界不画）—— 缩放 2 的那块屏上就是
+			 * 「录屏里看不到光标」，2 倍屏的第一次录还可能是黑的（消费者按
+			 * size 协商缓冲，跟合成器报的格式撞上就整路不出图）。
+			 * 位置（x/y）仍然是**布局逻辑坐标**，那是前端要的口径。 */
+			st->w = out->px_w;
+			st->h = out->px_h;
 			st->source_type = SOURCE_TYPE_MONITOR;
 			snprintf(st->label, sizeof(st->label), "%s", out->name);
 			break;

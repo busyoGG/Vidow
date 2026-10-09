@@ -27,6 +27,11 @@ static void keyboard_modifiers(struct wl_listener *listener, void *data) {
 	(void)data;
 	struct vidow_keyboard *kb = wl_container_of(listener, kb, modifiers);
 
+	/* 正在拆（wl_display_run 已经返回）：seat 可能已经没了，别再往里塞东西。 */
+	if (kb->server->shutting_down) {
+		return;
+	}
+
 	/* 输入法抢着键盘时修饰键也归它：它会连同按键一起用虚拟键盘回注。 */
 	if (vidow_im_owns_keyboard(kb->server, kb)) {
 		vidow_im_modifiers(kb->server, kb->wlr_keyboard);
@@ -54,6 +59,14 @@ static void keyboard_key(struct wl_listener *listener, void *data) {
 	struct vidow_keyboard *kb = wl_container_of(listener, kb, key);
 	struct vidow_server *server = kb->server;
 	struct wlr_keyboard_key_event *event = data;
+
+	/* 正在拆：wlr_keyboard_finish() 会给每个还按着的键补一条**松开**事件，走到
+	 * 下面那条 wlr_seat_set_keyboard(server->seat) 时 seat 可能已经释放了
+	 * （coredump：keyboard_key -> wlr_seat_set_keyboard，退出时崩）。退出路上
+	 * 谁按着什么键已经没人关心，直接丢。 */
+	if (server->shutting_down) {
+		return;
+	}
 
 	/* evdev keycode -> xkb keycode */
 	uint32_t keycode = event->keycode + 8;

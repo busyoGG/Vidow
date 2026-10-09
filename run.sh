@@ -179,8 +179,15 @@ check_coredump() {
 	echo "  ⚠ 有 $n 个新 coredump：vidow 是崩着退的（不是正常退出）"
 	coredumpctl list --since "@$START_TS" --no-legend 2>/dev/null |
 		grep vidow | tail -3 | sed 's/^/    /'
+	# 头（信号 / si_code）+ 调用栈。**录屏 / 光标**那几行一起打出来：崩在录屏那条
+	# 路上时，栈前面那几帧看不出来是「哪一路流、光标查到没查到」，日志这几行能。
 	coredumpctl info --since "@$START_TS" 2>/dev/null |
-		grep -A5 "Stack trace of thread" | head -8 | sed 's/^/    /'
+		grep -aE "^ *(PID|Signal|si_code|Stack trace of thread):|^ *#[0-9]+" |
+		head -26 | sed 's/^/    /'
+	if grep -aqE "screencast|cursor_dst_pos" "$LOG" 2>/dev/null; then
+		echo "  日志里「录屏 / 光标」最后 12 行："
+		grep -aE "screencast|cursor_dst_pos" "$LOG" | tail -12 | sed 's/^/    /'
+	fi
 }
 
 cleanup() {

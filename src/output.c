@@ -1035,6 +1035,13 @@ static struct vidow_output *output_pick_fallback(struct vidow_server *server,
  * 之前调用：记忆要记下它离开时的视口 / 位置 / 焦点，而 wlr_output 还是活的。 */
 static struct vidow_output *output_gone(struct vidow_server *server,
 		struct vidow_output *output) {
+	/* 正在拆（wl_display_run 已经返回）：wl_display_destroy() 会一块一块 finish
+	 * 输出，走到这儿的时候工作区链已经拆过一半了 —— 实测崩在
+	 * vidow_workspace_count 里读 link.next（si_addr=0x8）。退出时没有「把东西挪到
+	 * 别的屏上」这回事，整段跳过（视图 / 列的指针跟着进程一起消失）。 */
+	if (server->shutting_down) {
+		return NULL;
+	}
 	/* Alt+Tab 切换器开着、而且它就摆在这块屏上：先关掉 —— 它攥着
 	 * wlr_output 指针，再往下走这块就要被释放了。 */
 	if (server->mru.output == output->wlr_output) {

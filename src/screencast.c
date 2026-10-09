@@ -105,6 +105,10 @@ struct vidow_sc_pw_stream {
 	uint8_t *cursor_pixels;
 	uint32_t cursor_hash;
 	bool cursor_hashed;
+	/* 第一次查光标的结果报过没：这条走 INFO（每路流一次），后面每帧那些走
+	 * DEBUG。用户报「录屏里看不到光标」时，日志里有没有这一行就是分水岭 ——
+	 * 是合成器这边就没找到光标，还是找到了、消费者没画。 */
+	bool cursor_logged;
 	/* 光标元数据报过了（只在 metadata 模式、协商到格式之后报一次）。 */
 	bool meta_announced;
 	/* 给消费者发过多少帧；第一帧顺手看一眼是不是黑的（「有流但黑屏」这类报告
@@ -567,9 +571,23 @@ static void stream_fill_cursor(struct vidow_sc_pw_stream *ps, struct spa_buffer 
 	if (!vidow_capture_cursor_info(stream->sc->server, stream->output, &box, scale,
 			&info, ps->cursor_pixels,
 			(size_t)VIDOW_CURSOR_MAX_PX * VIDOW_CURSOR_MAX_PX * 4)) {
+		if (!ps->cursor_logged) {
+			ps->cursor_logged = true;
+			wlr_log(WLR_INFO, "screencast: metadata 第一次：这块屏（%s）上没有"
+				"可见光标 —— 消费者这边也就没有光标可画",
+				stream->output != NULL ? stream->output->name : "?");
+		}
 		wlr_log(WLR_DEBUG, "screencast: metadata：这块屏上没有可见光标");
 		ps->cursor_hashed = false; /* 光标没了：下次再出现要重发位图 */
 		return;
+	}
+	if (!ps->cursor_logged) {
+		ps->cursor_logged = true;
+		wlr_log(WLR_INFO, "screencast: metadata 第一次：光标在流里 %d,%d"
+			"（热点 %d,%d，位图 %dx%d，流 %dx%d，框 %d,%d %dx%d 缩放 %.3f）",
+			info.x, info.y, info.hotspot_x, info.hotspot_y, info.width,
+			info.height, stream->out_w, stream->out_h, box.x, box.y,
+			box.width, box.height, scale);
 	}
 	wlr_log(WLR_DEBUG, "screencast: metadata：光标 %d,%d 热点 %d,%d 位图 %dx%d",
 		info.x, info.y, info.hotspot_x, info.hotspot_y, info.width, info.height);
@@ -1088,13 +1106,12 @@ static void handle_stream_window(struct wl_client *client,
 	 * 的偏移（一般就是 0,0），拿来当布局坐标使，反查出来永远是布局左上角那块屏。
 	 * 窗口在非 0 那块屏上时，后果是三件（实测）：① 光标元数据在错的那块屏上找
 	 * 光标 → 永远 id=0（「非 0 显示器上采集不到光标」）；② 流尺寸乘的是错那块屏
-	 * 的 scale（缩放屏上分辨率不对）；③ 输出提交那条抓帧路盯的也是错那块屏。 */
-	struct wlr_box at = vidow_view_screen_box(view);
-	struct wlr_output *output = wlr_output_layout_output_at(sc->server->output_layout,
-		at.x + at.width / 2, at.y + at.height / 2);
-	if (output == NULL) {
-		output = view->output;
-	}
+	 * 的 scale（缩放屏上分辨率不对）；③ 输出提交那条抓帧路盯的也是错那块屏。
+	 *
+	 * 这个判据和窗口抓帧源（wincapture.c 的 vidow_win_grab_output）**共用一份**：
+	 * portal 报给前端的 size 是从抓帧源的约束来的，两处选的屏不一样时，报出去的
+	 * size 就跟这一路流的缓冲尺寸对不上（2 倍屏上消费者会把光标位置换算错）。 */
+	struct wlr_output *output = vidow_win_grab_output(sc->server, view);
 	if (output == NULL) {
 		reply_failed(client, sc, resource, stream_id,
 			"vidow: 这个窗口不在任何一块屏上");

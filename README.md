@@ -4063,6 +4063,38 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
        而要收就得连它一起收 —— 那会把 grim / wf-recorder / OBS 全废掉。要边界得靠 sandbox
        那一层（别的进程拿不到 wayland socket），不是合成器。
 
+182. **录屏：portal 报的流尺寸改成「像素」，跟合成器开的缓冲一个口径**（用户报「2 倍屏上录屏
+      看不到光标、OBS 第一次弹选择器不管选什么都黑屏」）。
+
+      - **根因**：`vidow-portal` 报给前端的 `size` 是**逻辑**尺寸（monitor 流 `out->w = px_w /
+        scale`、窗口流用缩略图的逻辑尺寸），而合成器给这一路流开的缓冲是**设备像素**
+        （monitor 流 = `output->width/height`；窗口流 = 窗口逻辑尺寸 × 那块屏的 scale）。缩放 2
+        的屏上正好差一倍。光标的 `SPA_META_Cursor` 位置按协议就是**流像素**（对的那一边），
+        消费者拿 size 当元数据换算 / 判越界 —— 2 倍屏上位置判成越界就不画（挪到 1 倍那块屏
+        就正常），协商缓冲那条路对不上就是黑屏。用户日志里两个数并排摆着：`框 1920,0
+        1920x1080 缩放 2.000`、流 `3840x2160`、portal 却报 `1920x1080`。
+      - `tools/vidowportal.c`：monitor 流报 `px_w/px_h`（`x/y` 仍是布局逻辑坐标，那是前端要的
+        口径）。窗口流那条：窗口抓帧源（`ext-image-copy-capture`，portal 拿它的约束当窗口 size）
+        以前按**逻辑**尺寸 1:1 渲染，现在按「逻辑 × 窗口那块屏的 scale」渲染并声明约束
+        （`src/wincapture.c` 的 `win_source_size`）—— 顺带把窗口截图 / 缩略图从「缩放屏上糊的」
+        变成原生像素。选哪块屏的判据抽成 `vidow_win_grab_output()` 并**和 `handle_stream_window`
+        共用一份**（两边选屏不一样时报出去的 size 又会漂）。
+      - 诊断：录屏第一次查光标的结果走 INFO（`metadata 第一次：…`：有没有光标 / 位置 / 位图 /
+        流尺寸 / 取景框 / 缩放），`cursor_dst_pos` 的每个输入走 DEBUG；`./dbg.sh` 退出时自动打
+        「退出码 + 新 coredump 的栈 + 录屏日志」，并忽略 SIGPIPE（Ctrl+C 不再被当成「141 崩了」）；
+        `run.sh` 的 coredump 块 8 帧 → 26 帧，带录屏日志。
+      - **退出时的段错误**：`server.shutting_down`（`wl_display_run()` 一返回就立牌子）。原因是
+        `wl_display_destroy()` 会一块块 finish 后端，键盘 / 输出那些 finish 还会再发一轮事件进
+        我们的监听器，而 seat / 工作区链那时已经拆过一半（coredump：`keyboard_key →
+        wlr_seat_set_keyboard`、`output_gone → vidow_workspace_count` 读 `link.next`，si_addr 都
+        是 0x8）。
+      - **回归**：`test-portal-own.sh` 的 HEADLESS-2 改成「2560x1440 模式 + 缩放 2」（= 用户那台
+        机器的几何），新增「报出去的 size == 这一路流的缓冲尺寸」（monitor / 窗口各一条；缩放 1
+        时它们也过，缩放 2 时旧代码必挂），光标位置那几条改成按 scale 现算；双击确认加一次重试
+        （GTK 双击判定窄，漏一次后面的轮次会连着报 code=2）。test-portal-own 50 项全过；
+        test-capture-hide / test-screencast / test-portal / test-ipc / test-workspace /
+        test-hotplug / test-binds / test-mru / test-dmabuf-update 全 rc=0。
+
 181. **Alt+Tab 的最近窗口切换器（niri 的 recent windows，新增 `src/mru.c`）**（用户要「niri
       样式」：按住显示、连点 Tab 换窗口、松开提交焦点；样式可配，包括「超出范围不滚动、
       换行铺在屏幕里、一行限制窗口数量、窗口多时预览自适应变小」）。

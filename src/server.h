@@ -1286,6 +1286,14 @@ extern struct vidow_frame_stats vidow_stats;
 struct vidow_server {
 	struct wl_display *display;
 	struct wlr_backend *backend;
+	/* wl_display_run() 已经返回了 = 正在拆。**拆的时候不能再处理设备事件**：
+	 * wl_display_destroy() 会依次 finish 后端（键盘 / 输出），那些 finish 会再发
+	 * 一轮事件进我们的监听器，而这时 seat / 工作区链已经在别处拆过一半了 ——
+	 * 键盘那条会走到 wlr_seat_set_keyboard(已释放的 seat)（coredump：keyboard_key），
+	 * 输出那条会走到工作区链上（coredump：vidow_workspace_count 读 link.next，
+	 * si_addr=0x8，说明链上有个 NULL）。退出时这些状态本来就不用维护，直接不进。
+	 * 见 main.c / input.c 的 keyboard_key / output.c 的 output_gone。 */
+	bool shutting_down;
 	/* 真机（tty）上才有：wlr_backend_autocreate() 建出来的会话。嵌套 / headless
 	 * 是 NULL。切 VT 要它（wlr_session_change_vt），「现在轮到我画了吗」也看它
 	 * （events.active，见 main.c 的 session_active）。 */
@@ -2264,6 +2272,11 @@ struct vidow_win_grab *vidow_win_grab_create(struct vidow_server *server,
 void vidow_win_grab_destroy(struct vidow_win_grab *grab);
 /* 镜像的外接框（逻辑尺寸）。没内容（客户端还没提交过缓冲）返回 false。 */
 bool vidow_win_grab_box(struct vidow_win_grab *grab, int *width, int *height);
+/* 这个窗口算在哪块屏上（按窗口中心的布局位置反查，找不到退回 view->output）。
+ * **按窗口录屏的流尺寸和窗口抓帧源的尺寸必须用同一份判据**：一边是 zkde 流的
+ * 缓冲尺寸，另一边是 portal 报给前端的 size，对不上消费者就把光标位置换算错。 */
+struct wlr_output *vidow_win_grab_output(struct vidow_server *server,
+		struct vidow_view *view);
 /* 渲染一帧：窗口等比缩放摆进 out_w × out_h（剩下的边是黑的），返回**加锁的**缓冲
  * （调用方 unlock）。out_w / out_h 给 0 = 按窗口自己的尺寸（1:1）。不看损伤。 */
 struct wlr_buffer *vidow_win_grab_render(struct vidow_win_grab *grab,

@@ -444,6 +444,25 @@ void vidow_win_grab_destroy(struct vidow_win_grab *grab) {
 
 /* ------------------------------------------- 截图源（ext-copy 的窗口源） */
 
+/* 这个窗口的「取景」算在哪块屏上：**按窗口中心在布局里的位置反查**（跟
+ * screencast.c 的 handle_stream_window 同一个判据，找不到就退回 view->output）。
+ *
+ * 为什么两边必须一致：合成器给 zkde 窗口流开的缓冲尺寸是「窗口逻辑尺寸 × 这块屏
+ * 的 scale」（设备像素），而 portal 报给前端的 size 是从**窗口抓帧源的约束**来的
+ * （vidow-portal 拿缩略图的像素尺寸当 size）。两边用不同的屏 / 口径算，报出去的
+ * size 就跟真实缓冲对不上 —— 消费者（OBS）按比值换算光标位置，2 倍屏上就是
+ * 「录屏里看不到光标」（位置判越界，不画）。 */
+struct wlr_output *vidow_win_grab_output(struct vidow_server *server,
+		struct vidow_view *view) {
+	if (server == NULL || view == NULL) {
+		return NULL;
+	}
+	struct wlr_box at = vidow_view_screen_box(view);
+	struct wlr_output *output = wlr_output_layout_output_at(
+		server->output_layout, at.x + at.width / 2, at.y + at.height / 2);
+	return output != NULL ? output : view->output;
+}
+
 struct vidow_win_source {
 	struct wlr_ext_image_capture_source_v1 base;
 
@@ -493,9 +512,32 @@ static void source_send_constraints(struct vidow_win_source *src) {
 	src->last_h = h;
 }
 
-/* 渲染一帧（1:1，窗口自己多大就多大），挂到 src->pending 上。 */
+/* 渲染一帧（窗口自己多大就多大 **× 它那块屏的 scale**），挂到 src->pending 上。
+ *
+ * 为什么要乘 scale：客户端拿到的约束（尺寸）就是这张图的尺寸，而 vidow-portal 把
+ * 它当「这一路流的 size」报给前端 —— 跟 zkde 窗口流的缓冲尺寸（同样是
+ * 逻辑 × scale，见 screencast.c）必须一个口径。乘了 scale 之后 2 倍屏上的窗口
+ * 缩略图 / 截图也是原生像素，不再是糊的。 */
+static void win_source_size(struct vidow_win_source *src, int *w, int *h) {
+	int gw = 0, gh = 0;
+	if (src->grab == NULL || !vidow_win_grab_box(src->grab, &gw, &gh)) {
+		*w = 0;
+		*h = 0;
+		return;
+	}
+	double scale = 1.0;
+	struct wlr_output *output = vidow_win_grab_output(src->server, src->view);
+	if (output != NULL && output->scale > 0) {
+		scale = output->scale;
+	}
+	*w = (int)lround(gw * scale);
+	*h = (int)lround(gh * scale);
+}
+
 static bool source_render(struct vidow_win_source *src) {
-	struct wlr_buffer *buffer = vidow_win_grab_render(src->grab, 0, 0);
+	int w = 0, h = 0;
+	win_source_size(src, &w, &h);
+	struct wlr_buffer *buffer = vidow_win_grab_render(src->grab, w, h);
 	if (buffer == NULL) {
 		return false;
 	}
@@ -622,8 +664,11 @@ static void source_handle_surface_commit(struct wl_listener *listener,
 	if (src->num_started == 0) {
 		return;
 	}
+	/* 比的是**报出去的那个尺寸**（逻辑 × scale），跟 source_render 一套算法：
+	 * 拿逻辑尺寸比的话，换屏（scale 变了、逻辑没变）就不会重发约束。 */
 	int w = 0, h = 0;
-	if (!vidow_win_grab_box(src->grab, &w, &h)) {
+	win_source_size(src, &w, &h);
+	if (w <= 0 || h <= 0) {
 		return;
 	}
 	if (src->have_constraints && src->last_w == w && src->last_h == h) {

@@ -435,6 +435,11 @@ int main(int argc, char *argv[]) {
 
 	wl_display_run(server.display);
 
+	/* 从这里往下就是拆：wl_display_destroy() 会 finish 后端，键盘 / 输出那些
+	 * finish 还会再发一轮事件进我们的监听器（那时 seat / 工作区链已经拆过一半），
+	 * 所以先立牌子：退出路上不再处理设备事件（见 server.h 的注释）。 */
+	server.shutting_down = true;
+
 	/* 环境是启动时推进 systemd 用户管理器的，退出前放回去：宿主合成器那边
 	 * 的后端才能重新连上它自己的 socket。放在最前面 —— 后面的清理不碰它。 */
 	vidow_portal_env_restore();

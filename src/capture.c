@@ -241,6 +241,9 @@ static void cursor_dst_pos(struct vidow_server *server, struct wlr_output *outpu
 	double ly = obox.y + oc->y / oscale;
 	*x = (int)lround((lx - box->x) * scale);
 	*y = (int)lround((ly - box->y) * scale);
+	wlr_log(WLR_DEBUG, "cursor_dst_pos: oc=%.1f,%.1f oscale=%.2f obox=%d,%d "
+		"box=%d,%d scale=%.2f -> %d,%d", oc->x, oc->y, oscale, obox.x, obox.y,
+		box->x, box->y, scale, *x, *y);
 }
 
 /* 把这块屏上的光标合成到抓帧图上（ext-copy 的 PAINT_CURSORS、screencopy 的
