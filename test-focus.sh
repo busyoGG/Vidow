@@ -510,8 +510,8 @@ check("不抢焦点" not in b, "基线里没有「不抢焦点」这回事")
 print()
 print("== 2) focus_on_open = false：不抢键盘，但窗口照常出现 ==")
 b = log("log-2.txt")
-check(re.search(r"rule: app_id=demo title=\* class=\* .*开窗口抢焦点=off", b)
-	is not None, "规则读进来了（日志里写了开窗口抢焦点=off）")
+check(re.search(r"rule: app_id=demo .*focus_on_open=false", b)
+	is not None, "规则读进来了（日志里写了 focus_on_open=false）")
 check(re.search(r"rule 1: app_id=demo focus_on_open=false", b) is not None,
 	"vidow.rules() 查得回 focus_on_open=false")
 check(re.search(r"rule 1: app_id=demo focus_on_open=false focus_on_activate=nil",
@@ -579,8 +579,8 @@ check(re.search(r"焦点: .* -> 演示", b) is not None, "焦点给了它")
 print()
 print("== 6) focus_on_activate = false ==")
 b = log("log-6.txt")
-check(re.search(r"rule: app_id=demo title=\* class=\* .*激活理它=off", b)
-	is not None, "规则读进来了（激活理它=off）")
+check(re.search(r"rule: app_id=demo .*focus_on_activate=false", b)
+	is not None, "规则读进来了（focus_on_activate=false）")
 check("激活: 演示 不理（窗口规则 focus_on_activate = false）" in b,
 	"激活请求被规则挡下（日志明说）")
 check(b.rfind("焦点: ") < b.find("激活: 演示 不理"),
@@ -634,8 +634,8 @@ check(re.search(r"焦点: a1 -> 演示", b) is not None, "焦点真的给了它"
 print()
 print("== 11) 窗口规则 honor_invalid_serial = true（按应用开口子）==")
 b = log("log-11a.txt")
-check(re.search(r"rule: app_id=demo title=\* class=\* .*无效serial也理=on", b)
-	is not None, "规则读进来了（日志里写了无效serial也理=on）")
+check(re.search(r"rule: app_id=demo .*honor_invalid_serial=true", b)
+	is not None, "规则读进来了（日志里写了 honor_invalid_serial=true）")
 check(re.search(r"rule 1: app_id=demo honor_invalid_serial=true", b) is not None,
 	"vidow.rules() 查得回 honor_invalid_serial=true")
 check("但这个窗口的规则写着 honor_invalid_serial = true → 照样理" in b,

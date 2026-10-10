@@ -767,113 +767,218 @@ static const char *table_string(lua_State *L, int index, const char *key) {
 	return value;
 }
 
-/* 表里有没有写这个布尔字段（nil = 没写 = 不动） */
-static bool table_bool(lua_State *L, int index, const char *key, bool *out) {
-	lua_getfield(L, index, key);
-	bool has = !lua_isnil(L, -1);
-	if (has) {
-		*out = lua_toboolean(L, -1) != 0;
-	}
-	lua_pop(L, 1);
-	return has;
-}
-
+/* vidow.rule{ … }：一条窗口规则 / 图层规则。字段表在 rule.c 的
+ * vidow_rule_fields[]（匹配 + 作用一起），这里只负责「从 Lua 表里按类型取值」。
+ *
+ * 字符串字段 = POSIX 扩展正则（不锚定、大小写不敏感），前面加 ! 取反；literal =
+ * true 就整条规则退回子串匹配。 */
 static int l_rule(lua_State *L) {
 	struct vidow_script *s = script_of(L);
 	if (!lua_istable(L, 1)) {
 		return luaL_error(L, "vidow.rule 要一个表，比如 "
 			"vidow.rule{ app_id = \"mpv\", force_render = true }");
 	}
-	struct vidow_rule_spec spec = { 0 };
-	spec.has_force_render = table_bool(L, 1, "force_render",
-		&spec.force_render);
-
-	/* hz = 这个窗口每秒补多少帧（0 = 不限）；不写就用配置里的 force_render_hz */
-	lua_getfield(L, 1, "hz");
-	spec.has_hz = !lua_isnil(L, -1);
-	spec.hz = spec.has_hz ? (int)lua_tointeger(L, -1) : 0;
+	char err_buf[256];
+	struct vidow_rule *rule = vidow_rule_new();
+	if (rule == NULL) {
+		return luaL_error(L, "vidow.rule: 内存不够了");
+	}
+	/* 先扫一遍 literal：它管的是所有字符串字段的匹配方式，得在写字段之前知道。 */
+	lua_getfield(L, 1, "literal");
+	if (!lua_isnil(L, -1)) {
+		vidow_rule_set_literal(rule, lua_toboolean(L, -1) != 0);
+	}
 	lua_pop(L, 1);
 
-	/* 焦点行为：新窗口抢不抢焦点 / 别人请求激活它时理不理 */
-	spec.has_focus_on_open = table_bool(L, 1, "focus_on_open",
-		&spec.focus_on_open);
-	spec.has_focus_on_activate = table_bool(L, 1, "focus_on_activate",
-		&spec.focus_on_activate);
-	/* 它的激活请求即使令牌 serial 校验不过也照样理（默认不理） */
-	spec.has_honor_invalid_serial = table_bool(L, 1, "honor_invalid_serial",
-		&spec.honor_invalid_serial);
-
-	/* 这个窗口的 X11 缩放桥（1 = 客户端没按 GDK_SCALE 画，别除）。只对 X11
-	 * 窗口有意义：Wayland 客户端自己声明 buffer_scale。 */
-	lua_getfield(L, 1, "x11_scale");
-	spec.has_scale = !lua_isnil(L, -1);
-	spec.scale = spec.has_scale ? lua_tonumber(L, -1) : 0.0;
-	lua_pop(L, 1);
-
-	/* 抓帧遮挡：截图 / 录屏里这个窗口怎么出现。
-	 *   "off"  = 照常出现（默认）
-	 *   "hide" = 不出现
-	 * 写了 namespace 的规则管的是 layer surface，不写就管窗口。 */
-	const char *cap = table_string(L, 1, "capture");
-	spec.has_capture = cap != NULL;
-	if (cap != NULL) {
-		if (strcmp(cap, "hide") == 0) {
-			spec.capture = VIDOW_CAPTURE_HIDE;
-		} else if (strcmp(cap, "mosaic") == 0) {
-			spec.capture = VIDOW_CAPTURE_MOSAIC;
-		} else if (strcmp(cap, "off") == 0 || cap[0] == '\0') {
-			spec.capture = VIDOW_CAPTURE_OFF;
-		} else {
-			return luaL_error(L, "vidow.rule 的 capture 只能是 \"off\"、"
-				"\"hide\" 或 \"mosaic\"，给的是 \"%s\"", cap);
+	lua_pushnil(L); /* 第一个 key */
+	while (lua_next(L, 1) != 0) {
+		const char *key = lua_tostring(L, -2);
+		const struct vidow_rule_field *field =
+			key != NULL ? vidow_rule_field_find(key) : NULL;
+		if (key == NULL) {
+			vidow_rule_discard(rule);
+			return luaL_error(L, "vidow.rule 的键只能是字符串");
+		}
+		if (strcmp(key, "literal") == 0) {
+			lua_pop(L, 1);
+			continue;
+		}
+		if (field == NULL) {
+			vidow_rule_discard(rule);
+			return luaL_error(L, "vidow.rule 没有 %s 这个字段。能写的：%s",
+				key, vidow_rule_all_names(0));
+		}
+		char err[256];
+		err[0] = '\0';
+		bool ok = true;
+		switch (field->kind) {
+		case RK_STR: {
+			const char *text = lua_type(L, -1) == LUA_TSTRING ?
+				lua_tostring(L, -1) : NULL;
+			if (text == NULL) {
+				ok = false;
+				snprintf(err, sizeof(err), "要一个字符串（正则）");
+			} else {
+				ok = vidow_rule_set_str(rule, field->slot, text, err,
+					sizeof(err));
+			}
+			break;
+		}
+		case RK_BOOL:
+		case RK_ACT_BOOL: {
+			if (lua_isnil(L, -1)) {
+				ok = false;
+				snprintf(err, sizeof(err), "要 true 或 false");
+			} else {
+				bool value = lua_toboolean(L, -1) != 0;
+				if (field->kind == RK_BOOL) {
+					ok = vidow_rule_set_bool(rule, field->slot, value);
+				} else {
+					ok = vidow_rule_set_act_bool(rule, field->slot,
+						value);
+				}
+			}
+			break;
+		}
+		case RK_NUM:
+		case RK_ACT_INT: {
+			if (!lua_isnumber(L, -1)) {
+				ok = false;
+				snprintf(err, sizeof(err), "要一个整数");
+			} else if (field->kind == RK_NUM) {
+				ok = vidow_rule_set_num(rule, field->slot,
+					(long long)lua_tointeger(L, -1));
+			} else {
+				ok = vidow_rule_set_act_int(rule, field->slot,
+					(long long)lua_tointeger(L, -1));
+			}
+			break;
+		}
+		case RK_ACT_DOUBLE: {
+			if (!lua_isnumber(L, -1)) {
+				ok = false;
+				snprintf(err, sizeof(err), "要一个数");
+			} else {
+				ok = vidow_rule_set_act_double(rule, field->slot,
+					lua_tonumber(L, -1));
+			}
+			break;
+		}
+		case RK_ACT_STR: {
+			const char *text = lua_type(L, -1) == LUA_TSTRING ?
+				lua_tostring(L, -1) : NULL;
+			if (text == NULL) {
+				ok = false;
+				snprintf(err, sizeof(err), "要一个字符串");
+			} else {
+				ok = vidow_rule_set_act_str(rule, field->slot, text, err,
+					sizeof(err));
+			}
+			break;
+		}
+		case RK_ACT_COLOR: {
+			const char *text = lua_type(L, -1) == LUA_TSTRING ?
+				lua_tostring(L, -1) : NULL;
+			if (text == NULL) {
+				ok = false;
+				snprintf(err, sizeof(err),
+					"要一个颜色串，比如 \"ff0000\"");
+			} else {
+				ok = vidow_rule_set_act_color(rule, field->slot, text,
+					err, sizeof(err));
+			}
+			break;
+		}
+		case RK_ACT_CAPTURE: {
+			const char *text = lua_type(L, -1) == LUA_TSTRING ?
+				lua_tostring(L, -1) : NULL;
+			if (text == NULL) {
+				ok = false;
+				snprintf(err, sizeof(err), "要 \"off\" / \"hide\" / "
+					"\"mosaic\"");
+			} else {
+				ok = vidow_rule_set_capture(rule, field->slot, text, err,
+					sizeof(err));
+			}
+			break;
+		}
+		default:
+			ok = false;
+			snprintf(err, sizeof(err), "不认识的字段类型");
+			break;
+		}
+		lua_pop(L, 1); /* 值（key 还留着给 lua_next） */
+		if (!ok) {
+			vidow_rule_discard(rule);
+			return luaL_error(L, "vidow.rule 的 %s：%s", key, err);
 		}
 	}
-	/* 马赛克的块边长（屏幕像素）。只在 capture = "mosaic" 下有用 —— 单独写它
-	 * 不算一条作用，所以不参与下面那个「至少写一个作用」的检查。 */
-	lua_getfield(L, 1, "capture_mosaic");
-	spec.has_capture_mosaic = !lua_isnil(L, -1);
-	spec.capture_mosaic = spec.has_capture_mosaic ?
-		(int)lua_tointeger(L, -1) : VIDOW_CAPTURE_MOSAIC_DEFAULT;
-	if (spec.capture_mosaic < VIDOW_CAPTURE_MOSAIC_MIN) {
-		return luaL_error(L, "capture_mosaic 是马赛克的块边长（屏幕像素），"
-			"至少 %d，给的是 %d", VIDOW_CAPTURE_MOSAIC_MIN,
-			spec.capture_mosaic);
-	}
-	lua_pop(L, 1);
 
-	if (!spec.has_force_render && !spec.has_hz && !spec.has_focus_on_open &&
-			!spec.has_focus_on_activate && !spec.has_honor_invalid_serial &&
-			!spec.has_scale && !spec.has_capture) {
-		return luaL_error(L, "vidow.rule 至少写一个作用：force_render = true / "
-			"hz = <每秒补几帧，0 = 不限> / focus_on_open = false / "
-			"focus_on_activate = false / honor_invalid_serial = true / "
-			"x11_scale = <X11 缩放桥，1 = 不除> / capture = \"hide\""
-			"（匹配字段：app_id / title / class / namespace —— 写了 namespace "
-			"这条规则就管 layer surface）");
-	}
-
-	spec.app_id = table_string(L, 1, "app_id");
-	spec.title = table_string(L, 1, "title");
-	spec.klass = table_string(L, 1, "class");
-	spec.namespace = table_string(L, 1, "namespace");
-	struct vidow_rule *rule = vidow_rule_add(s->server, &spec);
-	if (rule == NULL) {
-		return luaL_error(L, "cannot add a window rule");
+	if (!vidow_rule_commit(s->server, rule, err_buf, sizeof(err_buf))) {
+		vidow_rule_discard(rule);
+		return luaL_error(L, "vidow.rule: %s", err_buf);
 	}
 	lua_pushboolean(L, 1);
 	return 1;
 }
 
-/* 规则里的布尔开关：没写就推 nil（「这条规则没管它」和「这条规则管了、给的是
+/* 一个字段的值 → Lua 栈（没写的字段推 nil：「这条规则没管它」和「管了、给的是
  * 默认值」是两回事）。 */
-static void push_rule_bool(lua_State *L, bool has, bool value,
-		const char *key) {
-	if (has) {
-		lua_pushboolean(L, value);
-	} else {
+static void push_rule_field(lua_State *L, const struct vidow_rule *rule,
+		const struct vidow_rule_field *field) {
+	if (!vidow_rule_has_field(rule, field)) {
 		lua_pushnil(L);
+		return;
 	}
-	lua_setfield(L, -2, key);
+	switch (field->kind) {
+	case RK_STR: {
+		/* 原样推回去（带取反的 !），写进去什么样读出来什么样。 */
+		const struct vidow_rule_match *m = &rule->str[field->slot];
+		if (m->negate) {
+			char buf[VIDOW_RULE_PAT + 1];
+			snprintf(buf, sizeof(buf), "!%s", m->pat);
+			lua_pushstring(L, buf);
+		} else {
+			lua_pushstring(L, m->pat);
+		}
+		break;
+	}
+	case RK_BOOL:
+		lua_pushboolean(L, rule->bval[field->slot]);
+		break;
+	case RK_NUM:
+		lua_pushinteger(L, (lua_Integer)rule->nval[field->slot]);
+		break;
+	case RK_ACT_BOOL:
+		lua_pushboolean(L, rule->aval[field->slot].b);
+		break;
+	case RK_ACT_INT:
+		lua_pushinteger(L, (lua_Integer)rule->aval[field->slot].i);
+		break;
+	case RK_ACT_DOUBLE:
+		lua_pushnumber(L, rule->aval[field->slot].d);
+		break;
+	case RK_ACT_STR:
+		lua_pushstring(L, rule->aval[field->slot].s);
+		break;
+	case RK_ACT_COLOR: {
+		const float *c = rule->aval[field->slot].color;
+		char buf[16];
+		snprintf(buf, sizeof(buf), "#%02x%02x%02x%02x",
+			(int)(c[0] * 255.0f + 0.5f), (int)(c[1] * 255.0f + 0.5f),
+			(int)(c[2] * 255.0f + 0.5f), (int)(c[3] * 255.0f + 0.5f));
+		lua_pushstring(L, buf);
+		break;
+	}
+	case RK_ACT_CAPTURE:
+		lua_pushstring(L, rule->aval[field->slot].i == VIDOW_CAPTURE_HIDE ?
+			"hide" : rule->aval[field->slot].i == VIDOW_CAPTURE_MOSAIC ?
+			"mosaic" : "off");
+		break;
+	default:
+		lua_pushnil(L);
+		break;
+	}
 }
 
 static int l_rules(lua_State *L) {
@@ -886,51 +991,18 @@ static int l_rules(lua_State *L) {
 		}
 		lua_pushinteger(L, (lua_Integer)i + 1);
 		lua_newtable(L);
-		lua_pushstring(L, rule->app_id);
-		lua_setfield(L, -2, "app_id");
-		lua_pushstring(L, rule->title);
-		lua_setfield(L, -2, "title");
-		lua_pushstring(L, rule->klass);
-		lua_setfield(L, -2, "class");
-		lua_pushstring(L, rule->namespace);
-		lua_setfield(L, -2, "namespace");
-		if (rule->has_force_render) {
-			lua_pushboolean(L, rule->force_render);
-		} else {
-			lua_pushnil(L);
+		if (rule->literal) {
+			lua_pushboolean(L, 1);
+			lua_setfield(L, -2, "literal");
 		}
-		lua_setfield(L, -2, "force_render");
-		if (rule->has_hz) {
-			lua_pushinteger(L, rule->hz);
-		} else {
-			lua_pushnil(L);
+		for (size_t j = 0; j < vidow_rule_field_count; j++) {
+			const struct vidow_rule_field *field = &vidow_rule_fields[j];
+			if (!vidow_rule_has_field(rule, field)) {
+				continue;
+			}
+			push_rule_field(L, rule, field);
+			lua_setfield(L, -2, field->name);
 		}
-		lua_setfield(L, -2, "hz");
-		push_rule_bool(L, rule->has_focus_on_open, rule->focus_on_open,
-			"focus_on_open");
-		push_rule_bool(L, rule->has_focus_on_activate, rule->focus_on_activate,
-			"focus_on_activate");
-		push_rule_bool(L, rule->has_honor_invalid_serial,
-			rule->honor_invalid_serial, "honor_invalid_serial");
-		if (rule->has_scale) {
-			lua_pushnumber(L, rule->scale);
-		} else {
-			lua_pushnil(L);
-		}
-		lua_setfield(L, -2, "x11_scale");
-		if (rule->has_capture) {
-			lua_pushstring(L, rule->capture == VIDOW_CAPTURE_HIDE ? "hide" :
-				rule->capture == VIDOW_CAPTURE_MOSAIC ? "mosaic" : "off");
-		} else {
-			lua_pushnil(L);
-		}
-		lua_setfield(L, -2, "capture");
-		if (rule->has_capture_mosaic) {
-			lua_pushinteger(L, rule->capture_mosaic);
-		} else {
-			lua_pushnil(L);
-		}
-		lua_setfield(L, -2, "capture_mosaic");
 		lua_settable(L, -3);
 	}
 	return 1;

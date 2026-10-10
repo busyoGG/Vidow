@@ -450,27 +450,34 @@ Wayland 的帧回调（`wl_surface.frame`）是合成器「我要用你的画面
 -- 全局节流：视口外补帧每秒最多几帧（0 = 不限速，跟输出的帧节奏走）
 force_render_hz = 60          -- 也可以用 VIDOW_FORCE_RENDER_HZ 覆盖
 
--- ① 窗口规则：哪些窗口值得保活、各补多少帧，由你说了算（子串匹配，大小写不敏感）
+-- ① 窗口规则：哪些窗口值得保活、各补多少帧，由你说了算
+--    （匹配是 POSIX 正则：不锚定 = 子串语义、大小写不敏感；前面加 ! 取反）
 vidow.rule{ app_id = "mpv", force_render = true }              -- 用全局的 60Hz
-vidow.rule{ title = "预览", force_render = true, hz = 15 }     -- 这个窗口只补 15Hz
+vidow.rule{ title = "^预览", force_render = true, hz = 15 }    -- 这个窗口只补 15Hz
 vidow.rule{ class = "Steam", force_render = false }            -- 后面的覆盖前面的
 vidow.rule{ app_id = "vlc", hz = 0 }                           -- 只调节流：不限速
+vidow.rule{ exe = "^wechat$", x11_scale = 1 }                  -- 没有 app_id 的按进程认
 
--- 一条规则至少写一个作用（force_render / hz / x11_scale / capture），都不写会在配置那一行报错。
+-- 一条规则至少写一个作用，都不写会在配置那一行报错；字段名写错了也报错，
+-- 而且把能写的字段名全列出来。
 
--- 查回来（状态栏 / 自检用；空字段按 * 显示是调用方的事）
-local function star(v) return (v == nil or v == "") and "*" or v end
+-- 查回来（状态栏 / 自检用；没管的字段是 nil —— 「没管它」和「管了、给了默认值」
+-- 是两回事，JSON 那边（vidowmsg rules）对应的是 null）
 for i, r in ipairs(vidow.rules()) do
-  vidow.log(string.format("rule %d: app_id=%s title=%s class=%s force_render=%s hz=%s",
-    i, star(r.app_id), star(r.title), star(r["class"]), tostring(r.force_render),
-    r.hz == nil and "配置默认" or tostring(r.hz)))
+  vidow.log(string.format("rule %d: app_id=%s title=%s exe=%s force_render=%s hz=%s",
+    i, tostring(r.app_id), tostring(r.title), tostring(r.exe),
+    tostring(r.force_render), r.hz == nil and "配置默认" or tostring(r.hz)))
 end
 ```
 
 | 项 | 说明 |
 | --- | --- |
-| 匹配字段 | `app_id` / `title` / `class`（X11 的 `WM_CLASS`），都是**子串、大小写不敏感**；留空 = 不限。三个都空 = 匹配所有窗口（能用，但日志里会打成 `* / *` 提醒你）。写了 `namespace` 的规则只匹配 **layer surface**（按 layer 的 namespace 子串），窗口那条路会跳过它 —— 见「截图 / 录屏里不出现」 |
-| 覆盖顺序 | 按配置里的先后逐条套用，**后面的覆盖前面的**（同一个窗口命中多条时以最后一条为准） |
+| 匹配方式 | 字符串字段都是 **POSIX 扩展正则**（`regcomp(REG_EXTENDED \| REG_ICASE)`），**不锚定** = 找到就算命中 —— 所以普通字符串写进去就是原来的「子串、大小写不敏感」。含元字符（`. * + ? [ ] ( ) { } \| ^ $ \`）的串要转义：`title = "v1\\.0"`；整条规则写 `literal = true` 退回纯子串匹配。字段前面加 `!` = 取反（`title = "!^预览"` = 不是预览窗口），要匹配字面的 `!` 就写 `\\!` |
+| 匹配字段（窗口） | `app_id`（Wayland 的 app_id / X11 的 WM_CLASS class 段）、`title`、`class`、`instance`、`role`、`initial_app_id`、`initial_title`、`initial_class`、`initial_instance`（上屏那一刻的名字 —— 浏览器、终端会改标题，认「刚开的那一屏」用它）、`xwayland`、`popup`、`floating`、`fullscreen`、`maximized`、`minimized`、`fixed_size`（客户端声明了固定尺寸，微信登录窗那种）、`on_output`、`on_workspace` |
+| 匹配字段（窗口和图层都认） | `pid`、`exe`、`cmdline` —— 从 `/proc/<pid>/…` 读，没有 `app_id` 可认的老程序、包一层启动脚本的，按进程认（`exe` 是 `/proc/<pid>/exe` 的最后一段，flatpak 那种是 `bwrap`，用 `cmdline` 更准） |
+| 匹配字段（图层） | `namespace`（waybar / mako / notifications …）、`layer`（`background` / `bottom` / `top` / `overlay`）—— 写了这两个里任何一个就是**图层规则**。窗口字段和图层字段写进同一条规则 = 这条谁也不匹配（不静默失效，日志和 `vidowmsg rules` 都看得见） |
+| 布尔字段 | 写成 `true` / `false`（不写 = 不管它）。`floating` / `fullscreen` / `maximized` / `minimized` / `on_output` / `on_workspace` 是**判定那一刻**的状态，判定发生在建窗口、标题 / class 变化、重载规则这三处 |
+| 覆盖顺序 | 按配置里的先后逐条套用，**后面的覆盖前面的**；一条规则只动它写了的字段，谁都没写的字段用默认值 |
 | 生效时机 | 建窗口时判一次；标题 / class 变了再判一次；`SIGHUP` 重载规则后把已经开着的窗口全部重判 |
 | 节流 | `force_render_hz = <每秒几帧>`（默认 60，`0` = 不限速）；规则里写 `hz = <n>` 可以逐窗口覆盖。补帧要主动排下一帧，不限速时会一直出帧（headless 后端上量到过 2500fps），所以默认按刷新率给 |
 | X11 缩放桥 | `x11_scale = <n>`：这个 X11 窗口的缓冲区按 `n` 倍声明（逻辑尺寸 = 缓冲 / `n`）。`x11_scale = 1` = 「这个客户端没按 `GDK_SCALE` 画，别除」—— 微信登录窗那类固定尺寸、不认 env 的程序在 2 倍屏上就不会只剩 1/4 面积。见「X11 的 HiDPI」那节，回归判据 `test-x11scale.sh` |
@@ -4392,6 +4399,38 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
        口子（screencopy / ext-image-copy-capture 同样对所有客户端开放，grim / OBS 靠它），
        而要收就得连它一起收 —— 那会把 grim / wf-recorder / OBS 全废掉。要边界得靠 sandbox
        那一层（别的进程拿不到 wayland socket），不是合成器。
+
+197. **规则的匹配换成正则、匹配字段从 3 个扩到 24 个**（用户要求「匹配允许正则匹配，匹配的项目增加，尽可能覆盖更多情况」）
+
+      原来只有 app_id / title / class 三个字段、都是子串匹配，套用逻辑是一长串手写的
+      `if (rule->has_xxx)`。现在字段表和套用都改成表驱动（`vidow_rule_fields[]`，`src/rule.c`）：
+      加一个字段只加一行，Lua 解析（`script.c` 的 `l_rule` / `l_rules`）和 IPC
+      （`ipcstate.c` 的 `vidow_ipc_json_rules`）自动跟上，不会再三处各写一遍。
+
+      - **匹配是 POSIX 扩展正则**（`REG_EXTENDED | REG_ICASE | REG_NOSUB`），不锚定 = 找到就
+        算命中 —— 所以 `app_id = "mpv"` 还是原来的子串语义，`title = "^预览"` 就是锚定；
+        整条规则写 `literal = true` 退回纯子串。字段前面加 `!` 取反。
+      - 新增匹配字段 21 个：`instance` / `role` / `initial_app_id` / `initial_title` /
+        `initial_class` / `initial_instance` / `exe` / `cmdline` / `pid` / `on_output` /
+        `on_workspace` / `layer` / `xwayland` / `popup` / `floating` / `fullscreen` /
+        `maximized` / `minimized` / `fixed_size`。`exe` / `cmdline` 读 `/proc/<pid>/…`
+        （每个窗口抓一次就缓存，而且只有规则里真写了才去读）—— 没有 app_id 可认的老程序、
+        包一层启动脚本的，按进程认。
+      - `initial_*` 是**上屏那一刻**的名字快照（`view.c` 的 `vidow_view_note_initial_names`，
+        只填空着的：X11 的 WM_CLASS / WM_NAME 有时比 map 还晚到）。浏览器、终端都会改标题，
+        「认刚开的那一屏」用它。
+      - **字段跟目标对不上 = 这条规则不匹配**（给图层规则写 `app_id` 这种）：宁可没生效，
+        也别因为「这个字段没意义」就悄悄匹配上一切。
+      - 字段名写错**当场报错**并列出所有能写的字段名（以前是静默忽略：`appid = "mpv"` 会
+        变成一条「匹配一切」的规则）；正则编译不过也当场报错，带字段名和 `regerror` 的话。
+      - `vidowmsg rules` 每个字段都给（没写的是 `null`），`vidow.rules()` 里没写的是 `nil`；
+        窗口 JSON 的 `rules` 里多了 `capture` / `capture_mosaic` / `x11_scale`（自检脚本的判据）。
+      - 顺带修文档：`app_id` 在 X11 上取的是 WM_CLASS 的 **class 段（第二段）**，旧手册写成
+        「第一段」（ICCCM 里第一段是 instance，现在有单独的 `instance` 字段可以匹配）。
+      - 判据：新测试 `test-rules.sh`（77 项：读回、报错、窗口上的正则 / 取反 / literal / pid /
+        exe / cmdline / 布尔字段 / AND / 覆盖顺序，图层上的 namespace / layer）；
+        `test-defaultconfig.sh` 那条「表字段都得写进配置说明」现在从 `rule.c` 抠字段名（39 项）；
+        `test-capture-hide.sh` / `test-focus.sh` 跟着新的报错文本和日志格式改。
 
 196. **exec 那四个名字并成两个**（用户要求「exec 这里优化一下，有些重复功能的方法就合并了」）
 

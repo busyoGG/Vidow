@@ -1,38 +1,29 @@
-/* 窗口规则：按 app_id / 标题 / X11 class 给窗口定行为，用户写在 config.lua 里。
+/* 窗口规则 / 图层规则：一条规则 = 匹配谁 + 怎么对待它，用户写在 config.lua 里。
  *
- *   vidow.rule{ app_id = "mpv", force_render = true }              -- 视口外也补帧
- *   vidow.rule{ title = "预览", force_render = true, hz = 15 }     -- 而且只补 15Hz
- *   vidow.rule{ app_id = "mpv", hz = 0 }                           -- 只调节流：不限速
- *   vidow.rule{ app_id = "slack", focus_on_open = false }          -- 开新窗口别抢焦点
- *   vidow.rule{ app_id = "slack", focus_on_activate = false }      -- 别理它的抢焦点请求
- *   vidow.rule{ app_id = "weird", honor_invalid_serial = true }    -- 它令牌不灵也照样理
+ *   vidow.rule{ app_id = "mpv", force_render = true }
+ *   vidow.rule{ title = "^预览", force_render = true, hz = 15 }
+ *   vidow.rule{ class = "Steam", focus_on_open = false }
+ *   vidow.rule{ namespace = "notifications", capture = "hide" }
  *
- * 作用（可以只写一个）：
- *   force_render —— 窗口滚到视口外（或者所在工作区被藏起来）时，
- * 仍然给它补帧回调，让客户端接着出帧。原因见 view.c 里 vidow_view_render_pump()：
- * Wayland 的帧回调是合成器「我要用你的画面了」的许可，窗口不在画面上就没有回调，
- * 视频播放器 / 游戏 / 任何按帧节流的客户端会停帧 —— 录屏、窗口预览、切回来看到的
- * 就是一张冻住的画面。
- *   hz           —— 这种窗口每秒补多少帧（0 = 不限）。不写就用全局的
- *                   force_render_hz；补帧要主动排下一帧，不限速会空转到几千 fps。
- *   focus_on_open     —— 这个应用**开新窗口**的时候要不要把焦点给它（默认 true）。
- * Electron 系客户端会为了通知 / 剪贴板开一个看不见的辅助窗口，一开就把焦点从你
- * 正在打字的窗口上抢走；这类应用关掉它，窗口照常出现，只是不抢键盘。
- *   focus_on_activate —— 别人**请求激活**它（点通知、任务栏按钮、portal 顶窗口）
- * 时理不理（默认 true）。反过来的毛病（它的令牌不灵、点了通知窗口不动）由
- * 配置项 activation_token_timeout 治，见 config.c。
- *   honor_invalid_serial —— 它的激活请求**即使令牌里的 serial 校验不过**也照样理
- * （默认 false）。工具包偷懒写 set_serial(0, seat) 的应用（很常见）默认顶不上来；
- * 全局开关 honor_xdg_activation_with_invalid_serial 是「所有应用都理」，这条规则是
- * 「只有这几个应用理」—— 想开小口子就用它（代价：serial 校验本来是防抢焦点的）。
+ * 匹配：每个字符串字段都是一条 **POSIX 扩展正则**（ERE），不锚定 = 找到就算命中，
+ * 大小写不敏感；留空 = 不限。写正则之前那些普通字符串照样是「子串匹配」——
+ * "mpv" 当正则用就是在整串里找 mpv。含正则元字符（. * + ? [ ] ( ) { } | ^ $ \）
+ * 的串得转义：title = "v1\\.0"。整条规则写 literal = true 就退回「纯子串」匹配。
+ * 串前面加 ! = 取反（「这个字段不是它」），要匹配字面的 ! 就写 \\!。
  *
- * 匹配是「子串、大小写不敏感」；规则按配置里的先后顺序逐条套用，后面的覆盖前面的。
- * 三个字段都空 = 匹配所有窗口（能用，但小心）。 */
+ * 一条规则**只管一边**：写了 namespace / layer（layer surface 才有的字段）就是
+ * 图层规则；写了窗口才有的字段就是窗口规则。字段跟目标对不上（比如给图层规则写
+ * app_id）时这条规则**不匹配**（宁可没生效也别悄悄匹配上一切）。
+ *
+ * 规则按配置里的先后顺序逐条套用，**后面的覆盖前面的**：同一个字段以「最后一条
+ * 写了它的规则」为准；谁都没写的字段用默认值（不是回上一条规则给的值，也不是
+ * 回「这条规则没写」的那个默认 —— 一条规则只动它写了的字段）。 */
 #ifndef VIDOW_RULE_H
 #define VIDOW_RULE_H
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <regex.h>
 
 #include <wayland-util.h>
 
@@ -56,102 +47,176 @@ enum vidow_capture_mode {
 /* 块边长下限：1 就是原图，没有意义（渲染上也要 ≥2 才能叫马赛克）。 */
 #define VIDOW_CAPTURE_MOSAIC_MIN 2
 
+/* 模式串长度上限（含结尾的 0）：正则可以比子串长，但也别太长。 */
+#define VIDOW_RULE_PAT 192
+/* 作用里的字符串（workspace / output 的名字）长度上限。 */
+#define VIDOW_RULE_VAL 128
+
+/* ------------------------------------------------------------ 匹配字段
+ *
+ * 三个维度分开排：字符串（正则）、布尔、数值。加一个字段要动四处：这里的枚举、
+ * rule.c 的 vidow_rule_fields[]（名字 / 类型 / 管哪一边 / 一句话说明）、
+ * rule.c 的 ctx_from_view / ctx_from_layer（填值）、以及文档。 */
+
+enum vidow_rule_str {
+	VRS_APP_ID = 0,        /* Wayland 的 app_id / X11 的 WM_CLASS class 段 */
+	VRS_TITLE,             /* 当前标题 */
+	VRS_CLASS,             /* X11 的 WM_CLASS class 段 */
+	VRS_INSTANCE,          /* X11 的 WM_CLASS instance 段 */
+	VRS_ROLE,              /* X11 的 WM_WINDOW_ROLE */
+	VRS_INITIAL_APP_ID,    /* 上屏那一刻的 app_id（客户端后来改标题不影响它） */
+	VRS_INITIAL_TITLE,
+	VRS_INITIAL_CLASS,
+	VRS_INITIAL_INSTANCE,
+	VRS_EXE,               /* 客户端可执行文件名（/proc/<pid>/exe 的最后一段） */
+	VRS_CMDLINE,           /* 客户端命令行（/proc/<pid>/cmdline，参数用空格接） */
+	VRS_NAMESPACE,         /* layer surface 的 namespace（waybar / mako …） */
+	VRS_LAYER,             /* layer 的层：background / bottom / top / overlay */
+	VRS_ON_OUTPUT,         /* 现在摆在哪块屏上（输出名） */
+	VRS_ON_WORKSPACE,      /* 现在属于哪块工作区（名字） */
+	VRS_COUNT
+};
+
+enum vidow_rule_bool {
+	VRB_XWAYLAND = 0,      /* 是 X11（XWayland）窗口 */
+	VRB_POPUP,             /* 菜单 / 提示 / 下拉框这类弹出物 */
+	VRB_FLOATING,          /* 现在是浮动窗口 */
+	VRB_FULLSCREEN,
+	VRB_MAXIMIZED,         /* 所在列正整列最大化 */
+	VRB_MINIMIZED,         /* 收起来了（还在列里，但不显示） */
+	VRB_FIXED_SIZE,        /* 客户端声明了固定尺寸（min == max），微信登录窗那种 */
+	VRB_COUNT
+};
+
+enum vidow_rule_num {
+	VRN_PID = 0,           /* 客户端进程号 */
+	VRN_COUNT
+};
+
+/* ------------------------------------------------------------ 作用字段
+ *
+ * 「写了才动」：没写的字段回默认值，不是留着上一条规则给的值。 */
+
+enum vidow_rule_act {
+	VRA_FORCE_RENDER = 0,  /* 视口外也补帧（录屏 / 预览要新画面） */
+	VRA_HZ,                /* 补帧频率（0 = 不限） */
+	VRA_FOCUS_ON_OPEN,     /* 它开新窗口时抢不抢焦点 */
+	VRA_FOCUS_ON_ACTIVATE, /* 别人请求激活它时理不理 */
+	VRA_HONOR_INVALID_SERIAL, /* 令牌 serial 校验不过也理 */
+	VRA_X11_SCALE,         /* X11 缩放桥（1 = 不除） */
+	VRA_CAPTURE,           /* off / hide / mosaic */
+	VRA_CAPTURE_MOSAIC,    /* 马赛克块边长 */
+	VRA_COUNT
+};
+
+/* 一个作用的值：按 vidow_rule_fields[] 里的类型取对应的成员。 */
+union vidow_rule_value {
+	bool b;
+	long long i;
+	double d;
+	float color[4];
+	char s[VIDOW_RULE_VAL];
+};
+
+/* 一个字符串匹配字段：模式串 + 编译好的正则（literal 时不编译）。 */
+struct vidow_rule_match {
+	char pat[VIDOW_RULE_PAT];
+	regex_t re;
+	bool has_re;
+	bool negate; /* 写的时候前面带了 ! */
+};
+
 struct vidow_rule {
 	struct wl_list link; /* vidow_server.rules */
-	char app_id[128];    /* 空 = 不限 */
-	char title[128];
-	char klass[128];     /* X11 的 WM_CLASS */
-	/* layer-shell 的 namespace（waybar / mako / swaync …）。**写了它这条规则就
-	 * 只管 layer surface**，窗口匹配直接跳过它 —— 否则一条只写了 namespace 的
-	 * 规则会因为 app_id / title / class 全空而匹配上所有窗口。 */
-	char namespace[128];
 
-	bool has_force_render;
-	bool force_render;
+	/* 匹配 */
+	struct vidow_rule_match str[VRS_COUNT];
+	bool bset[VRB_COUNT];
+	bool bval[VRB_COUNT];
+	bool nset[VRN_COUNT];
+	long long nval[VRN_COUNT];
+	bool literal; /* 所有字符串按子串匹配（不做正则） */
 
-	/* 这个窗口的补帧节流（每秒几帧，0 = 不限）；has_hz = false 时用全局配置 */
-	bool has_hz;
-	int hz;
-
-	/* 焦点行为；has_xxx = false 时不动（用窗口自己的默认值，都是 true） */
-	bool has_focus_on_open;
-	bool focus_on_open;
-	bool has_focus_on_activate;
-	bool focus_on_activate;
-
-	/* 无效 serial 的激活请求理不理（默认 false = 不理） */
-	bool has_honor_invalid_serial;
-	bool honor_invalid_serial;
-
-	/* 这个窗口的 X11 缩放桥（0 = 跟随全局 xwayland_scale）。
-	 *
-	 * 全局那套假设「X 客户端按 GDK_SCALE / QT_SCALE_FACTOR 画了 2 倍」，于是把
-	 * 缓冲区除以 2 —— 认这套 env 的客户端（GTK / Qt）刚好和 Wayland 应用一样大，
-	 * 不认的老程序（微信登录窗、CEF 系）就被缩掉一半（面积 1/4）。逐窗口写 1
-	 * 就是「这个客户端没按 2 倍画，别除」。 */
-	bool has_scale;
-	double scale;
-
-	/* 抓帧遮挡（enum vidow_capture_mode）；has_capture = false 时不动。
-	 * capture_mosaic 是马赛克的块边长（屏幕像素），只在 MOSAIC 下有用。 */
-	bool has_capture;
-	int capture;
-	bool has_capture_mosaic;
-	int capture_mosaic;
+	/* 作用 */
+	bool aset[VRA_COUNT];
+	union vidow_rule_value aval[VRA_COUNT];
 };
 
-/* 一条规则的内容。字段多，用结构体传：全是「有没有写 / 写的什么」成对的开关，
- * 十几个位置参数迟早会传错顺序。字符串可以是 NULL / 空串。 */
-struct vidow_rule_spec {
-	const char *app_id;
-	const char *title;
-	const char *klass;
-	const char *namespace;
-
-	bool has_force_render;
-	bool force_render;
-	bool has_hz;
-	int hz;
-
-	bool has_focus_on_open;
-	bool focus_on_open;
-	bool has_focus_on_activate;
-	bool focus_on_activate;
-
-	bool has_honor_invalid_serial;
-	bool honor_invalid_serial;
-
-	bool has_scale;
-	double scale;
-
-	bool has_capture;
-	int capture;
-	bool has_capture_mosaic;
-	int capture_mosaic;
+/* 字段类型：RK_* 是匹配字段，RK_ACT_* 是作用字段。 */
+enum vidow_rule_kind {
+	RK_STR = 0,
+	RK_BOOL,
+	RK_NUM,
+	RK_ACT_BOOL,
+	RK_ACT_INT,
+	RK_ACT_DOUBLE,
+	RK_ACT_STR,
+	RK_ACT_COLOR,
+	RK_ACT_CAPTURE,
 };
+
+/* 这个字段管哪一边（不适用 = 这条规则对那一边不匹配）。 */
+#define VIDOW_RULE_WINDOW 1u
+#define VIDOW_RULE_LAYER  2u
+
+struct vidow_rule_field {
+	const char *name;   /* Lua / JSON 里的名字 */
+	enum vidow_rule_kind kind;
+	int slot;           /* str[] / bset[] / nset[] / aset[] 的下标 */
+	unsigned targets;   /* VIDOW_RULE_WINDOW | VIDOW_RULE_LAYER */
+	const char *help;   /* 一句话说明（报错和文档用） */
+};
+
+extern const struct vidow_rule_field vidow_rule_fields[];
+extern const size_t vidow_rule_field_count;
 
 bool vidow_rule_init(struct vidow_server *server);
 
-/* 加一条规则（Lua 那边解析完表之后调）。至少要写一个作用（force_render / hz /
- * focus_on_open / focus_on_activate / honor_invalid_serial / x11_scale / capture），
- * 不然这条规则什么也不做（调用方负责报错）。 */
-struct vidow_rule *vidow_rule_add(struct vidow_server *server,
-		const struct vidow_rule_spec *spec);
+/* 按名字找字段；NULL = 没这个名字（调用方报错时可以把所有名字列出来）。 */
+const struct vidow_rule_field *vidow_rule_field_find(const char *name);
+/* 所有字段名，用 " / " 连起来（报错用）。targets = 0 表示全部。 */
+const char *vidow_rule_all_names(unsigned targets);
+
+/* 一条新规则：字段填完调 vidow_rule_commit 挂进 server->rules；中间出错就
+ * vidow_rule_discard 丢掉。 */
+struct vidow_rule *vidow_rule_new(void);
+void vidow_rule_discard(struct vidow_rule *rule);
+
+/* 写字段（Lua 那边按 kind 调对应的那个）。失败返回 false 并填 err。 */
+bool vidow_rule_set_str(struct vidow_rule *rule, int slot, const char *pattern,
+		char *err, size_t errlen);
+bool vidow_rule_set_bool(struct vidow_rule *rule, int slot, bool value);
+bool vidow_rule_set_num(struct vidow_rule *rule, int slot, long long value);
+bool vidow_rule_set_act_bool(struct vidow_rule *rule, int slot, bool value);
+bool vidow_rule_set_act_int(struct vidow_rule *rule, int slot, long long value);
+bool vidow_rule_set_act_double(struct vidow_rule *rule, int slot, double value);
+bool vidow_rule_set_act_str(struct vidow_rule *rule, int slot, const char *value,
+		char *err, size_t errlen);
+bool vidow_rule_set_act_color(struct vidow_rule *rule, int slot,
+		const char *value, char *err, size_t errlen);
+bool vidow_rule_set_capture(struct vidow_rule *rule, int slot,
+		const char *value, char *err, size_t errlen);
+void vidow_rule_set_literal(struct vidow_rule *rule, bool literal);
+
+/* 这条规则写没写这个字段（读回来的时候用：vidow.rules() / IPC 的 rules）。 */
+bool vidow_rule_has_field(const struct vidow_rule *rule,
+		const struct vidow_rule_field *field);
+/* 字符串字段的模式串，原样（带取反的 !；没写 = NULL）。 */
+const char *vidow_rule_field_str(const struct vidow_rule *rule,
+		const struct vidow_rule_field *field);
+
+/* 编译正则 + 检查「至少写一个作用」，然后挂进 server->rules（成功时返回 true，
+ * 之后 rule 归 server 管）。失败填 err，调用方负责 vidow_rule_discard。 */
+bool vidow_rule_commit(struct vidow_server *server, struct vidow_rule *rule,
+		char *err, size_t errlen);
 
 /* 清空（SIGHUP 重载 = 重新声明一遍）。 */
 void vidow_rule_clear(struct vidow_server *server);
 
-/* 这条规则匹配不匹配这个窗口（写了 namespace 的规则只对 layer 生效，这里直接
- * 返回 false）。 */
-bool vidow_rule_matches(const struct vidow_rule *rule,
-		const struct vidow_view *view);
+/* 把规则套到这个窗口上（建窗口时、标题/class 变了、规则重载时都调）。 */
+void vidow_rule_apply(struct vidow_server *server, struct vidow_view *view);
 
-/* 把规则套到这个窗口上（建窗口时、标题/class 变了、规则重载时都调）。
- * 返回强制渲染这个开关有没有变化。 */
-bool vidow_rule_apply(struct vidow_server *server, struct vidow_view *view);
-
-/* 把规则套到这个 layer surface 上（它 map 的时候、规则重载时都调）。匹配的是
- * namespace。 */
+/* 把规则套到这个 layer surface 上（它 map 的时候、规则重载时都调）。 */
 void vidow_rule_apply_layer(struct vidow_server *server,
 		struct vidow_layer_surface *ls);
 

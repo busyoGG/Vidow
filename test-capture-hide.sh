@@ -383,7 +383,7 @@ mark "10. 配置错误：capture 的合法值 / 块边长下限"
 # 配置在第一处错误就停了，两条各起一次
 start_headless "$RUNDIR/bad" 'scale = "1"
 vidow.rule{ app_id = "bluewin", capture = "blur" }' "$RUNDIR/bad.log" >/dev/null
-grep -aq 'capture 只能是 "off"、"hide" 或 "mosaic"' "$RUNDIR/bad.log" \
+grep -aq 'capture：只能是 "off"、"hide" 或 "mosaic"' "$RUNDIR/bad.log" \
 	&& pass "非法 capture 值点了合法值" || fail "非法 capture 值没说清楚"
 start_headless "$RUNDIR/bad2" 'scale = "1"
 vidow.rule{ app_id = "bluewin", capture = "mosaic", capture_mosaic = 1 }' "$RUNDIR/bad2.log" >/dev/null

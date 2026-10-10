@@ -574,6 +574,33 @@ static bool parse_easing(const char *value, enum vidow_easing *out) {
 	return false;
 }
 
+/* "RRGGBB" / "RRGGBBAA"（# 可有可无）→ 四个 0..1 的分量，直通 alpha（非预乘）。
+ * 配置键（K_COLOR）和窗口规则的颜色作用共用这一份。 */
+bool vidow_config_parse_color(const char *value, float out[4]) {
+	if (value == NULL) {
+		return false;
+	}
+	const char *hex = value[0] == '#' ? value + 1 : value;
+	size_t len = strlen(hex);
+	if (len != 6 && len != 8) {
+		return false;
+	}
+	char part[3] = {0};
+	for (int i = 0; i < 4; i++) {
+		if (i == 3 && len == 6) {
+			out[3] = 1.0f;
+			break;
+		}
+		memcpy(part, hex + i * 2, 2);
+		if (!isxdigit((unsigned char)part[0]) ||
+				!isxdigit((unsigned char)part[1])) {
+			return false;
+		}
+		out[i] = (float)strtol(part, NULL, 16) / 255.0f;
+	}
+	return true;
+}
+
 /* Returns false if the key is unknown or the value cannot be parsed. */
 static bool apply(struct vidow_config *cfg, const char *key, const char *value) {
 	for (size_t i = 0; i < sizeof(entries) / sizeof(entries[0]); i++) {
@@ -618,26 +645,13 @@ static bool apply(struct vidow_config *cfg, const char *key, const char *value) 
 		case K_STRING:
 			snprintf((char *)field, e->size, "%s", value);
 			return true;
-		case K_COLOR: {
-			const char *hex = value[0] == '#' ? value + 1 : value;
-			size_t len = strlen(hex);
-			if (len != 6 && len != 8) {
+		case K_COLOR:
+			if (!vidow_config_parse_color(value, (float *)field)) {
 				wlr_log(WLR_ERROR, "config: colour '%s' must be RRGGBB or RRGGBBAA",
 					value);
 				return false;
 			}
-			char part[3] = {0};
-			float *out = field;
-			for (int i = 0; i < 4; i++) {
-				if (i == 3 && len == 6) {
-					out[3] = 1.0f;
-					break;
-				}
-				memcpy(part, hex + i * 2, 2);
-				out[i] = (float)strtol(part, NULL, 16) / 255.0f;
-			}
 			return true;
-		}
 		}
 	}
 	return false;
@@ -1329,34 +1343,53 @@ static void print_keys_lua(FILE *f) {
 "--     vidow.bind(\"Mod+C\", \"workspace chat\")      -- 切过去\n"
 "--     vidow.bind(\"Mod+Shift+C\", \"move chat\")     -- 把当前窗口搬进去\n"
 "\n"
-"-- 窗口规则（vidow.rule{…}）：一条规则 = 匹配哪些窗口 + 对它们做什么\n"
+"-- 窗口规则 / 图层规则（vidow.rule{…}）：一条规则 = 匹配谁 + 怎么对待它\n"
 "--\n"
-"--     匹配字段（可叠加；一个都不写 = 匹配所有窗口）：\n"
-"--         app_id     Wayland 的 app_id / X11 的 WM_CLASS 第一段\n"
-"--         title      标题的子串\n"
-"--         class      X11 的 WM_CLASS（Wayland 窗口没有这个）\n"
-"--         namespace  写了它这条规则就管 layer surface（状态栏 / 通知），不是窗口\n"
-"--     作用（**至少写一个**，都不写会在这一行报错）：\n"
-"--         force_render = true        滚出视口 / 被藏起来 / 最小化了也照样给它补帧\n"
-"--                                    （录屏、窗口预览要的是新画面；每秒几帧看\n"
-"--                                     configs/06-render.lua 的 force_render_hz）\n"
-"--         hz = 30                    只给这个窗口定补帧频率（0 = 不限）\n"
-"--         focus_on_open = false      它开窗的时候不抢焦点（Electron 系那种看不见的\n"
-"--                                    辅助窗口会开个窗口把自己顶上来）\n"
-"--         focus_on_activate = false  别人请求激活它（点通知 / 任务栏按钮）时不理\n"
-"--         honor_invalid_serial = true  它的激活请求即使令牌 serial 校验不过也照样理\n"
-"--         x11_scale = 1              X11 缩放桥：1 = 这个客户端没按 GDK_SCALE 画，\n"
-"--                                    缓冲区不除（只对 X11 窗口有意义）\n"
-"--         capture = \"hide\"           截图 / 录屏里怎么出现：\"off\"（默认，照常）/\n"
-"--                                    \"hide\"（不出现）/ \"mosaic\"（打马赛克）\n"
-"--         capture_mosaic = 24        马赛克的块边长（屏幕像素，默认 16，最小 2）；只在\n"
-"--                                    capture = \"mosaic\" 时有用，单独写不算一个作用\n"
+"--   匹配字段（可叠加，一个都不写 = 匹配一切）。字符串字段是 **POSIX 扩展正则**：\n"
+"--   不锚定（找到就算命中）、大小写不敏感，写普通字符串就是子串匹配；前面加 !\n"
+"--   是取反（\"!^mpv$\" = 不是它）；整条规则写 literal = true 就退回纯子串匹配，\n"
+"--   含 . * + ? [ ] ( ) { } | ^ $ \\ 的串记得转义（title = \"v1\\\\.0\"）。\n"
 "--\n"
-"--     vidow.rule{ app_id = \"mpv\", title = \"预览\", force_render = true }\n"
-"--     vidow.rule{ class = \"Steam\", focus_on_open = false }\n"
-"--     vidow.rule{ namespace = \"notifications\", capture = \"hide\" }\n"
-"--     读回来：vidow.rules()（没管的字段是 nil：「没管它」和「管了、给了默认值」\n"
-"--     是两回事）\n"
+"--     窗口：app_id（Wayland 的 app_id / X11 的 WM_CLASS class 段）\n"
+"--           title（当前标题）/ initial_title（上屏那一刻的标题 —— 浏览器、终端\n"
+"--                 会改标题，认「刚开的那一屏」用它）\n"
+"--           class / instance（X11 的 WM_CLASS 两段）/ role（X11 的 WM_WINDOW_ROLE）\n"
+"--           initial_app_id / initial_class / initial_instance（上屏那一刻的上面几个）\n"
+"--           xwayland（是 X11 窗口）/ popup（菜单、提示这类弹出物）\n"
+"--           floating / fullscreen / maximized / minimized\n"
+"--           fixed_size（客户端声明了固定尺寸，微信登录窗那种）\n"
+"--           on_output（现在在哪块屏）/ on_workspace（现在在哪块工作区）\n"
+"--     两边：pid（进程号）/ exe（可执行文件名）/ cmdline（命令行）—— 没有\n"
+"--           app_id 可认的应用（老 X11 程序、包一层启动脚本的）按进程认\n"
+"--     图层：namespace（waybar / mako / notifications …）/ layer（background /\n"
+"--           bottom / top / overlay）—— 写了这两个里任何一个就是图层规则，\n"
+"--           窗口字段和图层字段写进同一条规则 = 这条规则谁也不匹配（当场看得见）\n"
+"--\n"
+"--   作用（**至少写一个**，都不写会在这一行报错；没写的字段用默认值，同一个字段\n"
+"--   以最后一条写了它的规则为准）：\n"
+"--     force_render = true        滚出视口 / 被藏起来 / 最小化了也照样给它补帧\n"
+"--                                （录屏、窗口预览要的是新画面；每秒几帧看\n"
+"--                                 configs/06-render.lua 的 force_render_hz）\n"
+"--     hz = 30                    只给这个窗口定补帧频率（0 = 不限）\n"
+"--     focus_on_open = false      它开窗的时候不抢焦点（Electron 系那种看不见的\n"
+"--                                辅助窗口会开个窗口把自己顶上来）\n"
+"--     focus_on_activate = false  别人请求激活它（点通知 / 任务栏按钮）时不理\n"
+"--     honor_invalid_serial = true  它的激活请求即使令牌 serial 校验不过也照样理\n"
+"--     x11_scale = 1              X11 缩放桥：1 = 这个客户端没按 GDK_SCALE 画，\n"
+"--                                缓冲区不除（只对 X11 窗口有意义）\n"
+"--     capture = \"hide\"           截图 / 录屏里怎么出现：\"off\"（默认，照常）/\n"
+"--                                \"hide\"（不出现）/ \"mosaic\"（打马赛克）\n"
+"--     capture_mosaic = 24        马赛克的块边长（屏幕像素，默认 16，最小 2）；只在\n"
+"--                                capture = \"mosaic\" 时有用，单独写不算一个作用\n"
+"--\n"
+"--   vidow.rule{ app_id = \"^mpv$\", force_render = true }\n"
+"--   vidow.rule{ title = \"^预览\", force_render = true, hz = 15 }\n"
+"--   vidow.rule{ class = \"Steam\", focus_on_open = false }\n"
+"--   vidow.rule{ namespace = \"^notifications$\", capture = \"hide\" }\n"
+"--   vidow.rule{ exe = \"^wechat$\", x11_scale = 1 }     -- 没有 app_id 的应用按进程认\n"
+"--   读回来：vidow.rules()（没管的字段是 nil：「没管它」和「管了、给了默认值」\n"
+"--   是两回事）；字段名写错了当场报错，并列出所有能写的字段名\n"
+"\n"
 "\n"
 "-- vidow.* 的函数（配置就是一门 Lua，下面这些是 vidow 注册进去的，全在这一份里）\n"
 "--\n"

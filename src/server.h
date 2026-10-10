@@ -851,6 +851,18 @@ struct vidow_view {
 	 * 字符串在销毁信号之后就没了）。map / 标题变化时刷新。 */
 	char last_title[128];
 	char last_app_id[128];
+	/* 窗口规则的 initial_* 字段：上屏那一刻的标题 / app_id / class / instance。
+	 * 客户端之后改标题不影响这里（浏览器、终端都会改）。X11 的 WM_CLASS 有时比
+	 * map 还晚到，所以空着的时候还要补（见 view.c 的 view_note_initial_names）。 */
+	char init_title[128];
+	char init_app_id[128];
+	char init_class[128];
+	char init_instance[128];
+	/* 窗口规则的 exe / cmdline：按 pid 去 /proc 抓一次就缓存（probe_pid 变了才
+	 * 重抓 —— 一个窗口的客户端进程不会换）。 */
+	int probe_pid;
+	char probe_exe[128];
+	char probe_cmdline[256];
 	struct vidow_view_tag tag;
 	bool mapped;
 	/* 「最近用过」的时间戳（单调时钟 ns；0 = 还没记过）。Alt+Tab 的切换器
@@ -1037,6 +1049,10 @@ struct vidow_layer_surface {
 	 * 屏回来时再挪回去。 */
 	struct vidow_output_memory *home;
 	uint32_t layer;
+	/* 图层规则的 exe / cmdline：和窗口那边一样，按 pid 抓一次就缓存。 */
+	int probe_pid;
+	char probe_exe[128];
+	char probe_cmdline[256];
 
 	/* animation */
 	struct vidow_anim *anim;
@@ -1819,6 +1835,9 @@ void vidow_config_each(const struct vidow_config *cfg,
 		void (*cb)(void *data, const char *key, const char *value), void *data);
 void vidow_config_apply_env(struct vidow_config *cfg);
 void vidow_config_log(const struct vidow_config *cfg);
+/* "RRGGBB" / "RRGGBBAA"（# 可有可无）→ 四个 0..1 分量。配置键和窗口规则的颜色
+ * 作用共用这一份。 */
+bool vidow_config_parse_color(const char *value, float out[4]);
 bool vidow_config_has(const char *key);
 bool vidow_config_set(struct vidow_config *cfg, const char *key,
 		const char *value);
@@ -2389,6 +2408,8 @@ void vidow_view_set_tiled(struct vidow_view *view, bool tiled);
 void vidow_view_close(struct vidow_view *view);
 /* 把当前标题 / app_id 记一份（事件用，见 vidow_view.last_title）。 */
 void vidow_view_note_names(struct vidow_view *view);
+/* 窗口规则的 initial_* 快照（只填空着的，见 vidow_view.init_title）。 */
+void vidow_view_note_initial_names(struct vidow_view *view);
 /* 有父窗口的另一半吗（xdg 的 parent / X11 的 WM_TRANSIENT_FOR）。 */
 struct wlr_surface *vidow_view_parent_surface(const struct vidow_view *view);
 /* 客户端自己要的尺寸，逻辑单位（X11 的像素要除以 xwayland_scale）。 */

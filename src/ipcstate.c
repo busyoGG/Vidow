@@ -22,6 +22,7 @@
 
 #include "hooks.h"
 #include "ipc.h"
+#include "rule.h"
 #include "server.h"
 
 /* ------------------------------------------------------------------ 小工具 */
@@ -278,6 +279,12 @@ void vidow_ipc_json_window(struct jbuf *b, struct vidow_server *server,
 	jb_kv_bool(b, "focus_on_open", view->focus_on_open);
 	jb_kv_bool(b, "focus_on_activate", view->focus_on_activate);
 	jb_kv_bool(b, "honor_invalid_serial", view->honor_invalid_serial);
+	/* 抓帧遮挡 / X11 缩放桥也是规则给的（见 rule.c）：屏幕上、抓帧里各是什么样
+	 * 只看得出「现在」，自检脚本要的是「规则有没有套上」。 */
+	jb_kv_str(b, "capture", view->capture_mode == VIDOW_CAPTURE_HIDE ? "hide" :
+		view->capture_mode == VIDOW_CAPTURE_MOSAIC ? "mosaic" : "off");
+	jb_kv_int(b, "capture_mosaic", view->capture_mosaic);
+	jb_kv_double(b, "x11_scale", view->x11_scale);
 	jb_obj_end(b);
 
 	/* 客户端自己要的尺寸边界（xdg 的 min/max，X11 读 WM_NORMAL_HINTS）。 */
@@ -629,6 +636,10 @@ void vidow_ipc_json_layer(struct jbuf *b, struct vidow_server *server,
 	jb_kv_double(b, "alpha", ls->anim_alpha);
 	jb_key(b, "anim");
 	json_anim(b, ls->anim);
+	/* 图层规则给的抓帧遮挡（见 rule.c）。 */
+	jb_kv_str(b, "capture", ls->capture_mode == VIDOW_CAPTURE_HIDE ? "hide" :
+		ls->capture_mode == VIDOW_CAPTURE_MOSAIC ? "mosaic" : "off");
+	jb_kv_int(b, "capture_mosaic", ls->capture_mosaic);
 	jb_obj_end(b);
 }
 
@@ -671,61 +682,71 @@ void vidow_ipc_json_rules(struct jbuf *b, struct vidow_server *server) {
 	struct vidow_rule *rule;
 	wl_list_for_each(rule, &server->rules, link) {
 		jb_obj(b);
-		jb_kv_str(b, "app_id", rule->app_id[0] != '\0' ? rule->app_id : NULL);
-		jb_kv_str(b, "title", rule->title[0] != '\0' ? rule->title : NULL);
-		jb_kv_str(b, "class", rule->klass[0] != '\0' ? rule->klass : NULL);
-		/* 写了 namespace 的规则管的是 layer surface，不写就管窗口。 */
-		jb_kv_str(b, "namespace",
-			rule->namespace[0] != '\0' ? rule->namespace : NULL);
-		jb_key(b, "force_render");
-		if (rule->has_force_render) {
-			jb_bool(b, rule->force_render);
-		} else {
-			jb_null(b);
+		/* 字段表在 rule.c 的 vidow_rule_fields[]：匹配和作用都在里面，这里只是
+		 * 把「写了哪些」按类型倒出来。没写的字段输出 null —— 「没管它」和
+		 * 「管了、给的是默认值」是两回事。 */
+		if (rule->literal) {
+			jb_kv_bool(b, "literal", true);
 		}
-		jb_key(b, "hz");
-		if (rule->has_hz) {
-			jb_int(b, rule->hz);
-		} else {
-			jb_null(b);
-		}
-		jb_key(b, "focus_on_open");
-		if (rule->has_focus_on_open) {
-			jb_bool(b, rule->focus_on_open);
-		} else {
-			jb_null(b);
-		}
-		jb_key(b, "focus_on_activate");
-		if (rule->has_focus_on_activate) {
-			jb_bool(b, rule->focus_on_activate);
-		} else {
-			jb_null(b);
-		}
-		jb_key(b, "honor_invalid_serial");
-		if (rule->has_honor_invalid_serial) {
-			jb_bool(b, rule->honor_invalid_serial);
-		} else {
-			jb_null(b);
-		}
-		jb_key(b, "x11_scale");
-		if (rule->has_scale) {
-			jb_double(b, rule->scale);
-		} else {
-			jb_null(b);
-		}
-		/* 抓帧遮挡：截图 / 录屏里这个窗口怎么出现 */
-		jb_key(b, "capture");
-		if (rule->has_capture) {
-			jb_str(b, rule->capture == VIDOW_CAPTURE_HIDE ? "hide" :
-				rule->capture == VIDOW_CAPTURE_MOSAIC ? "mosaic" : "off");
-		} else {
-			jb_null(b);
-		}
-		jb_key(b, "capture_mosaic");
-		if (rule->has_capture_mosaic) {
-			jb_int(b, rule->capture_mosaic);
-		} else {
-			jb_null(b);
+		for (size_t i = 0; i < vidow_rule_field_count; i++) {
+			const struct vidow_rule_field *f = &vidow_rule_fields[i];
+			jb_key(b, f->name);
+			/* 没写的字段也出一个 null（键是稳的，外面不用先判有没有）。 */
+			if (!vidow_rule_has_field(rule, f)) {
+				jb_null(b);
+				continue;
+			}
+			switch (f->kind) {
+			case RK_STR: {
+				const struct vidow_rule_match *m = &rule->str[f->slot];
+				if (m->negate) {
+					char buf[VIDOW_RULE_PAT + 1];
+					snprintf(buf, sizeof(buf), "!%s", m->pat);
+					jb_str(b, buf);
+				} else {
+					jb_str(b, m->pat);
+				}
+				break;
+			}
+			case RK_BOOL:
+				jb_bool(b, rule->bval[f->slot]);
+				break;
+			case RK_NUM:
+				jb_int(b, rule->nval[f->slot]);
+				break;
+			case RK_ACT_BOOL:
+				jb_bool(b, rule->aval[f->slot].b);
+				break;
+			case RK_ACT_INT:
+				jb_int(b, rule->aval[f->slot].i);
+				break;
+			case RK_ACT_DOUBLE:
+				jb_double(b, rule->aval[f->slot].d);
+				break;
+			case RK_ACT_STR:
+				jb_str(b, rule->aval[f->slot].s);
+				break;
+			case RK_ACT_COLOR: {
+				const float *c = rule->aval[f->slot].color;
+				char buf[16];
+				snprintf(buf, sizeof(buf), "#%02x%02x%02x%02x",
+					(int)(c[0] * 255.0f + 0.5f),
+					(int)(c[1] * 255.0f + 0.5f),
+					(int)(c[2] * 255.0f + 0.5f),
+					(int)(c[3] * 255.0f + 0.5f));
+				jb_str(b, buf);
+				break;
+			}
+			case RK_ACT_CAPTURE:
+				jb_str(b, rule->aval[f->slot].i == VIDOW_CAPTURE_HIDE ?
+					"hide" :
+					rule->aval[f->slot].i == VIDOW_CAPTURE_MOSAIC ?
+					"mosaic" : "off");
+				break;
+			default:
+				jb_null(b);
+				break;
+			}
 		}
 		jb_obj_end(b);
 	}

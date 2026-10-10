@@ -142,6 +142,7 @@ import os, re, sys
 rundir = sys.argv[1]
 cfg = open("src/config.c", encoding="utf-8").read()
 script = open("src/script.c", encoding="utf-8").read()
+rule = open("src/rule.c", encoding="utf-8").read()
 
 flat = re.findall(r'^\t\{ "([a-zA-Z0-9_]+)",\s*K_', cfg, re.M)
 fields = []
@@ -150,8 +151,10 @@ for m in re.finditer(r'static const struct group_field \w+_fields\[\] = \{', cfg
     j = cfg.index("};", i)
     fields += [f for f, _ in re.findall(r'\{ "([^"]+)",\s*"([^"]+)" \}', cfg[i:j])]
 api = re.findall(r'^\t\t\{ "([a-z_]+)", l_[a-z_]+ \},', script, re.M) + ["include"]
-tbl = re.findall(r'(?:lua_getfield\(L, 1, |table_bool\(L, 1, |'
-                 r'table_string\(L, 1, )"([a-z0-9_]+)"', script)
+# vidow.rule 的字段表在 rule.c（匹配和作用同一张表，见 vidow_rule_fields[]）
+tbl = re.findall(r'^\t\{ "([a-z0-9_]+)",\s*RK_', rule, re.M)
+tbl += re.findall(r'(?:lua_getfield\(L, 1, |table_string\(L, 1, )"([a-z0-9_]+)"',
+                  script)
 tbl += re.findall(r'lua_getfield\(L, 2, "([a-z0-9_]+)"', script)
 
 doc = ""
@@ -163,7 +166,7 @@ groups = [
     ("平铺键（entries[]）", flat),
     ("族里的项（*_fields[]）", fields),
     ("vidow.* 的函数", api),
-    ("表参数里的字段（vidow.rule / vidow.output）", tbl),
+    ("表参数里的字段（vidow.rule 在 rule.c / vidow.output 在 script.c）", tbl),
 ]
 bad = 0
 for name, names in groups:

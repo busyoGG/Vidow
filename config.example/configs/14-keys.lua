@@ -68,34 +68,53 @@ end
 --     vidow.bind("Mod+C", "workspace chat")      -- 切过去
 --     vidow.bind("Mod+Shift+C", "move chat")     -- 把当前窗口搬进去
 
--- 窗口规则（vidow.rule{…}）：一条规则 = 匹配哪些窗口 + 对它们做什么
+-- 窗口规则 / 图层规则（vidow.rule{…}）：一条规则 = 匹配谁 + 怎么对待它
 --
---     匹配字段（可叠加；一个都不写 = 匹配所有窗口）：
---         app_id     Wayland 的 app_id / X11 的 WM_CLASS 第一段
---         title      标题的子串
---         class      X11 的 WM_CLASS（Wayland 窗口没有这个）
---         namespace  写了它这条规则就管 layer surface（状态栏 / 通知），不是窗口
---     作用（**至少写一个**，都不写会在这一行报错）：
---         force_render = true        滚出视口 / 被藏起来 / 最小化了也照样给它补帧
---                                    （录屏、窗口预览要的是新画面；每秒几帧看
---                                     configs/06-render.lua 的 force_render_hz）
---         hz = 30                    只给这个窗口定补帧频率（0 = 不限）
---         focus_on_open = false      它开窗的时候不抢焦点（Electron 系那种看不见的
---                                    辅助窗口会开个窗口把自己顶上来）
---         focus_on_activate = false  别人请求激活它（点通知 / 任务栏按钮）时不理
---         honor_invalid_serial = true  它的激活请求即使令牌 serial 校验不过也照样理
---         x11_scale = 1              X11 缩放桥：1 = 这个客户端没按 GDK_SCALE 画，
---                                    缓冲区不除（只对 X11 窗口有意义）
---         capture = "hide"           截图 / 录屏里怎么出现："off"（默认，照常）/
---                                    "hide"（不出现）/ "mosaic"（打马赛克）
---         capture_mosaic = 24        马赛克的块边长（屏幕像素，默认 16，最小 2）；只在
---                                    capture = "mosaic" 时有用，单独写不算一个作用
+--   匹配字段（可叠加，一个都不写 = 匹配一切）。字符串字段是 **POSIX 扩展正则**：
+--   不锚定（找到就算命中）、大小写不敏感，写普通字符串就是子串匹配；前面加 !
+--   是取反（"!^mpv$" = 不是它）；整条规则写 literal = true 就退回纯子串匹配，
+--   含 . * + ? [ ] ( ) { } | ^ $ \ 的串记得转义（title = "v1\\.0"）。
 --
---     vidow.rule{ app_id = "mpv", title = "预览", force_render = true }
---     vidow.rule{ class = "Steam", focus_on_open = false }
---     vidow.rule{ namespace = "notifications", capture = "hide" }
---     读回来：vidow.rules()（没管的字段是 nil：「没管它」和「管了、给了默认值」
---     是两回事）
+--     窗口：app_id（Wayland 的 app_id / X11 的 WM_CLASS class 段）
+--           title（当前标题）/ initial_title（上屏那一刻的标题 —— 浏览器、终端
+--                 会改标题，认「刚开的那一屏」用它）
+--           class / instance（X11 的 WM_CLASS 两段）/ role（X11 的 WM_WINDOW_ROLE）
+--           initial_app_id / initial_class / initial_instance（上屏那一刻的上面几个）
+--           xwayland（是 X11 窗口）/ popup（菜单、提示这类弹出物）
+--           floating / fullscreen / maximized / minimized
+--           fixed_size（客户端声明了固定尺寸，微信登录窗那种）
+--           on_output（现在在哪块屏）/ on_workspace（现在在哪块工作区）
+--     两边：pid（进程号）/ exe（可执行文件名）/ cmdline（命令行）—— 没有
+--           app_id 可认的应用（老 X11 程序、包一层启动脚本的）按进程认
+--     图层：namespace（waybar / mako / notifications …）/ layer（background /
+--           bottom / top / overlay）—— 写了这两个里任何一个就是图层规则，
+--           窗口字段和图层字段写进同一条规则 = 这条规则谁也不匹配（当场看得见）
+--
+--   作用（**至少写一个**，都不写会在这一行报错；没写的字段用默认值，同一个字段
+--   以最后一条写了它的规则为准）：
+--     force_render = true        滚出视口 / 被藏起来 / 最小化了也照样给它补帧
+--                                （录屏、窗口预览要的是新画面；每秒几帧看
+--                                 configs/06-render.lua 的 force_render_hz）
+--     hz = 30                    只给这个窗口定补帧频率（0 = 不限）
+--     focus_on_open = false      它开窗的时候不抢焦点（Electron 系那种看不见的
+--                                辅助窗口会开个窗口把自己顶上来）
+--     focus_on_activate = false  别人请求激活它（点通知 / 任务栏按钮）时不理
+--     honor_invalid_serial = true  它的激活请求即使令牌 serial 校验不过也照样理
+--     x11_scale = 1              X11 缩放桥：1 = 这个客户端没按 GDK_SCALE 画，
+--                                缓冲区不除（只对 X11 窗口有意义）
+--     capture = "hide"           截图 / 录屏里怎么出现："off"（默认，照常）/
+--                                "hide"（不出现）/ "mosaic"（打马赛克）
+--     capture_mosaic = 24        马赛克的块边长（屏幕像素，默认 16，最小 2）；只在
+--                                capture = "mosaic" 时有用，单独写不算一个作用
+--
+--   vidow.rule{ app_id = "^mpv$", force_render = true }
+--   vidow.rule{ title = "^预览", force_render = true, hz = 15 }
+--   vidow.rule{ class = "Steam", focus_on_open = false }
+--   vidow.rule{ namespace = "^notifications$", capture = "hide" }
+--   vidow.rule{ exe = "^wechat$", x11_scale = 1 }     -- 没有 app_id 的应用按进程认
+--   读回来：vidow.rules()（没管的字段是 nil：「没管它」和「管了、给了默认值」
+--   是两回事）；字段名写错了当场报错，并列出所有能写的字段名
+
 
 -- vidow.* 的函数（配置就是一门 Lua，下面这些是 vidow 注册进去的，全在这一份里）
 --

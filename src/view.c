@@ -119,6 +119,30 @@ void vidow_view_note_names(struct vidow_view *view) {
 		app_id != NULL ? app_id : "");
 }
 
+/* 窗口规则的 initial_* 快照：上屏那一刻的标题 / app_id / class / instance。
+ * 只填空着的 —— X11 的 WM_CLASS / WM_NAME 有时比 map 还晚到，那时候补上；填过
+ * 的就不再动（客户端之后改标题不算「刚开的样子」，那正是 initial_* 的用处）。 */
+void vidow_view_note_initial_names(struct vidow_view *view) {
+	const char *title = vidow_view_title(view);
+	const char *app_id = vidow_view_app_id(view);
+	const bool x11 = view->kind == VIDOW_VIEW_X11 && view->x11 != NULL;
+	const char *klass = x11 ? view->x11->class : NULL;
+	const char *instance = x11 ? view->x11->instance : NULL;
+	if (view->init_title[0] == '\0' && title != NULL) {
+		snprintf(view->init_title, sizeof(view->init_title), "%s", title);
+	}
+	if (view->init_app_id[0] == '\0' && app_id != NULL) {
+		snprintf(view->init_app_id, sizeof(view->init_app_id), "%s", app_id);
+	}
+	if (view->init_class[0] == '\0' && klass != NULL) {
+		snprintf(view->init_class, sizeof(view->init_class), "%s", klass);
+	}
+	if (view->init_instance[0] == '\0' && instance != NULL) {
+		snprintf(view->init_instance, sizeof(view->init_instance), "%s",
+			instance);
+	}
+}
+
 struct wlr_box vidow_view_geometry(const struct vidow_view *view) {
 	if (view->kind == VIDOW_VIEW_X11) {
 		/* X11 窗口没有「窗口几何」和「表面」的区别：整块就是内容。 */
