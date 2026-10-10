@@ -369,6 +369,11 @@ int main(int argc, char *argv[]) {
 	/* 输入法候选框：压在所有东西之上，连 overlay 层也盖住 */
 	server.layer_im = wlr_scene_tree_create(&server.scene->tree);
 
+	/* 拖动落点的预览块（niri 的 insert hint）：建在窗口那一层里，平时关着。 */
+	if (!vidow_drag_init(&server)) {
+		return 1;
+	}
+
 	server.xdg_shell = wlr_xdg_shell_create(server.display, 6);
 
 	server.cursor = wlr_cursor_create();

@@ -15,7 +15,7 @@
 void vidow_place_view(struct vidow_view *view, int x, int y, int w, int h);
 static void view_ensure_column(struct vidow_server *server,
 		struct vidow_view *view);
-static void view_leave_column(struct vidow_view *view);
+void vidow_view_leave_column(struct vidow_view *view);
 /* X11：按窗口的绝对坐标把它归到某块输出上（弹出物可以开在另一块屏上）。 */
 static void x11_track_output(struct vidow_view *view);
 
@@ -25,7 +25,7 @@ void vidow_view_join_layout(struct vidow_server *server,
 }
 
 void vidow_view_leave_layout(struct vidow_view *view) {
-	view_leave_column(view);
+	vidow_view_leave_column(view);
 }
 
 /* ------------------------------------------------------------- lookup */
@@ -766,7 +766,7 @@ static void view_ensure_column(struct vidow_server *server,
 	}
 }
 
-static void view_leave_column(struct vidow_view *view) {
+void vidow_view_leave_column(struct vidow_view *view) {
 	if (view->column == NULL) {
 		return;
 	}
@@ -2086,6 +2086,13 @@ static void output_arrange(struct vidow_server *server,
 		 * 滑出去那半块由 view_clip_box 裁在自己那块屏里（不会画到隔壁显示器）。 */
 		int fx = full_box.x + col->offset - (int)viewport;
 
+		/* 记一笔「这块列画在屏上的哪一块」：拖动找落点（drag.c）要按**屏幕上
+		 * 看得见的**几何算，而全屏那列占一整屏、整列最小化的宽度是 0 这些
+		 * 规矩只有这里知道。 */
+		bool col_full = column_has_fullscreen(col);
+		col->screen_x = col_full ? fx : x;
+		col->slot_width = col_full ? work.width : col->width;
+
 		int n = 0;
 		struct vidow_view *view;
 		wl_list_for_each(view, &col->views, column_link) {
@@ -3061,6 +3068,55 @@ static void view_move_to_column(struct vidow_view *view,
 	vidow_workspace_track(target->ws, view, false);
 }
 
+/* 插进 `target` 这条列的第 index 位（niri 的 insert into column：一列里上下叠
+ * 起来）。index 数的是「目标列里现在还占着位置的窗口（不含正被拖动 / 正搬家的这
+ * 一个）的第几位」—— 和落点算法（drag.c 的 insert_pos_at）数的是同一份东西：插
+ * 在第 index 个**还占位置的**窗口之前，数不够就放在最后。
+ *
+ * 最小化的窗口不算位置（它不占条带），所以插进去的时候也是插在它们前面 —— 它们
+ * 原来在上下哪一段就留在哪一段。
+ *
+ * 同一条列（拖自己那条列里的上下顺序）：就地重排。
+ * 别的列：从原来那条列里摘出来（列空了就拆掉），再插进目标列 —— 跨工作区的调用
+ * 方负责先把 view->ws / output 换过去（见 vidow_workspace_move_view_into_column）。 */
+bool vidow_view_insert_into_column(struct vidow_view *view,
+		struct vidow_column *target, int index) {
+	if (view == NULL || target == NULL || view->popup) {
+		return false;
+	}
+	if (index < 0) {
+		index = 0;
+	}
+	struct vidow_column *old = view->column;
+	if (old == target) {
+		wl_list_remove(&view->column_link);
+	} else {
+		vidow_view_leave_column(view);
+	}
+
+	view->column = target;
+	struct wl_list *at = &target->views; /* 默认：放在最后 */
+	int i = 0;
+	struct vidow_view *it;
+	wl_list_for_each(it, &target->views, column_link) {
+		if (!view_shows(it)) {
+			continue;
+		}
+		if (i == index) {
+			at = &it->column_link;
+			break;
+		}
+		i++;
+	}
+	/* wl_list_insert(pos, elm) 是插在 pos 之后 —— 插到 at 前面要写 at->prev。 */
+	wl_list_insert(at->prev, &view->column_link);
+	if (old != target) {
+		/* 这条窗口现在住在列里了：列里的窗口不算浮窗。 */
+		vidow_workspace_track(target->ws, view, false);
+	}
+	return true;
+}
+
 void vidow_move_window(struct vidow_server *server, int direction) {
 	struct vidow_view *view = server->focused;
 	if (view == NULL || view->column == NULL) {
@@ -3351,7 +3407,7 @@ static void view_unmap(struct wl_listener *listener, void *data) {
 	if (server->focused == view) {
 		/* 邻居要在摘列之前找（见 focus_after_close）。 */
 		struct vidow_view *next = focus_after_close(server, view, output);
-		view_leave_column(view);
+		vidow_view_leave_column(view);
 		server->focused = NULL;
 		if (next != NULL) {
 			vidow_focus_view(next);
@@ -3359,7 +3415,7 @@ static void view_unmap(struct wl_listener *listener, void *data) {
 			focus_nearest_column(server, output);
 		}
 	} else {
-		view_leave_column(view);
+		vidow_view_leave_column(view);
 	}
 
 	/* 列真的摘掉了，它那块工作区才可能变空 —— 栈中间的空工作区该收掉（niri：
@@ -3690,7 +3746,7 @@ static void view_destroy(struct wl_listener *listener, void *data) {
 	if (was_focused) {
 		server->focused = NULL;
 	}
-	view_leave_column(view);
+	vidow_view_leave_column(view);
 	vidow_workspace_cleanup(server);
 
 	free(view);
@@ -4430,7 +4486,7 @@ static void x11_destroy_view(struct wl_listener *listener, void *data) {
 	if (was_focused) {
 		server->focused = NULL;
 	}
-	view_leave_column(view);
+	vidow_view_leave_column(view);
 	vidow_workspace_cleanup(server);
 
 	free(view);

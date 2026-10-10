@@ -119,6 +119,11 @@ bool vidow_workspace_move_view(struct vidow_server *server,
 /* 按名字搬：特殊工作区按名字找，找不到就当普通工作区建一块。 */
 bool vidow_workspace_move_view_to_name(struct vidow_server *server,
 		struct vidow_view *view, const char *name);
+/* 把**一条窗口**（不是整条列）插到别的（屏/工作区）某条列里的第 index 位：niri
+ * 的拖拽落点是「进这条列」而目标列在另一块工作区上时走这条。原来那条列里还有别人
+ * 就留着，只剩它一个就把空列拆掉。 */
+bool vidow_workspace_move_view_into_column(struct vidow_server *server,
+		struct vidow_view *view, struct vidow_column *target_col, int index);
 /* 整块工作区换屏（列 + 浮窗一起过去，home 也跟着改：这是人做的决定）。 */
 bool vidow_workspace_move_to_output(struct vidow_server *server,
 		struct vidow_workspace *ws, struct wlr_output *output);

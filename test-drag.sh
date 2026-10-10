@@ -159,12 +159,12 @@ W1OUT=$(field w1 2); W2OUT=$(field w2 2)
 W2X=$(field w2 4); W2Y=$(field w2 5)
 pass "两个平铺窗口：w1 在 $W1OUT，w2 在 $W2OUT（w2 在 $W2X,$W2Y）"
 
-# 拖 w2 到 w1 那块屏的中间
+# 拖 w2 到 w1 那块屏**最左边那条外层 gap 里**（= 新开一条列插到最前面，不是插
+# 进 w1 那条列 —— 光标再往右挪一点就落在 w1 窗口身上了，那是 niri 的 InColumn）
 if [ "$W1OUT" = "$OUT2" ]; then TARGET=$OTHER_ORIGIN; else TARGET=$ORIGIN; fi
 act "pointer-motion $((W2X + 300)) $((W2Y + 300))"
 act "pointer-button left press mod"
-act "pointer-motion $((TARGET + 400)) $((W2Y + 300))" 0.25
-act "pointer-motion $((TARGET + 600)) $((W2Y + 300))" 0.25
+act "pointer-motion $((TARGET + 2)) $((W2Y + 300))" 0.25
 act "pointer-button left release mod" 0.8
 W2OUT2=$(field w2 2)
 if grep -aq "grab tile: w2" "$LOG"; then
@@ -180,18 +180,27 @@ fi
 
 echo
 echo "== 平铺窗口按落点插入列位置 =="
-# 拖到 w1 那块屏最左边（列带第一个位置之前）→ 应该插到 w1 前面
+# w2 那条列这会儿排在最前面（上一节落的第 1 位）。把 **w1** 拖到同一块屏最左边
+# 那条外层 gap 里 → 新开一条列、插到第 1 位（niri 的 NewColumn(0)）→ w1 换到
+# w2 前面。光标要真的在条带左边那条缝里：落在窗口身上就是「插进那条列」了
+# （niri 的 InColumn，见 test-drag-insert.sh）。
 A=$(field w1 4); B=$(field w2 4)
 if [ "$W2OUT2" = "$OUT2" ]; then LEFT=$OTHER_ORIGIN; else LEFT=$ORIGIN; fi
-act "pointer-motion $((B + 300)) $((W2Y + 300))"
+act "pointer-motion $((A + 300)) $((W2Y + 300))"
 act "pointer-button left press mod"
-act "pointer-motion $((LEFT + 40)) $((W2Y + 300))" 0.25
+act "pointer-motion $((LEFT + 2)) $((W2Y + 300))" 0.25
+act "pointer-motion $((LEFT + 2)) $((W2Y + 300))" 0.25
 act "pointer-button left release mod" 0.8
 A2=$(field w1 4); B2=$(field w2 4)
-if [ "$B2" -lt "$A2" ]; then
-	pass "拖到最左边 → w2 插到 w1 前面（w1 x=$A→$A2，w2 x=$B→$B2）"
+if grep -aq "grab: w1 在 HEADLESS-1 的第 1 块工作区里挪到第 1 位" "$LOG"; then
+	pass "落点是「新开一条列、插到第 1 位」（niri 的 NewColumn）"
 else
-	fail "没插到最前面：w1 x=$A2，w2 x=$B2（w2 该在更左边）"
+	fail "没有新列的日志（$(grep -a 'grab: w1' "$LOG" | tail -1)）"
+fi
+if [ "$A2" -lt "$B2" ]; then
+	pass "w1 那条列换到了 w2 前面（w1 x=$A→$A2，w2 x=$B→$B2）"
+else
+	fail "没换到前面：w1 x=$A2，w2 x=$B2（w1 该在更左边）"
 fi
 
 exec 9>&-

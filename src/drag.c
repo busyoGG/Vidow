@@ -7,19 +7,48 @@
  *               显示着的工作区（跨屏拖拽）；
  *   平铺窗口 —— 这里的 vidow_tile_grab_*()：Mod+左键按住，窗口跟着光标飘起来
  *               （只动场景节点，布局一行都不重排），松手时按**落点**决定去哪：
- *               光标在哪块屏上就归那块屏的工作区，光标在列带上的哪个位置就插到
- *               那一列的位置（niri 的 insert hint 语义，没画提示条而已）。
+ *               光标在哪块屏上就归那块屏的工作区；落在列带上的哪个缝就新开一条
+ *               列插在那儿；落在**某条列里**（离那条列里的窗口缝近）就插进那条列、
+ *               一列里上下叠起来 —— niri 的那两条（NewColumn / InColumn）。
+ *
+ * 拖的过程里落点随时算、随时用一块半透明的预览块标出来（niri 的 insert hint，
+ * 见 insert_pos_at / vidow_insert_hint_update）：新列是一张整高的「卡片」骑在那个
+ * 缝上，插进已有列是那条列里的一条横条（150 / 300 高那两种，照抄 niri 的
+ * insert_hint_area）。
  *
  * 为什么松手才改工作区：拖动中途改工作区要连带动可见性、焦点、底部空位和清理，
  * 每帧都做一遍既贵又容易把焦点抖掉；视觉上窗口本来就跟着光标走（场景是全局的），
- * 所以「跨过去」这件事松手时一次做完就够了。 */
+ * 所以「跨过去」这件事松手时一次做完就够了。
+ *
+ * 一处故意跟 niri 不一样：niri 一开始拖就把那个窗口从布局里摘走（后面的列当场
+ * 并拢），vidow 让它那条列的空位**留着**（松手才重排）。所以预览块是按「屏幕上
+ * 现在看得见的这些位置」画的，被拖窗口原来那个空位在拖动期间还看得见。 */
 #include "server.h"
 #include "ipc.h"
+#include "workspace.h"
 
+#include <limits.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include <wlr/types/wlr_output_layout.h>
+#include <wlr/types/wlr_scene.h>
+#include <wlr/util/box.h>
 #include <wlr/util/log.h>
+
+/* 落点预览块的尺寸（照 niri 的 insert_hint_area）：新列是一张 300 宽的「卡片」、
+ * 整块可用高；插进已有列是那条列里的一条横条 —— 贴最上面 / 最下面时 150 高，
+ * 骑在两个窗口之间那个缝上时 300 高。 */
+#define INSERT_CARD_W 300
+#define INSERT_BAR_H 150
+#define INSERT_BAR_MID_H 300
+
+/* 预览块的颜色：niri 的 layout.insert-hint 默认色 #ffc87f80（橙 255,200,127、
+ * alpha 128）。wlr_scene_rect 的颜色是**预乘**的（wlroots 直接把它交给渲染通道
+ * 的预乘混合，见 wlr_scene.c 里 scene_rect 那段），所以这里的 rgb 已经乘过
+ * alpha —— 不乘的话叠在亮色窗口上会变成加法而不是半透明（实测叠在纯红窗口上
+ * 量到 (255,200,127)，预乘之后是 niri 那个 (127,100,63)）。 */
+static const float INSERT_HINT_COLOR[4] = { 0.502f, 0.394f, 0.250f, 0.502f };
 
 /* 光标底下是哪块屏（没有屏就是 NULL）。 */
 static struct wlr_output *output_under_cursor(struct vidow_server *server) {
@@ -36,28 +65,377 @@ static struct vidow_workspace *shown_workspace(struct vidow_server *server,
 	return vidow_workspace_shown_for(server, output);
 }
 
-/* 光标落在这块屏列带上的第几个位置（0 = 最左边那列之前）。列的位置是 arrange
- * 算出来的：offset 从**可用区**左边算起，所以加回可用区原点才是屏幕坐标。 */
-static int insert_index_at(struct vidow_server *server,
-		struct vidow_workspace *ws, struct wlr_output *output, double lx,
-		int skip_id) {
-	if (ws == NULL || output == NULL) {
-		return 0;
+/* 落点（niri 的 InsertPosition）：要么是「列带上的一个新列位」，要么是「某条列
+ * 里的第几个窗口位置」（一列里叠起来）。 */
+struct insert_pos {
+	bool into_column;
+	/* 新列：插到条带上的第几位；进列：插到那条列里的第几位（0 = 最上面） */
+	int index;
+	/* into_column 时：进哪条列 */
+	struct vidow_column *column;
+	/* 预览块（屏幕坐标）。width <= 0 = 这次没有落点、不画。 */
+	struct wlr_box hint;
+};
+
+/* 这条列第 k 个「窗口缝」的 y：k < n 是第 k 个还占位置的窗口的上边缘，k == n 是
+ * 最下面那个窗口的下边缘 + gap（niri 的 tile_offsets 末尾那个 dummy —— 它让
+ * 「插到最后一个下面」也能选到）。列里只剩被拖的那一个（n == 0）时缝就是这条列
+ * 自己的上下两头（top_y / bottom_y）。 */
+static int tile_gap_y(struct vidow_column *col, struct vidow_view *drag, int k,
+		int n, int top_y, int bottom_y) {
+	if (n == 0) {
+		return k <= 0 ? top_y : bottom_y;
 	}
-	struct wlr_box work = vidow_work_area(server, output);
-	int index = 0;
-	struct vidow_column *col;
-	wl_list_for_each(col, &ws->columns, link) {
-		if ((int)col->id == skip_id) {
+	if (k >= n) {
+		return bottom_y;
+	}
+	int i = 0;
+	struct vidow_view *v;
+	wl_list_for_each(v, &col->views, column_link) {
+		if (v == drag || v->minimized) {
 			continue;
 		}
-		int center = work.x + col->offset + col->width / 2;
-		if (lx < center) {
-			break;
+		if (i == k) {
+			return v->geom.y;
 		}
-		index++;
+		i++;
 	}
-	return index;
+	return top_y;
+}
+
+/* 算落点（niri 的 ScrollingSpace::insert_position + insert_hint_area 那一套）：
+ *
+ *   横向：光标离哪条列的**左边缘**最近 → 新列就插那个缝里（closest_i）；
+ *   纵向：光标离同一条列里哪个**窗口缝**最近 → 就插到那条列的那一位（ti）；
+ *   两个距离谁小听谁的 —— niri 就是一句 `if vert_dist <= hor_dist`：离列的左边缘
+ *   近 = 新开一条列，离窗口的上下缝近 = 插进这条列（niri 的 InColumn）。
+ *
+ * 位置一律取**屏幕上看得见的那块**：列的 screen_x/slot_width 是 arrange 记下来的、
+ * 窗口的 geom 就是现在这一块 —— 全屏那列占一整屏、整列最小化的列不占位这些规矩
+ * 只有 arrange 知道，这里不重算条带数学。
+ *
+ * drag = 正被拖的那个窗口：它自己不算落点（条带上跳过它那条列、列里跳过它那个）
+ * —— 落点说的是「剩下这些」之间的位置，插进去之后它就落在那个缝上。 */
+static void insert_pos_at(struct vidow_server *server,
+		struct vidow_workspace *ws, struct wlr_output *output,
+		struct vidow_view *drag, struct insert_pos *out) {
+	memset(out, 0, sizeof(*out));
+	if (server == NULL || ws == NULL || output == NULL || drag == NULL) {
+		return;
+	}
+	struct wlr_box work = vidow_work_area(server, output);
+	int inner = vidow_gap_inner(&server->config);
+	if (inner < 0) {
+		inner = 0;
+	}
+	int half = inner / 2;
+	/* niri 里光标也先各挪半个 gap：那是「瞄着缝的中心」的意思。 */
+	int px = (int)server->cursor->x + half;
+	int py = (int)server->cursor->y + half;
+	int card_h = work.height - 2 * inner;
+	if (card_h < 1) {
+		card_h = 1;
+	}
+
+	/* 拿掉被拖的那个之后，它那条列里还剩几个窗口 —— 一个都不剩它就不在布局里了
+	 * （niri 是先把它从布局里摘走、再算落点的）。 */
+	int n_drag = 0;
+	if (drag->column != NULL) {
+		struct vidow_view *v;
+		wl_list_for_each(v, &drag->column->views, column_link) {
+			if (v != drag && !v->minimized) {
+				n_drag++;
+			}
+		}
+	}
+	bool drag_stays = n_drag > 0;
+
+	/* 条带上这些列：光标落在哪条列上（containing）、**最近的一条列缝**在哪儿
+	 * （closest_i = 新列的落点）、最左边那条的左边（first_l）、最右边那条的右
+	 * 边缘 + gap（niri 的 column_x(len)，它也算一条缝）。
+	 *
+	 * 「列缝」数的是**剩下的**那些列的左边缘（index 空间里不含被拖的那条）——
+	 * niri 的 column_xs 就是这样，左右两边的缝都算：光标在哪条列的右半边时，
+	 * 最近的那条缝是它右边那条列的左边缘（= 插到它们两个中间）。
+	 *
+	 * 被拖的那条列算不算「光标落在哪条列上」：算。它那条列的空位在 vidow 里还
+	 * 留在条带上（niri 会当场并拢，vidow 松手才重排），所以落在自己那个空位上
+	 * 就是「放回原处」或者「在自己这条列里挪个上下位置」—— 该按自己这条列的缝
+	 * 来判。它自己也在「谁在谁边上」的名单里（还有别的窗口时 niri 里它也还在
+	 * 布局里），但 index 照样按「剩下的那些」数。 */
+	int m = 0;      /* 剩下的列有几条 */
+	int i = 0;      /* 这一条在「剩下的那些」里的序号 */
+	bool first_seen = false, last_seen = false;
+	int first_l = 0, last_right = 0, after_last = 0;
+	int closest_i = 0, closest_d = INT_MAX;
+	struct vidow_column *containing = NULL;
+	struct vidow_column *c;
+	wl_list_for_each(c, &ws->columns, link) {
+		if (c->slot_width <= 0) {
+			continue; /* 整列最小化的：不在条带上占位置 */
+		}
+		bool mine = (c == drag->column);
+		int l = c->screen_x;
+		if (l <= px) {
+			containing = c;
+		}
+		if (!mine || drag_stays) {
+			/* 拿掉被拖的那个之后它还在布局里：它的左边缘算一条缝 */
+			if (!first_seen) {
+				first_l = l;
+				first_seen = true;
+			}
+			int d = l > px ? l - px : px - l;
+			if (d < closest_d) {
+				closest_d = d;
+				closest_i = i;
+			}
+			last_right = l + c->slot_width;
+			last_seen = true;
+		}
+		if (!mine) {
+			m++;
+			i++;
+		}
+	}
+	if (last_seen) {
+		after_last = last_right + inner;
+		int d = after_last > px ? after_last - px : px - after_last;
+		if (d < closest_d) {
+			closest_d = d;
+			closest_i = m;
+		}
+	}
+
+	/* 什么都不剩（niri 的 `columns.is_empty()` 早退）：落点只能是「最前面那条
+	 * 新列位」，预览块就是那张整高的卡片、画在列带开头。 */
+	if (m == 0 && n_drag == 0) {
+		out->into_column = false;
+		out->index = 0;
+		int card_x = work.x;
+		int lo = work.x - INSERT_CARD_W / 2;
+		int hi = work.x + work.width - INSERT_CARD_W / 2;
+		if (card_x < lo) {
+			card_x = lo;
+		}
+		if (card_x > hi) {
+			card_x = hi;
+		}
+		out->hint = (struct wlr_box){ card_x, work.y + inner, INSERT_CARD_W,
+			card_h };
+		return;
+	}
+
+	/* 光标在列带左边那一条里（外层 gap）：落在最前面（niri 的 `if x < 0 →
+	 * NewColumn(0)`）—— 卡片整块摆在条带左边。 */
+	if (containing == NULL || px < first_l) {
+		out->into_column = false;
+		out->index = 0;
+		int lo = work.x - INSERT_CARD_W / 2;
+		int hi = work.x + work.width - INSERT_CARD_W / 2;
+		int card_x = first_l - INSERT_CARD_W - inner;
+		if (card_x < lo) {
+			card_x = lo;
+		}
+		if (card_x > hi) {
+			card_x = hi;
+		}
+		out->hint = (struct wlr_box){ card_x, work.y + inner, INSERT_CARD_W,
+			card_h };
+		return;
+	}
+
+	/* 这条列里有哪些「窗口缝」：每个还占位置的窗口的上边缘（被拖的那个不算），
+	 * 外加最下面那个窗口的下边缘 + gap。 */
+	int n = 0, top_y = work.y, bottom_y = work.y + work.height + inner;
+	struct vidow_view *v;
+	wl_list_for_each(v, &containing->views, column_link) {
+		if (v == drag || v->minimized) {
+			continue;
+		}
+		if (n == 0) {
+			top_y = v->geom.y;
+		}
+		bottom_y = v->geom.y + v->geom.height + inner;
+		n++;
+	}
+
+	/* 最近的窗口缝（纵向）vs 最近的**列缝**（横向）—— niri 的 hor_dist / vert_dist：
+	 * 横向那个是「到最近一条列左边缘的距离」，**左右两边的缝都算数**（光标在哪条列
+	 * 的右半边时最近的就是它右边那条列的左边缘），不是「到光标底下这条列左边缘的
+	 * 距离」。谁小听谁的：离列缝近 = 新开一条列，离窗口缝近 = 插进这条列。 */
+	int td = INT_MAX, ti = 0;
+	for (int k = 0; k <= n; k++) {
+		int y = tile_gap_y(containing, drag, k, n, top_y, bottom_y);
+		int d = y > py ? y - py : py - y;
+		if (d < td) {
+			td = d;
+			ti = k;
+		}
+	}
+	int hd = closest_d;
+
+	/* 光标在最后一条列（别的列，被拖那条不算）右边 + gap 之外：落在最后
+	 * （niri 的 `col_idx == len → NewColumn(closest_col_idx)`）。 */
+	if (m > 0 && px >= after_last) {
+		out->into_column = false;
+		out->index = closest_i;
+		int card_x = after_last;
+		int lo = work.x - INSERT_CARD_W / 2;
+		int hi = work.x + work.width - INSERT_CARD_W / 2;
+		if (card_x < lo) {
+			card_x = lo;
+		}
+		if (card_x > hi) {
+			card_x = hi;
+		}
+		out->hint = (struct wlr_box){ card_x, work.y + inner, INSERT_CARD_W,
+			card_h };
+		return;
+	}
+
+	if (hd <= td) {
+		/* 离列左边缘更近 → 新开一条列：卡片骑在 closest_i 那个缝上 —— 上一条列
+		 * （在条带上排在它前面那条）的右边缘和这一条的左边缘的**中间**（niri
+		 * 写的是 column_x(i) - 宽 / 2 - gap / 2，两头中间没夹着别的东西时两者
+		 * 一样）。 */
+		out->into_column = false;
+		out->index = closest_i;
+		int left_edge = work.x, right_edge = work.x;
+		int k = 0;
+		wl_list_for_each(c, &ws->columns, link) {
+			if (c == drag->column || c->slot_width <= 0) {
+				continue;
+			}
+			if (k == closest_i) {
+				right_edge = c->screen_x;
+				break;
+			}
+			left_edge = c->screen_x + c->slot_width;
+			k++;
+		}
+		int card_x;
+		if (m == 0) {
+			/* 这块工作区上没有别的列了：新列就落在列带开头 */
+			card_x = work.x;
+		} else if (closest_i == 0) {
+			card_x = right_edge - INSERT_CARD_W - inner;
+		} else if (closest_i >= m) {
+			card_x = left_edge + inner;
+		} else {
+			card_x = (left_edge + right_edge) / 2 - INSERT_CARD_W / 2;
+		}
+		/* niri：卡片至少露一半在屏上（贴着屏边的时候别整个跑出去）。 */
+		int lo = work.x - INSERT_CARD_W / 2;
+		int hi = work.x + work.width - INSERT_CARD_W / 2;
+		if (card_x < lo) {
+			card_x = lo;
+		}
+		if (card_x > hi) {
+			card_x = hi;
+		}
+		out->hint = (struct wlr_box){ card_x, work.y + inner, INSERT_CARD_W,
+			card_h };
+		return;
+	}
+
+	/* 插进这条列：横条画在那个缝上（niri 的 InColumn 三种位置）。 */
+	int gy = tile_gap_y(containing, drag, ti, n, top_y, bottom_y);
+	int bar_h, bar_y;
+	if (ti <= 0) {
+		bar_h = INSERT_BAR_H;
+		bar_y = gy;
+	} else if (ti >= n) {
+		bar_h = INSERT_BAR_H;
+		bar_y = gy - inner - INSERT_BAR_H;
+	} else {
+		bar_h = INSERT_BAR_MID_H;
+		bar_y = gy - half - INSERT_BAR_H;
+	}
+	out->into_column = true;
+	out->column = containing;
+	out->index = ti;
+	out->hint = (struct wlr_box){ containing->screen_x, bar_y,
+		containing->slot_width, bar_h };
+}
+
+/* 抬到最上面（已经是最上面了一个节点都不动 —— raise_to_top 要动链表，白动一下
+ * 会多记一次损伤）。 */
+static void raise_node(struct wlr_scene_node *node) {
+	if (node == NULL || node->parent == NULL) {
+		return;
+	}
+	if (node->parent->children.prev == &node->link) {
+		return;
+	}
+	wlr_scene_node_raise_to_top(node);
+}
+
+void vidow_insert_hint_hide(struct vidow_server *server) {
+	if (server != NULL && server->insert_hint != NULL) {
+		wlr_scene_node_set_enabled(&server->insert_hint->node, false);
+	}
+}
+
+void vidow_insert_hint_update(struct vidow_server *server) {
+	if (server == NULL || server->insert_hint == NULL) {
+		return;
+	}
+	struct vidow_view *view = server->grab_mode == VIDOW_GRAB_TILE ?
+		server->grab_view : NULL;
+	struct wlr_output *output = output_under_cursor(server);
+	struct vidow_workspace *ws = shown_workspace(server, output);
+	if (view == NULL || view->column == NULL || ws == NULL) {
+		vidow_insert_hint_hide(server);
+		return;
+	}
+	struct insert_pos pos;
+	insert_pos_at(server, ws, output, view, &pos);
+	struct wlr_box box = pos.hint;
+	if (box.width <= 0 || box.height <= 0) {
+		vidow_insert_hint_hide(server);
+		return;
+	}
+	/* 只画在光标底下那块屏里：预览块贴着屏边的时候会被裁掉一半（跟窗口一样，
+	 * 见 view_clip_box），不许糊到隔壁显示器上去。 */
+	struct wlr_box out_box = {0};
+	struct wlr_box clipped = box;
+	wlr_output_layout_get_box(server->output_layout, output, &out_box);
+	if (out_box.width < 1 || out_box.height < 1 ||
+			!wlr_box_intersection(&clipped, &box, &out_box) ||
+			clipped.width <= 0 || clipped.height <= 0) {
+		vidow_insert_hint_hide(server);
+		return;
+	}
+	wlr_scene_rect_set_size(server->insert_hint, clipped.width,
+		clipped.height);
+	wlr_scene_node_set_position(&server->insert_hint->node, clipped.x,
+		clipped.y);
+	wlr_scene_node_set_enabled(&server->insert_hint->node, true);
+	/* 块压在别的窗口之上、**被拖的那个之下**（niri 把被拖的窗口画在提示块之上）：
+	 * 拖的过程里别人可能重排过层级（vidow_restack），这里每次指针动都收口一次
+	 * —— 层级已经对的时候 raise_node 一个节点都不碰。 */
+	raise_node(&server->insert_hint->node);
+	if (view->scene_tree != NULL) {
+		raise_node(&view->scene_tree->node);
+	}
+}
+
+bool vidow_drag_init(struct vidow_server *server) {
+	if (server == NULL || server->layer_toplevels == NULL) {
+		return false;
+	}
+	/* 建在窗口那一层里（拖动时靠 raise 收层级：块在所有窗口之上、被拖的那个
+	 * 之下），平时关着。 */
+	server->insert_hint = wlr_scene_rect_create(server->layer_toplevels, 1, 1,
+		(float[4]){ INSERT_HINT_COLOR[0], INSERT_HINT_COLOR[1],
+			INSERT_HINT_COLOR[2], INSERT_HINT_COLOR[3] });
+	if (server->insert_hint == NULL) {
+		wlr_log(WLR_ERROR, "drag: 落点预览块建不出来");
+		return false;
+	}
+	wlr_scene_node_set_enabled(&server->insert_hint->node, false);
+	return true;
 }
 
 void vidow_tile_grab_begin(struct vidow_server *server,
@@ -88,6 +466,9 @@ void vidow_tile_grab_begin(struct vidow_server *server,
 	if (view != server->focused) {
 		vidow_focus_view(view);
 	}
+	/* 落点预览块：起拖就摆出来（按现在这个抓点算），层级收一次口（块在所有窗口
+	 * 之上、被拖的这个之下，见 vidow_insert_hint_update）。 */
+	vidow_insert_hint_update(server);
 	wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "grabbing");
 	wlr_log(WLR_INFO, "grab tile: %s（%s 上第 %d 块工作区）",
 		vidow_view_title(view) != NULL ? vidow_view_title(view) : "?",
@@ -115,6 +496,8 @@ void vidow_tile_grab_update(struct vidow_server *server, double lx, double ly) {
 	 * 一次渲染，不会变成「每个事件渲染一遍」。 */
 	vidow_view_apply_anim_place(view);
 	vidow_output_schedule_frame(server, view->output, "拖动跟手");
+	/* 落点预览块跟着一起更新（很便宜：就是几个整形比较 + 摆一次节点）。 */
+	vidow_insert_hint_update(server);
 	/* 顺手把保帧看门狗武装上：要帧那一下可能被「后端已经欠着一帧」挡掉
 	 * （嵌套在别的合成器里时很常见），没有看门狗就没人再推了 —— 拖动会冻住。 */
 	vidow_output_kick_watchdog(server);
@@ -127,6 +510,8 @@ void vidow_tile_grab_end(struct vidow_server *server) {
 	if (view != NULL) {
 		vidow_backdrop_damage_box(server, &server->grab_last_box);
 	}
+	/* 预览块收掉（落点算不算得出来都得收）。 */
+	vidow_insert_hint_hide(server);
 	server->grab_dirty = false;
 	server->grab_mode = VIDOW_GRAB_NONE;
 	server->grab_view = NULL;
@@ -149,10 +534,41 @@ void vidow_tile_grab_end(struct vidow_server *server) {
 		return;
 	}
 	struct vidow_column *col = view->column;
-	int index = insert_index_at(server, target, output, server->cursor->x,
-		(int)col->id);
+	struct insert_pos pos;
+	insert_pos_at(server, target, output, view, &pos);
 	int from_idx = vidow_workspace_index(view->ws);
 
+	if (pos.into_column) {
+		/* 落进**某条列里**：一列里上下叠起来（niri 的 InColumn）。跨工作区 /
+		 * 跨屏时搬的是窗口自己（niri 拖的一直是窗口），不是整条列 —— 原来那
+		 * 条列里还有别人就留在原处。 */
+		const char *title = vidow_view_title(view) != NULL ?
+			vidow_view_title(view) : "?";
+		int want = pos.index;
+		if (pos.column->ws != view->ws) {
+			if (!vidow_workspace_move_view_into_column(server, view,
+					pos.column, want)) {
+				vidow_arrange(server);
+				return;
+			}
+			wlr_log(WLR_INFO,
+				"grab: %s 落到 %s 上第 %d 块工作区的一条列里（第 %d 位）%s",
+				title, output->name,
+				vidow_workspace_index(pos.column->ws), want + 1,
+				output != view->output ? "（跨屏）" : "");
+		} else if (vidow_view_insert_into_column(view, pos.column, want)) {
+			wlr_log(WLR_INFO, "grab: %s 插进 %s 的一条列里的第 %d 位",
+				title, output->name, want + 1);
+		} else {
+			vidow_arrange(server);
+			return;
+		}
+		vidow_focus_view(view);
+		vidow_arrange(server);
+		return;
+	}
+
+	int index = pos.index;
 	if (target != view->ws) {
 		/* 跨屏（或跨工作区）：整条列搬过去。 */
 		if (!vidow_workspace_move_view(server, view, target)) {
@@ -171,7 +587,9 @@ void vidow_tile_grab_end(struct vidow_server *server) {
 			output->name, from_idx, index + 1);
 	}
 
-	/* 按落点插进目标工作区的列带（跨屏那条路是追加到末尾的，这里统一重排）。 */
+	/* 按落点插进目标工作区的列带（跨屏那条路是追加到末尾的，这里统一重排）。
+	 * index 数的是「条带上还剩的那些列」：被拖的那条不算（它自己就是被拖的），
+	 * 整列最小化的也不算（它不占条带）—— 和 insert_pos_at 数的是同一份。 */
 	if (index < 0) {
 		index = 0;
 	}
@@ -179,7 +597,7 @@ void vidow_tile_grab_end(struct vidow_server *server) {
 	int i = 0;
 	struct vidow_column *it;
 	wl_list_for_each(it, &target->columns, link) {
-		if (it == col) {
+		if (it == col || it->slot_width <= 0) {
 			continue;
 		}
 		if (i == index) {

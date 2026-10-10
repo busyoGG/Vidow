@@ -753,6 +753,11 @@ struct vidow_column {
 	double maximized_saved;
 	int offset;            /* from the usable area's left edge */
 	int width;             /* computed each arrange */
+	/* 上一次 arrange 把它**画在屏上**的那一块：左边（列带滚过之后的绝对坐标，
+	 * 已经减掉视口偏移）和它在那条带上占的宽度。拖动找落点（drag.c）看的就是
+	 * 「屏幕上看得见的那个位置」—— 全屏那列占一整屏、整列最小化的宽度是 0 这些
+	 * 规矩只有 arrange 知道，外面别自己再算一遍条带数学。 */
+	int screen_x, slot_width;
 };
 
 struct vidow_view_tag {
@@ -1529,6 +1534,11 @@ struct vidow_server {
 	 * grab_last_box = **已经画出来**的那个位置（损伤从它算起）。 */
 	bool grab_dirty;
 	struct wlr_box grab_last_box;
+	/* 拖动落点预览块（niri 的 insert hint，见 drag.c）：半透明的一块，拖平铺窗口
+	 * 的时候按落点摆出来 —— 新列是一条整高的「卡片」，插进已有列是那条列里的
+	 * 一条横条。平时 node.enabled = false。建在 layer_toplevels 里、压在别的窗口
+	 * 之上、被拖的那个之下（见 vidow_insert_hint_update）。 */
+	struct wlr_scene_rect *insert_hint;
 	/* 浮动窗口拖拽同理：每帧最多重排一次（见 vidow_float_grab_update）。 */
 	bool arrange_dirty;
 	/* 探针：最近一次拖拽移动事件的时刻（见 output.c 的拖拽延迟统计） */
@@ -1893,6 +1903,14 @@ void vidow_tile_grab_begin(struct vidow_server *server,
 		struct vidow_view *view);
 void vidow_tile_grab_update(struct vidow_server *server, double lx, double ly);
 void vidow_tile_grab_end(struct vidow_server *server);
+
+/* 落点预览块（niri 的 insert hint）：建在 layer_toplevels 里，main.c 建完场景层
+ * 之后调一次。拖平铺窗口的每个指针事件都会重算一遍落点并摆这块（见 drag.c）。 */
+bool vidow_drag_init(struct vidow_server *server);
+/* 重算并摆预览块（没有落点 / 没在拖就收起来）。 */
+void vidow_insert_hint_update(struct vidow_server *server);
+/* 收起来（松手、拖到没屏的地方、暂停拖动）。 */
+void vidow_insert_hint_hide(struct vidow_server *server);
 
 /* 平铺窗口的 Mod+右键拖拽：改这一列的宽度（niri 的 interactive resize 那条）。
  * 只有横向 —— 平铺窗口的高度是布局给的（整块可用高），没有「单个窗口的高度」。 */
@@ -2482,6 +2500,15 @@ void vidow_focus_column(struct vidow_server *server, int direction);
 void vidow_focus_window(struct vidow_server *server, int direction);
 void vidow_move_column(struct vidow_server *server, int direction);
 void vidow_move_window(struct vidow_server *server, int direction);
+/* 把一条窗口插进**另一条列**的第 index 位（niri 的 insert into column：一列里
+ * 上下叠起来）。index 是「目标列现在这些窗口（不含自己）里的第几位」，越界就放
+ * 最后。同一条列 = 就地换位置；别的列 = 从原来那条列里摘出来（列空了就拆掉）。
+ * 跨工作区/跨屏那条路由 vidow_workspace_move_view_into_column() 兜。 */
+bool vidow_view_insert_into_column(struct vidow_view *view,
+		struct vidow_column *target, int index);
+/* 从自己那条列里摘出来（列里没别人了就把它拆掉）。摘出来的窗口会短暂「没有列」，
+ * 调用方得紧接着把它放进哪条列里（见 vidow_view_insert_into_column）。 */
+void vidow_view_leave_column(struct vidow_view *view);
 void vidow_cycle_column_width(struct vidow_server *server);
 /* niri 式列最大化：整列撑满工作区宽度，maximized_saved 记着原来的比例，关掉就还原。
  * 列里每个客户端都会收到 set_maximized 的应答（它们自己也知道自己最大化了）。

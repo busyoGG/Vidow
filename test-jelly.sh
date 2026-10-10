@@ -177,6 +177,31 @@ print("%d %d %d" % (out[0], out[1], out[2]))
 PY
 }
 
+# 右边缘轮廓：同上，取每行**最右**那个非黑像素。
+# 平铺窗口那一段用这个而不用左边缘：拖平铺窗口时会画一块落点预览（niri 的
+# insert hint，见 drag.c）—— 它正好落在窗口原来那个空位上（屏幕左边），量左边缘
+# 会量到预览块。形变判据（顶部比底部靠前）两边一样，往右拖就看右边缘。
+edge_right() { # <png> -> "top mid bottom"
+	python3 - "$1" <<'PY'
+import sys
+from PIL import Image
+im = Image.open(sys.argv[1]).convert("RGB")
+W, H = im.size
+px = im.load()
+ys = [y for y in range(H) if any(px[x, y] != (0, 0, 0) for x in range(W))]
+if not ys:
+    print("none")
+    sys.exit()
+y0, y1 = min(ys), max(ys)
+out = []
+for frac in (0.05, 0.5, 0.95):
+    y = int(y0 + (y1 - y0) * frac)
+    row = [x for x in range(W) if px[x, y] != (0, 0, 0)]
+    out.append(row[-1] if row else -1)
+print("%d %d %d" % (out[0], out[1], out[2]))
+PY
+}
+
 # 窗口宽（非黑像素的外接盒），用来确认「窗口还在」
 win_w() { # <png>
 	python3 - "$1" <<'PY'
@@ -396,12 +421,12 @@ else
 	fail "w1 不该是浮动的"
 fi
 drag_and_shot "$RUNDIR/tile.png" "$((WX + WW / 2))" "$((WY + 20))" 400
-E=$(edge "$RUNDIR/tile.png")
+E=$(edge_right "$RUNDIR/tile.png")
 read -r ET EM EB <<<"$E"
 if [ "$ET" = "none" ]; then
 	fail "平铺拖拽时截不到窗口"
 elif [ $((ET - EB)) -ge 5 ]; then
-	pass "平铺窗口拖着走也是弯的：差 $((ET - EB))px"
+	pass "平铺窗口拖着走也是弯的：右边缘差 $((ET - EB))px"
 else
 	fail "平铺窗口没弯：$ET/$EM/$EB（差 $((ET - EB))）"
 fi

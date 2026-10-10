@@ -1060,6 +1060,33 @@ bool vidow_workspace_show_special(struct vidow_server *server,
 	return true;
 }
 
+/* 搬完之后的收尾（整列搬和「一条窗口插到别的列里」共用）：补空工作区、通知外面
+ * 的脚本、把焦点交回看得见的地方、重排、收掉搬空了的那块。 */
+static void ws_move_tail(struct vidow_server *server, struct vidow_view *view,
+		struct vidow_workspace *source, struct vidow_workspace *target) {
+	if (!target->special && target->output != NULL) {
+		/* 搬到的是栈底那块空的 → 它就是「新工作区」了，底下再补一块 */
+		vidow_workspace_ensure_bottom(server, target->output);
+	}
+	vidow_ipc_emit_window(server, "window-workspace-changed", view);
+
+	/* 搬走了就看不见了：焦点交给现在显示着的那块工作区里还在的东西。 */
+	if (server->focused == view) {
+		server->focused = NULL;
+	}
+	vidow_workspace_apply_visibility(server);
+	if (source != NULL && source->focused == view) {
+		source->focused = NULL;
+	}
+	struct vidow_workspace *back = vidow_workspace_shown(server);
+	if (back != NULL) {
+		focus_workspace(server, back);
+	}
+	vidow_arrange(server);
+	/* 搬空了的那块（如果它只是栈中间的一块）收掉 */
+	vidow_workspace_cleanup(server);
+}
+
 /* 把一个窗口搬到某块工作区（IPC 也走这里：不一定是焦点窗口）。列里的窗口
  * 整列搬过去（列是工作区的东西）。 */
 bool vidow_workspace_move_view(struct vidow_server *server,
@@ -1088,27 +1115,40 @@ bool vidow_workspace_move_view(struct vidow_server *server,
 			vidow_workspace_index(target),
 			target->named ? target->name : "(没名字)");
 	}
-	if (!target->special && target->output != NULL) {
-		/* 搬到的是栈底那块空的 → 它就是「新工作区」了，底下再补一块 */
-		vidow_workspace_ensure_bottom(server, target->output);
-	}
-	vidow_ipc_emit_window(server, "window-workspace-changed", view);
+	ws_move_tail(server, view, source, target);
+	return true;
+}
 
-	/* 搬走了就看不见了：焦点交给现在显示着的那块工作区里还在的东西。 */
-	if (server->focused == view) {
-		server->focused = NULL;
+/* 把**一条窗口**（不是整条列）插到别的工作区某条列里的第 index 位：拖拽落点算
+ * 出「进这条列」、而目标列在另一块工作区（另一块屏）上时走这条。niri 里被拖的
+ * 是窗口自己（不是列），所以原来那条列里还有别人就留在原处，只剩它一个才把空列
+ * 拆掉。 */
+bool vidow_workspace_move_view_into_column(struct vidow_server *server,
+		struct vidow_view *view, struct vidow_column *target_col, int index) {
+	if (server == NULL || view == NULL || target_col == NULL ||
+			target_col->ws == NULL || target_col->ws == view->ws) {
+		return false;
 	}
-	vidow_workspace_apply_visibility(server);
-	if (source != NULL && source->focused == view) {
-		source->focused = NULL;
+	struct vidow_workspace *source = view->ws;
+	struct vidow_workspace *target = target_col->ws;
+
+	/* 顺序要紧：先把窗口放进目标列（目标工作区立刻就算「有东西」了，收尾里那次
+	 * cleanup 不会把它当成空工作区收掉），再走收尾。 */
+	view->ws = target;
+	if (target_col->output != NULL) {
+		view->output = target_col->output;
 	}
-	struct vidow_workspace *back = vidow_workspace_shown(server);
-	if (back != NULL) {
-		focus_workspace(server, back);
+	if (!vidow_view_insert_into_column(view, target_col, index)) {
+		view->ws = source;
+		return false;
 	}
-	vidow_arrange(server);
-	/* 搬空了的那块（如果它只是栈中间的一块）收掉 */
-	vidow_workspace_cleanup(server);
+
+	wlr_log(WLR_INFO, "workspace: 把 %s 插到 %s 上的第 %d 块工作区的列里",
+		vidow_view_title(view) != NULL ?
+			vidow_view_title(view) : "(无题)",
+		target->output != NULL ? target->output->name : "-",
+		vidow_workspace_index(target));
+	ws_move_tail(server, view, source, target);
 	return true;
 }
 
