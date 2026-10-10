@@ -56,7 +56,7 @@ EOF
 
 # 子进程真实拿到的环境：X11 缩放是这样传给客户端的
 cat >> "$CFGDIR/.config/vidow/config.lua" <<'EOF'
--- vidow.exec 返回 stdout（失败时 nil + 原因）；要退出码用 vidow.exec_status
+-- vidow.exec 返回 stdout（失败时 nil + 原因）；要退出码用 { status = true }
 local v = vidow.exec("printenv GDK_SCALE")
 vidow.log("childenv GDK_SCALE=" .. tostring(v or "nil"))
 local q = vidow.exec("printenv QT_SCALE_FACTOR")

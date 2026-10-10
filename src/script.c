@@ -31,8 +31,14 @@
  * the event loop, and the coroutine is resumed with the output. The render
  * loop never waits, and the config never has to be written with callbacks.
  *
- * vidow.exec()        -> out            (exit 0), or nil, reason
- * vidow.exec_status() -> out, code, err (always three values)
+ * vidow.exec(cmd)                     -> out            (exit 0), or nil, reason
+ * vidow.exec(cmd, { status = true })  -> out, code, err (always three values)
+ * vidow.exec(cmd, { wait = false })   -> true           (撒手跑，不等)
+ *
+ * 只有两个入口：vidow.exec()（跑一条，等不等 / 要不要退出码看选项）和
+ * vidow.exec_once()（一个 vidow 生命周期只起一次）。原来的 vidow.spawn() 和
+ * vidow.exec_status() 已经并成 vidow.exec() 的选项 —— 老写法会报一句人话
+ * （见 l_api_index）。
  */
 struct vidow_script {
 	struct vidow_server *server;
@@ -40,7 +46,7 @@ struct vidow_script {
 	lua_State *co; /* the coroutine running the chunk */
 	struct vidow_exec *job;
 	int nargs;        /* arguments for the next resume */
-	bool want_status; /* the pending yield came from vidow.exec_status() */
+	bool want_status; /* 这次 yield 是 vidow.exec(cmd, { status = true }) 发的 */
 	int execs;        /* commands run so far, for the log */
 	bool finished;
 };
@@ -48,6 +54,9 @@ struct vidow_script {
 static struct vidow_script *script_of(lua_State *L) {
 	return lua_touserdata(L, lua_upvalueindex(1));
 }
+
+/* 定义在下面（配置里起子进程之前先对一次环境：缩放 / DISPLAY）。 */
+static void script_sync_env_for_child(struct vidow_server *server);
 
 /* --------------------------------------------------------------- values */
 
@@ -186,13 +195,66 @@ static int script_index(lua_State *L) {
 
 /* ------------------------------------------------------------ vidow.* */
 
-/* Yields the command; the compositor runs it and resumes us with the output,
- * which becomes the return value. From Lua this reads as a blocking call. */
-static int l_exec_yield(lua_State *L, bool want_status) {
+/* vidow.exec() 的第二个参数（选项表）：
+ *
+ *   { wait = false }    撒手跑：不等它、不要输出（原来单独一个 vidow.spawn()）
+ *   { status = true }   要退出码：返回 out, code, err（原来单独一个 vidow.exec_status()）
+ *
+ * 两个都能给。不认识的项名当场报错并列出能写哪些 —— 拼错的选项悄悄不生效最难受。
+ * def_wait 是「没写 wait 时算不算等」：vidow.exec() 默认等，vidow.exec_once() 默认
+ * 不等（它本来就是撒手跑的）。 */
+static void exec_opts(lua_State *L, int index, bool def_wait, bool *wait,
+		bool *status) {
+	*wait = def_wait;
+	*status = false;
+	/* index <= 0 = 调用方说「这次没有选项表」。**不能拿 0 当「没有」再交给
+	 * lua_isnoneornil 判**：0 不是合法索引，读的是栈顶那个槽位 —— 有时是 nil
+	 * （看着没事），有时是上一次操作留下的残值，于是同一个 vidow.exec_once()
+	 * 在一个配置里好使、在另一个配置里报「第二个参数得是张选项表」。 */
+	if (index <= 0 || lua_isnoneornil(L, index)) {
+		return;
+	}
+	if (!lua_istable(L, index)) {
+		luaL_error(L, "第二个参数得是张选项表，比如 "
+			"{ wait = false } / { status = true }");
+		return;
+	}
+	index = lua_absindex(L, index);
+	lua_pushnil(L);
+	while (lua_next(L, index) != 0) {
+		const char *key = lua_tostring(L, -2);
+		bool val = lua_toboolean(L, -1);
+		if (key == NULL) {
+			luaL_error(L, "选项表的键得是字符串（wait / status）");
+			return;
+		}
+		if (strcmp(key, "wait") == 0) {
+			*wait = val;
+		} else if (strcmp(key, "status") == 0) {
+			*status = val;
+		} else {
+			luaL_error(L, "不认识的选项 '%s'（能写：wait / status）", key);
+			return;
+		}
+		lua_pop(L, 1);
+	}
+}
+
+/* vidow.exec("命令")            等它跑完，返回 out（退出码非 0 时 nil + 原因）
+ * vidow.exec("命令", { status = true })   返回 out, code, err
+ * vidow.exec("waybar", { wait = false })  撒手：不等、不要输出（起常驻程序用这个）
+ *
+ * 等的那条路：yield 给合成器（命令在事件循环里跑），拿到输出再 resume —— 从 Lua
+ * 看是同步的，渲染一点没停。 */
+static int l_exec(lua_State *L) {
+	struct vidow_script *s = script_of(L);
 	size_t len = 0;
 	const char *cmd = luaL_checklstring(L, 1, &len);
+	bool wait, status;
+	exec_opts(L, 2, true, &wait, &status);
+
 	if (len == 0) {
-		if (want_status) {
+		if (status) {
 			lua_pushstring(L, "");
 			lua_pushinteger(L, -1);
 			lua_pushstring(L, "empty command");
@@ -202,17 +264,24 @@ static int l_exec_yield(lua_State *L, bool want_status) {
 		lua_pushstring(L, "empty command");
 		return 2;
 	}
+
+	if (!wait) {
+		/* 撒手跑：和配置里起的其它子进程一样，先对一次环境（缩放 / DISPLAY）。 */
+		char *copy = strndup(cmd, len);
+		if (copy == NULL) {
+			return luaL_error(L, "out of memory");
+		}
+		script_sync_env_for_child(s->server);
+		vidow_exec_detached(copy);
+		s->execs++;
+		free(copy);
+		lua_pushboolean(L, 1);
+		return 1;
+	}
+
 	lua_pushlstring(L, cmd, len);
-	lua_pushboolean(L, want_status);
+	lua_pushboolean(L, status);
 	return lua_yield(L, 2);
-}
-
-static int l_exec(lua_State *L) {
-	return l_exec_yield(L, false);
-}
-
-static int l_exec_status(lua_State *L) {
-	return l_exec_yield(L, true);
 }
 
 static int l_set(lua_State *L) {
@@ -525,24 +594,15 @@ static int l_off(lua_State *L) {
 	return 1;
 }
 
-/* vidow.spawn("waybar")：撒手跑一条命令，不等它、不阻塞渲染、输出丢掉。
- * vidow.exec() 的区别是不返回输出 —— 起常驻程序（状态栏、通知守护、输入法）用它。 */
-static int l_spawn(lua_State *L) {
-	const char *cmd = luaL_checkstring(L, 1);
-	if (cmd[0] == '\0') {
-		return luaL_error(L, "vidow.spawn('')：命令是空的");
-	}
-	vidow_exec_detached(cmd);
-	lua_pushboolean(L, 1);
-	return 1;
-}
-
 /* vidow.exec_once("waybar")：**整个 vidow 生命周期只起一次**（配置重载不重跑）——
  * Hyprland 的 exec-once。命令先排队，等这份配置跑完再撒出去（那时环境、缩放、
  * DISPLAY 都定了，见 vidow_config_sync）。认一个字符串，也认一串 / 一张表：
  *
  *   vidow.exec_once("waybar")
  *   vidow.exec_once{ "swaybg -i 壁纸.png", "mako" }
+ *
+ * 第二个参数可以是选项表，但这里只认「不等」这个默认：它是撒手跑的，`wait = true`
+ * 和 `status = true` 都当场报错（要输出 / 要退出码就用 vidow.exec）。
  */
 static void exec_once_queue(struct vidow_server *server, const char *cmd) {
 	if (cmd == NULL || cmd[0] == '\0') {
@@ -563,6 +623,14 @@ static void exec_once_queue(struct vidow_server *server, const char *cmd) {
 static int l_exec_once(lua_State *L) {
 	struct vidow_script *s = script_of(L);
 	int n = lua_gettop(L);
+	/* 第二项是表 = 选项（以前第二项只能是命令字符串，所以不冲突）。 */
+	bool opts_at2 = n >= 2 && lua_istable(L, 2);
+	bool wait, status;
+	exec_opts(L, opts_at2 ? 2 : 0, false, &wait, &status);
+	if (wait || status) {
+		return luaL_error(L, "vidow.exec_once 是撒手跑的（等这份配置跑完才起）："
+			"等不了、也没有输出和退出码 —— 要等就用 vidow.exec(cmd)");
+	}
 	if (n == 1 && lua_istable(L, 1)) {
 		lua_pushnil(L);
 		while (lua_next(L, 1) != 0) {
@@ -575,13 +643,16 @@ static int l_exec_once(lua_State *L) {
 		return 1;
 	}
 	for (int i = 1; i <= n; i++) {
+		if (i == 2 && opts_at2) {
+			continue;
+		}
 		exec_once_queue(s->server, luaL_checkstring(L, i));
 	}
 	lua_pushboolean(L, 1);
 	return 1;
 }
 
-/* 环境变量：vidow 起的子进程（exec / spawn / 事件钩子）继承的就是它。
+/* 环境变量：vidow 起的子进程（exec / 事件钩子 / exec_once）继承的就是它。
  *
  *   vidow.env("GDK_SCALE")                 -- 读
  *   vidow.env("MOZ_ENABLE_WAYLAND", "1")   -- 写（顺手推给 systemd）
@@ -1231,6 +1302,27 @@ static const char include_lua[] =
 	"	depth = depth - 1\n"
 	"end\n";
 
+/* vidow 表上「合并掉的那两个名字」的报错（挂在 __index 上，见 register_api）。
+ * 现在只有两个入口：vidow.exec（跑，能等 / 能要退出码 / 能撒手）和 vidow.exec_once
+ * （一个生命周期只起一次）。 */
+static int l_api_index(lua_State *L) {
+	const char *key = lua_tostring(L, 2);
+	if (key == NULL) {
+		lua_pushnil(L);
+		return 1;
+	}
+	if (strcmp(key, "spawn") == 0) {
+		return luaL_error(L, "vidow.spawn 已经并进 vidow.exec："
+			"写成 vidow.exec(cmd, { wait = false })（撒手跑，不等、不要输出）");
+	}
+	if (strcmp(key, "exec_status") == 0) {
+		return luaL_error(L, "vidow.exec_status 已经并进 vidow.exec："
+			"写成 vidow.exec(cmd, { status = true })（返回 out, code, err）");
+	}
+	lua_pushnil(L);
+	return 1;
+}
+
 static void register_api(struct vidow_script *s) {
 	lua_State *L = s->L;
 	lua_newtable(L);
@@ -1239,8 +1331,6 @@ static void register_api(struct vidow_script *s) {
 		lua_CFunction fn;
 	} fns[] = {
 		{ "exec", l_exec },
-		{ "exec_status", l_exec_status },
-		{ "spawn", l_spawn },
 		{ "exec_once", l_exec_once },
 		{ "env", l_env },
 		{ "env_export", l_env_export },
@@ -1287,6 +1377,17 @@ static void register_api(struct vidow_script *s) {
 		lua_pop(L, 1);
 	}
 	lua_setglobal(L, "vidow");
+
+	/* 合并掉的那两个名字：vidow 表上挂个 __index，只在这两个名字上给一句人话
+	 * （别的还是 nil）。不挂的话报的是 "attempt to call a nil value" —— 看的人
+	 * 只知道配置坏了，不知道改成什么。 */
+	lua_getglobal(L, "vidow");
+	lua_newtable(L);
+	lua_pushlightuserdata(L, s);
+	lua_pushcclosure(L, l_api_index, 1);
+	lua_setfield(L, -2, "__index");
+	lua_setmetatable(L, -2);
+	lua_pop(L, 1);
 
 	/* Config keys as globals. */
 	lua_pushglobaltable(L);
@@ -1535,7 +1636,7 @@ static void script_exec_done(void *data, const char *out, const char *errout,
 	s->want_status = false;
 
 	if (full) {
-		/* vidow.exec_status(): always three values, never nil for out. */
+		/* { status = true }：永远三个值，out 不会是 nil。 */
 		lua_pushstring(co, out != NULL ? out : "");
 		lua_pushinteger(co, ok ? status : -1);
 		lua_pushstring(co, errout != NULL ? errout : "");

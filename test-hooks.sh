@@ -100,9 +100,9 @@ vidow.on("window-opened", "echo open:\$VIDOW_EVENT:\$VIDOW_APP_ID:\$VIDOW_TITLE 
 vidow.on("*", "echo any:\$VIDOW_EVENT >> $HKDIR/any.log")
 -- Lua 钩子：载荷是张表，钩子里能 await vidow.exec()
 vidow.on("window-opened", function(e)
-	vidow.spawn("echo lua:" .. tostring(e.data.app_id) .. ":" .. e.event .. " >> $HKDIR/lua.log")
+	vidow.exec("echo lua:" .. tostring(e.data.app_id) .. ":" .. e.event .. " >> $HKDIR/lua.log", { wait = false })
 	local out = vidow.exec("echo from-exec")
-	vidow.spawn("echo exec:" .. tostring(out) .. " >> $HKDIR/lua.log")
+	vidow.exec("echo exec:" .. tostring(out) .. " >> $HKDIR/lua.log", { wait = false })
 end)
 -- 出错的钩子：只该打日志，后面的钩子照跑
 vidow.on("window-opened", function(e) error("故意炸一个") end)
@@ -110,7 +110,7 @@ vidow.on("window-opened", function(e) error("故意炸一个") end)
 local once
 once = vidow.on("window-opened", function(e)
 	vidow.off(once)
-	vidow.spawn("echo once >> $HKDIR/once.log")
+	vidow.exec("echo once >> $HKDIR/once.log", { wait = false })
 end)
 -- 自定义事件：data 里的字段展开成 \$VIDOW_<字段名大写>
 vidow.on("test-ping", "echo ping:\$VIDOW_N >> $HKDIR/ping.log")

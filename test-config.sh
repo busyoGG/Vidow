@@ -9,6 +9,8 @@
 #   5) 重载 = 重新读一遍：删掉的行回默认值，不是留着旧值
 #   6) ipc = false 在配置文件里照样有效（socket 先建后拆）；把那行删掉，自动重载后回来
 #   7) $VIDOW_CONFIG 能换配置文件位置
+#   8) vidow.exec 的选项：{ status = true } 拿退出码 / { wait = false } 撒手跑 /
+#      并掉的老名字（vidow.spawn、vidow.exec_status）给一句人话而不是 "nil value"
 set -u
 cd "$(dirname "$0")"
 
@@ -154,6 +156,49 @@ printf 'scale = "1"\nxwayland = false\ngaps = 52\n' > "$ALT"
 waitcfg gaps 52 && pass "换过去的那个文件改了也自动重载" \
 	|| fail "VIDOW_CONFIG 指的文件的自动重载没生效"
 unset VIDOW_CONFIG
+stop_vidow
+
+# ------------------------------------------- 8) vidow.exec 的选项 / 老名字报错
+mark "vidow.exec 的选项：status / wait，以及并掉的老名字报错"
+SPAWNLOG="$RUNDIR/spawn.log"
+rm -f "$SPAWNLOG"
+write_cfg 'scale = "1"' 'xwayland = false' \
+	'local out, code, err = vidow.exec("echo hi; exit 3", { status = true })' \
+	'vidow.log("OPT status out=[" .. tostring(out) .. "] code=" .. tostring(code) .. " err=[" .. tostring(err) .. "]")' \
+	'local o2, why = vidow.exec("exit 7")' \
+	'vidow.log("OPT plain out=" .. tostring(o2) .. " why=[" .. tostring(why) .. "]")' \
+	'vidow.log("OPT waitfalse ret=" .. tostring(vidow.exec("echo ran >> '"$SPAWNLOG"'", { wait = false })))' \
+	'local ok, msg = pcall(function() return vidow.spawn("x") end)' \
+	'vidow.log("OPT spawn ok=" .. tostring(ok) .. " msg=" .. tostring(msg))' \
+	'local ok2, msg2 = pcall(function() return vidow.exec_status("x") end)' \
+	'vidow.log("OPT exec_status ok=" .. tostring(ok2) .. " msg=" .. tostring(msg2))' \
+	'local ok3, msg3 = pcall(function() return vidow.exec("echo x", { wait = true, nope = 1 }) end)' \
+	'vidow.log("OPT badopt ok=" .. tostring(ok3) .. " msg=" .. tostring(msg3))' \
+	'local ok4, msg4 = pcall(function() return vidow.exec_once("echo x", { wait = true }) end)' \
+	'vidow.log("OPT once_wait ok=" .. tostring(ok4) .. " msg=" .. tostring(msg4))'
+start_vidow
+grep -aq "OPT status out=\[hi" "$LOG" && grep -aq "code=3" "$LOG" &&
+	pass "{ status = true } 返回 out, code, err（out=hi / code=3）" \
+	|| fail "status 形态不对：$(grep -a 'OPT status' "$LOG" | tail -1)"
+grep -aq "OPT plain out=nil why=\[exit 7\]" "$LOG" &&
+	pass "不给选项时照旧：非 0 退出 = nil + 原因（老手感没变）" \
+	|| fail "默认形态变了：$(grep -a 'OPT plain' "$LOG" | tail -1)"
+grep -aq "OPT waitfalse ret=true" "$LOG" && grep -aq "^ran$" "$SPAWNLOG" 2>/dev/null &&
+	pass "{ wait = false } 立刻返回 true，命令照跑（原来 vidow.spawn 的活）" \
+	|| fail "wait = false 不对：$(grep -a 'OPT waitfalse' "$LOG" | tail -1) / 命令跑了没：$(cat "$SPAWNLOG" 2>/dev/null)"
+grep -aq "OPT spawn ok=false" "$LOG" && grep -aq "OPT spawn .*并进 vidow.exec" "$LOG" &&
+	pass "老名字 vidow.spawn 报的是一句人话（怎么写才对）" \
+	|| fail "vidow.spawn 的报错不对：$(grep -a 'OPT spawn' "$LOG" | tail -1)"
+grep -aq "OPT exec_status ok=false" "$LOG" && grep -aq "OPT exec_status .*并进 vidow.exec" "$LOG" &&
+	pass "老名字 vidow.exec_status 同样给一句人话" \
+	|| fail "vidow.exec_status 的报错不对：$(grep -a 'OPT exec_status' "$LOG" | tail -1)"
+grep -aq "OPT badopt .*不认识的选项 'nope'" "$LOG" &&
+	pass "选项名拼错当场报错并列出能写哪些" \
+	|| fail "拼错的选项没报错：$(grep -a 'OPT badopt' "$LOG" | tail -1)"
+grep -aq "OPT once_wait .*撒手跑的" "$LOG" &&
+	pass "exec_once 传 { wait = true } 报错（它等不了）" \
+	|| fail "exec_once 的 wait = true 没报错：$(grep -a 'OPT once_wait' "$LOG" | tail -1)"
+grep -aq "Assertion" "$LOG" && fail "退出时日志里有 assert" || pass "退出时没有 assert"
 stop_vidow
 
 echo

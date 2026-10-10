@@ -35,10 +35,11 @@ systemd_env_export = true
 --
 -- ================== 自启动（Hyprland 的 exec-once / exec）
 --
+-- vidow.exec("命令")                     等它跑完，拿 stdout（看着同步，不阻塞渲染）
+-- vidow.exec("命令", { status = true })   要退出码：返回 out, code, err
+-- vidow.exec("waybar", { wait = false })  撒手跑：不等、不要输出（起常驻程序用它）
 -- vidow.exec_once("waybar")              整个 vidow 生命周期只起一次（重载不重来）
 -- vidow.exec_once{ "swaybg -i 壁纸.png", "mako" }
--- vidow.spawn("命令")                    每次配置加载都起（撒手，不等、不要输出）
--- vidow.exec("命令")                     要输出 / 退出码时用它（看着同步，不阻塞渲染）
 --
 -- exec_once 的命令**先排队**，等这份配置跑完（环境、缩放、DISPLAY 都定了）再起。
 -- 「起过了」按**命令原文**记：改过原文就是一条新命令，会再起一次；配置里删掉的会

@@ -923,7 +923,7 @@ python3 test-float.py        # 三个真实 GTK 窗口，验证浮动模式自�
 ./test-blurnooverlap.sh              # 窗口不再重叠之后，模糊底衬和「从没重叠过」时逐像素一样（5 项断言）
 ./test-pixman-renderer.sh            # 软件渲染器（pixman）下不崩：装饰关掉、窗口照常上屏（5 项断言）
 ./test-blur2out.sh                  # 两块屏（1 倍 + 2 倍）下私有模糊区域的金字塔缓冲每帧都复用（6 项断言）
-./test-config.sh                     # 配置系统：一个 Lua 文件 + 改了就自动重载（全 headless，15 项断言）
+./test-config.sh                     # 配置系统：一个 Lua 文件 + 改了就自动重载 + vidow.exec 的选项（全 headless，24 项断言）
 ./test-binds.sh                      # 键位全是配置给的：没配置=没有键位、默认那套能用、换键位、动作字符串（全 headless，35 项断言）
 ./test-config-include.sh             # 配置拆成好几份：vidow.include() 的路径/顺序/报错 + 改哪份都自动重载（全 headless，25 项断言）
 ./test-defaultconfig.sh              # 默认配置按类别拆成 configs/（--default-config / --write-config）+ 配置族的表写法 + 说明的完整性（全 headless，45 项断言）
@@ -1813,20 +1813,29 @@ vidow.off(ids[2])
 - 自定义事件：`vidowmsg emit my-event --data '{"n":1}'` 发一个，订阅者和钩子一起收
   （`--data` 给的是 JSON 本身，不是字符串）。脚本之间、脚本和配置之间的一条通道。
 
-### 自启动：`exec_once` / `spawn` / `exec`
+### 自启动：`exec` / `exec_once`
+
+**两个入口**：`vidow.exec()` 跑一条命令（等不等、要不要退出码看选项），`vidow.exec_once()`
+一个 vidow 生命周期只起一次。原来的 `vidow.spawn()` 和 `vidow.exec_status()` 已经并成
+`vidow.exec()` 的选项 —— 老写法会报一句人话告诉你改成什么。
 
 ```lua
+vidow.exec("fcitx5 -d", { wait = false })    -- 撒手：不等、不要输出（起常驻程序用它）
+local host = vidow.exec("hostname")          -- 等它跑完，拿 stdout（400ms 超时）
+local out, code, err = vidow.exec("grim /tmp/a.png", { status = true })   -- 要退出码
 vidow.exec_once("waybar")                    -- 整个 vidow 生命周期只起一次
 vidow.exec_once{ "swaybg -i 壁纸.png", "mako" }
-vidow.spawn("fcitx5 -d")                     -- 每次配置加载都起（撒手、不等）
-local host = vidow.exec("hostname")          -- 要输出：跑一条、等它（400ms 超时）
 ```
 
-| 写法 | 什么时候起 | 等它吗 | 要输出用它吗 |
+| 写法 | 什么时候起 | 等它吗 | 返回值 |
 | --- | --- | --- | --- |
-| `vidow.exec_once(cmd)` | 这份配置跑完之后起；**重载不重来** | 不等 | 不 |
-| `vidow.spawn(cmd)` | 配置跑到那一行就起；每次重载都起 | 不等 | 不 |
-| `vidow.exec(cmd)` / `vidow.exec_status(cmd)` | 配置跑到那一行就起 | 等（协程让出，不阻塞渲染） | 是 |
+| `vidow.exec(cmd)` | 配置跑到那一行就起 | 等（协程让出，不阻塞渲染） | `out`；失败 `nil, 原因` |
+| `vidow.exec(cmd, { status = true })` | 同上 | 等 | `out, code, err`（永远三个值） |
+| `vidow.exec(cmd, { wait = false })` | 同上 | 不等 | `true` |
+| `vidow.exec_once(cmd)` | 这份配置跑完之后起；**重载不重来** | 不等 | `true` |
+
+选项表就两个键（`wait` / `status`），拼错当场报错并列出能写哪些；`exec_once` 只认默认的
+撒手跑，传 `wait = true` 会报错（它是等这份配置跑完才起的，等不了）。
 
 - `exec_once` 的命令**先排队**，等这份配置跑完（环境、缩放、`DISPLAY` 都定了）再以撒手方式
   起 —— 所以配置里写多早都不影响它看到的环境。这对应 Hyprland 的 `exec-once`。
@@ -1835,12 +1844,13 @@ local host = vidow.exec("hostname")          -- 要输出：跑一条、等它�
 - 名单是「只进不出」的话，删删改改攒到 128 条上限之后就再也记不住新命令了（那时每次重载都
   会把它当没起过、再起一遍）。所以每轮配置跑完对一次账：**这一轮没声明的就从名单里划掉**
   —— 删掉再写回来 = 一条新命令，会再起一次。
-- 三条路起的子进程都**继承 vidow 的完整环境**：`WAYLAND_DISPLAY` 指向 vidow 自己、
-  `DISPLAY`（X 起来之后）、`XDG_CURRENT_DESKTOP`、`VIDOW_SOCKET`、以及 `vidow.env{}` 设过的
-  变量 —— 状态栏、通知守护、输入法直接就能连上，不用自己猜 socket 路径。
+- 起子进程的三条路（`exec` 等 / `exec` 撒手 / `exec_once`）都**继承 vidow 的完整环境**：
+  `WAYLAND_DISPLAY` 指向 vidow 自己、`DISPLAY`（X 起来之后）、`XDG_CURRENT_DESKTOP`、
+  `VIDOW_SOCKET`、以及 `vidow.env{}` 设过的变量 —— 状态栏、通知守护、输入法直接就能连上，
+  不用自己猜 socket 路径。
 - `vidow.exec()` 默认 400ms 超时（`VIDOW_EXEC_TIMEOUT` 改，超时按进程组 SIGKILL）。要起常驻
-  程序别用它（后台进程继承着捕获用的管道，EOF 永远不来 → 400ms 后被杀），用 `spawn` 或
-  `exec_once`。
+  程序别用等的那条（后台进程继承着捕获用的管道，EOF 永远不来 → 400ms 后被杀），用
+  `{ wait = false }` 或 `exec_once`。
 
 ## 自启动 / 会话环境：和 systemd 用户管理器两个方向对账
 
@@ -2664,7 +2674,7 @@ end
 ```
 
 `vidow.exec(cmd)` 成功（退出码 0）返回 stdout 一个值；失败返回 `nil, 原因`
-（原因优先用 stderr）。需要退出码时用 `vidow.exec_status(cmd)` → `out, code, err`
+（原因优先用 stderr）。需要退出码时加 `{ status = true }` → `out, code, err`
 （永远 3 个值）。stdout 和 stderr 分开抓。
 
 ```lua
@@ -2676,7 +2686,7 @@ local v, why = vidow.exec("cat /nonexistent")
 -- v = nil, why = "cat: /nonexistent: 没有那个文件或目录"
 
 -- 要看退出码（grim 只写文件、不打印）
-local out, code, err = vidow.exec_status("grim /tmp/shot.png")
+local out, code, err = vidow.exec("grim /tmp/shot.png", { status = true })
 if code ~= 0 then vidow.log("截图失败: " .. err) end
 ```
 
@@ -3306,7 +3316,7 @@ src/xwayland.c XWayland：懒启动服务、seat、xwayland_shell 只给 Xwaylan
 src/exec.c     异步 `sh -c`：pipe + wl_event_loop_add_fd + 共享超时定时器，绝不阻塞渲染
 src/script.c   配置语言：Lua 5.4，协程化的 vidow.exec、全局名→配置键、vidow.include()
                （一类一份配置就地展开）、SIGHUP 重载、vidow.on() 的事件钩子（Lua 那一半）、
-               vidow.env{} / vidow.exec_once() / vidow.spawn()
+               vidow.env{} / vidow.exec_once() / vidow.exec() 的 wait / status 选项
 src/hooks.c    事件钩子：config.lua 里 vidow.on() 声明的那些（命令 / Lua 两种），事件
                *名单*（vidowmsg events 就报它）、统一入队 + idle 派发、命令钩子的环境变量
 src/env.c      会话环境账本：和 systemd 用户管理器两个方向对账（吸 / 推 + 退出还原）、
@@ -4383,6 +4393,36 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
        而要收就得连它一起收 —— 那会把 grim / wf-recorder / OBS 全废掉。要边界得靠 sandbox
        那一层（别的进程拿不到 wayland socket），不是合成器。
 
+196. **exec 那四个名字并成两个**（用户要求「exec 这里优化一下，有些重复功能的方法就合并了」）
+
+      四个入口里真正重复的是名字，不是逻辑：`exec` / `exec_status` 早就是同一个实现
+      （`l_exec_yield(L, want_status)`，只差返回形态），`spawn` / `exec_once` 也都是同一个
+      `vidow_exec_detached()`，只差「等不等 / 要不要输出 / 起几次」。所以并成：
+
+      | 现在 | 原来的名字 |
+      | --- | --- |
+      | `vidow.exec(cmd)` | `vidow.exec(cmd)`（没变） |
+      | `vidow.exec(cmd, { status = true })` | `vidow.exec_status(cmd)` |
+      | `vidow.exec(cmd, { wait = false })` | `vidow.spawn(cmd)` |
+      | `vidow.exec_once(cmd)` | `vidow.exec_once(cmd)`（没变） |
+
+      决定留这两个名字（用户定的：一个 `exec`、一个 `exec_once`）—— 「等不等 / 要不要退出码」
+      是同一个动作的参数，不值得各占一个名字；「一个生命周期只起一次」是另一件事，值得一个
+      名字。选项表只认 `wait` / `status`，拼错当场报错并列出能写哪些（和配置族那张表一个规矩）。
+
+      - 老名字**不静默**：`vidow` 表上挂了 `__index`，`vidow.spawn` / `vidow.exec_status`
+        会报「已经并进 vidow.exec：写成 vidow.exec(cmd, { wait = false })」—— 比
+        `attempt to call a nil value` 有用得多，而且不用在 API 表里留两个墓碑函数（那样
+        `test-defaultconfig.sh` 的「说明完整性」还得把它们写进手册）。
+      - `exec_once` 也收选项表，但只认默认的撒手跑：`{ wait = true }` 当场报错（它是等这份
+        配置跑完才起的，等不了；要输出就用 `vidow.exec`）。
+      - `{ wait = false }` 那条路比原来的 `spawn` 多做一件事：起之前 `script_sync_env_for_child()`
+        对一次环境（缩放 / `DISPLAY`），和等的那条路一致。
+      - 回归：`test-config.sh` 新增一节 8 项（`{ status = true }` 拿到 `out=hi code=3`、
+        不给选项时照旧 `nil + 原因`、`{ wait = false }` 立刻返回 true 且命令真跑了、两个老名字
+        的报错都带「并进 vidow.exec」、拼错的选项名报错、`exec_once` 的 `wait = true` 报错），
+        16 → **24 项**。`test-hooks.sh` 里三处 `vidow.spawn()` 改成新写法（顺手验了撒手那条路）。
+
 195. **事件钩子（`vidow.on`）、自启动（`exec_once`）、和 systemd 用户管理器两个方向对账**
       （用户要求「参考 hyprland 实现事件系统，自启动，窗口打开时之类的。执行 shell 需要继承
       vidow 的环境变量，有些 systemd 起来的应用也要继承 vidow 变量，也就是说 vidow 需要支持
@@ -4424,8 +4464,8 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
         也容错：收到字符串形式的 data 会再解一次。
 
       **2）自启动（Hyprland 的 `exec-once` / `exec`）**：`vidow.exec_once(cmd)`（整个 vidow
-      生命周期只起一次，重载不重来）、`vidow.spawn(cmd)`（每次配置加载都起，撒手）、
-      `vidow.exec()` 照旧（要输出、等它）。`exec_once` 的命令**先排队**，等这份配置跑完
+      生命周期只起一次，重载不重来）、`vidow.exec(cmd, { wait = false })`（每次配置加载都
+      起，撒手）、`vidow.exec(cmd)` 照旧（要输出、等它）。`exec_once` 的命令**先排队**，等这份配置跑完
       （环境、缩放、`DISPLAY` 都定了）再起 —— 这和 `script_sync_env_for_child()` 是同一个
       理由：配置是分步跑的，命令起来时环境可能还没落地。「起过了」按**命令原文**记（不是行号
       / 下标）：重载后同一行还是同一行、认得出，改过原文就算新命令（和 Hyprland 一个规矩）。

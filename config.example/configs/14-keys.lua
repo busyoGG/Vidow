@@ -123,7 +123,7 @@ end
 --     跑命令与日志：
 --         vidow.exec("命令")                     跑一条 shell 命令，拿它的 stdout（看着是同步
 --                                                的，实际不阻塞渲染）；失败返回 nil, 原因
---         vidow.exec_status("命令")              要退出码时用它：返回 out, code, err
+--         vidow.exec("命令", { status = true })   要退出码时用它：返回 out, code, err
 --         vidow.log("消息")                     往合成器日志打一行（VIDOW_LOG=debug 看得见）
 --         vidow.ipc_path()                      当前 IPC socket 的路径（没开 IPC 时是 nil）
 
