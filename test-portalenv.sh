@@ -205,7 +205,11 @@ if has "$LOG/A.log" "portal: 环境快照" && has "$LOG/A.log" "portal: 还原�
 else
 	fail "vidow 日志缺快照或还原记录"
 fi
-if has "$FAKELOG" "unset-environment"; then
+# 只看**我们那三个**：vidow 的会话环境导出（见 src/env.c）退出时会把「我们推上去、
+# 用户管理器里本来没有的」变量（VIDOW_SOCKET 这类）unset 掉 —— 那是它自己的账，不是
+# 这一条要管的。这里要盯的是：三个值原来都在，就一个都不许 unset。
+if grep -a -- "--user unset-environment" "$FAKELOG" 2>/dev/null |
+	grep -qE "XDG_CURRENT_DESKTOP|WAYLAND_DISPLAY|XDG_RUNTIME_DIR"; then
 	fail "三个值原来都在，不该 unset"
 else
 	pass "值都在时不 unset"

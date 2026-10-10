@@ -34,9 +34,9 @@ trap cleanup EXIT
 our_vidow_pids() {
 	local p
 	for p in /proc/[0-9]*; do
-		[ -r "$p/cmdline" ] || continue
+		[ -r "$p/cmdline" ] 2>/dev/null || continue
 		grep -aq "build/vidow" "$p/cmdline" 2>/dev/null || continue
-		[ -r "$p/environ" ] || continue
+		[ -r "$p/environ" ] 2>/dev/null || continue
 		grep -aqz "$RUNDIR" "$p/environ" 2>/dev/null || continue
 		echo "${p#/proc/}"
 	done
