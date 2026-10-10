@@ -52,19 +52,19 @@ const struct vidow_rule_field vidow_rule_fields[] = {
 		"现在属于哪块工作区（名字）" },
 
 	/* ---- 匹配：布尔 */
-	{ "xwayland", RK_BOOL, VRB_XWAYLAND, VIDOW_RULE_WINDOW,
+	{ "is_xwayland", RK_BOOL, VRB_XWAYLAND, VIDOW_RULE_WINDOW,
 		"是 X11（XWayland）窗口" },
-	{ "popup", RK_BOOL, VRB_POPUP, VIDOW_RULE_WINDOW,
+	{ "is_popup", RK_BOOL, VRB_POPUP, VIDOW_RULE_WINDOW,
 		"菜单 / 提示 / 下拉框这类弹出物（X11 的 override-redirect）" },
-	{ "floating", RK_BOOL, VRB_FLOATING, VIDOW_RULE_WINDOW,
+	{ "is_floating", RK_BOOL, VRB_FLOATING, VIDOW_RULE_WINDOW,
 		"现在是浮动窗口" },
-	{ "fullscreen", RK_BOOL, VRB_FULLSCREEN, VIDOW_RULE_WINDOW,
+	{ "is_fullscreen", RK_BOOL, VRB_FULLSCREEN, VIDOW_RULE_WINDOW,
 		"现在全屏" },
-	{ "maximized", RK_BOOL, VRB_MAXIMIZED, VIDOW_RULE_WINDOW,
+	{ "is_maximized", RK_BOOL, VRB_MAXIMIZED, VIDOW_RULE_WINDOW,
 		"所在列正整列最大化" },
-	{ "minimized", RK_BOOL, VRB_MINIMIZED, VIDOW_RULE_WINDOW,
+	{ "is_minimized", RK_BOOL, VRB_MINIMIZED, VIDOW_RULE_WINDOW,
 		"收起来了（还在列里，但不显示）" },
-	{ "fixed_size", RK_BOOL, VRB_FIXED_SIZE, VIDOW_RULE_WINDOW,
+	{ "is_fixed_size", RK_BOOL, VRB_FIXED_SIZE, VIDOW_RULE_WINDOW,
 		"客户端声明了固定尺寸（min == max），微信登录窗那种" },
 
 	/* ---- 匹配：数值 */
@@ -93,6 +93,30 @@ const struct vidow_rule_field vidow_rule_fields[] = {
 		VIDOW_RULE_WINDOW | VIDOW_RULE_LAYER,
 		"马赛克的块边长（屏幕像素，默认 16，最小 2）；只在 capture = "
 		"\"mosaic\" 时有用，单独写不算一个作用" },
+	/* 开窗时兑现一次的 */
+	{ "float", RK_ACT_BOOL, VRA_FLOAT, VIDOW_RULE_WINDOW,
+		"true = 强制浮动（对话框那类本来就会浮的不用写），false = 强制平铺" },
+	{ "workspace", RK_ACT_STR, VRA_WORKSPACE, VIDOW_RULE_WINDOW,
+		"开在哪块工作区：具名工作区（没有就建）、特殊工作区（\"special:名字\" "
+		"或直接写名字）、序号（\"2\"）" },
+	{ "output", RK_ACT_STR, VRA_OUTPUT, VIDOW_RULE_WINDOW,
+		"开在哪块屏（那块屏现在显示着的工作区）" },
+	{ "width", RK_ACT_INT, VRA_WIDTH, VIDOW_RULE_WINDOW,
+		"浮动窗口的宽（逻辑像素；不写 = 客户端自己定）" },
+	{ "height", RK_ACT_INT, VRA_HEIGHT, VIDOW_RULE_WINDOW,
+		"浮动窗口的高（逻辑像素；不写 = 客户端自己定）" },
+	{ "center", RK_ACT_BOOL, VRA_CENTER, VIDOW_RULE_WINDOW,
+		"浮动窗口开在屏幕中间" },
+	{ "fullscreen", RK_ACT_BOOL, VRA_FULLSCREEN, VIDOW_RULE_WINDOW,
+		"开出来就全屏" },
+	{ "maximize", RK_ACT_BOOL, VRA_MAXIMIZE, VIDOW_RULE_WINDOW,
+		"开出来就整列最大化" },
+	{ "minimize", RK_ACT_BOOL, VRA_MINIMIZE, VIDOW_RULE_WINDOW,
+		"开出来就收起来（留在列里，但不显示、不抢焦点）" },
+	{ "column_width", RK_ACT_DOUBLE, VRA_COLUMN_WIDTH, VIDOW_RULE_WINDOW,
+		"这个窗口新开的列有多宽（占可用宽度的比例，0.1 ~ 1.0；默认 0.5）" },
+	{ "anim", RK_ACT_BOOL, VRA_ANIM, VIDOW_RULE_WINDOW,
+		"false = 这个窗口不做开合动画（它开、它关都是瞬间到位）" },
 };
 
 const size_t vidow_rule_field_count =
@@ -149,6 +173,19 @@ const char *vidow_rule_all_names(unsigned targets) {
 
 bool vidow_rule_init(struct vidow_server *server) {
 	wl_list_init(&server->rules);
+	/* 字段名重了就是 bug（查找只认第一个，写名字的那个人拿到的不是他想要的
+	 * 那个字段）—— 这种错在配置里看着像「规则没生效」，很难查，所以在启动时
+	 * 就喊出来。踩过一次：fullscreen 既是匹配字段又是作用字段。 */
+	for (size_t i = 0; i < vidow_rule_field_count; i++) {
+		for (size_t j = i + 1; j < vidow_rule_field_count; j++) {
+			if (strcmp(vidow_rule_fields[i].name,
+					vidow_rule_fields[j].name) == 0) {
+				wlr_log(WLR_ERROR, "rule: 字段表里 %s 重了（第 %zu 项和"
+					"第 %zu 项）—— 只有第一个能找到",
+					vidow_rule_fields[i].name, i, j);
+			}
+		}
+	}
 	return true;
 }
 
@@ -434,6 +471,26 @@ bool vidow_rule_commit(struct vidow_server *server, struct vidow_rule *rule,
 			rule->aval[VRA_CAPTURE_MOSAIC].i);
 		return false;
 	}
+	/* 列宽占比：0.1 ~ 1.0（外面那个数就是「占可用宽度的比例」）。 */
+	if (rule->aset[VRA_COLUMN_WIDTH] &&
+			(rule->aval[VRA_COLUMN_WIDTH].d < 0.1 ||
+			 rule->aval[VRA_COLUMN_WIDTH].d > 1.0)) {
+		snprintf(err, errlen, "column_width 是列宽占可用宽度的比例，"
+			"得在 0.1 ~ 1.0 之间，给的是 %.2f",
+			rule->aval[VRA_COLUMN_WIDTH].d);
+		return false;
+	}
+	/* 浮动窗口的尺寸：不写 = 客户端自己定（0），写了就得是正数。 */
+	const char *size_keys[2] = { "width", "height" };
+	const int size_slots[2] = { VRA_WIDTH, VRA_HEIGHT };
+	for (int i = 0; i < 2; i++) {
+		if (rule->aset[size_slots[i]] &&
+				rule->aval[size_slots[i]].i < 1) {
+			snprintf(err, errlen, "%s 是逻辑像素，得是正数，给的是 %lld",
+				size_keys[i], rule->aval[size_slots[i]].i);
+			return false;
+		}
+	}
 	/* 字符串字段编译成正则。literal = true 就跳过编译，走子串匹配。 */
 	for (size_t i = 0; i < VRS_COUNT; i++) {
 		struct vidow_rule_match *m = &rule->str[i];
@@ -708,12 +765,8 @@ static bool rule_matches(const struct vidow_rule *rule,
 
 /* 累积结果：命中多条规则时，后面的覆盖前面的（逐字段 —— 一条规则只动它写了
  * 的字段，没写的字段不参与，叠出来的是「所有命中规则里最后写的那个值」）。 */
-struct rule_eff {
-	bool set[VRA_COUNT];
-	union vidow_rule_value val[VRA_COUNT];
-};
-
-static void accumulate(const struct vidow_rule *rule, struct rule_eff *eff) {
+static void accumulate(const struct vidow_rule *rule,
+		struct vidow_rule_eff *eff) {
 	for (size_t i = 0; i < VRA_COUNT; i++) {
 		if (!rule->aset[i]) {
 			continue;
@@ -724,7 +777,7 @@ static void accumulate(const struct vidow_rule *rule, struct rule_eff *eff) {
 }
 
 static void apply_view(struct vidow_server *server, struct vidow_view *view,
-		const struct rule_eff *eff) {
+		const struct vidow_rule_eff *eff) {
 	/* 先摆默认值，再把命中的规则按顺序叠上来：同一个字段以最后一条写了它的规则
 	 * 为准，谁都没写就是这里给的默认值。 */
 	bool force_render = false;
@@ -814,10 +867,26 @@ static void apply_view(struct vidow_server *server, struct vidow_view *view,
 			force_render ? "开" : "关",
 			interval > 0 ? "" : "（不限速）");
 	}
+
+	/* 强制浮动 / 强制平铺：规则说了算，自动识别（对话框那类）让位。
+	 * vidow_float_update_mode() 也认这一份（view->rule_eff），所以尺寸提示晚到
+	 * 的时候不会把规则的结论推翻。 */
+	if (eff->set[VRA_FLOAT] && !view->popup) {
+		enum vidow_float_mode want_mode = eff->val[VRA_FLOAT].b ?
+			VIDOW_FLOAT_FIXED : VIDOW_FLOAT_NONE;
+		if (view->float_mode != want_mode) {
+			wlr_log(WLR_INFO, "rule: %s 规则要求%s（现在%s）",
+				vidow_view_title(view) != NULL ?
+					vidow_view_title(view) : "(无题)",
+				want_mode == VIDOW_FLOAT_NONE ? "平铺" : "浮动",
+				view->float_mode == VIDOW_FLOAT_NONE ? "平铺" : "浮动");
+			vidow_float_set_mode(view, want_mode);
+		}
+	}
 }
 
 static void apply_layer(struct vidow_server *server,
-		struct vidow_layer_surface *ls, const struct rule_eff *eff) {
+		struct vidow_layer_surface *ls, const struct vidow_rule_eff *eff) {
 	(void)server;
 	int capture = VIDOW_CAPTURE_OFF;
 	int capture_mosaic = VIDOW_CAPTURE_MOSAIC_DEFAULT;
@@ -849,7 +918,7 @@ void vidow_rule_apply(struct vidow_server *server, struct vidow_view *view) {
 	struct rule_ctx ctx;
 	ctx_from_view(server, view, &ctx);
 
-	struct rule_eff eff = { 0 };
+	struct vidow_rule_eff eff = { 0 };
 	const struct vidow_rule *rule;
 	wl_list_for_each(rule, &server->rules, link) {
 		if (!rule_matches(rule, &ctx)) {
@@ -857,7 +926,140 @@ void vidow_rule_apply(struct vidow_server *server, struct vidow_view *view) {
 		}
 		accumulate(rule, &eff);
 	}
+	/* 存一份在窗口上：渲染 / 布局那边（fx.c、view.c、float.c）直接看它，
+	 * 不用每条规则各判一遍。 */
+	view->rule_eff = eff;
 	apply_view(server, view, &eff);
+}
+
+/* 按名字找一块屏（先精确、再大小写不敏感的子串，和 IPC 那边一个规矩）。 */
+static struct vidow_output *output_by_name(struct vidow_server *server,
+		const char *name) {
+	struct vidow_output *output, *sub = NULL;
+	wl_list_for_each(output, &server->outputs, link) {
+		if (strcasecmp(output->wlr_output->name, name) == 0) {
+			return output;
+		}
+		if (sub == NULL && contains(output->wlr_output->name, name)) {
+			sub = output;
+		}
+	}
+	return sub;
+}
+
+/* 规则里的工作区名字 → 一块工作区：
+ *   "special:名字"  特殊工作区（没有就建；名字留空 = "special"）
+ *   "3"             那块屏上的第 3 块（niri 的序号写法）
+ *   别的            具名工作区（没有就建 —— 规则写了名字就是要它存在）
+ * 注意不能直接用 vidow_workspace_move_view_to_name()：那个只按**特殊工作区**的名字
+ * 找（IPC 的老规矩），具名工作区得自己 lookup / create。 */
+static struct vidow_workspace *rule_workspace(struct vidow_server *server,
+		struct vidow_view *view, const char *name) {
+	const char *special = NULL;
+	if (strncmp(name, "special:", 8) == 0) {
+		special = name + 8;
+		if (special[0] == '\0') {
+			special = "special";
+		}
+	}
+	if (special != NULL) {
+		struct vidow_workspace *ws;
+		wl_list_for_each(ws, &server->workspaces, link) {
+			if (ws->special && strcmp(vidow_workspace_name(ws), special) == 0) {
+				return ws;
+			}
+		}
+		return vidow_workspace_create_special(server, special);
+	}
+	char *end = NULL;
+	long n = strtol(name, &end, 10);
+	if (end != name && *end == '\0' && n > 0) {
+		struct wlr_output *output = view->output != NULL ?
+			view->output : server->focused_output;
+		int cnt = vidow_workspace_count(server, output);
+		if (cnt == 0) {
+			return NULL;
+		}
+		return vidow_workspace_at(server, output, n > cnt ? cnt : (int)n);
+	}
+	struct vidow_workspace *ws = vidow_workspace_lookup(server, name);
+	if (ws != NULL) {
+		return ws;
+	}
+	return vidow_workspace_create(server, name,
+		view->output != NULL ? view->output : server->focused_output);
+}
+
+/* 开窗时兑现一次的那些作用（工作区 / 屏 / 尺寸 / 居中 / 全屏 / 最大化 / 最小化）。
+ * 只在 view_map 里调一次：重载规则不搬已经开着的窗口，也不改它们的尺寸 ——
+ * 「开出来什么样」和「现在什么样」是两回事。 */
+void vidow_rule_placement(struct vidow_server *server, struct vidow_view *view) {
+	if (view == NULL || view->popup) {
+		return;
+	}
+	const struct vidow_rule_eff *eff = &view->rule_eff;
+	const char *title = vidow_view_title(view) != NULL ?
+		vidow_view_title(view) : "(无题)";
+
+	if (eff->set[VRA_WORKSPACE]) {
+		const char *name = eff->val[VRA_WORKSPACE].s;
+		struct vidow_workspace *ws = rule_workspace(server, view, name);
+		if (ws != NULL && vidow_workspace_move_view(server, view, ws)) {
+			wlr_log(WLR_INFO, "rule: %s 开在 %s 上", title,
+				vidow_workspace_name(ws));
+		} else {
+			wlr_log(WLR_ERROR, "rule: %s 想开在 %s 上，但搬不过去",
+				title, name);
+		}
+	}
+	if (eff->set[VRA_OUTPUT]) {
+		const char *name = eff->val[VRA_OUTPUT].s;
+		struct vidow_output *output = output_by_name(server, name);
+		if (output == NULL) {
+			wlr_log(WLR_ERROR, "rule: %s 想开在 %s 上，但没有这块屏",
+				title, name);
+		} else {
+			struct vidow_workspace *ws = vidow_workspace_active_for(server,
+				output->wlr_output);
+			if (ws != NULL && vidow_workspace_move_view(server, view, ws)) {
+				wlr_log(WLR_INFO, "rule: %s 开在 %s 上", title,
+					output->wlr_output->name);
+			}
+		}
+	}
+
+	/* 尺寸 / 居中只对浮动窗口有意义（平铺的尺寸由布局定）。 */
+	if (view->float_mode != VIDOW_FLOAT_NONE) {
+		int w = eff->set[VRA_WIDTH] ? (int)eff->val[VRA_WIDTH].i :
+			view->float_geom.width;
+		int h = eff->set[VRA_HEIGHT] ? (int)eff->val[VRA_HEIGHT].i :
+			view->float_geom.height;
+		if (w > 0 && h > 0 && (eff->set[VRA_WIDTH] ||
+				eff->set[VRA_HEIGHT])) {
+			wlr_log(WLR_INFO, "rule: %s 开成 %dx%d", title, w, h);
+			vidow_float_set_size(view, w, h);
+		}
+		if (eff->set[VRA_CENTER] && eff->val[VRA_CENTER].b) {
+			vidow_float_center(view);
+		}
+	}
+
+	if (eff->set[VRA_FULLSCREEN] && eff->val[VRA_FULLSCREEN].b &&
+			!view->fullscreen) {
+		vidow_view_toggle_fullscreen(view);
+		wlr_log(WLR_INFO, "rule: %s 开出来就全屏", title);
+	}
+	if (eff->set[VRA_MAXIMIZE] && eff->val[VRA_MAXIMIZE].b &&
+			view->column != NULL && !view->column->maximized) {
+		vidow_column_set_maximized(view->column, true);
+		wlr_log(WLR_INFO, "rule: %s 开出来就整列最大化", title);
+	}
+	/* 最小化放最后：收起来的窗口不抢焦点（下面 view_map 的焦点那一步会跳过它）。 */
+	if (eff->set[VRA_MINIMIZE] && eff->val[VRA_MINIMIZE].b &&
+			!view->minimized) {
+		vidow_view_set_minimized(view, true);
+		wlr_log(WLR_INFO, "rule: %s 开出来就收起来", title);
+	}
 }
 
 void vidow_rule_apply_layer(struct vidow_server *server,
@@ -868,7 +1070,7 @@ void vidow_rule_apply_layer(struct vidow_server *server,
 	struct rule_ctx ctx;
 	ctx_from_layer(server, ls, &ctx);
 
-	struct rule_eff eff = { 0 };
+	struct vidow_rule_eff eff = { 0 };
 	const struct vidow_rule *rule;
 	wl_list_for_each(rule, &server->rules, link) {
 		if (!rule_matches(rule, &ctx)) {
@@ -876,6 +1078,7 @@ void vidow_rule_apply_layer(struct vidow_server *server,
 		}
 		accumulate(rule, &eff);
 	}
+	ls->rule_eff = eff;
 	apply_layer(server, ls, &eff);
 }
 

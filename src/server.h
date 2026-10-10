@@ -11,6 +11,7 @@
 #include <wlr/backend.h>
 #include <wlr/backend/session.h>
 #include "scale.h"
+#include "rule.h"
 #include "outputconf.h"
 #include "hotplug.h"
 #include "clipboard.h"
@@ -863,6 +864,9 @@ struct vidow_view {
 	int probe_pid;
 	char probe_exe[128];
 	char probe_cmdline[256];
+	/* 窗口规则算出来的作用（rule.c 填；开窗时兑现的那些见 vidow_rule_placement，
+	 * 渲染 / 布局那边的「这个窗口现在该什么样」也看它）。 */
+	struct vidow_rule_eff rule_eff;
 	struct vidow_view_tag tag;
 	bool mapped;
 	/* 「最近用过」的时间戳（单调时钟 ns；0 = 还没记过）。Alt+Tab 的切换器
@@ -1049,6 +1053,8 @@ struct vidow_layer_surface {
 	 * 屏回来时再挪回去。 */
 	struct vidow_output_memory *home;
 	uint32_t layer;
+	/* 图层规则算出来的作用（rule.c 填）。 */
+	struct vidow_rule_eff rule_eff;
 	/* 图层规则的 exe / cmdline：和窗口那边一样，按 pid 抓一次就缓存。 */
 	int probe_pid;
 	char probe_exe[128];

@@ -155,11 +155,11 @@ apply_cfg \
 	'vidow.rule{ title = "^预览", capture = "mosaic", capture_mosaic = 24 }' \
 	'vidow.rule{ namespace = "notifications", capture = "hide" }' \
 	'vidow.rule{ class = "Steam", focus_on_open = false }' \
-	'vidow.rule{ app_id = "!mpv", xwayland = false, capture = "hide" }' \
+	'vidow.rule{ app_id = "!mpv", is_xwayland = false, capture = "hide" }' \
 	'vidow.rule{ literal = true, title = "a.b", capture = "hide" }' \
 	'vidow.rule{ pid = 4242, exe = "^mpv$", cmdline = "mpv --no-config",' \
-	'             layer = "overlay", on_output = "DP-1", floating = true,' \
-	'             fixed_size = false, initial_title = "^新", role = "pop-up",' \
+	'             layer = "overlay", on_output = "DP-1", is_floating = true,' \
+	'             is_fixed_size = false, initial_title = "^新", role = "pop-up",' \
 	'             capture = "off" }' \
 	'local n = 0' \
 	'for i, r in ipairs(vidow.rules()) do' \
@@ -205,7 +205,7 @@ if len(rules) == 7:
 	eq(3, "class", "Steam")
 	eq(3, "focus_on_open", False)
 	eq(4, "app_id", "!mpv")         # 取反原样读回来
-	eq(4, "xwayland", False)
+	eq(4, "is_xwayland", False)
 	eq(5, "literal", True)
 	eq(5, "title", "a.b")
 	eq(6, "pid", 4242)
@@ -213,8 +213,8 @@ if len(rules) == 7:
 	eq(6, "cmdline", "mpv --no-config")
 	eq(6, "layer", "overlay")
 	eq(6, "on_output", "DP-1")
-	eq(6, "floating", True)
-	eq(6, "fixed_size", False)
+	eq(6, "is_floating", True)
+	eq(6, "is_fixed_size", False)
 	eq(6, "initial_title", "^新")
 	eq(6, "role", "pop-up")
 	eq(6, "capture", "off")
@@ -245,6 +245,12 @@ apply_cfg \
 	'  vidow.rule{ app_id = 42, capture = "hide" } end)))))' \
 	'vidow.log("E7 " .. tostring((select(2, pcall(function()' \
 	'  vidow.rule{ app_id = "mpv", hz = "fast" } end)))))' \
+	'vidow.log("E8 " .. tostring((select(2, pcall(function()' \
+	'  vidow.rule{ app_id = "mpv", column_width = 5 } end)))))' \
+	'vidow.log("E9 " .. tostring((select(2, pcall(function()' \
+	'  vidow.rule{ app_id = "mpv", width = 0 } end)))))' \
+	'vidow.log("E10 " .. tostring((select(2, pcall(function()' \
+	'  vidow.rule{ app_id = "mpv", workspace = "" } end)))))' \
 	'vidow.rule{ app_id = "keep", capture = "hide" }'
 
 check_log() { # check_log <标签> <必须出现的串> [<也得出现的串>]
@@ -269,6 +275,9 @@ check_log E4 "hide"
 check_log E5 "至少 2"
 check_log E6 "字符串"
 check_log E7 "整数"
+check_log E8 "0.1 ~ 1.0"
+check_log E9 "正数"
+check_log E10 "不能是空的"
 
 RULES_N=$(./build/vidowmsg rules 2>/dev/null | python3 -c '
 import json, sys
@@ -308,10 +317,10 @@ case_state "pid 不匹配"                   off  'vidow.rule{ pid = 1, capture 
 case_state "exe 匹配（python3）"          hide 'vidow.rule{ exe = "^python3", capture = "hide" }'
 case_state "cmdline 匹配"                 hide 'vidow.rule{ cmdline = "bluewin\\.py", capture = "hide" }'
 case_state "cmdline 不匹配"               off  'vidow.rule{ cmdline = "^nope", capture = "hide" }'
-case_state "xwayland = false 命中"        hide 'vidow.rule{ xwayland = false, capture = "hide" }'
-case_state "xwayland = true 不命中"       off  'vidow.rule{ xwayland = true, capture = "hide" }'
-case_state "floating = false 命中"        hide 'vidow.rule{ floating = false, capture = "hide" }'
-case_state "floating = true 不命中"       off  'vidow.rule{ floating = true, capture = "hide" }'
+case_state "is_xwayland = false 命中"        hide 'vidow.rule{ is_xwayland = false, capture = "hide" }'
+case_state "is_xwayland = true 不命中"       off  'vidow.rule{ is_xwayland = true, capture = "hide" }'
+case_state "is_floating = false 命中"        hide 'vidow.rule{ is_floating = false, capture = "hide" }'
+case_state "is_floating = true 不命中"       off  'vidow.rule{ is_floating = true, capture = "hide" }'
 case_state "on_output 命中"               hide "vidow.rule{ on_output = \"^$OUT$\", capture = \"hide\" }"
 case_state "on_output 不命中"             off  'vidow.rule{ on_output = "^NOPE$", capture = "hide" }'
 case_state "initial_title 命中"           hide 'vidow.rule{ initial_title = "^bluewin$", capture = "hide" }'
@@ -357,8 +366,169 @@ case_layer "图层规则写窗口字段 = 不匹配"   off  'vidow.rule{ namespa
 case_layer "窗口规则不管图层"              off  'vidow.rule{ app_id = "^dot$", capture = "hide" }'
 case_layer "capture_mosaic 在图层上也认"   mosaic 'vidow.rule{ namespace = "^dot$", capture = "mosaic", capture_mosaic = 48 }'
 
-# ------------------------------------------------------------ 5) 收尾
-mark "5) 收尾"
+# ------------------------------------------------------------ 5) 开窗时兑现的作用
+mark "5) 开窗时一次的作用（浮动 / 尺寸 / 居中 / 全屏 / 最大化 / 最小化 / 列宽 / 动画 / 工作区 / 屏）"
+
+newest_id() {
+	./build/vidowmsg windows 2>/dev/null | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+w = d.get("windows", d) if isinstance(d, dict) else d
+print(max([x["id"] for x in w], default=0))'
+}
+
+LAST_PID=""
+open_win() { # 起一个客户端、等它上屏，把窗口 id 打在 stdout
+	local before id i
+	before=$(newest_id)
+	HOME="$CFGDIR" python3 tools/bluewin.py > "$RUNDIR/blue-$RANDOM.log" 2>&1 &
+	LAST_PID=$!
+	for i in $(seq 1 80); do
+		id=$(newest_id)
+		if [ -n "$id" ] && [ "$id" -gt "$before" ]; then
+			echo "$id"
+			return 0
+		fi
+		sleep 0.2
+	done
+	return 1
+}
+
+kill_win() {
+	[ -n "$LAST_PID" ] && kill "$LAST_PID" 2>/dev/null
+	LAST_PID=""
+	sleep 0.5
+}
+
+win_field() { # win_field <id> <python 表达式，x 是那个窗口的 dict>
+	./build/vidowmsg windows 2>/dev/null | python3 -c '
+import json, sys
+wid, expr = int(sys.argv[1]), sys.argv[2]
+d = json.load(sys.stdin)
+w = d.get("windows", d) if isinstance(d, dict) else d
+for x in w:
+	if x["id"] == wid:
+		print(eval(expr, {"x": x}))
+		break
+else:
+	print("missing")
+' "$1" "$2"
+}
+
+wait_field() { # wait_field <id> <表达式> <期望> —— 最多等 5 秒
+	local id="$1" expr="$2" want="$3" i got
+	for i in $(seq 1 50); do
+		got=$(win_field "$id" "$expr")
+		[ "$got" = "$want" ] && return 0
+		sleep 0.1
+	done
+	echo "      （等 $expr = $want 超时，现在是 $got）"
+	return 1
+}
+
+# case_open <标签> <表达式> <期望> <规则行…>：写配置 → 开一个新窗口 → 看它开成什么样
+case_open() {
+	local label="$1" expr="$2" want="$3"; shift 3
+	apply_cfg "$@" || { fail "$label：配置没重载"; return; }
+	local id
+	if ! id=$(open_win); then
+		fail "$label：窗口没起来"
+		return
+	fi
+	if wait_field "$id" "$expr" "$want"; then
+		pass "$label → $expr = $want"
+	else
+		fail "$label → 想要 $want"
+	fi
+	kill_win
+}
+
+case_open "float = true 强制浮动" 'x["floating"]' True \
+	'vidow.rule{ title = "^bluewin$", float = true }'
+case_open "width / height 定浮动尺寸" 'x["float_geometry"]["width"]' 400 \
+	'vidow.rule{ title = "^bluewin$", float = true, width = 400, height = 300 }'
+case_open "height 也认" 'x["float_geometry"]["height"]' 300 \
+	'vidow.rule{ title = "^bluewin$", float = true, width = 400, height = 300 }'
+case_open "fullscreen = true 开出来就全屏" 'x["fullscreen"]' True \
+	'vidow.rule{ title = "^bluewin$", fullscreen = true }'
+case_open "maximize = true 开出来就整列最大化" 'x["column"]["maximized"]' True \
+	'vidow.rule{ title = "^bluewin$", maximize = true }'
+case_open "minimize = true 开出来就收起来" 'x["minimized"]' True \
+	'vidow.rule{ title = "^bluewin$", minimize = true }'
+case_open "收起来的窗口不抢焦点" 'x["focused"]' False \
+	'vidow.rule{ title = "^bluewin$", minimize = true }'
+case_open "column_width 定新列的宽度" 'x["column"]["width_fraction"]' 0.25 \
+	'vidow.rule{ title = "^bluewin$", column_width = 0.25 }'
+case_open "workspace 开在别的工作区" 'x["workspace"]' "chat" \
+	'vidow.rule{ title = "^bluewin$", workspace = "chat" }'
+case_open "output 开在指定的屏上" 'x["output"]' "$OUT" \
+	"vidow.rule{ title = \"^bluewin$\", output = \"$OUT\" }"
+
+# 居中：拿浮动窗口的中心和屏幕中心比（工作区有边距，容 30px）
+apply_cfg 'vidow.rule{ title = "^bluewin$", float = true, width = 400, height = 300, center = true }'
+if id=$(open_win); then
+	OUT_W=$(./build/vidowmsg outputs 2>/dev/null | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+o = d.get("outputs", d) if isinstance(d, dict) else d
+print(o[0]["layout"]["width"])')
+	got=$(win_field "$id" 'x["float_geometry"]["x"] + x["float_geometry"]["width"] // 2')
+	want=$((OUT_W / 2))
+	if [ "$got" != missing ] && [ $((got - want)) -le 30 ] && [ $((want - got)) -le 30 ]; then
+		pass "center = true 居中（窗口中心 $got，屏幕中心 $want）"
+	else
+		fail "center = true 没居中（窗口中心 $got，屏幕中心 $want）"
+	fi
+	kill_win
+else
+	fail "center = true：窗口没起来"
+fi
+
+# anim = false：日志里不该有这一条的入场动画（别的窗口有，所以只数「这一条之后」）
+apply_cfg 'vidow.rule{ title = "^bluewin$", anim = false }'
+ANIM_BEFORE=$(grep -ac "anim open start" "$LOG")
+if id=$(open_win); then
+	sleep 0.8
+	ANIM_AFTER=$(grep -ac "anim open start" "$LOG")
+	if [ "$ANIM_AFTER" = "$ANIM_BEFORE" ]; then
+		pass "anim = false：开窗没有入场动画（anim open start 还是 $ANIM_BEFORE 条）"
+	else
+		fail "anim = false 还是跑了入场动画（多了 $((ANIM_AFTER - ANIM_BEFORE)) 条）"
+	fi
+	kill_win
+else
+	fail "anim = false：窗口没起来"
+fi
+apply_cfg   # 回到「没有规则」的配置
+ANIM_BEFORE=$(grep -ac "anim open start" "$LOG")
+if id=$(open_win); then
+	sleep 0.8
+	ANIM_AFTER=$(grep -ac "anim open start" "$LOG")
+	[ "$ANIM_AFTER" -gt "$ANIM_BEFORE" ] &&
+		pass "对照组（没写 anim）：照样有入场动画" ||
+		fail "对照组（没写 anim）反而没有入场动画"
+	kill_win
+else
+	fail "对照组：窗口没起来"
+fi
+
+# float 是「一直在」的那一类：重载改规则，已经开着的窗口跟着变
+apply_cfg 'vidow.rule{ title = "^bluewin$", float = true }'
+if id=$(open_win); then
+	wait_field "$id" 'x["floating"]' True >/dev/null &&
+		apply_cfg 'vidow.rule{ title = "^bluewin$", float = false }' &&
+		if wait_field "$id" 'x["floating"]' False; then
+			pass "float 跟着重载走（浮动的窗口被规则按回平铺）"
+		else
+			fail "重载之后 float = false 没生效"
+		fi
+	kill_win
+else
+	fail "float 重载用例：窗口没起来"
+fi
+
+# ------------------------------------------------------------ 6) 收尾
+mark "6) 收尾"
 grep -aq "Assertion" "$LOG" || grep -aq "abort" "$LOG" &&
 	fail "日志里有 assert / abort" || pass "日志里没有 assert / abort"
 ./build/vidowmsg windows 2>/dev/null | grep -aq '"title": *"bluewin"' &&

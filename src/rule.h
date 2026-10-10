@@ -106,6 +106,19 @@ enum vidow_rule_act {
 	VRA_X11_SCALE,         /* X11 缩放桥（1 = 不除） */
 	VRA_CAPTURE,           /* off / hide / mosaic */
 	VRA_CAPTURE_MOSAIC,    /* 马赛克块边长 */
+	/* 开窗时兑现一次的（见 vidow_rule_placement）：重载不搬窗口、不改尺寸。 */
+	VRA_FLOAT,             /* true = 强制浮动，false = 强制平铺 */
+	VRA_WORKSPACE,         /* 开在哪块工作区（具名 / 特殊工作区 / 序号） */
+	VRA_OUTPUT,            /* 开在哪块屏（那块的当前工作区） */
+	VRA_WIDTH,             /* 浮动窗口的宽（逻辑像素，0 = 客户端自己定） */
+	VRA_HEIGHT,
+	VRA_CENTER,            /* 浮动窗口居中 */
+	VRA_FULLSCREEN,        /* 开就全屏 */
+	VRA_MAXIMIZE,          /* 开就整列最大化 */
+	VRA_MINIMIZE,          /* 开就收起来（不显示、不抢焦点） */
+	VRA_COLUMN_WIDTH,      /* 新列的宽度占比（0.1 ~ 1.0） */
+	/* 一直在的 */
+	VRA_ANIM,              /* false = 这个窗口不做开合动画 */
 	VRA_COUNT
 };
 
@@ -124,6 +137,14 @@ struct vidow_rule_match {
 	regex_t re;
 	bool has_re;
 	bool negate; /* 写的时候前面带了 ! */
+};
+
+/* 一个目标（窗口 / layer）身上最终生效的作用：命中多条规则时后面的覆盖前面的
+ * （逐字段）。view->rule_eff / ls->rule_eff 存的就是这一份 —— 渲染和布局那边
+ * 直接看它，不用每条规则各判一遍。 */
+struct vidow_rule_eff {
+	bool set[VRA_COUNT];
+	union vidow_rule_value val[VRA_COUNT];
 };
 
 struct vidow_rule {
@@ -213,8 +234,13 @@ bool vidow_rule_commit(struct vidow_server *server, struct vidow_rule *rule,
 /* 清空（SIGHUP 重载 = 重新声明一遍）。 */
 void vidow_rule_clear(struct vidow_server *server);
 
-/* 把规则套到这个窗口上（建窗口时、标题/class 变了、规则重载时都调）。 */
+/* 把规则套到这个窗口上（建窗口时、标题/class 变了、规则重载时都调）。只做
+ * 「一直在」的那些：补帧 / 焦点 / 缩放桥 / 抓帧 / 浮动 / 动画。 */
 void vidow_rule_apply(struct vidow_server *server, struct vidow_view *view);
+
+/* 开窗时**兑现一次**的那些（工作区 / 屏 / 尺寸 / 居中 / 全屏 / 最大化 / 最小化）：
+ * 只在 view_map 里调一次 —— 重载规则不搬已经开着的窗口，也不改它们的尺寸。 */
+void vidow_rule_placement(struct vidow_server *server, struct vidow_view *view);
 
 /* 把规则套到这个 layer surface 上（它 map 的时候、规则重载时都调）。 */
 void vidow_rule_apply_layer(struct vidow_server *server,

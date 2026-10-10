@@ -457,6 +457,8 @@ vidow.rule{ title = "^预览", force_render = true, hz = 15 }    -- 这个窗口
 vidow.rule{ class = "Steam", force_render = false }            -- 后面的覆盖前面的
 vidow.rule{ app_id = "vlc", hz = 0 }                           -- 只调节流：不限速
 vidow.rule{ exe = "^wechat$", x11_scale = 1 }                  -- 没有 app_id 的按进程认
+vidow.rule{ app_id = "^mpv$", workspace = "media", fullscreen = true }
+vidow.rule{ title = "^登录", float = true, width = 480, height = 320, center = true }
 
 -- 一条规则至少写一个作用，都不写会在配置那一行报错；字段名写错了也报错，
 -- 而且把能写的字段名全列出来。
@@ -473,10 +475,12 @@ end
 | 项 | 说明 |
 | --- | --- |
 | 匹配方式 | 字符串字段都是 **POSIX 扩展正则**（`regcomp(REG_EXTENDED \| REG_ICASE)`），**不锚定** = 找到就算命中 —— 所以普通字符串写进去就是原来的「子串、大小写不敏感」。含元字符（`. * + ? [ ] ( ) { } \| ^ $ \`）的串要转义：`title = "v1\\.0"`；整条规则写 `literal = true` 退回纯子串匹配。字段前面加 `!` = 取反（`title = "!^预览"` = 不是预览窗口），要匹配字面的 `!` 就写 `\\!` |
-| 匹配字段（窗口） | `app_id`（Wayland 的 app_id / X11 的 WM_CLASS class 段）、`title`、`class`、`instance`、`role`、`initial_app_id`、`initial_title`、`initial_class`、`initial_instance`（上屏那一刻的名字 —— 浏览器、终端会改标题，认「刚开的那一屏」用它）、`xwayland`、`popup`、`floating`、`fullscreen`、`maximized`、`minimized`、`fixed_size`（客户端声明了固定尺寸，微信登录窗那种）、`on_output`、`on_workspace` |
+| 匹配字段（窗口） | `app_id`（Wayland 的 app_id / X11 的 WM_CLASS class 段）、`title`、`class`、`instance`、`role`、`initial_app_id`、`initial_title`、`initial_class`、`initial_instance`（上屏那一刻的名字 —— 浏览器、终端会改标题，认「刚开的那一屏」用它）、`on_output`（现在在哪块屏）、`on_workspace`（现在在哪块工作区） |
 | 匹配字段（窗口和图层都认） | `pid`、`exe`、`cmdline` —— 从 `/proc/<pid>/…` 读，没有 `app_id` 可认的老程序、包一层启动脚本的，按进程认（`exe` 是 `/proc/<pid>/exe` 的最后一段，flatpak 那种是 `bwrap`，用 `cmdline` 更准） |
 | 匹配字段（图层） | `namespace`（waybar / mako / notifications …）、`layer`（`background` / `bottom` / `top` / `overlay`）—— 写了这两个里任何一个就是**图层规则**。窗口字段和图层字段写进同一条规则 = 这条谁也不匹配（不静默失效，日志和 `vidowmsg rules` 都看得见） |
-| 布尔字段 | 写成 `true` / `false`（不写 = 不管它）。`floating` / `fullscreen` / `maximized` / `minimized` / `on_output` / `on_workspace` 是**判定那一刻**的状态，判定发生在建窗口、标题 / class 变化、重载规则这三处 |
+| 匹配字段（状态） | `is_` 开头的是「现在是不是这样」：`is_xwayland`、`is_popup`（菜单 / 提示这类弹出物）、`is_floating`、`is_fullscreen`、`is_maximized`（所在列整列最大化）、`is_minimized`、`is_fixed_size`（客户端声明了固定尺寸，微信登录窗那种）。写成 `true` / `false`（不写 = 不管它），比的是**判定那一刻**的状态 —— 判定发生在建窗口、标题 / class 变化、重载规则这三处 |
+| 作用（一直在） | `force_render`、`hz`、`focus_on_open`、`focus_on_activate`、`honor_invalid_serial`、`x11_scale`、`capture`、`capture_mosaic`、`anim`（`false` = 这个窗口不做开合动画） |
+| 作用（开窗时兑现一次） | `float`（`true` 强制浮动 / `false` 强制平铺）、`workspace`（具名工作区，没有就建 / `special:名字` / 序号）、`output`（开在哪块屏）、`width` / `height`（浮动窗口开多大）、`center`、`fullscreen`、`maximize`、`minimize`、`column_width`（这个窗口新开的列有多宽）。**重载规则不搬已经开着的窗口，也不改它们的尺寸** —— 「开出来什么样」和「现在什么样」是两回事 |
 | 覆盖顺序 | 按配置里的先后逐条套用，**后面的覆盖前面的**；一条规则只动它写了的字段，谁都没写的字段用默认值 |
 | 生效时机 | 建窗口时判一次；标题 / class 变了再判一次；`SIGHUP` 重载规则后把已经开着的窗口全部重判 |
 | 节流 | `force_render_hz = <每秒几帧>`（默认 60，`0` = 不限速）；规则里写 `hz = <n>` 可以逐窗口覆盖。补帧要主动排下一帧，不限速时会一直出帧（headless 后端上量到过 2500fps），所以默认按刷新率给 |
@@ -4399,6 +4403,39 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
        口子（screencopy / ext-image-copy-capture 同样对所有客户端开放，grim / OBS 靠它），
        而要收就得连它一起收 —— 那会把 grim / wf-recorder / OBS 全废掉。要边界得靠 sandbox
        那一层（别的进程拿不到 wayland socket），不是合成器。
+
+198. **规则的作用覆盖到 vidow 能改的地方**（用户要求「规则允许修改的项目覆盖 vidow 所有能改的地方」）
+
+      197 只做了匹配那一半。这一条把「一条规则能对它做什么」从 8 项扩到 20 项，并且
+      分成两类 —— 这个分法本身就是设计的一部分：
+
+      | 类别 | 什么时候套 | 有哪些 |
+      | --- | --- | --- |
+      | **一直在** | 建窗口 / 标题变了 / 重载规则，每次都套 | `force_render`、`hz`、`focus_on_open`、`focus_on_activate`、`honor_invalid_serial`、`x11_scale`、`capture`、`capture_mosaic`、`anim` |
+      | **开窗时一次** | 只在 `view_map` 里兑现一次 | `float`、`workspace`、`output`、`width`、`height`、`center`、`fullscreen`、`maximize`、`minimize`、`column_width` |
+
+      为什么分两类：`SIGHUP` / 自动重载会**重放**所有规则，如果「搬哪块工作区」「开多大」
+      也在重放里，那改一行别的配置就会把已经摆好的窗口全搬一遍。所以重载只更新「这个
+      窗口该是什么样」（行为 / 外观），不重演「它开出来是什么样」。
+
+      - 规则算出来的那一份作用存在窗口 / layer 自己身上（`view->rule_eff`，`rule.c` 的
+        `vidow_rule_apply` 填）：渲染和布局那边直接看它，不用每条规则各判一遍。
+        `vidow_float_update_mode()` 因此也认规则（`float` 写了就是规则说了算，尺寸提示
+        晚到的对话框不会把它推翻）。
+      - 布尔**匹配**字段全部改名成 `is_` 开头（`is_floating` / `is_fullscreen` /
+        `is_maximized` / `is_minimized` / `is_popup` / `is_xwayland` / `is_fixed_size`）。
+        起因是个真 bug：`fullscreen` 同时是匹配字段和作用字段，字段表里重名，查找只认
+        第一个 —— 于是 `vidow.rule{ fullscreen = true }` 被当成「匹配全屏窗口」，
+        报「至少要写一个作用」。**现在字段表重名会在启动时喊出来**（`vidow_rule_init`），
+        这类坑不该靠人记住。
+      - `workspace` 的取值：具名工作区（没有就建）、`special:名字`（特殊工作区）、序号
+        `"2"`。**没有**直接用 `vidow_workspace_move_view_to_name()`：那个只按特殊工作区
+        的名字找（IPC 的老规矩），具名工作区得自己 lookup / create。
+      - 判据：`test-rules.sh` 第 5 节 14 项 —— 强制浮动、尺寸、居中（窗口中心和屏幕中心
+        比）、全屏、整列最大化、收起来（`minimized` 且不抢焦点）、列宽、开在别的工作区、
+        开在指定的屏、`anim = false`（数日志里的 `anim open start`，对照组照样有）、
+        `float` 跟着重载走；另有 3 项新校验（`column_width` 越界、`width = 0`、
+        `workspace = ""`）。
 
 197. **规则的匹配换成正则、匹配字段从 3 个扩到 24 个**（用户要求「匹配允许正则匹配，匹配的项目增加，尽可能覆盖更多情况」）
 

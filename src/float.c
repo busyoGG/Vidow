@@ -151,6 +151,13 @@ void vidow_float_set_mode(struct vidow_view *view,
 }
 
 void vidow_float_update_mode(struct vidow_view *view) {
+	/* 窗口规则说了算（float = true / false）：自动识别让位。尺寸提示晚到
+	 * （dialogs 在第一次 configure 之后才发 min/max）的时候也不能把它推翻。 */
+	if (view->rule_eff.set[VRA_FLOAT]) {
+		vidow_float_set_mode(view, view->rule_eff.val[VRA_FLOAT].b ?
+			VIDOW_FLOAT_FIXED : VIDOW_FLOAT_NONE);
+		return;
+	}
 	vidow_float_set_mode(view, detect_mode(view));
 }
 

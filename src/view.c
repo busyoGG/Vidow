@@ -743,7 +743,10 @@ static void view_ensure_column(struct vidow_server *server,
 	col->id = ++server->next_column_id;
 	col->output = view->output;
 	col->home = view->home;
-	col->width_fraction = DEFAULT_COLUMN_WIDTH;
+	/* 列宽：窗口规则写了 column_width 就用它（这个窗口新开的列有多宽），
+	 * 没写用默认的一半。 */
+	col->width_fraction = view->rule_eff.set[VRA_COLUMN_WIDTH] ?
+		view->rule_eff.val[VRA_COLUMN_WIDTH].d : DEFAULT_COLUMN_WIDTH;
 	wl_list_init(&col->views);
 
 	/* 这条列落在哪块工作区：窗口自己记着的那块（新窗口在 map 时就定好了，
@@ -1748,8 +1751,11 @@ void vidow_view_open_anim(struct vidow_view *view) {
 	/* 弹出物（X11 菜单 / 提示 / 下拉框）和 Wayland 的 xdg_popup 一样：不装饰、
 	 * 不跑 shader、也不做入场动画。它是跟着操作「啪」地出现的一块小图，滑动
 	 * 或淡入都显得慢半拍；而且它常在自己的位置上重开，动画会看着像窗口在飘。
-	 * 这里只把场景节点摆到最终位置。 */
-	if (view->popup) {
+	 * 这里只把场景节点摆到最终位置。
+	 * 窗口规则 anim = false 是同一回事，只不过由用户点名（终端那类「开出来
+	 * 就该在」的窗口）。 */
+	if (view->popup ||
+			(view->rule_eff.set[VRA_ANIM] && !view->rule_eff.val[VRA_ANIM].b)) {
 		vidow_anim_cancel(view->anim_open);
 		view->anim_open = NULL;
 		view->anim_alpha = 1.0;
@@ -3315,6 +3321,10 @@ static void view_map(struct wl_listener *listener, void *data) {
 
 	view->mapped = true;
 	vidow_portal_view_mapped(view, true);
+	/* 窗口规则先判一遍：float / workspace / output 决定它落在哪儿、怎么摆，
+	 * 下面「归哪块工作区、平铺还是浮动」的判据都要看它（app_id / 标题这时
+	 * 都齐了）。开窗只兑现一次的那几条在工作区落定之后（vidow_rule_placement）。 */
+	vidow_rule_apply(server, view);
 	/* 落进现在显示着的那块工作区：新窗口跟着走，不偷偷开在藏起来的工作区里。
 	 * 列的窗口在 view_ensure_column 里落工作区；浮窗落在这里。 */
 	if (!view->popup) {
@@ -3348,10 +3358,9 @@ static void view_map(struct wl_listener *listener, void *data) {
 		surface != NULL ? surface->current.height : 0, geo.x, geo.y);
 
 	/* Re-run detection here: clients that pin a fixed size (dialogs) only
-	 * send their min/max hints after the first configure round-trip. */
+	 * send their min/max hints after the first configure round-trip.
+	 * 规则写了 float 就以规则为准（vidow_float_update_mode 认 view->rule_eff）。 */
 	vidow_float_update_mode(view);
-	/* 窗口规则（app_id / 标题 / class 这时都齐了） */
-	vidow_rule_apply(server, view);
 
 	if (view->float_mode == VIDOW_FLOAT_NONE) {
 		view_ensure_column(server, view);
@@ -3364,6 +3373,9 @@ static void view_map(struct wl_listener *listener, void *data) {
 	} else if (!view->popup) {
 		vidow_workspace_track(view->ws, view, true);
 	}
+	/* 规则的「开出来就这样」：工作区 / 屏 / 尺寸 / 居中 / 全屏 / 最大化 / 最小化。
+	 * 放在这里是因为工作区和列都已经落定（最小化收起来的窗口下面就不抢焦点了）。 */
+	vidow_rule_placement(server, view);
 	/* 弹出物不抢焦点：它不装饰，焦点边框长在父窗口上，父窗口的边框不该因为
 	 * 弹出一个菜单就灭掉；关掉菜单后焦点也不该被重新算到别的窗口上去。
 	 * 键盘照给它（X11 的菜单要收方向键、Esc），见 view_popup_grab_keyboard。 */
