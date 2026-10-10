@@ -492,6 +492,26 @@ bool vidow_action_run(struct vidow_server *server, const char *action) {
 		log_action(action, "焦点 / 窗口挪一格");
 		return true;
 	}
+	/* 从列里取出来（niri 的 expel-window-from-column）：默认单独成一条列摆在
+	 * 原来那条列右边，参数写 left 就摆左边。列里只剩它一个 = 没什么可取的。 */
+	if (strcmp(name, "expel-window-from-column") == 0 ||
+			strcmp(name, "expel-window") == 0) {
+		int dir = 1;
+		if (arg != NULL && arg[0] != '\0' &&
+				!parse_direction(arg, &dir)) {
+			wlr_log(WLR_ERROR, "%s 的方向参数是 left / right"
+				"（不写 = right）", name);
+			return false;
+		}
+		if (server->focused == NULL ||
+				!vidow_view_expel_from_column(server->focused, dir)) {
+			wlr_log(WLR_INFO, "取不出来：焦点窗口是浮窗、或者它那条列里"
+				"就它一个（那它本来就是单独一条列）");
+			return false;
+		}
+		log_action(action, "把窗口从列里取出来");
+		return true;
+	}
 	if (strcmp(name, "close-window") == 0) {
 		if (server->focused == NULL) {
 			return false;

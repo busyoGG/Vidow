@@ -274,6 +274,13 @@ struct vidow_config;
 void vidow_rule_look(const struct vidow_config *cfg,
 		const struct vidow_rule_eff *eff, struct vidow_look *out);
 
+/* 一个**窗口**现在该长什么样：vidow_rule_look 的结果上再按全屏收一道 ——
+ * 全屏窗口不画服务端装饰（边框 / 圆角 / 阴影 / 噪点都没有），直接铺满整块屏。
+ * 渲染（fx.c）、IPC（vidowmsg windows 的 look）都用这一份。 */
+void vidow_view_look(const struct vidow_config *cfg,
+		const struct vidow_rule_eff *eff, bool fullscreen,
+		struct vidow_look *out);
+
 /* 这个目标（layer = true 时按 layer 的全局时长）现在该用多长的开合动画。
  * eff 可以是 NULL（没有规则的目标）。 */
 void vidow_rule_anim(const struct vidow_config *cfg,

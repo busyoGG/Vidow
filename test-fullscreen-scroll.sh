@@ -132,6 +132,32 @@ else:
 ' "$1" "$2"
 }
 
+geom_box() { # <标题> -> "x y w h"（**永远**取 geometry：浮动的全屏也只进 geom）
+	./build/vidowmsg windows 2>/dev/null | python3 -c '
+import json, sys
+for w in json.load(sys.stdin):
+    if w["title"] == sys.argv[1]:
+        g = w["geometry"]
+        print(g["x"], g["y"], g["width"], g["height"])
+        break
+else:
+    print("0 0 0 0")
+' "$1"
+}
+
+look_field() { # <标题> <look 里的字段>（全屏之后装饰参数该被归零）
+	./build/vidowmsg windows 2>/dev/null | python3 -c '
+import json, sys
+for w in json.load(sys.stdin):
+    if w["title"] == sys.argv[1]:
+        v = w.get("look", {}).get(sys.argv[2])
+        print("%g" % v if isinstance(v, float) else v)
+        break
+else:
+    print("?")
+' "$1" "$2"
+}
+
 expect_box() { # <标题> <期望盒子> <说明>
 	local got
 	got=$(box "$1")
@@ -313,7 +339,69 @@ expect_box D "10 10 498 700" "D 回到它自己那条列（10）"
 msg focus-column 1
 sleep 0.8
 expect_box E "0 0 1280 720" "焦点右移回来：E 又严丝合缝盖住整屏"
-kill "${CLIENT_PIDS##* }" 2>/dev/null   # 收掉 preinit（它按 --linger 还活着）
+# E（preinit）先留着：下一节拿它验「浮动的全屏也占满整块屏」，那一节末尾才收掉它。
+
+# ------------------------------------------------------------ 8) 全屏没有服务端装饰
+mark "全屏窗口不画服务端装饰（SSD）：边框 / 圆角 / 阴影 / 噪点全不要"
+# A 是 pattern.py 客户端（左上象限红），拿它当靶子：非全屏时有装饰，全屏之后没有
+msg focus-window --title A
+sleep 0.6
+[ "$(field A fullscreen)" = "False" ] && pass "A 现在不是全屏（对照组）" ||
+	fail "A 还是全屏（fullscreen=$(field A fullscreen)）"
+check_look() { # <标题> <字段> <期望> <说明>
+	local got
+	got=$(look_field "$1" "$2")
+	if [ "$got" = "$3" ]; then
+		pass "$4（look.$2 = $got）"
+	else
+		fail "$4（look.$2 = $got，期望 $3）"
+	fi
+}
+check_look A border_width 2 "非全屏的 A 带着服务端边框"
+check_look A corner_radius 12 "非全屏的 A 带着圆角"
+check_look A shadow_radius 8 "非全屏的 A 带着阴影"
+
+msg toggle-fullscreen --title A
+sleep 0.8
+[ "$(field A fullscreen)" = "True" ] && pass "A 进全屏了" ||
+	fail "A 没进全屏（fullscreen=$(field A fullscreen)）"
+check_look A border_width 0 "全屏：边框不要了"
+check_look A corner_radius 0 "全屏：圆角不要了"
+check_look A shadow_radius 0 "全屏：阴影不要了"
+check_look A noise 0 "全屏：噪点不要了"
+expect_box A "0 0 1280 720" "全屏的 A 盖住整块屏（整块输出，不吃 gap）"
+
+# 像素反证：全屏 A 的左上角那一点是**它自己的内容**（pattern.py 左上象限是红的）。
+# 有圆角的话（12px）这一点落在圆角外面，露出来的是它背后的东西（这里没壁纸 = 黑）。
+expect_color ssd-corner 2 2 红 "全屏的 A 左上角就是它自己的内容（没有圆角 / 边框）"
+msg toggle-fullscreen --title A
+sleep 0.8
+
+# 浮动窗口全屏也要占满整块屏：走的是另一条摆位分支（浮动的那条，以前用的是工作区）。
+# 这里新开一个客户端（F）：上一节的 preinit 按 --linger 自己会退出，拿它当靶子不稳。
+start_client F
+msg toggle-floating --title F
+sleep 0.6
+[ "$(field F floating)" = "True" ] && pass "F 是浮窗" ||
+	fail "F 没浮动（floating=$(field F floating)）"
+msg toggle-fullscreen --title F
+sleep 0.8
+GOT=$(geom_box F)
+if [ "$GOT" = "0 0 1280 720" ]; then
+	pass "浮动的全屏窗口也盖住整块屏（geometry = $GOT）"
+else
+	fail "浮动的全屏窗口没占满整块屏（geometry = $GOT，期望 0 0 1280 720）"
+fi
+# 退出全屏要回到它自己的浮动尺寸（几何只进 geom，float_geometry 一直没动）
+msg toggle-fullscreen --title F
+sleep 0.8
+GOT=$(geom_box F)
+if [ "$GOT" != "0 0 1280 720" ]; then
+	pass "退出全屏回到原来的浮动尺寸（geometry = $GOT）"
+else
+	fail "退出全屏之后还占着整块屏（geometry = $GOT）"
+fi
+kill "${CLIENT_PIDS##* }" 2>/dev/null   # 收掉最后起的那个客户端（F）
 
 echo
 if [ "$FAILED" = 0 ]; then

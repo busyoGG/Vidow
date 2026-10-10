@@ -362,6 +362,47 @@ if [ -n "${NODE:-}" ]; then
 	else
 		fail "静止画面上只拿到 $NS 帧"
 	fi
+
+	# 抓帧节奏：以前**每个输出提交都抓一整帧**（整块离屏渲染 + 消费者有空缓冲时
+	# 还要回读一整块），144Hz 的屏上主线程被占满 —— 屏幕上所有动画 / 拖动跟着掉到
+	# 60fps（用户报的「portal 录制导致显示器帧率被限制到 60」）。现在抓帧只在
+	# 「消费者要一帧、而且到点了」的时候发生（见 screencast.c 的 stream_send_due）。
+	#
+	# 判据：抓帧次数跟**发出去的帧数**一个量级，而不是跟输出提交次数一个量级。
+	$VM --socket "$IPC" state > "$R/state-sc.json" 2>/dev/null
+	python3 - "$R/state-sc.json" <<'PYEOF'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1], encoding='utf-8'))
+except Exception as e:
+    print("  FAIL  读不到 state：%s" % e); raise SystemExit(1)
+streams = [s for s in d.get("screencast", []) if s.get("frames", 0) > 0]
+if not streams:
+    print("  FAIL  state.screencast 里没有发过帧的流"); raise SystemExit(1)
+bad = 0
+for s in streams:
+    print("      （%s：发帧 %d、抓帧 %d、输出提交 %d、消费者 %.0ffps、上限 %.1fms）" %
+          (s.get("kind"), s["frames"], s["grabs"], s["commits"],
+           s.get("consumer_fps", 0), s.get("cap_ms", 0)))
+    if s["grabs"] > s["frames"] + 2:
+        bad += 1
+if bad == 0:
+    print("  PASS  抓帧次数跟着发帧次数走（不是每次输出提交都抓一整帧）")
+else:
+    print("  FAIL  %d 路流的抓帧次数远超发帧次数 —— 又在每次提交都抓整帧了" % bad)
+big = [s for s in streams if s["commits"] > s["frames"] + 5]
+if big:
+    print("  PASS  输出提交次数远多于发帧次数（%d 路：提交 >> 发帧）" % len(big))
+else:
+    print("  FAIL  没有一路流能证明「提交比发帧多」—— 场景没造出来")
+capped = [s for s in streams if s.get("cap_ms", 0) > 0]
+if capped:
+    print("  PASS  发帧节奏有上限（%.1fms）" % capped[0]["cap_ms"])
+else:
+    print("  FAIL  发帧没有节奏上限（cap_ms = 0）")
+sys.exit(1 if (bad or not big or not capped) else 0)
+PYEOF
+[ $? -eq 0 ] || FAILED=1
 else
 	fail "没有 node，消费那几条测不了"
 fi

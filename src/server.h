@@ -661,6 +661,9 @@ struct vidow_closing {
 	/* 关的时候长什么样（窗口规则的装饰参数）—— 快照要按同一份参数画，
 	 * 不然关窗动画一出来装饰就变回全局配置的样子了。 */
 	struct vidow_rule_eff rule_eff;
+	/* 关的时候是不是全屏：全屏窗口不画服务端装饰（见 rule.c 的 vidow_view_look），
+	 * 快照也得按同一份参数画。 */
+	bool fullscreen;
 };
 
 /* ------------------------------------------------------------------ output */
@@ -2002,11 +2005,13 @@ bool vidow_fx_begin(struct vidow_server *server, struct vidow_fx_target *fx,
 bool vidow_fx_draw_mesh(struct vidow_server *server, struct wlr_buffer *dst,
 	int w, int h, struct wlr_texture *src, const float *verts, int n_verts);
 
-/* eff = 这个目标的规则作用（rule.c 的 vidow_rule_eff，NULL = 没规则）。 */
+/* eff = 这个目标的规则作用（rule.c 的 vidow_rule_eff，NULL = 没规则）。
+ * fullscreen = 这是不是一块全屏窗口：全屏不画服务端装饰（边框 / 圆角 / 阴影 /
+ * 噪点全归零，见 rule.c 的 vidow_view_look）。layer 表面一律传 false。 */
 bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 		struct wlr_scene_buffer *src, const struct vidow_fx_geo *geo,
 		int x, int y, int ox, int oy,
-		double alpha, bool focused, double scale, double ov,
+		double alpha, bool focused, bool fullscreen, double scale, double ov,
 		const struct vidow_rule_eff *eff);
 void vidow_fx_end(struct vidow_server *server, struct vidow_fx_target *fx);
 void vidow_fx_release(struct vidow_fx_target *fx);
@@ -2256,6 +2261,21 @@ struct vidow_screencast_stream {
 	struct vidow_sc_pw_stream *pw;
 };
 
+/* 一路录屏流的「发帧节奏」诊断数（screencast.c 里那份 PipeWire 侧私有状态对
+ * 外露出的几个数；IPC 的 state.screencast 用它）。 */
+struct vidow_sc_stream_stats {
+	bool has_pw;               /* PipeWire 流建起来了吗 */
+	double consumer_fps;       /* 消费者协商要的帧率，0 = 没指定（不限） */
+	double cap_ms;             /* 发帧节奏上限（毫秒），0 = 不设上限 */
+	unsigned long long frames; /* 真的发出去多少帧 */
+	unsigned long long grabs;  /* 整帧抓了多少次（整块离屏渲染 + 回读） */
+	unsigned long long commits;/* 看见多少次输出提交 */
+	unsigned long long throttled; /* 消费者来要帧但被节奏上限挡下的次数 */
+	long long last_send_ms;    /* 上一帧是什么时候发的（单调时钟毫秒），-1 = 还没发过 */
+};
+bool vidow_screencast_stream_stats(const struct vidow_screencast_stream *stream,
+		struct vidow_sc_stream_stats *out);
+
 /* 建 zkde_screencast_unstable_v1。返回 NULL = 没建成（不致命：录屏用不了，
  * 别的照常）。 */
 struct vidow_screencast *vidow_screencast_create(struct wl_display *display,
@@ -2453,7 +2473,7 @@ void vidow_closing_start(struct vidow_server *server,
 		const struct vidow_fx_geo *geo, int x, int y, int w, int h,
 		int duration_ms, int slide_px, bool decorate, const char *shader_name,
 		double scale, enum vidow_easing easing, double anim_scale_to,
-		const struct vidow_rule_eff *eff);
+		const struct vidow_rule_eff *eff, bool fullscreen);
 
 /* ------------------------------------------------------------------ layout */
 
@@ -2679,6 +2699,10 @@ bool vidow_view_insert_into_column(struct vidow_view *view,
 /* 从自己那条列里摘出来（列里没别人了就把它拆掉）。摘出来的窗口会短暂「没有列」，
  * 调用方得紧接着把它放进哪条列里（见 vidow_view_insert_into_column）。 */
 void vidow_view_leave_column(struct vidow_view *view);
+/* 把窗口从它那条列里拎出来、单独成一条新列（niri 的 expel-window-from-column）：
+ * direction > 0 = 新列插在原来那条列右边，< 0 = 左边。列里只剩它一个（或者它是
+ * 浮窗 / 弹出物）返回 false。 */
+bool vidow_view_expel_from_column(struct vidow_view *view, int direction);
 void vidow_cycle_column_width(struct vidow_server *server);
 /* niri 式列最大化：整列撑满工作区宽度，maximized_saved 记着原来的比例，关掉就还原。
  * 列里每个客户端都会收到 set_maximized 的应答（它们自己也知道自己最大化了）。

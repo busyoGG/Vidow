@@ -120,6 +120,18 @@ struct vidow_sc_pw_stream {
 	 * 光靠日志分不清是**我们发的就是黑的**还是消费者那边没画）。 */
 	uint64_t frames;
 	bool first_checked;
+	/* 上一次**真的发出去**一帧的时刻（CLOCK_MONOTONIC 纳秒，0 = 还没发过）：
+	 * 发帧节奏的上限（见 stream_send_due）按它算。 */
+	int64_t last_send_ns;
+	/* 诊断用的计数（`vidowmsg state` 的 screencast 那一块）：抓了几次整帧、
+	 * 看见多少次输出提交。用户报「录制期间显示器帧率被压到 60」时，这两个数
+	 * 和 frames 摆在一起就能看出「是不是每次提交都抓了一整帧」。 */
+	uint64_t grabs;
+	uint64_t commits;
+	/* 消费者来要帧、但被节奏上限挡下的次数（见 stream_send_due）：这个数大
+	 * 说明消费者要得比屏幕刷新率还急，我们按上限压着 —— 不是丢帧，是「屏幕
+	 * 上本来就没有新画面」。 */
+	uint64_t throttled;
 };
 
 /* 光标在这一路里的状态（见 vidow_sc_pw_stream 的 cursor_state）。 */
@@ -379,6 +391,61 @@ static void pw_stream_param_changed(void *data, uint32_t id,
 	stream_announce_cursor_meta(ps);
 }
 
+/* 这一路发一帧的节奏上限 = min(消费者要的帧率, 这块屏的刷新率)。
+ *
+ * 为什么要有这个上限：抓一帧是**整块离屏渲染 + 一次整块回读**，而且是在合成器的
+ * 主线程上做的（PipeWire 的 loop 挂在 Wayland 的 event loop 上，见 pw_loop_ready）。
+ * 以前只要输出提交就抓一帧 —— 144Hz 的屏上就是每秒 144 趟整屏渲染，消费者手上
+ * 还有空缓冲时每次提交都再回读一整块（4K 上 33MB），主线程被占满：屏幕上所有
+ * 动画 / 拖动跟着掉到 60fps（用户报的「portal 录制导致显示器帧率被限制到 60」）。
+ *
+ * 消费者要的帧率来自格式协商的 SPA_FORMAT_VIDEO_framerate（录制软件自己填的那个）；
+ * 0/1（或者还没协商）算「不限」，那就只按屏幕刷新率封顶 —— 也就是「上限允许到
+ * 显示器帧率上限」。屏幕刷新率用输出的**标称** refresh（不是量到的帧间隔：量到的
+ * 那个会被「录制把帧率拖下去」反过来影响，帧间隔变大 → 上限放宽 → 抓得更多，
+ * 是个正反馈）。输出没报刷新率的（headless / 虚拟输出）才退回量到的帧间隔；
+ * 两个都拿不到就不设上限（0 = 不限）。
+ *
+ * 上限只影响**发帧**：屏幕上的渲染一帧不少，掉帧的只是录制这一路。 */
+static int64_t stream_send_interval_ns(struct vidow_sc_pw_stream *ps) {
+	int64_t iv = 0;
+	struct wlr_output *out = ps->stream->output;
+	struct vidow_output *output = out != NULL ?
+		vidow_output_lookup(ps->stream->sc->server, out) : NULL;
+	if (out != NULL && out->refresh > 0) {
+		/* 标称刷新率就是「显示器帧率上限」—— 用它而不是量到的帧间隔：
+		 * 量到的那个会被「录制把帧率拖下去了」这件事反过来影响（帧间隔变大 →
+		 * 上限放宽 → 更多抓帧 → 更慢），是个正反馈。 */
+		iv = 1000000000LL / out->refresh;
+	} else if (output != NULL && output->frame_gap_ns > 0) {
+		/* 没报刷新率的（headless / 虚拟输出）：用后端量到的帧间隔兜底。 */
+		iv = output->frame_gap_ns;
+	}
+	if (ps->have_format && ps->video.framerate.denom > 0 &&
+			ps->video.framerate.num > 0) {
+		int64_t consumer = 1000000000LL * ps->video.framerate.denom /
+			ps->video.framerate.num;
+		if (consumer > 0 && (iv == 0 || consumer > iv)) {
+			iv = consumer; /* 消费者要得比屏幕慢：听消费者的 */
+		}
+	}
+	if (iv > 0 && iv < 4 * 1000000LL) {
+		iv = 4 * 1000000LL; /* 下限 4ms（250Hz）：0 / 怪值别把我们坑了 */
+	}
+	return iv;
+}
+
+static bool stream_send_due(struct vidow_sc_pw_stream *ps) {
+	if (ps->last_send_ns == 0) {
+		return true; /* 一帧都还没发过：第一帧立刻给 */
+	}
+	int64_t iv = stream_send_interval_ns(ps);
+	if (iv <= 0) {
+		return true;
+	}
+	return vidow_now_ns() - ps->last_send_ns >= iv;
+}
+
 /* 图转起来了 → 把手上那一帧填进去。手上没有（流刚建好、或者消费者刚连上来）
  * 就当场抓一帧：屏幕静止时没有任何输出提交，不这么做消费者一个缓冲都拿不到 ——
  * 表现是「连上了但一直是黑的」。 */
@@ -388,8 +455,14 @@ static void pw_stream_process(void *data) {
 	if (buffer == NULL) {
 		return;
 	}
+	/* 到点才抓：上限见 stream_send_due。没到点就只把缓冲还回去（不填）——
+	 * 消费者那一格拿到的是空缓冲，但它本来就不该在这时候要帧（是我们催早了）。 */
 	if (ps->pending == NULL) {
-		ps->pending = stream_grab(ps);
+		if (stream_send_due(ps)) {
+			ps->pending = stream_grab(ps);
+		} else {
+			ps->throttled++;
+		}
 	}
 	if (ps->pending != NULL) {
 		pw_stream_fill(ps, buffer);
@@ -459,6 +532,7 @@ static void pw_stream_fill(struct vidow_sc_pw_stream *ps,
 	buf->datas[0].chunk->stride = (int32_t)stride;
 
 	ps->frames++;
+	ps->last_send_ns = vidow_now_ns();
 	if (!ps->first_checked) {
 		/* 第一帧报一句：黑屏那类报告（「第一次录是黑的」）看这一行就知道是我们
 		 * 发的图就是黑的，还是消费者没画。每 64 个像素采一个，代价可以忽略。 */
@@ -675,6 +749,7 @@ static struct wlr_buffer *stream_grab(struct vidow_sc_pw_stream *ps) {
 	if (stream->output == NULL) {
 		return NULL;
 	}
+	ps->grabs++;
 	struct wlr_buffer *frame = NULL;
 	struct wlr_box cursor_box = {0};
 	double cursor_scale = 0;
@@ -748,16 +823,19 @@ static void stream_handle_output_commit(struct wl_listener *listener, void *data
 	if (!(event->state->committed & WLR_OUTPUT_STATE_BUFFER)) {
 		return;
 	}
+	ps->commits++;
 	if (ps->pending != NULL) {
-		/* 上一帧还没被取走：丢掉它，用新的（录屏要的是最新画面）。 */
+		/* 上一帧还没被取走：丢掉它（录屏要的是最新画面），下一次真的要发时
+		 * 现抓一张新的。 */
 		wlr_buffer_unlock(ps->pending);
 		ps->pending = NULL;
 	}
-	ps->pending = stream_grab(ps);
-	if (ps->pending == NULL) {
-		return;
+	/* **不在这里抓帧**：抓一次是整块离屏渲染 + 回读，而消费者手上没空缓冲时
+	 * 抓了也发不出去（以前每个提交都抓一遍，144Hz 的屏上就把主线程占满了）。
+	 * 真正的抓帧在 pw_stream_process 里 —— 消费者要一帧、而且到点了才抓。 */
+	if (stream_send_due(ps)) {
+		pw_stream_trigger_process(ps->pw_stream);
 	}
-	pw_stream_trigger_process(ps->pw_stream);
 }
 
 /* 指针动了 → 光标不在画面里的那几路流推一帧。
@@ -772,10 +850,9 @@ static void stream_handle_output_commit(struct wl_listener *listener, void *data
  * embedded 模式同理（光标是画进画面的，指针一动画面就变了），hidden 模式不用
  * （画面里根本没有光标）。
  *
- * 节流到 ~60Hz：指针事件可以几百 Hz，每个都抓一整帧没必要（消费者取缓冲也就这个
- * 速率）。 */
-#define VIDOW_SC_CURSOR_PUSH_NS (16 * 1000 * 1000)
-
+ * 节奏跟发帧那条上限走（stream_send_due = min(消费者帧率, 屏幕刷新率)）：指针事件
+ * 可以几百 Hz，每个都抓一整帧没必要 —— 消费者取缓冲也就这个速率。以前这里写死
+ * 16ms（60Hz），144Hz 的屏上「指针跟手」就只到 60fps。 */
 void vidow_screencast_cursor_moved(struct vidow_server *server) {
 	if (server == NULL || server->screencast == NULL) {
 		return;
@@ -792,17 +869,14 @@ void vidow_screencast_cursor_moved(struct vidow_server *server) {
 	if (!any) {
 		return; /* 没人在录光标：一次都不往下走 */
 	}
-	struct timespec now;
-	clock_gettime(CLOCK_MONOTONIC, &now);
-	int64_t ns = (int64_t)now.tv_sec * 1000000000 + now.tv_nsec;
+	int64_t ns = vidow_now_ns();
 	wl_list_for_each(stream, &server->screencast->streams, link) {
 		if (stream->pw == NULL || stream->pw->pw_stream == NULL ||
 				stream->pointer_mode == ZKDE_SCREENCAST_UNSTABLE_V1_POINTER_HIDDEN) {
 			continue;
 		}
-		if (stream->cursor_push_ns != 0 &&
-				ns - stream->cursor_push_ns < VIDOW_SC_CURSOR_PUSH_NS) {
-			continue;
+		if (!stream_send_due(stream->pw)) {
+			continue; /* 还没到这一路该有的节奏 */
 		}
 		stream->cursor_push_ns = ns;
 		if (stream->cursor_pushes == 0) {
@@ -812,8 +886,43 @@ void vidow_screencast_cursor_moved(struct vidow_server *server) {
 				"（pointer_mode=%u）", stream->pointer_mode);
 		}
 		stream->cursor_pushes++;
+		/* 手上那张是上一次指针位置抓的：丢掉，真要发的时候现抓（光标的位置 /
+		 * 位图属于「这一帧长什么样」）。 */
+		if (stream->pw->pending != NULL) {
+			wlr_buffer_unlock(stream->pw->pending);
+			stream->pw->pending = NULL;
+		}
 		pw_stream_trigger_process(stream->pw->pw_stream);
 	}
+}
+
+/* 一路流的发帧节奏诊断（见 server.h 的 struct vidow_sc_stream_stats）。 */
+bool vidow_screencast_stream_stats(const struct vidow_screencast_stream *stream,
+		struct vidow_sc_stream_stats *out) {
+	if (stream == NULL || out == NULL) {
+		return false;
+	}
+	*out = (struct vidow_sc_stream_stats){ .last_send_ms = -1 };
+	struct vidow_sc_pw_stream *ps = stream->pw;
+	if (ps == NULL) {
+		return true;
+	}
+	out->has_pw = ps->pw_stream != NULL;
+	if (ps->have_format && ps->video.framerate.denom > 0 &&
+			ps->video.framerate.num > 0) {
+		out->consumer_fps = (double)ps->video.framerate.num /
+			(double)ps->video.framerate.denom;
+	}
+	int64_t iv = stream_send_interval_ns(ps);
+	out->cap_ms = iv > 0 ? (double)iv / 1e6 : 0.0;
+	out->frames = ps->frames;
+	out->grabs = ps->grabs;
+	out->commits = ps->commits;
+	out->throttled = ps->throttled;
+	if (ps->last_send_ns > 0) {
+		out->last_send_ms = ps->last_send_ns / 1000000;
+	}
+	return true;
 }
 
 /* ------------------------------------------------------------ 流的生命周期 */

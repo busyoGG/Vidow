@@ -1626,7 +1626,8 @@ static bool backdrop_render(struct vidow_server *server,
  * backdrop is the wallpaper and the layer surfaces. */
 static bool view_wants_blur(struct vidow_view *view) {
 	struct vidow_look look;
-	vidow_rule_look(&view->server->config, &view->rule_eff, &look);
+	vidow_view_look(&view->server->config, &view->rule_eff, view->fullscreen,
+		&look);
 	/* blur 那条规则在这里生效：false = 这个窗口背后不模糊（视频、终端那种
 	 * 「糊了更难看」的），true = 平铺也模糊（等于给这一个窗口开 blur_all）。 */
 	if (!look.blur || !view->mapped || !view->fx.active) {
@@ -2373,7 +2374,8 @@ void vidow_blur_update(struct vidow_output *output) {
 		blur_mask_min_changed(&view->fx, server->config.blur_alpha_min);
 
 		struct vidow_look look;
-		vidow_rule_look(&server->config, &view->rule_eff, &look);
+		vidow_view_look(&server->config, &view->rule_eff,
+			view->fullscreen, &look);
 		if (look.blur_xray || !view_overlaps_other(view)) {
 			/* Tiled and non-overlapping floating windows all share the
 			 * wallpaper backdrop: one capture and one chain for all of them.
@@ -2699,15 +2701,15 @@ bool vidow_fx_begin(struct vidow_server *server, struct vidow_fx_target *fx,
 bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 		struct wlr_scene_buffer *src, const struct vidow_fx_geo *geo,
 		int x, int y, int ox, int oy,
-		double alpha, bool focused, double scale, double ov,
+		double alpha, bool focused, bool fullscreen, double scale, double ov,
 		const struct vidow_rule_eff *eff) {
 	if (!fx->active || fx->node == NULL || src == NULL || src->buffer == NULL) {
 		return false;
 	}
 	/* 这个窗口 / layer 现在该长什么样：全局配置压上窗口规则（见 rule.c 的
-	 * vidow_rule_look）。eff = NULL 就是纯全局。 */
+	 * vidow_view_look / vidow_rule_look）。eff = NULL 就是纯全局。 */
 	struct vidow_look look;
-	vidow_rule_look(&server->config, eff, &look);
+	vidow_view_look(&server->config, eff, fullscreen, &look);
 	if (geo == NULL || geo->w <= 0 || geo->h <= 0) {
 		return false;
 	}
@@ -3390,7 +3392,8 @@ static void closing_update(void *data, double t, double linear) {
 	if (closing->fx.active) {
 		vidow_fx_frame(closing->server, &closing->fx, closing->node,
 			&closing->geo, closing->x, y, closing->x, y, closing->alpha,
-			false, closing->scale, 1.0, &closing->rule_eff);
+			false, closing->fullscreen, closing->scale, 1.0,
+			&closing->rule_eff);
 		return;
 	}
 	if (closing->node != NULL) {
@@ -3427,7 +3430,7 @@ void vidow_closing_start(struct vidow_server *server,
 		const struct vidow_fx_geo *geo, int x, int y, int w, int h,
 		int duration_ms, int slide_px, bool decorate, const char *shader_name,
 		double scale, enum vidow_easing easing, double anim_scale_to,
-		const struct vidow_rule_eff *eff) {
+		const struct vidow_rule_eff *eff, bool fullscreen) {
 	if (snapshot == NULL || duration_ms <= 0 || w <= 0 || h <= 0) {
 		return;
 	}
@@ -3450,6 +3453,7 @@ void vidow_closing_start(struct vidow_server *server,
 	if (eff != NULL) {
 		closing->rule_eff = *eff;
 	}
+	closing->fullscreen = fullscreen;
 	closing->geo = (struct vidow_fx_geo){0};
 	if (geo != NULL) {
 		closing->geo = *geo;

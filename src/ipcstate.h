@@ -49,6 +49,9 @@ void vidow_ipc_json_windows(struct jbuf *b, struct vidow_server *server);
 void vidow_ipc_json_workspaces(struct jbuf *b, struct vidow_server *server);
 void vidow_ipc_json_outputs(struct jbuf *b, struct vidow_server *server);
 void vidow_ipc_json_layers(struct jbuf *b, struct vidow_server *server);
+/* 录屏那几路流（zkde_screencast）：发帧节奏 / 抓帧次数 —— 「录制把显示器帧率
+ * 拖下去」这类报告靠它定案。 */
+void vidow_ipc_json_screencast(struct jbuf *b, struct vidow_server *server);
 void vidow_ipc_json_columns(struct jbuf *b, struct vidow_server *server);
 void vidow_ipc_json_focused(struct jbuf *b, struct vidow_server *server);
 /* 全量：上面所有的东西 + 计数 + 版本。 */

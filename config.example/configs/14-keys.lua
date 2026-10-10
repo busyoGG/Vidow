@@ -20,6 +20,11 @@ vidow.bind("Mod+J", "focus-window down")
 vidow.bind("Mod+K", "focus-window up")
 vidow.bind("Mod+Shift+J", "move-window down")
 vidow.bind("Mod+Shift+K", "move-window up")
+-- 把窗口从它那条列里拎出来、单独成一条列（niri 的 expel-window-from-column：
+-- 并进去是拖拽 / Mod+Shift+J,K 挤进旁边那条列，取出来只有这一条路）。加 Shift
+-- 是取到左边那条列位。列里就它一个的时候什么都不会发生（本来就是单独一条列）。
+vidow.bind("Mod+Period", "expel-window-from-column")
+vidow.bind("Mod+Shift+Period", "expel-window-from-column left")
 vidow.bind("Mod+V", "toggle-floating")
 vidow.bind("Mod+Shift+Space", "toggle-floating")
 vidow.bind("Mod+F", "toggle-fullscreen")

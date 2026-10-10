@@ -449,6 +449,26 @@ void vidow_rule_look(const struct vidow_config *cfg,
 	}
 }
 
+/* 窗口那一份：全屏窗口不画服务端装饰（SSD）—— 边框、圆角、阴影、噪点全归零，
+ * 它直接铺满整块屏（摆位见 view.c 的 output_arrange，全屏窗口取整块输出框，
+ * 不吃 gap、也不理状态栏的占位）。niri 同款：全屏窗口没有圆角。
+ *
+ * 注意「不画装饰」不等于「关掉 fx」：模糊、内容合成、离屏缓冲照旧走装饰着色器，
+ * 只是那几笔装饰参数是 0（见 decor_draw 的 u_radius / u_border_width /
+ * u_shadow_* / u_noise）。 */
+void vidow_view_look(const struct vidow_config *cfg,
+		const struct vidow_rule_eff *eff, bool fullscreen,
+		struct vidow_look *out) {
+	vidow_rule_look(cfg, eff, out);
+	if (!fullscreen) {
+		return;
+	}
+	out->corner_radius = 0.0;
+	out->border_width = 0.0;
+	out->shadow_radius = 0.0;
+	out->noise = 0.0;
+}
+
 /* 这个目标该用多长的开合动画：全局时长打底，规则的 open_ms / close_ms 压上去，
  * anim = false 就是把两个时长都归零（调用方照「时长 <= 0 = 不做动画」处理，和
  * 配置里写 0 是同一条路）。 */

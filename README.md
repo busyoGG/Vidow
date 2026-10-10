@@ -290,6 +290,7 @@ end
 | `none` | 空绑定，用来屏蔽某个键 |
 | `focus-column <方向>` / `move-column <方向>` | 焦点左/右移一列 / 当前列左/右移一位 |
 | `focus-window <方向>` / `move-window <方向>` | 列内焦点下/上移 / 列内窗口下/上移 |
+| `expel-window-from-column [left\|right]`（`expel-window` 同义） | 把焦点窗口从它那条列里拎出来、单独成一条新列（niri 的 expel-window-from-column；不写方向 = 右边）。列里只剩它一个 / 它是浮窗时什么都不做 |
 | `close-window` | 关掉焦点窗口 |
 | `toggle-floating` | 焦点窗口 平铺 ⇄ 浮动 |
 | `toggle-fullscreen`（`fullscreen` 同义） | 焦点窗口全屏开关 |
@@ -962,6 +963,7 @@ python3 test-float.py        # 三个真实 GTK 窗口，验证浮动模式自�
                                      #   set_minimized / set_fullscreen）不许把合成器打死（22 项断言）
 ./test-drag.sh                       # 拖窗口：拖得动 / 跨屏改归属 / 平铺按落点插入（12 项）
 ./test-drag-insert.sh                # 拖平铺窗口的落点：插进已有列 / 新开一条列（左右两边的缝都算）/ 落点预览块（23 项）
+./test-expel.sh                      # 把窗口从列里拎出来单独成列（niri 的 expel-window-from-column：动作 / IPC / 左右 / 取不出来的两种情形，26 项）
 ./test-drag-stall.sh                 # 后端不给帧事件时，拖动照样跟手（浮窗 + 平铺两个case，10 项断言）
 ./test-drag-follow.sh                # 拖动跟手 + 松手后把指针位置补给客户端（9 项断言）
 ./test-popup2out.sh                  # 不在布局原点上的窗口，弹出物要摆在自己那块屏上（13 项断言）
@@ -1683,7 +1685,7 @@ vidow 自己的，比如 `vidow-wayland-1.sock`）；`ipc_socket` 可以写死�
 | 类别 | 命令 |
 | --- | --- |
 | 窗口 | `focus-window`、`activate-window`（= 点通知：先把工作区端出来再给焦点）、`close-window`、`minimize-window`、`unminimize-window`（不带参数 = 最近收起来的那个）、`toggle-minimize`、`toggle-floating`、`set-floating`、`toggle-fullscreen`、`set-fullscreen`、`set-window-size`、`set-window-position`、`center-window`、`set-window-force-render`、`focus-window-direction`、`move-window-direction`、`move-window-to-workspace`、`move-window-to-special`、`move-window-to-output` |
-| 列 | `focus-column`、`move-column`、`cycle-column-width`、`set-column-width`（`fraction` 绝对值 / `delta` 相对）、`expand-column-to-available-width`、`center-column`、`toggle-maximize-column`、`set-maximize-column`（`maximized` true/false） |
+| 列 | `focus-column`、`move-column`、`cycle-column-width`、`set-column-width`（`fraction` 绝对值 / `delta` 相对）、`expand-column-to-available-width`、`center-column`、`toggle-maximize-column`、`set-maximize-column`（`maximized` true/false）、`expel-window-from-column`（把窗口从列里拎出来单独成列，`direction` 不写 = 右边） |
 | 工作区 | `focus-workspace`（名字 / `next` / `prev` / `index`）、`toggle-special`（= `focus-special`）、`create-workspace`、`move-workspace-to-output` |
 | 输出 | `output-power`（`on` / `off` / `toggle`）、`output-enable` / `output-disable` / `output-toggle`、`output-scale`（数字或 `auto`）、`output-transform`、`output-mode`（宽 高 [刷新率]）、`output-position`、`output-focus` |
 | 剪贴板 | `clipboard`（查状态）、`clipboard-get`（取数据：文本或 base64）、`clipboard-set`（放数据：文本 / base64 / 指定 mime / 指定选区）、`clipboard-clear` |
@@ -2777,7 +2779,20 @@ portal_capture = "wlr"   -- 借 xdg-desktop-portal-wlr：没有选择器，直�
 portal_capture = "none"  -- ScreenCast / Screenshot 两行都不写
 ```
 
-实测（`./test-portal-own.sh`，47 项）：私有 dbus + headless vidow → `vidow.portal` 落地、
+**发帧节奏 = min(消费者要的帧率, 屏幕刷新率)**（`src/screencast.c` 的 `stream_send_due`）：
+抓一帧是**整块离屏渲染 + 一次整块回读**，而且是在合成器的主线程上做的（PipeWire 的 loop
+挂在 Wayland 的 event loop 上）。以前只要输出提交就抓一帧 —— 144Hz 的屏上每秒 144 趟整屏
+渲染（消费者手上还有空缓冲时每次提交都再回读一整块），主线程被占满：屏幕上所有动画 / 拖动
+跟着掉到 60fps（用户报的「portal 录制导致显示器帧率被限制到 60」）。现在抓帧只在**消费者
+真的来要一帧、而且到点了**的时候发生：输出提交只把手上那一帧作废并催一次，消费者手上没空
+缓冲时一次都不抓。上限取输出的**标称刷新率**（不用量到的帧间隔：那个会被「录制把帧率拖下去」
+反过来影响 —— 帧间隔变大 → 上限放宽 → 抓得更多，是个正反馈），消费者自己协商了更低的帧率
+就听消费者的；输出没报刷新率的（headless / 虚拟输出）才退回量到的帧间隔。
+`vidowmsg state` 的 `screencast` 那一块把这件事摆出来：`frames`（发出去多少帧）/ `grabs`
+（抓了多少次整帧）/ `commits`（看见多少次输出提交）/ `throttled`（消费者来要但被上限挡下
+多少次）/ `cap_ms`（上限）—— 修好之后 `grabs ≈ frames`，而 `commits` 可以远大于它俩。
+
+实测（`./test-portal-own.sh`，53 项）：私有 dbus + headless vidow → `vidow.portal` 落地、
 `vidow-portal` 占住总线名 → 前端把 ScreenCast / Screenshot 指到它 → 选择器画在 vidow 上
 （标题「共享屏幕」，第一行默认选中）→ 回车确认 → `Start` 返回 `node` / `size`：
 整屏（1280x720）、**窗口**（`source_type=2`，尺寸报窗口的）、**虚拟输出**（合成器里真多出
@@ -3162,8 +3177,8 @@ scene buffer 合成，所以 shader 可以任意改写几何（缩放、挤压�
    当场并拢），vidow 松手才重排 —— 所以预览块是按「屏幕上现在看得见的这些位置」画的，
    那个空位在拖动期间还看得见（`test-drag-insert.sh` 里「卡片」那条断言量的就是这件事）。
 2. **「新开一条列」搬的是整条列**，不是单个窗口：vidow 的平铺拖拽一直动的是列（见上）。
-   所以「从一条两窗口的列里拎一个出来单独成列」这条 niri 有的路，vidow 里得用
-   `move-window-direction` 把窗口挤进旁边那条列来实现。
+   「从一条两窗口的列里拎一个出来单独成列」得用动作 `expel-window-from-column`
+   （`Mod+Period`；niri 同款），或者 `move-window-direction` 把它挤进旁边那条列。
 3. **预览块画在被拖窗口之上还是之下**：vidow 把被拖的那个画在预览块之上（niri 的移动窗口
    也在提示块之上），层级靠拖动时抬两次收口（`raise_node()`，已经对了就一个节点都不碰）。
 
@@ -4405,6 +4420,67 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
        口子（screencopy / ext-image-copy-capture 同样对所有客户端开放，grim / OBS 靠它），
        而要收就得连它一起收 —— 那会把 grim / wf-recorder / OBS 全废掉。要边界得靠 sandbox
        那一层（别的进程拿不到 wayland socket），不是合成器。
+
+203. **portal 录制不再把显示器帧率拖到 60**（用户报「portal 录制会导致显示器帧率被限制到
+      60，哪怕录制的是窗口，portal 录制帧率应该上限允许到显示器帧率上限」）
+
+      录制这一路以前是**每次输出提交都抓一整帧**：`stream_handle_output_commit()` 里直接
+      `stream_grab()`（整块离屏渲染）再把缓冲交给 PipeWire。抓帧和回读都在合成器的**主线程**
+      上做（PipeWire 的 loop 挂在 Wayland 的 event loop 上，`pw_loop_ready()`），144Hz 的屏上
+      就是每秒 144 趟整屏渲染 —— 消费者手上还有空缓冲时每次提交都再回读一整块（4K 上 33MB）。
+      主线程被占满，屏幕上所有动画 / 拖动跟着掉到 60fps：用户说的「被限制到 60」是这么来的，
+      跟录的是窗口还是整屏无关。
+
+      - 抓帧挪进 `pw_stream_process()`：**消费者真的来要一帧**（`pw_stream_dequeue_buffer()`
+        拿得到空缓冲）**而且到点了**才抓。输出提交只做两件便宜事：把手上那一帧作废（录屏要的是
+        最新画面）并催一次流。
+      - 新增 `stream_send_due()` / `stream_send_interval_ns()`：发帧节奏上限 =
+        **min(消费者协商的帧率, 屏幕刷新率)** —— 消费者要的帧率来自 `SPA_FORMAT_VIDEO_framerate`
+        （0/1 = 不限），屏幕那一侧取输出的**标称** `refresh`（不用量到的 `frame_gap_ns`：那个会被
+        「录制把帧率拖下去」反过来影响，帧间隔变大 → 上限放宽 → 抓得更多，是个正反馈），
+        输出没报刷新率的（headless / 虚拟输出）才退回帧间隔；两个都拿不到就不设上限。
+        下限 4ms（250Hz），免得怪值把节奏锁死。
+      - 光标推帧（`vidow_screencast_cursor_moved()`）跟着同一条上限走：以前写死 16ms（60Hz），
+        144Hz 的屏上「指针跟手」就只到 60fps。
+      - 新增 `vidowmsg state` 的 `screencast` 那一块：`frames` / `grabs` / `commits` /
+        `throttled` / `cap_ms` / `consumer_fps` —— 「是不是又在每次提交都抓整帧」一眼看得出来
+        （修好之后 `grabs ≈ frames`，`commits` 可以远大于它俩）。`struct vidow_sc_stream_stats`
+        + `vidow_screencast_stream_stats()` 是那一份私有状态对外的口子。
+      - 判据：`test-portal-own.sh` 新增 3 条（抓帧次数跟发帧次数一个量级、输出提交次数远多于
+        发帧次数、节奏有上限）；53 项全过。
+
+202. **全屏窗口不画服务端装饰（SSD），浮动全屏也占满整块屏**（用户报「全屏窗口应该没有 ssd，
+      直接独占显示器区域」）
+
+      - 新增 `vidow_view_look()`（`rule.c`）：`vidow_rule_look()` 的结果上再按全屏收一道 ——
+        边框 / 圆角 / 阴影 / 噪点全归零，其余（模糊、不透明度、内容合成）照旧。**不是**关掉
+        fx：装饰着色器照跑，只是那几笔参数是 0。
+      - 渲染那几处（`view_wants_blur()`、模糊区域选择、`vidow_fx_frame()`）和 IPC（`vidowmsg
+        windows` 的 `look`）用的是同一份，自检不用量像素。
+      - `vidow_fx_frame()` / `vidow_closing_start()` 多一个 `fullscreen` 参数：**关窗动画的快照**
+        也得按同一份参数画（全屏窗口的淡出不该突然冒出一圈边框）。layer 表面一律传 false。
+      - 摆位：浮动的全屏窗口以前摆在**工作区**（`work`，状态栏占位之外那一块），现在和列里的
+        全屏一样取**整块输出框**（`full_box`）—— 「独占显示器区域」。
+      - 判据：`test-fullscreen-scroll.sh` 新增 9 条（非全屏的 look 有边框 2 / 圆角 12 / 阴影 8，
+        全屏之后都是 0；左上角那一点是全屏窗口自己的内容而不是圆角外面的背景；浮动的全屏
+        geometry = 0,0 1280x720、退出全屏回到原来的浮动尺寸）；47 项全过。
+
+201. **窗口能从列里取出来**（用户报「窗口放入列后无法取出」）
+
+      并进一列有两条路（拖拽落点 / `move-window-direction`），取出来以前一条都没有 —— niri 的
+      `expel-window-from-column` 在 vidow 里是缺的，README 里还把它写成「故意跟 niri 不一样」。
+
+      - `vidow_view_expel_from_column(view, direction)`（`view.c`）：把窗口从它那条列里摘出来、
+        单独成一条新列，`direction > 0` 插在原来那条列右边（niri 的默认），`< 0` 左边。
+        新列继承原来那条列的 `width_fraction`（取出来是为了单独挪它，尺寸突变没有意义），
+        **不带**列最大化状态（新列不该一出生就满宽）。
+      - 列里只剩它一个（那它本来就是单独一条列）、浮窗 / 弹出物、收起来的窗口 —— 这几种返回
+        false，调用方报一句人话（不是默默什么都不做）。
+      - 动作 `expel-window-from-column [left|right]`（别名 `expel-window`）+ 默认键位
+        `Mod+Period`（取到右边）/ `Mod+Shift+Period`（取到左边）+ IPC
+        `expel-window-from-column`（`direction` 不写 = 右边）。
+      - 判据：新测试 `test-expel.sh`（26 项）：并起来 → 取出来（右边 / 左边 / 宽度继承 / 焦点
+        不换 / 日志）→ 两种取不出来的情形报人话且结构一点没动 → 动作串那条路。
 
 200. **图层规则补齐：开合动画、动画时长、不透明度**（「覆盖 vidow 所有能改的地方」的收尾）
 

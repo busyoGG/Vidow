@@ -823,6 +823,33 @@ static bool cmd_move_window_direction(struct vidow_server *server,
 	return true;
 }
 
+/* 把窗口从它那条列里取出来、单独成一条新列（niri 的 expel-window-from-column）。
+ * direction 不写 = 右边（left / -1 = 左边）。 */
+static bool cmd_expel_window_from_column(struct vidow_server *server,
+		struct jval *req, struct jbuf *out, char *err, size_t errlen) {
+	struct vidow_view *view = req_view(server, req, err, errlen);
+	if (view == NULL) {
+		return false;
+	}
+	int direction = 1;
+	long long d = 0;
+	if (jget_int(req, "direction", &d) ||
+			jget_str(req, "direction") != NULL) {
+		if (!req_direction(req, &direction, err, errlen)) {
+			return false;
+		}
+	}
+	if (!vidow_view_expel_from_column(view, direction)) {
+		snprintf(err, errlen, "取不出来：%s 是浮窗 / 弹出物，或者它那条列里"
+			"就它一个（那它本来就是单独一条列）",
+			vidow_view_title(view) != NULL ? vidow_view_title(view) :
+				"这个窗口");
+		return false;
+	}
+	changed_window(out, server, view);
+	return true;
+}
+
 static bool cmd_cycle_column_width(struct vidow_server *server, struct jval *req,
 		struct jbuf *out, char *err, size_t errlen) {
 	(void)req;
@@ -2222,6 +2249,9 @@ static bool ipc_run(struct vidow_server *server, struct ipc_client *c,
 	}
 	if (strcmp(cmd, "move_window_direction") == 0) {
 		return cmd_move_window_direction(server, req, out, err, errlen);
+	}
+	if (strcmp(cmd, "expel_window_from_column") == 0) {
+		return cmd_expel_window_from_column(server, req, out, err, errlen);
 	}
 
 	/* 列 */

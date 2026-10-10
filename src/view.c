@@ -1630,7 +1630,7 @@ void vidow_view_anim_bake(struct vidow_view *view) {
 	view->fx.anim_scale = view->anim_scale;
 	int64_t bake_t0 = vidow_now_ns();
 	bool fx_drawn = vidow_fx_frame(view->server, &view->fx, src, &geo, 0, 0,
-		x, y, alpha, view->server->focused == view,
+		x, y, alpha, view->server->focused == view, view->fullscreen,
 		view_scale(view) * ov, ov, &view->rule_eff);
 	/* 探针：整块窗口那么大的离屏渲染一共多少钱（见统计行的「重烘」；次数由
 	 * vidow_fx_frame 的 vidow_stats.bakes 记）。拖动 / 滚动动画里每个在动的
@@ -1861,7 +1861,7 @@ static void view_snapshot_close(struct vidow_view *view) {
 		anim.close_ms, server->config.close_slide_px,
 		true, server->config.shader_close, view_scale(view),
 		server->config.close_easing, server->config.close_scale_to,
-		&view->rule_eff);
+		&view->rule_eff, view->fullscreen);
 }
 
 void vidow_place_view(struct vidow_view *view, int x, int y, int w, int h) {
@@ -2171,11 +2171,11 @@ static void output_arrange(struct vidow_server *server,
 
 	vidow_float_place_all(server, output);
 
-	/* 浮动的全屏窗口也要占满整块工作区：以前只有「列里的全屏」会被摆成整屏，浮动
-	 * 的那种「全屏」在层级上照样永远压在最上面（vidow_restack 只认 fullscreen
-	 * 标志），画面上却还是它自己那一小块 —— 用户看到的就是「它一直叠在最上面，
-	 * 还不占满屏」。几何只进 geom（vidow_place_view 不碰 float_geom），退出全屏
-	 * 时照旧回原尺寸。 */
+	/* 浮动的全屏窗口也要占满**整块屏**（和列里的全屏同一个 full_box）：以前只有
+	 * 「列里的全屏」会被摆成整屏，浮动的那种「全屏」在层级上照样永远压在最上面
+	 * （vidow_restack 只认 fullscreen 标志），画面上却还是它自己那一小块 ——
+	 * 用户看到的就是「它一直叠在最上面，还不占满屏」。几何只进 geom
+	 * （vidow_place_view 不碰 float_geom），退出全屏时照旧回原尺寸。 */
 	if (fullscreen == NULL) {
 		struct vidow_view *v;
 		wl_list_for_each(v, &server->views, link) {
@@ -2190,8 +2190,8 @@ static void output_arrange(struct vidow_server *server,
 		/* 只有**浮动**的全屏在这儿摆：列里那些在上面的 Pass 3 就摆完了（它们
 		 * 的位置跟着条带走、尺寸给整块屏），这里再摆一次会把那一份盖掉。 */
 		if (fullscreen != NULL) {
-			vidow_place_view(fullscreen, work.x, work.y, work.width,
-				work.height);
+			vidow_place_view(fullscreen, full_box.x, full_box.y,
+				full_box.width, full_box.height);
 		}
 	}
 
@@ -3166,6 +3166,75 @@ bool vidow_view_insert_into_column(struct vidow_view *view,
 		/* 这条窗口现在住在列里了：列里的窗口不算浮窗。 */
 		vidow_workspace_track(target->ws, view, false);
 	}
+	return true;
+}
+
+/* 把窗口从它那条列里拎出来、单独成一条新列（niri 的 expel-window-from-column）。
+ * 这是「并进一列」的逆操作：拖拽只往列里插（落点判据见 drag.c），取出来得靠动作 /
+ * IPC —— 以前没有这条路，用户报的「窗口放入列后无法取出」就是它。
+ *
+ * direction > 0 = 新列插在原来那条列**右边**（niri 的默认），< 0 = 左边。
+ * 列里只剩它一个的时候没什么可取的（它本来就是独立一条列），浮窗 / 弹出物本来就
+ * 不在列里 —— 这两种都返回 false，调用方报一句人话。
+ *
+ * 宽度跟着原来那条列走（同一个 width_fraction）：取出来是为了单独挪它 / 单独调它
+ * 的宽度，尺寸突变一下没有意义。**列最大化状态不带过来** —— 新列不该一出生就是
+ * 满宽（用户按下「取出来」要的是「它自己一条列」）。 */
+bool vidow_view_expel_from_column(struct vidow_view *view, int direction) {
+	if (view == NULL || view->popup || view->float_mode != VIDOW_FLOAT_NONE ||
+			view->column == NULL || !view_shows(view)) {
+		return false;
+	}
+	struct vidow_column *col = view->column;
+	if (col->ws == NULL) {
+		return false;
+	}
+	/* 列里还有别的**看得见**的窗口，才算「它在一条多窗口的列里」。收起来的
+	 * （最小化）不算 —— 它们在布局里不占位，取出来对它们没有影响。 */
+	bool stacked = false;
+	struct vidow_view *it;
+	wl_list_for_each(it, &col->views, column_link) {
+		if (it != view && view_shows(it)) {
+			stacked = true;
+			break;
+		}
+	}
+	if (!stacked) {
+		return false;
+	}
+
+	struct vidow_server *server = view->server;
+	struct vidow_column *ncol = calloc(1, sizeof(*ncol));
+	if (ncol == NULL) {
+		return false;
+	}
+	ncol->server = server;
+	ncol->id = ++server->next_column_id;
+	ncol->output = col->output;
+	ncol->home = col->home;
+	ncol->ws = col->ws;
+	ncol->width_fraction = col->width_fraction;
+	wl_list_init(&ncol->views);
+	wl_list_init(&ncol->link);
+
+	vidow_view_leave_column(view);
+	view->column = ncol;
+	wl_list_insert(ncol->views.prev, &view->column_link);
+	if (direction > 0) {
+		/* wl_list_insert(pos, elm) 是插在 pos 之后 = 插在原来那条列右边。 */
+		wl_list_insert(&col->link, &ncol->link);
+	} else {
+		wl_list_insert(col->link.prev, &ncol->link);
+	}
+	/* 和 insert_into_column 一样：这条窗口现在住在列里（不是浮窗）。 */
+	vidow_workspace_track(ncol->ws, view, false);
+
+	vidow_arrange(server);
+	vidow_ipc_emit_column(server, "column-expel-window", ncol);
+	wlr_log(WLR_INFO, "取出窗口: %s 从列 #%llu 到新列 #%llu（%s）",
+		vidow_view_title(view) != NULL ? vidow_view_title(view) : "(无题)",
+		(unsigned long long)col->id, (unsigned long long)ncol->id,
+		direction > 0 ? "右边" : "左边");
 	return true;
 }
 

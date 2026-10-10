@@ -305,10 +305,10 @@ void vidow_ipc_json_window(struct jbuf *b, struct vidow_server *server,
 	jb_kv_double(b, "x11_scale", view->x11_scale);
 	jb_obj_end(b);
 
-	/* 这个窗口现在该长什么样：全局配置压上窗口规则（rule.c 的 vidow_rule_look）。
-	 * 渲染用的就是这一份 —— 自检脚本拿它当判据，不用去量像素。 */
+	/* 这个窗口现在该长什么样：全局配置压上窗口规则，再按全屏收一道（rule.c 的
+	 * vidow_view_look）。渲染用的就是这一份 —— 自检脚本拿它当判据，不用去量像素。 */
 	struct vidow_look look;
-	vidow_rule_look(&server->config, &view->rule_eff, &look);
+	vidow_view_look(&server->config, &view->rule_eff, view->fullscreen, &look);
 	jb_key(b, "look");
 	jb_obj(b);
 	jb_kv_double(b, "opacity", look.opacity);
@@ -699,6 +699,59 @@ void vidow_ipc_json_layers(struct jbuf *b, struct vidow_server *server) {
 	struct vidow_layer_surface *ls;
 	wl_list_for_each(ls, &server->layers, link) {
 		vidow_ipc_json_layer(b, server, ls);
+	}
+	jb_arr_end(b);
+}
+
+/* ------------------------------------------------------- 录屏（screencast） */
+
+static const char *sc_kind_name(enum vidow_sc_kind kind) {
+	switch (kind) {
+	case VIDOW_SC_OUTPUT:
+		return "output";
+	case VIDOW_SC_WINDOW:
+		return "window";
+	case VIDOW_SC_REGION:
+		return "region";
+	case VIDOW_SC_VIRTUAL:
+		return "virtual";
+	default:
+		return "?";
+	}
+}
+
+/* 录屏那几路流现在什么状态：发帧节奏（cap_ms = min(消费者帧率, 屏幕刷新率)）、
+ * 发了多少帧、整帧抓了多少次、看见多少次输出提交。
+ *
+ * 「抓帧次数 ≈ 输出提交次数」就是以前那个 bug 的样子（每次提交都抓一整帧，
+ * 144Hz 的屏上主线程被占满，屏幕上所有动画跟着掉到 60fps）；修完之后它应该
+ * 跟 frames 一个量级（消费者要一帧才抓一帧）。 */
+void vidow_ipc_json_screencast(struct jbuf *b, struct vidow_server *server) {
+	jb_arr(b);
+	if (server->screencast != NULL) {
+		struct vidow_screencast_stream *stream;
+		wl_list_for_each(stream, &server->screencast->streams, link) {
+			struct vidow_sc_stream_stats st;
+			vidow_screencast_stream_stats(stream, &st);
+			jb_obj(b);
+			jb_kv_str(b, "kind", sc_kind_name(stream->kind));
+			jb_kv_str(b, "output", stream->output != NULL ?
+				stream->output->name : NULL);
+			jb_kv_int(b, "width", stream->out_w);
+			jb_kv_int(b, "height", stream->out_h);
+			jb_kv_uint(b, "pointer_mode", stream->pointer_mode);
+			jb_kv_bool(b, "closed", stream->closed);
+			jb_kv_bool(b, "has_pw", st.has_pw);
+			jb_kv_double(b, "consumer_fps", st.consumer_fps);
+			jb_kv_double(b, "cap_ms", st.cap_ms);
+			jb_kv_uint(b, "frames", st.frames);
+			jb_kv_uint(b, "grabs", st.grabs);
+			jb_kv_uint(b, "commits", st.commits);
+			jb_kv_uint(b, "throttled", st.throttled);
+			jb_kv_uint(b, "cursor_pushes", stream->cursor_pushes);
+			jb_kv_int(b, "last_send_ms", st.last_send_ms);
+			jb_obj_end(b);
+		}
 	}
 	jb_arr_end(b);
 }
@@ -1226,6 +1279,8 @@ void vidow_ipc_json_state(struct jbuf *b, struct vidow_server *server) {
 	vidow_ipc_json_windows(b, server);
 	jb_key(b, "layers");
 	vidow_ipc_json_layers(b, server);
+	jb_key(b, "screencast");
+	vidow_ipc_json_screencast(b, server);
 	jb_key(b, "seats");
 	vidow_ipc_json_seats(b, server);
 	jb_key(b, "keybinds");
