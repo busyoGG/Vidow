@@ -575,6 +575,40 @@ void vidow_tile_grab_end(struct vidow_server *server) {
 	}
 
 	int index = pos.index;
+	if (index < 0) {
+		index = 0;
+	}
+	/* 落点按「条带上还剩的那些列」数（被拖的那条不算、整列最小化的不算）——
+	 * 和 insert_pos_at 数的是同一份。at = 新列该插在哪个位置**之前**。 */
+	struct wl_list *at = &target->columns; /* 追加到末尾 */
+	int i = 0;
+	struct vidow_column *it;
+	wl_list_for_each(it, &target->columns, link) {
+		if (it == col || it->slot_width <= 0) {
+			continue;
+		}
+		if (i == index) {
+			at = &it->link;
+			break;
+		}
+		i++;
+	}
+
+	/* 落点是「新开一条列」（niri 的 NewColumn）：这条窗口在一条**多窗口**的列里
+	 * 的时候，把**它自己**取出来成新列（niri 拖的一直是窗口），原来那条列连同别的
+	 * 窗口留在原处。用户报的「拖到右边 / 拖到空白处也取不出来」就是这儿 —— 以前
+	 * 落点算成新列位就整条列搬走，窗口永远留在列里。
+	 * 列里就它一个（或者它是浮窗）→ 取不出来，走老路：整条列搬过去。 */
+	if (target == view->ws && vidow_view_expel_new_column(view, target, at,
+			"拖出列") != NULL) {
+		wlr_log(WLR_INFO,
+			"grab: %s 从列里取出来 → %s 上第 %d 块工作区的第 %d 位",
+			vidow_view_title(view) != NULL ? vidow_view_title(view) : "?",
+			output->name, vidow_workspace_index(target), index + 1);
+		vidow_focus_view(view);
+		return; /* 取出来那条路自己 arrange 过了 */
+	}
+
 	if (target != view->ws) {
 		/* 跨屏（或跨工作区）：整条列搬过去。 */
 		if (!vidow_workspace_move_view(server, view, target)) {
@@ -593,25 +627,8 @@ void vidow_tile_grab_end(struct vidow_server *server) {
 			output->name, from_idx, index + 1);
 	}
 
-	/* 按落点插进目标工作区的列带（跨屏那条路是追加到末尾的，这里统一重排）。
-	 * index 数的是「条带上还剩的那些列」：被拖的那条不算（它自己就是被拖的），
-	 * 整列最小化的也不算（它不占条带）—— 和 insert_pos_at 数的是同一份。 */
-	if (index < 0) {
-		index = 0;
-	}
-	struct wl_list *at = &target->columns; /* 追加到末尾 */
-	int i = 0;
-	struct vidow_column *it;
-	wl_list_for_each(it, &target->columns, link) {
-		if (it == col || it->slot_width <= 0) {
-			continue;
-		}
-		if (i == index) {
-			at = &it->link;
-			break;
-		}
-		i++;
-	}
+	/* 按落点把整条列插进目标工作区的列带（跨屏那条路是搬过来再重排，这里统一
+	 * 按上面算好的 at 插）。 */
 	if (!wl_list_empty(&col->link)) {
 		wl_list_remove(&col->link);
 	}

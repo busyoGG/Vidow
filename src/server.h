@@ -2271,6 +2271,12 @@ struct vidow_sc_stream_stats {
 	unsigned long long grabs;  /* 整帧抓了多少次（整块离屏渲染 + 回读） */
 	unsigned long long commits;/* 看见多少次输出提交 */
 	unsigned long long throttled; /* 消费者来要帧但被节奏上限挡下的次数 */
+	/* 一帧的主线程成本（毫秒，平均值）：grab = 整块离屏渲染，readback = 从
+	 * 抓帧缓冲回读到 PipeWire 的 memfd。录制时桌面卡不卡就看这两个数 ——
+	 * 实测 2560x1440 上回读 6.2ms、渲染 1.4ms，拷贝是渲染的 4 倍多。 */
+	double grab_ms;
+	double grab_ms_max;
+	double readback_ms;
 	long long last_send_ms;    /* 上一帧是什么时候发的（单调时钟毫秒），-1 = 还没发过 */
 };
 bool vidow_screencast_stream_stats(const struct vidow_screencast_stream *stream,
@@ -2699,9 +2705,13 @@ bool vidow_view_insert_into_column(struct vidow_view *view,
 /* 从自己那条列里摘出来（列里没别人了就把它拆掉）。摘出来的窗口会短暂「没有列」，
  * 调用方得紧接着把它放进哪条列里（见 vidow_view_insert_into_column）。 */
 void vidow_view_leave_column(struct vidow_view *view);
-/* 把窗口从它那条列里拎出来、单独成一条新列（niri 的 expel-window-from-column）：
- * direction > 0 = 新列插在原来那条列右边，< 0 = 左边。列里只剩它一个（或者它是
- * 浮窗 / 弹出物）返回 false。 */
+/* 把窗口从它那条列里拎出来、单独成一条新列（niri 的 expel-window-from-column），
+ * 插在 ws 的列带里 `at` 那个位置之前（NULL = 原来那条列的右边）。列里只剩它一个
+ * （或者它是浮窗 / 弹出物）返回 NULL。拖拽落点那条路也用它（见 drag.c）。 */
+struct vidow_column *vidow_view_expel_new_column(struct vidow_view *view,
+		struct vidow_workspace *ws, struct wl_list *at, const char *reason);
+/* 动作 / IPC 那条路：direction > 0 = 新列插在原来那条列右边，< 0 = 左边。
+ * 取不出来（浮窗 / 列里就它一个）返回 false。 */
 bool vidow_view_expel_from_column(struct vidow_view *view, int direction);
 void vidow_cycle_column_width(struct vidow_server *server);
 /* niri 式列最大化：整列撑满工作区宽度，maximized_saved 记着原来的比例，关掉就还原。

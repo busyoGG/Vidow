@@ -132,6 +132,16 @@ struct vidow_sc_pw_stream {
 	 * 说明消费者要得比屏幕刷新率还急，我们按上限压着 —— 不是丢帧，是「屏幕
 	 * 上本来就没有新画面」。 */
 	uint64_t throttled;
+	/* 一帧的主线程成本拆成两半（都是累计纳秒，`vidowmsg state` 的
+	 * screencast 里报平均值）：
+	 *   grab_ns     —— 整块离屏渲染（把场景画进抓帧缓冲）
+	 *   readback_ns —— 从那张缓冲回读到 PipeWire 的 memfd（GPU→CPU 同步拷贝，
+	 *                  4K 一帧 33MB）
+	 * 用户报「录制时整个桌面（光标）卡」时，这两个数一眼看出钱花在哪一半：
+	 * 渲染贵 → 少抓 / 复用上一帧；回读贵 → 该给消费者 dmabuf（不落 CPU）。 */
+	int64_t grab_ns;
+	int64_t readback_ns;
+	int64_t grab_ns_max;
 };
 
 /* 光标在这一路里的状态（见 vidow_sc_pw_stream 的 cursor_state）。 */
@@ -459,7 +469,13 @@ static void pw_stream_process(void *data) {
 	 * 消费者那一格拿到的是空缓冲，但它本来就不该在这时候要帧（是我们催早了）。 */
 	if (ps->pending == NULL) {
 		if (stream_send_due(ps)) {
+			int64_t t0 = vidow_now_ns();
 			ps->pending = stream_grab(ps);
+			int64_t dt = vidow_now_ns() - t0;
+			ps->grab_ns += dt;
+			if (dt > ps->grab_ns_max) {
+				ps->grab_ns_max = dt;
+			}
 		} else {
 			ps->throttled++;
 		}
@@ -504,6 +520,7 @@ static void pw_stream_fill(struct vidow_sc_pw_stream *ps,
 		return;
 	}
 
+	int64_t rb_t0 = vidow_now_ns();
 	struct wlr_texture *texture = wlr_texture_from_buffer(
 		ps->stream->output->renderer, src);
 	if (texture == NULL) {
@@ -523,6 +540,7 @@ static void pw_stream_fill(struct vidow_sc_pw_stream *ps,
 	if (!ok) {
 		return;
 	}
+	ps->readback_ns += vidow_now_ns() - rb_t0;
 
 	if (buf->datas[0].chunk == NULL) {
 		return;
@@ -919,6 +937,13 @@ bool vidow_screencast_stream_stats(const struct vidow_screencast_stream *stream,
 	out->grabs = ps->grabs;
 	out->commits = ps->commits;
 	out->throttled = ps->throttled;
+	if (ps->grabs > 0) {
+		out->grab_ms = (double)ps->grab_ns / (double)ps->grabs / 1e6;
+	}
+	out->grab_ms_max = (double)ps->grab_ns_max / 1e6;
+	if (ps->frames > 0) {
+		out->readback_ms = (double)ps->readback_ns / (double)ps->frames / 1e6;
+	}
 	if (ps->last_send_ns > 0) {
 		out->last_send_ms = ps->last_send_ns / 1000000;
 	}
@@ -1009,8 +1034,14 @@ void vidow_sc_pw_stream_start(struct vidow_screencast_stream *stream) {
 	pw_stream_add_listener(ps->pw_stream, &ps->listener, &pw_stream_events, ps);
 
 	/* 只报一种格式（BGRx + 输出像素尺寸），协商没得选 —— 消费者要别的尺寸
-	 * 自己加 filter。缓冲走 memfd：合成器这边直接 read_pixels 进去，零拷贝做不到
-	 * （要 dmabuf 得让 renderer 导出，先不做）。 */
+	 * 自己加 filter。缓冲走 memfd：合成器这边直接 read_pixels 进去。
+	 *
+	 * dmabuf 直通（像素不落 CPU）**没做成**：PipeWire 这一层是**消费者**分配
+	 * 缓冲，我们报 DmaBuf 它就去要 dmabuf 型的缓冲，而消费者（GStreamer /
+	 * 我们自己的 probe）的分配器建不出来 —— 实测 `error alloc buffers:
+	 * 不支持的操作`（ENOTSUP）、一帧都拿不到。要做到底得先有一个能分配 dmabuf
+	 * 的消费者来验（OBS 那条路 / 自己写一个 gbm 分配的 probe），见 README
+	 * 「录屏的发帧节奏」那一节。 */
 	uint8_t pod_buffer[1024];
 	struct spa_pod_builder builder = SPA_POD_BUILDER_INIT(pod_buffer,
 		sizeof(pod_buffer));
@@ -1032,6 +1063,9 @@ void vidow_sc_pw_stream_start(struct vidow_screencast_stream *stream) {
 		SPA_FORMAT_VIDEO_size, SPA_POD_Rectangle(&size),
 		SPA_FORMAT_VIDEO_framerate, SPA_POD_CHOICE_RANGE_Fraction(&rate,
 			&min_rate, &max_rate),
+		/* 这里**不报** SPA_FORMAT_VIDEO_modifier：报了就等于说「我给你的图带
+		 * 修饰符」，GStreamer 的 pipewiresrc 会因此协商不出固定 caps（实测
+		 * handle_format_change 直接断言失败、一帧都拿不到）。 */
 		0);
 	params[0] = spa_pod_builder_pop(&builder, &frame);
 

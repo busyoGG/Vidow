@@ -721,11 +721,15 @@ static const char *sc_kind_name(enum vidow_sc_kind kind) {
 }
 
 /* 录屏那几路流现在什么状态：发帧节奏（cap_ms = min(消费者帧率, 屏幕刷新率)）、
- * 发了多少帧、整帧抓了多少次、看见多少次输出提交。
+ * 发了多少帧、整帧抓了多少次、看见多少次输出提交、一帧的主线程成本（grab_ms =
+ * 整块离屏渲染，readback_ms = 回读到 PipeWire 的 memfd）。
  *
  * 「抓帧次数 ≈ 输出提交次数」就是以前那个 bug 的样子（每次提交都抓一整帧，
  * 144Hz 的屏上主线程被占满，屏幕上所有动画跟着掉到 60fps）；修完之后它应该
- * 跟 frames 一个量级（消费者要一帧才抓一帧）。 */
+ * 跟 frames 一个量级（消费者要一帧才抓一帧）。
+ *
+ * 「录制的时候整个桌面卡」再往下查就看 grab_ms / readback_ms 哪一半贵：
+ * 4K 一帧 33MB，readback_ms 是大头 → 该给消费者 dmabuf（像素不落 CPU）。 */
 void vidow_ipc_json_screencast(struct jbuf *b, struct vidow_server *server) {
 	jb_arr(b);
 	if (server->screencast != NULL) {
@@ -748,6 +752,9 @@ void vidow_ipc_json_screencast(struct jbuf *b, struct vidow_server *server) {
 			jb_kv_uint(b, "grabs", st.grabs);
 			jb_kv_uint(b, "commits", st.commits);
 			jb_kv_uint(b, "throttled", st.throttled);
+			jb_kv_double(b, "grab_ms", st.grab_ms);
+			jb_kv_double(b, "grab_ms_max", st.grab_ms_max);
+			jb_kv_double(b, "readback_ms", st.readback_ms);
 			jb_kv_uint(b, "cursor_pushes", stream->cursor_pushes);
 			jb_kv_int(b, "last_send_ms", st.last_send_ms);
 			jb_obj_end(b);

@@ -3170,24 +3170,30 @@ bool vidow_view_insert_into_column(struct vidow_view *view,
 }
 
 /* 把窗口从它那条列里拎出来、单独成一条新列（niri 的 expel-window-from-column）。
- * 这是「并进一列」的逆操作：拖拽只往列里插（落点判据见 drag.c），取出来得靠动作 /
- * IPC —— 以前没有这条路，用户报的「窗口放入列后无法取出」就是它。
+ * 这是「并进一列」的逆操作：并进一列有两条路（拖拽落点 / move-window-direction），
+ * 取出来以前一条都没有 —— 用户报的「窗口放入列后无法取出」就是它。
  *
- * direction > 0 = 新列插在原来那条列**右边**（niri 的默认），< 0 = 左边。
+ * 插在 ws 的列带里 `at` 那个位置**之前**（at = &ws->columns 就是追加到末尾；
+ * NULL = 插在原来那条列右边）。落点由调用方算：动作 / IPC 那条路是「原来那条列的
+ * 右边 / 左边」，拖拽那条路是落点算法（drag.c 的 insert_pos_at）给的那个缝 ——
+ * 两边的「第几位」数的是同一份东西。
+ *
  * 列里只剩它一个的时候没什么可取的（它本来就是独立一条列），浮窗 / 弹出物本来就
- * 不在列里 —— 这两种都返回 false，调用方报一句人话。
+ * 不在列里 —— 这两种都返回 NULL，调用方报一句人话 / 走老路。
  *
  * 宽度跟着原来那条列走（同一个 width_fraction）：取出来是为了单独挪它 / 单独调它
  * 的宽度，尺寸突变一下没有意义。**列最大化状态不带过来** —— 新列不该一出生就是
- * 满宽（用户按下「取出来」要的是「它自己一条列」）。 */
-bool vidow_view_expel_from_column(struct vidow_view *view, int direction) {
-	if (view == NULL || view->popup || view->float_mode != VIDOW_FLOAT_NONE ||
-			view->column == NULL || !view_shows(view)) {
-		return false;
+ * 满宽（用户按下「取出来」要的是「它自己一条列」）。reason 只进日志。 */
+struct vidow_column *vidow_view_expel_new_column(struct vidow_view *view,
+		struct vidow_workspace *ws, struct wl_list *at, const char *reason) {
+	if (view == NULL || ws == NULL || view->popup ||
+			view->float_mode != VIDOW_FLOAT_NONE || view->column == NULL ||
+			!view_shows(view)) {
+		return NULL;
 	}
 	struct vidow_column *col = view->column;
-	if (col->ws == NULL) {
-		return false;
+	if (col->ws == NULL || col->ws != ws) {
+		return NULL;
 	}
 	/* 列里还有别的**看得见**的窗口，才算「它在一条多窗口的列里」。收起来的
 	 * （最小化）不算 —— 它们在布局里不占位，取出来对它们没有影响。 */
@@ -3200,13 +3206,13 @@ bool vidow_view_expel_from_column(struct vidow_view *view, int direction) {
 		}
 	}
 	if (!stacked) {
-		return false;
+		return NULL;
 	}
 
 	struct vidow_server *server = view->server;
 	struct vidow_column *ncol = calloc(1, sizeof(*ncol));
 	if (ncol == NULL) {
-		return false;
+		return NULL;
 	}
 	ncol->server = server;
 	ncol->id = ++server->next_column_id;
@@ -3220,12 +3226,11 @@ bool vidow_view_expel_from_column(struct vidow_view *view, int direction) {
 	vidow_view_leave_column(view);
 	view->column = ncol;
 	wl_list_insert(ncol->views.prev, &view->column_link);
-	if (direction > 0) {
-		/* wl_list_insert(pos, elm) 是插在 pos 之后 = 插在原来那条列右边。 */
-		wl_list_insert(&col->link, &ncol->link);
-	} else {
-		wl_list_insert(col->link.prev, &ncol->link);
+	if (at == NULL) {
+		at = col->link.next; /* 默认：原来那条列的右边 */
 	}
+	/* wl_list_insert(pos, elm) 是插在 pos 之后 —— 插到 at 前面要写 at->prev。 */
+	wl_list_insert(at->prev, &ncol->link);
 	/* 和 insert_into_column 一样：这条窗口现在住在列里（不是浮窗）。 */
 	vidow_workspace_track(ncol->ws, view, false);
 
@@ -3234,8 +3239,23 @@ bool vidow_view_expel_from_column(struct vidow_view *view, int direction) {
 	wlr_log(WLR_INFO, "取出窗口: %s 从列 #%llu 到新列 #%llu（%s）",
 		vidow_view_title(view) != NULL ? vidow_view_title(view) : "(无题)",
 		(unsigned long long)col->id, (unsigned long long)ncol->id,
-		direction > 0 ? "右边" : "左边");
-	return true;
+		reason != NULL ? reason : "取出来");
+	return ncol;
+}
+
+/* 动作 / IPC 那条路：把窗口从它那条列里拎出来单独成一条新列。
+ * direction > 0 = 新列插在原来那条列**右边**（niri 的默认），< 0 = 左边。
+ * 取不出来（浮窗 / 列里就它一个）返回 false，调用方报一句人话。 */
+bool vidow_view_expel_from_column(struct vidow_view *view, int direction) {
+	if (view == NULL || view->column == NULL) {
+		return false;
+	}
+	struct vidow_column *col = view->column;
+	/* at 得在摘之前算：wl_list_insert(at->prev, …) 插在 at 前面，而
+	 * col->link.next 就是「原来那条列的右边」那个位置。 */
+	struct wl_list *at = direction > 0 ? col->link.next : &col->link;
+	return vidow_view_expel_new_column(view, col->ws, at,
+		direction > 0 ? "右边" : "左边") != NULL;
 }
 
 void vidow_move_window(struct vidow_server *server, int direction) {

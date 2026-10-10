@@ -13,7 +13,10 @@
 #   6) 列里只剩它一个时取不出来：IPC 报人话、列结构一点没动
 #   7) 浮窗取不出来（报人话）
 #   8) 键位动作那条路也通（vidowmsg action expel-window-from-column）
-#   9) 日志里没有 assert / abort
+#   9) **拖到右边 / 没窗口的地方也取得出来**：落点算成「新开一条列」时，取出来的是
+#      被拖的那个窗口（niri 拖的一直是窗口），原来那条列连同别的窗口留在原处；
+#      列里就它一个的时候照旧整条列搬过去（老路没坏）
+#  10) 日志里没有 assert / abort
 #
 # 用法：./test-expel.sh   （VIDOW_TEST_KEEP=1 保留运行目录）
 # 注意：别和别的测试**并行**跑 —— 收尾按 cmdline 杀 pattern.py。
@@ -58,6 +61,7 @@ chmod 700 "$RUNDIR/run"
 
 cat > "$CFGDIR/.config/vidow/config.lua" <<'CFG'
 scale = "1"
+gaps = 10
 xwayland = false
 window_open_ms = 0
 window_move_ms = 0
@@ -69,6 +73,10 @@ export XDG_RUNTIME_DIR="$RUNDIR/run"
 export HOME="$CFGDIR" VIDOW_LOG=debug
 export WLR_BACKENDS=headless WLR_HEADLESS_OUTPUTS=1 WLR_LIBINPUT_NO_DEVICES=1
 export DISPLAY= WAYLAND_DISPLAY=
+# 拖拽那条路要注入鼠标：headless 里没有真鼠标，走 VIDOW_TEST_ACTION 的 FIFO
+# （pointer-motion / pointer-button），和 test-drag-insert.sh 同一套。
+export VIDOW_TEST_ACTION="file:$RUNDIR/actions"
+mkfifo "$RUNDIR/actions"
 
 setsid ./build/vidow > "$LOG" 2>&1 &
 VIDOW_PGID=$!
@@ -81,6 +89,9 @@ grep -aq "vidow ready" "$LOG" || {
 export WAYLAND_DISPLAY=$(grep -ao "WAYLAND_DISPLAY=[a-z0-9-]*" "$LOG" |
 	tail -1 | cut -d= -f2)
 sleep 0.5
+
+exec 9> "$RUNDIR/actions"
+act() { echo "$1" >&9; sleep "${2:-0.3}"; }
 
 # ------------------------------------------------------------ 工具
 win_id() { # <标题> -> id
@@ -152,6 +163,18 @@ for w in json.load(sys.stdin):
         print(w["title"]); break
 else:
     print("(没有)")'
+}
+
+geom4() { # <标题> -> "x y w h"（平铺看 geometry，浮动看 float_geometry）
+	./build/vidowmsg windows 2>/dev/null | python3 -c '
+import json, sys
+for w in json.load(sys.stdin):
+    if w["title"] == sys.argv[1]:
+        g = w["float_geometry"] if w["floating"] else w["geometry"]
+        print(g["x"], g["y"], g["width"], g["height"]); break
+else:
+    print("0 0 0 0")
+' "$1"
 }
 
 spawn_pattern() { # <标题>
@@ -256,12 +279,53 @@ sleep 0.6
 sleep 0.6
 check "[a2] | [a1]" "$(shape)" "动作串带 left 参数"
 
-# ------------------------------------------------------------ 6) 收尾
-mark "6) 收尾"
+# ------------------------------------------------------------ 6) 拖出去
+mark "6) 拖到右边 / 没窗口的地方也取得出来（不是整条列搬走）"
+# 造状态：[a1 a2] | [a3]，每条列 0.3 宽（371），右边留一大片没窗口的地方
+./build/vidowmsg focus-window --title a1 >/dev/null 2>&1
+./build/vidowmsg move-window-direction -1 >/dev/null 2>&1
+sleep 0.6
+check "[a1 a2]" "$(shape)" "a1 并进 a2 那条列（叠在它上面）"
+spawn_pattern a3
+./build/vidowmsg focus-window --title a3 >/dev/null 2>&1
+./build/vidowmsg set-column-width 0.3 >/dev/null 2>&1
+sleep 0.5
+check "[a1 a2] | [a3]" "$(shape)" "a3 自己一条列在右边（两条列都 0.3 宽）"
+
+# 拖 a2：从它身上按下去，拖到 a3 右边那片空白（「没窗口的地方」），松手
+read -r AX AY AW AH <<< "$(geom4 a2)"
+read -r BX BY BW BH <<< "$(geom4 a3)"
+act "pointer-motion $((AX + AW / 2)) $((AY + AH / 2))" 0.2
+act "pointer-button left press mod" 0.3
+act "pointer-motion $((BX + BW + 40)) $((BY + BH / 2))" 0.4
+act "pointer-motion $((BX + BW + 40)) $((BY + BH / 2))" 0.2
+act "pointer-button left release mod" 0.8
+check "[a1] | [a3] | [a2]" "$(shape)" \
+	"拖到右边空白处：a2 自己成一条新列、a1 留在原来那条列"
+grep -aq "grab: a2 从列里取出来" "$LOG" &&
+	pass "日志说的是「从列里取出来」（不是整条列搬走）" ||
+	fail "日志里没有取出来的记录：$(grep -a 'grab:' "$LOG" | tail -1)"
+
+# 列里就它一个的时候照旧整条列搬过去（老路没坏）
+read -r AX AY AW AH <<< "$(geom4 a1)"
+read -r BX BY BW BH <<< "$(geom4 a2)"
+act "pointer-motion $((AX + AW / 2)) $((AY + AH / 2))" 0.2
+act "pointer-button left press mod" 0.3
+act "pointer-motion $((BX + BW + 40)) $((BY + BH / 2))" 0.4
+act "pointer-button left release mod" 0.8
+check "[a3] | [a2] | [a1]" "$(shape)" \
+	"a1 那条列里就它一个 → 整条列搬到最右边（老路）"
+grep -aq "grab: a1 在 .*挪到第 3 位" "$LOG" &&
+	pass "日志说的是整条列「挪到第 3 位」" ||
+	fail "日志里没有整列搬家的记录：$(grep -a 'grab:' "$LOG" | tail -1)"
+
+# ------------------------------------------------------------ 7) 收尾
+mark "7) 收尾"
 grep -aq "Assertion" "$LOG" || grep -aq "abort" "$LOG" &&
 	fail "日志里有 assert / abort" || pass "日志里没有 assert / abort"
 [ "$(win_id a1)" != "" ] && [ "$(win_id a2)" != "" ] &&
-	pass "两个窗口都还活着" || fail "有窗口不见了"
+	[ "$(win_id a3)" != "" ] &&
+	pass "三个窗口都还活着" || fail "有窗口不见了"
 
 echo
 if [ "$FAILED" = 0 ]; then

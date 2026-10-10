@@ -380,12 +380,23 @@ streams = [s for s in d.get("screencast", []) if s.get("frames", 0) > 0]
 if not streams:
     print("  FAIL  state.screencast 里没有发过帧的流"); raise SystemExit(1)
 bad = 0
+missing = []
 for s in streams:
     print("      （%s：发帧 %d、抓帧 %d、输出提交 %d、消费者 %.0ffps、上限 %.1fms）" %
           (s.get("kind"), s["frames"], s["grabs"], s["commits"],
            s.get("consumer_fps", 0), s.get("cap_ms", 0)))
+    print("      （一帧的主线程成本：抓帧渲染 %.2fms（最多 %.2fms）、回读 %.2fms）" %
+          (s.get("grab_ms", 0), s.get("grab_ms_max", 0), s.get("readback_ms", 0)))
+    for k in ("grab_ms", "grab_ms_max", "readback_ms"):
+        if k not in s:
+            missing.append(k)
     if s["grabs"] > s["frames"] + 2:
         bad += 1
+if missing:
+    print("  FAIL  state.screencast 少了成本字段：%s" % ", ".join(sorted(set(missing))))
+    bad += 1
+else:
+    print("  PASS  每路流都报了一帧的主线程成本（grab_ms / grab_ms_max / readback_ms）")
 if bad == 0:
     print("  PASS  抓帧次数跟着发帧次数走（不是每次输出提交都抓一整帧）")
 else:
@@ -911,6 +922,7 @@ if [ -n "${NODE4:-}" ]; then
 	fi
 	$VM --socket "$IPC" output-scale "${SOUT:-HEADLESS-1}" 1 >/dev/null 2>&1
 	sleep 1
+
 fi
 # 反证：hidden 模式下**同样**要元数据的消费者一个字节都拿不到（元数据是照
 # pointer_mode 报的，不是无脑塞）。
