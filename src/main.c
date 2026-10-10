@@ -1,4 +1,5 @@
 #include "server.h"
+#include "hooks.h"
 #include "ipc.h"
 
 #include <signal.h>
@@ -306,6 +307,9 @@ int main(int argc, char *argv[]) {
 		return 1;
 	}
 	vidow_workspace_init(&server);
+	/* 事件钩子（config.lua 的 vidow.on，见 hooks.c）：要在任何事件发出来之前
+	 * 建好 —— 第一块屏「插上」（output-added）就发生在几行之后。 */
+	vidow_hooks_init(&server);
 	vidow_keybind_init(&server);
 	vidow_rule_init(&server);
 	vidow_output_conf_init(&server);
@@ -455,6 +459,7 @@ int main(int argc, char *argv[]) {
 	vidow_clipboard_finish(&server);
 	server_finish(&server);
 	vidow_script_finish(&server);
+	vidow_hooks_finish(&server);
 	vidow_exec_cancel_all(&server);
 	wl_display_destroy_clients(server.display);
 	wl_display_destroy(server.display);

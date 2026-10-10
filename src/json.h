@@ -89,4 +89,8 @@ bool jget_bool(const struct jval *obj, const char *key, bool *out);
 bool jget_int(const struct jval *obj, const char *key, long long *out);
 bool jget_double(const struct jval *obj, const char *key, double *out);
 
+/* 把一个解析出来的值再写回 JSON 文本（IPC 的 emit 命令要原样转发调用方给的
+ * data）。写进已有的 jbuf，失败走 jb_* 那套（最后问 jb_ok）。 */
+void jval_json(struct jbuf *b, const struct jval *v);
+
 #endif /* VIDOW_JSON_H */

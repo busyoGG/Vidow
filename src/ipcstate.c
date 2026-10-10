@@ -20,6 +20,7 @@
 #include <wlr/util/log.h>
 #include <xkbcommon/xkbcommon.h>
 
+#include "hooks.h"
 #include "ipc.h"
 #include "server.h"
 
@@ -1206,7 +1207,42 @@ static void emit(struct vidow_server *server, const char *event,
 	jb_obj_end(&b);
 	jb_raw(&b, "\n");
 	if (jb_ok(&b)) {
+		/* 一条事件两条路：IPC 订阅者拿 JSON，配置里的钩子（vidow.on）拿同一份
+		 * JSON 的文本（见 hooks.c —— 那边只入队，执行在 idle 里）。 */
 		vidow_ipc_broadcast(server, event, b.buf, b.len);
+		vidow_hooks_dispatch(server, event, b.buf);
+	}
+	jb_free(&b);
+}
+
+/* 自定义事件：data 原样带上（IPC 的 emit 命令）。 */
+void vidow_ipc_emit_custom(struct vidow_server *server, const char *event,
+		const struct jval *data) {
+	if (server == NULL || event == NULL || event[0] == '\0') {
+		return;
+	}
+	if (!vidow_event_wanted(server, event)) {
+		return;
+	}
+	struct jbuf b;
+	jb_init(&b, 512);
+	jb_obj(&b);
+	jb_kv_str(&b, "event", event);
+	jb_kv_int(&b, "time_ms", now_ms());
+	jb_key(&b, "data");
+	if (data != NULL && (data->t == J_OBJ || data->t == J_ARR ||
+			data->t == J_STR || data->t == J_NUM || data->t == J_BOOL ||
+			data->t == J_NULL)) {
+		jval_json(&b, data);
+	} else {
+		jb_obj(&b);
+		jb_obj_end(&b);
+	}
+	jb_obj_end(&b);
+	jb_raw(&b, "\n");
+	if (jb_ok(&b)) {
+		vidow_ipc_broadcast(server, event, b.buf, b.len);
+		vidow_hooks_dispatch(server, event, b.buf);
 	}
 	jb_free(&b);
 }
@@ -1249,7 +1285,7 @@ static void payload_output(struct jbuf *b, struct vidow_server *server,
 
 void vidow_ipc_emit_window(struct vidow_server *server, const char *event,
 		struct vidow_view *view) {
-	if (!vidow_ipc_wanted(server) || view == NULL) {
+	if (!vidow_event_wanted(server, event) || view == NULL) {
 		return;
 	}
 	emit(server, event, payload_window, view);
@@ -1274,7 +1310,7 @@ static void payload_closed(struct jbuf *b, struct vidow_server *server,
 
 void vidow_ipc_emit_window_closed(struct vidow_server *server, uint64_t id,
 		const char *title, const char *app_id) {
-	if (!vidow_ipc_wanted(server)) {
+	if (!vidow_event_wanted(server, "window-closed")) {
 		return;
 	}
 	struct closed_info info = { .id = id, .title = title, .app_id = app_id };
@@ -1299,7 +1335,7 @@ static void payload_focus(struct jbuf *b, struct vidow_server *server,
 }
 
 void vidow_ipc_emit_focus(struct vidow_server *server, struct vidow_view *view) {
-	if (!vidow_ipc_wanted(server)) {
+	if (!vidow_event_wanted(server, "window-focus-changed")) {
 		return;
 	}
 	emit(server, "window-focus-changed", payload_focus, view);
@@ -1307,7 +1343,7 @@ void vidow_ipc_emit_focus(struct vidow_server *server, struct vidow_view *view) 
 
 void vidow_ipc_emit_workspace(struct vidow_server *server, const char *event,
 		struct vidow_workspace *ws) {
-	if (!vidow_ipc_wanted(server) || ws == NULL) {
+	if (!vidow_event_wanted(server, event) || ws == NULL) {
 		return;
 	}
 	emit(server, event, payload_workspace, ws);
@@ -1315,7 +1351,7 @@ void vidow_ipc_emit_workspace(struct vidow_server *server, const char *event,
 
 void vidow_ipc_emit_output(struct vidow_server *server, const char *event,
 		struct wlr_output *output) {
-	if (!vidow_ipc_wanted(server) || output == NULL) {
+	if (!vidow_event_wanted(server, event) || output == NULL) {
 		return;
 	}
 	emit(server, event, payload_output, output);
@@ -1334,7 +1370,8 @@ static void payload_clipboard(struct jbuf *b, struct vidow_server *server,
 
 void vidow_ipc_emit_clipboard(struct vidow_server *server,
 		struct vidow_clip_selection *sel, const char *what) {
-	if (!vidow_ipc_wanted(server) || sel == NULL) {
+	if (!vidow_event_wanted(server, sel != NULL && sel->primary ?
+			"primary-changed" : "clipboard-changed") || sel == NULL) {
 		return;
 	}
 	struct clip_ev ev = {.sel = sel, .what = what};
@@ -1344,7 +1381,7 @@ void vidow_ipc_emit_clipboard(struct vidow_server *server,
 
 void vidow_ipc_emit_layer(struct vidow_server *server, const char *event,
 		struct vidow_layer_surface *ls) {
-	if (!vidow_ipc_wanted(server) || ls == NULL) {
+	if (!vidow_event_wanted(server, event) || ls == NULL) {
 		return;
 	}
 	emit(server, event, payload_layer, ls);
@@ -1357,14 +1394,14 @@ static void payload_column(struct jbuf *b, struct vidow_server *server,
 
 void vidow_ipc_emit_column(struct vidow_server *server, const char *event,
 		struct vidow_column *col) {
-	if (!vidow_ipc_wanted(server) || col == NULL) {
+	if (!vidow_event_wanted(server, event) || col == NULL) {
 		return;
 	}
 	emit(server, event, payload_column, col);
 }
 
 void vidow_ipc_emit_note(struct vidow_server *server, const char *event) {
-	if (!vidow_ipc_wanted(server)) {
+	if (!vidow_event_wanted(server, event)) {
 		return;
 	}
 	emit(server, event, NULL, NULL);

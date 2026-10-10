@@ -729,3 +729,48 @@ bool jget_double(const struct jval *obj, const char *key, double *out) {
 	*out = v->num;
 	return true;
 }
+
+/* 反过来：把一个解析出来的值写回文本。嵌套的原样写（IPC 的 emit 命令用：
+ * 调用方给的 data 原样转给订阅者和钩子）。循环引用不可能有 —— jparse 造出来的
+ * 是一棵树，深度上限也在解析那边管着。 */
+void jval_json(struct jbuf *b, const struct jval *v) {
+	if (v == NULL) {
+		jb_null(b);
+		return;
+	}
+	switch (v->t) {
+	case J_NULL:
+		jb_null(b);
+		break;
+	case J_BOOL:
+		jb_bool(b, v->b);
+		break;
+	case J_NUM: {
+		double d = v->num;
+		if (d == (double)(long long)d && d > -1e15 && d < 1e15) {
+			jb_int(b, (long long)d);
+		} else {
+			jb_double(b, d);
+		}
+		break;
+	}
+	case J_STR:
+		jb_str(b, v->str);
+		break;
+	case J_ARR:
+		jb_arr(b);
+		for (size_t i = 0; i < v->n; i++) {
+			jval_json(b, v->items[i]);
+		}
+		jb_arr_end(b);
+		break;
+	case J_OBJ:
+		jb_obj(b);
+		for (size_t i = 0; i < v->n; i++) {
+			jb_key(b, v->keys[i]);
+			jval_json(b, v->items[i]);
+		}
+		jb_obj_end(b);
+		break;
+	}
+}

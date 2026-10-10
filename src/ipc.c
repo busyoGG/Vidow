@@ -28,6 +28,7 @@
 #include <wlr/types/wlr_seat.h>
 #include <wlr/util/log.h>
 
+#include "hooks.h"
 #include "ipcstate.h"
 #include "json.h"
 #include "server.h"
@@ -1386,6 +1387,69 @@ static bool cmd_action(struct vidow_server *server, struct jval *req,
 	return true;
 }
 
+/* 配置里挂着的钩子（vidow.on）：谁在听哪个事件、跑过几次。 */
+static bool cmd_hooks(struct vidow_server *server, struct jval *req,
+		struct jbuf *out, char *err, size_t errlen) {
+	(void)req;
+	(void)err;
+	(void)errlen;
+	vidow_hooks_json(out, server);
+	return true;
+}
+
+/* 全部事件名（合起来就是「vidow 会发哪些事件」的权威清单）。 */
+static bool cmd_events(struct vidow_server *server, struct jval *req,
+		struct jbuf *out, char *err, size_t errlen) {
+	(void)server;
+	(void)req;
+	(void)err;
+	(void)errlen;
+	const char *const *names = NULL;
+	size_t n = vidow_event_names(&names);
+	jb_obj(out);
+	jb_kv_uint(out, "count", n);
+	jb_key(out, "events");
+	jb_arr(out);
+	for (size_t i = 0; i < n; i++) {
+		jb_str(out, names[i]);
+	}
+	jb_arr_end(out);
+	jb_obj_end(out);
+	return true;
+}
+
+/* 自己发一个事件：订阅者和钩子都会收到（名字随便起，data 原样带上）。
+ * 脚本之间、脚本和配置钩子之间的一条自定义通道。 */
+static bool cmd_emit(struct vidow_server *server, struct jval *req,
+		struct jbuf *out, char *err, size_t errlen) {
+	char text[256];
+	const char *event = jtext(req, "event", text, sizeof(text));
+	if (event == NULL || event[0] == '\0') {
+		snprintf(err, errlen, "要 event = \"my-event\"（名字随便起）");
+		return false;
+	}
+	struct jval *data = jget(req, "data");
+	/* 客户端可能把 data 当字符串传（"--data '{"a":1}"' 被引起来那种）：
+	 * 再解一次，能解就当 JSON 用 —— 订阅者和钩子拿到的才是字段而不是一串文本。 */
+	struct jval *parsed = NULL;
+	if (data != NULL && data->t == J_STR && data->str != NULL) {
+		char jerr[128] = "";
+		struct jval *again = jparse(data->str, jerr, sizeof(jerr));
+		if (again != NULL) {
+			parsed = again;
+			data = again;
+		}
+	}
+	vidow_ipc_emit_custom(server, event, data);
+	jfree(parsed);
+	jb_obj(out);
+	jb_kv_str(out, "event", event);
+	jb_kv_int(out, "subscribers", server->ipc_subscribers);
+	jb_kv_int(out, "hooks", vidow_hooks_matching(server, event));
+	jb_obj_end(out);
+	return true;
+}
+
 static bool cmd_set_config(struct vidow_server *server, struct jval *req,
 		struct jbuf *out, char *err, size_t errlen) {
 	char key_text[256];
@@ -2205,6 +2269,16 @@ static bool ipc_run(struct vidow_server *server, struct ipc_client *c,
 	if (strcmp(cmd, "action") == 0) {
 		return cmd_action(server, req, out, err, errlen);
 	}
+	/* 事件（见 hooks.c）：谁在听、有哪些事件、自己发一个 */
+	if (strcmp(cmd, "hooks") == 0) {
+		return cmd_hooks(server, req, out, err, errlen);
+	}
+	if (strcmp(cmd, "events") == 0) {
+		return cmd_events(server, req, out, err, errlen);
+	}
+	if (strcmp(cmd, "emit") == 0) {
+		return cmd_emit(server, req, out, err, errlen);
+	}
 	if (strcmp(cmd, "set_config") == 0) {
 		return cmd_set_config(server, req, out, err, errlen);
 	}
@@ -2495,6 +2569,14 @@ static int ipc_accept(int fd, uint32_t mask, void *data) {
 
 bool vidow_ipc_wanted(const struct vidow_server *server) {
 	return server != NULL && server->ipc_subscribers > 0;
+}
+
+bool vidow_event_wanted(const struct vidow_server *server, const char *event) {
+	if (vidow_ipc_wanted(server)) {
+		return true;
+	}
+	/* 没有订阅者，但配置里可能挂着钩子（vidow.on）：事件照样得发出来 */
+	return vidow_hooks_wanted(server, event);
 }
 
 void vidow_ipc_broadcast(struct vidow_server *server, const char *event,

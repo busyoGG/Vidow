@@ -1,3 +1,5 @@
+#include "hooks.h"
+#include "json.h"
 #include "server.h"
 #include "ipc.h"
 
@@ -266,6 +268,272 @@ static void restrict_stdlib(lua_State *L) {
 		lua_setfield(L, -2, "loadlib");
 	}
 	lua_pop(L, 1);
+}
+
+/* ------------------------------------------------------------ 事件钩子 */
+
+/* 一个 Lua 钩子的这次调用（见下面 l_on 和 vidow_script_hook_run）。
+ *
+ * 和配置文件那套协程一样能 await vidow.exec()（yield 一条命令、回来接着跑），但
+ * 两边的「跑完了干什么」不一样：配置跑完要 apply 整个配置，钩子跑完什么都不用
+ * 做。所以状态单独存一份，队列在 server->hook_calls 里。配置重载会换一代 Lua
+ * 状态，那些还挂着的调用跟着扔掉（命令本身由 vidow_exec_cancel_all 收掉）。 */
+static void script_sync_env_for_child(struct vidow_server *server);
+
+struct hook_call {
+	struct wl_list link;   /* vidow_server.hook_calls */
+	struct vidow_server *server;
+	int id;                /* 钩子的 id，只为日志（钩子本身可能已经没了） */
+	lua_State *L;          /* 主状态（协程在主状态的注册表里留着） */
+	lua_State *co;
+	int co_ref;
+	int nargs;
+	bool want_status;
+};
+
+bool vidow_script_alive(const struct vidow_server *server, void *lua_state) {
+	return server != NULL && server->script != NULL &&
+		server->script->L == lua_state;
+}
+
+void vidow_script_hook_unref(void *lua_state, int ref) {
+	if (lua_state != NULL && ref != 0) {
+		luaL_unref((lua_State *)lua_state, LUA_REGISTRYINDEX, ref);
+	}
+}
+
+/* JSON -> Lua 表：钩子的参数（和 IPC 订阅者看到的那条 JSON 同构，字段名一样）。 */
+static void json_to_lua(lua_State *L, const struct jval *v) {
+	switch (v->t) {
+	case J_NULL:
+		lua_pushnil(L);
+		break;
+	case J_BOOL:
+		lua_pushboolean(L, v->b);
+		break;
+	case J_NUM:
+		lua_pushnumber(L, v->num);
+		break;
+	case J_STR:
+		lua_pushstring(L, v->str != NULL ? v->str : "");
+		break;
+	case J_ARR:
+		lua_createtable(L, (int)v->n, 0);
+		for (size_t i = 0; i < v->n; i++) {
+			json_to_lua(L, v->items[i]);
+			lua_rawseti(L, -2, (lua_Integer)i + 1);
+		}
+		break;
+	case J_OBJ:
+		lua_createtable(L, 0, (int)v->n);
+		for (size_t i = 0; i < v->n; i++) {
+			json_to_lua(L, v->items[i]);
+			lua_setfield(L, -2, v->keys[i]);
+		}
+		break;
+	}
+}
+
+static void hook_call_free(struct hook_call *hc) {
+	wl_list_remove(&hc->link);
+	if (hc->L != NULL && hc->co_ref != 0) {
+		luaL_unref(hc->L, LUA_REGISTRYINDEX, hc->co_ref);
+	}
+	free(hc);
+}
+
+/* 配置重载 / 退出：还挂着的钩子调用全扔掉（Lua 状态要关，命令已经收过）。 */
+static void hook_calls_abort(struct vidow_server *server) {
+	struct hook_call *hc, *tmp;
+	wl_list_for_each_safe(hc, tmp, &server->hook_calls, link) {
+		hook_call_free(hc);
+	}
+}
+
+static void hook_call_resume(struct hook_call *hc);
+
+static void hook_call_done(void *data, const char *out, const char *errout,
+		int status, bool ok) {
+	struct hook_call *hc = data;
+	lua_State *co = hc->co;
+	if (hc->want_status) {
+		lua_pushstring(co, out != NULL ? out : "");
+		lua_pushinteger(co, ok ? status : -1);
+		lua_pushstring(co, errout != NULL ? errout : "");
+		hc->nargs = 3;
+	} else if (!ok || status != 0) {
+		char buf[512];
+		if (errout != NULL && errout[0] != '\0') {
+			snprintf(buf, sizeof(buf), "%s", errout);
+		} else {
+			snprintf(buf, sizeof(buf), "exit %d", status);
+		}
+		lua_pushnil(co);
+		lua_pushstring(co, buf);
+		hc->nargs = 2;
+	} else {
+		lua_pushstring(co, out != NULL ? out : "");
+		hc->nargs = 1;
+	}
+	hook_call_resume(hc);
+}
+
+static void hook_call_resume(struct hook_call *hc) {
+	int nres = 0;
+	int status = lua_resume(hc->co, NULL, hc->nargs, &nres);
+	hc->nargs = 0;
+
+	if (status == LUA_YIELD) {
+		/* vidow.exec()：yield 出来的是 (命令, 要不要状态) */
+		bool want_status = lua_toboolean(hc->co, -1) != 0;
+		size_t len = 0;
+		const char *cmd = lua_tolstring(hc->co, -2, &len);
+		lua_pop(hc->co, 2);
+		if (cmd == NULL || len == 0) {
+			hook_call_free(hc);
+			return;
+		}
+		char *copy = strndup(cmd, len);
+		if (copy == NULL) {
+			hook_call_free(hc);
+			return;
+		}
+		hc->want_status = want_status;
+		script_sync_env_for_child(hc->server);
+		/* 失败时 vidow_exec_run 会**先**调一次 hook_call_done（里面可能把 hc
+		 * 放掉了），所以这之后不能再碰 hc。 */
+		if (vidow_exec_run(hc->server, copy, hook_call_done, hc) == NULL) {
+			free(copy);
+			return;
+		}
+		free(copy);
+		return;
+	}
+
+	if (status != LUA_OK) {
+		const char *msg = lua_tostring(hc->co, -1);
+		wlr_log(WLR_ERROR, "钩子 #%d 出错：%s", hc->id,
+			msg != NULL ? msg : "unknown error");
+	}
+	hook_call_free(hc);
+}
+
+bool vidow_script_hook_run(struct vidow_server *server, struct vidow_hook *hook,
+		const char *json) {
+	struct vidow_script *s = server != NULL ? server->script : NULL;
+	if (s == NULL || s->L == NULL || hook == NULL) {
+		return false;
+	}
+	/* 上一代配置留下的钩子（Lua 状态已经换了）：不碰它 */
+	if (hook->lua_state != s->L || hook->lua_ref == 0) {
+		return false;
+	}
+	lua_State *L = s->L;
+	lua_rawgeti(L, LUA_REGISTRYINDEX, hook->lua_ref);
+	if (!lua_isfunction(L, -1)) {
+		lua_pop(L, 1);
+		return false;
+	}
+
+	struct hook_call *hc = calloc(1, sizeof(*hc));
+	lua_State *co = lua_newthread(L);
+	if (hc == NULL || co == NULL) {
+		lua_pop(L, 2); /* 函数 + 线程 */
+		free(hc);
+		return false;
+	}
+	hc->server = server;
+	hc->id = hook->id;
+	hc->L = L;
+	hc->co = co;
+	/* 线程得留个引用（不然被 GC 掉），函数搬进它的栈里当参数。 */
+	hc->co_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+	lua_xmove(L, co, 1);
+
+	struct jval *env = jparse(json, NULL, 0);
+	lua_newtable(co);
+	if (env != NULL) {
+		const char *fields[] = { "event", "time_ms", "data" };
+		for (size_t i = 0; i < 3; i++) {
+			const struct jval *v = jget(env, fields[i]);
+			if (v != NULL) {
+				json_to_lua(co, v);
+				lua_setfield(co, -2, fields[i]);
+			}
+		}
+	}
+	jfree(env);
+	/* 第二个参数：整条 JSON —— 以后事件加了字段，老配置也拿得到 */
+	lua_pushstring(co, json);
+
+	wl_list_insert(server->hook_calls.prev, &hc->link);
+	hc->nargs = 2;
+	hook_call_resume(hc); /* 里面有可能是同步跑完并 free(hc) */
+	return true;
+}
+
+/* 加钩子：vidow.on(事件, 命令字符串 或 函数)，也认一张表（一次挂好几个）。
+ * 返回 id（vidow.off 用）；给表就返回一串 id。 */
+static int hook_add_one(lua_State *L, struct vidow_script *s, const char *event,
+		int index) {
+	if (lua_type(L, index) == LUA_TSTRING) {
+		int id = vidow_hook_add_cmd(s->server, event,
+			lua_tostring(L, index));
+		if (id == 0) {
+			return luaL_error(L, "vidow.on('%s', …)：命令是空的 / "
+				"事件名太长", event);
+		}
+		lua_pushinteger(L, id);
+		return 1;
+	}
+	if (lua_type(L, index) == LUA_TFUNCTION) {
+		lua_pushvalue(L, index);
+		int ref = luaL_ref(L, LUA_REGISTRYINDEX);
+		int id = vidow_hook_add_lua(s->server, event, s->L, ref);
+		if (id == 0) {
+			luaL_unref(L, LUA_REGISTRYINDEX, ref);
+			return luaL_error(L, "vidow.on('%s', …)：挂不上", event);
+		}
+		lua_pushinteger(L, id);
+		return 1;
+	}
+	return luaL_error(L, "vidow.on('%s', …)：第二个参数得是命令字符串"
+		"（\"notify-send $VIDOW_APP_ID\"）或者一个函数", event);
+}
+
+static int l_on(lua_State *L) {
+	struct vidow_script *s = script_of(L);
+	const char *event = luaL_checkstring(L, 1);
+	if (lua_istable(L, 2)) {
+		lua_newtable(L);
+		int n = 0;
+		for (lua_pushnil(L); lua_next(L, 2) != 0; lua_pop(L, 1)) {
+			int idx = lua_absindex(L, -1);
+			hook_add_one(L, s, event, idx);
+			lua_rawseti(L, -3, ++n);
+		}
+		return 1;
+	}
+	return hook_add_one(L, s, event, 2);
+}
+
+static int l_off(lua_State *L) {
+	struct vidow_script *s = script_of(L);
+	lua_pushboolean(L, vidow_hook_remove(s->server,
+		(int)luaL_checkinteger(L, 1)));
+	return 1;
+}
+
+/* vidow.spawn("waybar")：撒手跑一条命令，不等它、不阻塞渲染、输出丢掉。
+ * vidow.exec() 的区别是不返回输出 —— 起常驻程序（状态栏、通知守护、输入法）用它。 */
+static int l_spawn(lua_State *L) {
+	const char *cmd = luaL_checkstring(L, 1);
+	if (cmd[0] == '\0') {
+		return luaL_error(L, "vidow.spawn('')：命令是空的");
+	}
+	vidow_exec_detached(cmd);
+	lua_pushboolean(L, 1);
+	return 1;
 }
 
 /* ------------------------------------------------------------ 工作区 / 键位 */
@@ -859,6 +1127,9 @@ static void register_api(struct vidow_script *s) {
 	} fns[] = {
 		{ "exec", l_exec },
 		{ "exec_status", l_exec_status },
+		{ "spawn", l_spawn },
+		{ "on", l_on },
+		{ "off", l_off },
 		{ "set", l_set },
 		{ "get", l_get },
 		{ "log", l_log },
@@ -1209,7 +1480,11 @@ void vidow_script_finish(struct vidow_server *server) {
 	}
 	server->script = NULL;
 	s->finished = true;
+	/* 钩子引用的是这个 Lua 状态里的函数：状态关掉之前先把手里的引用还回去
+	 * （vidow.on 声明的钩子跟着配置走 —— 重载 = 重新声明一遍）。 */
+	vidow_hooks_clear(server);
 	vidow_exec_cancel_all(server); /* drops the callbacks with the jobs */
+	hook_calls_abort(server);      /* 在等命令的那些钩子：状态要没了，扔掉 */
 	if (s->L != NULL) {
 		lua_close(s->L);
 	}
@@ -1300,6 +1575,7 @@ static int script_reload_signal(int signo, void *data) {
 }
 
 bool vidow_script_init(struct vidow_server *server) {
+	wl_list_init(&server->hook_calls);
 	server->reload_sig = wl_event_loop_add_signal(
 		wl_display_get_event_loop(server->display), SIGHUP,
 		script_reload_signal, server);

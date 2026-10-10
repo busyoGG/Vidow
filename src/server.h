@@ -1333,6 +1333,33 @@ struct vidow_frame_stats {
 };
 extern struct vidow_frame_stats vidow_stats;
 
+/* 一条事件钩子（config.lua 里的 vidow.on()，见 hooks.c / hooks.h）。
+ *
+ * lua = true 的那种拿 lua_ref 指着一个 Lua 函数（在那个 lua_State 的注册表里），
+ * 配置重载时整个 Lua 状态会重来一遍，所以那时钩子全部作废、重新声明（见
+ * vidow_script_finish）。 */
+struct vidow_hook {
+	struct wl_list link;      /* vidow_server.hooks */
+	int id;                   /* vidow.off() 的句柄（从 1 起，永不重用） */
+	bool lua;                 /* false = 起一条命令 */
+	bool dead;                /* 派发途中被摘了：跳过，遍历完统一回收 */
+	char event[64];           /* 事件名，或 "*" = 全部 */
+	char cmd[1024];           /* shell 命令（lua 那种是空的） */
+	void *lua_state;
+	int lua_ref;
+	uint64_t fired;           /* 跑过多少次（IPC {"cmd":"hooks"} 报出去） */
+	uint64_t last_ms;         /* 上次跑是什么时候 */
+};
+
+/* 等着派发的一个事件：事件名 + 信封 JSON（和给 IPC 订阅者的那条一模一样）。
+ * 钩子能做的事和 IPC 命令一样多，所以**不在合成的半路上跑**，一律进队等 idle
+ * （见 hooks.c 的 vidow_hooks_dispatch）。 */
+struct vidow_hook_event {
+	struct wl_list link;      /* vidow_server.hook_queue */
+	char *event;
+	char *json;
+};
+
 struct vidow_server {
 	struct wl_display *display;
 	struct wlr_backend *backend;
@@ -1587,6 +1614,18 @@ struct vidow_server {
 	struct wl_list ipc_clients;         /* ipc_client.link */
 	char ipc_path[PATH_MAX];            /* 实际在听的路径（空 = 没起来） */
 	int ipc_subscribers;                /* 订阅了事件的连接数 */
+
+	/* 事件钩子（见 hooks.c）：config.lua 里 vidow.on() 声明的那些。事件发出去
+	 * 的时候 IPC 订阅者和钩子一起喂（ipcstate.c 的 emit）。 */
+	struct wl_list hooks;               /* vidow_hook.link */
+	struct wl_list hook_queue;          /* vidow_hook_event.link（等派发） */
+	struct wl_event_source *hook_idle;
+	int hook_count;                     /* 现存的钩子数（0 = 快速通道） */
+	int hook_queue_len;
+	int hook_next_id;
+	int hook_dispatch_depth;            /* > 0 = 正在派发，摘钩子只标记不回收 */
+	/* 钩子里的 Lua 调用（在等 vidow.exec 的那种，见 script.c） */
+	struct wl_list hook_calls;
 	/* IPC 报给外面的稳定编号（从 1 起，0 = 还没分配） */
 	uint64_t next_view_id;
 	uint64_t next_column_id;
@@ -1787,6 +1826,19 @@ void vidow_config_sync(struct vidow_server *server);
 bool vidow_script_init(struct vidow_server *server);
 bool vidow_script_load(struct vidow_server *server);
 void vidow_script_finish(struct vidow_server *server);
+
+/* 事件钩子里的 Lua 那一半（实现在 script.c：Lua 状态机在那儿）。
+ *
+ * vidow_script_hook_run(): 跑一个 Lua 钩子，载荷是事件信封的 JSON（和给 IPC
+ * 订阅者的那条一样）：解码成 Lua 表当参数，协程里跑，钩子里能 await
+ * vidow.exec()（和配置文件里那套一样）。返回 false = 这次没跑起来（Lua 状态
+ * 已经换了代 / 函数不是函数 / 出错）。 */
+bool vidow_script_hook_run(struct vidow_server *server, struct vidow_hook *hook,
+		const char *json);
+/* 钩子没了：把 Lua 注册表里的引用还回去。 */
+void vidow_script_hook_unref(void *lua_state, int ref);
+/* 这个 lua_State 还是当前这一代配置的吗（配置重载会换一个）。 */
+bool vidow_script_alive(const struct vidow_server *server, void *lua_state);
 
 /* 配置文件一改就自动重载（inotify 盯目录 + stat 比对，见 configwatch.c）。
  * 失败只打日志：自动重载是锦上添花，SIGHUP 永远还在。

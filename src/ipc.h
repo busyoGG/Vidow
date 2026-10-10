@@ -29,6 +29,7 @@ struct vidow_column;
 struct vidow_clip_selection;
 struct vidow_layer_surface;
 struct vidow_workspace;
+struct jval;
 struct wlr_output;
 
 /* 建 socket、开始听（配置里 ipc = false 时什么都不做）。失败只打日志：IPC 坏了
@@ -46,6 +47,19 @@ const char *vidow_ipc_path(const struct vidow_server *server);
 
 /* 有订阅者吗？事件发射前先问一句，省得白建 JSON。 */
 bool vidow_ipc_wanted(const struct vidow_server *server);
+
+/* 这个事件有人要吗 —— IPC 订阅者**或者**配置里挂的钩子（vidow.on，见 hooks.c）。
+ * 事件发出来之前先问这个：没人要就别白建 JSON 了。 */
+bool vidow_event_wanted(const struct vidow_server *server, const char *event);
+
+/* 自定义事件：IPC 的 {"cmd":"emit","event":"名字","data":{…}}。名字由调用方定，
+ * data 原样带上（NULL 也行）。脚本之间、脚本和配置钩子之间的一条自定义通道：
+ *
+ *   vidowmsg emit my-event --data '{"hello":"world"}'
+ *   -- config.lua 里：vidow.on("my-event", "notify-send \"$VIDOW_HELLO\"")
+ */
+void vidow_ipc_emit_custom(struct vidow_server *server, const char *event,
+		const struct jval *data);
 
 /* 窗口事件：window-opened / window-title-changed / window-moved /
  * window-floating-changed / window-fullscreen-changed / window-workspace-changed

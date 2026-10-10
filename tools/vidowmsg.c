@@ -129,6 +129,21 @@ static void json_value(FILE *out, const char *v) {
 	json_escape(out, v);
 }
 
+/* data 例外：写 event-data 时给的是一段 JSON（{"hello":"world"}），原样搬进去 ——
+ * 引号包起来的话对面收到的就只是一串文本，字段一个都取不到。 */
+static void json_value_data(FILE *out, const char *v) {
+	size_t n = strlen(v);
+	while (n > 0 && (v[n - 1] == ' ' || v[n - 1] == '\t')) {
+		n--;
+	}
+	if (n >= 2 && ((v[0] == '{' && v[n - 1] == '}') ||
+			(v[0] == '[' && v[n - 1] == ']'))) {
+		fwrite(v, 1, n, out);
+		return;
+	}
+	json_value(out, v);
+}
+
 /* 一条命令的位置参数怎么摆进 JSON。 */
 static const char *positional_key(const char *cmd, int index) {
 	static const struct {
@@ -158,6 +173,7 @@ static const char *positional_key(const char *cmd, int index) {
 		{ "set-config", { "key", "value", NULL } },
 		{ "get-config", { "key", NULL } },
 		{ "config", { "key", NULL } },
+		{ "emit", { "event", NULL } },
 		{ "focus-column", { "direction", NULL } },
 		{ "move-column", { "direction", NULL } },
 		{ "focus-window-direction", { "direction", NULL } },
@@ -456,7 +472,11 @@ int main(int argc, char *argv[]) {
 				fputc(',', f);
 				json_escape(f, args[i].key);
 				fputc(':', f);
-				json_value(f, args[i].value);
+				if (strcmp(args[i].key, "data") == 0) {
+					json_value_data(f, args[i].value);
+				} else {
+					json_value(f, args[i].value);
+				}
 			}
 			for (int i = 0; i < n_positional; i++) {
 				if (strcmp(cmd, "action") == 0) {

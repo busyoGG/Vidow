@@ -150,6 +150,7 @@ sources = files(
   'src/decoration.c',
   'src/activation.c',
   'src/json.c',
+  'src/hooks.c',
   'src/ipc.c',
   'src/clipboard.c',
   'src/ipcstate.c',
