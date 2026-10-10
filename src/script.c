@@ -1348,8 +1348,32 @@ static void exec_once_note_ran(struct vidow_server *server, const char *cmd) {
 	server->exec_once_ran_n++;
 }
 
-/* 把这一轮配置里声明的 exec_once 落地：没起过的起掉，起过的（含上一轮的）跳过。 */
+/* 把这一轮配置里声明的 exec_once 落地：没起过的起掉，起过的（含上一轮的）跳过；
+ * 最后把「配置里已经删掉的那些」从名单里忘掉 —— 不然删删改改攒到 128 条上限之后
+ * 就再也记不住新命令了（那样会每重载一次起一次，最难受的那种）。 */
 static void exec_once_flush(struct vidow_server *server) {
+	/* 这一轮声明了哪些（下面「忘掉」按它判）。必须自己拷一份：下面起完就把队列项
+	 * 连同命令原文 free 了，指着它们比 = 读已释放的内存（tcache 的 next/key 正好
+	 * 盖在字符串头上，于是刚起的命令当场被判成「配置里没了」，重载就又起一遍 ——
+	 * 恰好是这个功能要防的那件事）。 */
+	char *declared[EXEC_ONCE_RAN_MAX];
+	size_t ndeclared = 0;
+	bool declared_complete = true;
+	struct vidow_exec_once *scan;
+	wl_list_for_each(scan, &server->exec_once, link) {
+		if (ndeclared == EXEC_ONCE_RAN_MAX) {
+			/* 声明的比名单记得下的还多：这一轮干脆什么都不忘 */
+			declared_complete = false;
+			break;
+		}
+		declared[ndeclared] = strdup(scan->cmd);
+		if (declared[ndeclared] == NULL) {
+			declared_complete = false;
+			break;
+		}
+		ndeclared++;
+	}
+
 	struct vidow_exec_once *item, *tmp;
 	wl_list_for_each_safe(item, tmp, &server->exec_once, link) {
 		wl_list_remove(&item->link);
@@ -1367,6 +1391,34 @@ static void exec_once_flush(struct vidow_server *server) {
 		exec_once_note_ran(server, item->cmd);
 		free(item->cmd);
 		free(item);
+	}
+
+	if (declared_complete) {
+		for (size_t i = 0; i < server->exec_once_ran_n;) {
+			bool still = false;
+			for (size_t k = 0; k < ndeclared; k++) {
+				if (strcmp(server->exec_once_ran[i], declared[k]) ==
+					0) {
+					still = true;
+					break;
+				}
+			}
+			if (still) {
+				i++;
+				continue;
+			}
+			wlr_log(WLR_DEBUG, "exec-once：%s 配置里没了，忘掉它",
+				server->exec_once_ran[i]);
+			free(server->exec_once_ran[i]);
+			memmove(&server->exec_once_ran[i],
+				&server->exec_once_ran[i + 1],
+				(server->exec_once_ran_n - i - 1) *
+					sizeof(*server->exec_once_ran));
+			server->exec_once_ran_n--;
+		}
+	}
+	for (size_t k = 0; k < ndeclared; k++) {
+		free(declared[k]);
 	}
 }
 
@@ -1441,6 +1493,14 @@ static void script_done(struct vidow_script *s, const char *why) {
 	s->finished = true;
 	if (why != NULL) {
 		wlr_log(WLR_ERROR, "config.lua: %s", why);
+		/* 事件：配置没跑成（写错了 / vidow.exec 里出的错）。状态栏 / 通知脚本
+		 * 靠它报出来；配置文件里挂的钩子这时候已经作废了，所以只有 IPC
+		 * 订阅者收得到 —— 这份配置自己声明的钩子当然也包括在内。 */
+		const struct vidow_event_field fields[] = {
+			VIDOW_EV_STR("error", why),
+			VIDOW_EV_END,
+		};
+		vidow_ipc_emit_simple(s->server, "config-failed", fields);
 	} else {
 		wlr_log(WLR_INFO, "config.lua: applied (%d command%s)", s->execs,
 			s->execs == 1 ? "" : "s");

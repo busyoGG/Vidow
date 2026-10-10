@@ -255,6 +255,28 @@ waitline "$RUNDIR/once.log" 1 && grep -aq "second-v2" "$RUNDIR/once.log" &&
 	pass "改了命令原文就是新命令（重载起了一次 second-v2）" \
 	|| fail "改了原文没起：$(cat "$RUNDIR/once.log" 2>/dev/null | tr '\n' ' ')"
 
+# ------------------------------------------- 5b) 配置里删掉的会「忘掉」
+mark "5b) exec-once：配置里删掉的命令会被忘掉（写回来会再起一次）"
+: > "$RUNDIR/once.log"
+cat > "$CFGDIRV/config.lua" <<EOF
+vidow.exec_once("echo third >> $RUNDIR/once.log")
+EOF
+waitline "$RUNDIR/once.log" 1
+grep -aq "^third$" "$RUNDIR/once.log" && pass "换成一条没见过的命令：起了" \
+	|| fail "新命令没起：$(tr '\n' ' ' < "$RUNDIR/once.log")"
+# 攒着不忘的话，名单满了之后就记不住新命令了（那样每重载起一次，最难受）
+grep -aq "exec-once：.*配置里没了，忘掉它" "$LOG" &&
+	pass "日志里说清了「配置里没了 → 忘掉」" \
+	|| fail "日志里没提忘掉：$(grep -a 'exec-once' "$LOG" | tail -3 | tr '\n' ' ')"
+# 把最开始那条原样写回来：它已经被忘掉了，所以应该**再起一次**
+cat > "$CFGDIRV/config.lua" <<EOF
+vidow.exec_once("echo once:\$TEST_MINE:\$TEST_ABSORB:\$TEST_ALREADY:\$WAYLAND_DISPLAY:\$VIDOW_SOCKET >> $RUNDIR/once.log")
+EOF
+waitline "$RUNDIR/once.log" 2
+grep -aq "^once:" "$RUNDIR/once.log" &&
+	pass "写回来之后又起了一次（先忘了才可能再起）" \
+	|| fail "写回来没起：$(tr '\n' ' ' < "$RUNDIR/once.log")"
+
 # ------------------------------------------------------------ 6) 开关
 mark "6) 两个开关（配置键 + 环境变量覆盖）"
 stop_vidow
