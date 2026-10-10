@@ -198,7 +198,7 @@ spawn_pattern a2
 BEFORE_A2=$(place_of a2)
 # a1 的 x 是 0 还是 6 取决于条带有没有滚动（两条列刚好比工作区宽一点点，
 # 焦点跟到右边那条时视口会滚 6 像素），所以这里只认 a2 的位置变化。
-check "640,6 634x708" "$BEFORE_A2" "a2 一开始在 a1 右边（640,6）"
+check "643,6 631x708" "$BEFORE_A2" "a2 一开始在 a1 右边（643 = 6+631+6）"
 
 ID1=$(win_id a1)
 ./build/vidowmsg minimize-window --id "$ID1" >/dev/null
@@ -206,7 +206,7 @@ sleep 0.8
 check "true" "$(win_field a1 minimized)" "a1 报 minimized=true"
 check "false" "$(win_field a1 visible)" "a1 不显示（visible=false）"
 check "true" "$(win_field a1 mapped)" "a1 客户端还活着（mapped=true）"
-check "6,6 634x708" "$(place_of a2)" "a2 滑到最左边（条带合拢：x 640 -> 6）"
+check "6,6 631x708" "$(place_of a2)" "a2 滑到最左边（条带合拢：x 643 -> 6）"
 check "false" "$(win_field a2 minimized)" "a2 没被牵连"
 if grep -aq "最小化: a1 收起" "$LOG"; then
 	pass "日志说了「最小化: a1 收起」"
@@ -300,7 +300,7 @@ mark "6) 整列都最小化：那条列从条带里消失"
 ./build/vidowmsg minimize-window --id "$(win_id a2)" >/dev/null
 sleep 0.8
 spawn_pattern a3
-check "6,6 634x708" "$(place_of a3)" "新窗口落在最左边（两条列都让出了位置）"
+check "6,6 631x708" "$(place_of a3)" "新窗口落在最左边（两条列都让出了位置）"
 check "true" "$(win_field a1 minimized)" "a1 还是收着的"
 check "true" "$(win_field a2 minimized)" "a2 还是收着的"
 

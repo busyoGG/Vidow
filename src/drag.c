@@ -623,7 +623,8 @@ void vidow_tile_grab_end(struct vidow_server *server) {
  * 宽度**（列宽的右边缘跟着光标走）。拖的过程里实时改 width_fraction + 重排，窗口
  * 跟着手走。
  *
- * 为什么只横向：vidow 的平铺尺寸模型里窗口宽 = 列宽（width_fraction × 可用宽）、
+ * 为什么只横向：vidow 的平铺尺寸模型里窗口宽 = 列宽（比例分的是连 gap 一起算的
+ * 那块区域，窗口 = 那块区域 - 一个 gap，见 server.h 的 vidow_column_width_px）、
  * 高永远是整块可用高 —— 没有「单个窗口的高度」这个概念（只有浮窗有自己的几何）。
  * 纵向拖动不改任何东西，松手也不留副作用。
  *
@@ -639,7 +640,8 @@ void vidow_tile_resize_begin(struct vidow_server *server,
 	}
 	struct wlr_box work = vidow_work_area(server, view->output);
 	int width = view->column->width > 0 ? view->column->width :
-		(int)(work.width * view->column->width_fraction);
+		vidow_column_width_px(&server->config, work.width,
+			view->column->width_fraction);
 	if (width < 1) {
 		return;
 	}
@@ -669,7 +671,10 @@ void vidow_tile_resize_update(struct vidow_server *server, double lx, double ly)
 	}
 	double want = (double)server->resize_from_width +
 		(lx - server->resize_from_x);
-	double fraction = want / (double)work.width;
+	/* 像素 → 比例：和 arrange 里那条（vidow_column_width_px）互逆，所以拖到
+	 * 哪儿右边缘就停在哪儿，不会因为 gap 而差一格。 */
+	double fraction = vidow_column_fraction_of_px(&server->config, work.width,
+		want);
 	if (fraction < 0.05) {
 		fraction = 0.05;
 	}

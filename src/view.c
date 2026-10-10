@@ -2022,10 +2022,10 @@ static void output_arrange(struct vidow_server *server,
 			col->offset = cursor;
 			continue;
 		}
-		int width = (int)(work.width * col->width_fraction);
-		if (width < 1) {
-			width = 1;
-		}
+		/* 比例 → 像素用 vidow_column_width_px（连 gap 一起分那块区域）：
+		 * 两条 0.5 连着中间的 gap 正好铺满可用区，不会多出一个 gap。 */
+		int width = vidow_column_width_px(&server->config, work.width,
+			col->width_fraction);
 		col->width = width;
 		col->offset = cursor;
 		/* 全屏的那条列在条带上占**一整屏**：它画出来就是整块屏那么大，让位 /

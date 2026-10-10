@@ -12,7 +12,9 @@
 #     往旁边滚一列它就整块滑出去、旁边的列并排露出来。以前它钉在屏幕上（不跟着条带走），
 #     怎么滚都糊在整块屏上，看着像「滚动对它没反应」。
 #
-# 判据（headless 1280x720 一块屏，gaps 10 → 工作区 10,10 1260x700；4 条列各 0.4 = 504 宽）：
+# 判据（headless 1280x720 一块屏，gaps 10 → 工作区 10,10 1260x700；4 条列各 0.4 档：
+# (1260+10)×0.4−10 = 498 宽 —— 比例分的是连 gap 一起算的那块区域，见 server.h 的
+# vidow_column_width_px）：
 #   1) 聚焦 A、Mod+F → A 的盒子 0,0 1280x720（**整块屏**，不是工作区 10,10 1260x700）；
 #      左下角那颗像素从壁纸色变成 A 的内容色 —— 贴到屏幕边上了，没有 gap 那圈缝
 #   2) 焦点右移一列 → A 滑到 -514（还是 1280x720、还可见），B 并排出现在 766；
@@ -195,23 +197,23 @@ start_client() { # <窗口标题>
 }
 
 # ------------------------------------------------------------ 0) 四条 0.4 宽的列
-mark "四条列各 0.4 宽（工作区 1260，所以每条 504）"
+mark "四条列各 0.4 宽（工作区 1260，所以每条 498）"
 for t in A B C D; do start_client "$t"; done
 for t in A B C D; do msg set-column-width 0.4 --title "$t"; done
 sleep 0.6
 
 read -r AX AY AW AH <<< "$(box A)"
-if [ "$AW" = 504 ] && [ "$AH" = 700 ] && [ "$AY" = 10 ]; then
-	pass "列宽 504、工作区高 700（A = $AX,$AY ${AW}x${AH}）"
+if [ "$AW" = 498 ] && [ "$AH" = 700 ] && [ "$AY" = 10 ]; then
+	pass "列宽 498、工作区高 700（A = $AX,$AY ${AW}x${AH}）"
 else
-	fail "工作区不是预想的 1260x700 / 列宽 504（A = $AX,$AY ${AW}x${AH}）—— 后面的数字全要重算"
+	fail "工作区不是预想的 1260x700 / 列宽 498（A = $AX,$AY ${AW}x${AH}）—— 后面的数字全要重算"
 fi
 
 # ------------------------------------------------------------ 1) 聚焦 A + 全屏：盖住整块屏
 mark "聚焦 A 再全屏：占的是整块屏，不是工作区"
 msg focus-window --title A
 sleep 0.6
-expect_box A "10 10 504 700" "聚焦 A：它在自己那条 504 宽的列里（左边就是那道 10px 的 gap）"
+expect_box A "10 10 498 700" "聚焦 A：它在自己那条 498 宽的列里（左边就是那道 10px 的 gap）"
 # 屏幕最左边那一竖条（x=4，取样窗开小一点）：没全屏时是 gap（黑背景），全屏之后是 A 的
 # 内容（红）—— 「贴到屏幕边上、没有 gap 那圈缝」靠这两条判。
 expect_not_color base 4 200 红 "基线：屏幕最左边是 gap（黑背景）" 6
@@ -229,8 +231,8 @@ expect_color content 300 100 红 "屏上是 A 的内容（左上象限红）"
 mark "焦点右移一列：A 滑出去、B 并排露出来（参与滚动）"
 msg focus-column 1
 sleep 0.8
-expect_box A "-514 0 1280 720" "A 跟着条带滑到 -514，尺寸还是整块屏"
-expect_box B "766 10 504 700" "B 并排出现在右半屏（766）"
+expect_box A "-508 0 1280 720" "A 跟着条带滑到 -508，尺寸还是整块屏"
+expect_box B "772 10 498 700" "B 并排出现在右半屏（772）"
 [ "$(visible A)" = "true" ] && pass "A 还画着（滑出去一半没被藏掉）" ||
 	fail "A 被藏了（visible=$(visible A)）—— 半块在屏里就该画"
 expect_color side-left 200 300 绿 "左边那块是 A 的尾巴（右上象限绿）"
@@ -240,10 +242,10 @@ expect_color side-right 900 300 红 "右边那块是 B（左上象限红）"
 mark "再往右滚：A 露出小半块 → 整块滚出屏 → 藏起"
 msg focus-column 1
 sleep 0.8
-expect_box A "-1028 0 1280 720" "A 露出小半块（-1028，右边缘到 252）"
+expect_box A "-1016 0 1280 720" "A 露出小半块（-1016，右边缘到 264）"
 msg focus-column 1
 sleep 0.8
-expect_box A "-1542 0 1280 720" "A 整块滚出屏（-1542，右边缘到 -262）"
+expect_box A "-1524 0 1280 720" "A 整块滚出屏（-1524，右边缘到 -244）"
 [ "$(visible A)" = "false" ] && pass "滚出屏的 A 藏起来了（visible=false）" ||
 	fail "A 还在画（visible=$(visible A)）—— 屏外那块会落到隔壁显示器上"
 grep -aq "workspace: A 藏起（停到屏外）" "$LOG" && pass "日志里写着「A 藏起（停到屏外）」" ||
@@ -264,16 +266,16 @@ expect_color back 4 200 红 "还是贴着屏幕左边（缝还是没的）" 6
 mark "退全屏：列宽回到 0.4，后面的列合拢"
 msg toggle-fullscreen --title A
 sleep 0.8
-expect_box A "10 10 504 700" "退出全屏的 A 回到 0.4 宽的列"
-expect_box B "524 10 504 700" "B 跟着合拢（从 766 回到 524）"
+expect_box A "10 10 498 700" "退出全屏的 A 回到 0.4 宽的列"
+expect_box B "518 10 498 700" "B 跟着合拢（从 772 回到 518）"
 grep -aq "全屏: A 关" "$LOG" && pass "日志里写着「全屏: A 关」" ||
 	fail "日志里没有退全屏那行：$(grep -a '全屏:' "$LOG" | tail -2 | tr '\n' ' ')"
 expect_not_color gapback 4 200 红 "退全屏之后屏幕左边又是 gap（壁纸色）" 6
 
 # ------------------------------------------------------------ 6) 滑出去那半块裁在自己那块屏里
 mark "滑出屏外那半块裁在自己那块屏里"
-grep -aq "clip: A 裁到自己那块屏里（屏框 0,0 1280x720，窗口 -514,0 1280x720）" "$LOG" &&
-	pass "日志里写着 A 裁到自己那块屏里（窗口 -514,0 1280x720）" ||
+grep -aq "clip: A 裁到自己那块屏里（屏框 0,0 1280x720，窗口 -508,0 1280x720）" "$LOG" &&
+	pass "日志里写着 A 裁到自己那块屏里（窗口 -508,0 1280x720）" ||
 	fail "日志里没有那条裁剪：$(grep -a 'clip: A' "$LOG" | tail -3 | tr '\n' '|')"
 
 # ------------------------------------------------------------ 7) 客户端自己请求全屏
@@ -282,7 +284,7 @@ mark "客户端自己要的全屏（preinit --after-commit --fullscreen：OBS �
 # 后面去（那它左边那条列就不是 D 了，下面按条带算的数字全错）。
 msg focus-window --title D
 sleep 0.6
-expect_box D "766 10 504 700" "先把焦点放最后一条列上（新窗口的列插在它后面）"
+expect_box D "772 10 498 700" "先把焦点放最后一条列上（新窗口的列插在它后面）"
 ./build/preinit --after-commit --fullscreen --linger=60 preinit E \
 	> "$RUNDIR/preinit.out" 2>&1 &
 CLIENT_PIDS="$CLIENT_PIDS $!"
@@ -303,8 +305,8 @@ expect_box E "0 0 1280 720" "客户端要的全屏同样盖住整块屏（它是
 
 msg focus-column -1
 sleep 0.8
-expect_box E "514 0 1280 720" "焦点左移一列：全屏的 E 跟着条带往右滑（514）"
-expect_box D "10 10 504 700" "D 回到它自己那条列（10）"
+expect_box E "508 0 1280 720" "焦点左移一列：全屏的 E 跟着条带往右滑（508）"
+expect_box D "10 10 498 700" "D 回到它自己那条列（10）"
 [ "$(visible E)" = "true" ] && pass "滑出去半块的 E 还画着" ||
 	fail "E 被藏了（visible=$(visible E)）"
 

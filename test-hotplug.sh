@@ -284,8 +284,9 @@ if all(t in b for t in tiles) and all(t in a for t in tiles):
               for i in range(2)]
     check(gaps_b == gaps_a, "列与列之间的间距没变（%s -> %s）" % (gaps_b, gaps_a))
     widths = sorted({b[t][2] for t in tiles})
-    check(max(widths) == 845 and min(widths) == 634,
-          "Mod+R 改过的那一列宽度还在（宽度 %s：焦点那列 2/3 = 845，其余 634）"
+    check(max(widths) == 843 and min(widths) == 631,
+          "Mod+R 改过的那一列宽度还在（宽度 %s：焦点那列 2/3 = (1268+6)×2/3−6 = 843，"
+          "其余 0.5 档 = 631）"
           % widths)
 
     moved = all(a[t][0] - b[t][0] == shift for t in tiles)

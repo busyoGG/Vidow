@@ -296,6 +296,33 @@ static inline int vidow_gap_inner(const struct vidow_config *cfg) {
 	return vidow_gap_resolve(cfg->gaps_inner, cfg->gaps);
 }
 
+/* 列宽：比例 → 像素。niri 的 resolve_column_width：
+ *     width = (working_area.w - gaps) * proportion - gaps
+ * —— 比例分的是**连 gap 一起算**的那块区域，窗口 = 那块区域减掉一个内部 gap。
+ * niri 的 working_area 没有预先扣 gap，vidow 的可用区（vidow_work_area）已经把
+ * 左右两道 gap 扣掉了，同一个式子换算过来就是 (可用宽 + gap) * 比例 - gap：
+ * 两者一模一样，只是坐标系差着左右各一个 gap。
+ *
+ * 这么分的好处：Σ比例 = 1 时，几条列连着中间的 gap 正好铺满可用区 —— 两条 0.5
+ * 不会被 gap 挤出去一格（以前宽 = 可用宽 × 比例，两条 0.5 加起来比可用区多一个
+ * gap，得滚动才看得全第二条）。纵向本来就没这个问题：n 块窗口的高度是
+ * (可用高 - (n-1) * gap) / n，从第一天起就是这么分的。 */
+static inline int vidow_column_width_px(const struct vidow_config *cfg,
+		int work_width, double fraction) {
+	int inner = vidow_gap_inner(cfg);
+	int w = (int)((work_width + inner) * fraction) - inner;
+	return w > 1 ? w : 1;
+}
+
+/* 上面那条的逆（拖动改宽：像素 → 比例）。niri 的 set_column_width 里
+ * proportion = (px + gaps) / (working_area.w - gaps) 是同一个式子的另一头。 */
+static inline double vidow_column_fraction_of_px(const struct vidow_config *cfg,
+		int work_width, double px) {
+	int inner = vidow_gap_inner(cfg);
+	int full = work_width + inner;
+	return full > 0 ? (px + inner) / (double)full : 1.0;
+}
+
 /* --------------------------------------------------------------- animation */
 
 /* One running animation. Progress comes from CLOCK_MONOTONIC. */

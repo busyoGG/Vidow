@@ -8,9 +8,15 @@
 #   4) 单边（gaps_left / gaps_top…）只改那一边，-1 回到跟随统一值
 #   5) 同列两个窗口的纵向间距 = gaps_inner（单列时列宽还是 50%）
 #   6) 负值当 0（负 gap 会让工作区比屏幕还大）
+#   7) 两条 50% 连着中间的 gap **正好铺满**可用区（第二条的右边缘贴到右边距）——
+#      以前列宽 = 可用宽 × 比例，两条 50% 加起来比可用区多一个 gap，第二条得滚一下
+#      才看得全（用户报的「两个 50 50 的窗口会因为 gap 导致一个屏装不下」）
 #
 # 模型（输出 1280x720、scale=1、两列各 50%）：
-#   可用区 = 输出 - 四边 gap；列宽 = floor(可用宽 / 2)；列间距 = 列宽 + 内间距
+#   可用区 = 输出 - 四边 gap；**比例分的是连 gap 一起算的那块区域**，窗口 = 那块
+#   区域 - 一个内间距（niri 的 resolve_column_width，见 server.h 的
+#   vidow_column_width_px）：列宽 = floor((可用宽 + 间距) / 2) - 间距，列间距 = 间距。
+#   所以两条 50% 连着中间的 gap 正好铺满可用区（这是这个测试的判据 7）。
 # 注意：geometry 是**滚动之后**的位置，所以断言只看列间距、y、宽高这些跟滚动无关
 # 的量，不去猜滚动量。
 set -u
@@ -158,16 +164,19 @@ a, b = w["w1"], w["w2"]
 # 两列时的 x 是滚动之后的位置，边距只能从宽高反推（640 = 1280/2 的列宽）
 check(a["y"] == 6 and a["height"] == 708,
 	"默认离屏幕边 6px（列高 708 = 720-12、y=6）")
-check(a["width"] == 634, "默认列宽 634（= (1280-12)/2）")
+check(a["width"] == 631, "默认列宽 631（= (1268+6)/2 - 6）")
 check((b["x"] - a["x"]) - a["width"] == 6,
 	"默认列间距 6px（相邻列 x 差 %d，列宽 %d）" % (b["x"] - a["x"], a["width"]))
+check(b["x"] + b["width"] == 1280 - 6,
+	"两条 50%% 正好装进一屏：第二条右边缘贴到右边距（%d + %d = %d，期望 %d）"
+	% (b["x"], b["width"], b["x"] + b["width"], 1280 - 6))
 
 # gaps_inner 20：只有列间距变，屏幕边不动
 w = load("s-inner20.json")
 a, b = w["w1"], w["w2"]
 check((b["x"] - a["x"]) - a["width"] == 20,
 	"gaps_inner 20 → 列间距 20px（%d）" % ((b["x"] - a["x"]) - a["width"]))
-check(a["y"] == 6 and a["height"] == 708 and a["width"] == 634,
+check(a["y"] == 6 and a["height"] == 708 and a["width"] == 624,
 	"gaps_inner 不影响离屏幕边（y=%d h=%d w=%d）"
 	% (a["y"], a["height"], a["width"]))
 
@@ -177,8 +186,8 @@ a, b = w["w1"], w["w2"]
 check(a["y"] == 16 and a["height"] == 688,
 	"gaps 16 → 离屏幕边 16px、列高 720-32 = 688（y=%d h=%d）"
 	% (a["y"], a["height"]))
-check(a["width"] == 624 and (b["x"] - a["x"]) - a["width"] == 16,
-	"gaps 16 → 列宽 624、列间距 16（w=%d 间距=%d）"
+check(a["width"] == 616 and (b["x"] - a["x"]) - a["width"] == 16,
+	"gaps 16 → 列宽 616、列间距 16（w=%d 间距=%d）"
 	% (a["width"], (b["x"] - a["x"]) - a["width"]))
 
 # gaps 40：列宽 (1280-80)/2 = 600、列高 640
@@ -186,7 +195,7 @@ w = load("s-gaps40.json")
 a, b = w["w1"], w["w2"]
 check(a["y"] == 40 and a["height"] == 640,
 	"gaps 40 → 离屏幕边 40、列高 640（y=%d h=%d）" % (a["y"], a["height"]))
-check(a["width"] == 600, "gaps 40 → 列宽 600（= (1280-80)/2）")
+check(a["width"] == 580, "gaps 40 → 列宽 580（= (1200+40)/2 - 40）")
 check((b["x"] - a["x"]) - a["width"] == 40,
 	"gaps 40 → 列间距 40px（%d）" % ((b["x"] - a["x"]) - a["width"]))
 
@@ -201,7 +210,7 @@ tg, bg = stacked("s-stack6.json")
 check(tg["x"] == bg["x"], "并进同一列后 x 相同（%d / %d）" % (tg["x"], bg["x"]))
 check(bg["y"] - (tg["y"] + tg["height"]) == 6,
 	"同列纵向间距 6px（%d）" % (bg["y"] - (tg["y"] + tg["height"])))
-check(tg["width"] == 634, "单列还是占一半（列宽 %d）" % tg["width"])
+check(tg["width"] == 631, "单列还是占一半（列宽 %d）" % tg["width"])
 check(tg["y"] == 6 and tg["height"] == 351,
 	"gaps 6 → 每格高 (708-6)/2 = 351、起点 y=6（h=%d y=%d）" % (tg["height"], tg["y"]))
 
@@ -224,8 +233,8 @@ def one_col(name):
 
 top, bot = one_col("s-side-left.json")
 check(top["x"] == 40, "gaps_left 40 → 窗口左边距 40px（%d）" % top["x"])
-check(top["width"] == 617,
-	"左边距 40 后列宽 = (1280-40-6)/2 = 617（%d）" % top["width"])
+check(top["width"] == 614,
+	"左边距 40 后列宽 = (1234+6)/2 - 6 = 614（%d）" % top["width"])
 check(top["y"] == 6 and top["height"] == 351,
 	"上下没设，还是统一值 6（y=%d h=%d）" % (top["y"], top["height"]))
 
@@ -233,12 +242,12 @@ top, bot = one_col("s-side-top.json")
 check(top["y"] == 30, "gaps_top 30 → 窗口上边距 30px（%d）" % top["y"])
 check(top["height"] == 339, "上边距 30 后每格高 = (720-30-6-6)/2 = 339（%d）"
 	% top["height"])
-check(top["x"] == 40 and top["width"] == 617,
-	"左边距 40、列宽 617 不受影响（x=%d w=%d）" % (top["x"], top["width"]))
+check(top["x"] == 40 and top["width"] == 614,
+	"左边距 40、列宽 614 不受影响（x=%d w=%d）" % (top["x"], top["width"]))
 
 top, bot = one_col("s-side-back.json")
-check(top["x"] == 6 and top["width"] == 634,
-	"gaps_left -1 回到跟随统一值 → 左边距 6、列宽 634（x=%d w=%d）"
+check(top["x"] == 6 and top["width"] == 631,
+	"gaps_left -1 回到跟随统一值 → 左边距 6、列宽 631（x=%d w=%d）"
 	% (top["x"], top["width"]))
 check(top["y"] == 30, "gaps_top 30 仍然生效（y=%d）" % top["y"])
 

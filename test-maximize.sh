@@ -6,7 +6,7 @@
 # 判据（headless 1280x720 一块屏 + pattern / preinit 客户端）：
 #   1) IPC toggle-maximize-column：列 JSON 报 maximized=true、width_fraction 1.0、
 #      width = 工作区宽 1268，窗口的 place 行跟着变成整块工作区
-#   2) 再按一次：回到原来的 0.5（634），place 也回来
+#   2) 再按一次：回到原来的 0.5（631 = (1268+6)×0.5−6），place 也回来
 #   3) 记住的是**原比例**：先 set-column-width 0.25，最大化再还原 -> 回到 0.25
 #   4) 手动改宽度 = 退出最大化状态：cycle-column-width / set-column-width /
 #      expand-column-to-available-width 都把 maximized 按掉
@@ -219,13 +219,13 @@ PY
 }
 
 # ---------------------------------------------------------------- 基本行为
-mark "1) 列最大化：整列撑满工作区（0.5 x 1268 -> 1268）"
+mark "1) 列最大化：整列撑满工作区（0.5 档 631 -> 1268）"
 start_vidow false
 spawn_pattern a1
 check "false" "$(col_field a1 maximized)" "一开始不是最大化的"
 check "0.5" "$(col_field a1 width_fraction)" "一开始是默认的 0.5"
-check "634" "$(col_field a1 width)" "列宽 = 0.5 x 1268 = 634"
-check "6,6 634x708" "$(place_of a1)" "窗口占半宽（6,6 634x708）"
+check "631" "$(col_field a1 width)" "列宽 = (1268+6) x 0.5 - 6 = 631"
+check "6,6 631x708" "$(place_of a1)" "窗口占半宽（6,6 631x708）"
 if ./build/vidowmsg toggle-maximize-column >/dev/null 2>&1; then
 	pass "IPC toggle-maximize-column 成功"
 else
@@ -242,7 +242,7 @@ mark "2) 再按一次：还原成原来那个比例"
 sleep 0.5
 check "false" "$(col_field a1 maximized)" "还原了"
 check "0.5" "$(col_field a1 width_fraction)" "比例回到 0.5"
-check "6,6 634x708" "$(place_of a1)" "窗口回到半宽"
+check "6,6 631x708" "$(place_of a1)" "窗口回到半宽"
 
 mark "3) 记住的是原比例，不是写死的 0.5"
 ./build/vidowmsg set-column-width 0.25 >/dev/null 2>&1
@@ -254,7 +254,7 @@ check "1" "$(col_field a1 width_fraction)" "最大化之后是满宽"
 ./build/vidowmsg toggle-maximize-column >/dev/null 2>&1
 sleep 0.4
 check "0.25" "$(col_field a1 width_fraction)" "还原回 0.25（不是 0.5）"
-check "317" "$(col_field a1 width)" "列宽 0.25 x 1268 = 317"
+check "312" "$(col_field a1 width)" "列宽 (1268+6) x 0.25 - 6 = 312"
 
 mark "4) 手动改宽度 = 退出最大化状态"
 ./build/vidowmsg toggle-maximize-column >/dev/null 2>&1
@@ -367,7 +367,7 @@ for _ in $(seq 1 30); do
 done
 sleep 0.6
 check "false" "$(col_field p4 maximized)" "它自己撤销：列还原了"
-check "634" "$(col_field p4 width)" "列宽回到 0.5 x 1268 = 634"
+check "631" "$(col_field p4 width)" "列宽回到 0.5 档 = 631"
 check "no" "$(conf_after "$P4" "preinit request unmaximize")" "撤销之后收到的 configure 不带 maximized"
 
 # ---------------------------------------------------------------- 事件 / 报错
@@ -441,7 +441,7 @@ else
 		wmctrl -i -r "$XWID" -b remove,maximized_vert,maximized_horz 2>/dev/null
 		sleep 1.2
 		check "false" "$(col_field xp-popup maximized)" "X 客户端撤销 -> 列还原"
-		check "634" "$(col_field xp-popup width)" "列宽回到 634"
+		check "631" "$(col_field xp-popup width)" "列宽回到 631"
 		XPROP2=$(xprop -id "$XWID" _NET_WM_STATE 2>/dev/null)
 		case "$XPROP2" in
 		*_NET_WM_STATE_MAXIMIZED_VERT*) fail "X 那边的 MAXIMIZED_VERT 没撤掉（$XPROP2）" ;;

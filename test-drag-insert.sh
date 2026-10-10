@@ -17,7 +17,8 @@
 # 走的是和真实输入完全同一条路（vidow_pointer_motion / vidow_pointer_button）。
 #
 # 坐标都是算出来的：一块 1280x720 的屏、gaps 10 → 可用区 10,10 1260x700；
-# 每条列 0.3 → 378 宽，三条列就是 10 / 398 / 786，不滚动（视口恒为 0）。
+# 每条列 0.3 → 371 宽（= (可用宽 1260 + gap 10) × 0.3 − 10，见 server.h 的
+# vidow_column_width_px），三条列就是 10 / 391 / 772，不滚动（视口恒为 0）。
 #
 # 用法：./test-drag-insert.sh    （VIDOW_TEST_KEEP=1 保留运行目录）
 set -u
@@ -92,7 +93,7 @@ print(len(json.load(sys.stdin)))'
 }
 # 一条窗口的几何，拼成 "x,y,w,h" 方便比
 geom() { echo "$(field "$1" 4),$(field "$1" 5),$(field "$1" 6),$(field "$1" 7)"; }
-# 布置一个窗口：起一个 pattern 窗口，把它的列宽设成 0.3（378 宽）
+# 布置一个窗口：起一个 pattern 窗口，把它的列宽设成 0.3（371 宽）
 spawn() {
 	python3 ./tools/pattern.py "$1" >/dev/null 2>&1 &
 	CLIENT_PIDS="$CLIENT_PIDS $!"
@@ -115,28 +116,28 @@ start_drag() { # $1 = 标题, $2 = 目标 x, $3 = 目标 y, $4 = 抓点 dx, $5 =
 }
 release() { act "pointer-button left release mod" 0.7; }
 
-echo "== 准备：三条列、每条列一个窗口（378 宽 = 可用宽 1260 的 0.3）=="
+echo "== 准备：三条列、每条列一个窗口（371 宽 = (1260+10)×0.3−10）=="
 spawn w1
 spawn w2
 spawn w3
-if [ "$(cols)" = "3" ] && [ "$(field w1 4)" = "10" ] && [ "$(field w2 4)" = "398" ] &&
-		[ "$(field w3 4)" = "786" ]; then
-	pass "三条列并排在 10 / 398 / 786（各 378x700）"
+if [ "$(cols)" = "3" ] && [ "$(field w1 4)" = "10" ] && [ "$(field w2 4)" = "391" ] &&
+		[ "$(field w3 4)" = "772" ]; then
+	pass "三条列并排在 10 / 391 / 772（各 371x700）"
 else
 	fail "布局不对：w1=$(geom w1) w2=$(geom w2) w3=$(geom w3) 列数=$(cols)"
 fi
-if [ "$(geom w1)" = "10,10,378,700" ]; then
+if [ "$(geom w1)" = "10,10,371,700" ]; then
 	pass "w1 占满整条列高：$(geom w1)"
 else
-	fail "w1 的几何不对：$(geom w1)（期望 10,10,378,700）"
+	fail "w1 的几何不对：$(geom w1)（期望 10,10,371,700）"
 fi
 
 echo
 echo "== 右边那条缝也算数：拖到 w1 那条列的**右半边**（离右边那条缝更近） =="
 # niri 的 vert_dist 量的是「到**最近一条列左边缘**的距离」（column_xs 里最近的
 # 那个），左右两边的缝都算 —— 光标在 w1 那条列（10..388）的右半边时，最近的缝是
-# w2 那条列的左边缘 398，也就是「插到 w1 和 w2 中间」，不是「并进 w1 那条列」。
-# 光标 (350,200) → 到 398 只有 43，到 w1 的上边缘 195 → 43 < 195 → 新开一条列。
+# w2 那条列的左边缘 391，也就是「插到 w1 和 w2 中间」，不是「并进 w1 那条列」。
+# 光标 (350,200) → 到 391 只有 41，到 w1 的上边缘 190 → 41 < 190 → 新开一条列。
 grim -o HEADLESS-1 "$SHOT/before-right-gap.png" 2>/dev/null
 start_drag w3 350 200 20 20
 grim -o HEADLESS-1 "$SHOT/right-gap.png" 2>/dev/null
@@ -147,15 +148,15 @@ if grep -aq "grab: w3 在 HEADLESS-1 的第 1 块工作区里挪到第 2 位" "$
 else
 	fail "没有插到中间那条缝的日志（$(grep -a 'grab:' "$LOG" | tail -1)）"
 fi
-if [ "$(field w3 4)" = "398" ] && [ "$(field w2 4)" = "786" ]; then
-	pass "w3 那条列插到了 w1 和 w2 中间：w3 x 786→398，w2 x 398→786"
+if [ "$(field w3 4)" = "391" ] && [ "$(field w2 4)" = "772" ]; then
+	pass "w3 那条列插到了 w1 和 w2 中间：w3 x 772→391，w2 x 391→772"
 else
-	fail "顺序不对：w3 x=$(field w3 4)（期望 398），w2 x=$(field w2 4)（期望 786）"
+	fail "顺序不对：w3 x=$(field w3 4)（期望 391），w2 x=$(field w2 4)（期望 772）"
 fi
 
 echo
 echo "== 插进 w3 那条列：拖到那条列的**上边缘**（离窗口缝比离列左边缘近） =="
-# 光标 (698,40)：目标列（中间那条，w3 在 398）宽 378 → 到左右两条缝都远（305 / 83），
+# 光标 (698,40)：目标列（中间那条，w3 在 391）宽 371 → 到左右两条缝都远（307 / 74），
 # 列里只有 w3 一个窗口，缝在 y=10 和 y=720 → 到上缝 35。35 < 83 → 进列。
 grim -o HEADLESS-1 "$SHOT/before-into-top.png" 2>/dev/null
 start_drag w1 698 40 $GRAB_DX $GRAB_DY
@@ -167,16 +168,16 @@ if grep -aq "grab: w1 插进 HEADLESS-1 的一条列里的第 1 位" "$LOG"; the
 else
 	fail "没有插进列的日志（$(grep -a 'grab:' "$LOG" | tail -1)）"
 fi
-# w1 原来那条列空了就没了，剩下的两条列并到 10 / 398：w1、w3 在同一条列里对半劈
-if [ "$(geom w1)" = "10,10,378,345" ]; then
+# w1 原来那条列空了就没了，剩下的两条列并到 10 / 391：w1、w3 在同一条列里对半劈
+if [ "$(geom w1)" = "10,10,371,345" ]; then
 	pass "w1 插到了那条列的最上面（高度对半劈）：$(geom w1)"
 else
-	fail "w1 的几何不对：$(geom w1)（期望 10,10,378,345）"
+	fail "w1 的几何不对：$(geom w1)（期望 10,10,371,345）"
 fi
-if [ "$(geom w3)" = "10,365,378,345" ]; then
+if [ "$(geom w3)" = "10,365,371,345" ]; then
 	pass "w3 被挤到下半截：$(geom w3)"
 else
-	fail "w3 的几何不对：$(geom w3)（期望 10,365,378,345）"
+	fail "w3 的几何不对：$(geom w3)（期望 10,365,371,345）"
 fi
 if [ "$(cols)" = "2" ]; then
 	pass "列数 3 → 2（w1 原来那条空列拆掉了）"
@@ -186,7 +187,7 @@ fi
 
 echo
 echo "== 新开一条列：拖到列带最左边（外层 gap 里，离列左边缘最近） =="
-# 从 w2（398,10 378x700）的左上角起拖，拖到 x=2 → 光标在列带左边那条之外 →
+# 从 w2（391,10 371x700）的左上角起拖，拖到 x=2 → 光标在列带左边那条之外 →
 # niri 的 `x < 0 → NewColumn(0)`：w2 那条列插到最前面
 start_drag w2 2 360 20 20
 grim -o HEADLESS-1 "$SHOT/new-column.png" 2>/dev/null
@@ -197,16 +198,16 @@ if grep -aq "grab: w2 在 HEADLESS-1 的第 1 块工作区里挪到第 1 位" "$
 else
 	fail "没有新列的日志（$(grep -a 'grab:' "$LOG" | tail -1)）"
 fi
-if [ "$(field w2 4)" = "10" ] && [ "$(field w1 4)" = "398" ]; then
-	pass "那条列插到了最前面：w2 x=10，w1/w3 那条列让到 398"
+if [ "$(field w2 4)" = "10" ] && [ "$(field w1 4)" = "391" ]; then
+	pass "那条列插到了最前面：w2 x=10，w1/w3 那条列让到 391"
 else
-	fail "顺序不对：w2 x=$(field w2 4)（期望 10），w1 x=$(field w1 4)（期望 398）"
+	fail "顺序不对：w2 x=$(field w2 4)（期望 10），w1 x=$(field w1 4)（期望 391）"
 fi
 
 echo
 echo "== 插进两个窗口的那条列：拖到那条列的**下边缘**（离下面的缝最近） =="
-# 现在 w2 在 10（378x700），w1/w3 那条列在 398（两个 345 高）。光标 (698,700)：
-# 目标列在 398 → 到左右两条缝 305 / 83；缝在 y=10、365、720 → 到最下面那个 15。
+# 现在 w2 在 10（371x700），w1/w3 那条列在 391（两个 345 高）。光标 (698,700)：
+# 目标列在 391 → 到左右两条缝 307 / 74；缝在 y=10、365、720 → 到最下面那个 20。
 # 15 < 83 → 进列。
 grim -o HEADLESS-1 "$SHOT/before-into-bottom.png" 2>/dev/null
 start_drag w2 698 700 20 20
@@ -218,10 +219,10 @@ if grep -aq "grab: w2 插进 HEADLESS-1 的一条列里的第 3 位" "$LOG"; the
 else
 	fail "插进列第 3 位的日志没出现（$(grep -a 'grab:' "$LOG" | tail -1)）"
 fi
-if [ "$(geom w2)" = "10,482,378,226" ]; then
+if [ "$(geom w2)" = "10,482,371,226" ]; then
 	pass "被拖的那个落在最下面、三个窗口三等分（(700-2×10)/3 = 226）：w2 = $(geom w2)"
 else
-	fail "w2 的几何不对：$(geom w2)（期望 10,482,378,226）"
+	fail "w2 的几何不对：$(geom w2)（期望 10,482,371,226）"
 fi
 if [ "$(cols)" = "1" ]; then
 	pass "三个窗口都在同一条列里（列数 2 → 1）"
@@ -285,8 +286,8 @@ def plateau(p):
 # 被拖的那个窗口和光标 —— 底下的颜色无所谓，混色那个式子跟它无关。
 
 # 1) 插进中间那条列（贴那条列上边缘）：预览块是那条列顶上的一条横条
-#    （398,10 378x150，niri 的 InColumn 第 0 位）。量 (480,120)：全程在窗口内容里
-#    （标题栏 ~40px 之下）；被拖的 w1 这会儿在 598..976，够不着。
+#    （391,10 371x150，niri 的 InColumn 第 0 位）。量 (480,120)：全程在窗口内容里
+#    （标题栏 ~40px 之下）；被拖的 w1 这会儿在 598..969，够不着。
 base = px('before-into-top.png', 480, 120)
 during = px('into-top.png', 480, 120)
 say(pure_red(base) and is_blend(during, base),
@@ -297,15 +298,15 @@ after = px('after-into-top.png', 480, 120)
 say(pure_red(after), '松手后预览块收掉了（480,120 回到纯红 → %s）' % (tuple(after),))
 
 # 2) 插到**右边的缝**上（光标在左边那条列的右半边）：卡片骑在那条缝中间
-#    （388 和 398 的中间 393 − 150 = 243，300x680）。量 (280,100) 在卡片里、且在
-#    左边那条列上（被拖的 w3 这会儿在 330..708、y 180 以下，够不着）。
+#    （381 和 391 的中间 386 − 150 = 236，300x680）。量 (280,100) 在卡片里、且在
+#    左边那条列上（被拖的 w3 这会儿在 330..701、y 180 以下，够不着）。
 base = px('before-right-gap.png', 280, 100)
 during = px('right-gap.png', 280, 100)
 say(is_blend(during, base),
     '插到右边那条缝时预览块骑在缝上：280,100 %s → %s' % (tuple(base), tuple(during)))
 # 卡片左边之外（150,100）不该有东西 —— 这一条钉住卡片的左边界
 same = tuple(px('right-gap.png', 150, 100)) == tuple(px('before-right-gap.png', 150, 100))
-say(same, '卡片从 243 起（150,100 跟没拖之前一模一样）')
+say(same, '卡片从 236 起（150,100 跟没拖之前一模一样）')
 after = px('after-right-gap.png', 280, 100)
 say(plateau(after) or dark(after),
     '松手后卡片收掉了（280,100 回到纯色块/空 → %s）' % (tuple(after),))
@@ -323,13 +324,13 @@ say(pure_green(p), '卡片就到 160 为止（250,60 还是纯绿 → %s）' % (
 after = px('after-new-column.png', 60, 200)
 say(pure_red(after), '松手后卡片收掉了（60,200 回到纯红 → %s）' % (tuple(after),))
 
-# 4) 插到那条列最下面：预览块是那条列底部的一条横条（398,560 378x150）。
+# 4) 插到那条列最下面：预览块是那条列底部的一条横条（391,560 371x150）。
 #    量 (480,620)：在下面那个窗口的内容块里（蓝）；被拖的 w2 这会儿在 y 680 以下。
 base = px('before-into-bottom.png', 480, 620)
 during = px('into-bottom.png', 480, 620)
 say(pure_blue(base) and is_blend(during, base),
     '插到列最下面时预览块画在底部那截：480,620 %s → %s' % (tuple(base), tuple(during)))
-# 落定之后三个窗口并成一条列（宽 378，贴着屏左边）→ (480,620) 上什么都没有
+# 落定之后三个窗口并成一条列（宽 371，贴着屏左边）→ (480,620) 上什么都没有
 after = px('after-into-bottom.png', 480, 620)
 say(dark(after), '松手后预览块收掉了（480,620 那块已经空了 → %s）' % (tuple(after),))
 
