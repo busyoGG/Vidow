@@ -908,7 +908,7 @@ python3 test-float.py        # 三个真实 GTK 窗口，验证浮动模式自�
 ./test-ipc.sh                        # IPC：状态输出 / 命令 / 事件 / 多屏（全 headless，162 项断言）
 ./test-hooks.sh                      # 事件钩子（config.lua 的 vidow.on）：命令钩子 / Lua 钩子 / "*" / 自定义事件 / 摘钩子 / 出错不连累别人（全 headless，30 项断言）
 ./test-events.sh                     # 事件的丰富度：keybind / ipc-action / window-activated / 拖拽 / 屏开关 / X11 起来 / 输入设备插拔 / 配置出错（全 headless，28 项断言）
-./test-env.sh                        # 会话环境：和 systemd 用户管理器两个方向对账 + exec-once 自启动（全 headless，33 项断言）
+./test-env.sh                        # 会话环境：和 systemd 用户管理器两个方向对账 + exec-once 自启动（全 headless，42 项断言）
 ./test-input-inject.sh               # 输入注入：鼠标 / 键盘合成事件到客户端（全 headless，54 项断言）
 ./test-pointer-lock.sh               # 指针约束：锁鼠标 / 夹光标 / 相对位移，X11 的 XGrabPointer 也认（全 headless，27 项断言）
 ./test-keyboard-grab.sh              # 键盘那两个协议：快捷键抑制（含逃生口）+ X11 的 XGrabKeyboard（全 headless，30 项断言）
@@ -1832,6 +1832,9 @@ local host = vidow.exec("hostname")          -- 要输出：跑一条、等它�
   起 —— 所以配置里写多早都不影响它看到的环境。这对应 Hyprland 的 `exec-once`。
 - 「起过了」按**命令原文**记：重载之后同一行还是同一行，认得出、不重来；把命令原文改了就
   是一条新命令，会再起一次（和 Hyprland 一个规矩）。
+- 名单是「只进不出」的话，删删改改攒到 128 条上限之后就再也记不住新命令了（那时每次重载都
+  会把它当没起过、再起一遍）。所以每轮配置跑完对一次账：**这一轮没声明的就从名单里划掉**
+  —— 删掉再写回来 = 一条新命令，会再起一次。
 - 三条路起的子进程都**继承 vidow 的完整环境**：`WAYLAND_DISPLAY` 指向 vidow 自己、
   `DISPLAY`（X 起来之后）、`XDG_CURRENT_DESKTOP`、`VIDOW_SOCKET`、以及 `vidow.env{}` 设过的
   变量 —— 状态栏、通知守护、输入法直接就能连上，不用自己猜 socket 路径。
@@ -1862,11 +1865,20 @@ dbus-update-activation-environment --systemd …
 - 推之前先记下「用户管理器里原来是什么样」，**退出时还回去**（这是从 portalconf.c 那套学来
   的规矩）。嵌套跑 / headless 测试时这一步最要紧：不还的话桌面里由 systemd 拉起来的程序
   全指着已经退了的 vidow。
-- 读和还原都备了第二条路：`systemctl --user` 在「`XDG_RUNTIME_DIR` 是临时的」会话里连不上
-  用户管理器（`Failed to connect to user scope bus via local transport`）—— **而正是那种
-  环境**里 dbus 那条路照样能把环境改脏。所以读走 `busctl --user get-property … Manager
-  Environment`，还原走 `systemctl` + `dbus-update-activation-environment --systemd` +
-  `busctl … UnsetEnvironment`（`busctl` 会等应答；`dbus-send` 不等，消息会丢）。
+- **只碰「我们够得着的」那个用户管理器**：认 `systemctl --user show-environment` 这一条，够
+  不着就什么都不推、也不还原。嵌套跑（vidow 里再起一个 vidow）和 headless 测试时
+  `XDG_RUNTIME_DIR` 是临时的，`systemctl --user` 连不上（`Failed to connect to user scope
+  bus via local transport`）—— 但 `dbus-update-activation-environment` / `busctl` 走的是会话
+  总线（`DBUS_SESSION_BUS_ADDRESS`），照样能改到**宿主会话**的用户管理器上：推上去的是嵌套
+  里那个 `WAYLAND_DISPLAY`，退出还原还会把宿主本来就有、我们却以为「原来没有」的变量
+  `unset` 掉（实测删掉过宿主 Hyprland 会话的 `WAYLAND_DISPLAY` / `DISPLAY` /
+  `XDG_CURRENT_DESKTOP`）。够不着 = 我们不是这个会话的主人，那就不碰。
+- **读**还可以退到第二条路（`busctl --user get-property … Manager Environment`）：读不会改
+  别人，而且从 tty 起 vidow 时「用户管理器里有什么」正是要吸进来的东西。写只走 systemctl。
+- 还原那一步两条路都发：`systemctl --user set-environment` / `unset-environment` **加上**
+  `dbus-update-activation-environment --systemd` / `busctl … UnsetEnvironment` —— 前者管
+  systemd 用户管理器，后者管 dbus 的激活环境（两套账，都得还）。`busctl` 会等应答；
+  `dbus-send` 不等，消息会丢（试过，删不掉）。
 
 **吸（systemd → vidow）**：`systemd_env`（默认开）
 
@@ -1906,7 +1918,7 @@ vidow.env_export()                      -- 立刻推一轮（平时是自动的�
 
 ```bash
 systemctl --user show-environment       # 用户管理器里现在是什么（推成功了没）
-./test-env.sh                           # 这一节的回归（33 项断言，假的 systemctl / busctl /
+./test-env.sh                           # 这一节的回归（42 项断言，假的 systemctl / busctl /
                                         #  dbus-update-activation-environment 记调用，一个字符
                                         #  都不会动你真会话的环境）
 ```
@@ -1923,9 +1935,17 @@ systemd_env_export = 1          # 把 vidow 的环境推给 systemd / dbus
 ### 测试
 
 `./test-env.sh`（全 headless + 假的 systemctl / busctl / dbus-update-activation-environment
-记调用，33 项断言）七段：吸收（吸哪些 / 不吸哪些）、推送（变量清单 + 两条通道）、`vidow.env`
+记调用，42 项断言）八段：吸收（吸哪些 / 不吸哪些）、推送（变量清单 + 两条通道）、`vidow.env`
 读写删 + 账本、IPC 的 `env` / `set-env` / `unset-env`、`exec_once` 只起一次（重载不重来、
-改原文才重来）、两个开关（配置键 + 环境变量覆盖）、退出时把用户管理器还原。
+改原文才重来、配置里删掉的会被忘掉）、两个开关（配置键 + 环境变量覆盖）、退出时把用户管理器
+还原、`systemctl --user` 够不着时整个跳过（一条命令都不发）。
+
+**够不着就不碰**：写用户管理器只走 `systemctl --user` 这一条 —— 嵌套跑 / headless 测试里
+`XDG_RUNTIME_DIR` 是临时的，`systemctl --user` 连不上（`Failed to connect to user scope bus
+via local transport`），这时 `dbus-update-activation-environment` / `busctl` 走会话总线仍然能
+改到**宿主会话**的用户管理器上（推的是嵌套里那个 `WAYLAND_DISPLAY`，还原还会 unset 掉宿主本
+来就有的变量 —— 实测删掉过宿主 Hyprland 会话的 `WAYLAND_DISPLAY` / `DISPLAY` /
+`XDG_CURRENT_DESKTOP`）。所以够不着就整个跳过，日志里写一句为什么。
 
 ## 输入注入：IPC 能操控鼠标和键盘
 
@@ -3290,7 +3310,8 @@ src/script.c   配置语言：Lua 5.4，协程化的 vidow.exec、全局名→�
 src/hooks.c    事件钩子：config.lua 里 vidow.on() 声明的那些（命令 / Lua 两种），事件
                *名单*（vidowmsg events 就报它）、统一入队 + idle 派发、命令钩子的环境变量
 src/env.c      会话环境账本：和 systemd 用户管理器两个方向对账（吸 / 推 + 退出还原）、
-               vidow.env{} 改过的变量记着原值、VIDOW_SYSTEMD_ENV{,_EXPORT} 开关
+               vidow.env{} 改过的变量记着原值、VIDOW_SYSTEMD_ENV{,_EXPORT} 开关、
+               只碰 systemctl --user 够得着的那个管理器（嵌套 / 测试里够不着就整个跳过）
 src/configwatch.c 配置自动重载：inotify 盯目录 + stat 比对，盯的是「配置真正读了哪些文件」
                （入口 + 每一份 include 的），改哪一份都重载
 src/anim.c     动画引擎：单调时钟进度、缓动函数、每帧 tick
@@ -4408,6 +4429,11 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
       （环境、缩放、`DISPLAY` 都定了）再起 —— 这和 `script_sync_env_for_child()` 是同一个
       理由：配置是分步跑的，命令起来时环境可能还没落地。「起过了」按**命令原文**记（不是行号
       / 下标）：重载后同一行还是同一行、认得出，改过原文就算新命令（和 Hyprland 一个规矩）。
+      每轮配置跑完还会把**这一轮没声明的**从名单里划掉（不然删删改改攒到 128 条上限之后就
+      再也记不住新命令了 —— 那时每次重载都会把它当没起过、再起一遍）。对账时比的是自己拷的
+      一份字符串：队列项连同命令原文在起完那一刻就 `free` 了，指着它们比就是在读已释放内存
+      （tcache 的 `next` / `key` 正好盖在字符串头上），刚起的命令会当场被判成「配置里没了」、
+      下一轮重载又起一遍 —— 第一版就是这个 bug，`test-env.sh` 5b 逮住的。
 
       **3）和 systemd 用户管理器两个方向对账（`src/env.c` / `src/env.h`，新文件）**。这是
       需求里「systemd 起来的应用也要继承 vidow 变量」那一半：
@@ -4432,11 +4458,17 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
           `XDG_RUNTIME_DIR=/tmp/vidow-env-test/run` —— 那个目录早没了）。它是会话自己的东西，
           嵌套/headless 里 vidow 的是临时的；portal 那边要连 PipeWire，自己带着快照 / 还原管
           它，不归这一份。`XCURSOR_*` 同理（会改掉系统里所有程序的指针大小）。
-        - **还原得走两条路**：`systemctl --user` 在「`XDG_RUNTIME_DIR` 是临时的」会话里连不上
-          用户管理器（`Failed to connect to user scope bus via local transport`），而**正是
-          那种环境**里 `dbus-update-activation-environment --systemd` 照样能把用户管理器的环境
-          改脏 —— 读快照于是改走 `busctl --user get-property … Manager Environment`，还原走
-          `systemctl` + `dbus-update-activation-environment` + `busctl … UnsetEnvironment`。
+        - **只碰「我们够得着的」那个管理器**：认 `systemctl --user show-environment` 这一条，
+          够不着就什么都不推、也不还原。这条是踩出来的 —— 嵌套跑 / headless 测试时
+          `XDG_RUNTIME_DIR` 是临时的，`systemctl --user` 连不上，可 `dbus-update-activation-
+          environment` / `busctl` 走的是会话总线，照样改得到**宿主会话**的用户管理器：推上去
+          的是测试里那个 `WAYLAND_DISPLAY`，退出还原还会把宿主本来就有、我们却以为「原来没
+          有」的变量 `unset` 掉（实测把宿主 Hyprland 会话的 `WAYLAND_DISPLAY` / `DISPLAY` /
+          `XDG_CURRENT_DESKTOP` 删掉过）。**读**仍然可以退到 `busctl --user get-property …
+          Manager Environment`（读不改别人，而且从 tty 起 vidow 时正要把管理器的环境吸进来）。
+        - **还原得走两条路**：`systemctl --user set-environment` / `unset-environment` 管
+          systemd 用户管理器，`dbus-update-activation-environment --systemd` /
+          `busctl … UnsetEnvironment` 管 dbus 的激活环境（两套账，都得还）。
         - `dbus-send` **不等应答**就退出，消息会丢（试过：`UnsetEnvironment` 看着成功，变量还
           在）。换成 `busctl`（它等应答）才删得掉。
         - `vidowmsg --raw` 打得少，测试里解析 JSON 要认准「pretty 模式剥了信封、raw 是整封」。
@@ -4453,7 +4485,7 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
       （`vidow_ipc_emit_simple()` + `VIDOW_EV_STR/NUM/BOOL`），不用为每条写一个 payload 函数。
 
       **测试**：`./test-hooks.sh`（30 项断言）、`./test-events.sh`（28 项断言）、
-      `./test-env.sh`（33 项断言）。三个都是全 headless，各带自己的靶子（钩子看日志文件、
+      `./test-env.sh`（42 项断言）。三个都是全 headless，各带自己的靶子（钩子看日志文件、
       事件看 `*` 钩子写的事件流水、环境看假的 `systemctl` / `busctl` /
       `dbus-update-activation-environment` 记下的调用）。`test-env.sh` 特意把三条命令都做成
       脚本 —— 真实跑一遍会把**你真会话**的环境改掉，测完还得手动收拾（这一次是自己踩了才

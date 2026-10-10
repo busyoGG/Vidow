@@ -328,6 +328,45 @@ grep -a "busctl --user call" "$CALLS" | grep -aq "UnsetEnvironment as 1 VIDOW_SO
 	|| fail "还原没走 busctl：$(grep -a busctl "$CALLS" | tail -1)"
 grep -aq "Assertion" "$LOG" && fail "退出时日志里有 assert" || pass "退出时没有 assert"
 
+# ---------------------------------------- 8) 够不着用户管理器：整个跳过
+# 嵌套跑（vidow 里再起一个 vidow）/ headless 测试时 XDG_RUNTIME_DIR 是临时的：
+# systemctl --user 连不上，可 busctl / dbus-update-activation-environment 走的是会话
+# 总线（DBUS_SESSION_BUS_ADDRESS），照样能改到**宿主会话**的用户管理器上 —— 推上去
+# 的是嵌套里那个 WAYLAND_DISPLAY，退出还原还会把宿主本来就有、我们却以为「原来没有」
+# 的变量 unset 掉（实测删掉过宿主 Hyprland 会话的 WAYLAND_DISPLAY / DISPLAY /
+# XDG_CURRENT_DESKTOP）。够不着 = 我们不是这个会话的主人，那就不碰。
+mark "8) systemctl --user 够不着用户管理器：不推也不还原（免得改脏宿主会话）"
+: > "$CALLS"
+cat > "$FAKEBIN/systemctl" <<EOF
+#!/bin/bash
+echo "systemctl \$*" >> "$CALLS"
+exit 1
+EOF
+chmod +x "$FAKEBIN/systemctl"
+cat > "$CFGDIRV/config.lua" <<EOF
+vidow.env("TEST_GATE", "1")
+EOF
+start_vidow
+grep -aq "够不着用户管理器" "$LOG" &&
+	pass "日志说清了为什么跳过（够不着 = 我们不是这个会话的主人）" \
+	|| fail "没说清：$(grep -a '环境：' "$LOG" | head -3 | tr '\n' ' ')"
+# 注意：portalconf.c 自己那条 import-environment（XDG_CURRENT_DESKTOP
+# WAYLAND_DISPLAY XDG_RUNTIME_DIR）不算 —— 那是 portal 后端要连宿主合成器时用的，
+# 不是这一份的账。这一份的清单里有 VIDOW_SOCKET，认它就够了。
+grep -a "import-environment" "$CALLS" | grep -aq "VIDOW_SOCKET" &&
+	fail "够不着却还是 import 了：$(grep -a import-environment "$CALLS" | grep VIDOW_SOCKET | head -1)" \
+	|| pass "没推（我们那份清单一次都没 import）"
+# 读可以退到 busctl（读不改别人）；写不行 —— 那条走会话总线，会改到宿主会话上。
+grep -aqE "^dbus-update-activation-environment|^busctl .*(Unset|Set)Environment" "$CALLS" &&
+	fail "退到 busctl / dbus 的写那条路了 —— 那正是会把宿主会话改脏的一条：$(grep -aE '^dbus-update-activation-environment|^busctl .*(Unset|Set)Environment' "$CALLS" | head -1)" \
+	|| pass "也没退到 busctl / dbus 的写那条路（会话总线是真的，那条会改到宿主上）"
+./build/vidowmsg action quit >/dev/null 2>&1
+waitgone && pass "退出干净" || fail "进程还在"
+grep -aqE "unset-environment|UnsetEnvironment" "$CALLS" &&
+	fail "退出还去还原了：$(grep -aE 'unset-environment|UnsetEnvironment' "$CALLS" | head -1)" \
+	|| pass "退出也没去还原（本来就没改，不用还）"
+grep -aq "Assertion" "$LOG" && fail "退出时日志里有 assert" || pass "退出时没有 assert"
+
 echo
 if [ "$FAILED" = 0 ]; then
 	echo "全部通过 / test-env.sh: OK"

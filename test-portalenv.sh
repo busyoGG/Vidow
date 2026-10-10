@@ -101,6 +101,22 @@ exit 0
 FAKE_SH
 chmod +x "$FAKE/systemctl"
 
+# 会话环境（src/env.c）除了 systemctl 还有两条路能改用户管理器的环境：busctl 和
+# dbus-update-activation-environment（都走会话总线，不看 XDG_RUNTIME_DIR）。这里
+# 也得假掉 —— 不然这一轮测试会去改**真**用户管理器：推的是测试里那个
+# WAYLAND_DISPLAY，退出还原还会把宿主会话本来就有的变量 unset 掉。
+cat >"$FAKE/busctl" <<'FAKE_SH'
+#!/bin/sh
+printf 'busctl %s\n' "$*" >>"${FAKE_LOG:?}"
+exit 0
+FAKE_SH
+cat >"$FAKE/dbus-update-activation-environment" <<'FAKE_SH'
+#!/bin/sh
+printf 'dbus-update-activation-environment %s\n' "$*" >>"${FAKE_LOG:?}"
+exit 0
+FAKE_SH
+chmod +x "$FAKE/busctl" "$FAKE/dbus-update-activation-environment"
+
 # 起一轮 headless vidow，跑起来后把启动阶段的 systemctl 调用切出来（$1.start）。
 # $2 是额外环境变量（比如 VIDOW_PORTAL_NO_RESTART=1）。
 run_round() {

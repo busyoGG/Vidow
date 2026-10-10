@@ -94,6 +94,37 @@ static bool env_no_manager(void) {
 	return getenv("VIDOW_PORTAL_NO_RESTART") != NULL;
 }
 
+/* 用户管理器是不是「我们自己的」—— **只认 systemctl --user 这条**。够不着就
+ * 不推、也不还原。
+ *
+ * 为什么不能退到 busctl / dbus-update-activation-environment：嵌套跑（vidow 里
+ * 再起一个 vidow）和测试跑的时候 XDG_RUNTIME_DIR 是临时的，systemctl 连不上，
+ * 可会话总线（DBUS_SESSION_BUS_ADDRESS）还是真的 —— 那两条路会把**宿主会话**的
+ * 用户管理器改脏：推上去的是嵌套里那个 WAYLAND_DISPLAY，退出时还原还会把宿主
+ * 本来就有、我们却以为「原来没有」的变量 unset 掉（实测：宿主 Hyprland 会话的
+ * WAYLAND_DISPLAY / DISPLAY / XDG_CURRENT_DESKTOP 就这么被删掉过）。
+ * 够不着 = 我们不是这个会话的主人，那就不碰。 */
+static int env_owns_cached = -1; /* -1 没探过 / 1 够得着 / 0 够不着 */
+
+/* systemctl 这条读通了：它就是我们的管理器，不用再探一次。 */
+static void env_manager_owns_note(void) {
+	env_owns_cached = 1;
+}
+
+static bool env_manager_owns(void) {
+	if (env_owns_cached >= 0) {
+		return env_owns_cached == 1;
+	}
+	FILE *f = popen("systemctl --user show-environment >/dev/null 2>&1", "r");
+	int st = f != NULL ? pclose(f) : -1;
+	env_owns_cached = st == 0 ? 1 : 0;
+	if (env_owns_cached == 0) {
+		wlr_log(WLR_INFO, "环境：systemctl --user 够不着用户管理器"
+			"（嵌套 / 测试跑），不推也不还原 —— 免得改脏宿主会话");
+	}
+	return env_owns_cached == 1;
+}
+
 bool vidow_env_name_ok(const char *name) {
 	if (name == NULL || name[0] == '\0' || strlen(name) >= 128) {
 		return false;
@@ -244,6 +275,9 @@ static size_t env_manager_read(struct env_kv *out, size_t max) {
 		pclose(f);
 	}
 	if (n > 0) {
+		/* systemctl 够得着：这个管理器就是我们的（env_manager_owns 记一笔，
+		 * 省掉它自己那次探测） */
+		env_manager_owns_note();
 		return n;
 	}
 
@@ -470,7 +504,7 @@ static void shell_quote_into(const char *in, char *out, size_t outlen) {
 }
 
 static void env_restore_manager(struct vidow_server *server) {
-	if (env_no_manager()) {
+	if (env_no_manager() || !env_manager_owns()) {
 		return;
 	}
 	/* 两条路都要走，因为「哪条能把用户管理器改脏」取决于 vidow 是在什么环境里
@@ -538,7 +572,7 @@ static void env_restore_manager(struct vidow_server *server) {
 }
 
 void vidow_env_export_now(struct vidow_server *server) {
-	if (env_no_manager()) {
+	if (env_no_manager() || !env_manager_owns()) {
 		return;
 	}
 	if (!env_override_bool("VIDOW_SYSTEMD_ENV_EXPORT",
