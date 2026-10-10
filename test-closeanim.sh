@@ -24,6 +24,10 @@
 #   3) 面板关闭动画中段面板还看得见（快照真的在淡出，不是「啪」一下没了）
 #   4) 面板外面（右边 4~14px 那条带）不比壁纸暗 —— 没有阴影圈，也没有比面板大的框
 #   5) 动画结束后面板和面板外都是干净的壁纸
+#   6) 关掉左边那条列时，隔壁那块（pattern）的**位移补间**中段还在路上：t=30% 时它的
+#      左边缘既没在起点、也没在终点（修之前它头一帧就落到终点 —— 同一帧里 arrange 跑
+#      三遍，第二遍走 `!moved` 那条分支把刚起的补间掐掉、anim_off 清零，看着就是「瞬移」）
+#   7) 补间走完（t=230%）它正好落在自己那条列上
 #
 # 用法：./test-closeanim.sh    （VIDOW_TEST_KEEP=1 保留运行目录）
 set -u
@@ -75,6 +79,9 @@ close_alpha_to = 0
 close_scale_to = 0.82
 close_slide_px = 14
 layer_close_ms = 1200
+-- 位移补间也拉长（默认 190ms，快门有几十毫秒延迟，量不准中段）—— 判据是「中段还在
+-- 路上」，拉长不改这一点。
+window_move_ms = 2000
 CFG
 
 BIN=${VIDOW_BIN:-./build/vidow}
@@ -143,6 +150,37 @@ if [ -n "${P:-}" ]; then
 	wait_until 0.40 "$P"; grim -o HEADLESS-1 "$FRAMES/panel-close-33.png" 2>/dev/null
 	wait_until 0.75 "$P"; grim -o HEADLESS-1 "$FRAMES/panel-close-62.png" 2>/dev/null
 	wait_until 1.60 "$P"; grim -o HEADLESS-1 "$FRAMES/panel-after.png" 2>/dev/null
+fi
+
+mark "3/3 关窗时隔壁那块的位移补间：不许头一帧就落到终点"
+# 先把面板收掉：它压在左上角 400x200 那块，正好盖住下面要扫的那一行。
+kill "$PANEL_PID" 2>/dev/null
+sleep 1.6
+
+# 左边那条列 = 蓝窗口（要关的就是它），右边 = pattern 四象限（左上象限是红的，
+# 蓝窗口和灰壁纸都不红 —— 扫 y=200 那行第一个红色像素就是它的左边缘）。
+setsid nohup python3 ./tools/bluewin.py > "$RUNDIR/blue2.log" 2>&1 </dev/null &
+BLUE2_PID=$!
+CLIENT_PIDS="$CLIENT_PIDS $BLUE2_PID"
+for _ in $(seq 1 40); do ./build/vidowmsg windows 2>/dev/null | grep -aq '"title": "bluewin"' && break; sleep 0.25; done
+sleep 1.0
+./build/vidowmsg set-column-width 0.4 --title bluewin >/dev/null 2>&1
+setsid nohup python3 ./tools/pattern.py move >/dev/null 2>&1 </dev/null &
+CLIENT_PIDS="$CLIENT_PIDS $!"
+for _ in $(seq 1 40); do ./build/vidowmsg windows 2>/dev/null | grep -aq '"title": "move"' && break; sleep 0.25; done
+sleep 1.0
+./build/vidowmsg set-column-width 0.4 --title move >/dev/null 2>&1
+./build/vidowmsg focus-window --title bluewin >/dev/null 2>&1
+sleep 1.0
+grim -o HEADLESS-1 "$FRAMES/move-before.png" 2>/dev/null
+
+n2=$(count "move tween move")
+kill "$BLUE2_PID" 2>/dev/null
+M=$(wait_log_after "move tween move" "$n2") || fail "没等到隔壁那块的位移补间（日志里没有 move tween move）"
+if [ -n "${M:-}" ]; then
+	wait_until 0.30 "$M"; grim -o HEADLESS-1 "$FRAMES/move-30.png" 2>/dev/null
+	wait_until 0.75 "$M"; grim -o HEADLESS-1 "$FRAMES/move-75.png" 2>/dev/null
+	wait_until 2.30 "$M"; grim -o HEADLESS-1 "$FRAMES/move-after.png" 2>/dev/null
 fi
 
 python3 - "$FRAMES" <<'PY'
@@ -227,6 +265,29 @@ say(e62 < 3.0, '关闭动画 62%% 处面板边上没有边框环：边比里面�
 
 say(b_end < 0.5 and o_end > -1.0,
 	'动画结束后面板内外都是干净的壁纸：蓝 %.1f、外面 %.1f' % (b_end, o_end))
+
+def red_edge(img, y=200):
+	"""y 那一行里第一个红色像素的 x（pattern 的左上象限是红的；蓝窗口、灰壁纸都不红）"""
+	row = img[y]
+	for x in range(row.shape[0]):
+		r, g, b = row[x]
+		if r > 180 and g < 80 and b < 80:
+			return x
+	return -1
+
+m_before = red_edge(load('move-before.png'))
+m30 = red_edge(load('move-30.png'))
+m75 = red_edge(load('move-75.png'))
+m_end = red_edge(load('move-after.png'))
+say(490 < m_before < 560,
+	'起手：pattern 那条列在 524（左边缘量到 %d）' % m_before)
+say(60 < m30 < 500,
+	'位移补间 30%% 处它还在路上：左边缘 %d（起点 %d、终点 ≈12）—— 不许是终点'
+	% (m30, m_before))
+say(m30 > m75 > m_end,
+	'一路往左走：%d → %d → %d' % (m30, m75, m_end))
+say(m_end < 20,
+	'补间走完它落在自己那条列上：左边缘 %d（≈12）' % m_end)
 
 sys.exit(0 if ok else 1)
 PY

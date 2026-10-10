@@ -1910,11 +1910,28 @@ void vidow_place_view(struct vidow_view *view, int x, int y, int w, int h) {
 
 	/* 弹出物不做移动补间：它是「跟着手指出现」的一块图，滑动会显慢半拍
 	 * （Wayland 的 xdg_popup 同样不走任何动画）。 */
-	if (view->popup || !moved || cfg->window_move_ms <= 0) {
+	if (view->popup || cfg->window_move_ms <= 0) {
 		vidow_anim_cancel(view->anim_move);
 		view->anim_move = NULL;
 		view->anim_off_x = 0.0;
 		view->anim_off_y = 0.0;
+		vidow_view_apply_anim(view);
+		return;
+	}
+
+	/* 目标位置没变：这一趟布局没打算动它。
+	 *
+	 * **手里要是正跑着一个位移补间，那个补间就是朝这个位置跑的 —— 别掐它。**
+	 * 以前这里不分青红皂白 cancel + anim_off = 0：而同一帧里 arrange 会跑好几
+	 * 遍（关一个窗口那条路实测 3 遍：unmap 一次、摘列一次、换焦点一次），第二
+	 * 遍就把上一遍刚起的补间清掉、偏移归零 —— 窗口当场落到终点，看起来就是
+	 * 「关窗的时候隔壁那块瞬移」（用户报「窗口关闭的时候移动动画不够自然，好像
+	 * 有点瞬移」）。没有补间在跑时照旧把残留偏移清掉（保持原来的语义）。 */
+	if (!moved) {
+		if (view->anim_move == NULL) {
+			view->anim_off_x = 0.0;
+			view->anim_off_y = 0.0;
+		}
 		vidow_view_apply_anim(view);
 		return;
 	}
