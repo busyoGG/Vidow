@@ -87,9 +87,8 @@ static const struct section sections[] = {
 		"Alt+Tab 的窗口切换器（niri 的 recent windows）：列哪些窗口、怎么排版、"
 		"选中框长什么样" },
 	/* 会话环境同样是往后加（16-…）：前面那些文件名早就写进用户的 config.lua 了。 */
-	{ "会话环境（systemd）", "16-env.lua",
-		"和 systemd 用户管理器对账：从它那儿吸环境、把 vidow 的环境推回去"
-		"（由 systemd 拉起来的应用才看得到 vidow）" },
+	{ "会话环境 / 自启动 / 事件钩子", "16-env.lua",
+		"和 systemd 用户管理器对账（吸 / 推）、exec_once 自启动、vidow.on() 事件钩子" },
 };
 #define N_SECTIONS ((int)(sizeof(sections) / sizeof(sections[0])))
 /* 「键位 / 工作区 / 规则」那一节：它不是配置键，entries[] 里没有它，打印也
@@ -97,6 +96,8 @@ static const struct section sections[] = {
 #define SECTION_KEYS 13
 /* 缩放与输出那一节多一段 vidow.output{…} 的写法（不是配置键）。 */
 #define SECTION_OUTPUT 8
+/* 16-env.lua 多一段 vidow.* 的写法（会话环境 / 自启动 / 事件钩子，不是配置键）。 */
+#define SECTION_ENV 15
 
 #define OFF(field) offsetof(struct vidow_config, field)
 #define SZ(field) sizeof(((struct vidow_config *)0)->field)
@@ -261,12 +262,12 @@ static const struct entry entries[] = {
 	{ "portal_capture",  K_STRING, OFF(portal_capture),  SZ(portal_capture), 11,
 		"录屏 / 截图交给谁：auto（默认）/ vidow / kde / wlr / hyprland / none" },
 
-	{ "systemd_env",     K_BOOL,   OFF(systemd_env),     SZ(systemd_env), 16,
+	{ "systemd_env",     K_BOOL,   OFF(systemd_env),     SZ(systemd_env), 15,
 		"启动时从 systemd 用户管理器吸环境（我们自己没有的才吸：PATH / "
 		"SSH_AUTH_SOCK / environment.d 里那些）；WAYLAND_DISPLAY / DISPLAY 这类"
 		"由 vidow 自己定，不吸" },
 	{ "systemd_env_export", K_BOOL, OFF(systemd_env_export),
-		SZ(systemd_env_export), 16,
+		SZ(systemd_env_export), 15,
 		"把 vidow 的环境推给 systemd 用户管理器 + dbus 激活环境"
 		"（systemctl --user import-environment + dbus-update-activation-environment "
 		"--systemd）：xdg-desktop-portal、systemd 服务和桌面文件激活的程序才"
@@ -1204,6 +1205,58 @@ static void print_output_hint(FILE *f) {
 "-- 没了，写了会在日志里喊一声。\n", f);
 }
 
+/* 16-env.lua 后面那一段：会话环境 / 自启动 / 事件钩子这三件事的 vidow.* 写法
+ * （上面两个键只管「要不要对账」，怎么用是这些函数的事）。 */
+static void print_env_lua(FILE *f) {
+	fputs(
+"\n"
+"-- ================== 会话环境（和 systemd 用户管理器对账）\n"
+"--\n"
+"-- 从 vidow 里起的命令继承的是**进程环境**；由 systemd / dbus 拉起来的应用\n"
+"-- （xdg-desktop-portal、systemd --user 的服务、桌面文件激活的程序）继承的是\n"
+"-- **用户管理器里的环境**。两个不打通，就会出现「配置里起的程序连得上 vidow，\n"
+"-- systemd 起的那个连的是宿主合成器」。所以两个方向都做，默认都开。\n"
+"--\n"
+"-- 推（vidow → systemd / dbus）：systemctl --user import-environment +\n"
+"--   dbus-update-activation-environment --systemd，推 WAYLAND_DISPLAY / DISPLAY /\n"
+"--   XDG_CURRENT_DESKTOP / XDG_SESSION_TYPE / XDG_SESSION_DESKTOP / VIDOW_SOCKET\n"
+"--   以及下面 vidow.env{} 声明过的每一个；退出时把改过的还回去。\n"
+"-- 吸（systemd → vidow）：启动时问一次用户管理器，把**我们自己没有的**吸进来\n"
+"--   （PATH / SSH_AUTH_SOCK / environment.d 里那些）。\n"
+"-- 够不着用户管理器（嵌套跑 / headless 测试里 XDG_RUNTIME_DIR 是临时的）就整个\n"
+"--   跳过：那时只有走会话总线的那两条路「能改到」，改的是**宿主会话** —— 不碰。\n"
+"--\n"
+"-- vidow.env(\"名字\")                     读（没有就是 nil）\n"
+"-- vidow.env(\"名字\", \"值\")               写（顺手推给 systemd）\n"
+"-- vidow.env(\"名字\", false)              删\n"
+"-- vidow.env{ A = \"1\", B = false }       一次一串\n"
+"-- vidow.env_export()                    立刻推一轮（平时是自动的）\n"
+"-- 改过的变量记着原值，vidow 退出时还原；`vidowmsg env` 把账本报出来。\n"
+"--\n"
+"-- ================== 自启动（Hyprland 的 exec-once / exec）\n"
+"--\n"
+"-- vidow.exec_once(\"waybar\")              整个 vidow 生命周期只起一次（重载不重来）\n"
+"-- vidow.exec_once{ \"swaybg -i 壁纸.png\", \"mako\" }\n"
+"-- vidow.spawn(\"命令\")                    每次配置加载都起（撒手，不等、不要输出）\n"
+"-- vidow.exec(\"命令\")                     要输出 / 退出码时用它（看着同步，不阻塞渲染）\n"
+"--\n"
+"-- exec_once 的命令**先排队**，等这份配置跑完（环境、缩放、DISPLAY 都定了）再起。\n"
+"-- 「起过了」按**命令原文**记：改过原文就是一条新命令，会再起一次；配置里删掉的会\n"
+"-- 从名单里忘掉（写回来 = 新命令）。这三条起的子进程都继承 vidow 的完整环境。\n"
+"--\n"
+"-- ================== 事件钩子（Hyprland socket2 的等价物）\n"
+"--\n"
+"-- vidow.on(\"事件名\", \"命令\")            返回 id；事件来了跑这条 shell 命令\n"
+"-- vidow.on(\"事件名\", function(e) … end) 返回 id；或者跑一段 Lua（里面能 await vidow.exec）\n"
+"-- vidow.on(\"*\", { \"命令\", fn })         一次挂一串，返回 id 表\n"
+"-- vidow.off(id)                         摘掉一条（id 就是 on() 返回的那个）\n"
+"--\n"
+"-- 命令钩子拿得到事件：VIDOW_EVENT / VIDOW_EVENT_TIME_MS / VIDOW_EVENT_JSON，\n"
+"-- 载荷里每个标量字段再来一个 VIDOW_<字段名大写>（- 变 _）。Lua 钩子收到一张表\n"
+"-- （e.event / e.time_ms / e.data）。事件名单（42 个）见 README 的事件表，\n"
+"-- 或者 `vidowmsg events`；订阅同一份事件流也可以走 IPC。\n", f);
+}
+
 /* 14-keys.lua：键位 / 工作区 / 规则。没有配置键，全是 vidow.* 的调用。
  *
  * 这里给的是**一套默认键位** —— 合成器自己一个键位都不内置（原来 input.c 里有
@@ -1347,6 +1400,9 @@ static void print_section_body(FILE *f, const struct vidow_config *cfg,
 	print_section_keys(f, cfg, section);
 	if (section == SECTION_OUTPUT) {
 		print_output_hint(f);
+	}
+	if (section == SECTION_ENV) {
+		print_env_lua(f);
 	}
 }
 

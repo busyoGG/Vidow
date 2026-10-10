@@ -31,3 +31,4 @@ vidow.include("configs/12-portal.lua")     -- xdg-desktop-portal
 vidow.include("configs/13-cursor.lua")     -- 指针
 vidow.include("configs/14-keys.lua")       -- 键位 / 工作区 / 规则
 vidow.include("configs/15-mru.lua")        -- 最近窗口（Alt+Tab）
+vidow.include("configs/16-env.lua")        -- 会话环境 / 自启动 / 事件钩子

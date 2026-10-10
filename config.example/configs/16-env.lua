@@ -1,0 +1,57 @@
+-- 会话环境 / 自启动 / 事件钩子 —— vidow 配置的一类，由入口 config.lua 读进来：
+--     vidow.include("configs/16-env.lua")
+--
+-- 下面每行都是内置默认值：改哪行哪行才生效，删掉那行就回到默认值。
+-- 和 systemd 用户管理器对账（吸 / 推）、exec_once 自启动、vidow.on() 事件钩子
+
+-- ================== 会话环境 / 自启动 / 事件钩子
+-- 启动时从 systemd 用户管理器吸环境（我们自己没有的才吸：PATH / SSH_AUTH_SOCK / environment.d 里那些）；WAYLAND_DISPLAY / DISPLAY 这类由 vidow 自己定，不吸
+systemd_env = true
+-- 把 vidow 的环境推给 systemd 用户管理器 + dbus 激活环境（systemctl --user import-environment + dbus-update-activation-environment --systemd）：xdg-desktop-portal、systemd 服务和桌面文件激活的程序才连得上 vidow
+systemd_env_export = true
+
+-- ================== 会话环境（和 systemd 用户管理器对账）
+--
+-- 从 vidow 里起的命令继承的是**进程环境**；由 systemd / dbus 拉起来的应用
+-- （xdg-desktop-portal、systemd --user 的服务、桌面文件激活的程序）继承的是
+-- **用户管理器里的环境**。两个不打通，就会出现「配置里起的程序连得上 vidow，
+-- systemd 起的那个连的是宿主合成器」。所以两个方向都做，默认都开。
+--
+-- 推（vidow → systemd / dbus）：systemctl --user import-environment +
+--   dbus-update-activation-environment --systemd，推 WAYLAND_DISPLAY / DISPLAY /
+--   XDG_CURRENT_DESKTOP / XDG_SESSION_TYPE / XDG_SESSION_DESKTOP / VIDOW_SOCKET
+--   以及下面 vidow.env{} 声明过的每一个；退出时把改过的还回去。
+-- 吸（systemd → vidow）：启动时问一次用户管理器，把**我们自己没有的**吸进来
+--   （PATH / SSH_AUTH_SOCK / environment.d 里那些）。
+-- 够不着用户管理器（嵌套跑 / headless 测试里 XDG_RUNTIME_DIR 是临时的）就整个
+--   跳过：那时只有走会话总线的那两条路「能改到」，改的是**宿主会话** —— 不碰。
+--
+-- vidow.env("名字")                     读（没有就是 nil）
+-- vidow.env("名字", "值")               写（顺手推给 systemd）
+-- vidow.env("名字", false)              删
+-- vidow.env{ A = "1", B = false }       一次一串
+-- vidow.env_export()                    立刻推一轮（平时是自动的）
+-- 改过的变量记着原值，vidow 退出时还原；`vidowmsg env` 把账本报出来。
+--
+-- ================== 自启动（Hyprland 的 exec-once / exec）
+--
+-- vidow.exec_once("waybar")              整个 vidow 生命周期只起一次（重载不重来）
+-- vidow.exec_once{ "swaybg -i 壁纸.png", "mako" }
+-- vidow.spawn("命令")                    每次配置加载都起（撒手，不等、不要输出）
+-- vidow.exec("命令")                     要输出 / 退出码时用它（看着同步，不阻塞渲染）
+--
+-- exec_once 的命令**先排队**，等这份配置跑完（环境、缩放、DISPLAY 都定了）再起。
+-- 「起过了」按**命令原文**记：改过原文就是一条新命令，会再起一次；配置里删掉的会
+-- 从名单里忘掉（写回来 = 新命令）。这三条起的子进程都继承 vidow 的完整环境。
+--
+-- ================== 事件钩子（Hyprland socket2 的等价物）
+--
+-- vidow.on("事件名", "命令")            返回 id；事件来了跑这条 shell 命令
+-- vidow.on("事件名", function(e) … end) 返回 id；或者跑一段 Lua（里面能 await vidow.exec）
+-- vidow.on("*", { "命令", fn })         一次挂一串，返回 id 表
+-- vidow.off(id)                         摘掉一条（id 就是 on() 返回的那个）
+--
+-- 命令钩子拿得到事件：VIDOW_EVENT / VIDOW_EVENT_TIME_MS / VIDOW_EVENT_JSON，
+-- 载荷里每个标量字段再来一个 VIDOW_<字段名大写>（- 变 _）。Lua 钩子收到一张表
+-- （e.event / e.time_ms / e.data）。事件名单（42 个）见 README 的事件表，
+-- 或者 `vidowmsg events`；订阅同一份事件流也可以走 IPC。

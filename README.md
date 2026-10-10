@@ -2599,7 +2599,7 @@ layer 的模糊底衬把 layer surface 自己的缓冲当 mask 传进去，窗�
     ├── 13-cursor.lua            指针
     ├── 14-keys.lua              键位（合成器不内置，默认这一套）+ 工作区 / 窗口规则
     ├── 15-mru.lua               Alt+Tab 的最近窗口切换器
-    └── 16-env.lua               会话环境（和 systemd 用户管理器对账）
+    └── 16-env.lua               会话环境（和 systemd 用户管理器对账）/ 自启动 / 事件钩子
 ```
 
 `vidow.include("configs/01-gaps.lua")` 就是「把那份文件就地展开」，和抄在这里一个意思：
