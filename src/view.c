@@ -1631,7 +1631,7 @@ void vidow_view_anim_bake(struct vidow_view *view) {
 	int64_t bake_t0 = vidow_now_ns();
 	bool fx_drawn = vidow_fx_frame(view->server, &view->fx, src, &geo, 0, 0,
 		x, y, alpha, view->server->focused == view,
-		view_scale(view) * ov, ov);
+		view_scale(view) * ov, ov, &view->rule_eff);
 	/* 探针：整块窗口那么大的离屏渲染一共多少钱（见统计行的「重烘」；次数由
 	 * vidow_fx_frame 的 vidow_stats.bakes 记）。拖动 / 滚动动画里每个在动的
 	 * 窗口每帧都要烘一次，所以这项随窗口数线性涨。 */
@@ -1844,7 +1844,8 @@ static void view_snapshot_close(struct vidow_view *view) {
 		view->geom.y + (int)lround(view->anim_off_y), w, h,
 		server->config.window_close_ms, server->config.close_slide_px,
 		true, server->config.shader_close, view_scale(view),
-		server->config.close_easing, server->config.close_scale_to);
+		server->config.close_easing, server->config.close_scale_to,
+		&view->rule_eff);
 }
 
 void vidow_place_view(struct vidow_view *view, int x, int y, int w, int h) {

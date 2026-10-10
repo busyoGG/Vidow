@@ -117,6 +117,36 @@ const struct vidow_rule_field vidow_rule_fields[] = {
 		"这个窗口新开的列有多宽（占可用宽度的比例，0.1 ~ 1.0；默认 0.5）" },
 	{ "anim", RK_ACT_BOOL, VRA_ANIM, VIDOW_RULE_WINDOW,
 		"false = 这个窗口不做开合动画（它开、它关都是瞬间到位）" },
+	/* 外观：装饰着色器的参数，没写的用全局配置（configs/02-decor.lua、
+	 * 03-blur.lua 那些）。全局开关（decor_enabled / blur_enabled）仍是总闸。 */
+	{ "decor", RK_ACT_BOOL, VRA_DECOR, VIDOW_RULE_WINDOW,
+		"false = 这个窗口不画装饰（边框 / 圆角 / 阴影都不要）" },
+	{ "opacity", RK_ACT_DOUBLE, VRA_OPACITY, VIDOW_RULE_WINDOW,
+		"整块（含装饰）的不透明度，0.5 = 半透明" },
+	{ "corner_radius", RK_ACT_DOUBLE, VRA_CORNER_RADIUS, VIDOW_RULE_WINDOW,
+		"圆角半径（逻辑像素，0 = 直角）" },
+	{ "border_width", RK_ACT_DOUBLE, VRA_BORDER_WIDTH, VIDOW_RULE_WINDOW,
+		"边框宽度（0 = 不画边框）" },
+	{ "border_color", RK_ACT_COLOR, VRA_BORDER_COLOR, VIDOW_RULE_WINDOW,
+		"没聚焦时的边框颜色（RRGGBB / RRGGBBAA）" },
+	{ "border_color_focus", RK_ACT_COLOR, VRA_BORDER_COLOR_FOCUS,
+		VIDOW_RULE_WINDOW,
+		"聚焦时的边框颜色" },
+	{ "shadow_radius", RK_ACT_DOUBLE, VRA_SHADOW_RADIUS, VIDOW_RULE_WINDOW,
+		"阴影半径（0 = 不画阴影）" },
+	{ "shadow_color", RK_ACT_COLOR, VRA_SHADOW_COLOR, VIDOW_RULE_WINDOW,
+		"阴影颜色，alpha 管浓淡" },
+	{ "shadow_offset_x", RK_ACT_INT, VRA_SHADOW_OFFSET_X, VIDOW_RULE_WINDOW,
+		"阴影横向偏移（像素）" },
+	{ "shadow_offset_y", RK_ACT_INT, VRA_SHADOW_OFFSET_Y, VIDOW_RULE_WINDOW,
+		"阴影纵向偏移（像素）" },
+	{ "noise", RK_ACT_DOUBLE, VRA_NOISE, VIDOW_RULE_WINDOW,
+		"往装饰里掺的噪点强度，0 = 不加" },
+	{ "blur", RK_ACT_BOOL, VRA_BLUR, VIDOW_RULE_WINDOW | VIDOW_RULE_LAYER,
+		"false = 它背后不模糊（true = 平铺窗口也模糊；全局 blur_enabled 仍是"
+		"总开关，关着就一律不模糊）" },
+	{ "blur_xray", RK_ACT_BOOL, VRA_BLUR_XRAY, VIDOW_RULE_WINDOW,
+		"重叠时也用整屏那份底衬（糊的是壁纸，不是压着的那个窗口）" },
 };
 
 const size_t vidow_rule_field_count =
@@ -340,6 +370,76 @@ void vidow_rule_set_literal(struct vidow_rule *rule, bool literal) {
 	}
 }
 
+/* 全局配置 + 规则作用 → 一份「现在长什么样」。规则没写的外观参数就用全局的；
+ * 写了的那几项以规则为准。全局开关（decor_enabled / blur_enabled）压在上面：
+ * 关掉全局就是关掉一切，规则只能收窄不能突破。 */
+void vidow_rule_look(const struct vidow_config *cfg,
+		const struct vidow_rule_eff *eff, struct vidow_look *out) {
+	out->opacity = cfg->window_opacity;
+	out->corner_radius = cfg->corner_radius;
+	out->border_width = cfg->border_width;
+	memcpy(out->border_color, cfg->border_color, sizeof(out->border_color));
+	memcpy(out->border_color_focus, cfg->border_color_focus,
+		sizeof(out->border_color_focus));
+	out->shadow_radius = cfg->shadow_radius;
+	memcpy(out->shadow_color, cfg->shadow_color, sizeof(out->shadow_color));
+	out->shadow_offset_x = cfg->shadow_offset_x;
+	out->shadow_offset_y = cfg->shadow_offset_y;
+	out->noise = cfg->noise;
+	out->decor = cfg->decor_enabled;
+	out->blur = cfg->blur_enabled;
+	out->blur_xray = cfg->blur_xray;
+	if (eff == NULL) {
+		return;
+	}
+	if (eff->set[VRA_OPACITY]) {
+		out->opacity = eff->val[VRA_OPACITY].d;
+	}
+	if (eff->set[VRA_CORNER_RADIUS]) {
+		out->corner_radius = eff->val[VRA_CORNER_RADIUS].d;
+	}
+	if (eff->set[VRA_BORDER_WIDTH]) {
+		out->border_width = eff->val[VRA_BORDER_WIDTH].d;
+	}
+	if (eff->set[VRA_BORDER_COLOR]) {
+		memcpy(out->border_color, eff->val[VRA_BORDER_COLOR].color,
+			sizeof(out->border_color));
+	}
+	if (eff->set[VRA_BORDER_COLOR_FOCUS]) {
+		memcpy(out->border_color_focus,
+			eff->val[VRA_BORDER_COLOR_FOCUS].color,
+			sizeof(out->border_color_focus));
+	}
+	if (eff->set[VRA_SHADOW_RADIUS]) {
+		out->shadow_radius = eff->val[VRA_SHADOW_RADIUS].d;
+	}
+	if (eff->set[VRA_SHADOW_COLOR]) {
+		memcpy(out->shadow_color, eff->val[VRA_SHADOW_COLOR].color,
+			sizeof(out->shadow_color));
+	}
+	if (eff->set[VRA_SHADOW_OFFSET_X]) {
+		out->shadow_offset_x = (int)eff->val[VRA_SHADOW_OFFSET_X].i;
+	}
+	if (eff->set[VRA_SHADOW_OFFSET_Y]) {
+		out->shadow_offset_y = (int)eff->val[VRA_SHADOW_OFFSET_Y].i;
+	}
+	if (eff->set[VRA_NOISE]) {
+		out->noise = eff->val[VRA_NOISE].d;
+	}
+	if (eff->set[VRA_DECOR]) {
+		/* 和 blur 一样：全局开关是总闸，规则只能收窄（decor_enabled = false 时
+		 * 规则写 decor = true 也开不回来 —— 全局关装饰多半是为了性能 / 兼容，
+		 * 被一条规则悄悄打开会更意外）。 */
+		out->decor = cfg->decor_enabled && eff->val[VRA_DECOR].b;
+	}
+	if (eff->set[VRA_BLUR]) {
+		out->blur = cfg->blur_enabled && eff->val[VRA_BLUR].b;
+	}
+	if (eff->set[VRA_BLUR_XRAY]) {
+		out->blur_xray = eff->val[VRA_BLUR_XRAY].b;
+	}
+}
+
 bool vidow_rule_has_field(const struct vidow_rule *rule,
 		const struct vidow_rule_field *field) {
 	if (rule == NULL || field == NULL) {
@@ -488,6 +588,25 @@ bool vidow_rule_commit(struct vidow_server *server, struct vidow_rule *rule,
 				rule->aval[size_slots[i]].i < 1) {
 			snprintf(err, errlen, "%s 是逻辑像素，得是正数，给的是 %lld",
 				size_keys[i], rule->aval[size_slots[i]].i);
+			return false;
+		}
+	}
+	/* 外观参数的取值范围：比例 / 长度都得是非负，透明度 0 ~ 1。 */
+	struct { int slot; const char *name; double lo, hi; } ranges[] = {
+		{ VRA_OPACITY, "opacity", 0.0, 1.0 },
+		{ VRA_CORNER_RADIUS, "corner_radius", 0.0, 1e9 },
+		{ VRA_BORDER_WIDTH, "border_width", 0.0, 1e9 },
+		{ VRA_SHADOW_RADIUS, "shadow_radius", 0.0, 1e9 },
+		{ VRA_NOISE, "noise", 0.0, 1e9 },
+	};
+	for (size_t i = 0; i < sizeof(ranges) / sizeof(ranges[0]); i++) {
+		if (!rule->aset[ranges[i].slot]) {
+			continue;
+		}
+		double v = rule->aval[ranges[i].slot].d;
+		if (v < ranges[i].lo || v > ranges[i].hi) {
+			snprintf(err, errlen, "%s 得在 %g ~ %g 之间，给的是 %g",
+				ranges[i].name, ranges[i].lo, ranges[i].hi, v);
 			return false;
 		}
 	}

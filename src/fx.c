@@ -1200,7 +1200,30 @@ int vidow_fx_pad(struct vidow_server *server) {
 	}
 	int off = abs(cfg->shadow_offset_x) > abs(cfg->shadow_offset_y) ?
 		abs(cfg->shadow_offset_x) : abs(cfg->shadow_offset_y);
-	int pad = (int)(cfg->shadow_radius + off + 2);
+	double radius = cfg->shadow_radius;
+	/* 窗口规则可以把某个窗口的阴影调大：内边距按「所有规则里最大的那个」留
+	 * （多留一点只是离屏缓冲大一圈，少留就是阴影被裁掉）。规则没写 shadow_*
+	 * 的时候这一步等于没做。 */
+	const struct vidow_rule *rule;
+	wl_list_for_each(rule, &server->rules, link) {
+		if (rule->aset[VRA_SHADOW_RADIUS] &&
+				rule->aval[VRA_SHADOW_RADIUS].d > radius) {
+			radius = rule->aval[VRA_SHADOW_RADIUS].d;
+		}
+		if (rule->aset[VRA_SHADOW_OFFSET_X]) {
+			long long v = rule->aval[VRA_SHADOW_OFFSET_X].i;
+			if (labs(v) > off) {
+				off = (int)labs(v);
+			}
+		}
+		if (rule->aset[VRA_SHADOW_OFFSET_Y]) {
+			long long v = rule->aval[VRA_SHADOW_OFFSET_Y].i;
+			if (labs(v) > off) {
+				off = (int)labs(v);
+			}
+		}
+	}
+	int pad = (int)(radius + off + 2);
 	if (pad < 0) {
 		pad = 0;
 	}
@@ -1602,8 +1625,11 @@ static bool backdrop_render(struct vidow_server *server,
  * windows always can; tiled ones only when blur_all is set, because their
  * backdrop is the wallpaper and the layer surfaces. */
 static bool view_wants_blur(struct vidow_view *view) {
-	struct vidow_config *cfg = &view->server->config;
-	if (!cfg->blur_enabled || !view->mapped || !view->fx.active) {
+	struct vidow_look look;
+	vidow_rule_look(&view->server->config, &view->rule_eff, &look);
+	/* blur 那条规则在这里生效：false = 这个窗口背后不模糊（视频、终端那种
+	 * 「糊了更难看」的），true = 平铺也模糊（等于给这一个窗口开 blur_all）。 */
+	if (!look.blur || !view->mapped || !view->fx.active) {
 		return false;
 	}
 	/* overview 里不采样背景模糊：UV 是按窗口自己的位置算的，窗口缩小之后对不上。
@@ -1613,7 +1639,9 @@ static bool view_wants_blur(struct vidow_view *view) {
 	if (vidow_overview_active(view->server)) {
 		return false;
 	}
-	if (cfg->blur_all || view->float_mode != VIDOW_FLOAT_NONE) {
+	if (view->rule_eff.set[VRA_BLUR] ||
+			view->server->config.blur_all ||
+			view->float_mode != VIDOW_FLOAT_NONE) {
 		return true;
 	}
 	/* 客户端自己开口要的（ext-background-effect），blur_all 关着也得给 */
@@ -2344,7 +2372,9 @@ void vidow_blur_update(struct vidow_output *output) {
 
 		blur_mask_min_changed(&view->fx, server->config.blur_alpha_min);
 
-		if (server->config.blur_xray || !view_overlaps_other(view)) {
+		struct vidow_look look;
+		vidow_rule_look(&server->config, &view->rule_eff, &look);
+		if (look.blur_xray || !view_overlaps_other(view)) {
 			/* Tiled and non-overlapping floating windows all share the
 			 * wallpaper backdrop: one capture and one chain for all of them.
 			 * Only drop a private pyramid if there really is one, otherwise
@@ -2450,7 +2480,7 @@ static void decor_draw(struct vidow_server *server,
 		struct vidow_fx_target *fx, struct wlr_buffer *dst,
 		struct wlr_texture *src, struct wlr_texture *mask,
 		const float border[4], int ox, int oy,
-		double alpha, double scale) {
+		double alpha, double scale, const struct vidow_look *look) {
 	struct vidow_decor_prog *d = &server->decor;
 	struct vidow_config *cfg = &server->config;
 
@@ -2500,22 +2530,23 @@ static void decor_draw(struct vidow_server *server,
 	glUniform2f(d->u_size, (float)fx->content_w, (float)fx->content_h);
 	glUniform2f(d->u_target_size, (float)fx->w, (float)fx->h);
 	glUniform1f(d->u_pad, (float)fx->px_pad);
-	glUniform1f(d->u_radius, (float)(cfg->corner_radius * scale));
-	glUniform1f(d->u_border_width, (float)(cfg->border_width * scale));
+	glUniform1f(d->u_radius, (float)(look->corner_radius * scale));
+	glUniform1f(d->u_border_width, (float)(look->border_width * scale));
 	/* The decoration shader works in premultiplied alpha; the config keeps
 	 * straight values so a script can read them back. */
 	float border_pm[4] = { border[0] * border[3], border[1] * border[3],
 		border[2] * border[3], border[3] };
-	float shadow_pm[4] = { cfg->shadow_color[0] * cfg->shadow_color[3],
-		cfg->shadow_color[1] * cfg->shadow_color[3],
-		cfg->shadow_color[2] * cfg->shadow_color[3], cfg->shadow_color[3] };
+	float shadow_pm[4] = { look->shadow_color[0] * look->shadow_color[3],
+		look->shadow_color[1] * look->shadow_color[3],
+		look->shadow_color[2] * look->shadow_color[3],
+		look->shadow_color[3] };
 	glUniform4fv(d->u_border_color, 1, border_pm);
 	glUniform4fv(d->u_shadow_color, 1, shadow_pm);
-	glUniform2f(d->u_shadow_offset, (float)(cfg->shadow_offset_x * scale),
-		(float)(cfg->shadow_offset_y * scale));
-	glUniform1f(d->u_shadow_radius, (float)(cfg->shadow_radius * scale));
-	glUniform1f(d->u_opacity, (float)cfg->window_opacity);
-	glUniform1f(d->u_noise, (float)cfg->noise);
+	glUniform2f(d->u_shadow_offset, (float)(look->shadow_offset_x * scale),
+		(float)(look->shadow_offset_y * scale));
+	glUniform1f(d->u_shadow_radius, (float)(look->shadow_radius * scale));
+	glUniform1f(d->u_opacity, (float)look->opacity);
+	glUniform1f(d->u_noise, (float)look->noise);
 	glUniform1f(d->u_alpha, (float)alpha);
 	glUniform1f(glGetUniformLocation(d->program, "u_time"),
 		(float)(vidow_now_ns() % 1000000000000LL) / 1e9f);
@@ -2668,10 +2699,15 @@ bool vidow_fx_begin(struct vidow_server *server, struct vidow_fx_target *fx,
 bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 		struct wlr_scene_buffer *src, const struct vidow_fx_geo *geo,
 		int x, int y, int ox, int oy,
-		double alpha, bool focused, double scale, double ov) {
+		double alpha, bool focused, double scale, double ov,
+		const struct vidow_rule_eff *eff) {
 	if (!fx->active || fx->node == NULL || src == NULL || src->buffer == NULL) {
 		return false;
 	}
+	/* 这个窗口 / layer 现在该长什么样：全局配置压上窗口规则（见 rule.c 的
+	 * vidow_rule_look）。eff = NULL 就是纯全局。 */
+	struct vidow_look look;
+	vidow_rule_look(&server->config, eff, &look);
 	if (geo == NULL || geo->w <= 0 || geo->h <= 0) {
 		return false;
 	}
@@ -2737,16 +2773,16 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 	struct wlr_buffer *displayed = NULL;
 	struct wlr_buffer *decorated = NULL;
 	const float *border = NULL; /* 重画装饰用（动画那趟失败时） */
-	if (server->config.decor_enabled && server->decor.program != 0) {
+	if (look.decor && server->decor.program != 0) {
 		struct wlr_buffer *target = pick_free(fx->buf);
 		if (target != NULL) {
-			border = focused ? server->config.border_color_focus :
-				server->config.border_color;
+			border = focused ? look.border_color_focus :
+				look.border_color;
 			/* 有动画那趟时装饰按满 alpha 画：整块的淡入淡出由动画着色器统一乘
 			 * 一次，两边各乘一次就成了 alpha²（淡得比设定的快）。 */
 			double decor_alpha = anim != NULL ? 1.0 : alpha;
 			decor_draw(server, fx, target, tex, NULL, border, ox, oy,
-				decor_alpha, scale);
+				decor_alpha, scale, &look);
 			displayed = target;
 			decorated = target;
 		} else {
@@ -2781,7 +2817,7 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 			/* 动画那趟没画成（FBO 拿到就没了）：装饰还在，把它按真正的 alpha
 			 * 重画一遍补上淡入淡出，别让窗口整块亮一帧。 */
 			decor_draw(server, fx, decorated, tex, NULL, border, ox, oy,
-				alpha, scale);
+				alpha, scale, &look);
 		}
 		if (atex != tex) {
 			wlr_texture_destroy(atex);
@@ -2956,6 +2992,10 @@ void vidow_fx_release(struct vidow_fx_target *fx) {
 static bool layer_blur_wanted(struct vidow_server *server,
 		struct vidow_layer_surface *ls) {
 	if (!server->shader_ok || !server->config.blur_enabled) {
+		return false;
+	}
+	/* 图层规则 blur = false：这块 layer 底下不垫模糊（全局开关仍然是总闸）。 */
+	if (ls->rule_eff.set[VRA_BLUR] && !ls->rule_eff.val[VRA_BLUR].b) {
 		return false;
 	}
 	/* 壁纸自己（background 层）不模糊：模糊的底衬里就有它，垫一层等于画重。 */
@@ -3236,8 +3276,10 @@ static bool layer_blur_frame(struct vidow_server *server,
 			mask_dumped);
 		mask_dumped++;
 	}
+	struct vidow_look ls_look;
+	vidow_rule_look(&server->config, &ls->rule_eff, &ls_look);
 	decor_draw(server, fx, target, server->empty_tex, mask, no_border,
-		ls->geom.x, ls->geom.y, 1.0, scale);
+		ls->geom.x, ls->geom.y, 1.0, scale, &ls_look);
 	if (mask != NULL) {
 		wlr_texture_destroy(mask);
 	}
@@ -3342,7 +3384,7 @@ static void closing_update(void *data, double t, double linear) {
 	if (closing->fx.active) {
 		vidow_fx_frame(closing->server, &closing->fx, closing->node,
 			&closing->geo, closing->x, y, closing->x, y, closing->alpha,
-			false, closing->scale, 1.0);
+			false, closing->scale, 1.0, &closing->rule_eff);
 		return;
 	}
 	if (closing->node != NULL) {
@@ -3378,7 +3420,8 @@ void vidow_closing_start(struct vidow_server *server,
 		struct wlr_scene_tree *parent, struct wlr_buffer *snapshot,
 		const struct vidow_fx_geo *geo, int x, int y, int w, int h,
 		int duration_ms, int slide_px, bool decorate, const char *shader_name,
-		double scale, enum vidow_easing easing, double anim_scale_to) {
+		double scale, enum vidow_easing easing, double anim_scale_to,
+		const struct vidow_rule_eff *eff) {
 	if (snapshot == NULL || duration_ms <= 0 || w <= 0 || h <= 0) {
 		return;
 	}
@@ -3398,6 +3441,9 @@ void vidow_closing_start(struct vidow_server *server,
 	closing->anim_scale_to = anim_scale_to > 0.0 ? anim_scale_to : 1.0;
 	closing->easing = easing;
 	closing->scale = scale > 0.0 ? scale : 1.0;
+	if (eff != NULL) {
+		closing->rule_eff = *eff;
+	}
 	closing->geo = (struct vidow_fx_geo){0};
 	if (geo != NULL) {
 		closing->geo = *geo;

@@ -251,6 +251,10 @@ apply_cfg \
 	'  vidow.rule{ app_id = "mpv", width = 0 } end)))))' \
 	'vidow.log("E10 " .. tostring((select(2, pcall(function()' \
 	'  vidow.rule{ app_id = "mpv", workspace = "" } end)))))' \
+	'vidow.log("E11 " .. tostring((select(2, pcall(function()' \
+	'  vidow.rule{ app_id = "mpv", opacity = 2 } end)))))' \
+	'vidow.log("E12 " .. tostring((select(2, pcall(function()' \
+	'  vidow.rule{ app_id = "mpv", corner_radius = -3 } end)))))' \
 	'vidow.rule{ app_id = "keep", capture = "hide" }'
 
 check_log() { # check_log <标签> <必须出现的串> [<也得出现的串>]
@@ -278,6 +282,8 @@ check_log E7 "整数"
 check_log E8 "0.1 ~ 1.0"
 check_log E9 "正数"
 check_log E10 "不能是空的"
+check_log E11 "0 ~ 1"
+check_log E12 "0 ~ 1e+09"
 
 RULES_N=$(./build/vidowmsg rules 2>/dev/null | python3 -c '
 import json, sys
@@ -527,8 +533,110 @@ else
 	fail "float 重载用例：窗口没起来"
 fi
 
-# ------------------------------------------------------------ 6) 收尾
-mark "6) 收尾"
+# ------------------------------------------------------------ 6) 外观作用
+mark "6) 外观作用（装饰 / 不透明度 / 圆角 / 边框 / 阴影 / 噪点 / 模糊）"
+
+case_look() { # case_look <标签> <表达式> <期望> <规则行…>
+	local label="$1" expr="$2" want="$3"; shift 3
+	apply_cfg "$@" || { fail "$label：配置没重载"; return; }
+	# 用第 3 节那个一直开着的窗口（title = bluewin 的第一个）
+	local id
+	id=$(./build/vidowmsg windows 2>/dev/null | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+w = d.get("windows", d) if isinstance(d, dict) else d
+print(next((x["id"] for x in w if x.get("title") == "bluewin"), 0))')
+	if [ "$id" = 0 ]; then
+		fail "$label：没有窗口"
+		return
+	fi
+	if wait_field "$id" "$expr" "$want"; then
+		pass "$label → $expr = $want"
+	else
+		fail "$label → 想要 $want"
+	fi
+}
+
+case_look "opacity 改不透明度" 'x["look"]["opacity"]' 0.5 \
+	'vidow.rule{ title = "^bluewin$", opacity = 0.5 }'
+case_look "corner_radius 改圆角" 'x["look"]["corner_radius"]' 24 \
+	'vidow.rule{ title = "^bluewin$", corner_radius = 24 }'
+case_look "border_width 改边框" 'x["look"]["border_width"]' 0 \
+	'vidow.rule{ title = "^bluewin$", border_width = 0 }'
+case_look "border_color 改边框颜色" 'x["look"]["border_color"]' "#ff0000ff" \
+	'vidow.rule{ title = "^bluewin$", border_color = "ff0000" }'
+case_look "border_color_focus 也认" 'x["look"]["border_color_focus"]' "#00ff00ff" \
+	'vidow.rule{ title = "^bluewin$", border_color_focus = "00ff00" }'
+case_look "shadow_radius 改阴影" 'x["look"]["shadow_radius"]' 30 \
+	'vidow.rule{ title = "^bluewin$", shadow_radius = 30 }'
+case_look "shadow_offset 也认" 'x["look"]["shadow_offset_y"]' 8 \
+	'vidow.rule{ title = "^bluewin$", shadow_offset_y = 8 }'
+case_look "noise 也认" 'x["look"]["noise"]' 0.2 \
+	'vidow.rule{ title = "^bluewin$", noise = 0.2 }'
+case_look "decor = false 不画装饰" 'x["look"]["decor"]' False \
+	'vidow.rule{ title = "^bluewin$", decor = false }'
+case_look "blur = false 关掉这个窗口的模糊" 'x["look"]["blur"]' False \
+	'vidow.rule{ title = "^bluewin$", blur = false }'
+case_look "blur = true 让平铺窗口也模糊" 'x["look"]["blur"]' True \
+	'vidow.rule{ title = "^bluewin$", blur = true }'
+case_look "blur_xray 也认" 'x["look"]["blur_xray"]' True \
+	'vidow.rule{ title = "^bluewin$", blur_xray = true }'
+case_look "全局开关压得住规则（decor_enabled = false）" 'x["look"]["decor"]' False \
+	'decor_enabled = false' \
+	'vidow.rule{ title = "^bluewin$", decor = true }'
+case_look "规则压得住全局值（全局圆角 4，规则 24）" 'x["look"]["corner_radius"]' 24 \
+	'corner_radius = 4' \
+	'vidow.rule{ title = "^bluewin$", corner_radius = 24 }'
+
+# 真的画上去了：不透明度 0.3 的窗口抓下来要暗一大截（量窗口中心的蓝通道）
+mark "6b) 不透明度真的作用在画面上（抓帧量像素）"
+if command -v grim >/dev/null && python3 -c 'import PIL' 2>/dev/null; then
+	center_pixel() { # center_pixel <png> <x> <y> —— 打印蓝通道
+		python3 - "$1" "$2" "$3" <<'PYEOF'
+import sys
+from PIL import Image
+img = Image.open(sys.argv[1]).convert("RGB")
+x, y = int(sys.argv[2]), int(sys.argv[3])
+x = max(0, min(img.width - 1, x))
+y = max(0, min(img.height - 1, y))
+print(img.getpixel((x, y))[2])
+PYEOF
+	}
+	win_center() { # 那个窗口的中心（布局坐标）
+		./build/vidowmsg windows 2>/dev/null | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+w = d.get("windows", d) if isinstance(d, dict) else d
+for x in w:
+	if x.get("title") == "bluewin":
+		g = x["geometry"]
+		print(g["x"] + g["width"] // 2, g["y"] + g["height"] // 2)
+		break
+else:
+	print(0, 0)'
+	}
+
+	apply_cfg
+	sleep 0.5
+	read -r WX WY <<< "$(win_center)"
+	grim -o "$OUT" "$RUNDIR/full.png" 2>/dev/null
+	B_FULL=$(center_pixel "$RUNDIR/full.png" "$WX" "$WY")
+	apply_cfg 'vidow.rule{ title = "^bluewin$", opacity = 0.3 }'
+	sleep 0.5
+	grim -o "$OUT" "$RUNDIR/dim.png" 2>/dev/null
+	B_DIM=$(center_pixel "$RUNDIR/dim.png" "$WX" "$WY")
+	if [ "$B_FULL" -gt 150 ] && [ "$B_DIM" -lt $((B_FULL * 6 / 10)) ]; then
+		pass "opacity = 0.3：窗口中心的蓝从 $B_FULL 掉到 $B_DIM"
+	else
+		fail "opacity = 0.3 没作用在画面上（原样 $B_FULL → 现在 $B_DIM）"
+	fi
+	apply_cfg
+else
+	echo "  （没有 grim 或 PIL，跳过像素判据）"
+fi
+
+# ------------------------------------------------------------ 7) 收尾
+mark "7) 收尾"
 grep -aq "Assertion" "$LOG" || grep -aq "abort" "$LOG" &&
 	fail "日志里有 assert / abort" || pass "日志里没有 assert / abort"
 ./build/vidowmsg windows 2>/dev/null | grep -aq '"title": *"bluewin"' &&

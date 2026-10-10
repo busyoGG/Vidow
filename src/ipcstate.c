@@ -27,6 +27,15 @@
 
 /* ------------------------------------------------------------------ 小工具 */
 
+/* 颜色（四个 0..1 的分量）→ "#rrggbbaa"，和配置里读回来的写法一致。 */
+static void jb_kv_color(struct jbuf *b, const char *key, const float c[4]) {
+	char buf[16];
+	snprintf(buf, sizeof(buf), "#%02x%02x%02x%02x",
+		(int)(c[0] * 255.0f + 0.5f), (int)(c[1] * 255.0f + 0.5f),
+		(int)(c[2] * 255.0f + 0.5f), (int)(c[3] * 255.0f + 0.5f));
+	jb_kv_str(b, key, buf);
+}
+
 static int64_t now_ms(void) {
 	return vidow_now_ns() / 1000000;
 }
@@ -285,6 +294,27 @@ void vidow_ipc_json_window(struct jbuf *b, struct vidow_server *server,
 		view->capture_mode == VIDOW_CAPTURE_MOSAIC ? "mosaic" : "off");
 	jb_kv_int(b, "capture_mosaic", view->capture_mosaic);
 	jb_kv_double(b, "x11_scale", view->x11_scale);
+	jb_obj_end(b);
+
+	/* 这个窗口现在该长什么样：全局配置压上窗口规则（rule.c 的 vidow_rule_look）。
+	 * 渲染用的就是这一份 —— 自检脚本拿它当判据，不用去量像素。 */
+	struct vidow_look look;
+	vidow_rule_look(&server->config, &view->rule_eff, &look);
+	jb_key(b, "look");
+	jb_obj(b);
+	jb_kv_double(b, "opacity", look.opacity);
+	jb_kv_double(b, "corner_radius", look.corner_radius);
+	jb_kv_double(b, "border_width", look.border_width);
+	jb_kv_color(b, "border_color", look.border_color);
+	jb_kv_color(b, "border_color_focus", look.border_color_focus);
+	jb_kv_double(b, "shadow_radius", look.shadow_radius);
+	jb_kv_color(b, "shadow_color", look.shadow_color);
+	jb_kv_int(b, "shadow_offset_x", look.shadow_offset_x);
+	jb_kv_int(b, "shadow_offset_y", look.shadow_offset_y);
+	jb_kv_double(b, "noise", look.noise);
+	jb_kv_bool(b, "decor", look.decor);
+	jb_kv_bool(b, "blur", look.blur);
+	jb_kv_bool(b, "blur_xray", look.blur_xray);
 	jb_obj_end(b);
 
 	/* 客户端自己要的尺寸边界（xdg 的 min/max，X11 读 WM_NORMAL_HINTS）。 */

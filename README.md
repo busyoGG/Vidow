@@ -480,6 +480,7 @@ end
 | 匹配字段（图层） | `namespace`（waybar / mako / notifications …）、`layer`（`background` / `bottom` / `top` / `overlay`）—— 写了这两个里任何一个就是**图层规则**。窗口字段和图层字段写进同一条规则 = 这条谁也不匹配（不静默失效，日志和 `vidowmsg rules` 都看得见） |
 | 匹配字段（状态） | `is_` 开头的是「现在是不是这样」：`is_xwayland`、`is_popup`（菜单 / 提示这类弹出物）、`is_floating`、`is_fullscreen`、`is_maximized`（所在列整列最大化）、`is_minimized`、`is_fixed_size`（客户端声明了固定尺寸，微信登录窗那种）。写成 `true` / `false`（不写 = 不管它），比的是**判定那一刻**的状态 —— 判定发生在建窗口、标题 / class 变化、重载规则这三处 |
 | 作用（一直在） | `force_render`、`hz`、`focus_on_open`、`focus_on_activate`、`honor_invalid_serial`、`x11_scale`、`capture`、`capture_mosaic`、`anim`（`false` = 这个窗口不做开合动画） |
+| 作用（外观） | `decor`（`false` = 不画装饰）、`opacity`、`corner_radius`、`border_width`、`border_color`、`border_color_focus`、`shadow_radius`、`shadow_color`、`shadow_offset_x`、`shadow_offset_y`、`noise`、`blur`（`false` = 它背后不模糊，`true` = 平铺窗口也模糊）、`blur_xray`。没写的用全局配置；**全局开关（`decor_enabled` / `blur_enabled`）是总闸**，规则只能收窄不能突破。`vidowmsg windows` 的 `look` 那一块就是「这个窗口现在长什么样」—— 规则有没有生效看它，不用量像素 |
 | 作用（开窗时兑现一次） | `float`（`true` 强制浮动 / `false` 强制平铺）、`workspace`（具名工作区，没有就建 / `special:名字` / 序号）、`output`（开在哪块屏）、`width` / `height`（浮动窗口开多大）、`center`、`fullscreen`、`maximize`、`minimize`、`column_width`（这个窗口新开的列有多宽）。**重载规则不搬已经开着的窗口，也不改它们的尺寸** —— 「开出来什么样」和「现在什么样」是两回事 |
 | 覆盖顺序 | 按配置里的先后逐条套用，**后面的覆盖前面的**；一条规则只动它写了的字段，谁都没写的字段用默认值 |
 | 生效时机 | 建窗口时判一次；标题 / class 变了再判一次；`SIGHUP` 重载规则后把已经开着的窗口全部重判 |
@@ -4403,6 +4404,31 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
        口子（screencopy / ext-image-copy-capture 同样对所有客户端开放，grim / OBS 靠它），
        而要收就得连它一起收 —— 那会把 grim / wf-recorder / OBS 全废掉。要边界得靠 sandbox
        那一层（别的进程拿不到 wayland socket），不是合成器。
+
+199. **规则能改外观**（「覆盖 vidow 所有能改的地方」的最后一截：装饰着色器的参数）
+
+      198 把布局 / 行为那些作用做完了，剩下的是「这个窗口长什么样」—— 圆角、边框、
+      阴影、噪点、不透明度、背后模不模糊，这些原本只有全局配置键（`configs/02-decor.lua`、
+      `03-blur.lua`）。现在每个窗口都能单独盖：
+
+      - 新作用 13 项：`decor`、`opacity`、`corner_radius`、`border_width`、
+        `border_color`、`border_color_focus`、`shadow_radius`、`shadow_color`、
+        `shadow_offset_x`、`shadow_offset_y`、`noise`、`blur`、`blur_xray`。
+      - 合成一份「现在长什么样」（`struct vidow_look` + `vidow_rule_look()`，`rule.c`）：
+        全局配置打底、规则压上去。渲染（`fx.c` 的 `decor_draw` / `view_wants_blur` /
+        `layer_blur_wanted`）和 IPC（`vidowmsg windows` 的 `look`）用的是同一份 ——
+        「规则有没有生效」不用去量像素。
+      - **全局开关是总闸**：`decor_enabled = false` 时规则写 `decor = true` 也开不回来
+        （关装饰多半是为了性能 / 兼容，被一条规则悄悄打开更意外）；`blur` 同理。
+      - `shadow_radius` / `shadow_offset_*` 会改离屏装饰缓冲的内边距（`vidow_fx_pad`），
+        所以它按「全局值」和「所有规则里最大的那个」取大 —— 多留一圈只是缓冲大一点，
+        少留就是阴影被裁掉。
+      - 关窗动画的快照也带上一份规则作用（`vidow_closing_start` 多一个参数）：不带的
+        话，关窗动画一出来装饰就变回全局配置的样子。
+      - 判据：`test-rules.sh` 第 6 节 15 项（每一项都拿 `look` 对：单项改、全局压规则、
+        规则压全局）+ 一条**真的量像素**的判据（`opacity = 0.3` 时窗口中心的蓝通道
+        255 → 97，用 grim 抓帧 + PIL 读）；第 2 节另加 `opacity = 2` /
+        `corner_radius = -3` 两条越界校验。
 
 198. **规则的作用覆盖到 vidow 能改的地方**（用户要求「规则允许修改的项目覆盖 vidow 所有能改的地方」）
 

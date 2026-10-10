@@ -119,6 +119,20 @@ enum vidow_rule_act {
 	VRA_COLUMN_WIDTH,      /* 新列的宽度占比（0.1 ~ 1.0） */
 	/* 一直在的 */
 	VRA_ANIM,              /* false = 这个窗口不做开合动画 */
+	/* 外观（装饰着色器的参数；没写的用全局配置） */
+	VRA_DECOR,             /* false = 这个窗口不画装饰（边框 / 圆角 / 阴影） */
+	VRA_OPACITY,           /* 整块（含装饰）的不透明度 */
+	VRA_CORNER_RADIUS,
+	VRA_BORDER_WIDTH,
+	VRA_BORDER_COLOR,      /* 没聚焦时的边框颜色 */
+	VRA_BORDER_COLOR_FOCUS,
+	VRA_SHADOW_RADIUS,
+	VRA_SHADOW_COLOR,
+	VRA_SHADOW_OFFSET_X,
+	VRA_SHADOW_OFFSET_Y,
+	VRA_NOISE,
+	VRA_BLUR,              /* false = 它背后不模糊（全局 blur_enabled 仍是总开关） */
+	VRA_BLUR_XRAY,         /* 重叠时也用整屏那份底衬 */
 	VRA_COUNT
 };
 
@@ -161,6 +175,25 @@ struct vidow_rule {
 	/* 作用 */
 	bool aset[VRA_COUNT];
 	union vidow_rule_value aval[VRA_COUNT];
+};
+
+/* 一个窗口 / layer 现在的装饰参数：窗口规则写了就用规则的，没写用全局配置。
+ * 渲染（fx.c）和 IPC（vidowmsg windows 的 look 那一块）都看这一份 ——
+ * 「规则有没有生效」不用去量像素。 */
+struct vidow_look {
+	double opacity;
+	double corner_radius;
+	double border_width;
+	float border_color[4];
+	float border_color_focus[4];
+	double shadow_radius;
+	float shadow_color[4];
+	int shadow_offset_x;
+	int shadow_offset_y;
+	double noise;
+	bool decor;   /* 画不画装饰 */
+	bool blur;    /* 它背后的模糊给不给（全局 blur_enabled 关着就一律不给） */
+	bool blur_xray;
 };
 
 /* 字段类型：RK_* 是匹配字段，RK_ACT_* 是作用字段。 */
@@ -218,6 +251,12 @@ bool vidow_rule_set_act_color(struct vidow_rule *rule, int slot,
 bool vidow_rule_set_capture(struct vidow_rule *rule, int slot,
 		const char *value, char *err, size_t errlen);
 void vidow_rule_set_literal(struct vidow_rule *rule, bool literal);
+
+/* 把全局配置和规则算出来的作用合成一份「现在长什么样」。eff 可以是 NULL
+ * （没有规则的目标）。 */
+struct vidow_config;
+void vidow_rule_look(const struct vidow_config *cfg,
+		const struct vidow_rule_eff *eff, struct vidow_look *out);
 
 /* 这条规则写没写这个字段（读回来的时候用：vidow.rules() / IPC 的 rules）。 */
 bool vidow_rule_has_field(const struct vidow_rule *rule,

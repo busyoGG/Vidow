@@ -243,7 +243,7 @@ static void layer_snapshot_close(struct vidow_layer_surface *ls) {
 		ls->output != NULL && ls->output->wlr_output != NULL ?
 			(double)ls->output->wlr_output->scale : 1.0,
 		/* layer 的关闭沿用全局 easing、也不缩放：状态栏「缩着淡出」很怪。 */
-		cfg->easing, 1.0);
+		cfg->easing, 1.0, &ls->rule_eff);
 }
 
 /* --------------------------------------------------------------- events */

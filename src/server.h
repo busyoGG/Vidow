@@ -658,6 +658,9 @@ struct vidow_closing {
 	int x, y, w, h;
 	struct vidow_fx_geo geo; /* 快照里哪一块是「可见窗口」（见上） */
 	double scale;
+	/* 关的时候长什么样（窗口规则的装饰参数）—— 快照要按同一份参数画，
+	 * 不然关窗动画一出来装饰就变回全局配置的样子了。 */
+	struct vidow_rule_eff rule_eff;
 };
 
 /* ------------------------------------------------------------------ output */
@@ -1999,10 +2002,12 @@ bool vidow_fx_begin(struct vidow_server *server, struct vidow_fx_target *fx,
 bool vidow_fx_draw_mesh(struct vidow_server *server, struct wlr_buffer *dst,
 	int w, int h, struct wlr_texture *src, const float *verts, int n_verts);
 
+/* eff = 这个目标的规则作用（rule.c 的 vidow_rule_eff，NULL = 没规则）。 */
 bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 		struct wlr_scene_buffer *src, const struct vidow_fx_geo *geo,
 		int x, int y, int ox, int oy,
-		double alpha, bool focused, double scale, double ov);
+		double alpha, bool focused, double scale, double ov,
+		const struct vidow_rule_eff *eff);
 void vidow_fx_end(struct vidow_server *server, struct vidow_fx_target *fx);
 void vidow_fx_release(struct vidow_fx_target *fx);
 void vidow_fx_flush(struct vidow_server *server);
@@ -2447,7 +2452,8 @@ void vidow_closing_start(struct vidow_server *server,
 		struct wlr_scene_tree *parent, struct wlr_buffer *snapshot,
 		const struct vidow_fx_geo *geo, int x, int y, int w, int h,
 		int duration_ms, int slide_px, bool decorate, const char *shader_name,
-		double scale, enum vidow_easing easing, double anim_scale_to);
+		double scale, enum vidow_easing easing, double anim_scale_to,
+		const struct vidow_rule_eff *eff);
 
 /* ------------------------------------------------------------------ layout */
 
