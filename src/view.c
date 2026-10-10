@@ -2676,6 +2676,11 @@ void vidow_view_activate(struct vidow_view *view) {
 		return;
 	}
 	struct vidow_server *server = view->server;
+	/* 事件：有人要求激活这个窗口（X11 的 _NET_ACTIVE_WINDOW、Wayland 的
+	 * xdg-activation、IPC 的 activate-window、点通知预览…都走这里）。
+	 * 关注点不是「谁抢了焦点」而是「应用在喊『看我』」—— 通知 / 高亮脚本要的是
+	 * 这个。 */
+	vidow_ipc_emit_window(server, "window-activated", view);
 	const char *title = vidow_view_title(view) != NULL ?
 		vidow_view_title(view) : "(无题)";
 

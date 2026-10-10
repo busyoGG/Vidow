@@ -26,6 +26,7 @@
  * 光标模式（pointer_mode，协议里的 enum pointer）：hidden / embedded / metadata。
  */
 
+#include "ipc.h"
 #include "server.h"
 
 #include <math.h>
@@ -817,6 +818,9 @@ void vidow_screencast_cursor_moved(struct vidow_server *server) {
 
 /* ------------------------------------------------------------ 流的生命周期 */
 
+static const char *kind_name(enum vidow_sc_kind kind);
+static int count_streams(const struct vidow_screencast *sc);
+
 void vidow_sc_pw_stream_start(struct vidow_screencast_stream *stream) {
 	struct vidow_screencast *sc = stream->sc;
 	if (sc->pw == NULL) {
@@ -838,6 +842,16 @@ void vidow_sc_pw_stream_start(struct vidow_screencast_stream *stream) {
 	ps->pw = sc->pw;
 	ps->node_id = SPA_ID_INVALID;
 	stream->pw = ps;
+
+	/* 事件：这一路真的开始录了（哪块屏 / 什么内容 + 一共几路）。用户脚本靠它
+	 * 做「录屏时别弹通知 / 别切工作区」这类事。失败的流不会走到这儿。 */
+	const struct vidow_event_field fields[] = {
+		VIDOW_EV_STR("output", output->name),
+		VIDOW_EV_STR("kind", kind_name(stream->kind)),
+		VIDOW_EV_NUM("streams", count_streams(sc)),
+		VIDOW_EV_END,
+	};
+	vidow_ipc_emit_simple(sc->server, "screencast-started", fields);
 
 	/* 流的像素尺寸：整块输出 / 虚拟输出就是输出的像素尺寸，区域 / 窗口是调用方
 	 * 在请求里算好的（见 handle_stream_region / handle_stream_window）。 */
@@ -1020,7 +1034,45 @@ void vidow_screencast_stream_fail(struct vidow_screencast_stream *stream,
 	zkde_screencast_stream_unstable_v1_send_failed(stream->resource, why);
 }
 
+/* 这一路在录什么（事件里报出来用）。 */
+static const char *kind_name(enum vidow_sc_kind kind) {
+	switch (kind) {
+	case VIDOW_SC_OUTPUT:
+		return "output";
+	case VIDOW_SC_WINDOW:
+		return "window";
+	case VIDOW_SC_REGION:
+		return "region";
+	case VIDOW_SC_VIRTUAL:
+		return "virtual";
+	}
+	return "?";
+}
+
+/* 现在挂着几路流（含 stream 自己）。 */
+static int count_streams(const struct vidow_screencast *sc) {
+	int n = 0;
+	struct vidow_screencast_stream *st;
+	wl_list_for_each(st, &sc->streams, link) {
+		n++;
+	}
+	return n;
+}
+
 static void stream_destroy(struct vidow_screencast_stream *stream) {
+	struct vidow_screencast *sc = stream->sc;
+	/* 事件：这一路结束了（客户端断开 / 窗口没了 / 输出拔了都会走到这儿）。
+	 * streams 是「还剩几路」（这条还在列表里，所以是含自己的数）。 */
+	if (sc != NULL) {
+		const struct vidow_event_field fields[] = {
+			VIDOW_EV_STR("output", stream->output != NULL ?
+				stream->output->name : NULL),
+			VIDOW_EV_STR("kind", kind_name(stream->kind)),
+			VIDOW_EV_NUM("streams", count_streams(sc)),
+			VIDOW_EV_END,
+		};
+		vidow_ipc_emit_simple(sc->server, "screencast-stopped", fields);
+	}
 	if (stream->resource != NULL) {
 		wl_resource_set_user_data(stream->resource, NULL);
 		stream->resource = NULL;

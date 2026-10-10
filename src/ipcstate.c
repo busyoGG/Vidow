@@ -1400,6 +1400,42 @@ void vidow_ipc_emit_column(struct vidow_server *server, const char *event,
 	emit(server, event, payload_column, col);
 }
 
+struct simple_ev {
+	const struct vidow_event_field *fields;
+};
+
+static void payload_simple(struct jbuf *b, struct vidow_server *server,
+		void *data) {
+	(void)server;
+	struct simple_ev *ev = data;
+	jb_obj(b);
+	for (const struct vidow_event_field *f = ev->fields;
+			f != NULL && f->key != NULL; f++) {
+		switch (f->type) {
+		case VIDOW_EV_NUM:
+			jb_kv_int(b, f->key, f->num);
+			break;
+		case VIDOW_EV_BOOL:
+			jb_kv_bool(b, f->key, f->boolean);
+			break;
+		case VIDOW_EV_TEXT:
+		default:
+			jb_kv_str(b, f->key, f->text);
+			break;
+		}
+	}
+	jb_obj_end(b);
+}
+
+void vidow_ipc_emit_simple(struct vidow_server *server, const char *event,
+		const struct vidow_event_field *fields) {
+	if (!vidow_event_wanted(server, event) || fields == NULL) {
+		return;
+	}
+	struct simple_ev ev = { .fields = fields };
+	emit(server, event, payload_simple, &ev);
+}
+
 void vidow_ipc_emit_note(struct vidow_server *server, const char *event) {
 	if (!vidow_event_wanted(server, event)) {
 		return;

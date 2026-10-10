@@ -906,6 +906,9 @@ python3 test-float.py        # 三个真实 GTK 窗口，验证浮动模式自�
 ./test-vt.sh                         # tty 的 VT 切换（Ctrl+Alt+F1..F12 / switch-vt 动作）（全 headless，11 项断言）
 ./test-focus.sh                      # 焦点规则 + 激活请求（全 headless，61 项断言）
 ./test-ipc.sh                        # IPC：状态输出 / 命令 / 事件 / 多屏（全 headless，162 项断言）
+./test-hooks.sh                      # 事件钩子（config.lua 的 vidow.on）：命令钩子 / Lua 钩子 / "*" / 自定义事件 / 摘钩子 / 出错不连累别人（全 headless，30 项断言）
+./test-events.sh                     # 事件的丰富度：keybind / ipc-action / window-activated / 拖拽 / 屏开关 / X11 起来 / 输入设备插拔 / 配置出错（全 headless，28 项断言）
+./test-env.sh                        # 会话环境：和 systemd 用户管理器两个方向对账 + exec-once 自启动（全 headless，33 项断言）
 ./test-input-inject.sh               # 输入注入：鼠标 / 键盘合成事件到客户端（全 headless，54 项断言）
 ./test-pointer-lock.sh               # 指针约束：锁鼠标 / 夹光标 / 相对位移，X11 的 XGrabPointer 也认（全 headless，27 项断言）
 ./test-keyboard-grab.sh              # 键盘那两个协议：快捷键抑制（含逃生口）+ X11 的 XGrabKeyboard（全 headless，30 项断言）
@@ -1674,6 +1677,8 @@ vidow 自己的，比如 `vidow-wayland-1.sock`）；`ipc_socket` 可以写死�
 | 合成器 | `action`（键位那套动作字符串）、`set-config` / `get-config`、`reload-config`、`toggle-overview`、`mru`（最近窗口台账 + 面板几何）、`move-cursor`、`quit` |
 | 输入注入 | `pointer-button`（`click` / `press` / `release` + `button` / `count`）、`pointer-scroll`（`dx` / `dy` / `discrete`）、`send-key`（`state` + `keys`）、`type-text`（`text`）；见下面「输入注入」一节 |
 | 订阅 | `subscribe`（可带 `events` 过滤器）、`unsubscribe` |
+| 事件 | `hooks`（配置里挂着的钩子：谁在听、跑过几次 + 事件名单）、`events`（全部事件名）、`emit`（自己发一个事件） |
+| 环境 | `env`（vidow 管着哪些变量、会推哪些给 systemd）、`set-env` / `unset-env`（改一个变量） |
 
 几条语义值得记一下：
 
@@ -1685,8 +1690,11 @@ vidow 自己的，比如 `vidow-wayland-1.sock`）；`ipc_socket` 可以写死�
 - **`set-config` 是运行时改**：改完立刻生效（外观类的东西下一帧就是新的），但**不落盘**，
   SIGHUP / `reload-config` 之后按配置文件重来。
 - **`quit` 是正常退出**：走完整的析构路径（顺带修掉了一个一直藏着的 wlroots 断言，见下）。
-- **不提供 shell 命令**：IPC 只能操作合成器自己的功能，不能执行命令（能跑 shell 的是
-  `config.lua`，那是你自己写的文件）。安全边界就是 socket 的权限：`0600`，只有本人能连。
+- **跑 shell 有两条路**：`spawn <命令>` 这个动作串（`vidowmsg action "spawn kitty"`，
+  双 fork、不等它、不阻塞渲染），或者 `emit` 一个事件让**配置里**写好的钩子去跑
+  （`vidow.on("my-event", "…")`，见下面「事件钩子」）。安全边界就是 socket 的权限：
+  `0600`，只有本人能连；输入注入那一套（`pointer-button` / `send-key` / `type-text`）还能
+  用 `input_injection = 0` 整个关掉。
 
 ### 事件订阅
 
@@ -1703,16 +1711,29 @@ vidow 自己的，比如 `vidow-wayland-1.sock`）；`ipc_socket` 可以写死�
 | `window-moved` | 布局把它挪了 / 缩了（第一次摆放也报） |
 | `window-focus-changed` | 键盘焦点换人（载荷是新的焦点窗口，没有就是 `null`） |
 | `window-floating-changed` / `window-fullscreen-changed` / `window-workspace-changed` | 浮动 / 全屏 / 工作区变了 |
+| `window-minimized` / `window-unminimized` | 收起 / 放回（载荷是那个窗口） |
+| `window-activated` | 应用喊「看我」：xdg-activation 的令牌、X11 的 `_NET_ACTIVE_WINDOW`、IPC 的 `activate-window` 都走这儿 |
+| `drag-started` / `drag-ended` | 拖窗口起 / 停（载荷是那个窗口；挪动和改列宽都算，见 `src/drag.c`） |
 | `column-maximize-changed` | 那条列的最大化状态变了（载荷是列的完整对象，带 `maximized`） |
-| `workspace-created` / `workspace-activated` / `workspace-changed` / `workspace-special-changed` | 工作区建了 / 切了 / 换屏了 / 特殊工作区开关了 |
-| `output-added` / `output-removed` / `output-changed` | 屏插拔 / 开关 / 缩放 / 方向 / 模式 / 位置变了 |
+| `workspace-created` / `workspace-removed` / `workspace-activated` / `workspace-changed` / `workspace-special-changed` | 工作区建了 / 拆了 / 切了 / 换屏了 / 特殊工作区开关了 |
+| `output-added` / `output-removed` / `output-changed` | 屏插拔 / 缩放 / 方向 / 模式 / 位置变了 |
+| `output-power-changed` | 某块屏开了或关了（`name` + `enabled`；窗口和布局一件没动，见「关屏」那条） |
 | `layer-mapped` / `layer-unmapped` / `layer-closed` | layer surface 上屏 / 下屏 / 没了 |
 | `clipboard-changed` / `primary-changed` | 剪贴板 / 选区的内容或状态变了（载荷是那一刻的状态对象，跟 `clipboard` 命令一样） |
-| `overview-toggled` / `config-reloaded` | 全景开关、配置重载（没有载荷，去查状态） |
+| `mru-shown` / `mru-opened` / `mru-committed` / `mru-cancelled` | Alt+Tab 切换器：面板显形 / 打开 / 选定 / 取消（没有载荷，去查 `mru`） |
+| `keybind` | 绑好的键被按下（`trigger` = `Mod+1` 这样的触发串、`action` = 那条动作串） |
+| `ipc-action` | 从 IPC 来的动作（`action` + `source: "ipc"`）—— 和键位那条分开报，「谁按的」分得清 |
+| `input-device-added` / `input-device-removed` | 输入设备插拔（`name` + `type`：keyboard / pointer / touch / tablet…；虚拟键盘也算，名字就是协议给的 `wlr_virtual_keyboard_v1`） |
+| `xwayland-ready` | X 服务真的起来了（懒启动，第一个 X 客户端连上来才有这一下）：`display` + `scale` |
+| `screencast-started` / `screencast-stopped` | 有人开始 / 结束录屏了这一路（`output` / `kind` = output / window / region / virtual / `streams` = 还剩几路） |
+| `overview-toggled` / `config-reloaded` / `config-failed` | 全景开关、配置重载、配置没跑成（`config-failed` 带 `error`） |
+
+事件全名单跟着代码走：`vidowmsg events`（现在 42 个）。名字由调用方定的**自定义事件**
+（`vidowmsg emit my-event`）不在名单里，订阅和钩子照样能听。
 
 `subscribe` 可以带过滤器：`{"cmd":"subscribe","events":["window-opened"]}`，只收订了的
-那几种。没有订阅者时事件那条路完全不走（`vidow_ipc_wanted()` 先挡一下），不订阅就不花
-这份钱。
+那几种。没人要的事件完全不发 —— 判断的是「IPC 订阅者**或者**配置里的钩子」
+（`vidow_event_wanted()`）：不订阅、也没写 `vidow.on()` 就不花这份钱。
 
 ### 配置
 
@@ -1753,6 +1774,158 @@ ipc_socket = /run/user/1000/vidow.sock   # 留空 = 按 WAYLAND_DISPLAY 自动�
    原因提交一次**旧尺寸**，`vidow_float_on_commit()` 会拿旧尺寸把浮动盒改回去，随后 arrange
    又按旧尺寸 configure —— 等于这条命令没发生。现在记着「我让它多大」（`float_want_w/h`），
    在客户端认下来之前不采纳它的旧尺寸，并且再催一次 configure。
+
+### 事件钩子：`vidow.on()`（配置里直接听事件）
+
+事件本来只有一条路：外挂脚本连上 socket 订阅（`subscribe`）。配置里也能听：
+
+```lua
+-- 起一条命令（事件字段变成环境变量，见下）
+vidow.on("window-opened", "notify-send \"$VIDOW_APP_ID\" \"$VIDOW_TITLE\"")
+-- 跑一段 Lua（载荷是一张表：e.event / e.time_ms / e.data.*，跟那条 JSON 同构）
+vidow.on("window-opened", function(e)
+	if e.data.app_id == "mpv" then
+		vidow.log("mpv 来了：" .. tostring(e.data.title))
+	end
+end)
+-- "*" = 全部事件；也能一次挂一串（返回 id 表，vidow.off() 摘）
+local ids = vidow.on("*", {
+	"echo $VIDOW_EVENT >> /tmp/events.log",
+	function(e) vidow.log(e.event) end,
+})
+vidow.off(ids[2])
+```
+
+- **命令钩子**：事件字段变成子进程的环境变量 —— `VIDOW_EVENT`、`VIDOW_EVENT_TIME_MS`、
+  `VIDOW_EVENT_JSON`（整个信封的 JSON，要什么有什么），外加 `data` 里每个**标量**字段一条
+  `VIDOW_<字段名大写>`（`app_id` → `VIDOW_APP_ID`，`-` 换成 `_`；数组 / 对象跳过，它们在
+  `VIDOW_EVENT_JSON` 里）。命令跑完就把这些变量还原，不留在 vidow 自己的环境里。
+  跑的是和 `spawn` 同一套：双 fork、不等它、不阻塞渲染。
+- **Lua 钩子**：载荷是解码后的表（`e.event` / `e.time_ms` / `e.data`）+ 第二个参数给原始
+  JSON。里面**能 await `vidow.exec()`** —— 和配置文件里那套协程一样（yield 一条命令、
+  回来接着跑），所以「开窗时查一下什么东西再决定」写得出来。
+- 出错只打日志（`钩子 #3 出错：…`），**不连累**同一个事件的其它钩子，也不会把合成器带下去。
+- 钩子一律进队、在事件循环的 idle 里跑（钩子能做的事和 IPC 命令一样多 —— 改配置、关窗口、
+  开会话，不能站在合成的半路上）。队列上限 256 条：钩子里干的活太重、积到上限就丢新的并
+  打一条 error，免得无声吃内存。
+- **配置重载 = 钩子重新声明**：旧的整批作废（Lua 引用还回去），新配置里写了什么就是什么。
+  所以配置文件里删掉一行 `vidow.on`，它就真的没了。
+- 自定义事件：`vidowmsg emit my-event --data '{"n":1}'` 发一个，订阅者和钩子一起收
+  （`--data` 给的是 JSON 本身，不是字符串）。脚本之间、脚本和配置之间的一条通道。
+
+### 自启动：`exec_once` / `spawn` / `exec`
+
+```lua
+vidow.exec_once("waybar")                    -- 整个 vidow 生命周期只起一次
+vidow.exec_once{ "swaybg -i 壁纸.png", "mako" }
+vidow.spawn("fcitx5 -d")                     -- 每次配置加载都起（撒手、不等）
+local host = vidow.exec("hostname")          -- 要输出：跑一条、等它（400ms 超时）
+```
+
+| 写法 | 什么时候起 | 等它吗 | 要输出用它吗 |
+| --- | --- | --- | --- |
+| `vidow.exec_once(cmd)` | 这份配置跑完之后起；**重载不重来** | 不等 | 不 |
+| `vidow.spawn(cmd)` | 配置跑到那一行就起；每次重载都起 | 不等 | 不 |
+| `vidow.exec(cmd)` / `vidow.exec_status(cmd)` | 配置跑到那一行就起 | 等（协程让出，不阻塞渲染） | 是 |
+
+- `exec_once` 的命令**先排队**，等这份配置跑完（环境、缩放、`DISPLAY` 都定了）再以撒手方式
+  起 —— 所以配置里写多早都不影响它看到的环境。这对应 Hyprland 的 `exec-once`。
+- 「起过了」按**命令原文**记：重载之后同一行还是同一行，认得出、不重来；把命令原文改了就
+  是一条新命令，会再起一次（和 Hyprland 一个规矩）。
+- 三条路起的子进程都**继承 vidow 的完整环境**：`WAYLAND_DISPLAY` 指向 vidow 自己、
+  `DISPLAY`（X 起来之后）、`XDG_CURRENT_DESKTOP`、`VIDOW_SOCKET`、以及 `vidow.env{}` 设过的
+  变量 —— 状态栏、通知守护、输入法直接就能连上，不用自己猜 socket 路径。
+- `vidow.exec()` 默认 400ms 超时（`VIDOW_EXEC_TIMEOUT` 改，超时按进程组 SIGKILL）。要起常驻
+  程序别用它（后台进程继承着捕获用的管道，EOF 永远不来 → 400ms 后被杀），用 `spawn` 或
+  `exec_once`。
+
+## 自启动 / 会话环境：和 systemd 用户管理器两个方向对账
+
+从 vidow 里起来的命令继承的是**进程环境**，而由 systemd / dbus 拉起来的应用（xdg-desktop-
+portal、`systemd --user` 的服务、桌面文件激活的程序）继承的是**用户管理器里的环境**。两个不
+打通就会出现「配置里起的程序连得上 vidow，systemd 起的那个连的是宿主合成器（甚至没有
+Wayland）」。所以两个方向都做：
+
+**推（vidow → systemd / dbus）**：`systemd_env_export`（默认开）
+
+```bash
+systemctl --user import-environment WAYLAND_DISPLAY DISPLAY XDG_CURRENT_DESKTOP …
+dbus-update-activation-environment --systemd …
+```
+
+- 推的是：`WAYLAND_DISPLAY`、`DISPLAY`、`XDG_CURRENT_DESKTOP`、`XDG_SESSION_TYPE`、
+  `XDG_SESSION_DESKTOP`、`VIDOW_SOCKET` + **用户 `vidow.env{}` 声明过的每一个**（没设的变量
+  不推，推空值反而会把好环境擦掉）。
+- 时机：socket 定下来之后推一轮、X 起来（`DISPLAY` 变了）再推一轮、配置落地后再推一轮；
+  运行时改过变量（`vidow.env` / `vidowmsg set-env`）也在下一个 idle 里推。合并着推：连改
+  十个变量也只 fork 一次。
+- 推之前先记下「用户管理器里原来是什么样」，**退出时还回去**（这是从 portalconf.c 那套学来
+  的规矩）。嵌套跑 / headless 测试时这一步最要紧：不还的话桌面里由 systemd 拉起来的程序
+  全指着已经退了的 vidow。
+- 读和还原都备了第二条路：`systemctl --user` 在「`XDG_RUNTIME_DIR` 是临时的」会话里连不上
+  用户管理器（`Failed to connect to user scope bus via local transport`）—— **而正是那种
+  环境**里 dbus 那条路照样能把环境改脏。所以读走 `busctl --user get-property … Manager
+  Environment`，还原走 `systemctl` + `dbus-update-activation-environment --systemd` +
+  `busctl … UnsetEnvironment`（`busctl` 会等应答；`dbus-send` 不等，消息会丢）。
+
+**吸（systemd → vidow）**：`systemd_env`（默认开）
+
+- 启动时问一次用户管理器，把**我们自己没有的**变量吸收进来（PATH / `SSH_AUTH_SOCK` /
+  `environment.d` 里那些）—— 从 tty 直接起 vidow 时环境很寡，配置里起的子进程才有一份完整的
+  会话环境。
+- 不吸的：`WAYLAND_DISPLAY` / `WAYLAND_SOCKET` / `DISPLAY` / `XDG_SESSION_TYPE` /
+  `XDG_SESSION_DESKTOP` / `XDG_CURRENT_DESKTOP`（「哪个合成器」的身份，必须由 vidow 自己定）、
+  以及 `WLR_*` / `VIDOW_*`（会把我们的后端选择搅乱）。我们自己已经有了的也不动 —— 启动 vidow
+  的那个 shell / service 说了算。
+- 配置里写 `systemd_env = 0` 的话，启动时（那时只有默认值）吸进来的会**还回去**；用户自己
+  `vidow.env` 显式设过的不动（那是他显式要的）。
+- 环境变量覆盖：`VIDOW_SYSTEMD_ENV=0` / `VIDOW_SYSTEMD_ENV_EXPORT=0`（配置还没跑之前只有环境
+  变量能说话，所以启动那一步也认这两个）。另外 `VIDOW_PORTAL_NO_RESTART=1`（portalconf.c 那边
+  的老开关，语义是「一次 `systemctl` 都别调」）也管这里：吸 / 推 / 还原全都不做。
+
+**故意不推的**：`XDG_RUNTIME_DIR`（那是会话自己的东西；嵌套跑 / headless 里 vidow 的是临时
+目录，推上去等于把所有 systemd 拉起来的程序指到一个不存在的 runtime 目录 —— 踩过这个坑。
+portal 那边要连 PipeWire，自己带着快照 / 还原管它，见 `src/portalconf.c`）、`XCURSOR_*`
+（会改掉系统里所有程序的指针大小）。GDK / Qt 那几个缩放变量也不推（那是给 X11 客户端的提示，
+各家自己会算）。
+
+**vidow 自己的环境**（`vidow.env` / IPC 的 `env`、`set-env`、`unset-env`）：
+
+```lua
+vidow.env("GDK_SCALE")                  -- 读（没有就是 nil）
+vidow.env("MOZ_ENABLE_WAYLAND", "1")    -- 写（顺手推给 systemd）
+vidow.env("FOO", false)                 -- 删
+vidow.env{ A = "1", B = false }         -- 一次一串
+vidow.env_export()                      -- 立刻推一轮（平时是自动的）
+```
+
+- 名字得是 `[A-Za-z_][A-Za-z0-9_]*`，写错当场报错（`1bad` 这类）。
+- 改过的变量**记着原值**，vidow 退出时还原 —— vidow 是从别人的 shell / systemd 里起来的，
+  改过的东西得还回去。`vidowmsg env` 把账本一条条报出来（谁改的、原值是什么、会推给 systemd
+  的是哪些、推过几次）。
+
+```bash
+systemctl --user show-environment       # 用户管理器里现在是什么（推成功了没）
+./test-env.sh                           # 这一节的回归（33 项断言，假的 systemctl / busctl /
+                                        #  dbus-update-activation-environment 记调用，一个字符
+                                        #  都不会动你真会话的环境）
+```
+
+### 配置
+
+```bash
+systemd_env = 1                 # 启动时从 systemd 用户管理器吸环境（我们自己没有的才吸）
+systemd_env_export = 1          # 把 vidow 的环境推给 systemd / dbus
+```
+
+环境变量覆盖：`VIDOW_SYSTEMD_ENV=0` / `VIDOW_SYSTEMD_ENV_EXPORT=0`。
+
+### 测试
+
+`./test-env.sh`（全 headless + 假的 systemctl / busctl / dbus-update-activation-environment
+记调用，33 项断言）七段：吸收（吸哪些 / 不吸哪些）、推送（变量清单 + 两条通道）、`vidow.env`
+读写删 + 账本、IPC 的 `env` / `set-env` / `unset-env`、`exec_once` 只起一次（重载不重来、
+改原文才重来）、两个开关（配置键 + 环境变量覆盖）、退出时把用户管理器还原。
 
 ## 输入注入：IPC 能操控鼠标和键盘
 
@@ -2404,7 +2577,9 @@ layer 的模糊底衬把 layer surface 自己的缓冲当 mask 传进去，窗�
     ├── 11-activation.lua        窗口激活
     ├── 12-portal.lua            xdg-desktop-portal
     ├── 13-cursor.lua            指针
-    └── 14-keys.lua              键位（合成器不内置，默认这一套）+ 工作区 / 窗口规则
+    ├── 14-keys.lua              键位（合成器不内置，默认这一套）+ 工作区 / 窗口规则
+    ├── 15-mru.lua               Alt+Tab 的最近窗口切换器
+    └── 16-env.lua               会话环境（和 systemd 用户管理器对账）
 ```
 
 `vidow.include("configs/01-gaps.lua")` 就是「把那份文件就地展开」，和抄在这里一个意思：
@@ -3110,7 +3285,12 @@ src/xwayland.c XWayland：懒启动服务、seat、xwayland_shell 只给 Xwaylan
                X 全局缩放（= ceil(最密那块屏)）、X11 客户端环境（GDK_SCALE 等）
 src/exec.c     异步 `sh -c`：pipe + wl_event_loop_add_fd + 共享超时定时器，绝不阻塞渲染
 src/script.c   配置语言：Lua 5.4，协程化的 vidow.exec、全局名→配置键、vidow.include()
-               （一类一份配置就地展开）、SIGHUP 重载
+               （一类一份配置就地展开）、SIGHUP 重载、vidow.on() 的事件钩子（Lua 那一半）、
+               vidow.env{} / vidow.exec_once() / vidow.spawn()
+src/hooks.c    事件钩子：config.lua 里 vidow.on() 声明的那些（命令 / Lua 两种），事件
+               *名单*（vidowmsg events 就报它）、统一入队 + idle 派发、命令钩子的环境变量
+src/env.c      会话环境账本：和 systemd 用户管理器两个方向对账（吸 / 推 + 退出还原）、
+               vidow.env{} 改过的变量记着原值、VIDOW_SYSTEMD_ENV{,_EXPORT} 开关
 src/configwatch.c 配置自动重载：inotify 盯目录 + stat 比对，盯的是「配置真正读了哪些文件」
                （入口 + 每一份 include 的），改哪一份都重载
 src/anim.c     动画引擎：单调时钟进度、缓动函数、每帧 tick
@@ -4181,6 +4361,107 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
        口子（screencopy / ext-image-copy-capture 同样对所有客户端开放，grim / OBS 靠它），
        而要收就得连它一起收 —— 那会把 grim / wf-recorder / OBS 全废掉。要边界得靠 sandbox
        那一层（别的进程拿不到 wayland socket），不是合成器。
+
+195. **事件钩子（`vidow.on`）、自启动（`exec_once`）、和 systemd 用户管理器两个方向对账**
+      （用户要求「参考 hyprland 实现事件系统，自启动，窗口打开时之类的。执行 shell 需要继承
+      vidow 的环境变量，有些 systemd 起来的应用也要继承 vidow 变量，也就是说 vidow 需要支持
+      systemd 环境变量」+「支持的事件尽可能丰富」）。
+
+      三件事一起做的，因为它们是同一件事的三面：**事件**要能挂动作、动作要能起来就自启动、
+      起来的进程要有对的环境。
+
+      **1）事件钩子（`src/hooks.c` / `src/hooks.h`）**。以前事件只有一条路：外挂脚本连
+      socket 订阅（`{"cmd":"subscribe"}`）。现在配置里也能听：
+
+      ```lua
+      vidow.on("window-opened", "notify-send \"$VIDOW_APP_ID\"")   -- 起一条命令
+      vidow.on("window-opened", function(e) vidow.log(e.data.title) end) -- 跑一段 Lua
+      vidow.on("*", { "echo $VIDOW_EVENT >> /tmp/e.log", fn })          -- 全部 / 一串
+      ```
+
+      设计上的选择：
+
+      - **一条事件两个出口**：`emit()`（ipcstate.c）建好那条 JSON 之后，既广播给订阅者，也
+        交给钩子（`vidow_hooks_dispatch`）。所以两边的载荷**永远同构**，文档写一遍就够。
+      - 「没人要就不发」的门槛从 `vidow_ipc_wanted()`（只数订阅者）换成
+        `vidow_event_wanted()`（订阅者**或**钩子）—— 不然配置里挂的钩子会因为「没人订阅」
+        而收不到事件。
+      - 钩子**一律进队、在 idle 里跑**（`hook_queue` + 一个 idle 源）：钩子里能做的事和 IPC
+        命令一样多（关窗口、改配置、开会话），不能站在合成的半路上跑 Lua。队列上限 256，
+        积满了丢新的并打一条 error。
+      - **命令钩子**把事件字段变成环境变量（`VIDOW_EVENT` / `VIDOW_EVENT_TIME_MS` /
+        `VIDOW_EVENT_JSON` + `data` 里每个标量字段一条 `VIDOW_<大写>`，值截 512 字节，跑完
+        还原）—— 这样 `"notify-send \"$VIDOW_APP_ID\""` 就能用，不用自己解析 JSON。
+      - **Lua 钩子**能 await `vidow.exec()`：和配置文件那套协程同一套「yield 一条命令、回来
+        接着跑」（`hook_call` + `vidow_exec_run`，见 script.c），所以「开窗时先查一下」写得
+        出来。回调出错只打日志，不连累同事件的其它钩子。
+      - 配置重载 = 钩子重新声明（旧的整批作废、Lua 引用还回去），和键位 / 规则 / 每块屏的
+        配置一个规矩。
+      - 自定义事件：`{"cmd":"emit","event":"…","data":{…}}`（`vidowmsg emit my-event --data
+        '{"n":1}'`），订阅者和钩子一起收 —— 脚本之间、脚本和配置之间的一条通道。`vidowmsg`
+        的 `--data` 原样当 JSON 搬进去（被引号包成字符串的话对面只能拿到一串文本），服务端
+        也容错：收到字符串形式的 data 会再解一次。
+
+      **2）自启动（Hyprland 的 `exec-once` / `exec`）**：`vidow.exec_once(cmd)`（整个 vidow
+      生命周期只起一次，重载不重来）、`vidow.spawn(cmd)`（每次配置加载都起，撒手）、
+      `vidow.exec()` 照旧（要输出、等它）。`exec_once` 的命令**先排队**，等这份配置跑完
+      （环境、缩放、`DISPLAY` 都定了）再起 —— 这和 `script_sync_env_for_child()` 是同一个
+      理由：配置是分步跑的，命令起来时环境可能还没落地。「起过了」按**命令原文**记（不是行号
+      / 下标）：重载后同一行还是同一行、认得出，改过原文就算新命令（和 Hyprland 一个规矩）。
+
+      **3）和 systemd 用户管理器两个方向对账（`src/env.c` / `src/env.h`，新文件）**。这是
+      需求里「systemd 起来的应用也要继承 vidow 变量」那一半：
+
+      - **推**（`systemd_env_export`，默认开）：`systemctl --user import-environment` +
+        `dbus-update-activation-environment --systemd`，推 `WAYLAND_DISPLAY` / `DISPLAY` /
+        `XDG_CURRENT_DESKTOP` / `XDG_SESSION_TYPE` / `XDG_SESSION_DESKTOP` / `VIDOW_SOCKET`
+        + 用户 `vidow.env{}` 声明过的每一个。时机：socket 定下来、X 起来（`DISPLAY` 变了）、
+        配置落地，各推一轮；运行时改变量也在下一个 idle 里推（合并：连改十个也只 fork 一次）。
+      - **吸**（`systemd_env`，默认开）：启动时问一次用户管理器，把**我们自己没有的**吸进来
+        （PATH / `SSH_AUTH_SOCK` / `environment.d` 里那些）。`WAYLAND_DISPLAY` / `DISPLAY` /
+        `XDG_CURRENT_DESKTOP` 这类「哪个合成器」的身份、`WLR_*` / `VIDOW_*` 一律不吸；我们
+        自己有的也不覆盖（启动 vidow 的那个 shell / service 说了算）。
+      - **别赖账**：`vidow.env` 改过的变量记着原值，退出时还原；推给用户管理器的那些也先记
+        快照、退出时还回去（嵌套跑 / headless 测试时这一步最要紧 —— 不还的话桌面里由 systemd
+        拉起来的程序全指着已经退了的 vidow）。配置里 `systemd_env = 0` 的话，启动时按默认值
+        吸进来的会还回去（用户 `vidow.env` 显式设过的不动）。环境变量覆盖：
+        `VIDOW_SYSTEMD_ENV` / `VIDOW_SYSTEMD_ENV_EXPORT`。
+
+        踩过的坑：
+        - 推的清单里**不能有 `XDG_RUNTIME_DIR`**（第一版带了，测试跑完一看用户管理器里
+          `XDG_RUNTIME_DIR=/tmp/vidow-env-test/run` —— 那个目录早没了）。它是会话自己的东西，
+          嵌套/headless 里 vidow 的是临时的；portal 那边要连 PipeWire，自己带着快照 / 还原管
+          它，不归这一份。`XCURSOR_*` 同理（会改掉系统里所有程序的指针大小）。
+        - **还原得走两条路**：`systemctl --user` 在「`XDG_RUNTIME_DIR` 是临时的」会话里连不上
+          用户管理器（`Failed to connect to user scope bus via local transport`），而**正是
+          那种环境**里 `dbus-update-activation-environment --systemd` 照样能把用户管理器的环境
+          改脏 —— 读快照于是改走 `busctl --user get-property … Manager Environment`，还原走
+          `systemctl` + `dbus-update-activation-environment` + `busctl … UnsetEnvironment`。
+        - `dbus-send` **不等应答**就退出，消息会丢（试过：`UnsetEnvironment` 看着成功，变量还
+          在）。换成 `busctl`（它等应答）才删得掉。
+        - `vidowmsg --raw` 打得少，测试里解析 JSON 要认准「pretty 模式剥了信封、raw 是整封」。
+        - 顺手修掉一个自己在测里踩出来的坑：`echo a|b >> f` 写在 `vidow.on()` 的命令串里，
+          `|` 会被 `sh` 当管道（命令就成了一串「找不到的命令」）—— 文档里的例子都带了引号。
+
+      **4）事件本身也补了一批**（用户说「尽可能丰富」）：`keybind`（绑好的键被按下，带
+      trigger + action）、`ipc-action`（从 IPC 来的动作，带 source）、`window-activated`
+      （xdg-activation / `_NET_ACTIVE_WINDOW` / IPC `activate-window`）、`drag-started` +
+      `drag-ended`（挪动和改列宽都算）、`output-power-changed`、`input-device-added` +
+      `input-device-removed`（含虚拟键盘）、`xwayland-ready`、`screencast-started` +
+      `screencast-stopped`、`config-failed`。事件总数 31 → **42**，权威名单是
+      `vidowmsg events`（hooks.c 里一张表）。新事件的载荷都是「几个标量字段」
+      （`vidow_ipc_emit_simple()` + `VIDOW_EV_STR/NUM/BOOL`），不用为每条写一个 payload 函数。
+
+      **测试**：`./test-hooks.sh`（30 项断言）、`./test-events.sh`（28 项断言）、
+      `./test-env.sh`（33 项断言）。三个都是全 headless，各带自己的靶子（钩子看日志文件、
+      事件看 `*` 钩子写的事件流水、环境看假的 `systemctl` / `busctl` /
+      `dbus-update-activation-environment` 记下的调用）。`test-env.sh` 特意把三条命令都做成
+      脚本 —— 真实跑一遍会把**你真会话**的环境改掉，测完还得手动收拾（这一次是自己踩了才
+      知道的，见上面 `XDG_RUNTIME_DIR` 那条）。
+
+      **没做的**：X11 的 urgency（`window-urgent`）—— wlroots 0.20 的 `wlr_xwayland_surface`
+      没有 urgency 信号也没有 `urgent` 字段（只有 ext-workspace 协议里有），要做得像 wlroots
+      那样自己读 `WM_HINTS`（xcb-icccm）。留个口子，等有人真要「窗口在喊我」再加。
 
 194. **列宽改成「连 gap 一起分」：两条 50% 不再被中间的 gap 挤出屏外**（用户报「优化一下布局，
       两个 50 50 的窗口会因为 gap 导致一个屏装不下。现在 gap 应该是内部的区域，一个窗口区域

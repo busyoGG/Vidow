@@ -1351,6 +1351,17 @@ struct vidow_env_var {
 	bool explicit;
 };
 
+/* 一个连上来的输入设备（键盘 / 鼠标 / 触摸板 / 虚拟键盘…），只为事件记账：
+ * 谁插上了、谁拔了（见 input.c 的 input-device-added / removed）。设备自己没了
+ * 就把这条 freed，vidow_input_finish() 收剩下的。 */
+struct vidow_input_device {
+	struct wl_list link;      /* vidow_server.input_devices */
+	struct wl_listener destroy;
+	struct vidow_server *server;
+	char name[128];
+	char type[16];
+};
+
 /* 推给 systemd 之前记下的「用户管理器里原来是什么样」（见 env.c）：退出时还回去。 */
 struct vidow_env_snap {
 	struct wl_list link;      /* vidow_server.env_snap */
@@ -1661,6 +1672,7 @@ struct vidow_server {
 	struct wl_list hook_calls;
 
 	/* 环境变量账本（见 env.c）：和 systemd 用户管理器两个方向对账 */
+	struct wl_list input_devices;       /* vidow_input_device.link（事件用） */
 	struct wl_list env_vars;            /* vidow_env_var.link */
 	struct wl_list env_snap;            /* vidow_env_snap.link（用户管理器的原样） */
 	struct wl_event_source *env_idle;   /* 合并导出用的 idle 源 */
@@ -1753,6 +1765,8 @@ bool vidow_output_set_mode(struct vidow_server *server,
 bool vidow_output_set_position(struct vidow_server *server,
 		struct wlr_output *wlr_output, int x, int y);
 bool vidow_input_init(struct vidow_server *server);
+/* 退出：把输入设备的账本收掉（见 input.c）。 */
+void vidow_input_finish(struct vidow_server *server);
 bool vidow_view_init(struct vidow_server *server);
 /* xdg_popup 的 unconstrain 只能在 popup 自己第一次 commit 之后做（wlroots 里
  * schedule_configure 有 assert(surface->initialized)），见 view.c 的注释。 */

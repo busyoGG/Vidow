@@ -743,6 +743,14 @@ bool vidow_output_set_enabled(struct vidow_server *server,
 		wlr_output->name, enabled ? "打开" : "关掉", wlr_output->width,
 		wlr_output->height, (double)wlr_output->scale,
 		count_output_views(server, wlr_output));
+	/* 事件：屏开 / 关（笔记本盖屏、eDP 省电、`vidowmsg output-power` 都走这里）。
+	 * 窗口和布局一件没动，只是「这块屏还画不画」。 */
+	const struct vidow_event_field fields[] = {
+		VIDOW_EV_STR("name", wlr_output->name),
+		VIDOW_EV_BOOL("enabled", enabled),
+		VIDOW_EV_END,
+	};
+	vidow_ipc_emit_simple(server, "output-power-changed", fields);
 	if (!enabled && server->focused_output == wlr_output) {
 		/* 聚焦的屏关掉了：焦点挪到还开着的一块屏上，别对着黑屏打字。 */
 		struct vidow_output *other;

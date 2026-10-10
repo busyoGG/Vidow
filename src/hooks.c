@@ -26,7 +26,12 @@
  *   layer-*     layer surface（状态栏那种）
  *   clipboard-* / primary-*   剪贴板 / 主选区
  *   mru-*       Alt+Tab 切换器
- *   其余：overview-toggled / config-reloaded / config-failed
+ *   其余：overview-toggled（全景）/ window-activated（应用喊「看我」）/
+ *         drag-started + drag-ended（拖窗口）/ keybind（按键触发的绑定）/
+ *         ipc-action（从 IPC 来的动作）/ input-device-added + input-device-removed
+ *         （插拔输入设备）/ xwayland-ready / screencast-started +
+ *         screencast-stopped（录屏起止）/ output-power-changed（屏开关）/
+ *         config-reloaded + config-failed
  *
  * 自定义事件（IPC 的 emit 命令）不在名单里：名字由调用方定，钩子照样能听。 */
 static const char *event_names[] = {
@@ -59,6 +64,17 @@ static const char *event_names[] = {
 	"mru-committed",
 	"mru-cancelled",
 	"overview-toggled",
+	"window-activated",
+	"drag-started",
+	"drag-ended",
+	"keybind",
+	"ipc-action",
+	"input-device-added",
+	"input-device-removed",
+	"xwayland-ready",
+	"screencast-started",
+	"screencast-stopped",
+	"output-power-changed",
 	"config-reloaded",
 	"config-failed",
 };

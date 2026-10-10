@@ -87,6 +87,13 @@ static bool env_override_bool(const char *name, bool fallback) {
 	return fallback;
 }
 
+/* 「不碰用户管理器」：VIDOW_PORTAL_NO_RESTART 是 portalconf.c 那边的开关（测试
+ * 和诊断用），语义就是「一次 systemctl 都别调」—— 这一份也要认，不然它在那儿
+ * 说着不碰，我们这边照样把用户管理器的环境改了。 */
+static bool env_no_manager(void) {
+	return getenv("VIDOW_PORTAL_NO_RESTART") != NULL;
+}
+
 bool vidow_env_name_ok(const char *name) {
 	if (name == NULL || name[0] == '\0' || strlen(name) >= 128) {
 		return false;
@@ -292,6 +299,10 @@ static void env_kv_free(struct env_kv *kv, size_t n) {
 /* ------------------------------------------------- 从 systemd 吸（启动时） */
 
 void vidow_env_absorb_systemd(struct vidow_server *server) {
+	if (env_no_manager()) {
+		wlr_log(WLR_INFO, "环境：VIDOW_PORTAL_NO_RESTART 已设，不碰用户管理器");
+		return;
+	}
 	if (!env_override_bool("VIDOW_SYSTEMD_ENV", server->config.systemd_env)) {
 		wlr_log(WLR_INFO, "环境：systemd_env = 0，不从用户管理器吸环境");
 		return;
@@ -459,6 +470,9 @@ static void shell_quote_into(const char *in, char *out, size_t outlen) {
 }
 
 static void env_restore_manager(struct vidow_server *server) {
+	if (env_no_manager()) {
+		return;
+	}
 	/* 两条路都要走，因为「哪条能把用户管理器改脏」取决于 vidow 是在什么环境里
 	 * 起来的：
 	 *   - 正常会话（XDG_RUNTIME_DIR 就是会话的）：systemctl --user 最好使。
@@ -524,6 +538,9 @@ static void env_restore_manager(struct vidow_server *server) {
 }
 
 void vidow_env_export_now(struct vidow_server *server) {
+	if (env_no_manager()) {
+		return;
+	}
 	if (!env_override_bool("VIDOW_SYSTEMD_ENV_EXPORT",
 			server->config.systemd_env_export)) {
 		wlr_log(WLR_DEBUG, "环境：systemd_env_export = 0，不推给 systemd");
@@ -562,7 +579,7 @@ static void env_export_later_cb(void *data) {
 }
 
 void vidow_env_export_later(struct vidow_server *server) {
-	if (server == NULL || server->display == NULL ||
+	if (server == NULL || server->display == NULL || env_no_manager() ||
 			!env_override_bool("VIDOW_SYSTEMD_ENV_EXPORT",
 				server->config.systemd_env_export)) {
 		return;
@@ -598,6 +615,9 @@ static void env_absorb_undo(struct vidow_server *server) {
 }
 
 void vidow_env_apply_config(struct vidow_server *server) {
+	if (env_no_manager()) {
+		return;
+	}
 	if (!env_override_bool("VIDOW_SYSTEMD_ENV", server->config.systemd_env)) {
 		if (server->env_pulled) {
 			env_absorb_undo(server);

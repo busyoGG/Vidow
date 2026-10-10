@@ -88,6 +88,29 @@ void vidow_ipc_emit_column(struct vidow_server *server, const char *event,
 void vidow_ipc_emit_clipboard(struct vidow_server *server,
 		struct vidow_clip_selection *sel, const char *what);
 
+/* 一条「只有几个标量字段」的事件（keybind / ipc-action / output-power-changed
+ * 这类）。fields 以 VIDOW_EV_END 结尾；value = NULL 写成 null。 */
+enum vidow_event_type {
+	VIDOW_EV_TEXT,
+	VIDOW_EV_NUM,
+	VIDOW_EV_BOOL,
+};
+struct vidow_event_field {
+	const char *key;
+	enum vidow_event_type type;
+	const char *text;   /* VIDOW_EV_TEXT */
+	long long num;      /* VIDOW_EV_NUM */
+	bool boolean;       /* VIDOW_EV_BOOL */
+};
+#define VIDOW_EV_STR(k, v)  { (k), VIDOW_EV_TEXT, (v), 0, false }
+#define VIDOW_EV_NUM(k, v)  { (k), VIDOW_EV_NUM, NULL, (v), false }
+#define VIDOW_EV_BOOL(k, v) { (k), VIDOW_EV_BOOL, NULL, 0, (v) }
+#define VIDOW_EV_NULL(k)    { (k), VIDOW_EV_TEXT, NULL, 0, false }
+#define VIDOW_EV_END        { NULL, VIDOW_EV_TEXT, NULL, 0, false }
+
+void vidow_ipc_emit_simple(struct vidow_server *server, const char *event,
+		const struct vidow_event_field *fields);
+
 /* 没有载荷的事件：config-reloaded / overview-toggled */
 void vidow_ipc_emit_note(struct vidow_server *server, const char *event);
 

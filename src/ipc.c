@@ -1381,6 +1381,13 @@ static bool cmd_action(struct vidow_server *server, struct jval *req,
 		snprintf(err, errlen, "动作 '%s' 没做成", action);
 		return false;
 	}
+	/* 事件：从 IPC 来的动作（和键位那条分开报，「谁按的」分得清） */
+	const struct vidow_event_field fields[] = {
+		VIDOW_EV_STR("action", action),
+		VIDOW_EV_STR("source", "ipc"),
+		VIDOW_EV_END,
+	};
+	vidow_ipc_emit_simple(server, "ipc-action", fields);
 	jb_obj(out);
 	jb_kv_str(out, "action", action);
 	jb_kv_bool(out, "done", true);

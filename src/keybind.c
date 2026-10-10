@@ -10,6 +10,7 @@
 #include <wlr/types/wlr_output.h>
 #include <wlr/util/log.h>
 
+#include "ipc.h"
 #include "server.h"
 
 #include <linux/input-event-codes.h>
@@ -223,6 +224,14 @@ bool vidow_keybind_key(struct vidow_server *server, xkb_keysym_t sym,
 			continue;
 		}
 		vidow_action_run(server, bind->action);
+		/* 事件（见 hooks.c）：谁按了什么键、跑了哪条动作 —— 脚本要「跟着按键
+		 * 做点别的」（录屏时打标记、状态栏闪一下）不用自己抢键。 */
+		const struct vidow_event_field fields[] = {
+			VIDOW_EV_STR("trigger", bind->trigger),
+			VIDOW_EV_STR("action", bind->action),
+			VIDOW_EV_END,
+		};
+		vidow_ipc_emit_simple(server, "keybind", fields);
 		return true;
 	}
 	return false;

@@ -1,4 +1,5 @@
 #include "env.h"
+#include "ipc.h"
 #include "server.h"
 
 #include <math.h>
@@ -428,6 +429,16 @@ static void xwayland_ready(struct wl_listener *listener, void *data) {
 	server->xwayland_scale_ok = true;
 	server->xwayland_scale_probed = false;
 	server->xwayland_probe_tries = 0;
+
+	/* 事件：X 服务真的起来了（懒启动，第一个 X 客户端连上来才有这一下）。
+	 * 配置里 exec_once 起的 X11 程序要等它的话，听这个。 */
+	const struct vidow_event_field fields[] = {
+		VIDOW_EV_STR("display", server->xwayland != NULL ?
+			server->xwayland->display_name : NULL),
+		VIDOW_EV_NUM("scale", (long long)(server->xwayland_scale + 0.5)),
+		VIDOW_EV_END,
+	};
+	vidow_ipc_emit_simple(server, "xwayland-ready", fields);
 
 	/* 先把 X 那边的缩放告诉它（_XWAYLAND_GLOBAL_OUTPUT_SCALE + Xft.dpi）：
 	 * 打过补丁的 Xwayland 收到之后会立刻把 X 屏幕和 RandR 模式改成设备像素。

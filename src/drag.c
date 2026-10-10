@@ -446,6 +446,9 @@ void vidow_tile_grab_begin(struct vidow_server *server,
 	}
 	server->grab_mode = VIDOW_GRAB_TILE;
 	server->grab_view = view;
+	/* 事件：拖动了（载荷是那个窗口）—— 和 resize 那条共用 drag-started /
+	 * drag-ended，脚本不用分是「挪」还是「改宽」。 */
+	vidow_ipc_emit_window(server, "drag-started", view);
 	/* 平铺拖拽是 Mod+左键那条路：按下被合成器吃掉了，客户端没见过，松手也不
 	 * 转给它（见 server.h 里 grab_client_press 的说明）。 */
 	server->grab_client_press = false;
@@ -512,6 +515,9 @@ void vidow_tile_grab_end(struct vidow_server *server) {
 	}
 	/* 预览块收掉（落点算不算得出来都得收）。 */
 	vidow_insert_hint_hide(server);
+	if (view != NULL) {
+		vidow_ipc_emit_window(server, "drag-ended", view);
+	}
 	server->grab_dirty = false;
 	server->grab_mode = VIDOW_GRAB_NONE;
 	server->grab_view = NULL;
@@ -656,6 +662,8 @@ void vidow_tile_resize_begin(struct vidow_server *server,
 	wlr_log(WLR_INFO, "grab resize: %s 起拖（列宽 %d 像素，比例 %.3f）",
 		vidow_view_title(view) != NULL ? vidow_view_title(view) : "?",
 		width, view->column->width_fraction);
+	/* 事件：起拖 / 松手（载荷是那个窗口）—— 录屏脚本靠它打「在拖窗口」的标记 */
+	vidow_ipc_emit_window(server, "drag-started", view);
 }
 
 void vidow_tile_resize_update(struct vidow_server *server, double lx, double ly) {
@@ -706,6 +714,9 @@ void vidow_tile_resize_end(struct vidow_server *server) {
 			vidow_view_title(view) != NULL ? vidow_view_title(view) : "?",
 			col->width, col->width_fraction);
 		vidow_arrange(server);
+	}
+	if (view != NULL) {
+		vidow_ipc_emit_window(server, "drag-ended", view);
 	}
 	server->grab_mode = VIDOW_GRAB_NONE;
 	server->grab_view = NULL;

@@ -466,6 +466,8 @@ int main(int argc, char *argv[]) {
 
 	vidow_configwatch_finish(&server);
 	vidow_capturemask_finish(&server);
+	/* 输入设备的账本（见 input.c）：报事件用的那些，设备自己没了就没了 */
+	vidow_input_finish(&server);
 	vidow_ipc_finish(&server);
 	vidow_clipboard_finish(&server);
 	server_finish(&server);

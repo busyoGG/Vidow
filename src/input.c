@@ -1,3 +1,4 @@
+#include "ipc.h"
 #include "server.h"
 
 #include <math.h>
@@ -218,22 +219,96 @@ static void seat_update_capabilities(struct vidow_server *server) {
 }
 
 /* wtype / wlrctl and friends inject input through this protocol. */
+static void input_device_note(struct vidow_server *server,
+		struct wlr_input_device *device); /* 定义在下面（设备账本 + 事件） */
+
 static void server_new_virtual_keyboard(struct wl_listener *listener, void *data) {
 	struct vidow_server *server =
 		wl_container_of(listener, server, new_virtual_keyboard);
 	struct wlr_virtual_keyboard_v1 *virtual_keyboard = data;
 
 	wlr_log(WLR_INFO, "virtual keyboard attached");
+	input_device_note(server, &virtual_keyboard->keyboard.base);
 	server_add_keyboard(server, &virtual_keyboard->keyboard,
 		&virtual_keyboard->keyboard.base, virtual_keyboard, false);
 
 	seat_update_capabilities(server);
 }
 
+/* 设备类型名字（事件里报出来）。 */
+static const char *device_type_name(enum wlr_input_device_type type) {
+	switch (type) {
+	case WLR_INPUT_DEVICE_KEYBOARD:
+		return "keyboard";
+	case WLR_INPUT_DEVICE_POINTER:
+		return "pointer";
+	case WLR_INPUT_DEVICE_TOUCH:
+		return "touch";
+	case WLR_INPUT_DEVICE_TABLET:
+		return "tablet";
+	case WLR_INPUT_DEVICE_TABLET_PAD:
+		return "tablet-pad";
+	case WLR_INPUT_DEVICE_SWITCH:
+		return "switch";
+	}
+	return "?";
+}
+
+static void input_device_gone(struct wl_listener *listener, void *data) {
+	(void)data;
+	struct vidow_input_device *dev =
+		wl_container_of(listener, dev, destroy);
+	wl_list_remove(&dev->destroy.link);
+	wl_list_remove(&dev->link);
+	/* 先报事件再放掉名字：钩子命令的环境变量是从这条载荷拼的 */
+	const struct vidow_event_field fields[] = {
+		VIDOW_EV_STR("name", dev->name),
+		VIDOW_EV_STR("type", dev->type),
+		VIDOW_EV_END,
+	};
+	vidow_ipc_emit_simple(dev->server, "input-device-removed", fields);
+	free(dev);
+}
+
+/* 记一笔「这个设备连上来了」+ 报事件；拔的那一下由 destroy 信号收（见
+ * input_device_gone）。 */
+static void input_device_note(struct vidow_server *server,
+		struct wlr_input_device *device) {
+	struct vidow_input_device *dev = calloc(1, sizeof(*dev));
+	if (dev == NULL) {
+		return;
+	}
+	dev->server = server;
+	snprintf(dev->name, sizeof(dev->name), "%s",
+		device->name != NULL ? device->name : "(无名)");
+	snprintf(dev->type, sizeof(dev->type), "%s",
+		device_type_name(device->type));
+	dev->destroy.notify = input_device_gone;
+	wl_signal_add(&device->events.destroy, &dev->destroy);
+	wl_list_insert(server->input_devices.prev, &dev->link);
+
+	const struct vidow_event_field fields[] = {
+		VIDOW_EV_STR("name", dev->name),
+		VIDOW_EV_STR("type", dev->type),
+		VIDOW_EV_END,
+	};
+	vidow_ipc_emit_simple(server, "input-device-added", fields);
+}
+
+void vidow_input_finish(struct vidow_server *server) {
+	struct vidow_input_device *dev, *tmp;
+	wl_list_for_each_safe(dev, tmp, &server->input_devices, link) {
+		wl_list_remove(&dev->destroy.link);
+		wl_list_remove(&dev->link);
+		free(dev);
+	}
+}
+
 static void server_new_input(struct wl_listener *listener, void *data) {
 	struct vidow_server *server = wl_container_of(listener, server, new_input);
 	struct wlr_input_device *device = data;
 
+	input_device_note(server, device);
 	switch (device->type) {
 	case WLR_INPUT_DEVICE_KEYBOARD:
 		server_new_keyboard(server, device);
@@ -576,6 +651,7 @@ static void server_new_virtual_pointer(struct wl_listener *listener, void *data)
 	struct wlr_virtual_pointer_v1 *virtual_pointer = event->new_pointer;
 
 	wlr_log(WLR_INFO, "virtual pointer attached");
+	input_device_note(server, &virtual_pointer->pointer.base);
 	wlr_cursor_attach_input_device(server->cursor,
 		&virtual_pointer->pointer.base);
 	/* 虚拟指针也是指针：座位得把 POINTER 报出来，否则客户端收不到指针事件
@@ -584,6 +660,7 @@ static void server_new_virtual_pointer(struct wl_listener *listener, void *data)
 }
 
 bool vidow_input_init(struct vidow_server *server) {
+	wl_list_init(&server->input_devices);
 	server->new_input.notify = server_new_input;
 	wl_signal_add(&server->backend->events.new_input, &server->new_input);
 
