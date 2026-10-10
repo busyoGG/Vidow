@@ -115,14 +115,23 @@ const struct vidow_rule_field vidow_rule_fields[] = {
 		"开出来就收起来（留在列里，但不显示、不抢焦点）" },
 	{ "column_width", RK_ACT_DOUBLE, VRA_COLUMN_WIDTH, VIDOW_RULE_WINDOW,
 		"这个窗口新开的列有多宽（占可用宽度的比例，0.1 ~ 1.0；默认 0.5）" },
-	{ "anim", RK_ACT_BOOL, VRA_ANIM, VIDOW_RULE_WINDOW,
-		"false = 这个窗口不做开合动画（它开、它关都是瞬间到位）" },
+	{ "anim", RK_ACT_BOOL, VRA_ANIM,
+		VIDOW_RULE_WINDOW | VIDOW_RULE_LAYER,
+		"false = 不做开合动画（窗口 / 图层都是：开、关都瞬间到位）" },
+	{ "open_ms", RK_ACT_INT, VRA_OPEN_MS,
+		VIDOW_RULE_WINDOW | VIDOW_RULE_LAYER,
+		"开启动画时长（毫秒；覆盖 window_open_ms / layer_open_ms，0 = 不做）" },
+	{ "close_ms", RK_ACT_INT, VRA_CLOSE_MS,
+		VIDOW_RULE_WINDOW | VIDOW_RULE_LAYER,
+		"关闭动画时长（毫秒；覆盖 window_close_ms / layer_close_ms，0 = 不做）" },
 	/* 外观：装饰着色器的参数，没写的用全局配置（configs/02-decor.lua、
 	 * 03-blur.lua 那些）。全局开关（decor_enabled / blur_enabled）仍是总闸。 */
 	{ "decor", RK_ACT_BOOL, VRA_DECOR, VIDOW_RULE_WINDOW,
 		"false = 这个窗口不画装饰（边框 / 圆角 / 阴影都不要）" },
-	{ "opacity", RK_ACT_DOUBLE, VRA_OPACITY, VIDOW_RULE_WINDOW,
-		"整块（含装饰）的不透明度，0.5 = 半透明" },
+	{ "opacity", RK_ACT_DOUBLE, VRA_OPACITY,
+		VIDOW_RULE_WINDOW | VIDOW_RULE_LAYER,
+		"整块的不透明度，0.5 = 半透明（窗口 = 内容 + 边框；图层 = 它自己的内容，"
+		"底衬的模糊不跟着淡）" },
 	{ "corner_radius", RK_ACT_DOUBLE, VRA_CORNER_RADIUS, VIDOW_RULE_WINDOW,
 		"圆角半径（逻辑像素，0 = 直角）" },
 	{ "border_width", RK_ACT_DOUBLE, VRA_BORDER_WIDTH, VIDOW_RULE_WINDOW,
@@ -440,6 +449,33 @@ void vidow_rule_look(const struct vidow_config *cfg,
 	}
 }
 
+/* 这个目标该用多长的开合动画：全局时长打底，规则的 open_ms / close_ms 压上去，
+ * anim = false 就是把两个时长都归零（调用方照「时长 <= 0 = 不做动画」处理，和
+ * 配置里写 0 是同一条路）。 */
+void vidow_rule_anim(const struct vidow_config *cfg,
+		const struct vidow_rule_eff *eff, bool layer,
+		struct vidow_rule_anim *out) {
+	out->on = !(eff != NULL && eff->set[VRA_ANIM] && !eff->val[VRA_ANIM].b);
+	out->open_ms = layer ? cfg->layer_open_ms : cfg->window_open_ms;
+	out->close_ms = layer ? cfg->layer_close_ms : cfg->window_close_ms;
+	if (eff != NULL && eff->set[VRA_OPEN_MS]) {
+		out->open_ms = (int)eff->val[VRA_OPEN_MS].i;
+	}
+	if (eff != NULL && eff->set[VRA_CLOSE_MS]) {
+		out->close_ms = (int)eff->val[VRA_CLOSE_MS].i;
+	}
+	if (!out->on) {
+		out->open_ms = 0;
+		out->close_ms = 0;
+	}
+	if (out->open_ms < 0) {
+		out->open_ms = 0;
+	}
+	if (out->close_ms < 0) {
+		out->close_ms = 0;
+	}
+}
+
 bool vidow_rule_has_field(const struct vidow_rule *rule,
 		const struct vidow_rule_field *field) {
 	if (rule == NULL || field == NULL) {
@@ -607,6 +643,16 @@ bool vidow_rule_commit(struct vidow_server *server, struct vidow_rule *rule,
 		if (v < ranges[i].lo || v > ranges[i].hi) {
 			snprintf(err, errlen, "%s 得在 %g ~ %g 之间，给的是 %g",
 				ranges[i].name, ranges[i].lo, ranges[i].hi, v);
+			return false;
+		}
+	}
+	/* 动画时长：毫秒，负数没有意义（0 = 不做动画，那是合法的）。 */
+	const char *ms_keys[2] = { "open_ms", "close_ms" };
+	const int ms_slots[2] = { VRA_OPEN_MS, VRA_CLOSE_MS };
+	for (int i = 0; i < 2; i++) {
+		if (rule->aset[ms_slots[i]] && rule->aval[ms_slots[i]].i < 0) {
+			snprintf(err, errlen, "%s 是毫秒数，不能是负数（0 = 不做这个"
+				"动画），给的是 %lld", ms_keys[i], rule->aval[ms_slots[i]].i);
 			return false;
 		}
 	}
@@ -1006,7 +1052,8 @@ static void apply_view(struct vidow_server *server, struct vidow_view *view,
 
 static void apply_layer(struct vidow_server *server,
 		struct vidow_layer_surface *ls, const struct vidow_rule_eff *eff) {
-	(void)server;
+	const char *ns = ls->layer_surface->namespace != NULL ?
+		ls->layer_surface->namespace : "(无 namespace)";
 	int capture = VIDOW_CAPTURE_OFF;
 	int capture_mosaic = VIDOW_CAPTURE_MOSAIC_DEFAULT;
 	if (eff->set[VRA_CAPTURE]) {
@@ -1015,17 +1062,28 @@ static void apply_layer(struct vidow_server *server,
 	if (eff->set[VRA_CAPTURE_MOSAIC]) {
 		capture_mosaic = (int)eff->val[VRA_CAPTURE_MOSAIC].i;
 	}
-	if (ls->capture_mode == capture) {
-		ls->capture_mosaic = capture_mosaic;
-		return;
+	if (ls->capture_mode != capture) {
+		ls->capture_mode = capture;
+		wlr_log(WLR_INFO, "rule: layer %s 抓帧遮挡 = %s", ns,
+			capture == VIDOW_CAPTURE_HIDE ? "不出现" :
+			capture == VIDOW_CAPTURE_MOSAIC ? "马赛克" : "关");
 	}
-	ls->capture_mode = capture;
 	ls->capture_mosaic = capture_mosaic;
-	wlr_log(WLR_INFO, "rule: layer %s 抓帧遮挡 = %s",
-		ls->layer_surface->namespace != NULL ?
-			ls->layer_surface->namespace : "(无 namespace)",
-		capture == VIDOW_CAPTURE_HIDE ? "不出现" :
-		capture == VIDOW_CAPTURE_MOSAIC ? "马赛克" : "关");
+
+	/* 开合动画与不透明度（rule.c 的 vidow_rule_anim / vidow_rule_opacity）：
+	 * 时长是**用的时候**现读的（layer.c 的 layer_open_anim / layer_snapshot_close），
+	 * 不透明度是在 arrange_layers 里乘进场景 alpha 的 —— 那份 alpha 只在
+	 * arrange 的时候刷，所以规则一改（重载）就得重排一遍，不然要等到下次
+	 * 布局变化才看见。arrange 是幂等的，重排一次很便宜。 */
+	if (eff->set[VRA_ANIM] || eff->set[VRA_OPEN_MS] ||
+			eff->set[VRA_CLOSE_MS] || eff->set[VRA_OPACITY]) {
+		struct vidow_rule_anim ra;
+		vidow_rule_anim(&server->config, eff, true, &ra);
+		wlr_log(WLR_INFO, "rule: layer %s 动画 = %s（开 %dms / 关 %dms）、"
+			"不透明度 %.2f", ns, ra.on ? "按规则时长" : "关", ra.open_ms,
+			ra.close_ms, vidow_rule_opacity(eff));
+		vidow_arrange_layers(server);
+	}
 }
 
 void vidow_rule_apply(struct vidow_server *server, struct vidow_view *view) {

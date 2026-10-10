@@ -77,7 +77,20 @@ void vidow_arrange_layers(struct vidow_server *server) {
 				wlr_scene_node_set_position(&ls->scene->tree->node,
 					lx + (int)lround(ls->anim_off_x),
 					ly + (int)lround(ls->anim_off_y));
-				vidow_fx_set_alpha(&ls->scene->tree->node, ls->anim_alpha);
+				/* 入场 / 退场动画的 alpha 乘上规则给的 opacity（图层规则写
+				 * 了 opacity 才有这一项）：面板半透明 = 它自己的内容淡下去，
+				 * 背后的东西透出来。 */
+				vidow_fx_set_alpha(&ls->scene->tree->node,
+					ls->anim_alpha * vidow_rule_opacity(&ls->rule_eff));
+				/* 垫在下面的模糊底衬不跟着淡：opacity 说的是「这块面板多
+				 * 透」，透出来的应该是糊过的背景（和窗口那条路一致 ——
+				 * 装饰着色器里 u_opacity 也只乘内容和边框）。fx 节点是这块
+				 * 场景树的子节点，上面那一趟会连它一起乘，这里按它自己的
+				 * 状态放回去（masked 是抓帧遮挡，见 fx.c）。 */
+				if (ls->fx.node != NULL) {
+					wlr_scene_buffer_set_opacity(ls->fx.node,
+						ls->fx.masked ? 0.0f : 1.0f);
+				}
 			}
 		}
 
@@ -193,6 +206,19 @@ static void layer_anim_done(void *data, bool cancelled) {
 
 static void layer_open_anim(struct vidow_layer_surface *ls) {
 	struct vidow_config *cfg = &ls->server->config;
+	struct vidow_rule_anim anim;
+	vidow_rule_anim(cfg, &ls->rule_eff, true, &anim);
+	/* 图层规则 anim = false / open_ms = 0：不滑也不淡，直接到位（时长 0 会让
+	 * vidow_anim_start 返回 NULL，下面那段就是「瞬间到位」）。 */
+	if (anim.open_ms <= 0) {
+		vidow_anim_cancel(ls->anim);
+		ls->anim = NULL;
+		ls->anim_off_x = 0.0;
+		ls->anim_off_y = 0.0;
+		ls->anim_alpha = 1.0;
+		vidow_arrange_layers(ls->server);
+		return;
+	}
 	int dx = 0, dy = 0;
 	layer_slide_dir(ls, &dx, &dy);
 
@@ -205,7 +231,7 @@ static void layer_open_anim(struct vidow_layer_surface *ls) {
 	ls->anim_alpha = cfg->open_alpha_from;
 
 	vidow_anim_cancel(ls->anim);
-	ls->anim = vidow_anim_start(ls->server, "layer-open", cfg->layer_open_ms,
+	ls->anim = vidow_anim_start(ls->server, "layer-open", anim.open_ms,
 		cfg->easing, layer_anim_update, layer_anim_done, ls);
 	if (ls->anim == NULL) {
 		ls->anim_off_x = 0.0;
@@ -218,8 +244,19 @@ static void layer_open_anim(struct vidow_layer_surface *ls) {
 static void layer_snapshot_close(struct vidow_layer_surface *ls) {
 	struct vidow_server *server = ls->server;
 	struct vidow_config *cfg = &server->config;
-	if (ls->last_buffer == NULL || cfg->layer_close_ms <= 0 ||
+	struct vidow_rule_anim anim;
+	vidow_rule_anim(cfg, &ls->rule_eff, true, &anim);
+	if (ls->last_buffer == NULL || anim.close_ms <= 0 ||
 			ls->geom.width <= 0 || ls->geom.height <= 0) {
+		/* 「怎么没有关闭动画」在窗口那条路上是收到过的反馈（见 view.c），图层
+		 * 这里同样有四条路能跳过它：日志里说清楚是哪条，不然只能靠猜。 */
+		wlr_log(WLR_DEBUG, "关闭动画跳过 layer %s：%s",
+			ls->layer_surface->namespace != NULL ?
+				ls->layer_surface->namespace : "(无 namespace)",
+			ls->last_buffer == NULL ? "手里没有最后一帧快照" :
+			anim.close_ms <= 0 ? (anim.on ? "close_ms = 0（配置或规则里关了）" :
+				"规则写了 anim = false") :
+			"还没定下尺寸（geom 是空的）");
 		return;
 	}
 	int dx = 0, dy = 0;
@@ -238,7 +275,7 @@ static void layer_snapshot_close(struct vidow_layer_surface *ls) {
 	vidow_closing_start(server, layer_tree(server, ls->layer), ls->last_buffer,
 		&geo, ls->geom.x + (int)lround(ls->anim_off_x),
 		ls->geom.y + (int)lround(ls->anim_off_y),
-		ls->geom.width, ls->geom.height, cfg->layer_close_ms,
+		ls->geom.width, ls->geom.height, anim.close_ms,
 		dy * slide, false /* 不套窗口装饰：layer 自己就是内容 */, NULL,
 		ls->output != NULL && ls->output->wlr_output != NULL ?
 			(double)ls->output->wlr_output->scale : 1.0,
@@ -263,14 +300,18 @@ static void layer_surface_map(struct wl_listener *listener, void *data) {
 		layer_focus(ls);
 	}
 
+	/* 规则先套上：开合时长（anim / open_ms）和不透明度都在 ls->rule_eff 里，
+	 * 入场动画那一刻就要用 —— 放在 layer_open_anim 后面的话，规则写了
+	 * open_ms = 3000 也会先按全局的 200ms 起一遍动画（改完再重排也来不及，
+	 * 动画已经跑上了）。 */
+	vidow_rule_apply_layer(server, ls);
+
 	/* 一块 layer surface 上屏：底衬里多了一个东西 */
 	vidow_backdrop_damage(server, true);
 	vidow_arrange_layers(server); /* gives ls->geom, used to pick the slide */
 	layer_open_anim(ls);
 	vidow_arrange_layers(server);
 	vidow_arrange(server);
-	/* 窗口规则里写了 namespace 的那些（capture = "hide" / "mosaic"）管的就是它。 */
-	vidow_rule_apply_layer(server, ls);
 	vidow_ipc_emit_layer(server, "layer-mapped", ls);
 }
 

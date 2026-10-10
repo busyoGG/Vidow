@@ -479,10 +479,11 @@ end
 | 匹配字段（窗口和图层都认） | `pid`、`exe`、`cmdline` —— 从 `/proc/<pid>/…` 读，没有 `app_id` 可认的老程序、包一层启动脚本的，按进程认（`exe` 是 `/proc/<pid>/exe` 的最后一段，flatpak 那种是 `bwrap`，用 `cmdline` 更准） |
 | 匹配字段（图层） | `namespace`（waybar / mako / notifications …）、`layer`（`background` / `bottom` / `top` / `overlay`）—— 写了这两个里任何一个就是**图层规则**。窗口字段和图层字段写进同一条规则 = 这条谁也不匹配（不静默失效，日志和 `vidowmsg rules` 都看得见） |
 | 匹配字段（状态） | `is_` 开头的是「现在是不是这样」：`is_xwayland`、`is_popup`（菜单 / 提示这类弹出物）、`is_floating`、`is_fullscreen`、`is_maximized`（所在列整列最大化）、`is_minimized`、`is_fixed_size`（客户端声明了固定尺寸，微信登录窗那种）。写成 `true` / `false`（不写 = 不管它），比的是**判定那一刻**的状态 —— 判定发生在建窗口、标题 / class 变化、重载规则这三处 |
-| 作用（一直在） | `force_render`、`hz`、`focus_on_open`、`focus_on_activate`、`honor_invalid_serial`、`x11_scale`、`capture`、`capture_mosaic`、`anim`（`false` = 这个窗口不做开合动画） |
+| 作用（一直在） | `force_render`、`hz`、`focus_on_open`、`focus_on_activate`、`honor_invalid_serial`、`x11_scale`、`capture`、`capture_mosaic`、`anim`（`false` = 不做开合动画，窗口 / 图层都认）、`open_ms` / `close_ms`（开合动画时长，毫秒，覆盖 `window_open_ms` / `layer_open_ms` 那一对全局键；`0` = 不做这个动画） |
 | 作用（外观） | `decor`（`false` = 不画装饰）、`opacity`、`corner_radius`、`border_width`、`border_color`、`border_color_focus`、`shadow_radius`、`shadow_color`、`shadow_offset_x`、`shadow_offset_y`、`noise`、`blur`（`false` = 它背后不模糊，`true` = 平铺窗口也模糊）、`blur_xray`。没写的用全局配置；**全局开关（`decor_enabled` / `blur_enabled`）是总闸**，规则只能收窄不能突破。`vidowmsg windows` 的 `look` 那一块就是「这个窗口现在长什么样」—— 规则有没有生效看它，不用量像素 |
 | 作用（开窗时兑现一次） | `float`（`true` 强制浮动 / `false` 强制平铺）、`workspace`（具名工作区，没有就建 / `special:名字` / 序号）、`output`（开在哪块屏）、`width` / `height`（浮动窗口开多大）、`center`、`fullscreen`、`maximize`、`minimize`、`column_width`（这个窗口新开的列有多宽）。**重载规则不搬已经开着的窗口，也不改它们的尺寸** —— 「开出来什么样」和「现在什么样」是两回事 |
 | 覆盖顺序 | 按配置里的先后逐条套用，**后面的覆盖前面的**；一条规则只动它写了的字段，谁都没写的字段用默认值 |
+| 图层规则能用的作用 | `capture`、`capture_mosaic`、`anim`、`open_ms`、`close_ms`、`opacity`（面板**自己的内容**多透 —— 底衬那份模糊不跟着淡，和窗口那边 `u_opacity` 只乘内容 + 边框是同一个语义）、`blur`。其余作用都是窗口专有，写进图层规则 = 这条规则谁也不匹配（当场看得出来，不会悄悄生效）。`vidowmsg layers` 的 `rule` 那一块是算出来的 `anim` / `open_ms` / `close_ms` / `opacity` |
 | 生效时机 | 建窗口时判一次；标题 / class 变了再判一次；`SIGHUP` 重载规则后把已经开着的窗口全部重判 |
 | 节流 | `force_render_hz = <每秒几帧>`（默认 60，`0` = 不限速）；规则里写 `hz = <n>` 可以逐窗口覆盖。补帧要主动排下一帧，不限速时会一直出帧（headless 后端上量到过 2500fps），所以默认按刷新率给 |
 | X11 缩放桥 | `x11_scale = <n>`：这个 X11 窗口的缓冲区按 `n` 倍声明（逻辑尺寸 = 缓冲 / `n`）。`x11_scale = 1` = 「这个客户端没按 `GDK_SCALE` 画，别除」—— 微信登录窗那类固定尺寸、不认 env 的程序在 2 倍屏上就不会只剩 1/4 面积。见「X11 的 HiDPI」那节，回归判据 `test-x11scale.sh` |
@@ -4405,7 +4406,47 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
        而要收就得连它一起收 —— 那会把 grim / wf-recorder / OBS 全废掉。要边界得靠 sandbox
        那一层（别的进程拿不到 wayland socket），不是合成器。
 
-199. **规则能改外观**（「覆盖 vidow 所有能改的地方」的最后一截：装饰着色器的参数）
+200. **图层规则补齐：开合动画、动画时长、不透明度**（「覆盖 vidow 所有能改的地方」的收尾）
+
+      197–199 之后，图层规则（`namespace` / `layer`）能改的只有 `capture` / `capture_mosaic` /
+      `blur` 三项 —— 面板的开合动画和不透明度还是全局的（`layer_open_ms` / `layer_close_ms`）。
+      这一条把最后那块补上：
+
+      | 作用 | 窗口 | 图层 | 怎么落地 |
+      | --- | --- | --- | --- |
+      | `anim` | ✅ | ✅ | `false` = 开、关都瞬间到位（时长按 0 算） |
+      | `open_ms` | ✅ | ✅ | 覆盖 `window_open_ms` / `layer_open_ms`；`0` = 不做开启动画 |
+      | `close_ms` | ✅ | ✅ | 覆盖 `window_close_ms` / `layer_close_ms`；`0` = 不做关闭动画 |
+      | `opacity` | ✅ | ✅ | 窗口走装饰着色器（`u_opacity`）；图层走场景节点 alpha（`vidow_fx_set_alpha`） |
+
+      - 算「这个目标该用多长」只有一处：`vidow_rule_anim()`（`rule.c`）—— 全局时长打底、
+        规则的 `open_ms` / `close_ms` 压上去、`anim = false` 把两个都归零，然后负值夹到 0。
+        调用点两处：`view.c` 的 `vidow_view_open_anim` / `view_snapshot_close`，
+        `layer.c` 的 `layer_open_anim` / `layer_snapshot_close`。**「时长 ≤ 0 = 不做动画」
+        是配置里本来就有的一条路**（`window_close_ms = 0` 就是这么关的），规则只是接上它，
+        没有第二条代码路径。
+      - `open_ms` / `close_ms` 顺带也给了窗口：`window_open_ms` / `window_close_ms` 原本
+        只有全局键，现在能逐窗口调（`anim = false` 是它的粗粒度版本，两个都留着）。
+      - 图层的不透明度乘在**它自己的内容**上，**底衬那份模糊不跟着淡**：`fx` 节点是这块
+        场景树的子节点，`vidow_fx_set_alpha()` 会连它一起乘，所以 `arrange_layers()` 乘完
+        再按 `fx->masked` 把它放回 1.0 —— 半透明面板透出来的应该是糊过的背景，不是没糊的
+        壁纸（窗口那边 `u_opacity` 也只乘内容 + 边框，blur 那一项不乘，语义对齐）。
+      - 关窗 / 关面板的快照也认 `opacity`：装饰着色器那条路自己会乘，没走着色器的
+        （图层快照、关掉装饰的窗口）在 `closing_update()` 里乘一次 —— 不然「规则说半透明」
+        的窗口，关闭动画却是全不透明地淡出。
+      - **顺手修掉一个真 bug**：`anim = false` / `open_ms = 0` 的窗口以前会连 **fx
+        （装饰 / 模糊那条路）都不建** —— 边框和背景模糊都挂在 fx 节点上，不建就是「这个
+        窗口没有边框、也永远不模糊」，跟用户写的那句「不做动画」不是一个意思。现在「不做
+        动画」走 `view_open_done()`（没有入场动画时的开窗收尾：换 idle shader、摆到位），
+        fx 照建。`window_open_ms = 0` 本来走的就是这条路 —— `test-blurpartial.sh` 拿它当
+        默认配置跑，正是它把这件事抖出来的（改坏的那一版，所有窗口的私有底衬一次都没抓过）。
+      - 判据：`test-rules.sh` 第 8 节（图层 `anim = false` 当场没有 `anim-open`、`open_ms`
+        真的写进 `anim.duration_ms`、`close_ms = 0` 不出现关闭快照、`opacity = 0.3` 拿 grim
+        量 dot 那个白点的蓝通道 255 → 76）+ 第 6c 节（规则给红边框 + `anim = false`，
+        量窗口左边缘往里 2px：R=255 G=0 —— fx 没建的话那里是客户端自己的蓝）+ 第 2 节加
+        `open_ms = -1` 越界校验。
+
+199. **规则能改外观**（「覆盖 vidow 所有能改的地方」里的装饰着色器那一块）
 
       198 把布局 / 行为那些作用做完了，剩下的是「这个窗口长什么样」—— 圆角、边框、
       阴影、噪点、不透明度、背后模不模糊，这些原本只有全局配置键（`configs/02-decor.lua`、

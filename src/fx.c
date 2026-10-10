@@ -3366,6 +3366,12 @@ static void closing_update(void *data, double t, double linear) {
 	} else if (closing->alpha > 1.0) {
 		closing->alpha = 1.0;
 	}
+	/* 规则给的 opacity 在这条路上也得算：装饰着色器那条路自己会乘（decor_draw
+	 * 的 u_opacity），没走着色器的（layer 的快照、关掉装饰的窗口）就得在这儿乘
+	 * —— 不然「规则说这个窗口半透明」，它的关闭动画却是全不透明地淡出。 */
+	if (!closing->fx.active) {
+		closing->alpha *= vidow_rule_opacity(&closing->rule_eff);
+	}
 	/* 回弹的曲线让 t 稍微越过 1：位移和缩放跟着过冲（那才是回弹）。 */
 	closing->off_y = (double)closing->slide_px * t;
 	closing->fx.anim_scale = 1.0 + (closing->anim_scale_to - 1.0) * t;

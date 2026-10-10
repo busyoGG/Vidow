@@ -13,7 +13,8 @@
 #      title / initial_title / class / role
 #   6) 多条规则：AND、后面的覆盖前面的、没写的字段回默认（不是留着上一条的值）
 #   7) 图层规则：namespace / layer 匹配，窗口字段写进图层规则 = 这条不匹配
-#   8) 日志里没有 assert / abort，窗口还在
+#   8) 图层规则的作用：开合（anim / open_ms / close_ms）和不透明度（抓帧量像素）
+#   9) 日志里没有 assert / abort，窗口还在
 #
 # 用法：./test-rules.sh   （VIDOW_TEST_KEEP=1 保留运行目录）
 # 注意：别和别的测试**并行**跑 —— 收尾按 cmdline 杀 bluewin / dot 这两个客户端。
@@ -255,6 +256,8 @@ apply_cfg \
 	'  vidow.rule{ app_id = "mpv", opacity = 2 } end)))))' \
 	'vidow.log("E12 " .. tostring((select(2, pcall(function()' \
 	'  vidow.rule{ app_id = "mpv", corner_radius = -3 } end)))))' \
+	'vidow.log("E13 " .. tostring((select(2, pcall(function()' \
+	'  vidow.rule{ namespace = "dot", open_ms = -1 } end)))))' \
 	'vidow.rule{ app_id = "keep", capture = "hide" }'
 
 check_log() { # check_log <标签> <必须出现的串> [<也得出现的串>]
@@ -284,6 +287,7 @@ check_log E9 "正数"
 check_log E10 "不能是空的"
 check_log E11 "0 ~ 1"
 check_log E12 "0 ~ 1e+09"
+check_log E13 "open_ms" "负数"
 
 RULES_N=$(./build/vidowmsg rules 2>/dev/null | python3 -c '
 import json, sys
@@ -634,6 +638,211 @@ else:
 else
 	echo "  （没有 grim 或 PIL，跳过像素判据）"
 fi
+
+# ------------------------------------------------------------ 6c) anim = false 不等于「不要 fx」
+mark "6c) anim = false / open_ms = 0 的窗口照样有装饰（不是裸表面）"
+# 判据：给窗口一条红边框的规则 + anim = false，抓帧量**窗口左边缘**那个像素 ——
+# 装饰（边框）是画在 fx 节点上的，fx 不建的话那里就是客户端自己的蓝，或者壁纸。
+if command -v grim >/dev/null && python3 -c 'import PIL' 2>/dev/null; then
+	border_pixel() { # border_pixel <png> <窗口 id> —— 打印左边缘往里 2px 那个像素的 R,G
+		./build/vidowmsg windows > "$RUNDIR/windows.json" 2>/dev/null
+		python3 - "$1" "$2" "$RUNDIR/windows.json" <<'PYEOF'
+import json, sys
+from PIL import Image
+w = json.load(open(sys.argv[3], encoding='utf-8'))
+w = w.get("windows", w) if isinstance(w, dict) else w
+g = next((x["geometry"] for x in w if x["id"] == int(sys.argv[2])), None)
+img = Image.open(sys.argv[1]).convert("RGB")
+if g is None:
+    print(-1, -1)
+else:
+    x = max(0, min(img.width - 1, g["x"] + 2))
+    y = max(0, min(img.height - 1, g["y"] + g["height"] // 2))
+    r, gg, _ = img.getpixel((x, y))
+    print(r, gg)
+PYEOF
+	}
+
+	apply_cfg 'vidow.rule{ title = "^bluewin$", anim = false, border_width = 6,' \
+		'             border_color = "ff0000", border_color_focus = "ff0000" }'
+	if WID=$(open_win); then
+		sleep 0.5
+		grim -o "$OUT" "$RUNDIR/anim-nofx.png" 2>/dev/null
+		read -r BR BG <<< "$(border_pixel "$RUNDIR/anim-nofx.png" "$WID")"
+		if [ "$BR" -gt 150 ] && [ "$BG" -lt 100 ]; then
+			pass "anim = false 的窗口左边缘是规则给的红边框（R=$BR G=$BG）"
+		else
+			fail "anim = false 把 fx 一起关了：左边缘不是边框色（R=$BR G=$BG）"
+		fi
+		kill_win
+	else
+		fail "anim = false 那个窗口没起来"
+	fi
+	# open_ms = 0 是同一条路（这条一直是对的，一起钉住）
+	apply_cfg 'vidow.rule{ title = "^bluewin$", open_ms = 0, border_width = 6,' \
+		'             border_color = "ff0000", border_color_focus = "ff0000" }'
+	if WID=$(open_win); then
+		sleep 0.5
+		grim -o "$OUT" "$RUNDIR/openms0.png" 2>/dev/null
+		read -r BR BG <<< "$(border_pixel "$RUNDIR/openms0.png" "$WID")"
+		if [ "$BR" -gt 150 ] && [ "$BG" -lt 100 ]; then
+			pass "open_ms = 0 的窗口也有边框（R=$BR G=$BG）"
+		else
+			fail "open_ms = 0 把 fx 一起关了（R=$BR G=$BG）"
+		fi
+		kill_win
+	else
+		fail "open_ms = 0 那个窗口没起来"
+	fi
+	apply_cfg
+else
+	echo "  （没有 grim 或 PIL，跳过 6c 的像素判据）"
+fi
+
+# ------------------------------------------------------------ 8) 图层：开合 / 时长 / 不透明度
+mark "8) 图层规则的开合与不透明度（anim / open_ms / close_ms / opacity）"
+
+layer_field() { # layer_field <namespace> <python 表达式，x 是那个 layer 的 dict>
+	./build/vidowmsg layers 2>/dev/null | python3 -c '
+import json, sys
+ns, expr = sys.argv[1], sys.argv[2]
+d = json.load(sys.stdin)
+l = d.get("layers", d) if isinstance(d, dict) else d
+for x in l:
+	if x.get("namespace") == ns:
+		print(eval(expr, {"x": x}))
+		break
+else:
+	print("missing")
+' "$1" "$2"
+}
+
+stop_dot() {
+	[ -n "$DOT_PID" ] && kill "$DOT_PID" 2>/dev/null
+	DOT_PID=""
+	sleep 0.4
+}
+
+# 起一个 dot 图层客户端（**先写配置再起**：规则要在它 map 那一刻就生效）。
+# 第三个参数起：坐标（默认 dot.py 自己的 640,20）。
+start_dot() {
+	stop_dot
+	HOME="$CFGDIR" python3 tools/dot.py "$@" > "$RUNDIR/dot-$RANDOM.log" 2>&1 &
+	DOT_PID=$!
+	local i
+	for i in $(seq 1 60); do
+		# 等 mapped（不是等 namespace）：入场动画是在 map 的那一刻起的
+		[ "$(layer_field dot 'x["mapped"]')" = True ] && return 0
+		sleep 0.1
+	done
+	return 1
+}
+
+# 正例：open_ms = 3000 —— 采样这一刻动画还该在跑（duration_ms 是规则给的那个数）
+apply_cfg 'vidow.rule{ namespace = "^dot$", open_ms = 3000 }'
+if start_dot; then
+	LAY_DUR=$(layer_field dot 'x["anim"]["duration_ms"] if x["anim"] else "none"')
+	[ "$LAY_DUR" = 3000 ] &&
+		pass "open_ms = 3000：图层入场动画真的跑 3000ms（$LAY_DUR）" ||
+		fail "open_ms = 3000 没生效（anim = $LAY_DUR）"
+	[ "$(layer_field dot 'x["rule"]["open_ms"]')" = 3000 ] &&
+		pass "rule.open_ms 读回来是 3000" || fail "rule.open_ms 不对"
+	[ "$(layer_field dot 'x["alpha"] == 1')" = True ] &&
+		fail "open_ms = 3000 时不该已经淡到位（alpha = $(layer_field dot 'x["alpha"]')）" ||
+		pass "open_ms = 3000：采样这一刻还在淡入（alpha = $(layer_field dot 'x["alpha"]')）"
+else
+	fail "dot 没起来"
+fi
+
+# 反例：anim = false —— 同一套采样方式，这次压根没有动画，alpha 一上来就是 1
+apply_cfg 'vidow.rule{ namespace = "^dot$", anim = false }'
+if start_dot; then
+	[ "$(layer_field dot 'x["anim"]')" = "None" ] &&
+		pass "anim = false：没有 layer-open 动画" ||
+		fail "anim = false 还是有动画（$(layer_field dot 'x["anim"]')）"
+	[ "$(layer_field dot 'x["alpha"] == 1')" = True ] &&
+		pass "anim = false：alpha 一上来就是 1（不淡入）" ||
+		fail "anim = false 还在淡入（alpha = $(layer_field dot 'x["alpha"]')）"
+	[ "$(layer_field dot 'x["rule"]["open_ms"]')" = 0 ] &&
+		pass "anim = false 把两个时长都归零（rule.open_ms = 0）" ||
+		fail "anim = false 没归零"
+else
+	fail "dot 没起来（anim = false）"
+fi
+grep -aq "rule: layer dot 动画 = 关（开 0ms / 关 0ms）" "$LOG" &&
+	pass "日志里说了「layer dot 动画 = 关」" || fail "日志里没有 layer 动画那一行"
+
+# close_ms = 0：关掉面板时不出现关闭快照（日志里说明是哪条路跳过的）
+apply_cfg 'vidow.rule{ namespace = "^dot$", close_ms = 0 }'
+stop_dot
+sleep 0.3
+grep -aq "关闭动画跳过 layer dot：close_ms = 0" "$LOG" &&
+	pass "close_ms = 0：关面板时跳过关闭动画（日志说明了原因）" ||
+	fail "close_ms = 0 没生效（日志里没有跳过那一行）"
+
+# anim = false 连关也跳过，报的是另一条原因
+apply_cfg 'vidow.rule{ namespace = "^dot$", anim = false }'
+start_dot || fail "dot 没起来（关的那条）"
+stop_dot
+sleep 0.3
+grep -aq "关闭动画跳过 layer dot：规则写了 anim = false" "$LOG" &&
+	pass "anim = false：关的那条也跳过（日志说的是 anim = false）" ||
+	fail "anim = false 的关闭没跳过"
+
+# close_ms = 400：正例（读回来的值，以及默认配置下不该有「跳过」）
+apply_cfg 'vidow.rule{ namespace = "^dot$", close_ms = 400 }'
+start_dot || fail "dot 没起来（close_ms = 400）"
+[ "$(layer_field dot 'x["rule"]["close_ms"]')" = 400 ] &&
+	pass "close_ms = 400 读回来对得上" || fail "rule.close_ms 不对"
+SKIP_BEFORE=$(grep -ac "关闭动画跳过 layer dot" "$LOG")
+stop_dot
+sleep 0.3
+[ "$(grep -ac "关闭动画跳过 layer dot" "$LOG")" = "$SKIP_BEFORE" ] &&
+	pass "close_ms = 400：真的走了关闭动画（没有再报跳过）" ||
+	fail "close_ms = 400 也把关闭动画跳过了"
+
+# 不透明度：抓帧量那个白点中心的蓝通道（底衬是黑的，白点 = 255）
+if command -v grim >/dev/null && python3 -c 'import PIL' 2>/dev/null; then
+	apply_cfg
+	stop_clients
+	sleep 0.5
+	start_dot 900 40 || fail "dot 没起来（像素判据）"
+	sleep 0.5
+	layer_pixel() { # layer_pixel <png> —— dot 的白点中心（图层局部 900,40）的蓝通道
+		./build/vidowmsg layers > "$RUNDIR/layers.json" 2>/dev/null
+		python3 - "$1" "$RUNDIR/layers.json" <<'PYEOF'
+import json, sys
+from PIL import Image
+d = json.load(open(sys.argv[2], encoding='utf-8'))
+l = d.get("layers", d) if isinstance(d, dict) else d
+g = next((x["geometry"] for x in l if x.get("namespace") == "dot"), None)
+img = Image.open(sys.argv[1]).convert("RGB")
+if g is None:
+    print(-1)
+else:
+    x = max(0, min(img.width - 1, g["x"] + 900))
+    y = max(0, min(img.height - 1, g["y"] + 40))
+    print(img.getpixel((x, y))[2])
+PYEOF
+	}
+	grim -o "$OUT" "$RUNDIR/layer-full.png" 2>/dev/null
+	LB_FULL=$(layer_pixel "$RUNDIR/layer-full.png")
+	apply_cfg 'vidow.rule{ namespace = "^dot$", opacity = 0.3 }'
+	sleep 0.5
+	grim -o "$OUT" "$RUNDIR/layer-dim.png" 2>/dev/null
+	LB_DIM=$(layer_pixel "$RUNDIR/layer-dim.png")
+	if [ "$LB_FULL" -gt 150 ] && [ "$LB_DIM" -lt $((LB_FULL * 6 / 10)) ]; then
+		pass "图层 opacity = 0.3：白点的蓝从 $LB_FULL 掉到 $LB_DIM"
+	else
+		fail "图层 opacity = 0.3 没作用在画面上（原样 $LB_FULL → 现在 $LB_DIM）"
+	fi
+else
+	echo "  （没有 grim 或 PIL，跳过图层像素判据）"
+fi
+
+# 收尾那节要看「窗口还活着」：这一节把客户端清过一轮，补一个回来
+apply_cfg
+open_win > /dev/null || fail "补一个窗口失败（收尾那节要它）"
 
 # ------------------------------------------------------------ 7) 收尾
 mark "7) 收尾"

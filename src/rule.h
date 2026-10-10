@@ -118,7 +118,9 @@ enum vidow_rule_act {
 	VRA_MINIMIZE,          /* 开就收起来（不显示、不抢焦点） */
 	VRA_COLUMN_WIDTH,      /* 新列的宽度占比（0.1 ~ 1.0） */
 	/* 一直在的 */
-	VRA_ANIM,              /* false = 这个窗口不做开合动画 */
+	VRA_ANIM,              /* false = 这个窗口 / 图层不做开合动画 */
+	VRA_OPEN_MS,           /* 开启动画时长（毫秒，覆盖全局；0 = 不做开启动画） */
+	VRA_CLOSE_MS,          /* 关闭动画时长（毫秒，覆盖全局；0 = 不做关闭动画） */
 	/* 外观（装饰着色器的参数；没写的用全局配置） */
 	VRA_DECOR,             /* false = 这个窗口不画装饰（边框 / 圆角 / 阴影） */
 	VRA_OPACITY,           /* 整块（含装饰）的不透明度 */
@@ -176,6 +178,20 @@ struct vidow_rule {
 	bool aset[VRA_COUNT];
 	union vidow_rule_value aval[VRA_COUNT];
 };
+
+/* 一个目标的开合动画：规则写了就用规则的，没写用全局（窗口看 window_open_ms /
+ * window_close_ms，layer 看 layer_open_ms / layer_close_ms）。
+ *   on = false（anim = false）就是「不做动画」：时长一律按 0 算。 */
+struct vidow_rule_anim {
+	bool on;
+	int open_ms;
+	int close_ms;
+};
+
+/* 规则给的不透明度：没写 = 1.0（不透明）。 */
+static inline double vidow_rule_opacity(const struct vidow_rule_eff *eff) {
+	return eff != NULL && eff->set[VRA_OPACITY] ? eff->val[VRA_OPACITY].d : 1.0;
+}
 
 /* 一个窗口 / layer 现在的装饰参数：窗口规则写了就用规则的，没写用全局配置。
  * 渲染（fx.c）和 IPC（vidowmsg windows 的 look 那一块）都看这一份 ——
@@ -257,6 +273,12 @@ void vidow_rule_set_literal(struct vidow_rule *rule, bool literal);
 struct vidow_config;
 void vidow_rule_look(const struct vidow_config *cfg,
 		const struct vidow_rule_eff *eff, struct vidow_look *out);
+
+/* 这个目标（layer = true 时按 layer 的全局时长）现在该用多长的开合动画。
+ * eff 可以是 NULL（没有规则的目标）。 */
+void vidow_rule_anim(const struct vidow_config *cfg,
+		const struct vidow_rule_eff *eff, bool layer,
+		struct vidow_rule_anim *out);
 
 /* 这条规则写没写这个字段（读回来的时候用：vidow.rules() / IPC 的 rules）。 */
 bool vidow_rule_has_field(const struct vidow_rule *rule,

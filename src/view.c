@@ -1747,22 +1747,36 @@ static void view_open_done(void *data, bool cancelled) {
 
 void vidow_view_open_anim(struct vidow_view *view) {
 	struct vidow_config *cfg = &view->server->config;
+	struct vidow_rule_anim anim;
+	vidow_rule_anim(cfg, &view->rule_eff, false, &anim);
 
 	/* 弹出物（X11 菜单 / 提示 / 下拉框）和 Wayland 的 xdg_popup 一样：不装饰、
 	 * 不跑 shader、也不做入场动画。它是跟着操作「啪」地出现的一块小图，滑动
 	 * 或淡入都显得慢半拍；而且它常在自己的位置上重开，动画会看着像窗口在飘。
 	 * 这里只把场景节点摆到最终位置。
-	 * 窗口规则 anim = false 是同一回事，只不过由用户点名（终端那类「开出来
-	 * 就该在」的窗口）。 */
-	if (view->popup ||
-			(view->rule_eff.set[VRA_ANIM] && !view->rule_eff.val[VRA_ANIM].b)) {
+	 * 窗口规则 anim = false / open_ms = 0 是同一回事，只不过由用户点名
+	 * （终端那类「开出来就该在」的窗口）。
+	 *
+	 * 但**装饰 / 模糊那条路（fx）照样得建**：窗口的背景模糊和边框都挂在 fx
+	 * 节点上，不建 fx 这个窗口就永远没有模糊、也没有边框 —— 「不跑动画」不是
+	 * 「不要 fx」。所以这里走 view_open_done()（它做的正是「没有入场动画的开窗
+	 * 收尾」：换 idle shader、摆到位），而不是把窗口晾在裸表面状态。
+	 * （`window_open_ms = 0` 一直走的就是这条路，test-blurpartial.sh 拿它当
+	 * 默认配置跑；规则写 anim = false 之前会跳过 fx，等于顺手把模糊关了。） */
+	if (view->popup || anim.open_ms <= 0) {
 		vidow_anim_cancel(view->anim_open);
 		view->anim_open = NULL;
 		view->anim_alpha = 1.0;
 		view->anim_off_x = 0.0;
 		view->anim_off_y = 0.0;
 		view->anim_scale = 1.0;
-		vidow_view_apply_anim(view);
+		if (view->popup) {
+			vidow_view_apply_anim(view);
+			return;
+		}
+		vidow_fx_begin(view->server, &view->fx, view->scene_tree,
+			cfg->shader_open);
+		view_open_done(view, true);
 		return;
 	}
 
@@ -1789,7 +1803,7 @@ void vidow_view_open_anim(struct vidow_view *view) {
 
 	vidow_anim_cancel(view->anim_open);
 	view->anim_open = vidow_anim_start(view->server, "open",
-		cfg->window_open_ms, cfg->open_easing, view_open_update,
+		anim.open_ms, cfg->open_easing, view_open_update,
 		view_open_done, view);
 	if (view->anim_open == NULL) {
 		view_open_done(view, true);
@@ -1800,10 +1814,11 @@ void vidow_view_open_anim(struct vidow_view *view) {
  * a snapshot of the last committed buffer. */
 static void view_snapshot_close(struct vidow_view *view) {
 	struct vidow_server *server = view->server;
+	struct vidow_rule_anim anim;
+	vidow_rule_anim(&server->config, &view->rule_eff, false, &anim);
 	/* 弹出物不做关闭动画：菜单收起来就是收起来了（它常常在关掉的同一帧里被
 	 * 重开或换成另一个菜单，淡出的残影会串到下一个菜单上）。 */
-	if (view->popup || view->last_buffer == NULL ||
-			server->config.window_close_ms <= 0) {
+	if (view->popup || view->last_buffer == NULL || anim.close_ms <= 0) {
 		/* 「怎么没有关闭动画」是收到过的反馈，而这里有三条不同的路都能让它
 		 * 不出现（弹出物 / 没有最后一帧快照 / 时长是 0）。日志里说清楚是哪条，
 		 * 不然只能靠猜（`vidowmsg windows` 里能查回 popup / float_mode）。 */
@@ -1811,7 +1826,8 @@ static void view_snapshot_close(struct vidow_view *view) {
 			vidow_view_title(view) != NULL ? vidow_view_title(view) : "(无题)",
 			view->popup ? "弹出物（菜单 / 提示 / 下拉框）不做关闭动画" :
 			view->last_buffer == NULL ? "手里没有最后一帧快照" :
-			"window_close_ms = 0（配置里关了）");
+			anim.on ? "close_ms = 0（配置或规则里关了）" :
+				"规则写了 anim = false");
 		return;
 	}
 	/* 快照是整块源缓冲（表面），可见窗口在里面偏着 —— 把偏移一起交给关闭动画，
@@ -1842,7 +1858,7 @@ static void view_snapshot_close(struct vidow_view *view) {
 	vidow_closing_start(server, server->layer_toplevels, view->last_buffer,
 		&geo, view->geom.x + (int)lround(view->anim_off_x),
 		view->geom.y + (int)lround(view->anim_off_y), w, h,
-		server->config.window_close_ms, server->config.close_slide_px,
+		anim.close_ms, server->config.close_slide_px,
 		true, server->config.shader_close, view_scale(view),
 		server->config.close_easing, server->config.close_scale_to,
 		&view->rule_eff);

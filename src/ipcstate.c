@@ -277,6 +277,15 @@ void vidow_ipc_json_window(struct jbuf *b, struct vidow_server *server,
 	jb_key(b, "anim_open");
 	json_anim(b, view->anim_open);
 	jb_kv_double(b, "alpha", view->anim_alpha);
+	/* 这个窗口现在该用多长的开合动画（规则写了 anim / open_ms / close_ms 就是
+	 * 规则的那份，没写就是全局配置）：0 = 不做那个动画。 */
+	{
+		struct vidow_rule_anim ra;
+		vidow_rule_anim(&server->config, &view->rule_eff, false, &ra);
+		jb_kv_bool(b, "anim", ra.on);
+		jb_kv_int(b, "open_ms", ra.open_ms);
+		jb_kv_int(b, "close_ms", ra.close_ms);
+	}
 	jb_kv_bool(b, "force_render", view->force_render);
 	jb_kv_int(b, "pump_interval_ms", view->pump_interval_ms);
 	jb_kv_int(b, "capture_holders",
@@ -621,7 +630,6 @@ void vidow_ipc_json_outputs(struct jbuf *b, struct vidow_server *server) {
 
 void vidow_ipc_json_layer(struct jbuf *b, struct vidow_server *server,
 		struct vidow_layer_surface *ls) {
-	(void)server;
 	if (ls == NULL) {
 		jb_null(b);
 		return;
@@ -670,6 +678,19 @@ void vidow_ipc_json_layer(struct jbuf *b, struct vidow_server *server,
 	jb_kv_str(b, "capture", ls->capture_mode == VIDOW_CAPTURE_HIDE ? "hide" :
 		ls->capture_mode == VIDOW_CAPTURE_MOSAIC ? "mosaic" : "off");
 	jb_kv_int(b, "capture_mosaic", ls->capture_mosaic);
+	/* 规则算出来的开合动画与不透明度：这块面板现在「该」怎么样看这里，
+	 * 不用去量像素（alpha 是动画那一刻的值，动画停了恒为 1）。 */
+	jb_key(b, "rule");
+	jb_obj(b);
+	{
+		struct vidow_rule_anim ra;
+		vidow_rule_anim(&server->config, &ls->rule_eff, true, &ra);
+		jb_kv_bool(b, "anim", ra.on);
+		jb_kv_int(b, "open_ms", ra.open_ms);
+		jb_kv_int(b, "close_ms", ra.close_ms);
+	}
+	jb_kv_double(b, "opacity", vidow_rule_opacity(&ls->rule_eff));
+	jb_obj_end(b);
 	jb_obj_end(b);
 }
 

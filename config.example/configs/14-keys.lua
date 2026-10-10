@@ -107,9 +107,15 @@ end
 --                                "hide"（不出现）/ "mosaic"（打马赛克）
 --     capture_mosaic = 24        马赛克的块边长（屏幕像素，默认 16，最小 2）；只在
 --                                capture = "mosaic" 时有用，单独写不算一个作用
+--     anim = false               不做开合动画（窗口 / 图层都是：开、关都瞬间到位）
+--     open_ms = 500              开启动画时长（毫秒；覆盖全局 window_open_ms /
+--                                layer_open_ms，0 = 不做这个动画）
+--     close_ms = 80              关闭动画时长（毫秒；覆盖 window_close_ms /
+--                                layer_close_ms，0 = 不做这个动画）
 --   外观（装饰着色器的参数；没写的用全局配置，全局开关仍是总闸）：
 --     decor = false              这个窗口不画装饰（边框 / 圆角 / 阴影都不要）
---     opacity = 0.9              整块（含装饰）的不透明度
+--     opacity = 0.9              整块的不透明度（窗口 = 内容 + 边框；图层 = 面板
+--                                自己的内容，底衬的模糊不跟着淡）
 --     corner_radius = 12         圆角半径（逻辑像素）
 --     border_width = 0           边框宽度（0 = 不画边框）
 --     border_color = "ff0000"    没聚焦时的边框颜色（RRGGBB / RRGGBBAA）
@@ -121,8 +127,10 @@ end
 --     noise = 0.1                往装饰里掺的噪点强度（0 = 不加）
 --     blur = false               它背后不模糊（true = 平铺窗口也模糊）
 --     blur_xray = true           重叠时也用整屏那份底衬（糊的是壁纸）
-
---     anim = false               这个窗口不做开合动画（开、关都瞬间到位）
+--
+--   图层规则能用的作用：capture / capture_mosaic / anim / open_ms / close_ms /
+--   opacity / blur —— 其余（force_render、hz、float、装饰参数…）都是窗口专有，
+--   写进图层规则 = 这条规则谁也不匹配（当场看得出来，不会悄悄生效）。
 --   开窗时兑现一次（重载规则**不**搬已经开着的窗口，也不改它们的尺寸）：
 --     float = true               强制浮动（false = 强制平铺；对话框那类自动识别让位）
 --     workspace = "chat"         开在哪块工作区：具名工作区（没有就建）/ 特殊工作区
@@ -139,6 +147,8 @@ end
 --   vidow.rule{ title = "^预览", force_render = true, hz = 15 }
 --   vidow.rule{ class = "Steam", focus_on_open = false }
 --   vidow.rule{ namespace = "^notifications$", capture = "hide" }
+--   vidow.rule{ layer = "^background$", anim = false }   -- 壁纸不做入场动画
+--   vidow.rule{ namespace = "^waybar$", opacity = 0.9, close_ms = 0 }
 --   vidow.rule{ exe = "^wechat$", x11_scale = 1 }     -- 没有 app_id 的应用按进程认
 --   vidow.rule{ app_id = "^mpv$", workspace = "media", fullscreen = true }
 --   读回来：vidow.rules()（没管的字段是 nil：「没管它」和「管了、给了默认值」
