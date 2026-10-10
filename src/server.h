@@ -240,6 +240,10 @@ struct vidow_config {
 	/* 录屏 / 截图交给哪个后端：auto（默认，自己人优先）/ vidow / kde / wlr /
 	 * hyprland / none。跟 portal_desktop（会话名）是两件事。 */
 	char portal_capture[32];
+	/* 会话环境（见 env.c）：启动时从 systemd 用户管理器吸环境、把 vidow 的环境
+	 * 推回给 systemd / dbus（由 systemd 拉起来的应用才看得到 vidow）。 */
+	bool systemd_env;
+	bool systemd_env_export;
 
 	/* Alt+Tab 切换器（niri 的 recent windows，见 mru.c）。
 	 *   enabled        总开关：关掉就不记账、Alt+Tab 不认（那两条绑定变成没动作）
@@ -1333,6 +1337,35 @@ struct vidow_frame_stats {
 };
 extern struct vidow_frame_stats vidow_stats;
 
+/* 一个被 vidow.env{} / vidow.env() 动过的环境变量（见 env.c）：记着「进来之前
+ * 是什么样」，退出时还原 —— vidow 是从别人的 shell / systemd 里起来的，改过的
+ * 东西得还回去。 */
+struct vidow_env_var {
+	struct wl_list link;      /* vidow_server.env_vars */
+	char name[128];
+	char *before;             /* NULL = 进来的时候没这个变量 */
+	bool had_before;
+	/* 从 systemd 吸来的（配置里 systemd_env = 0 时要还回去） */
+	bool absorbed;
+	/* 用户 vidow.env 显式设过：那是他要的，别自动还回去 */
+	bool explicit;
+};
+
+/* 推给 systemd 之前记下的「用户管理器里原来是什么样」（见 env.c）：退出时还回去。 */
+struct vidow_env_snap {
+	struct wl_list link;      /* vidow_server.env_snap */
+	char name[128];
+	char *value;              /* NULL = 当时用户管理器里没有这个变量 */
+	bool had;
+};
+
+/* vidow.exec_once() 排队的命令：等这份配置跑完（环境、缩放、DISPLAY 都定了）再
+ * 以撒手方式起，然后记进「起过了」（配置重载不重来，见 script.c）。 */
+struct vidow_exec_once {
+	struct wl_list link;      /* vidow_server.exec_once */
+	char *cmd;
+};
+
 /* 一条事件钩子（config.lua 里的 vidow.on()，见 hooks.c / hooks.h）。
  *
  * lua = true 的那种拿 lua_ref 指着一个 Lua 函数（在那个 lua_State 的注册表里），
@@ -1626,6 +1659,17 @@ struct vidow_server {
 	int hook_dispatch_depth;            /* > 0 = 正在派发，摘钩子只标记不回收 */
 	/* 钩子里的 Lua 调用（在等 vidow.exec 的那种，见 script.c） */
 	struct wl_list hook_calls;
+
+	/* 环境变量账本（见 env.c）：和 systemd 用户管理器两个方向对账 */
+	struct wl_list env_vars;            /* vidow_env_var.link */
+	struct wl_list env_snap;            /* vidow_env_snap.link（用户管理器的原样） */
+	struct wl_event_source *env_idle;   /* 合并导出用的 idle 源 */
+	int env_exports;                    /* 推给 systemd 几次 */
+	bool env_pulled;                    /* 吸过 systemd 的环境了吗 */
+	/* vidow.exec_once()：排队的命令 + 已经起过的（配置重载不重来） */
+	struct wl_list exec_once;           /* vidow_exec_once.link */
+	char **exec_once_ran;
+	size_t exec_once_ran_n;
 	/* IPC 报给外面的稳定编号（从 1 起，0 = 还没分配） */
 	uint64_t next_view_id;
 	uint64_t next_column_id;

@@ -1,3 +1,4 @@
+#include "env.h"
 #include "server.h"
 
 #include <math.h>
@@ -576,6 +577,8 @@ bool vidow_xwayland_apply_config(struct vidow_server *server) {
 
 	/* 配置里启动的客户端要能连上 X：lazy 模式下 socket 现在就有了。 */
 	setenv("DISPLAY", server->xwayland->display_name, 1);
+	/* DISPLAY 变了就得再推一轮：systemd 拉起来的 X11 程序也要连得上 vidow 的 X */
+	vidow_env_export_later(server);
 
 	vidow_xwayland_scale_recompute(server);
 	vidow_xwayland_env(server);

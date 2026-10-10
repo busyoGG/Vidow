@@ -1,3 +1,4 @@
+#include "env.h"
 #include "hooks.h"
 #include "json.h"
 #include "server.h"
@@ -532,6 +533,118 @@ static int l_spawn(lua_State *L) {
 		return luaL_error(L, "vidow.spawn('')：命令是空的");
 	}
 	vidow_exec_detached(cmd);
+	lua_pushboolean(L, 1);
+	return 1;
+}
+
+/* vidow.exec_once("waybar")：**整个 vidow 生命周期只起一次**（配置重载不重跑）——
+ * Hyprland 的 exec-once。命令先排队，等这份配置跑完再撒出去（那时环境、缩放、
+ * DISPLAY 都定了，见 vidow_config_sync）。认一个字符串，也认一串 / 一张表：
+ *
+ *   vidow.exec_once("waybar")
+ *   vidow.exec_once{ "swaybg -i 壁纸.png", "mako" }
+ */
+static void exec_once_queue(struct vidow_server *server, const char *cmd) {
+	if (cmd == NULL || cmd[0] == '\0') {
+		return;
+	}
+	struct vidow_exec_once *item = calloc(1, sizeof(*item));
+	if (item == NULL) {
+		return;
+	}
+	item->cmd = strdup(cmd);
+	if (item->cmd == NULL) {
+		free(item);
+		return;
+	}
+	wl_list_insert(server->exec_once.prev, &item->link);
+}
+
+static int l_exec_once(lua_State *L) {
+	struct vidow_script *s = script_of(L);
+	int n = lua_gettop(L);
+	if (n == 1 && lua_istable(L, 1)) {
+		lua_pushnil(L);
+		while (lua_next(L, 1) != 0) {
+			if (lua_isstring(L, -1)) {
+				exec_once_queue(s->server, lua_tostring(L, -1));
+			}
+			lua_pop(L, 1);
+		}
+		lua_pushboolean(L, 1);
+		return 1;
+	}
+	for (int i = 1; i <= n; i++) {
+		exec_once_queue(s->server, luaL_checkstring(L, i));
+	}
+	lua_pushboolean(L, 1);
+	return 1;
+}
+
+/* 环境变量：vidow 起的子进程（exec / spawn / 事件钩子）继承的就是它。
+ *
+ *   vidow.env("GDK_SCALE")                 -- 读
+ *   vidow.env("MOZ_ENABLE_WAYLAND", "1")   -- 写（顺手推给 systemd）
+ *   vidow.env("FOO", false)                -- 删
+ *   vidow.env{ A = "1", B = false }        -- 一次一串
+ *
+ * 改过的变量记着原值，vidow 退出时还原（见 env.c）。 */
+static int l_env(lua_State *L) {
+	struct vidow_script *s = script_of(L);
+	if (lua_istable(L, 1)) {
+		lua_pushnil(L);
+		while (lua_next(L, 1) != 0) {
+			int vi = lua_absindex(L, -1);
+			char err[192] = "";
+			const char *name = lua_tostring(L, -2);
+			if (name == NULL) {
+				return luaL_error(L, "vidow.env{…}: 变量名得是字符串");
+			}
+			bool ok;
+			const char *value = lua_tostring(L, vi);
+			if (value == NULL) {
+				ok = vidow_env_unset(s->server, name, err, sizeof(err));
+			} else {
+				ok = vidow_env_set(s->server, name, value, err, sizeof(err));
+			}
+			if (!ok) {
+				return luaL_error(L, "%s", err);
+			}
+			lua_pop(L, 1);
+		}
+		lua_pushboolean(L, 1);
+		return 1;
+	}
+
+	const char *name = luaL_checkstring(L, 1);
+	if (lua_gettop(L) == 1) {
+		const char *value = getenv(name);
+		if (value != NULL) {
+			lua_pushstring(L, value);
+		} else {
+			lua_pushnil(L);
+		}
+		return 1;
+	}
+	char err[192] = "";
+	bool ok;
+	if (lua_isboolean(L, 2) && !lua_toboolean(L, 2)) {
+		ok = vidow_env_unset(s->server, name, err, sizeof(err));
+	} else {
+		ok = vidow_env_set(s->server, name, luaL_checkstring(L, 2), err,
+			sizeof(err));
+	}
+	if (!ok) {
+		return luaL_error(L, "%s", err);
+	}
+	lua_pushboolean(L, 1);
+	return 1;
+}
+
+/* vidow.env_export()：立刻把环境推给 systemd / dbus（平时是自动的、下一次 idle
+ * 里推；想在起某个 systemd 服务之前确保它已经推过去了，就显式调一下）。 */
+static int l_env_export(lua_State *L) {
+	vidow_env_export_now(script_of(L)->server);
 	lua_pushboolean(L, 1);
 	return 1;
 }
@@ -1128,6 +1241,9 @@ static void register_api(struct vidow_script *s) {
 		{ "exec", l_exec },
 		{ "exec_status", l_exec_status },
 		{ "spawn", l_spawn },
+		{ "exec_once", l_exec_once },
+		{ "env", l_env },
+		{ "env_export", l_env_export },
 		{ "on", l_on },
 		{ "off", l_off },
 		{ "set", l_set },
@@ -1194,6 +1310,66 @@ static void register_api(struct vidow_script *s) {
  * vidow.ipc_path()；X 服务的 DISPLAY 也必须在配置里的子进程之前设好），而缩放
  * 是在建输出的时候读的。所以启动时先按默认值建好，等配置跑完再由这里按配置
  * 修正一遍。全是幂等的，没变就什么都不做。 */
+/* vidow.exec_once() 排队的命令：这份配置跑完了才撒出去。
+ *
+ * 为什么不在配置跑的那一刻就起：配置是分步跑的，命令起来的时候缩放 / DISPLAY /
+ * 用户 vidow.env{} 设的变量可能还没落地（配置里 exec_once 写在前面的情况）。
+ * 等这份配置跑完再起，子进程看到的是「最终环境」。
+ *
+ * 「已经起过」按**命令原文**记（不是按行号 / 下标）：配置重载之后同一行还是同一行，
+ * 认得出是它；改过命令原文就是一条新命令，会再起一次（和 Hyprland 的 exec-once
+ * 一个规矩）。空闲（配置里删掉了那条）的命令下次重载会被忘掉。 */
+#define EXEC_ONCE_RAN_MAX 128
+
+static bool exec_once_already_ran(const struct vidow_server *server,
+		const char *cmd) {
+	for (size_t i = 0; i < server->exec_once_ran_n; i++) {
+		if (strcmp(server->exec_once_ran[i], cmd) == 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static void exec_once_note_ran(struct vidow_server *server, const char *cmd) {
+	if (server->exec_once_ran_n >= EXEC_ONCE_RAN_MAX) {
+		return; /* 到上限就不再记账：宁可多起一次，也别吃掉刚记的 */
+	}
+	char **p = realloc(server->exec_once_ran,
+		(server->exec_once_ran_n + 1) * sizeof(*p));
+	if (p == NULL) {
+		return;
+	}
+	server->exec_once_ran = p;
+	server->exec_once_ran[server->exec_once_ran_n] = strdup(cmd);
+	if (server->exec_once_ran[server->exec_once_ran_n] == NULL) {
+		return;
+	}
+	server->exec_once_ran_n++;
+}
+
+/* 把这一轮配置里声明的 exec_once 落地：没起过的起掉，起过的（含上一轮的）跳过。 */
+static void exec_once_flush(struct vidow_server *server) {
+	struct vidow_exec_once *item, *tmp;
+	wl_list_for_each_safe(item, tmp, &server->exec_once, link) {
+		wl_list_remove(&item->link);
+		if (exec_once_already_ran(server, item->cmd)) {
+			wlr_log(WLR_DEBUG, "exec-once：%s 起过了，跳过", item->cmd);
+			free(item->cmd);
+			free(item);
+			continue;
+		}
+		/* 和配置里起的其它子进程一样：先对一次环境（缩放 / DISPLAY / 输出） */
+		vidow_xwayland_scale_apply(server);
+		vidow_portal_desktop_env(&server->config);
+		wlr_log(WLR_INFO, "exec-once：起 %s", item->cmd);
+		vidow_exec_detached(item->cmd);
+		exec_once_note_ran(server, item->cmd);
+		free(item->cmd);
+		free(item);
+	}
+}
+
 void vidow_config_sync(struct vidow_server *server) {
 	vidow_ipc_apply_config(server);
 	vidow_xwayland_apply_config(server);
@@ -1220,6 +1396,11 @@ void vidow_config_sync(struct vidow_server *server) {
 	/* Alt+Tab 切换器正开着的话：排版 / 外观那些键（mru = {…}）改完立刻重排，
 	 * 不用等下次打开。 */
 	vidow_mru_update(server);
+	/* 环境（systemd_env / systemd_env_export）可能被改过：推给 systemd 的排队
+	 * 走一轮（多次改动只 fork 一次）。 */
+	vidow_env_apply_config(server);
+	/* vidow.exec_once() 排队的命令：这份配置到此为止算跑完了，撒出去。 */
+	exec_once_flush(server);
 }
 
 static void script_apply(struct vidow_script *s) {

@@ -86,6 +86,10 @@ static const struct section sections[] = {
 	{ "最近窗口（Alt+Tab）", "15-mru.lua",
 		"Alt+Tab 的窗口切换器（niri 的 recent windows）：列哪些窗口、怎么排版、"
 		"选中框长什么样" },
+	/* 会话环境同样是往后加（16-…）：前面那些文件名早就写进用户的 config.lua 了。 */
+	{ "会话环境（systemd）", "16-env.lua",
+		"和 systemd 用户管理器对账：从它那儿吸环境、把 vidow 的环境推回去"
+		"（由 systemd 拉起来的应用才看得到 vidow）" },
 };
 #define N_SECTIONS ((int)(sizeof(sections) / sizeof(sections[0])))
 /* 「键位 / 工作区 / 规则」那一节：它不是配置键，entries[] 里没有它，打印也
@@ -256,6 +260,17 @@ static const struct entry entries[] = {
 		"XDG_CURRENT_DESKTOP 的值（xdg-desktop-portal 按它选 <名字>-portals.conf）" },
 	{ "portal_capture",  K_STRING, OFF(portal_capture),  SZ(portal_capture), 11,
 		"录屏 / 截图交给谁：auto（默认）/ vidow / kde / wlr / hyprland / none" },
+
+	{ "systemd_env",     K_BOOL,   OFF(systemd_env),     SZ(systemd_env), 16,
+		"启动时从 systemd 用户管理器吸环境（我们自己没有的才吸：PATH / "
+		"SSH_AUTH_SOCK / environment.d 里那些）；WAYLAND_DISPLAY / DISPLAY 这类"
+		"由 vidow 自己定，不吸" },
+	{ "systemd_env_export", K_BOOL, OFF(systemd_env_export),
+		SZ(systemd_env_export), 16,
+		"把 vidow 的环境推给 systemd 用户管理器 + dbus 激活环境"
+		"（systemctl --user import-environment + dbus-update-activation-environment "
+		"--systemd）：xdg-desktop-portal、systemd 服务和桌面文件激活的程序才"
+		"连得上 vidow" },
 
 	{ "cursor_shake",    K_BOOL,   OFF(cursor_shake),    SZ(cursor_shake), 12,
 		"摇晃指针就放大一下（快速来回晃几下，指针变大一会儿，好找）" },
@@ -698,6 +713,11 @@ static void defaults(struct vidow_config *cfg) {
 	 * 路径留空 = 按 WAYLAND_DISPLAY 自动取（$XDG_RUNTIME_DIR/vidow-<display>.sock）。 */
 	cfg->ipc = true;
 	cfg->ipc_socket[0] = '\0';
+	/* 会话环境默认双向对账（见 env.c）：从 systemd 吸（我们自己没有的）、把
+	 * vidow 的环境推回去 —— 推不出去的话 systemd / dbus 拉起来的应用看不到
+	 * vidow 的 WAYLAND_DISPLAY，连的还是宿主合成器。 */
+	cfg->systemd_env = true;
+	cfg->systemd_env_export = true;
 	/* 输入注入默认开：IPC 能合成鼠标 / 键盘事件（move-cursor / pointer-button /
 	 * pointer-scroll / send-key / type-text），自动化靠它动手。socket 是 0600，
 	 * 只有本用户能连，而且每次注入都打一条 info 日志留痕；要收紧就写 false。 */

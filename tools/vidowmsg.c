@@ -174,6 +174,8 @@ static const char *positional_key(const char *cmd, int index) {
 		{ "get-config", { "key", NULL } },
 		{ "config", { "key", NULL } },
 		{ "emit", { "event", NULL } },
+		{ "set-env", { "name", "value", NULL } },
+		{ "unset-env", { "name", NULL } },
 		{ "focus-column", { "direction", NULL } },
 		{ "move-column", { "direction", NULL } },
 		{ "focus-window-direction", { "direction", NULL } },

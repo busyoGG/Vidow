@@ -1,4 +1,5 @@
 #include "server.h"
+#include "env.h"
 #include "hooks.h"
 #include "ipc.h"
 
@@ -316,6 +317,11 @@ int main(int argc, char *argv[]) {
 	/* 没量过 X 屏幕之前先当它认这个属性（不夹缩放）：量到了再说，见 xwayland.c */
 	server.xwayland_scale_ok = true;
 	vidow_script_init(&server);
+	/* 环境账本 + 从 systemd 用户管理器吸环境（见 env.c）。要在建 socket 之前：
+	 * XDG_RUNTIME_DIR 这类要是我们这儿没有、用户管理器里有，吸进来才对得上。 */
+	vidow_env_init(&server);
+	vidow_env_absorb_systemd(&server);
+	wl_list_init(&server.exec_once);
 
 	server.allocator = wlr_allocator_autocreate(server.backend, server.renderer);
 	if (server.allocator == NULL) {
@@ -413,6 +419,11 @@ int main(int argc, char *argv[]) {
 	 * see our socket, not the session we are nested in. */
 	setenv("WAYLAND_DISPLAY", socket, 1);
 	wlr_log(WLR_INFO, "vidow ready on WAYLAND_DISPLAY=%s", socket);
+	/* 推给 systemd / dbus（见 env.c）：systemd 和 dbus 拉起来的应用（portal、
+	 * systemd 服务、桌面文件激活的程序）环境从用户管理器拿，不推它们就看不到
+	 * vidow 的 WAYLAND_DISPLAY。配置落地后还会再推一轮（那时用户 vidow.env{}
+	 * 设的变量才算齐）。 */
+	vidow_env_export_later(&server);
 
 	/* IPC 在 socket 名定下来之后才起（默认路径带 WAYLAND_DISPLAY），但要在
 	 * config.lua 之前：脚本里起的状态栏要能连上它。失败只打日志，不拦启动。 */
@@ -460,6 +471,8 @@ int main(int argc, char *argv[]) {
 	server_finish(&server);
 	vidow_script_finish(&server);
 	vidow_hooks_finish(&server);
+	/* 改过的环境变量（vidow.env）还回原样：别把调用方的 shell 环境改脏 */
+	vidow_env_finish(&server);
 	vidow_exec_cancel_all(&server);
 	wl_display_destroy_clients(server.display);
 	wl_display_destroy(server.display);

@@ -28,6 +28,7 @@
 #include <wlr/types/wlr_seat.h>
 #include <wlr/util/log.h>
 
+#include "env.h"
 #include "hooks.h"
 #include "ipcstate.h"
 #include "json.h"
@@ -1387,6 +1388,48 @@ static bool cmd_action(struct vidow_server *server, struct jval *req,
 	return true;
 }
 
+/* 环境账本：vidow 自己管着哪些变量（原值是什么）、哪些会推给 systemd。 */
+static bool cmd_env(struct vidow_server *server, struct jval *req,
+		struct jbuf *out, char *err, size_t errlen) {
+	(void)req;
+	(void)err;
+	(void)errlen;
+	vidow_env_json(out, server);
+	return true;
+}
+
+/* 改一个环境变量（和配置里 vidow.env 是同一件事）：影响 vidow 之后起的子进程，
+ * 并且**顺手推给 systemd / dbus**（改完下一个 idle 里推）。 */
+static bool cmd_set_env(struct vidow_server *server, struct jval *req,
+		struct jbuf *out, char *err, size_t errlen) {
+	char name_buf[256];
+	char value_buf[4096];
+	const char *name = jtext(req, "name", name_buf, sizeof(name_buf));
+	if (name == NULL) {
+		snprintf(err, errlen, "要 name = \"VAR\"（可选 value，不给就是删掉）");
+		return false;
+	}
+	const char *value = jtext(req, "value", value_buf, sizeof(value_buf));
+	bool ok;
+	if (value == NULL) {
+		ok = vidow_env_unset(server, name, err, errlen);
+	} else {
+		ok = vidow_env_set(server, name, value, err, errlen);
+	}
+	if (!ok) {
+		return false;
+	}
+	jb_obj(out);
+	jb_kv_str(out, "name", name);
+	if (value != NULL) {
+		jb_kv_str(out, "value", value);
+	} else {
+		jb_kv_null(out, "value");
+	}
+	jb_obj_end(out);
+	return true;
+}
+
 /* 配置里挂着的钩子（vidow.on）：谁在听哪个事件、跑过几次。 */
 static bool cmd_hooks(struct vidow_server *server, struct jval *req,
 		struct jbuf *out, char *err, size_t errlen) {
@@ -2268,6 +2311,13 @@ static bool ipc_run(struct vidow_server *server, struct ipc_client *c,
 	/* 合成器 */
 	if (strcmp(cmd, "action") == 0) {
 		return cmd_action(server, req, out, err, errlen);
+	}
+	/* 会话环境（见 env.c）：我们管着哪些变量、改一个 */
+	if (strcmp(cmd, "env") == 0) {
+		return cmd_env(server, req, out, err, errlen);
+	}
+	if (strcmp(cmd, "set_env") == 0 || strcmp(cmd, "unset_env") == 0) {
+		return cmd_set_env(server, req, out, err, errlen);
 	}
 	/* 事件（见 hooks.c）：谁在听、有哪些事件、自己发一个 */
 	if (strcmp(cmd, "hooks") == 0) {
