@@ -48,10 +48,15 @@
  *   vidow-portal            # 占住总线名，等前端来调
  *   vidow-portal --probe    # 自检：连上合成器、列一遍输出和窗口、退出
  *   vidow-portal --dialog   # 不经过 DBus 直接把选择器弹出来（看排版 / 点着玩）
+ *                           #   VIDOW_PORTAL_TYPES=1|2|4|7 只看某一类来源
+ *                           #   VIDOW_PORTAL_PARENT=wayland:<handle> 当挂到应用窗口上
+ *                           #     （handle 从 tools/foreign-app.py 拿：带父窗口时合成器
+ *                           #      把它当浮窗、尺寸自己定，这才是真机上的样子）
  *   vidow-portal --shot     # 不经过 DBus 直接跑一次交互式截图
  */
 #define _GNU_SOURCE
 
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdbool.h>
@@ -83,6 +88,11 @@
  * 名字在下」，用户要预览小一点，所以比 KDE 那个尺寸还收了一圈。 */
 #define THUMB_W 176
 #define THUMB_H 110
+/* 缩略图圆角半径（外观：卡片里的预览切个圆角，别是一张硬边截图）。 */
+#define THUMB_RADIUS 5.0
+/* 卡片内边距 / 对话框内容区留白（CSS 里 button.card 的 padding 是 6，这里跟着走）。 */
+#define CARD_PAD 7
+#define CONTENT_PAD 16
 /* 一行最多几张卡片（KDE 的选择器是一格一格的卡片，不是「缩略图 + 右边一个按钮」
  * 的列表）。 */
 #define CARD_COLS 3
@@ -145,6 +155,7 @@ struct row {
 	int vw, vh;     /* ROW_VIRTUAL：要建的虚拟屏幕逻辑尺寸 */
 	GtkWidget *image;
 	GtkWidget *toggle;
+	GtkWidget *badge; /* 缩略图右上角那个对勾（选中才显示） */
 };
 
 /* ------------------------------------------------------------ 输出 */
@@ -283,6 +294,243 @@ static void log_info(const char *fmt, ...) {
 	vfprintf(stderr, fmt, ap);
 	fputc('\n', stderr);
 	va_end(ap);
+}
+
+/* ------------------------------------------------------------ 外观
+ *
+ * 选择器长什么样：配色走 Breeze（浅色 #eff0f1 底、白卡片、强调色 = KDE 的
+ * DecorationFocus，也就是「系统设置 → 外观 → 颜色」里那个高亮色，没配就是 Breeze
+ * 蓝 #3daee9），深色 GTK 主题自动跟着换。样式全在 CSS 里（GtkCssProvider），
+ * 结构那边只挂 class 名，不引新依赖。
+ *
+ * 想临时换一下：
+ *   VIDOW_PORTAL_ACCENT=#3daee9   指定强调色（覆盖 KDE 那个）
+ *   VIDOW_PORTAL_DARK=1           强制深色（0 = 强制浅色）
+ */
+
+struct palette {
+	const char *bg;      /* 窗口底 */
+	const char *base;    /* 卡片 / 缩略图底 */
+	const char *text;
+	const char *dim;     /* 次要文字（小字、分组标题） */
+	const char *border;
+	const char *hover;
+	const char *btn;     /* 次要按钮底 */
+	const char *btn_border;
+	const char *off_bg;  /* 禁用按钮 */
+	const char *off_text;
+};
+
+static const struct palette pal_light = {
+	.bg = "#eff0f1", .base = "#ffffff", .text = "#232629", .dim = "#7b858c",
+	.border = "#d8dde0", .hover = "#f3fafe", .btn = "#fcfcfc",
+	.btn_border = "#c3c9cd", .off_bg = "#dcdfe1", .off_text = "#a3a8ab",
+};
+
+static const struct palette pal_dark = {
+	.bg = "#232629", .base = "#2f3336", .text = "#eff0f1", .dim = "#9aa0a5",
+	.border = "#3b4045", .hover = "#333a3f", .btn = "#2f3336",
+	.btn_border = "#4a5055", .off_bg = "#31363a", .off_text = "#6b7175",
+};
+
+static const struct palette *pal = &pal_light;
+static char accent[8] = "#3daee9";
+static char accent_hover[8] = "#3daee9";
+static char accent_soft[8] = "#eaf6fd";
+static char on_accent[8] = "#ffffff";
+static bool style_dark = false;
+
+static void hex2rgb(const char *hex, double *r, double *g, double *b) {
+	unsigned long v = strtoul(hex[0] == '#' ? hex + 1 : hex, NULL, 16);
+	*r = (double)((v >> 16) & 0xffu) / 255.0;
+	*g = (double)((v >> 8) & 0xffu) / 255.0;
+	*b = (double)(v & 0xffu) / 255.0;
+}
+
+static void rgb2hex(char *out, double r, double g, double b) {
+	unsigned ri = (unsigned)(r * 255.0 + 0.5), gi = (unsigned)(g * 255.0 + 0.5),
+		bi = (unsigned)(b * 255.0 + 0.5);
+	if (ri > 255) ri = 255;
+	if (gi > 255) gi = 255;
+	if (bi > 255) bi = 255;
+	snprintf(out, 8, "#%02x%02x%02x", ri, gi, bi);
+}
+
+/* 两色按 t（0..1）混：t=0 全是 a，t=1 全是 b。 */
+static void mix_hex(const char *a, const char *b, double t, char *out) {
+	double ar, ag, ab, br, bg, bb;
+	hex2rgb(a, &ar, &ag, &ab);
+	hex2rgb(b, &br, &bg, &bb);
+	rgb2hex(out, ar + (br - ar) * t, ag + (bg - ag) * t, ab + (bb - ab) * t);
+}
+
+static bool valid_hex(const char *s) {
+	if (s == NULL || s[0] != '#' || strlen(s) != 7) {
+		return false;
+	}
+	for (int i = 1; i < 7; i++) {
+		if (!isxdigit((unsigned char)s[i])) {
+			return false;
+		}
+	}
+	return true;
+}
+
+/* KDE 的强调色：~/.config/kdeglobals 的 [Colors:Selection]。优先 DecorationFocus
+ * （Breeze 那个 #3daee9 档，填成按钮底色配白字看得清），没有就退到 BackgroundNormal
+ * （用户自己挑的选中色）。 */
+static bool kde_accent(char *out, size_t n) {
+	char path[512];
+	const char *cfg = getenv("XDG_CONFIG_HOME");
+	const char *home = getenv("HOME");
+	if (cfg != NULL && cfg[0] != '\0') {
+		snprintf(path, sizeof(path), "%s/kdeglobals", cfg);
+	} else if (home != NULL && home[0] != '\0') {
+		snprintf(path, sizeof(path), "%s/.config/kdeglobals", home);
+	} else {
+		return false;
+	}
+	FILE *f = fopen(path, "r");
+	if (f == NULL) {
+		return false;
+	}
+	bool in_sel = false, got = false;
+	unsigned r = 0, g = 0, b = 0;
+	char line[256];
+	while (fgets(line, sizeof(line), f) != NULL) {
+		if (line[0] == '[') {
+			in_sel = strncmp(line, "[Colors:Selection]", 18) == 0;
+			continue;
+		}
+		if (!in_sel) {
+			continue;
+		}
+		unsigned rr, gg, bb;
+		if (sscanf(line, "DecorationFocus=%u,%u,%u", &rr, &gg, &bb) == 3) {
+			r = rr; g = gg; b = bb; got = true;
+			break;
+		}
+		/* BackgroundNormal 先出现，先记下；后面撞上 DecorationFocus 就换掉。 */
+		if (!got && sscanf(line, "BackgroundNormal=%u,%u,%u", &rr, &gg, &bb) == 3) {
+			r = rr; g = gg; b = bb; got = true;
+		}
+	}
+	fclose(f);
+	if (!got) {
+		return false;
+	}
+	snprintf(out, n, "#%02x%02x%02x", r & 0xff, g & 0xff, b & 0xff);
+	return true;
+}
+
+static bool theme_is_dark(void) {
+	const char *env = getenv("VIDOW_PORTAL_DARK");
+	if (env != NULL && env[0] != '\0') {
+		return env[0] != '0';
+	}
+	const char *gtk_theme = getenv("GTK_THEME");
+	if (gtk_theme != NULL && strstr(gtk_theme, "dark") != NULL) {
+		return true;
+	}
+	GtkSettings *s = gtk_settings_get_default();
+	if (s == NULL) {
+		return false;
+	}
+	char *name = NULL;
+	gboolean prefer = FALSE;
+	g_object_get(s, "gtk-theme-name", &name, NULL);
+	g_object_get(s, "gtk-application-prefer-dark-theme", &prefer, NULL);
+	bool dark = prefer ||
+		(name != NULL && (strstr(name, "dark") != NULL || strstr(name, "Dark") != NULL));
+	g_free(name);
+	return dark;
+}
+
+static void style_load(void) {
+	const char *src = "Breeze 默认";
+	const char *env_accent = getenv("VIDOW_PORTAL_ACCENT");
+	if (valid_hex(env_accent)) {
+		snprintf(accent, sizeof(accent), "%s", env_accent);
+		src = "VIDOW_PORTAL_ACCENT";
+	} else if (kde_accent(accent, sizeof(accent))) {
+		src = "kdeglobals";
+	}
+	style_dark = theme_is_dark();
+	pal = style_dark ? &pal_dark : &pal_light;
+
+	/* 悬停 = 强调色压暗一点；选中底 = 强调色淡淡地铺在卡片底上。 */
+	mix_hex(accent, "#000000", 0.14, accent_hover);
+	mix_hex(pal->base, accent, 0.12, accent_soft);
+	/* 强调色浅的时候（用户把高亮色挑得很亮）白字看不清，改成深色字。 */
+	double ar, ag, ab;
+	hex2rgb(accent, &ar, &ag, &ab);
+	snprintf(on_accent, sizeof(on_accent), "%s",
+		0.299 * ar + 0.587 * ag + 0.114 * ab > 0.62 ? "#1b1e20" : "#ffffff");
+
+	char *css = g_strdup_printf(
+		"window { background-color: %1$s; }\n"
+		"window .background { background-color: %1$s; color: %3$s; }\n"
+		"headerbar { background-color: %1$s; background-image: none;"
+		"  color: %3$s; border-bottom: 1px solid %4$s; box-shadow: none;"
+		"  min-height: 38px; padding: 0 6px; }\n"
+		"headerbar .title { color: %3$s; font-weight: 700; font-size: 13px; }\n"
+		"headerbar button { color: %3$s; }\n"
+		"headerbar .subtitle { color: %5$s; font-size: 10px; }\n"
+		"headerbar button { background-image: none; background-color: transparent;"
+		"  border: none; box-shadow: none; border-radius: 6px; min-width: 26px;"
+		"  min-height: 26px; }\n"
+		"headerbar button:hover { background-color: %6$s; }\n"
+		"label.hint { color: %5$s; font-size: 12px; }\n"
+		"label.section { color: %5$s; font-size: 10px; font-weight: 700; }\n"
+		"label.card-title { color: %3$s; font-size: 12px; }\n"
+		"label.card-sub { color: %5$s; font-size: 10px; }\n"
+		"label.badge { background-color: %2$s; color: %9$s; border-radius: 10px;"
+		"  min-width: 15px; min-height: 15px; padding: 1px 3px;"
+		"  font-size: 10px; font-weight: 700; }\n"
+		"image.placeholder { border: 1px dashed %4$s; border-radius: 6px;"
+		"  color: %5$s; }\n"
+		"button.card { background-image: none; background-color: %10$s;"
+		"  border: 1px solid %4$s; border-radius: 8px; padding: 6px;"
+		"  box-shadow: none; }\n"
+		"button.card:hover { background-color: %6$s; border-color: %2$s; }\n"
+		"button.card:checked { background-color: %11$s;"
+		"  border: 2px solid %2$s; }\n"
+		"button.card:checked label.card-title { color: %2$s; font-weight: 700; }\n"
+		"button.primary { background-image: none; background-color: %2$s;"
+		"  color: %9$s; border: 1px solid %2$s; border-radius: 6px;"
+		"  padding: 6px 20px; font-weight: 700; box-shadow: none;"
+		"  text-shadow: none; }\n"
+		"button.primary:hover { background-color: %12$s; border-color: %12$s; }\n"
+		"button.primary:disabled { background-color: %13$s;"
+		"  border-color: %13$s; color: %14$s; }\n"
+		"button.ghost { background-image: none; background-color: %7$s;"
+		"  color: %3$s; border: 1px solid %8$s; border-radius: 6px;"
+		"  padding: 6px 20px; box-shadow: none; text-shadow: none; }\n"
+		"button.ghost:hover { background-color: %6$s; }\n"
+		"separator.footer { background-color: %4$s; min-height: 1px; }\n",
+		pal->bg, accent, pal->text, pal->border, pal->dim, pal->hover, pal->btn,
+		pal->btn_border, on_accent, pal->base, accent_soft, accent_hover,
+		pal->off_bg, pal->off_text);
+	GtkCssProvider *provider = gtk_css_provider_new();
+	GError *err = NULL;
+	gtk_css_provider_load_from_data(provider, css, -1, &err);
+	if (err != NULL) {
+		log_info("选择器样式有错（用系统主题继续）：%s", err->message);
+		g_error_free(err);
+	}
+	gtk_style_context_add_provider_for_screen(gdk_screen_get_default(),
+		GTK_STYLE_PROVIDER(provider), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+	g_object_unref(provider);
+	g_free(css);
+	log_info("选择器外观：%s主题，强调色 %s（%s）", style_dark ? "深色" : "浅色",
+		accent, src);
+}
+
+/* 给一个控件挂 class（CSS 里按 class 选）。 */
+static void add_class(GtkWidget *w, const char *name) {
+	if (w != NULL) {
+		gtk_style_context_add_class(gtk_widget_get_style_context(w), name);
+	}
 }
 
 /* ------------------------------------------------------------ 抓帧缓冲 */
@@ -427,7 +675,53 @@ static GdkPixbuf *output_to_pixbuf(struct output *out) {
 		out->y_invert);
 }
 
-/* 缩到缩略图大小（保持比例，不放大）。 */
+/* 给 pixbuf 切圆角 + 描一圈细边（缩略图看起来像卡片里的预览，不是贴上去的截图）。
+ * 走 cairo：圆角路径当 clip，画完再描边，最后转回带 alpha 的 pixbuf。 */
+static GdkPixbuf *pixbuf_rounded(GdkPixbuf *pix, double radius, double border_alpha) {
+	int w = gdk_pixbuf_get_width(pix);
+	int h = gdk_pixbuf_get_height(pix);
+	if (w < 2 || h < 2) {
+		return (GdkPixbuf *)g_object_ref(pix);
+	}
+	if (radius > w / 2.0) {
+		radius = w / 2.0;
+	}
+	if (radius > h / 2.0) {
+		radius = h / 2.0;
+	}
+	cairo_surface_t *surf = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, w, h);
+	if (cairo_surface_status(surf) != CAIRO_STATUS_SUCCESS) {
+		cairo_surface_destroy(surf);
+		return (GdkPixbuf *)g_object_ref(pix);
+	}
+	cairo_t *cr = cairo_create(surf);
+	double r = radius;
+	cairo_new_sub_path(cr);
+	cairo_arc(cr, w - r, r, r, -G_PI / 2.0, 0);
+	cairo_arc(cr, w - r, h - r, r, 0, G_PI / 2.0);
+	cairo_arc(cr, r, h - r, r, G_PI / 2.0, G_PI);
+	cairo_arc(cr, r, r, r, G_PI, 3.0 * G_PI / 2.0);
+	cairo_close_path(cr);
+	cairo_save(cr);
+	cairo_clip(cr);
+	gdk_cairo_set_source_pixbuf(cr, pix, 0, 0);
+	cairo_paint(cr);
+	cairo_restore(cr);
+	if (border_alpha > 0.0) {
+		cairo_set_source_rgba(cr, 0, 0, 0, border_alpha);
+		cairo_set_line_width(cr, 1.0);
+		cairo_stroke(cr);
+	}
+	cairo_destroy(cr);
+	GdkPixbuf *out = gdk_pixbuf_get_from_surface(surf, 0, 0, w, h);
+	cairo_surface_destroy(surf);
+	if (out == NULL) {
+		return (GdkPixbuf *)g_object_ref(pix);
+	}
+	return out;
+}
+
+/* 缩到缩略图大小（保持比例，不放大），顺手切圆角。 */
 static GdkPixbuf *thumb_of(GdkPixbuf *pix) {
 	int w = gdk_pixbuf_get_width(pix);
 	int h = gdk_pixbuf_get_height(pix);
@@ -440,7 +734,15 @@ static GdkPixbuf *thumb_of(GdkPixbuf *pix) {
 	int tw = (int)(w * s), th = (int)(h * s);
 	if (tw < 1) tw = 1;
 	if (th < 1) th = 1;
-	return gdk_pixbuf_scale_simple(pix, tw, th, GDK_INTERP_BILINEAR);
+	GdkPixbuf *scaled = gdk_pixbuf_scale_simple(pix, tw, th, GDK_INTERP_BILINEAR);
+	if (scaled == NULL) {
+		return NULL;
+	}
+	/* 深色主题下白描边看得见，浅色主题下用黑描边（就这一圈，别抢戏）。 */
+	GdkPixbuf *rounded = pixbuf_rounded(scaled, THUMB_RADIUS,
+		style_dark ? 0.35 : 0.10);
+	g_object_unref(scaled);
+	return rounded;
 }
 
 /* ------------------------------------------------- 窗口抓帧（缩略图 / 截窗口）
@@ -1606,6 +1908,10 @@ static void on_toggle(GtkToggleButton *button, gpointer data) {
 				}
 			}
 		}
+		if (r->badge != NULL) {
+			/* 缩略图角上那个对勾跟着选中状态走（no_show_all 挂着，只由这里控制）。 */
+			gtk_widget_set_visible(r->badge, on);
+		}
 		if (on) {
 			n++;
 		}
@@ -1643,6 +1949,7 @@ static struct row *add_card(GtkWidget *grid, int col, int line, enum row_kind ki
 	r->ptr = ptr;
 
 	GtkWidget *toggle = gtk_toggle_button_new();
+	add_class(toggle, "card");
 	GtkWidget *card = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
 	gtk_container_add(GTK_CONTAINER(toggle), card);
 	gtk_widget_set_margin_bottom(toggle, 4);
@@ -1650,13 +1957,35 @@ static struct row *add_card(GtkWidget *grid, int col, int line, enum row_kind ki
 
 	GtkWidget *image = gtk_image_new();
 	gtk_widget_set_size_request(image, THUMB_W, THUMB_H);
-	gtk_box_pack_start(GTK_BOX(card), image, FALSE, FALSE, 0);
+	if (kind == ROW_VIRTUAL) {
+		/* 虚拟屏幕没有画面可预览：占位图标 + 虚线框，别留一块空白让人以为坏了。 */
+		gtk_image_set_from_icon_name(GTK_IMAGE(image), "video-display-symbolic",
+			GTK_ICON_SIZE_DIALOG);
+		gtk_image_set_pixel_size(GTK_IMAGE(image), 44);
+		add_class(image, "placeholder");
+	}
+	/* 缩略图右上角的对勾（选中才显示，见 on_toggle）。GtkOverlay 盖在图上，
+	 * 对齐到右上角 —— 就是 KDE 选择器那种「选中的那张角上有个勾」。 */
+	GtkWidget *badge = gtk_label_new("✓");
+	add_class(badge, "badge");
+	gtk_widget_set_halign(badge, GTK_ALIGN_END);
+	gtk_widget_set_valign(badge, GTK_ALIGN_START);
+	gtk_widget_set_margin_end(badge, 6);
+	gtk_widget_set_margin_top(badge, 6);
+	gtk_widget_set_no_show_all(badge, TRUE);
+	gtk_widget_set_visible(badge, FALSE);
+	GtkWidget *overlay = gtk_overlay_new();
+	gtk_container_add(GTK_CONTAINER(overlay), image);
+	gtk_overlay_add_overlay(GTK_OVERLAY(overlay), badge);
+	gtk_box_pack_start(GTK_BOX(card), overlay, FALSE, FALSE, 0);
 	r->image = image;
+	r->badge = badge;
 
 	GtkWidget *label = gtk_label_new(title);
 	gtk_label_set_xalign(GTK_LABEL(label), 0.0);
 	gtk_label_set_ellipsize(GTK_LABEL(label), PANGO_ELLIPSIZE_END);
 	gtk_widget_set_size_request(label, THUMB_W, -1);
+	add_class(label, "card-title");
 	gtk_box_pack_start(GTK_BOX(card), label, FALSE, FALSE, 0);
 
 	if (sub != NULL && sub[0] != '\0') {
@@ -1664,6 +1993,7 @@ static struct row *add_card(GtkWidget *grid, int col, int line, enum row_kind ki
 		gtk_label_set_xalign(GTK_LABEL(sub_label), 0.0);
 		gtk_label_set_ellipsize(GTK_LABEL(sub_label), PANGO_ELLIPSIZE_END);
 		gtk_widget_set_size_request(sub_label, THUMB_W, -1);
+		add_class(sub_label, "card-sub");
 		gtk_box_pack_start(GTK_BOX(card), sub_label, FALSE, FALSE, 0);
 	}
 
@@ -1678,11 +2008,9 @@ static struct row *add_card(GtkWidget *grid, int col, int line, enum row_kind ki
 
 /* 一段的标题（"屏幕" / "窗口" / "虚拟屏幕"）。 */
 static void add_section(GtkWidget *grid, int line, const char *title) {
-	char text[128];
-	snprintf(text, sizeof(text), "<b>%s</b>", title);
-	GtkWidget *label = gtk_label_new(NULL);
-	gtk_label_set_markup(GTK_LABEL(label), text);
+	GtkWidget *label = gtk_label_new(title);
 	gtk_label_set_xalign(GTK_LABEL(label), 0.0);
+	add_class(label, "section");
 	gtk_widget_set_margin_top(label, 6);
 	gtk_widget_set_margin_bottom(label, 2);
 	gtk_grid_attach(GTK_GRID(grid), label, 0, line, CARD_COLS, 1);
@@ -1706,24 +2034,44 @@ static void dialog_show(struct request *req) {
 	uint32_t types = s->types != 0 ? s->types : SOURCE_TYPE_MONITOR;
 	GtkWidget *win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
 	gtk_window_set_title(GTK_WINDOW(win), "共享屏幕");
-	gtk_window_set_default_size(GTK_WINDOW(win), 3 * THUMB_W + 4 * 12, 520);
+	/* 只定宽（一行三张卡片）；高交给内容 —— 滚动区把内容的自然高度顶上来，
+	 * 对话框就正好装下三组卡片，底栏紧跟着，不留空白。 */
+	gtk_window_set_default_size(GTK_WINDOW(win),
+		3 * (THUMB_W + 2 * CARD_PAD) + 2 * 12 + 2 * CONTENT_PAD, -1);
 	gtk_window_set_position(GTK_WINDOW(win), GTK_WIN_POS_CENTER_ALWAYS);
 	gtk_window_set_type_hint(GTK_WINDOW(win), GDK_WINDOW_TYPE_HINT_DIALOG);
-	gtk_container_set_border_width(GTK_CONTAINER(win), 12);
+
+	/* 标题栏：标题 + 副标题（谁要录屏）。比 GTK 默认那条光秃秃的标题栏更像
+	 * 现在的对话框，也把「哪个应用在要」从正文里挪上来（正文只留一句提示）。 */
+	GtkWidget *header = gtk_header_bar_new();
+	gtk_header_bar_set_show_close_button(GTK_HEADER_BAR(header), TRUE);
+	gtk_header_bar_set_title(GTK_HEADER_BAR(header), "共享屏幕");
+	char sub[256];
+	snprintf(sub, sizeof(sub), "%s 想要录屏",
+		s->app_id != NULL && s->app_id[0] != '\0' ? s->app_id : "某个应用");
+	gtk_header_bar_set_subtitle(GTK_HEADER_BAR(header), sub);
+	gtk_window_set_titlebar(GTK_WINDOW(win), header);
 
 	GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+	gtk_widget_set_margin_start(box, CONTENT_PAD);
+	gtk_widget_set_margin_end(box, CONTENT_PAD);
+	gtk_widget_set_margin_top(box, 12);
+	gtk_widget_set_margin_bottom(box, 14);
 	gtk_container_add(GTK_CONTAINER(win), box);
 
-	char title[256];
-	snprintf(title, sizeof(title), "%s 想要录屏，选要共享的内容：",
-		s->app_id != NULL && s->app_id[0] != '\0' ? s->app_id : "某个应用");
-	GtkWidget *label = gtk_label_new(title);
+	GtkWidget *label = gtk_label_new("选择要共享的内容");
 	gtk_label_set_xalign(GTK_LABEL(label), 0.0);
+	add_class(label, "hint");
 	gtk_box_pack_start(GTK_BOX(box), label, FALSE, FALSE, 0);
 
 	GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
 	gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll),
 		GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+	/* 让滚动区把内容的自然高度顶给窗口：对话框就正好是「内容那么高」，底下不留
+	 * 一大块空白。给不了这么高的时候（小屏、被合成器裁）它自己滚动 —— 不要设
+	 * max_content_height，那个数比内容大就会凭空把窗口撑高（踩过：多出 53px）。 */
+	gtk_scrolled_window_set_propagate_natural_height(GTK_SCROLLED_WINDOW(scroll),
+		TRUE);
 	gtk_box_pack_start(GTK_BOX(box), scroll, TRUE, TRUE, 0);
 
 	GtkWidget *grid = gtk_grid_new();
@@ -1805,6 +2153,10 @@ static void dialog_show(struct request *req) {
 		first = rows->data;
 	}
 
+	GtkWidget *sep = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
+	add_class(sep, "footer");
+	gtk_box_pack_start(GTK_BOX(box), sep, FALSE, FALSE, 0);
+
 	GtkWidget *buttons = gtk_button_box_new(GTK_ORIENTATION_HORIZONTAL);
 	gtk_button_box_set_layout(GTK_BUTTON_BOX(buttons), GTK_BUTTONBOX_END);
 	gtk_box_set_spacing(GTK_BOX(buttons), 8);
@@ -1812,6 +2164,8 @@ static void dialog_show(struct request *req) {
 
 	GtkWidget *cancel = gtk_button_new_with_label("取消");
 	GtkWidget *share = gtk_button_new_with_label("共享");
+	add_class(cancel, "ghost");
+	add_class(share, "primary");
 	gtk_widget_set_sensitive(share, FALSE);
 	gtk_container_add(GTK_CONTAINER(buttons), cancel);
 	gtk_container_add(GTK_CONTAINER(buttons), share);
@@ -2681,14 +3035,50 @@ static gboolean shot_draw(GtkWidget *widget, cairo_t *cr, gpointer data) {
 		g_object_unref(scaled);
 	}
 	if (sh->dragging || (sh->x1 != 0 && sh->y1 != 0)) {
-		int x0 = sh->x0 < sh->x1 ? sh->x0 : sh->x1;
-		int y0 = sh->y0 < sh->y1 ? sh->y0 : sh->y1;
-		int x1 = sh->x0 > sh->x1 ? sh->x0 : sh->x1;
-		int y1 = sh->y0 > sh->y1 ? sh->y0 : sh->y1;
-		cairo_set_source_rgba(cr, 0.0, 0.6, 1.0, 0.9);
+		double rx0 = sh->x0 < sh->x1 ? sh->x0 : sh->x1;
+		double ry0 = sh->y0 < sh->y1 ? sh->y0 : sh->y1;
+		double rx1 = sh->x0 > sh->x1 ? sh->x0 : sh->x1;
+		double ry1 = sh->y0 > sh->y1 ? sh->y0 : sh->y1;
+		/* 选区之外压暗一层（KDE 的截图工具就是这样，选中的那块才跳出来），
+		 * 边框用强调色，尺寸标签贴在选区左上角。 */
+		cairo_set_source_rgba(cr, 0, 0, 0, 0.35);
+		cairo_rectangle(cr, 0, 0, aw, ry0);
+		cairo_rectangle(cr, 0, ry1, aw, ah - ry1);
+		cairo_rectangle(cr, 0, ry0, rx0, ry1 - ry0);
+		cairo_rectangle(cr, rx1, ry0, aw - rx1, ry1 - ry0);
+		cairo_fill(cr);
+
+		double ar, ag, ab;
+		hex2rgb(accent, &ar, &ag, &ab);
+		cairo_set_source_rgba(cr, ar, ag, ab, 1.0);
 		cairo_set_line_width(cr, 2);
-		cairo_rectangle(cr, x0 + 0.5, y0 + 0.5, x1 - x0, y1 - y0);
+		cairo_rectangle(cr, rx0 + 1, ry0 + 1, rx1 - rx0 - 2, ry1 - ry0 - 2);
 		cairo_stroke(cr);
+
+		/* 尺寸标签（换算回屏幕像素 —— 画的时候是等比缩过的）。 */
+		int pw = (int)((rx1 - rx0) / (k > 0 ? k : 1) + 0.5);
+		int ph = (int)((ry1 - ry0) / (k > 0 ? k : 1) + 0.5);
+		char label[64];
+		snprintf(label, sizeof(label), "%d × %d", pw, ph);
+		cairo_select_font_face(cr, "sans", CAIRO_FONT_SLANT_NORMAL,
+			CAIRO_FONT_WEIGHT_BOLD);
+		cairo_set_font_size(cr, 12);
+		cairo_text_extents_t ext;
+		cairo_text_extents(cr, label, &ext);
+		double lx = rx0, ly = ry0 - 8;
+		if (ly < 20) {
+			ly = ry1 + 8; /* 贴到选区下沿，别顶出屏幕 */
+		}
+		cairo_set_source_rgba(cr, ar, ag, ab, 0.95);
+		cairo_rectangle(cr, lx, ly - ext.height - 4, ext.width + 12,
+			ext.height + 9);
+		cairo_fill(cr);
+		/* 标签底色是强调色，字用「强调色上该用什么颜色」（浅色强调色时是深字）。 */
+		double tr, tg, tb;
+		hex2rgb(on_accent, &tr, &tg, &tb);
+		cairo_set_source_rgba(cr, tr, tg, tb, 1.0);
+		cairo_move_to(cr, lx + 6, ly + 1);
+		cairo_show_text(cr, label);
 	}
 	return TRUE;
 }
@@ -3034,6 +3424,14 @@ static void debug_dialog(void) {
 	req->session = s;
 	req->invocation = NULL;
 	req->parent_window = strdup("");
+	/* 想看「挂到应用窗口上」的样子（合成器把带父窗口的 toplevel 当浮窗，尺寸由
+	 * 客户端自己定；没父窗口时它就是个普通平铺窗口，会被铺满一整列）：
+	 *   VIDOW_PORTAL_PARENT=wayland:<handle>（handle 从 tools/foreign-app.py 拿） */
+	const char *parent_env = getenv("VIDOW_PORTAL_PARENT");
+	if (parent_env != NULL && parent_env[0] != '\0') {
+		free(req->parent_window);
+		req->parent_window = strdup(parent_env);
+	}
 	pending = req;
 	dialog_show(req);
 }
@@ -3130,6 +3528,7 @@ int main(int argc, char **argv) {
 		(GDestroyNotify)session_free);
 
 	gtk_init(&argc, &argv);
+	style_load();
 	wl_watch();
 
 	if (want_dialog) {

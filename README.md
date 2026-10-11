@@ -2782,6 +2782,20 @@ portal_capture = "wlr"   -- 借 xdg-desktop-portal-wlr：没有选择器，直�
 portal_capture = "none"  -- ScreenCast / Screenshot 两行都不写
 ```
 
+**选择器长什么样**（`tools/vidowportal.c`，用户：「portal 样式弄得好看一点现代一点，更接近 kde
+一点」）：配色走 Breeze —— 底 `#eff0f1`、白卡片、强调色取 KDE 的 `DecorationFocus`
+（`~/.config/kdeglobals` 的 `[Colors:Selection]`，没配就是 Breeze 蓝 `#3daee9`），深色 GTK 主题
+自动跟着换；卡片圆角 + 悬停描边，选中 = 强调色 2px 描边 + 底衬淡染 + 缩略图右上角一个对勾，缩略图
+自己切圆角并描一圈细边；标题栏是「共享屏幕」+「谁在要录屏」的副标题；底栏一条分隔线 + 灰色
+「取消」+ 强调色「共享」。虚拟屏幕那张卡没有画面可预览，用虚线框 + 显示器图标占位。样式全在 CSS 里
+（`GtkCssProvider`，结构那边只挂 class 名），不引新依赖；想换色：`VIDOW_PORTAL_ACCENT=#rrggbb`、
+`VIDOW_PORTAL_DARK=0|1`。**对话框高度 = 内容高度**（滚动区把内容的自然高度顶给窗口），装不下时才
+滚动 —— 别设 `max_content_height`，那个数比内容大就会凭空把窗口撑高（踩过：多出 53px 空白）。
+`vidow-portal --dialog` 可以脱离 DBus 直接看排版：`VIDOW_PORTAL_TYPES=1|2|4|7` 只看某一类来源，
+`VIDOW_PORTAL_PARENT=wayland:<handle>` 当挂到应用窗口上（handle 从 `tools/foreign-app.py` 拿）——
+带父窗口时合成器把它当**浮窗**、尺寸由客户端自己定，这才是真机上的样子；没父窗口时它就是个普通
+平铺窗口，会被铺满一整列。
+
 **发帧节奏 = min(消费者要的帧率, 屏幕刷新率)**（`src/screencast.c` 的 `stream_send_due`）：
 抓一帧是**整块离屏渲染 + 一次整块回读**，而且是在合成器的主线程上做的（PipeWire 的 loop
 挂在 Wayland 的 event loop 上）。以前只要输出提交就抓一帧 —— 144Hz 的屏上每秒 144 趟整屏
@@ -4504,6 +4518,27 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
       - 判据：`test-fullscreen-scroll.sh` 新增 9 条（非全屏的 look 有边框 2 / 圆角 12 / 阴影 8，
         全屏之后都是 0；左上角那一点是全屏窗口自己的内容而不是圆角外面的背景；浮动的全屏
         geometry = 0,0 1280x720、退出全屏回到原来的浮动尺寸）；47 项全过。
+
+205. **选择器换成 Breeze 那一套样子**（用户：「portal 样式弄得好看一点现代一点，更接近 kde 一点」）
+
+      配色不再吃 GTK 主题的默认灰：底 `#eff0f1` / 白卡片 / 强调色取 KDE 的
+      `[Colors:Selection] DecorationFocus`（真机上是 `#3daee9`），深色主题自动换一套；卡片圆角、
+      悬停描边、选中 = 强调色 2px 描边 + 底衬淡染 + 缩略图右上角一个对勾，缩略图自己切圆角再描一圈
+      细边；标题栏换成 headerbar（标题 + 「谁在要录屏」副标题）；底栏一条分隔线 + 灰色「取消」+
+      强调色「共享」；虚拟屏幕那张卡补上虚线框 + 显示器图标占位（以前是一块空白）。样式全在
+      `GtkCssProvider` 的 CSS 里，结构那边只挂 class 名，没有新依赖。
+
+      顺手两件事：**对话框高度 = 内容高度**（滚动区把内容的自然高度顶给窗口，装不下才滚动）——
+      以前固定 520 起步、底下留一大块空白，而且 `max_content_height` 只要比内容大就会把窗口撑高；
+      交互式截图的框选也统一到强调色（选区外压暗一层、边框强调色、左上角一个「宽 × 高」标签）。
+
+      调试口子：`VIDOW_PORTAL_TYPES=1|2|4|7` 只看某一类来源、`VIDOW_PORTAL_PARENT=wayland:<handle>`
+      当挂到应用窗口上（handle 从 `tools/foreign-app.py` 拿）。**注意**：没父窗口时合成器把选择器当
+      普通平铺窗口、会被铺满一整列（尺寸不归它定）—— 真机上它带父窗口，是浮窗。
+
+      验证：headless + grim 逐版截图（浅色 / 深色 / 浮窗 / 框选都看过）；`test-portal-own.sh` 全过
+      （含「双击第一张卡片的预览直接确认」，落点没跑）、`test-screencast.sh` pixman 11 项、
+      `VIDOW_TEST_RENDERER=gles2 ./test-screencast.sh` 13 项、`test-portal-queue.sh` 全过。
 
 204. **录屏 dmabuf 直通（零拷贝）：主线程一帧 7.6ms → 0.33ms**（用户：「hyprland portal 录屏
      就不会这样，肯定哪里代码写错了」）
