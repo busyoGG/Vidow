@@ -381,6 +381,13 @@ void vidow_pointer_motion(struct vidow_server *server, uint32_t time_msec) {
 		return;
 	}
 
+	/* 切换器显形之后指针也归它管：移动 = 点亮底下那一项（窗口都被摆到预览位置上
+	 * 去了，命中坐标同样对不上，别转给客户端）。 */
+	if (vidow_mru_showing(server)) {
+		vidow_mru_hover(server, server->cursor->x, server->cursor->y);
+		return;
+	}
+
 	/* 约束跟着指针焦点走：指针底下的表面 == 约束那个表面才生效，移开就解除。 */
 	vidow_pointer_constraint_focus(server, surface);
 
@@ -489,6 +496,24 @@ void vidow_pointer_button(struct vidow_server *server, uint32_t button,
 			server->overview.swallow_release = false;
 		}
 		return;
+	}
+
+	/* Alt+Tab 切换器：点一下卡片 = 直接切到那个窗口（不用等松修饰键），点空白 =
+	 * 什么都不做。点选那次的按下被吃掉了，对应的松手也一起吃掉。
+	 * 「面板已经关了、只剩 swallow_release 还挂着」时的按下不拦（照常走下面的绑定表）
+	 * —— 不然万一哪次松手丢了，所有按键就永远被吞在这儿。 */
+	if (vidow_mru_showing(server) || server->mru.swallow_release) {
+		if (!pressed) {
+			server->mru.swallow_release = false;
+			return;
+		}
+		if (vidow_mru_showing(server)) {
+			if (button == BTN_LEFT) {
+				vidow_mru_click(server, server->cursor->x,
+					server->cursor->y);
+			}
+			return;
+		}
 	}
 
 	/* 绑定表（`vidow.bind("Mod+mouse-left", …)`）：鼠标按键和键盘键同一张表、

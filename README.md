@@ -1657,7 +1657,33 @@ debounce 才落到时间戳上；往那个窗口打字算明确使用，debounce
 | `mru_max_height` | `480` | 预览高度上限（大屏上别让一个窗口占满屏） |
 | `mru_min_scale` | `0.05` | 再挤也不能比它更小 |
 | `mru_backdrop_alpha` | `0.8` | 后面那层压暗的浓度 |
-| `mru_highlight_padding` / `_border` / `_color` | `30` / `2` / `#999999ff` | 选中项那块板与边框 |
+| `mru_card_padding` | `8` | 每项背后那张卡片比预览大多少（逻辑像素） |
+| `mru_card_radius` | `16` | 卡片的圆角半径（超椭圆，和 portal 的选择器同一种圆角） |
+| `mru_card_color` | `#2f3336e6` | 卡片底色 |
+| `mru_card_border` / `_color` | `1` / `#3b4045ff` | 卡片描边宽度与颜色 |
+| `mru_highlight_border` / `_color` | `2` / `#3daee9ff` | 选中那张卡片的描边宽度与强调色 |
+
+### 卡片（样式照 portal 的 item）
+
+每一项背后一张卡片：超椭圆圆角、一层淡底、一圈细描边 —— 三种状态，和 portal 的选择器
+（`tools/vidowportal.c` 的 `card_draw`）一一对应：
+
+| 状态 | 底 | 描边 |
+| --- | --- | --- |
+| 选中（键盘在走 / 鼠标点中） | 卡片底混 12% 强调色 | 强调色，`mru_highlight_border` px |
+| 鼠标底下 | 卡片底 | 强调色 50%，`mru_card_border` px |
+| 其余 | 卡片底 | `mru_card_border_color`，`mru_card_border` px |
+
+圆角是自己画的：`wlr_scene_rect` 画不出圆角，wlroots 0.20 也没有圆角 API，所以四个角各挂一张
+**按覆盖率算出来的小图**（4×4 超采样抗锯齿），中间三条直边用普通矩形铺 —— 九宫格那套。四个角
+共用同一张图，靠 transform 翻过去用。像素走自实现的最小 `wlr_buffer`（`begin_data_ptr_access`），
+GLES2 / pixman 两条渲染器都吃，不用 GL 上下文。
+
+### 鼠标
+
+面板显形期间指针归切换器管：**移动 = 点亮底下那一张**（只改样式，**不改选中** —— 选中的那个
+还是键盘在走），**左键点一下 = 直接切过去**（不必等松修饰键），点空白什么都不做。命中按卡片算
+（比预览大一圈，圆角外面那点内边距也算点得中）。点选那次的按下被吃掉了，对应的松手也一起吃掉。
 
 两种排版（`mru = { layout = … }`）：
 
@@ -1669,8 +1695,10 @@ debounce 才落到时间戳上；往那个窗口打字算明确使用，debounce
 ### 测试
 
 ```bash
-./test-mru.sh   # 32 项：台账顺序 / 按住不换焦点 / 连点往前走 / 松开提交 / Esc 取消 /
-                #        快速点一下不显形 / strip 滚动 / grid 换行与自适应缩小 / 像素
+./test-mru.sh   # 46 项：台账顺序 / 按住不换焦点 / 连点往前走 / 松开提交 / Esc 取消 /
+                #        快速点一下不显形 / strip 滚动 / grid 换行与自适应缩小 / 像素 /
+                #        卡片几何与描边颜色（选中 = 强调色、其余 = 卡片描边色）/
+                #        鼠标悬停点亮（选中项不动）/ 鼠标点击当场切窗口
 ```
 
 ## IPC：状态输出与远程操作
@@ -3686,7 +3714,9 @@ test-overview.sh  Mod+O 全景：缩放比例/位置/顺序、四象限像素、
 test-mru.sh       Alt+Tab 的最近窗口切换器：台账顺序、按住期间焦点不动、连点往前走、
                   松开提交、Esc 取消、快速点一下（按住 < open_delay）不显形但照样切窗口、
                   strip 装不下横向滚且选中的完整可见、grid 换行 / 每行上限 / 装不下整体
-                  缩小、面板显形时壁纸被压暗（像素）
+                  缩小、面板显形时壁纸被压暗（像素）、每项背后的卡片（几何 / 相邻不重叠 /
+                  选中那张描边是强调色、其余是卡片描边色，都量像素）、鼠标悬停点亮底下那张
+                  （选中项不动）、鼠标点击当场切窗口
 portals.conf.example  拷成 ~/.config/vidow/portals.conf
 protocols/     wlr-layer-shell / wlr-virtual-pointer / input-method-v2 /
                ext-background-effect-v1 / xdg-shell / xdg-foreign v1+v2 协议 XML
@@ -4604,6 +4634,42 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
       - 判据：`test-fullscreen-scroll.sh` 新增 9 条（非全屏的 look 有边框 2 / 圆角 12 / 阴影 8，
         全屏之后都是 0；左上角那一点是全屏窗口自己的内容而不是圆角外面的背景；浮动的全屏
         geometry = 0,0 1280x720、退出全屏回到原来的浮动尺寸）；47 项全过。
+
+213. **切换器的每一项改成 portal 那种卡片，并且能用鼠标点**（用户：「mru样式也调整一下，也改的像
+      portal的item类似，且需要支持鼠标点击功能」）
+
+      - **样式照 portal 的选择器**（`tools/vidowportal.c` 的 `card_draw`）：每项背后一张卡片 ——
+        超椭圆圆角、一层淡底、一圈细描边。三种状态：**选中** = 底色混 12% 强调色（portal 的
+        `accent_soft` 同配方）+ 强调色 2px 描边；**鼠标底下** = 强调色 50% 的 1px 描边、底不动
+        （portal 的 hover 同此）；其余 = 卡片底 + 卡片描边色。默认调色板取 portal 深色那套
+        （底 `#2f3336e6`、描边 `#3b4045ff`），强调色默认 `#3daee9`（KDE Breeze 蓝，和 portal
+        从 `kdeglobals` 读到的那个同一个值）。
+      - **排版按卡片算**：卡片 = 预览 + 内边距（`mru_card_padding`，默认 8），相邻卡片之间隔的
+        还是 `mru_gap` —— 居中、「装不下就整体缩」、滚动可见性量的都是卡片的边，预览摆在卡片里
+        缩进内边距。`mru_highlight_padding` 因此没用了（那张「板」就是卡片），删掉。
+      - **圆角只能自己画**：`wlr_scene_rect` 是实心矩形，wlroots 0.20 的 `wlr_scene_buffer` 也没有
+        `corner_radius`。所以四角各挂一个小节点，里面是**按覆盖率算出来的像素**（`|x/r|⁴+|y/r|⁴ ≤ 1`
+        的 4×4 超采样，和 portal 的 `SQUIRCLE_N = 4` 同一种圆角），中间三条直边用普通矩形铺 ——
+        九宫格：角不拉伸、边拉伸。四个角共用同一张图，靠 `wlr_scene_buffer_set_transform`
+        翻过去（右上水平翻、左下垂直翻、右下转 180°）。
+      - **像素怎么进场景**：节点只认 `wlr_buffer`，而 wlroots 没有「从 CPU 像素造 buffer」的 API
+        （`wlr_texture_from_pixels` 给的是纹理，喂不进节点）。这里自己实现一个最小 `wlr_buffer`
+        （像素在堆上，`begin_data_ptr_access` 指过去）—— GLES2 和 pixman 两条渲染器都是从这条路
+        上传纹理的，和客户端递上来的 shm 缓冲同一条，不用 memfd、不用 GL 上下文、不碰渲染线程。
+        角图很小（半径 × 半径），尺寸 / 样式没变就不重画；面板收起时把图放掉，下次显形重画。
+      - **鼠标**：面板显形期间指针归切换器管（`vidow_pointer_motion` 里和 overview 同一处拦下，
+        窗口都摆到预览位置上去了，命中坐标对不上，别转给客户端）。移动 = **点亮鼠标底下那一张**
+        （只改样式、**不改选中** —— 不然「按住 Alt 时指针恰好停在某一项上」会莫名其妙把键盘选中的
+        那个顶掉）；左键点一下 = **直接切过去**（不用等松修饰键），点空白什么都不做。点选那次的
+        按下被吃掉了，对应的松手也一起吃掉（`mru.swallow_release`，和 overview 同一套）。
+        悬停变化没有动画在推帧，得自己 `vidow_output_schedule_frame` 催一帧。
+      - 命中按**卡片**算（`slot->cx/cy/cw/ch`，比预览大一圈）：圆角外面那点内边距也算点得中，
+        和 portal 的卡片一个手感。IPC 的 `mru` 多输出 `hover`、每项多 `cx/cy/cw/ch`。
+      - 判据：`./test-mru.sh` 从 32 项加到 46 项 —— 新增「卡片 = 预览 + 内边距（每边 12）」「相邻
+        卡片不重叠」「选中那张的描边是强调色 61,174,233 / 没选中的是卡片描边色 59,64,69（都是量
+        像素）」「鼠标悬停点亮指针底下那张且选中项不动」「挪到空白处悬停清掉」「点哪张卡片就切到
+        哪个窗口 + 面板当场收起 + 松手被吃掉」。相关回归：`./test-defaultconfig.sh`、`./test-config.sh`
+        （`mru_highlight_padding` 删了、`mru_card_*` 五个新键、默认配置重新生成）。
 
 212. **列宽变化也走过渡动画**（用户：「列宽变化的时候也需要过渡动画」）
 

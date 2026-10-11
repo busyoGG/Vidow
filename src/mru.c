@@ -45,6 +45,9 @@
 #include <string.h>
 #include <time.h>
 
+#include <drm_fourcc.h>
+#include <wlr/interfaces/wlr_buffer.h>
+#include <wlr/types/wlr_buffer.h>
 #include <wlr/types/wlr_scene.h>
 #include <wlr/util/log.h>
 
@@ -259,6 +262,18 @@ static double mru_slot_zoom(const struct vidow_config *cfg, int base_w,
 	return zoom;
 }
 
+/* 把一张卡片摆在 (x, y)（卡片尺寸 cw×ch）：卡片记在 cx/cy/cw/ch（鼠标命中按它
+ * 算），预览缩进内边距摆在卡片里。 */
+static void mru_slot_place(struct vidow_mru_slot *slot, int x, int y, int cw,
+		int ch, int pad) {
+	slot->cx = x;
+	slot->cy = y;
+	slot->cw = cw;
+	slot->ch = ch;
+	slot->x = x + pad;
+	slot->y = y + pad;
+}
+
 /* 重算整条清单的排版。窗口列表、配置、工作区、选中项变了都要重算一次。 */
 static void mru_layout(struct vidow_server *server) {
 	struct vidow_mru *mru = &server->mru;
@@ -276,6 +291,10 @@ static void mru_layout(struct vidow_server *server) {
 	int gap = cfg->mru_gap < 0 ? 0 : cfg->mru_gap;
 	int row_gap = cfg->mru_row_gap < 0 ? 0 : cfg->mru_row_gap;
 	int per_row = cfg->mru_per_row < 1 ? 1 : cfg->mru_per_row;
+	/* 每一项背后那张卡片比预览大一圈（内边距 pad）。排版按**卡片**算：居中、
+	 * 「装不下就整体缩」、相邻之间隔多少，量的都是卡片的边；预览摆在卡片里缩进
+	 * pad。下面这一段里的 w / h 都是卡片尺寸。 */
+	int pad = cfg->mru_card_padding < 0 ? 0 : cfg->mru_card_padding;
 
 	/* 先把每个预览的尺寸算出来（先按最大缩放，grid 装不下时再统一缩）。 */
 	int n = mru->n;
@@ -301,8 +320,8 @@ static void mru_layout(struct vidow_server *server) {
 				if (zoom < cfg->mru_min_scale) {
 					zoom = cfg->mru_min_scale;
 				}
-				int w = (int)lround(bw * zoom);
-				int h = (int)lround(bh * zoom);
+				int w = (int)lround(bw * zoom) + pad * 2;
+				int h = (int)lround(bh * zoom) + pad * 2;
 				row_w += w + (row_n > 0 ? gap : 0);
 				row_n++;
 				if (h > row_h) {
@@ -369,15 +388,16 @@ static void mru_layout(struct vidow_server *server) {
 	}
 
 	if (cfg->mru_layout == VIDOW_MRU_GRID) {
-		/* 分行、算总高，然后把每行居中摆下去。 */
+		/* 分行、算总高，然后把每行居中摆下去（摆的都是卡片）。 */
 		int rows = (n_used + per_row - 1) / per_row;
 		int total_h = 0;
 		for (int r = 0; r < rows; r++) {
 			int row_h = 0;
 			for (int i = r * per_row; i < (r + 1) * per_row && i < n_used;
 					i++) {
-				if (mru->slot[i].h > row_h) {
-					row_h = mru->slot[i].h;
+				int ch = mru->slot[i].h + pad * 2;
+				if (ch > row_h) {
+					row_h = ch;
 				}
 			}
 			total_h += row_h + (r > 0 ? row_gap : 0);
@@ -389,19 +409,23 @@ static void mru_layout(struct vidow_server *server) {
 			int row_w = 0, row_h = 0, cnt = 0;
 			for (int i = r * per_row; i < (r + 1) * per_row && i < n_used;
 					i++) {
-				row_w += mru->slot[i].w + (cnt > 0 ? gap : 0);
-				if (mru->slot[i].h > row_h) {
-					row_h = mru->slot[i].h;
+				int cw = mru->slot[i].w + pad * 2;
+				int ch = mru->slot[i].h + pad * 2;
+				row_w += cw + (cnt > 0 ? gap : 0);
+				if (ch > row_h) {
+					row_h = ch;
 				}
 				cnt++;
 			}
 			int x = work.x + (work.width - row_w) / 2;
 			for (int i = r * per_row; i < (r + 1) * per_row && i < n_used;
 					i++) {
-				/* 行内竖向居中（矮的预览跟高的对齐中线）。 */
-				mru->slot[i].x = x;
-				mru->slot[i].y = y + (row_h - mru->slot[i].h) / 2;
-				x += mru->slot[i].w + gap;
+				int cw = mru->slot[i].w + pad * 2;
+				int ch = mru->slot[i].h + pad * 2;
+				/* 行内竖向居中（矮的那张跟高的对齐中线）。 */
+				mru_slot_place(&mru->slot[i], x, y + (row_h - ch) / 2, cw,
+					ch, pad);
+				x += cw + gap;
 			}
 			y += row_h + row_gap;
 		}
@@ -409,9 +433,11 @@ static void mru_layout(struct vidow_server *server) {
 	} else {
 		int total_w = 0, max_h = 0;
 		for (int i = 0; i < n_used; i++) {
-			total_w += mru->slot[i].w + (i > 0 ? gap : 0);
-			if (mru->slot[i].h > max_h) {
-				max_h = mru->slot[i].h;
+			int cw = mru->slot[i].w + pad * 2;
+			int ch = mru->slot[i].h + pad * 2;
+			total_w += cw + (i > 0 ? gap : 0);
+			if (ch > max_h) {
+				max_h = ch;
 			}
 		}
 		mru->total_w = total_w;
@@ -423,9 +449,11 @@ static void mru_layout(struct vidow_server *server) {
 		int y = work.y + (work.height - max_h) / 2;
 		int x = base_x;
 		for (int i = 0; i < n_used; i++) {
-			mru->slot[i].x = x;
-			mru->slot[i].y = y + (max_h - mru->slot[i].h) / 2;
-			x += mru->slot[i].w + gap;
+			int cw = mru->slot[i].w + pad * 2;
+			int ch = mru->slot[i].h + pad * 2;
+			mru_slot_place(&mru->slot[i], x, y + (max_h - ch) / 2, cw, ch,
+				pad);
+			x += cw + gap;
 		}
 		/* 滚到「选中的那个整个可见」为止（条子比工作区宽才有得滚）。 */
 		double max_scroll = total_w > work.width ?
@@ -445,8 +473,8 @@ static void mru_layout(struct vidow_server *server) {
 			}
 		}
 		if (sel != NULL && max_scroll > 0.0) {
-			double left = sel->x - base_x;
-			double right = left + sel->w;
+			double left = sel->cx - base_x;
+			double right = left + sel->cw;
 			if (left < scroll) {
 				scroll = left;
 			} else if (right > scroll + work.width) {
@@ -462,7 +490,9 @@ static void mru_layout(struct vidow_server *server) {
 		mru->scroll = scroll;
 		int dx = -(int)lround(scroll);
 		for (int i = 0; i < n_used; i++) {
-			mru->slot[i].x += dx;
+			mru_slot_place(&mru->slot[i], mru->slot[i].cx + dx,
+				mru->slot[i].cy, mru->slot[i].cw, mru->slot[i].ch,
+				pad);
 		}
 	}
 	mru->slot_n = n_used;
@@ -478,7 +508,467 @@ static void mru_layout(struct vidow_server *server) {
 	}
 }
 
-/* 选中项背后那块板 + 边框，还有压暗的背景。 */
+/* ------------------------------------------------- 卡片（超椭圆圆角底 + 描边）
+ *
+ * 每一项背后一张卡片，样子照 portal 的选择器（tools/vidowportal.c 的 card_draw）：
+ * 超椭圆（squircle）圆角、一层淡底、一圈细描边；鼠标底下那张描边换成强调色，
+ * 选中的那张描边加粗、底也染一点强调色 —— portal 的 checked 就是这个配方。
+ *
+ * 圆角只能自己画：wlr_scene_rect 是实心矩形，wlr_scene 没有圆角 API（wlroots
+ * 0.20 的 wlr_scene_buffer 也没有 corner_radius），所以四个角各挂一个小节点，里面
+ * 是**按覆盖率算出来的像素**（4x4 超采样抗锯齿），中间那几条直边用普通矩形铺 ——
+ * 九宫格那套：角不拉伸、边拉伸。四个角共用同一张图，靠 transform 翻过去用。
+ *
+ * 像素怎么进场景：场景节点只认 wlr_buffer，而 wlroots 没有「从 CPU 像素造
+ * wlr_buffer」的 API（wlr_texture_from_pixels 给的是纹理，喂不进节点），所以这里
+ * 自己实现一个最小 wlr_buffer（像素在堆上，begin_data_ptr_access 指过去）。GLES2
+ * 和 pixman 两条渲染器都是从这条路把像素上传成纹理的，和客户端递上来的 shm 缓冲
+ * 同一条 —— 不用 memfd、不用 GL 上下文、不碰渲染线程。 */
+
+/* 超椭圆的指数（portal 的 SQUIRCLE_N 同值）：n = 2 是普通圆角，4 = 「方中带圆」。 */
+#define MRU_SQUIRCLE_N 4.0
+/* 圆角覆盖率的超采样倍数：4x4 = 16 级灰阶，够圆角用了。 */
+#define MRU_SS 4
+
+struct vidow_mru_buf {
+	struct wlr_buffer base;
+	uint32_t *px;
+};
+
+struct vidow_mru_card {
+	struct wlr_scene_buffer *fill_c[4]; /* 四个圆角（底） */
+	struct wlr_scene_rect *fill_e[3];   /* 中 / 左 / 右三条直边 */
+	struct wlr_scene_buffer *ring_c[4]; /* 四个圆角（描边） */
+	struct wlr_scene_rect *ring_e[4];   /* 上下左右四条直边 */
+	struct wlr_buffer *fill_buf;        /* 圆角那张图（四个角共用） */
+	struct wlr_buffer *ring_buf;
+	int px;                             /* 上次画的圆角边长（设备像素） */
+	int bw;                             /* 上次画的描边宽（设备像素），0 = 没描边 */
+	uint32_t fill_rgba;                 /* 上次用的颜色（直通色） */
+	uint32_t ring_rgba;
+};
+
+static void mru_card_hide(struct vidow_mru_card *card, bool free_buf);
+
+static void mru_buf_destroy(struct wlr_buffer *buffer) {
+	struct vidow_mru_buf *b = wl_container_of(buffer, b, base);
+	free(b->px);
+	free(b);
+}
+
+static bool mru_buf_begin_access(struct wlr_buffer *buffer, uint32_t flags,
+		void **data, uint32_t *format, size_t *stride) {
+	(void)flags;
+	struct vidow_mru_buf *b = wl_container_of(buffer, b, base);
+	*data = b->px;
+	*format = DRM_FORMAT_ARGB8888;
+	*stride = (size_t)buffer->width * 4;
+	return true;
+}
+
+static void mru_buf_end_access(struct wlr_buffer *buffer) {
+	(void)buffer;
+}
+
+static const struct wlr_buffer_impl mru_buf_impl = {
+	.destroy = mru_buf_destroy,
+	.begin_data_ptr_access = mru_buf_begin_access,
+	.end_data_ptr_access = mru_buf_end_access,
+};
+
+/* 造一张 w×h 的 CPU 像素缓冲（全透明，预乘 alpha）。用完 wlr_buffer_drop() 收。 */
+static struct wlr_buffer *mru_buf_create(int w, int h) {
+	if (w < 1 || h < 1) {
+		return NULL;
+	}
+	struct vidow_mru_buf *b = calloc(1, sizeof(*b));
+	if (b == NULL) {
+		return NULL;
+	}
+	b->px = calloc((size_t)w * (size_t)h, sizeof(b->px[0]));
+	if (b->px == NULL) {
+		free(b);
+		return NULL;
+	}
+	wlr_buffer_init(&b->base, &mru_buf_impl, w, h);
+	return &b->base;
+}
+
+static double mru_clamp01(double v) {
+	return v < 0.0 ? 0.0 : (v > 1.0 ? 1.0 : v);
+}
+
+/* 直通色 → 0xAARRGGBB（预乘在算像素的时候做）。 */
+static uint32_t mru_rgba(const float c[4]) {
+	uint32_t a = (uint32_t)lround(mru_clamp01(c[3]) * 255.0);
+	uint32_t r = (uint32_t)lround(mru_clamp01(c[0]) * 255.0);
+	uint32_t g = (uint32_t)lround(mru_clamp01(c[1]) * 255.0);
+	uint32_t b = (uint32_t)lround(mru_clamp01(c[2]) * 255.0);
+	return (a << 24) | (r << 16) | (g << 8) | b;
+}
+
+/* 预乘 alpha 的 over：先铺 base（覆盖率 cov_base），再把 top（覆盖率 cov_top）
+ * 压上去。两个颜色都是直通值。 */
+static uint32_t mru_px_over(const float base[4], double cov_base,
+		const float top[4], double cov_top) {
+	double ta = (double)top[3] * cov_top;
+	double ba = (double)base[3] * cov_base;
+	double k = 1.0 - ta;
+	double a = ta + ba * k;
+	double r = (double)top[0] * ta + (double)base[0] * ba * k;
+	double g = (double)top[1] * ta + (double)base[1] * ba * k;
+	double b = (double)top[2] * ta + (double)base[2] * ba * k;
+	return ((uint32_t)lround(mru_clamp01(a) * 255.0) << 24) |
+		((uint32_t)lround(mru_clamp01(r) * 255.0) << 16) |
+		((uint32_t)lround(mru_clamp01(g) * 255.0) << 8) |
+		(uint32_t)lround(mru_clamp01(b) * 255.0);
+}
+
+/* 超椭圆的内部判定：|dx/r|^n + |dy/r|^n <= 1（dx / dy 是离弧心的距离）。 */
+static bool mru_squircle_in(double dx, double dy, double r) {
+	double a = dx / r, b = dy / r;
+	double a2 = a * a, b2 = b * b;
+	return a2 * a2 + b2 * b2 <= 1.0;   /* n = MRU_SQUIRCLE_N = 4 */
+}
+
+/* 圆角那张图：n×n 设备像素（弧心在 (n, n)），只画**左上**那个角，别的角靠
+ * transform 翻过去。bw = 描边宽（设备像素，0 = 只画底）。底色在里、描边压在上面。 */
+static void mru_corner_pixels(uint32_t *out, int n, int bw, const float fill[4],
+		const float ring[4]) {
+	double r = (double)n;
+	double ri = (double)(n - bw);
+	for (int j = 0; j < n; j++) {
+		for (int i = 0; i < n; i++) {
+			int n_fill = 0, n_ring = 0;
+			for (int sy = 0; sy < MRU_SS; sy++) {
+				for (int sx = 0; sx < MRU_SS; sx++) {
+					double x = (double)i +
+						((double)sx + 0.5) / MRU_SS;
+					double y = (double)j +
+						((double)sy + 0.5) / MRU_SS;
+					double dx = r - x, dy = r - y;
+					if (!mru_squircle_in(dx, dy, r)) {
+						continue;
+					}
+					n_fill++;
+					if (bw > 0 && ri > 0.0 &&
+							mru_squircle_in(dx, dy, ri)) {
+						continue;
+					}
+					n_ring++;
+				}
+			}
+			if (n_fill == 0) {
+				continue;   /* 圆角外：透明（calloc 出来的就是 0） */
+			}
+			double cov = (double)n_fill / (MRU_SS * MRU_SS);
+			double cov_ring = (double)n_ring / (MRU_SS * MRU_SS);
+			out[j * n + i] = mru_px_over(fill, cov, ring, cov_ring);
+		}
+	}
+}
+
+/* 重画一张卡片的圆角图（尺寸或样式变了才调）。四个角共用同一张图：右上 = 水平
+ * 翻、左下 = 垂直翻、右下 = 转 180°。 */
+static void mru_card_rebuild(struct vidow_server *server,
+		struct vidow_mru_card *card, int px, int bw, const float fill[4],
+		const float ring[4]) {
+	static const enum wl_output_transform tr[4] = {
+		WL_OUTPUT_TRANSFORM_NORMAL,      /* 左上 */
+		WL_OUTPUT_TRANSFORM_FLIPPED,     /* 右上：水平翻 */
+		WL_OUTPUT_TRANSFORM_FLIPPED_180, /* 左下：垂直翻 */
+		WL_OUTPUT_TRANSFORM_180,         /* 右下：转 180° */
+	};
+	(void)server;
+	struct wlr_buffer *fb = mru_buf_create(px, px);
+	if (fb != NULL) {
+		struct vidow_mru_buf *b = wl_container_of(fb, b, base);
+		mru_corner_pixels(b->px, px, 0, fill, fill);
+	}
+	struct wlr_buffer *rb = bw > 0 ? mru_buf_create(px, px) : NULL;
+	if (rb != NULL) {
+		struct vidow_mru_buf *b = wl_container_of(rb, b, base);
+		mru_corner_pixels(b->px, px, bw, fill, ring);
+	}
+	for (int k = 0; k < 4; k++) {
+		wlr_scene_buffer_set_buffer(card->fill_c[k], fb);
+		wlr_scene_buffer_set_transform(card->fill_c[k], tr[k]);
+		wlr_scene_buffer_set_buffer(card->ring_c[k], rb);
+		wlr_scene_buffer_set_transform(card->ring_c[k], tr[k]);
+	}
+	if (card->fill_buf != NULL) {
+		wlr_buffer_drop(card->fill_buf);
+	}
+	if (card->ring_buf != NULL) {
+		wlr_buffer_drop(card->ring_buf);
+	}
+	card->fill_buf = fb;
+	card->ring_buf = rb;
+	card->px = px;
+	card->bw = bw;
+	card->fill_rgba = mru_rgba(fill);
+	card->ring_rgba = mru_rgba(ring);
+}
+
+/* 第 i 张卡片（按需建，建了留着复用）。节点顺序 = 画图顺序：先底、再描边。 */
+static struct vidow_mru_card *mru_card_get(struct vidow_server *server, int i) {
+	struct vidow_mru *mru = &server->mru;
+	if (i < 0 || i >= MRU_MAX) {
+		return NULL;
+	}
+	if (mru->card == NULL) {
+		mru->card = calloc(MRU_MAX, sizeof(mru->card[0]));
+		if (mru->card == NULL) {
+			return NULL;
+		}
+	}
+	if (mru->card[i] != NULL) {
+		return mru->card[i];
+	}
+	struct vidow_mru_card *card = calloc(1, sizeof(*card));
+	if (card == NULL) {
+		return NULL;
+	}
+	card->bw = -1;
+	bool ok = true;
+	for (int k = 0; k < 4; k++) {
+		card->fill_c[k] = wlr_scene_buffer_create(
+			server->layer_overview_dim, NULL);
+		ok = ok && card->fill_c[k] != NULL;
+	}
+	for (int k = 0; k < 3; k++) {
+		card->fill_e[k] = wlr_scene_rect_create(server->layer_overview_dim,
+			1, 1, (float[4]){ 0.0f, 0.0f, 0.0f, 0.0f });
+		ok = ok && card->fill_e[k] != NULL;
+	}
+	for (int k = 0; k < 4; k++) {
+		card->ring_c[k] = wlr_scene_buffer_create(
+			server->layer_overview_dim, NULL);
+		ok = ok && card->ring_c[k] != NULL;
+	}
+	for (int k = 0; k < 4; k++) {
+		card->ring_e[k] = wlr_scene_rect_create(server->layer_overview_dim,
+			1, 1, (float[4]){ 0.0f, 0.0f, 0.0f, 0.0f });
+		ok = ok && card->ring_e[k] != NULL;
+	}
+	if (!ok) {
+		return NULL;
+	}
+	mru_card_hide(card, false);
+	mru->card[i] = card;
+	if (i + 1 > mru->card_n) {
+		mru->card_n = i + 1;
+	}
+	return card;
+}
+
+/* 摆一条矩形（尺寸非正 = 这一条不画）。 */
+static void mru_rect_put(struct wlr_scene_rect *rc, int x, int y, int w, int h) {
+	if (rc == NULL) {
+		return;
+	}
+	if (w <= 0 || h <= 0) {
+		wlr_scene_node_set_enabled(&rc->node, false);
+		return;
+	}
+	wlr_scene_rect_set_size(rc, w, h);
+	wlr_scene_node_set_position(&rc->node, x, y);
+	wlr_scene_node_set_enabled(&rc->node, true);
+}
+
+/* 摆一个圆角节点（没图或尺寸非正 = 不画）。 */
+static void mru_buf_put(struct wlr_scene_buffer *node, int x, int y, int w,
+		int h) {
+	if (node == NULL) {
+		return;
+	}
+	if (w <= 0 || h <= 0 || node->buffer == NULL) {
+		wlr_scene_node_set_enabled(&node->node, false);
+		return;
+	}
+	wlr_scene_buffer_set_dest_size(node, w, h);
+	wlr_scene_node_set_position(&node->node, x, y);
+	wlr_scene_node_set_enabled(&node->node, true);
+}
+
+/* 把一张卡片摆到 box 上（逻辑像素）。 */
+static void mru_card_place(struct vidow_server *server,
+		struct vidow_mru_card *card, const struct wlr_box *box,
+		const float fill[4], const float ring[4], int bw) {
+	struct vidow_config *cfg = &server->config;
+	struct vidow_mru *mru = &server->mru;
+	double scale = 1.0;
+	if (mru->output != NULL && mru->output->scale > 0.0) {
+		scale = mru->output->scale;
+	}
+	int r = cfg->mru_card_radius;
+	if (r < 0) {
+		r = 0;
+	}
+	if (r > box->width / 2) {
+		r = box->width / 2;
+	}
+	if (r > box->height / 2) {
+		r = box->height / 2;
+	}
+	if (bw < 0) {
+		bw = 0;
+	}
+	if (bw > r) {
+		bw = r;
+	}
+	int x = box->x, y = box->y, w = box->width, h = box->height;
+	int px = (int)lround((double)r * scale);
+	int bwp = (int)lround((double)bw * scale);
+	bool round = px >= 2 && w > 0 && h > 0;
+	if (round && (card->px != px || card->bw != bwp ||
+			card->fill_rgba != mru_rgba(fill) ||
+			card->ring_rgba != mru_rgba(ring))) {
+		mru_card_rebuild(server, card, px, bwp, fill, ring);
+	}
+	/* 底：圆角那四块由角节点补，中间三条直边铺满剩下的地方。场景的矩形颜色是
+	 * 预乘 alpha 的（wlr_render_color 的约定），自己乘一遍。 */
+	float fill_pm[4] = { fill[0] * fill[3], fill[1] * fill[3],
+		fill[2] * fill[3], fill[3] };
+	if (round) {
+		mru_rect_put(card->fill_e[0], x + r, y, w - 2 * r, h);
+		mru_rect_put(card->fill_e[1], x, y + r, r, h - 2 * r);
+		mru_rect_put(card->fill_e[2], x + w - r, y + r, r, h - 2 * r);
+	} else {
+		mru_rect_put(card->fill_e[0], x, y, w, h);
+		mru_rect_put(card->fill_e[1], 0, 0, 0, 0);
+		mru_rect_put(card->fill_e[2], 0, 0, 0, 0);
+	}
+	for (int k = 0; k < 3; k++) {
+		if (card->fill_e[k] != NULL) {
+			wlr_scene_rect_set_color(card->fill_e[k], fill_pm);
+		}
+	}
+	int cxs[4] = { x, x + w - r, x, x + w - r };
+	int cys[4] = { y, y, y + h - r, y + h - r };
+	for (int k = 0; k < 4; k++) {
+		mru_buf_put(card->fill_c[k], cxs[k], cys[k], round ? r : 0,
+			round ? r : 0);
+		mru_buf_put(card->ring_c[k], cxs[k], cys[k],
+			round && bwp > 0 ? r : 0, round && bwp > 0 ? r : 0);
+	}
+	/* 描边：直边四条（圆角那四段由角节点补）。 */
+	float ring_pm[4] = { ring[0] * ring[3], ring[1] * ring[3],
+		ring[2] * ring[3], ring[3] };
+	for (int k = 0; k < 4; k++) {
+		if (card->ring_e[k] != NULL) {
+			wlr_scene_rect_set_color(card->ring_e[k], ring_pm);
+		}
+	}
+	if (bwp > 0) {
+		if (round) {
+			mru_rect_put(card->ring_e[0], x + r, y, w - 2 * r, bw);
+			mru_rect_put(card->ring_e[1], x + r, y + h - bw, w - 2 * r,
+				bw);
+			mru_rect_put(card->ring_e[2], x, y + r, bw, h - 2 * r);
+			mru_rect_put(card->ring_e[3], x + w - bw, y + r, bw,
+				h - 2 * r);
+		} else {
+			/* 没圆角（半径 0）：四条边围一圈，四角别重叠（重叠会叠两次色）。 */
+			mru_rect_put(card->ring_e[0], x, y, w, bw);
+			mru_rect_put(card->ring_e[1], x, y + h - bw, w, bw);
+			mru_rect_put(card->ring_e[2], x, y + bw, bw, h - 2 * bw);
+			mru_rect_put(card->ring_e[3], x + w - bw, y + bw, bw,
+				h - 2 * bw);
+		}
+	} else {
+		for (int k = 0; k < 4; k++) {
+			mru_rect_put(card->ring_e[k], 0, 0, 0, 0);
+		}
+	}
+}
+
+/* 收起一张卡片。free_buf = true 连圆角那张图一起放掉（面板关了就别占着内存，
+ * 下次显形重画 —— 一次重画就是几张小图，量可以忽略）。 */
+static void mru_card_hide(struct vidow_mru_card *card, bool free_buf) {
+	if (card == NULL) {
+		return;
+	}
+	for (int k = 0; k < 4; k++) {
+		if (card->fill_c[k] != NULL) {
+			wlr_scene_node_set_enabled(&card->fill_c[k]->node, false);
+		}
+		if (card->ring_c[k] != NULL) {
+			wlr_scene_node_set_enabled(&card->ring_c[k]->node, false);
+		}
+	}
+	for (int k = 0; k < 3; k++) {
+		if (card->fill_e[k] != NULL) {
+			wlr_scene_node_set_enabled(&card->fill_e[k]->node, false);
+		}
+	}
+	for (int k = 0; k < 4; k++) {
+		if (card->ring_e[k] != NULL) {
+			wlr_scene_node_set_enabled(&card->ring_e[k]->node, false);
+		}
+	}
+	if (!free_buf) {
+		return;
+	}
+	for (int k = 0; k < 4; k++) {
+		if (card->fill_c[k] != NULL) {
+			wlr_scene_buffer_set_buffer(card->fill_c[k], NULL);
+		}
+		if (card->ring_c[k] != NULL) {
+			wlr_scene_buffer_set_buffer(card->ring_c[k], NULL);
+		}
+	}
+	if (card->fill_buf != NULL) {
+		wlr_buffer_drop(card->fill_buf);
+		card->fill_buf = NULL;
+	}
+	if (card->ring_buf != NULL) {
+		wlr_buffer_drop(card->ring_buf);
+		card->ring_buf = NULL;
+	}
+	card->px = 0;
+	card->bw = -1;
+}
+
+/* 全部收起（面板关了）。 */
+static void mru_cards_hide(struct vidow_server *server, bool free_buf) {
+	struct vidow_mru *mru = &server->mru;
+	if (mru->card == NULL) {
+		return;
+	}
+	for (int i = 0; i < mru->card_n; i++) {
+		mru_card_hide(mru->card[i], free_buf);
+	}
+}
+
+/* 这一项现在该长什么样：底色 / 描边色 / 描边宽（逻辑像素）。
+ *   选中 —— 底 = 卡片底混一点强调色（portal 的 accent_soft 同配方），描边 = 强调色
+ *           且加粗；
+ *   悬停 —— 描边 = 强调色半透明（portal 的 hover 同此），底不动；
+ *   其余 —— 卡片底 + 卡片描边色。 */
+static void mru_card_style(const struct vidow_server *server,
+		const struct vidow_view *view, float fill[4], float ring[4],
+		int *bw) {
+	const struct vidow_config *cfg = &server->config;
+	const struct vidow_mru *mru = &server->mru;
+	const float *hl = cfg->mru_highlight_color;
+	memcpy(fill, cfg->mru_card_color, sizeof(float) * 4);
+	memcpy(ring, hl, sizeof(float) * 4);
+	if (view == mru->selected) {
+		for (int i = 0; i < 3; i++) {
+			fill[i] = cfg->mru_card_color[i] * 0.88f + hl[i] * 0.12f;
+		}
+		*bw = cfg->mru_highlight_border;
+	} else if (view == mru->hover) {
+		ring[3] *= 0.5f;
+		*bw = cfg->mru_card_border;
+	} else {
+		memcpy(ring, cfg->mru_card_border_color, sizeof(float) * 4);
+		*bw = cfg->mru_card_border;
+	}
+}
+
+/* 每项背后那张卡片 + 压暗的背景。 */
 static void mru_scene_apply(struct vidow_server *server) {
 	struct vidow_mru *mru = &server->mru;
 	struct vidow_config *cfg = &server->config;
@@ -488,14 +978,7 @@ static void mru_scene_apply(struct vidow_server *server) {
 	bool on = mru_showing(server) && mru->output != NULL;
 	if (!on) {
 		wlr_scene_node_set_enabled(&mru->backdrop->node, false);
-		if (mru->plate != NULL) {
-			wlr_scene_node_set_enabled(&mru->plate->node, false);
-		}
-		for (int i = 0; i < 4; i++) {
-			if (mru->border[i] != NULL) {
-				wlr_scene_node_set_enabled(&mru->border[i]->node, false);
-			}
-		}
+		mru_cards_hide(server, true);
 		return;
 	}
 	struct wlr_box box = {0};
@@ -512,57 +995,37 @@ static void mru_scene_apply(struct vidow_server *server) {
 		alpha = 1.0f;
 	}
 	wlr_scene_rect_set_color(mru->backdrop,
-		(float[4]){ 0.02f, 0.02f, 0.03f, alpha });
+		(float[4]){ 0.02f * alpha, 0.02f * alpha, 0.03f * alpha, alpha });
 	wlr_scene_rect_set_size(mru->backdrop, box.width, box.height);
 	wlr_scene_node_set_position(&mru->backdrop->node, box.x, box.y);
 	wlr_scene_node_set_enabled(&mru->backdrop->node, true);
 
-	struct vidow_mru_slot *sel = NULL;
+	/* 每一项背后一张卡片（滚出去 / 挤出去的那些不画）。 */
 	for (int i = 0; i < mru->slot_n; i++) {
-		if (mru->slot[i].view == mru->selected) {
-			sel = &mru->slot[i];
-			break;
-		}
-	}
-	if (sel == NULL || mru->plate == NULL) {
-		if (mru->plate != NULL) {
-			wlr_scene_node_set_enabled(&mru->plate->node, false);
-		}
-		for (int i = 0; i < 4; i++) {
-			if (mru->border[i] != NULL) {
-				wlr_scene_node_set_enabled(&mru->border[i]->node, false);
+		const struct vidow_mru_slot *slot = &mru->slot[i];
+		struct vidow_mru_card *card;
+		if (slot->view == NULL) {
+			/* 这一项滚出去了：它那张卡片收起来（图还留着，滚回来就不用重画）。 */
+			if (mru->card != NULL && mru->card[i] != NULL) {
+				mru_card_hide(mru->card[i], false);
 			}
-		}
-		return;
-	}
-	int pad = cfg->mru_highlight_padding < 0 ? 0 : cfg->mru_highlight_padding;
-	int bw = cfg->mru_highlight_border < 0 ? 0 : cfg->mru_highlight_border;
-	const float *color = cfg->mru_highlight_color;
-	wlr_scene_rect_set_color(mru->plate,
-		(float[4]){ color[0], color[1], color[2], color[3] * 0.35f });
-	wlr_scene_rect_set_size(mru->plate, sel->w + pad * 2, sel->h + pad * 2);
-	wlr_scene_node_set_position(&mru->plate->node, sel->x - pad, sel->y - pad);
-	wlr_scene_node_set_enabled(&mru->plate->node, true);
-	/* 边框：四条细矩形（wlr_scene_rect 是实心的，画不出描边）。 */
-	int bx = sel->x - pad, by = sel->y - pad;
-	int bwi = sel->w + pad * 2, bhi = sel->h + pad * 2;
-	struct { int x, y, w, h; } bars[4] = {
-		{ bx, by, bwi, bw },                    /* 上 */
-		{ bx, by + bhi - bw, bwi, bw },         /* 下 */
-		{ bx, by, bw, bhi },                    /* 左 */
-		{ bx + bwi - bw, by, bw, bhi },         /* 右 */
-	};
-	for (int i = 0; i < 4; i++) {
-		if (mru->border[i] == NULL) {
 			continue;
 		}
-		wlr_scene_rect_set_color(mru->border[i],
-			(float[4]){ color[0], color[1], color[2], color[3] });
-		wlr_scene_rect_set_size(mru->border[i], bars[i].w > 0 ? bars[i].w : 1,
-			bars[i].h > 0 ? bars[i].h : 1);
-		wlr_scene_node_set_position(&mru->border[i]->node, bars[i].x,
-			bars[i].y);
-		wlr_scene_node_set_enabled(&mru->border[i]->node, bw > 0);
+		card = mru_card_get(server, i);
+		if (card == NULL) {
+			continue;
+		}
+		float fill[4], ring[4];
+		int bw = 0;
+		mru_card_style(server, slot->view, fill, ring, &bw);
+		struct wlr_box at = { slot->cx, slot->cy, slot->cw, slot->ch };
+		mru_card_place(server, card, &at, fill, ring, bw);
+	}
+	/* 上一轮排了、这一轮没排到的（窗口少了 / 清单短了）也收起来。 */
+	for (int i = mru->slot_n; i < mru->card_n; i++) {
+		if (mru->card != NULL && mru->card[i] != NULL) {
+			mru_card_hide(mru->card[i], false);
+		}
 	}
 }
 
@@ -742,6 +1205,7 @@ static void mru_close(struct vidow_server *server, bool commit) {
 	mru->n = 0;
 	mru->scroll = 0.0;
 	mru->selected = NULL;
+	mru->hover = NULL;
 	mru->output = NULL;
 	if (mru->open_timer != NULL) {
 		wl_event_source_timer_update(mru->open_timer, 0);
@@ -770,6 +1234,67 @@ void vidow_mru_commit(struct vidow_server *server) {
 
 void vidow_mru_cancel(struct vidow_server *server) {
 	mru_close(server, false);
+}
+
+/* --------------------------------------------------------------- 鼠标
+ *
+ * 切换器开着的时候指针归它管（见 input.c）：移动 = 点亮鼠标底下那一项，左键点
+ * 一下 = 直接切过去（不必等松修饰键）。命中按**卡片**算 —— 卡片比预览大一圈，
+ * 圆角外面那点边距也算点得中，跟 portal 的卡片一个手感。
+ *
+ * 悬停只改样式、不改选中：选中的那个还是键盘（Alt+Tab）在走，鼠标扫过去不该
+ * 把它顶掉 —— 不然「按住 Alt 时指针恰好停在某一项上」会莫名其妙改选中项。 */
+
+/* 鼠标底下那一项（没有 = NULL）。 */
+static struct vidow_view *mru_slot_at(const struct vidow_server *server,
+		double sx, double sy) {
+	const struct vidow_mru *mru = &server->mru;
+	for (int i = 0; i < mru->slot_n; i++) {
+		const struct vidow_mru_slot *slot = &mru->slot[i];
+		if (slot->view == NULL) {
+			continue;
+		}
+		if (sx >= slot->cx && sx < slot->cx + slot->cw &&
+				sy >= slot->cy && sy < slot->cy + slot->ch) {
+			return slot->view;
+		}
+	}
+	return NULL;
+}
+
+bool vidow_mru_hover(struct vidow_server *server, double sx, double sy) {
+	struct vidow_mru *mru = &server->mru;
+	if (!mru_showing(server)) {
+		return false;
+	}
+	struct vidow_view *view = mru_slot_at(server, sx, sy);
+	if (view == mru->hover) {
+		return false;
+	}
+	mru->hover = view;
+	mru_scene_apply(server);
+	/* 这一下没有动画在跑，帧得自己催（场景损伤只记损伤，不排帧）。 */
+	vidow_output_schedule_frame(server, mru->output, "切换器悬停");
+	return true;
+}
+
+bool vidow_mru_click(struct vidow_server *server, double sx, double sy) {
+	struct vidow_mru *mru = &server->mru;
+	if (!mru_showing(server)) {
+		return false;
+	}
+	/* 这次按下被切换器吃了，对应的松手也得吃掉：客户端收到一个没有按下配对的
+	 * 松手会懵（和 overview 的 swallow_release 同一回事）。 */
+	mru->swallow_release = true;
+	struct vidow_view *view = mru_slot_at(server, sx, sy);
+	if (view == NULL) {
+		wlr_log(WLR_INFO, "mru: 点在空白处（窗口不动）");
+		return true;
+	}
+	mru->selected = view;
+	wlr_log(WLR_INFO, "mru: 点选 %s", mru_name(view));
+	vidow_mru_commit(server);
+	return true;
 }
 
 /* --------------------------------------------------------- 给渲染用 */
@@ -816,6 +1341,10 @@ bool vidow_mru_init(struct vidow_server *server) {
 	mru->selected = NULL;
 	mru->original = NULL;
 	mru->output = NULL;
+	mru->hover = NULL;
+	mru->swallow_release = false;
+	mru->card = NULL;
+	mru->card_n = 0;
 	mru->order = calloc(MRU_MAX, sizeof(mru->order[0]));
 	mru->slot = calloc(MRU_MAX, sizeof(mru->slot[0]));
 	if (mru->order == NULL || mru->slot == NULL) {
@@ -827,24 +1356,14 @@ bool vidow_mru_init(struct vidow_server *server) {
 	if (mru->timer == NULL || mru->open_timer == NULL) {
 		return false;
 	}
-	/* 面板的东西跟 overview 的遮罩挤同一层（壁纸之上、窗口之下）：压暗背景
-	 * 和选中项背后那块板都得在窗口**下面**才看得见。 */
+	/* 面板的东西跟 overview 的遮罩挤同一层（壁纸之上、窗口之下）：压暗背景和每项
+	 * 背后那张卡片都得在窗口**下面**才看得见（窗口压在卡片上，卡片只露出四周那
+	 * 圈内边距）。 */
 	mru->backdrop = wlr_scene_rect_create(server->layer_overview_dim, 1, 1,
 		(float[4]){ 0.0f, 0.0f, 0.0f, 0.0f });
-	mru->plate = wlr_scene_rect_create(server->layer_overview_dim, 1, 1,
-		(float[4]){ 0.0f, 0.0f, 0.0f, 0.0f });
-	if (mru->backdrop == NULL || mru->plate == NULL) {
+	if (mru->backdrop == NULL) {
 		return false;
 	}
-	for (int i = 0; i < 4; i++) {
-		mru->border[i] = wlr_scene_rect_create(server->layer_overview_dim, 1, 1,
-			(float[4]){ 0.0f, 0.0f, 0.0f, 0.0f });
-		if (mru->border[i] == NULL) {
-			return false;
-		}
-		wlr_scene_node_set_enabled(&mru->border[i]->node, false);
-	}
 	wlr_scene_node_set_enabled(&mru->backdrop->node, false);
-	wlr_scene_node_set_enabled(&mru->plate->node, false);
 	return true;
 }

@@ -12,6 +12,11 @@
 #   7) strip 一行：所有预览同一个 y；装不下时横向滚，选中的那个完整可见
 #   8) grid：按 per_row 换行、不滚动、全在屏内；装不下时预览整体变小
 #   9) 像素：面板显形后壁纸被压暗，预览那块还是亮的（能看到窗口的颜色）
+#  10) 卡片（样式照 portal 的 item）：每项背后一张超椭圆圆角卡片，比预览大一圈
+#      （内边距）；相邻不重叠；选中的那张描边是强调色，别的是卡片描边色
+#  11) 鼠标悬停：点亮指针底下那一张，**选中项不动**；挪到空白处悬停清掉
+#  12) 鼠标点击：点哪张卡片就切到哪个窗口（不用等松修饰键），面板当场收起，
+#      松手被吃掉（没漏给客户端）
 set -u
 cd "$(dirname "$0")"
 
@@ -64,7 +69,7 @@ xwayland = false
 window_open_ms = 120
 window_close_ms = 120
 window_move_ms = 120
-mru = { open_delay_ms = 0, debounce_ms = 0, highlight_padding = 30 }
+mru = { open_delay_ms = 0, debounce_ms = 0, card_padding = 12 }
 vidow.bind("Alt+Tab", "next-window")
 vidow.bind("Alt+Shift+Tab", "previous-window")
 EOF
@@ -92,6 +97,8 @@ export WAYLAND_DISPLAY=$(grep -ao "WAYLAND_DISPLAY=[a-z0-9-]*" "$LOG" | tail -1 
 mru_json() { ./build/vidowmsg --raw mru 2>/dev/null |
 	python3 -c "import json,sys; print(json.dumps(json.load(sys.stdin)['result']))" 2>/dev/null; }
 mq() { mru_json | python3 -c "import json,sys; d=json.load(sys.stdin); print($1)" 2>/dev/null; }
+# 同上，但把一串值（tuple / list）空格分开打出来，好喂给 read。
+mj() { mru_json | python3 -c "import json,sys; d=json.load(sys.stdin); print(*($1))" 2>/dev/null; }
 focused_title() { ./build/vidowmsg --raw focused 2>/dev/null |
 	python3 -c "import json,sys; d=json.load(sys.stdin)['result']; w=d.get('window') or {}; print(w.get('title') or '(无)')" 2>/dev/null; }
 # 工作区矩形（逻辑坐标）
@@ -101,6 +108,28 @@ d=json.load(sys.stdin)['result']
 b=d[0]['layout']
 print(b['x'], b['y'], b['width'], b['height'])
 " 2>/dev/null; }
+
+# IPC 注入（鼠标那条路和真设备同一条：move-cursor / pointer-button）
+msg() { ./build/vidowmsg --raw "$@" >/dev/null 2>&1; }
+# 截图里 (x, y) 那一点的颜色，打 "R G B"
+pix() { # pix <png> <x> <y>
+	python3 - "$1" "$2" "$3" <<'PY'
+import sys
+from PIL import Image
+im = Image.open(sys.argv[1]).convert("RGB")
+print(*im.getpixel((int(sys.argv[2]), int(sys.argv[3]))))
+PY
+}
+# 颜色像不像（每个通道容差 tol）
+color_like() { # color_like "<R G B>" "<R G B>" <tol>
+	python3 -c "
+import sys
+a = [int(v) for v in sys.argv[1].split()]
+b = [int(v) for v in sys.argv[2].split()]
+sys.exit(0 if len(a) == 3 and len(b) == 3 and
+         all(abs(x - y) <= int(sys.argv[3]) for x, y in zip(a, b)) else 1)
+" "$1" "$2" "$3"
+}
 
 # 按住 Alt + N 次 Tab，停住 hold_ms 让我检查，然后松开 Alt（后台跑）
 hold_tabs() { # hold_tabs <tab 次数> <按住多久再松手 ms>
@@ -185,6 +214,26 @@ else
 	fail "像素比较没跑起来"
 fi
 
+# 卡片：每项背后一张（超椭圆圆角的底 + 描边），比预览大一圈；相邻两张不重叠。
+card_geo=$(mq "all(e['cw'] == e['w'] + 24 and e['ch'] == e['h'] + 24 and e['cx'] == e['x'] - 12 and e['cy'] == e['y'] - 12 for e in d['entries'])")
+[ "$card_geo" = "True" ] && pass "卡片 = 预览 + 内边距（每边 12）" \
+	|| fail "卡片几何不对：$(mq "[(e['title'], e['x'], e['y'], e['w'], e['h'], e['cx'], e['cy'], e['cw'], e['ch']) for e in d['entries']]")"
+no_overlap=$(mq "all(a['cx'] + a['cw'] <= b['cx'] or b['cx'] + b['cw'] <= a['cx'] or a['cy'] + a['ch'] <= b['cy'] or b['cy'] + b['ch'] <= a['cy'] for i, a in enumerate(d['entries']) for b in d['entries'][i + 1:])")
+[ "$no_overlap" = "True" ] && pass "相邻卡片不重叠" \
+	|| fail "有卡片叠在一起了"
+read -r sel_cx sel_cy sel_cw <<<"$(mj "next((e['cx'], e['cy'], e['cw']) for e in d['entries'] if e['selected'])")"
+read -r uns_cx uns_cy uns_cw <<<"$(mj "next((e['cx'], e['cy'], e['cw']) for e in d['entries'] if not e['selected'])")"
+# 卡片那条上边框：选中的那张 = 强调色（默认 #3daee9，描边 2px），别的那张 = 卡片
+# 描边色（#3b4045，描边 1px —— 所以只取第一行，第二行已经是底了）。
+sel_edge=$(pix "$RUNDIR/during.png" $((sel_cx + sel_cw / 2)) $((sel_cy + 1)))
+uns_edge=$(pix "$RUNDIR/during.png" $((uns_cx + uns_cw / 2)) $((uns_cy)))
+color_like "$sel_edge" "61 174 233" 14 \
+	&& pass "选中的那张卡片描边是强调色（$sel_edge）" \
+	|| fail "选中卡片描边颜色不对（$sel_edge，期望 61 174 233）"
+color_like "$uns_edge" "59 64 69" 14 \
+	&& pass "没选中的那张描边是卡片描边色（$uns_edge）" \
+	|| fail "没选中卡片描边颜色不对（$uns_edge，期望 59 64 69）"
+
 # ---------------------------------------------------------------- 松开提交
 
 mark "3) 松开 Alt：提交 + 焦点移动"
@@ -249,7 +298,55 @@ vis=$(mq "all(e['x'] >= $wx and e['x'] + e['w'] <= $wx + $ww for e in d['entries
 wait $WTYPE_PID 2>/dev/null
 sleep 0.8
 
-mark "8) grid：换行铺在屏幕里，装不下就整体缩小"
+mark "8) 鼠标悬停：点亮底下那一张，选中项不动"
+# 收小一点，让条子上下留出空白（好试「挪到空白处」）
+./build/vidowmsg set-config mru_max_scale 0.5 >/dev/null 2>&1
+./build/vidowmsg set-config mru_max_height 300 >/dev/null 2>&1
+hold_tabs 1 3000
+sleep 0.7
+sel_before=$(mq 'd["selected"]')
+read -r hv_x hv_y hv_id <<<"$(mj "next((e['cx'] + e['cw'] // 2, e['cy'] + e['ch'] // 2, e['id']) for e in d['entries'] if not e['selected'])")"
+msg move-cursor "$hv_x" "$hv_y"
+sleep 0.4
+[ "$(mq 'd["hover"]')" = "$hv_id" ] && pass "悬停点亮指针底下那张（#$hv_id）" \
+	|| fail "悬停 = $(mq 'd["hover"]')，期望 #$hv_id"
+[ "$(mq 'd["selected"]')" = "$sel_before" ] && pass "选中项没被鼠标顶掉（还是 #$sel_before）" \
+	|| fail "选中项被鼠标改成 $(mq 'd["selected"]') 了"
+[ "$(mq "next((e['title'] for e in d['entries'] if e['hover']), '(无)')")" = "$(mq "next((e['title'] for e in d['entries'] if e['id'] == $hv_id), '(无)')")" ] \
+	&& pass "悬停的就是命中的那一项" || fail "悬停项和命中项对不上"
+# 挪到卡片外面（条子上方的空白）→ 悬停清掉
+msg move-cursor $((wx + ww / 2)) $((wy + 4))
+sleep 0.4
+[ "$(mq 'd["hover"]')" = "0" ] && pass "挪到空白处 → 悬停清掉" \
+	|| fail "挪开了还亮着（hover = $(mq 'd["hover"]')）"
+[ "$(mq 'd["selected"]')" = "$sel_before" ] && pass "选中项还是没动" \
+	|| fail "选中项变成 $(mq 'd["selected"]') 了"
+wait $WTYPE_PID 2>/dev/null
+sleep 0.8
+
+mark "9) 鼠标点击：点哪张卡片就切到哪个窗口"
+hold_tabs 1 4000
+sleep 0.7
+read -r ck_x ck_y ck_title <<<"$(mj "next((e['cx'] + e['cw'] // 2, e['cy'] + e['ch'] // 2, e['title']) for e in d['entries'] if not e['selected'])")"
+msg move-cursor "$ck_x" "$ck_y"
+sleep 0.3
+msg pointer-button press left
+sleep 0.5
+msg pointer-button release left
+sleep 0.8
+grep -aq "mru: 点选 $ck_title" "$LOG" && pass "日志：点选 $ck_title" \
+	|| fail "日志里没有「点选 $ck_title」"
+[ "$(focused_title)" = "$ck_title" ] && pass "点完焦点 = $ck_title" \
+	|| fail "点完焦点 = $(focused_title)，期望 $ck_title"
+[ "$(mq 'd["showing"]')" = "False" ] && pass "点完面板就收了" || fail "点完面板还开着"
+wait $WTYPE_PID 2>/dev/null
+sleep 0.8
+[ "$(focused_title)" = "$ck_title" ] && pass "松开 Alt 之后焦点没被搬走" \
+	|| fail "松开 Alt 之后焦点变成 $(focused_title) 了"
+./build/vidowmsg state >/dev/null 2>&1 && pass "vidow 存活（松手被吃掉，没漏给客户端）" \
+	|| fail "vidow 挂了"
+
+mark "10) grid：换行铺在屏幕里，装不下就整体缩小"
 ./build/vidowmsg set-config mru_layout grid >/dev/null 2>&1
 ./build/vidowmsg set-config mru_per_row 2 >/dev/null 2>&1
 hold_tabs 1 2500
@@ -273,7 +370,7 @@ geo_ok=$(mq "all(e['x'] >= $wx and e['y'] >= $wy and e['x'] + e['w'] <= $wx + $w
 wait $WTYPE_PID 2>/dev/null
 sleep 0.8
 
-mark "9) 收尾"
+mark "11) 收尾"
 ./build/vidowmsg set-config mru_layout strip >/dev/null 2>&1
 ./build/vidowmsg set-config mru_max_scale 0.5 >/dev/null 2>&1
 [ "$(mq 'd["showing"]')" = "False" ] && pass "面板已收起" || fail "面板还开着"

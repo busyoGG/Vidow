@@ -265,7 +265,9 @@ struct vidow_config {
 	 *   max_height     预览高度上限（大屏上别一个窗口占满屏）
 	 *   min_scale      再挤也不能比它更小
 	 *   backdrop_alpha 切换器后面那层压暗的浓度
-	 *   highlight_*    选中项背后那块板 / 边框 */
+	 *   card_*         每一项背后那张卡片（超椭圆圆角）：内边距 / 圆角半径 /
+	 *                  底色 / 描边宽度与颜色
+	 *   highlight_*    选中那张卡片：描边宽度与颜色（底色 = 卡片底混一点它） */
 	bool mru_enabled;
 	int mru_debounce_ms;
 	int mru_open_delay_ms;
@@ -278,7 +280,11 @@ struct vidow_config {
 	int mru_max_height;
 	double mru_min_scale;
 	double mru_backdrop_alpha;
-	int mru_highlight_padding;
+	int mru_card_padding;
+	int mru_card_radius;
+	float mru_card_color[4];
+	int mru_card_border;
+	float mru_card_border_color[4];
 	int mru_highlight_border;
 	float mru_highlight_color[4];
 };
@@ -455,6 +461,7 @@ struct vidow_overview {
 struct vidow_mru_slot {
 	struct vidow_view *view;
 	int x, y, w, h;   /* 预览摆在哪（布局坐标）+ 尺寸，都是屏幕上的值 */
+	int cx, cy, cw, ch; /* 这项背后那张卡片（= 预览 + 内边距），鼠标按它命中 */
 	double zoom;      /* 内容缩放（1.0 = 原尺寸） */
 };
 
@@ -478,8 +485,13 @@ struct vidow_mru {
 	double scroll;                  /* strip 模式横向滚了多少 */
 	int total_w, total_h;           /* 整条清单占多大（日志 / 断言用） */
 	struct wlr_scene_rect *backdrop; /* 压暗背景 */
-	struct wlr_scene_rect *plate;    /* 选中项背后那块板 */
-	struct wlr_scene_rect *border[4];/* 选中项的边框（四条细矩形） */
+	/* 每项背后那张卡片（超椭圆圆角的底 + 描边，见 mru.c）。节点按需建、建了留着
+	 * 复用；圆角是按覆盖率算出来的小图（wlr_scene_rect 画不出圆角），尺寸或样式
+	 * 变了才重画。 */
+	struct vidow_mru_card **card;
+	int card_n;
+	struct vidow_view *hover;       /* 鼠标底下的那一项（只影响样式，不改选中） */
+	bool swallow_release;           /* 点选那一下的松手也吃掉（别漏给客户端） */
 };
 
 /* 切换器里的窗口这一帧该怎么摆（view.c 的 view_anim_place 问它）。 */
@@ -2664,6 +2676,12 @@ bool vidow_mru_holds(const struct vidow_server *server,
 void vidow_mru_open(struct vidow_server *server, int dir, const char *app_id,
 		enum vidow_mru_scope scope);
 void vidow_mru_step(struct vidow_server *server, int dir);
+/* 鼠标在面板上动：命中的那一项点亮（返回 true = 确实换了高亮项，画面要重画）。
+ * 只改样式，不动选中 —— 选中的那个还是键盘在走。 */
+bool vidow_mru_hover(struct vidow_server *server, double sx, double sy);
+/* 鼠标点一下：命中的那一项直接切过去（点空白 = 什么都不做）。返回 true = 这次
+ * 点击被切换器吃掉了。 */
+bool vidow_mru_click(struct vidow_server *server, double sx, double sy);
 /* 松开修饰键：焦点给选中的那个，关掉。 */
 void vidow_mru_commit(struct vidow_server *server);
 /* Esc：关掉，焦点原地不动。 */

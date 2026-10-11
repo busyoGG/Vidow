@@ -314,15 +314,27 @@ static const struct entry entries[] = {
 	{ "mru_backdrop_alpha", K_DOUBLE, OFF(mru_backdrop_alpha),
 		SZ(mru_backdrop_alpha), 14,
 		"切换器后面那层压暗的浓度（0 = 不压暗）" },
-	{ "mru_highlight_padding", K_INT, OFF(mru_highlight_padding),
-		SZ(mru_highlight_padding), 14,
-		"选中项背后那块板比预览大多少（逻辑像素）" },
+	{ "mru_card_padding", K_INT, OFF(mru_card_padding),
+		SZ(mru_card_padding), 14,
+		"每一项背后那张卡片比预览大多少（逻辑像素）：预览到卡片边缘那圈" },
+	{ "mru_card_radius", K_INT, OFF(mru_card_radius),
+		SZ(mru_card_radius), 14,
+		"卡片的圆角半径（逻辑像素，超椭圆 —— 和 portal 的选择器同一种圆角）" },
+	{ "mru_card_color", K_COLOR, OFF(mru_card_color),
+		SZ(mru_card_color), 14,
+		"卡片的底色（RRGGBB 或 RRGGBBAA）" },
+	{ "mru_card_border", K_INT, OFF(mru_card_border),
+		SZ(mru_card_border), 14,
+		"卡片描边的宽度（逻辑像素，0 = 不描边）" },
+	{ "mru_card_border_color", K_COLOR, OFF(mru_card_border_color),
+		SZ(mru_card_border_color), 14,
+		"卡片描边的颜色；鼠标底下那张换成 mru_highlight_color（半透明）" },
 	{ "mru_highlight_border", K_INT, OFF(mru_highlight_border),
 		SZ(mru_highlight_border), 14,
-		"选中项的边框宽度（0 = 不画边框）" },
+		"选中的那张卡片的描边宽度（0 = 不画描边）" },
 	{ "mru_highlight_color", K_COLOR, OFF(mru_highlight_color),
 		SZ(mru_highlight_color), 14,
-		"选中项那块板和边框的颜色（RRGGBB 或 RRGGBBAA）" },
+		"强调色：选中那张卡片的描边、以及它的底色（底 = 卡片底混 12% 这个色）" },
 };
 
 /* ------------------------------------------------------------ 配置组
@@ -436,7 +448,11 @@ static const struct group_field mru_fields[] = {
 	{ "max_height",        "mru_max_height" },
 	{ "min_scale",         "mru_min_scale" },
 	{ "backdrop_alpha",    "mru_backdrop_alpha" },
-	{ "highlight_padding", "mru_highlight_padding" },
+	{ "card_padding",      "mru_card_padding" },
+	{ "card_radius",       "mru_card_radius" },
+	{ "card_color",        "mru_card_color" },
+	{ "card_border",       "mru_card_border" },
+	{ "card_border_color", "mru_card_border_color" },
 	{ "highlight_border",  "mru_highlight_border" },
 	{ "highlight_color",   "mru_highlight_color" },
 };
@@ -760,11 +776,24 @@ static void defaults(struct vidow_config *cfg) {
 	cfg->mru_max_height = 480;
 	cfg->mru_min_scale = 0.05;
 	cfg->mru_backdrop_alpha = 0.8;
-	cfg->mru_highlight_padding = 30;
+	/* 卡片样式照 portal 的选择器（深色那套调色板）：底 #2f3336 压一点透明度、
+	 * 描边 #3b4045；强调色默认取 KDE Breeze 蓝 #3daee9 —— 和 portal 用同一个
+	 * 强调色（portal 那边读 kdeglobals，这里没法读，就按默认值来）。 */
+	cfg->mru_card_padding = 8;
+	cfg->mru_card_radius = 16;
+	cfg->mru_card_color[0] = 0x2f / 255.0f;
+	cfg->mru_card_color[1] = 0x33 / 255.0f;
+	cfg->mru_card_color[2] = 0x36 / 255.0f;
+	cfg->mru_card_color[3] = 0xe6 / 255.0f;
+	cfg->mru_card_border = 1;
+	cfg->mru_card_border_color[0] = 0x3b / 255.0f;
+	cfg->mru_card_border_color[1] = 0x40 / 255.0f;
+	cfg->mru_card_border_color[2] = 0x45 / 255.0f;
+	cfg->mru_card_border_color[3] = 1.0f;
 	cfg->mru_highlight_border = 2;
-	cfg->mru_highlight_color[0] = 0x99 / 255.0f;
-	cfg->mru_highlight_color[1] = 0x99 / 255.0f;
-	cfg->mru_highlight_color[2] = 0x99 / 255.0f;
+	cfg->mru_highlight_color[0] = 0x3d / 255.0f;
+	cfg->mru_highlight_color[1] = 0xae / 255.0f;
+	cfg->mru_highlight_color[2] = 0xe9 / 255.0f;
 	cfg->mru_highlight_color[3] = 1.0f;
 
 	cfg->cursor_shake = true;

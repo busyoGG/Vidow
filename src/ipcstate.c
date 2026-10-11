@@ -1116,6 +1116,8 @@ void vidow_ipc_json_mru(struct jbuf *b, struct vidow_server *server) {
 	jb_kv_int(b, "total_w", mru->total_w);
 	jb_kv_int(b, "total_h", mru->total_h);
 	jb_kv_double(b, "scroll", mru->scroll);
+	/* 鼠标底下那一项（只影响样式，不改选中）。 */
+	jb_kv_uint(b, "hover", mru->hover != NULL ? mru->hover->id : 0);
 	jb_key(b, "entries");
 	jb_arr(b);
 	for (int i = 0; i < mru->slot_n; i++) {
@@ -1128,10 +1130,16 @@ void vidow_ipc_json_mru(struct jbuf *b, struct vidow_server *server) {
 		jb_kv_str(b, "title", vidow_view_title(slot->view));
 		jb_kv_str(b, "app_id", vidow_view_app_id(slot->view));
 		jb_kv_bool(b, "selected", slot->view == mru->selected);
+		jb_kv_bool(b, "hover", slot->view == mru->hover);
 		jb_kv_int(b, "x", slot->x);
 		jb_kv_int(b, "y", slot->y);
 		jb_kv_int(b, "w", slot->w);
 		jb_kv_int(b, "h", slot->h);
+		/* 背后那张卡片（预览 + 内边距）：鼠标命中按它算。 */
+		jb_kv_int(b, "cx", slot->cx);
+		jb_kv_int(b, "cy", slot->cy);
+		jb_kv_int(b, "cw", slot->cw);
+		jb_kv_int(b, "ch", slot->ch);
 		jb_kv_double(b, "zoom", slot->zoom);
 		jb_obj_end(b);
 	}
