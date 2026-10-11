@@ -85,6 +85,7 @@ end
 -- 捏合默认没绑（要就自己加，比如 vidow.gesture{ fingers = 2, pinch = "out",
 -- action = "cycle-column-width" }）。位移是 libinput 的归一化单位（1000dpi），
 -- speed 是「1 单位 → 多少像素」（默认 0.3 = 手指划 1cm ≈ 屏幕 118px）。
+-- direction 那种离散手势要扫够远才算（distance，默认 300 单位 ≈ 0.8cm）。
 vidow.gesture{ fingers = 3, swipe = "view" }
 vidow.gesture{ fingers = 4, direction = "up",   action = "workspace up" }
 vidow.gesture{ fingers = 4, direction = "down", action = "workspace down" }

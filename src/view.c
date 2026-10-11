@@ -744,9 +744,11 @@ static void view_ensure_column(struct vidow_server *server,
 	col->output = view->output;
 	col->home = view->home;
 	/* 列宽：窗口规则写了 column_width 就用它（这个窗口新开的列有多宽），
-	 * 没写用默认的一半。 */
+	 * 没写用默认的一半。新列不做过渡（它是刚生出来的，宽度没有「变化」），
+	 * width_shown 跟逻辑值一起给上 —— arrange 画的是 width_shown。 */
 	col->width_fraction = view->rule_eff.set[VRA_COLUMN_WIDTH] ?
 		view->rule_eff.val[VRA_COLUMN_WIDTH].d : DEFAULT_COLUMN_WIDTH;
+	col->width_shown = col->width_fraction;
 	wl_list_init(&col->views);
 
 	/* 这条列落在哪块工作区：窗口自己记着的那块（新窗口在 map 时就定好了，
@@ -804,6 +806,10 @@ void vidow_view_leave_column(struct vidow_view *view) {
 		if (col->ws != NULL) {
 			wl_list_remove(&col->link);
 		}
+		/* 列宽过渡的 data 就是这条列：不掐掉的话下一帧它会写一块已经 free
+		 * 掉的内存（列没了但补间还在跑）。 */
+		vidow_anim_cancel(col->anim_width);
+		col->anim_width = NULL;
 		free(col);
 	}
 }
@@ -1983,6 +1989,23 @@ void vidow_place_view(struct vidow_view *view, int x, int y, int w, int h) {
 		return;
 	}
 
+	/* 列宽过渡正跑着：这一帧它右边那些列的位置变化**是过渡本身推出来的** ——
+	 * 每帧重起一次位移补间的话它们会一直吊在过渡后面（补间刚走 5%，下一帧又
+	 * 从那儿重新起一条 190ms 的），过渡结束后再自己飘到位，看着就是「隔壁那
+	 * 几列慢半拍」。过渡期间直接落位：宽度本身是按曲线走的，它们跟着曲线走
+	 * 正是「整条带子刚性跟着变」的样子。
+	 *
+	 * 放在 moved 判断**后面**：没动的窗口照旧走上面那条（手里正跑着位移补间
+	 * 的那种不该被过渡掐掉）。 */
+	if (view->server->column_anim_n > 0) {
+		vidow_anim_cancel(view->anim_move);
+		view->anim_move = NULL;
+		view->anim_off_x = 0.0;
+		view->anim_off_y = 0.0;
+		vidow_view_apply_anim(view);
+		return;
+	}
+
 	/* Tween from wherever the window is drawn right now, so a new layout
 	 * change mid-flight does not snap it back. */
 	view->anim_from_x = (double)(drawn_x - x);
@@ -2037,6 +2060,10 @@ struct wlr_box vidow_work_area(struct vidow_server *server,
 	return area;
 }
 
+/* 这一帧该按哪个比例画（定义在下面「列宽过渡」那一段）：补间在跑就是补间当前
+ * 值，否则就是逻辑值。arrange 在上面，先声明一下。 */
+static double column_layout_fraction(const struct vidow_column *col);
+
 static void output_arrange(struct vidow_server *server,
 		struct vidow_output *output) {
 	struct wlr_box work = vidow_work_area(server, output->wlr_output);
@@ -2070,9 +2097,10 @@ static void output_arrange(struct vidow_server *server,
 			continue;
 		}
 		/* 比例 → 像素用 vidow_column_width_px（连 gap 一起分那块区域）：
-		 * 两条 0.5 连着中间的 gap 正好铺满可用区，不会多出一个 gap。 */
+		 * 两条 0.5 连着中间的 gap 正好铺满可用区，不会多出一个 gap。
+		 * 比例取 column_layout_fraction：列宽过渡在跑时是补间中间值。 */
 		int width = vidow_column_width_px(&server->config, work.width,
-			col->width_fraction);
+			column_layout_fraction(col));
 		col->width = width;
 		col->offset = cursor;
 		/* 全屏的那条列在条带上占**一整屏**：它画出来就是整块屏那么大，让位 /
@@ -3228,6 +3256,8 @@ struct vidow_column *vidow_view_expel_new_column(struct vidow_view *view,
 	ncol->home = col->home;
 	ncol->ws = col->ws;
 	ncol->width_fraction = col->width_fraction;
+	/* 新列继承的是**目标**宽度（原列正过渡到一半也照目标给），新列自己不过渡。 */
+	ncol->width_shown = ncol->width_fraction;
 	wl_list_init(&ncol->views);
 	wl_list_init(&ncol->link);
 
@@ -3301,6 +3331,76 @@ void vidow_move_window(struct vidow_server *server, int direction) {
 	}
 }
 
+/* ---------------------------------------------------------- 列宽过渡 */
+
+/* 这一帧该按哪个比例画。补间在跑就是补间当前值，否则就是逻辑值。 */
+static double column_layout_fraction(const struct vidow_column *col) {
+	return col->anim_width != NULL ? col->width_shown : col->width_fraction;
+}
+
+static void column_width_update(void *data, double t, double linear) {
+	(void)linear;
+	struct vidow_column *col = data;
+	col->width_shown = col->anim_from + (col->anim_to - col->anim_from) * t;
+	/* 重排推到下一帧的开头去做（output.c 的 arrange_dirty）。**不能在这儿直接
+	 * 调 vidow_arrange**：arrange 会掐掉 / 新起别的补间，而我们此刻正站在
+	 * anim.c 的遍历里，动的可能就是它手里那个 tmp 指针。 */
+	col->server->arrange_dirty = true;
+}
+
+static void column_width_done(void *data, bool cancelled) {
+	(void)cancelled;
+	struct vidow_column *col = data;
+	col->anim_width = NULL;
+	if (col->server->column_anim_n > 0) {
+		col->server->column_anim_n--;
+	}
+	col->server->arrange_dirty = true;
+}
+
+void vidow_column_set_width(struct vidow_column *col, double fraction, bool animate) {
+	if (col == NULL) {
+		return;
+	}
+	struct vidow_server *server = col->server;
+	/* 起点取「现在画在屏上的那个值」，不是逻辑值 —— 过渡没跑完就再改一次时，
+	 * 得从眼前这个宽度接着走，不能跳回上一次的目标。**必须在 cancel 之前取**：
+	 * cancel 会把 anim_width 清掉，之后就问不出中间值了。 */
+	double from = column_layout_fraction(col);
+
+	col->width_fraction = fraction;
+
+	int ms = server->config.column_width_ms;
+	if (!animate || ms <= 0 || from == fraction) {
+		vidow_anim_cancel(col->anim_width);
+		col->anim_width = NULL;
+		col->width_shown = fraction;
+		/* **当场重排**，不能只挂个 arrange_dirty：没有过渡就没有动画在推帧
+		 * （动画那条路靠看门狗保证帧），静态屏幕上下一帧可能几百毫秒之后才来
+		 * —— 一次「直接到位」的改宽得当场就位。 */
+		vidow_arrange(server);
+		return;
+	}
+
+	vidow_anim_cancel(col->anim_width);
+	col->anim_width = NULL;
+	col->anim_from = from;
+	col->anim_to = fraction;
+	col->anim_width = vidow_anim_start(server, "column-width", ms,
+		server->config.easing, column_width_update, column_width_done, col);
+	if (col->anim_width == NULL) {
+		/* 分配失败：别把宽度卡在中间，直接到位。 */
+		col->width_shown = fraction;
+		vidow_arrange(server);
+		return;
+	}
+	server->column_anim_n++;
+	/* 起点当场摆一次：从按下到下一帧之间不该还停在上一次的宽度上。 */
+	column_width_update(col, 0.0, 0.0);
+	wlr_log(WLR_DEBUG, "column-width tween: %.3f -> %.3f（%dms）", from,
+		fraction, ms);
+}
+
 void vidow_cycle_column_width(struct vidow_server *server) {
 	struct vidow_view *view = server->focused;
 	if (view == NULL || view->column == NULL) {
@@ -3316,6 +3416,8 @@ void vidow_cycle_column_width(struct vidow_server *server) {
 	 * 也就是「满宽再循环一次回到最窄」）。 */
 	col->maximized = false;
 
+	/* 「现在是第几档」按**目标**（width_fraction）数，不按画到一半的值 ——
+	 * 连按几下要一档一档往上走，不能因为动画没跑完就原地打转。 */
 	size_t current = n - 1;
 	for (size_t i = 0; i < n; i++) {
 		if (col->width_fraction < presets[i] + 0.01) {
@@ -3323,8 +3425,7 @@ void vidow_cycle_column_width(struct vidow_server *server) {
 			break;
 		}
 	}
-	col->width_fraction = presets[(current + 1) % n];
-
+	vidow_column_set_width(col, presets[(current + 1) % n], true);
 	vidow_arrange(server);
 }
 
@@ -3336,11 +3437,11 @@ void vidow_column_set_maximized(struct vidow_column *col, bool maximized) {
 
 	if (maximized) {
 		col->maximized_saved = col->width_fraction;
-		col->width_fraction = 1.0;
 		col->maximized = true;
+		vidow_column_set_width(col, 1.0, true);
 	} else {
-		col->width_fraction = col->maximized_saved;
 		col->maximized = false;
+		vidow_column_set_width(col, col->maximized_saved, true);
 	}
 
 	/* 列里每个客户端都被告知一声：它们自己也知道自己现在是不是最大化的

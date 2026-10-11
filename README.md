@@ -92,7 +92,7 @@ anim   = { open_ms = 220, easing = "out_quint" }
 | `border` | `width` `color` `color_focus` | —（光写一个值没法解释） |
 | `shadow` | `radius` `color` `offset_x` `offset_y` | — |
 | `blur` | `enabled` `all` `xray` `levels` `strength` `alpha_min` `offset` | `blur = false` |
-| `anim` | `open_ms` `close_ms` `move_ms` `layer_open_ms` `layer_close_ms` `easing` `open_easing` `close_easing` `open_alpha_from` `open_slide_px` `open_scale_from` `close_alpha_to` `close_slide_px` `close_scale_to` `jelly` `jelly_strength` | — |
+| `anim` | `open_ms` `close_ms` `move_ms` `column_width` `layer_open_ms` `layer_close_ms` `easing` `open_easing` `close_easing` `open_alpha_from` `open_slide_px` `open_scale_from` `close_alpha_to` `close_slide_px` `close_scale_to` `jelly` `jelly_strength` | — |
 | `shader` | `enabled` `dir` `flip_y` `open` `close` `idle` | `shader = false` |
 | `clipboard` | `enabled` `primary` `max_bytes` | `clipboard = false` |
 | `ipc` | `enabled` `socket` | `ipc = true` |
@@ -943,6 +943,7 @@ VIDOW_TEST_RENDERER=gles2 ./test-screencast.sh
 ./test-config.sh                     # 配置系统：一个 Lua 文件 + 改了就自动重载 + vidow.exec 的选项（全 headless，24 项断言）
 ./test-binds.sh                      # 键位全是配置给的：没配置=没有键位、默认那套能用、换键位、动作字符串（全 headless，35 项断言）
 ./test-gesture.sh                    # 触控板手势：三指横扫跟手拖视口 / 四指竖扫 / 捏合 / 按住（全 headless，注入，26 项断言）
+./test-widthanim.sh                  # 列宽过渡：cycle / 最大化 / IPC 改宽按 column_width_ms 补间，隔壁列不给位移补间（全 headless，30 项断言）
 ./test-config-include.sh             # 配置拆成好几份：vidow.include() 的路径/顺序/报错 + 改哪份都自动重载（全 headless，25 项断言）
 ./test-defaultconfig.sh              # 默认配置按类别拆成 configs/（--default-config / --write-config）+ 配置族的表写法 + 说明的完整性（全 headless，45 项断言）
 ./test-gap.sh                        # 间距：一个数管全部 + 单边/内间距覆盖 + 「两条 50% 正好装进一屏」（全 headless，34 项断言）
@@ -3624,6 +3625,11 @@ test-minimize.sh   最小化：窗口留在原列里（不占位 / 不显示 / �
                    同列剩下的撑满、焦点交给邻居、放回回原位、浮窗也认、整列收起、
                    客户端自己请求（`xdg_toplevel.set_minimized`）、`force_render` 的窗口
                    收起来照样出帧、SIGHUP 不改状态、X11 的 `WM_STATE` Iconic ⇄ Normal
+test-widthanim.sh  列宽过渡（`column_width_ms`）：`cycle-column-width` / 列最大化 / IPC 改宽都是
+                   **补间过去**（逐帧量到中间宽度、单调、落在目标像素、右边那条列每一帧
+                   都贴住左边），过渡期间**不给隔壁列起位移补间**（不然它吊在后面）；
+                   `column_width_ms = 0` 直接到位、改配置真的改时长；拖动改宽不补间
+                   （跟手那条由 `./test-tile-resize.sh` 兜）
 test-maximize.sh   列最大化（niri 的 `maximize-column`）：整列撑满工作区宽度、再按一次还原成
                    **原来那个比例**（0.25 改了再最大化再还原还是 0.25）、手动改宽度就是退出
                    最大化状态、`maximize-column` 动作名；客户端 `set_maximized` 映射到它 ——
@@ -4598,6 +4604,38 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
       - 判据：`test-fullscreen-scroll.sh` 新增 9 条（非全屏的 look 有边框 2 / 圆角 12 / 阴影 8，
         全屏之后都是 0；左上角那一点是全屏窗口自己的内容而不是圆角外面的背景；浮动的全屏
         geometry = 0,0 1280x720、退出全屏回到原来的浮动尺寸）；47 项全过。
+
+212. **列宽变化也走过渡动画**（用户：「列宽变化的时候也需要过渡动画」）
+
+      - **补间的是「画出来的宽度」，不是逻辑值**：列上多了 `width_shown`（这一帧拿来算像素）
+        和 `anim_width`（在跑的补间），`width_fraction` 一直是逻辑目标。`arrange` 的 Pass 1 读
+        `column_layout_fraction(col)` —— 补间在跑就是中间值。这么分是因为「现在是第几档」得按
+        **目标**数：连按 `cycle-column-width` 要一档一档往上走，不能从画到一半的地方数。
+      - **一个入口**：`vidow_column_set_width(col, fraction, animate)`，`cycle-column-width` /
+        列最大化 / `set-column-width` / `expand-column-to-available-width` 全走它；
+        `animate = false` 那一档**当场 `vidow_arrange`**（不是只挂 `arrange_dirty`）—— 没有过渡
+        就没有动画在推帧，静态屏上下一帧可能几百毫秒后才来。
+      - **拖动改宽（Mod+右键拖）不补间**：`animate = false`，跟手是硬要求（顺带把还在跑的过渡
+        掐掉，不然它接着往旧目标走）。每个指针事件的重排次数没变（重排由 setter 做掉，drag.c
+        不再单独调一次）。
+      - **过渡期间不给隔壁列起位移补间**（`server->column_anim_n`，见 `vidow_place_view`）：列一变宽，
+        右边那几条列每帧都在动，而 `vidow_place_view` 对「位置变了」一律起一条 `window_move_ms`
+        的补间 —— 每帧重起一次的话它们永远吊在过渡后面、过渡结束后再自己飘到位。过渡期间直接
+        落位，跟着宽度的曲线走（整条带子刚性跟着变）。收尾那一帧的 1px 取整会照常起一条补间，
+        那是布局重排自己的事。
+      - **配置**：`column_width_ms`（默认 200，`anim = { column_width = … }` 也认），`0` = 直接
+        到位；`easing` 复用布局那条（默认 `out_cubic`，不过冲 —— 宽度过冲会把右边那几条列顶出去）。
+      - **IPC 语义**：`width_fraction` 当场就是新值，`width`（像素）是**过渡中间值**，要终值得等
+        `column_width_ms`（`./test-ipc.sh` 那条断言因此加了 0.4s 等待，`./test-maximize.sh` 本来
+        就带 sleep）。
+      - 判据：`./test-widthanim.sh`（新，30 项断言）—— 默认 200ms 量到 10 个中间宽度、单调、
+        191ms 到位、停在目标像素 836、右边那条列每一帧 `offset = 宽 + gap`、过渡期间只有
+        `column-width` 一个动画；`column_width_ms = 0` 一个中间值都没有、`= 500` 真的走 452ms；
+        列最大化 / 还原同一条路。相关回归：`./test-maximize.sh`、`./test-ipc.sh`、
+        `./test-tile-resize.sh`、`./test-defaultconfig.sh`、`./test-config.sh` 全过。
+      - 顺手补两处**上一批改动漏下的测试漂移**：`./test-ipc.sh` 的 `state` 键表少了 `gestures`；
+        `./test-defaultconfig.sh` 的「说明完整性」缺手势的 `distance`（在 `14-keys.lua` 的说明里
+        补一句，默认配置跟着重新生成）。
 
 211. **选择器那条分段控件收小**（用户：「portal的tab缩小一点，不要占太多地方」）
 

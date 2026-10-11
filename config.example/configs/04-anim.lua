@@ -11,6 +11,8 @@ window_open_ms = 180
 window_close_ms = 140
 -- 窗口移动 / 布局重排的动画时长
 window_move_ms = 190
+-- 列宽变化的过渡时长（cycle-column-width / 列最大化 / IPC 改宽；0 = 直接到位。拖动改宽不补间 —— 那个必须跟手）
+column_width_ms = 200
 -- layer-shell（状态栏、通知、挂件）出现的动画时长
 layer_open_ms = 200
 -- layer-shell 消失的动画时长
@@ -37,4 +39,4 @@ close_scale_to = 0.82
 jelly = true
 -- 果冻的形变倍率（1.0 = 默认，0.5 = 收敛些，0 = 不弯）
 jelly_strength = 1
--- 这一族也能写成一张表，只写要改的项（anim = { open_ms = 180, close_ms = 140, move_ms = 190, layer_open_ms = 200, layer_close_ms = 150, easing = "out_cubic", open_alpha_from = 0, open_slide_px = 22, close_alpha_to = 0, close_slide_px = 14, open_easing = "out_elastic", close_easing = "out_elastic", open_scale_from = 0.82, close_scale_to = 0.82, jelly = true, jelly_strength = 1 }）
+-- 这一族也能写成一张表，只写要改的项（anim = { open_ms = 180, close_ms = 140, move_ms = 190, column_width = 200, layer_open_ms = 200, layer_close_ms = 150, easing = "out_cubic", open_alpha_from = 0, open_slide_px = 22, close_alpha_to = 0, close_slide_px = 14, open_easing = "out_elastic", close_easing = "out_elastic", open_scale_from = 0.82, close_scale_to = 0.82, jelly = true, jelly_strength = 1 }）

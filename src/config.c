@@ -172,6 +172,9 @@ static const struct entry entries[] = {
 		"窗口关闭动画时长" },
 	{ "window_move_ms",  K_INT,    OFF(window_move_ms),  SZ(window_move_ms), 3,
 		"窗口移动 / 布局重排的动画时长" },
+	{ "column_width_ms", K_INT,    OFF(column_width_ms), SZ(column_width_ms), 3,
+		"列宽变化的过渡时长（cycle-column-width / 列最大化 / IPC 改宽；0 = 直接"
+		"到位。拖动改宽不补间 —— 那个必须跟手）" },
 	{ "layer_open_ms",   K_INT,    OFF(layer_open_ms),   SZ(layer_open_ms), 3,
 		"layer-shell（状态栏、通知、挂件）出现的动画时长" },
 	{ "layer_close_ms",  K_INT,    OFF(layer_close_ms),  SZ(layer_close_ms), 3,
@@ -383,6 +386,7 @@ static const struct group_field anim_fields[] = {
 	{ "open_ms",        "window_open_ms" },
 	{ "close_ms",       "window_close_ms" },
 	{ "move_ms",        "window_move_ms" },
+	{ "column_width",   "column_width_ms" },
 	{ "layer_open_ms",  "layer_open_ms" },
 	{ "layer_close_ms", "layer_close_ms" },
 	{ "easing",         "easing" },
@@ -774,6 +778,7 @@ static void defaults(struct vidow_config *cfg) {
 	cfg->window_open_ms = 180;
 	cfg->window_close_ms = 140;
 	cfg->window_move_ms = 190;
+	cfg->column_width_ms = 200;
 	cfg->layer_open_ms = 200;
 	cfg->layer_close_ms = 150;
 	cfg->easing = VIDOW_EASE_OUT_CUBIC;
@@ -1011,12 +1016,14 @@ void vidow_config_log(const struct vidow_config *cfg) {
 		cfg->xwayland_env ? "on" : "off");
 	wlr_log(WLR_INFO,
 		"config: open=%dms(%s %.2f) close=%dms(%s %.2f) move=%dms "
+		"column_width=%dms "
 		"layer=%d/%dms easing=%s shader=%s open=%s close=%s idle=%s",
 		cfg->window_open_ms, easing_names[cfg->open_easing],
 		cfg->open_scale_from,
 		cfg->window_close_ms, easing_names[cfg->close_easing],
 		cfg->close_scale_to,
 		cfg->window_move_ms,
+		cfg->column_width_ms,
 		cfg->layer_open_ms, cfg->layer_close_ms, easing_names[cfg->easing],
 		cfg->shader_enabled ? "on" : "off",
 		cfg->shader_open[0] ? cfg->shader_open : "-",
@@ -1360,6 +1367,7 @@ static void print_keys_lua(FILE *f) {
 "-- 捏合默认没绑（要就自己加，比如 vidow.gesture{ fingers = 2, pinch = \"out\",\n"
 "-- action = \"cycle-column-width\" }）。位移是 libinput 的归一化单位（1000dpi），\n"
 "-- speed 是「1 单位 → 多少像素」（默认 0.3 = 手指划 1cm ≈ 屏幕 118px）。\n"
+"-- direction 那种离散手势要扫够远才算（distance，默认 300 单位 ≈ 0.8cm）。\n"
 "vidow.gesture{ fingers = 3, swipe = \"view\" }\n"
 "vidow.gesture{ fingers = 4, direction = \"up\",   action = \"workspace up\" }\n"
 "vidow.gesture{ fingers = 4, direction = \"down\", action = \"workspace down\" }\n"

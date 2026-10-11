@@ -893,7 +893,9 @@ static bool cmd_set_column_width(struct vidow_server *server, struct jval *req,
 	if (want > 1.0) {
 		want = 1.0;
 	}
-	col->width_fraction = want;
+	/* 补间过去（config.column_width_ms）。相对改宽（delta）的基准是**目标**宽度
+	 * 而不是画到一半的那个值：连点几下要一档一档走。 */
+	vidow_column_set_width(col, want, true);
 	/* 手动指定宽度 = 退出「列最大化」这个状态（最大化是「记住原宽度再还原」，
 	 * 用户自己给了宽度就以用户的为准，见 server.h 的 vidow_column.maximized）。 */
 	col->maximized = false;
@@ -912,7 +914,7 @@ static bool cmd_expand_column_to_available_width(struct vidow_server *server,
 		snprintf(err, errlen, "没有聚焦的列");
 		return false;
 	}
-	server->focused->column->width_fraction = 1.0;
+	vidow_column_set_width(server->focused->column, 1.0, true);
 	/* 同上：手动改宽度退出最大化状态（要「记住原宽度、还能还原」就用
 	 * toggle-maximize-column）。 */
 	server->focused->column->maximized = false;

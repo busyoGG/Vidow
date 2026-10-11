@@ -711,10 +711,12 @@ void vidow_tile_resize_update(struct vidow_server *server, double lx, double ly)
 	if (diff < 0.002 && diff > -0.002) {
 		return;
 	}
-	col->width_fraction = fraction;
+	/* animate = false：拖动改宽必须跟手（重排也由它当场做掉，这里不再单独调一次
+	 * —— 指针事件比帧密，每个事件两次重排就是白算一遍）。顺带把可能还在跑的
+	 * 列宽过渡掐掉：不然过渡会接着往旧目标走，跟手的那一下被它拽回去。 */
+	vidow_column_set_width(col, fraction, false);
 	/* 手动给了宽度 = 退出「列最大化」这个状态（见 server.h 的 maximized）。 */
 	col->maximized = false;
-	vidow_arrange(server);
 	/* 拖动时指针比刷新快：一帧里会来好几个移动事件，中间那些宽度屏幕上从来没
 	 * 出现过。重排是便宜的（列宽变了本来就要重排），这里只要保证「要一帧」，
 	 * 让这一帧把最终宽度画出来（同 vidow_tile_grab_update）。 */

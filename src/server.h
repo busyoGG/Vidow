@@ -129,6 +129,10 @@ struct vidow_config {
 	int window_open_ms;
 	int window_close_ms;
 	int window_move_ms;
+	/* 列宽变化的过渡（cycle-column-width / 列最大化 / IPC 改宽）。0 = 直接到位。
+	 * 拖动改宽（Mod+右键拖）不走它 —— 那个必须跟手。见 view.c 的
+	 * vidow_column_set_width。 */
+	int column_width_ms;
 	int layer_open_ms;
 	int layer_close_ms;
 	enum vidow_easing easing;
@@ -787,6 +791,15 @@ struct vidow_column {
 	struct vidow_output_memory *home;
 
 	double width_fraction; /* of the usable width */
+	/* 列宽过渡（见 view.c 的 vidow_column_set_width）：补间在跑的时候，**这一帧
+	 * 拿来算像素**的是 width_shown，width_fraction 一直是逻辑目标 —— 连着按
+	 * cycle-column-width 时下一档要从目标往上数，不能从画到一半的地方数。不在
+	 * 补间时两者相等。 */
+	struct vidow_anim *anim_width;
+	double width_shown;
+	/* 补间的两端（比例）：anim_from 是起手那一刻画在屏上的值，anim_to 是新目标。 */
+	double anim_from;
+	double anim_to;
 	/* niri 式「列最大化」：整列撑满工作区宽度（width_fraction 顶到 1.0），再按一次
 	 * 还原成原来那个比例（记在 maximized_saved 里）。手动改宽度（cycle-column-width
 	 * / set-column-width / expand-column-to-available-width）就是退出这个状态 ——
@@ -1681,6 +1694,11 @@ struct vidow_server {
 	struct wlr_scene_rect *insert_hint;
 	/* 浮动窗口拖拽同理：每帧最多重排一次（见 vidow_float_grab_update）。 */
 	bool arrange_dirty;
+	/* 正在跑的列宽过渡有几条。过渡期间**位置跟着变的那几列不做位移补间**：
+	 * 每帧都重起一次补间的话它们会一直吊在过渡后面、过渡结束后再自己飘到位
+	 * （见 view.c 的 vidow_place_view）。用计数不用 bool：连着来两条 IPC 改宽
+	 * 就是两条列同时在过渡。 */
+	int column_anim_n;
 	/* 探针：最近一次拖拽移动事件的时刻（见 output.c 的拖拽延迟统计） */
 	int64_t grab_ev_ns;
 	/* 平铺改宽（Mod+右键拖）：起拖时的光标 x 和那一列的像素宽。改宽按**增量**
@@ -2758,6 +2776,11 @@ void vidow_cycle_column_width(struct vidow_server *server);
  * 列里每个客户端都会收到 set_maximized 的应答（它们自己也知道自己最大化了）。
  * 状态入口只有这一个 —— 别在别处直接改 col->maximized。 */
 void vidow_column_set_maximized(struct vidow_column *col, bool maximized);
+/* 改列宽（比例）。animate = true 时按 config.column_width_ms 补间过去（列宽过渡），
+ * false 直接到位。**所有改 width_fraction 的地方都得走这儿**：arrange 用的是
+ * col->width_shown（补间中间值），绕过它直接写 width_fraction 会让记录的宽度和
+ * 画出来的宽度不一致。唯一的例外是刚建出来的列（那时两者都是 0，建完立刻赋值）。 */
+void vidow_column_set_width(struct vidow_column *col, double fraction, bool animate);
 /* 聚焦窗口所在的那条列：最大化 ⇄ 还原。没有聚焦窗口 / 浮窗（没有列）时什么也不做。 */
 void vidow_column_toggle_maximized(struct vidow_server *server);
 void vidow_view_close(struct vidow_view *view);

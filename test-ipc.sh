@@ -404,6 +404,9 @@ check "set-column-width 0.25" "{\"cmd\":\"set-column-width\",\"id\":$ID2,\"fract
 	'resp["result"]["column"]["width_fraction"]' '0.25'
 COL=$(jf "{\"cmd\":\"set-column-width\",\"id\":$ID2,\"fraction\":0.25}" \
 	'resp["result"]["column"]["id"]')
+# 列宽是**过渡**过去的（column_width_ms，默认 200ms）：像素宽得等它到位再量。
+# width_fraction 是逻辑目标，当场就是新值（上面那两条量的就是它）。
+sleep 0.4
 check "列宽算进布局了（0.25 * 1268 ≈ 317）" '{"cmd":"columns"}' \
 	"abs([c for c in resp['result'] if c['id']==$COL][0]['width'] - 317) < 8" 'True'
 check "set-column-width delta 加减" "{\"cmd\":\"set-column-width\",\"id\":$ID2,\"delta\":0.25}" \
@@ -543,7 +546,7 @@ check "im 状态" '{"cmd":"im"}' 'resp["result"]["connected"]' 'False'
 check "anims 结构" '{"cmd":"anims"}' '"running" in resp["result"]' 'True'
 check "state 里带上了一切" '{"cmd":"state"}' \
 	'sorted(resp["result"].keys())' \
-	"['activation_tokens', 'anims', 'clipboard', 'config', 'config_lua', 'counts', 'focused', 'im', 'input', 'keybinds', 'layers', 'log_level', 'mru', 'output_memories', 'outputs', 'overview', 'pid', 'primary_selection', 'rules', 'screencast', 'seats', 'shaders', 'socket', 'time_ms', 'version', 'wayland_display', 'windows', 'workspaces', 'xwayland']"
+	"['activation_tokens', 'anims', 'clipboard', 'config', 'config_lua', 'counts', 'focused', 'gestures', 'im', 'input', 'keybinds', 'layers', 'log_level', 'mru', 'output_memories', 'outputs', 'overview', 'pid', 'primary_selection', 'rules', 'screencast', 'seats', 'shaders', 'socket', 'time_ms', 'version', 'wayland_display', 'windows', 'workspaces', 'xwayland']"
 
 # ------------------------------------------------------------ 10) 事件订阅
 mark "事件订阅：打开 / 移动 / 浮动 / 关闭 / 工作区 / 输出 / 过滤器"
