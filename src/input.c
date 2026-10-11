@@ -85,11 +85,12 @@ static void keyboard_key(struct wl_listener *listener, void *data) {
 	/* config.lua 里 vidow.bind() 声明的键位（动作字符串见 README 的动作表）：
 	 * 工作区切换 / 窗口与列的方向移动 / 浮动 / 全屏 / 全景 / 起命令 / 切 tty …
 	 * 一个内置的都不预设，绑什么是什么；没命中的按键透传给客户端。 */
-	if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
-		for (int i = 0; i < nsyms; i++) {
-			handled = vidow_keybind_key(server, syms[i], mods, inhibited) ||
-				handled;
-		}
+	/* 按下和松开都要过绑定表：「松开才触发」的绑定和「单独一个修饰键」都靠松开
+	 * 那一下收尾（见 keybind.c 的 pending_release）。 */
+	bool pressed = event->state == WL_KEYBOARD_KEY_STATE_PRESSED;
+	for (int i = 0; i < nsyms; i++) {
+		handled = vidow_keybind_key(server, syms[i], pressed, mods,
+			inhibited) || handled;
 	}
 
 	/* Alt+Tab 切换器开着（按住修饰键期间）：键盘也归它管 —— 窗口马上就要换，
@@ -489,6 +490,20 @@ void vidow_pointer_button(struct vidow_server *server, uint32_t button,
 		return;
 	}
 
+	/* 绑定表（`vidow.bind("Mod+mouse-left", …)`）：鼠标按键和键盘键同一张表、
+	 * 同一套动作。按下 / 松开都要问 —— 「松开才触发」的绑定靠松开那一下收尾。 */
+	struct wlr_keyboard *kb = wlr_seat_get_keyboard(server->seat);
+	uint32_t mods = kb != NULL ? wlr_keyboard_get_modifiers(kb) : 0;
+	if (force_mod) {
+		/* 测试注入「假装按着 Mod」（见 server.h）：测试环境里没有真键盘，
+		 * 而拖动这类手势要求按着 Mod —— 绑定的匹配照样按真修饰键走。 */
+		mods |= MOD_KEY;
+	}
+	if (vidow_keybind_button(server, button, pressed, mods,
+			vidow_shortcuts_inhibited(server))) {
+		return;
+	}
+
 	if (!pressed) {
 		wlr_seat_pointer_notify_button(server->seat, time_msec, button,
 			WL_POINTER_BUTTON_STATE_RELEASED);
@@ -518,34 +533,10 @@ void vidow_pointer_button(struct vidow_server *server, uint32_t button,
 		return;
 	}
 
-	struct wlr_keyboard *kb = wlr_seat_get_keyboard(server->seat);
-	bool mod = force_mod || (kb != NULL &&
-		(wlr_keyboard_get_modifiers(kb) & MOD_KEY));
-
-	/* Mod+left drag moves a float, Mod+right drag resizes it. */
-	if (mod && view != NULL && view->float_mode != VIDOW_FLOAT_NONE) {
-		vidow_float_begin_grab(server, view, button == BTN_RIGHT, false);
-		if (view != server->focused) {
-			vidow_focus_view(view);
-		}
-		return;
-	}
-
-	/* Mod+左键按住**平铺**窗口 = 拖它（niri 的 interactive move）：窗口跟着光标
-	 * 飘起来，松手按落点决定归哪块屏的工作区、插在列带第几位。 */
-	if (mod && button == BTN_LEFT && view != NULL && !view->popup &&
-			view->float_mode == VIDOW_FLOAT_NONE && view->column != NULL) {
-		vidow_tile_grab_begin(server, view);
-		return;
-	}
-
-	/* Mod+右键按住**平铺**窗口 = 改这一列的宽度（niri 的 interactive resize）。
-	 * 浮窗那条在上面（Mod+右键 = 改浮窗自己的几何），这里只接平铺的。 */
-	if (mod && button == BTN_RIGHT && view != NULL && !view->popup &&
-			view->float_mode == VIDOW_FLOAT_NONE && view->column != NULL) {
-		vidow_tile_resize_begin(server, view);
-		return;
-	}
+	/* 指针手势（拖窗口 / 改列宽）现在是**绑定 + 动作**，见 keybind.c 的
+	 * `interactive-move` / `interactive-resize` 和上面那次 vidow_keybind_button()：
+	 * 默认配置里是 `Mod+mouse-left` / `Mod+mouse-right`。没绑就没有 —— 和键位
+	 * 同一条规矩：合成器一个都不内置。 */
 
 	wlr_seat_pointer_notify_button(server->seat, time_msec, button,
 		WL_POINTER_BUTTON_STATE_PRESSED);
@@ -585,16 +576,16 @@ void vidow_pointer_axis(struct vidow_server *server,
 		return;
 	}
 
-	/* Mod+wheel moves the view between columns, like niri's view scroll.
-	 * A plain wheel is forwarded to the client so apps keep scrolling. */
+	/* 绑定表（`vidow.bind("Mod+wheel-up", …)`）：一个方向一条，和键盘同一套动作。 */
 	struct wlr_keyboard *kb = wlr_seat_get_keyboard(server->seat);
-	if (kb != NULL && (wlr_keyboard_get_modifiers(kb) & MOD_KEY)) {
-		if (amount != 0) {
-			vidow_focus_column(server, amount > 0 ? 1 : -1);
-		}
+	uint32_t mods = kb != NULL ? wlr_keyboard_get_modifiers(kb) : 0;
+	if (vidow_keybind_wheel(server, orientation, amount, mods,
+			vidow_shortcuts_inhibited(server))) {
 		return;
 	}
 
+	/* 滚轮手势也走绑定（默认配置里 `Mod+wheel-up/down` → 换列）。没绑的滚轮
+	 * 照旧转发给客户端，应用里的滚动不受影响。 */
 	wlr_seat_pointer_notify_axis(server->seat, time_msec, orientation, delta,
 		delta_discrete, source, WL_POINTER_AXIS_RELATIVE_DIRECTION_IDENTICAL);
 }

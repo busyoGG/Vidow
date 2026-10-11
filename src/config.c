@@ -1319,6 +1319,24 @@ static void print_keys_lua(FILE *f) {
 "-- 逃生口，不然抑制着的窗口能把用户锁死在里面。\n"
 "vidow.bind(\"Mod+Escape\", \"quit\", { inhibited = true })\n"
 "\n"
+"-- 指针手势也是键位（同一张表、同一套动作）：鼠标按键写 mouse-left / mouse-middle /\n"
+"-- mouse-back / mouse-forward（别写 left —— 那是**方向键**），滚轮写 wheel-up /\n"
+"-- wheel-down / wheel-left / wheel-right。默认这四条 = 以前的写死行为：\n"
+"--     Mod+左键拖   = 拖窗口（浮窗挪位置、平铺窗口跟着光标飘）\n"
+"--     Mod+右键拖   = 改大小（浮窗改几何、平铺窗口改列宽）\n"
+"--     Mod+滚轮     = 焦点左 / 右移一列\n"
+"-- 不写就没有（合成器一个手势都不内置）。\n"
+"vidow.bind(\"Mod+mouse-left\", \"interactive-move\")\n"
+"vidow.bind(\"Mod+mouse-right\", \"interactive-resize\")\n"
+"vidow.bind(\"Mod+wheel-up\", \"focus-column left\")\n"
+"vidow.bind(\"Mod+wheel-down\", \"focus-column right\")\n"
+"-- 单独一个修饰键：默认**松开才触发**（按下就触发的话 Super+Q 会顺带开全景）。\n"
+"-- 按下武装、期间按了别的键或鼠标键就作废，松开且其它修饰键都松了才跑。\n"
+"--     vidow.bind(\"Mod\", \"toggle-overview\")        -- 按一下 Super 开全景\n"
+"--     vidow.bind(\"Super_L\", \"toggle-overview\")    -- 只认左边那个 Super\n"
+"-- 松开才触发也能给普通键位用：{ on = \"release\" }（默认 \"press\"）。\n"
+"--     vidow.bind(\"Mod+W\", \"close-window\", { on = \"release\" })\n"
+"\n"
 "-- 工作区（niri 那套：动态、按屏、按序号）\n"
 "--\n"
 "-- 每块屏各自一份纵向的工作区栈，序号 = 在这块屏上从上往下第几块。栈底永远是\n"
@@ -1466,7 +1484,7 @@ static void print_keys_lua(FILE *f) {
 "--         vidow.log(\"消息\")                     往合成器日志打一行（VIDOW_LOG=debug 看得见）\n"
 "--         vidow.ipc_path()                      当前 IPC socket 的路径（没开 IPC 时是 nil）\n"
 "\n"
-"-- 指针手势（Mod+左键拖窗口 / Mod+右键缩放 / Mod+滚轮切列）不是键位，改不了键。\n", f);
+"-- 指针手势（鼠标按键 / 滚轮）就是键位，见上面那四条 vidow.bind(\"Mod+mouse-…\")。\n", f);
 }
 
 /* 一份分类文件的正文（不含文件头）。 */

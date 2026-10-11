@@ -108,18 +108,108 @@ static bool key_sym(const char *name, xkb_keysym_t *out) {
 	return name[1] == '\0' && ascii_key(name[0], out);
 }
 
-/* "Mod+Shift+Q" -> 修饰键掩码 + 键。大小写不敏感，修饰键名字认几个别名。 */
-static bool parse_trigger(const char *trigger, uint32_t *mods,
-		xkb_keysym_t *sym, char *err, size_t errlen) {
+/* 触发解析的结果：一类触发源 + 修饰键掩码 + 那类源自己的参数。 */
+struct trigger_parsed {
+	uint32_t mods;
+	enum vidow_bind_src src;
+	xkb_keysym_t sym;           /* VIDOW_SRC_KEY：主键（单独修饰键时是 NoSymbol） */
+	uint32_t button;            /* VIDOW_SRC_MOUSE */
+	enum wl_pointer_axis axis;  /* VIDOW_SRC_WHEEL */
+	int axis_dir;
+	bool modifier_only;
+};
+
+/* 修饰键 keysym -> WLR_MODIFIER_* 的位。`vidow.bind("Super_L", …)` 只认左边那个。 */
+static uint32_t modifier_bit(xkb_keysym_t sym) {
+	switch (sym) {
+	case XKB_KEY_Super_L:
+	case XKB_KEY_Super_R:
+		return WLR_MODIFIER_LOGO;
+	case XKB_KEY_Alt_L:
+	case XKB_KEY_Alt_R:
+		return WLR_MODIFIER_ALT;
+	case XKB_KEY_Control_L:
+	case XKB_KEY_Control_R:
+		return WLR_MODIFIER_CTRL;
+	case XKB_KEY_Shift_L:
+	case XKB_KEY_Shift_R:
+		return WLR_MODIFIER_SHIFT;
+	default:
+		return 0;
+	}
+}
+
+/* 鼠标按键的名字：`mouse-left` / `mouse-middle` / `mouse-back` / `mouse-forward`，
+ * 也认 `BTN_LEFT` 这种原名和 `mouse-274` 这种裸编号。
+ *
+ * 为什么加 `mouse-` 前缀：`left` / `right` 在键名表里已经是**方向键**了，直接拿
+ * 来当鼠标左键会把方向键的绑定悄悄改掉。 */
+static bool mouse_button_name(const char *token, uint32_t *out) {
+	const char *name = NULL;
+	if (strncasecmp(token, "mouse-", 6) == 0) {
+		name = token + 6;
+	} else if (strncasecmp(token, "btn_", 4) == 0) {
+		name = token;
+	}
+	if (name == NULL) {
+		return false;
+	}
+	uint32_t btn = vidow_pointer_button_from_name(name);
+	if (btn == 0) {
+		return false;
+	}
+	*out = btn;
+	return true;
+}
+
+/* 滚轮方向：wheel-up / wheel-down / wheel-left / wheel-right（一个方向一条绑定）。 */
+static bool wheel_name(const char *token, enum wl_pointer_axis *axis, int *dir) {
+	if (strcasecmp(token, "wheel-up") == 0) {
+		*axis = WL_POINTER_AXIS_VERTICAL_SCROLL;
+		*dir = -1;
+		return true;
+	}
+	if (strcasecmp(token, "wheel-down") == 0) {
+		*axis = WL_POINTER_AXIS_VERTICAL_SCROLL;
+		*dir = 1;
+		return true;
+	}
+	if (strcasecmp(token, "wheel-left") == 0) {
+		*axis = WL_POINTER_AXIS_HORIZONTAL_SCROLL;
+		*dir = -1;
+		return true;
+	}
+	if (strcasecmp(token, "wheel-right") == 0) {
+		*axis = WL_POINTER_AXIS_HORIZONTAL_SCROLL;
+		*dir = 1;
+		return true;
+	}
+	return false;
+}
+
+/* "Mod+Shift+Q" -> 修饰键掩码 + 触发源。大小写不敏感，修饰键名字认几个别名。
+ *
+ * 三类都能写：
+ *   Mod+Q                     键盘键
+ *   Mod+mouse-left            鼠标按键（BTN_LEFT）
+ *   Mod+wheel-up              滚轮（纵向，往上）
+ *   Mod                       单独一个修饰键（没有主键） */
+static bool parse_trigger(const char *trigger, struct trigger_parsed *out,
+		char *err, size_t errlen) {
 	char buf[sizeof(((struct vidow_keybind *)0)->trigger)];
 	snprintf(buf, sizeof(buf), "%s", trigger);
 
+	*out = (struct trigger_parsed){ .src = VIDOW_SRC_KEY };
 	uint32_t m = 0;
 	bool have_key = false;
+	bool have_pointer = false;
 	const char *token = NULL;
 	char *save = NULL;
 	for (token = strtok_r(buf, "+", &save); token != NULL;
 			token = strtok_r(NULL, "+", &save)) {
+		uint32_t btn = 0;
+		enum wl_pointer_axis axis;
+		int dir = 0;
 		if (strcasecmp(token, "mod") == 0 || strcasecmp(token, "super") == 0 ||
 				strcasecmp(token, "logo") == 0 ||
 				strcasecmp(token, "win") == 0) {
@@ -132,7 +222,26 @@ static bool parse_trigger(const char *trigger, uint32_t *mods,
 		} else if (strcasecmp(token, "ctrl") == 0 ||
 				strcasecmp(token, "control") == 0) {
 			m |= WLR_MODIFIER_CTRL;
-		} else if (key_sym(token, sym)) {
+		} else if (wheel_name(token, &axis, &dir)) {
+			if (have_pointer || have_key) {
+				snprintf(err, errlen, "trigger '%s': 滚轮不能再和别的键"
+					"写在一起", trigger);
+				return false;
+			}
+			out->src = VIDOW_SRC_WHEEL;
+			out->axis = axis;
+			out->axis_dir = dir;
+			have_pointer = true;
+		} else if (mouse_button_name(token, &btn)) {
+			if (have_pointer || have_key) {
+				snprintf(err, errlen, "trigger '%s': 鼠标按键不能再和别的键"
+					"写在一起", trigger);
+				return false;
+			}
+			out->src = VIDOW_SRC_MOUSE;
+			out->button = btn;
+			have_pointer = true;
+		} else if (key_sym(token, &out->sym)) {
 			have_key = true;
 		} else {
 			snprintf(err, errlen, "trigger '%s': unknown token '%s'",
@@ -140,16 +249,30 @@ static bool parse_trigger(const char *trigger, uint32_t *mods,
 			return false;
 		}
 	}
-	if (!have_key) {
+	out->mods = m;
+
+	if (have_pointer) {
+		/* 鼠标按键 / 滚轮允许不带修饰键（中键直接绑个动作是常见需求）。 */
+		return true;
+	}
+	if (have_key) {
+		if (m == 0) {
+			snprintf(err, errlen, "trigger '%s' has no modifier "
+				"(refusing to grab a bare key)", trigger);
+			return false;
+		}
+		return true;
+	}
+	/* 只剩修饰键：单独一个修饰键的绑定（`vidow.bind("Mod", …)`）。 */
+	if (m == 0) {
 		snprintf(err, errlen, "trigger '%s' has no key (e.g. Mod+1)", trigger);
 		return false;
 	}
-	if (m == 0) {
-		snprintf(err, errlen, "trigger '%s' has no modifier "
-			"(refusing to grab a bare key)", trigger);
-		return false;
+	out->modifier_only = true;
+	/* `Super_L` / `Super_R` 这种写法的具体某一侧留在 sym 里（NoSymbol = 两侧都认）。 */
+	if (modifier_bit(out->sym) == 0) {
+		out->sym = XKB_KEY_NoSymbol;
 	}
-	*mods = m;
 	return true;
 }
 
@@ -160,7 +283,7 @@ bool vidow_keybind_init(struct vidow_server *server) {
 
 struct vidow_keybind *vidow_keybind_add(struct vidow_server *server,
 		const char *trigger, const char *action, bool inhibited,
-		char *err, size_t errlen) {
+		bool on_release, char *err, size_t errlen) {
 	if (err != NULL && errlen > 0) {
 		err[0] = '\0';
 	}
@@ -172,9 +295,8 @@ struct vidow_keybind *vidow_keybind_add(struct vidow_server *server,
 		return NULL;
 	}
 
-	uint32_t mods = 0;
-	xkb_keysym_t sym = XKB_KEY_NoSymbol;
-	if (!parse_trigger(trigger, &mods, &sym, err, errlen)) {
+	struct trigger_parsed t;
+	if (!parse_trigger(trigger, &t, err, errlen)) {
 		return NULL;
 	}
 
@@ -187,11 +309,23 @@ struct vidow_keybind *vidow_keybind_add(struct vidow_server *server,
 	}
 	snprintf(bind->trigger, sizeof(bind->trigger), "%s", trigger);
 	snprintf(bind->action, sizeof(bind->action), "%s", action);
-	bind->mods = mods;
-	bind->keysym = sym;
+	bind->mods = t.mods;
+	bind->keysym = t.sym;
 	bind->inhibited = inhibited;
+	bind->src = t.src;
+	bind->button = t.button;
+	bind->axis = t.axis;
+	bind->axis_dir = t.axis_dir;
+	bind->modifier_only = t.modifier_only;
+	/* 单独一个修饰键默认**松开才触发**：按下就触发的话 `Super+Q` 会顺带把
+	 * 全景也打开（那条绑定本来只想在「只按了 Super」时生效）。 */
+	bind->on = on_release || t.modifier_only ? VIDOW_BIND_RELEASE
+						 : VIDOW_BIND_PRESS;
 	wl_list_insert(server->keybinds.prev, &bind->link);
-	wlr_log(WLR_INFO, "keybind: %s -> %s%s", bind->trigger, bind->action,
+	wlr_log(WLR_INFO, "keybind: %s -> %s%s%s%s", bind->trigger, bind->action,
+		bind->src == VIDOW_SRC_MOUSE ? "（鼠标按键）" :
+			bind->src == VIDOW_SRC_WHEEL ? "（滚轮）" : "",
+		bind->on == VIDOW_BIND_RELEASE ? "（松开触发）" : "",
 		inhibited ? "（抑制期间也生效）" : "");
 	return bind;
 }
@@ -204,34 +338,275 @@ void vidow_keybind_clear(struct vidow_server *server) {
 	}
 }
 
-bool vidow_keybind_key(struct vidow_server *server, xkb_keysym_t sym,
-		uint32_t mods, bool inhibited) {
-	const uint32_t interesting = WLR_MODIFIER_LOGO | WLR_MODIFIER_ALT |
-		WLR_MODIFIER_CTRL | WLR_MODIFIER_SHIFT;
-	xkb_keysym_t lower = xkb_keysym_to_lower(sym);
+/* 按下还没松开的那些键。「松开才触发」的绑定要记住按下那一下，「单独一个
+ * 修饰键」还要记住武装期间有没有别的键插进来。 */
+struct pending_press {
+	bool used;
+	enum vidow_bind_src src;
+	xkb_keysym_t sym;
+	uint32_t button;
+	uint32_t mods;        /* 按下那一刻的修饰键掩码（松开时按它匹配） */
+	bool inhibited;       /* 按下那一刻的抑制状态 */
+	bool swallow;         /* 按下那一下已经吞了（松开也跟着吞） */
+	bool tap;             /* 单独一个修饰键：武装中 */
+	uint32_t tap_mods;    /* 武装时按着的那组修饰键 */
+};
+#define PENDING_MAX 8
+static struct pending_press pendings[PENDING_MAX];
 
+#define INTERESTING_MODS (WLR_MODIFIER_LOGO | WLR_MODIFIER_ALT | \
+	WLR_MODIFIER_CTRL | WLR_MODIFIER_SHIFT)
+
+static struct pending_press *pending_new(void) {
+	for (size_t i = 0; i < PENDING_MAX; i++) {
+		if (!pendings[i].used) {
+			pendings[i] = (struct pending_press){ .used = true };
+			return &pendings[i];
+		}
+	}
+	return NULL;
+}
+
+static struct pending_press *pending_find(enum vidow_bind_src src,
+		xkb_keysym_t sym, uint32_t button) {
+	for (size_t i = 0; i < PENDING_MAX; i++) {
+		struct pending_press *p = &pendings[i];
+		if (!p->used || p->src != src) {
+			continue;
+		}
+		if (src == VIDOW_SRC_KEY ? p->sym == sym : p->button == button) {
+			return p;
+		}
+	}
+	return NULL;
+}
+
+/* 按了别的键 / 点了鼠标：单独一个修饰键那种绑定就作废（Super+Q 不该顺带把
+ * 「只按了 Super」那条也跑掉）。 */
+static void pending_disarm_taps(void) {
+	for (size_t i = 0; i < PENDING_MAX; i++) {
+		if (pendings[i].used && pendings[i].tap) {
+			pendings[i].used = false;
+		}
+	}
+}
+
+static bool mods_match(uint32_t mods, uint32_t want) {
+	return (mods & INTERESTING_MODS) == want;
+}
+
+/* 这条绑定和这次事件对得上吗（只看「触发源 + 修饰键 + 键」，不看时机）。 */
+static bool bind_hits(const struct vidow_keybind *bind, enum vidow_bind_src src,
+		xkb_keysym_t sym, uint32_t button, uint32_t mods) {
+	if (bind->src != src || !mods_match(mods, bind->mods)) {
+		return false;
+	}
+	if (src == VIDOW_SRC_MOUSE) {
+		return bind->button == button;
+	}
+	if (src != VIDOW_SRC_KEY) {
+		return false;
+	}
+	return sym == bind->keysym || xkb_keysym_to_lower(sym) == bind->keysym;
+}
+
+static void bind_run(struct vidow_server *server, struct vidow_keybind *bind) {
+	vidow_action_run(server, bind->action);
+	/* 事件（见 hooks.c）：谁按了什么键、跑了哪条动作 —— 脚本要「跟着按键
+	 * 做点别的」（录屏时打标记、状态栏闪一下）不用自己抢键。 */
+	const struct vidow_event_field fields[] = {
+		VIDOW_EV_STR("trigger", bind->trigger),
+		VIDOW_EV_STR("action", bind->action),
+		VIDOW_EV_END,
+	};
+	vidow_ipc_emit_simple(server, "keybind", fields);
+}
+
+/* 按下 / 松开时在表里找一条：src 对应、时机对得上、修饰键和键都对得上。
+ * inhibited = 现在有生效中的快捷键抑制（只认标记了 inhibited 的那几条）。 */
+static struct vidow_keybind *bind_lookup(struct vidow_server *server,
+		enum vidow_bind_src src, enum vidow_bind_on on, xkb_keysym_t sym,
+		uint32_t button, uint32_t mods, bool inhibited) {
 	struct vidow_keybind *bind;
 	wl_list_for_each(bind, &server->keybinds, link) {
-		/* 焦点那个表面抑制着快捷键时只有标记过的那几条生效（逃生口：
-		 * 不然虚拟机窗口一抑制，用户连关窗都关不了）。 */
+		if (bind->on != on || bind->modifier_only) {
+			continue;
+		}
 		if (inhibited && !bind->inhibited) {
 			continue;
 		}
-		if ((mods & interesting) != bind->mods) {
+		if (bind_hits(bind, src, sym, button, mods)) {
+			return bind;
+		}
+	}
+	return NULL;
+}
+
+/* 「单独一个修饰键」：找一条 modifier_only 的绑定，修饰键对得上，而且（写了
+ * `Super_L` 那种具体一侧的话）就是这一侧。 */
+static struct vidow_keybind *tap_lookup(struct vidow_server *server,
+		uint32_t tap_mods, xkb_keysym_t sym, bool inhibited) {
+	struct vidow_keybind *bind;
+	wl_list_for_each(bind, &server->keybinds, link) {
+		if (!bind->modifier_only || bind->mods != tap_mods) {
 			continue;
 		}
-		if (sym != bind->keysym && lower != bind->keysym) {
+		if (inhibited && !bind->inhibited) {
 			continue;
 		}
-		vidow_action_run(server, bind->action);
-		/* 事件（见 hooks.c）：谁按了什么键、跑了哪条动作 —— 脚本要「跟着按键
-		 * 做点别的」（录屏时打标记、状态栏闪一下）不用自己抢键。 */
-		const struct vidow_event_field fields[] = {
-			VIDOW_EV_STR("trigger", bind->trigger),
-			VIDOW_EV_STR("action", bind->action),
-			VIDOW_EV_END,
-		};
-		vidow_ipc_emit_simple(server, "keybind", fields);
+		if (bind->keysym == XKB_KEY_NoSymbol || bind->keysym == sym) {
+			return bind;
+		}
+	}
+	return NULL;
+}
+
+/* 按下时问一句：这条键（鼠标按键）有没有「松开才触发」的绑定？有就记下来，
+ * 顺便把按下那一下也吞掉 —— 只吞松开的话客户端会以为这个键一直按着。 */
+static bool pending_record(struct vidow_server *server, enum vidow_bind_src src,
+		xkb_keysym_t sym, uint32_t button, uint32_t mods, bool inhibited) {
+	struct vidow_keybind *bind = bind_lookup(server, src, VIDOW_BIND_RELEASE,
+		sym, button, mods, inhibited);
+	if (bind == NULL) {
+		return false;
+	}
+	struct pending_press *p = pending_new();
+	if (p == NULL) {
+		/* 表满了：这一下不记（松开时自然不会触发）。 */
+		return false;
+	}
+	p->src = src;
+	p->sym = sym;
+	p->button = button;
+	p->mods = mods;
+	p->inhibited = inhibited;
+	p->swallow = true;
+	return true;
+}
+
+/* 松开：把按下时记下来的那条跑掉。返回是否吞掉这次松开。 */
+static bool pending_release(struct vidow_server *server,
+		enum vidow_bind_src src, xkb_keysym_t sym, uint32_t button,
+		uint32_t mods) {
+	struct pending_press *p = pending_find(src, sym, button);
+	if (p == NULL) {
+		return false;
+	}
+	bool swallow = p->swallow;
+	bool tap = p->tap;
+	uint32_t pmods = p->mods;
+	uint32_t tap_mods = p->tap_mods;
+	bool pinhibited = p->inhibited;
+	p->used = false;
+
+	if (tap) {
+		/* 还按着别的修饰键就不算「只按了一下」：等最后一个松开再说。 */
+		if ((mods & INTERESTING_MODS) != 0) {
+			return swallow;
+		}
+		struct vidow_keybind *bind =
+			tap_lookup(server, tap_mods, sym, pinhibited);
+		if (bind != NULL) {
+			bind_run(server, bind);
+			return true;
+		}
+		return swallow;
+	}
+	struct vidow_keybind *bind = bind_lookup(server, src, VIDOW_BIND_RELEASE,
+		sym, button, pmods, pinhibited);
+	if (bind != NULL) {
+		bind_run(server, bind);
+		return true;
+	}
+	return swallow;
+}
+
+bool vidow_keybind_key(struct vidow_server *server, xkb_keysym_t sym,
+		bool pressed, uint32_t mods, bool inhibited) {
+	if (!pressed) {
+		return pending_release(server, VIDOW_SRC_KEY, sym, 0, mods);
+	}
+
+	uint32_t bit = modifier_bit(sym);
+	if (bit == 0) {
+		/* 普通键：单独一个修饰键那种绑定作废（这是「组合键」了）。 */
+		pending_disarm_taps();
+	} else {
+		/* 修饰键按下：有「单独一个修饰键」的绑定就武装起来。
+		 * tap_mods 用「当前按着的 + 刚按下的这个」（wlroots 是先更新 xkb 状态
+		 * 再发按键事件，所以 mods 一般已经含这一位；补上一位两种情况都对）。 */
+		uint32_t held = (mods & INTERESTING_MODS) | bit;
+		if (tap_lookup(server, held, sym, inhibited) != NULL &&
+				pending_find(VIDOW_SRC_KEY, sym, 0) == NULL) {
+			struct pending_press *p = pending_new();
+			if (p != NULL) {
+				p->src = VIDOW_SRC_KEY;
+				p->sym = sym;
+				p->mods = mods;
+				p->inhibited = inhibited;
+				p->swallow = true;
+				p->tap = true;
+				p->tap_mods = held;
+			}
+			return true;
+		}
+	}
+
+	struct vidow_keybind *bind = bind_lookup(server, VIDOW_SRC_KEY,
+		VIDOW_BIND_PRESS, sym, 0, mods, inhibited);
+	if (bind != NULL) {
+		bind_run(server, bind);
+		return true;
+	}
+	if (pending_record(server, VIDOW_SRC_KEY, sym, 0, mods, inhibited)) {
+		return true;
+	}
+	return false;
+}
+
+bool vidow_keybind_button(struct vidow_server *server, uint32_t button,
+		bool pressed, uint32_t mods, bool inhibited) {
+	if (pressed) {
+		/* 点了鼠标就不算「只按了一下修饰键」。 */
+		pending_disarm_taps();
+	} else if (pending_release(server, VIDOW_SRC_MOUSE, XKB_KEY_NoSymbol,
+			button, mods)) {
+		return true;
+	}
+
+	struct vidow_keybind *bind = bind_lookup(server, VIDOW_SRC_MOUSE,
+		VIDOW_BIND_PRESS, XKB_KEY_NoSymbol, button, mods, inhibited);
+	if (bind != NULL) {
+		bind_run(server, bind);
+		return true;
+	}
+	if (pending_record(server, VIDOW_SRC_MOUSE, XKB_KEY_NoSymbol, button,
+			mods, inhibited)) {
+		return true;
+	}
+	return false;
+}
+
+bool vidow_keybind_wheel(struct vidow_server *server,
+		enum wl_pointer_axis axis, double amount, uint32_t mods,
+		bool inhibited) {
+	if (amount == 0) {
+		return false;
+	}
+	int dir = amount > 0 ? 1 : -1;
+	struct vidow_keybind *bind;
+	wl_list_for_each(bind, &server->keybinds, link) {
+		if (bind->src != VIDOW_SRC_WHEEL || bind->axis != axis ||
+				bind->axis_dir != dir) {
+			continue;
+		}
+		if (inhibited && !bind->inhibited) {
+			continue;
+		}
+		if (!mods_match(mods, bind->mods)) {
+			continue;
+		}
+		bind_run(server, bind);
 		return true;
 	}
 	return false;
@@ -328,6 +703,14 @@ static bool action_move_step(struct vidow_server *server, int direction) {
 	struct vidow_workspace *target =
 		vidow_workspace_at(server, view->ws->output, idx);
 	return target != NULL && vidow_workspace_move_view(server, view, target);
+}
+
+/* 光标底下那个窗口（指针手势动作用的：按下那一刻谁在光标下面，就拖谁）。 */
+static struct vidow_view *view_under_cursor(struct vidow_server *server) {
+	double sx, sy;
+	struct wlr_surface *surface = NULL;
+	return vidow_view_at(server, server->cursor->x, server->cursor->y, &surface,
+		&sx, &sy);
 }
 
 static void log_action(const char *action, const char *what) {
@@ -510,6 +893,35 @@ bool vidow_action_run(struct vidow_server *server, const char *action) {
 			return false;
 		}
 		log_action(action, "把窗口从列里取出来");
+		return true;
+	}
+	/* 鼠标拖拽：原来写死在 input.c 的指针手势，现在是一条动作 + 一条绑定：
+	 *     vidow.bind("Mod+mouse-left",  "interactive-move")
+	 *     vidow.bind("Mod+mouse-right", "interactive-resize")
+	 * 目标是**光标底下那个窗口**（按下那一刻的位置）：浮窗改自己的几何，平铺
+	 * 窗口拖动 / 改列宽。拖起来之后的移动和松手由抓取那套接管（input.c 的
+	 * grab_mode），这里只负责「开始拖」。 */
+	if (strcmp(name, "interactive-move") == 0 ||
+			strcmp(name, "interactive-resize") == 0) {
+		bool resize = strcmp(name, "interactive-resize") == 0;
+		struct vidow_view *view = view_under_cursor(server);
+		if (view == NULL || view->popup) {
+			return false;
+		}
+		if (view->float_mode != VIDOW_FLOAT_NONE) {
+			vidow_float_begin_grab(server, view, resize, false);
+			if (view != server->focused) {
+				vidow_focus_view(view);
+			}
+		} else if (view->column == NULL) {
+			return false;
+		} else if (resize) {
+			vidow_tile_resize_begin(server, view);
+		} else {
+			vidow_tile_grab_begin(server, view);
+		}
+		log_action(action, resize ? "开始改大小（跟着光标）" :
+			"开始拖窗口（跟着光标）");
 		return true;
 	}
 	if (strcmp(name, "close-window") == 0) {

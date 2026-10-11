@@ -100,6 +100,11 @@ write_config() {
 	# 注意 echo 后面那一段要**引号包住**：裸着写的话 | 会被 sh 当管道，
 	# 整条命令就变成一串「找不到的命令」了。
 	cat > "$CFGDIRV/config.lua" <<EOF
+-- 指针手势（拖动 / 改列宽 / 滚轮换列）现在是键位：合成器不内置，测试也得自己绑。
+vidow.bind("Mod+mouse-left", "interactive-move")
+vidow.bind("Mod+mouse-right", "interactive-resize")
+vidow.bind("Mod+wheel-up", "focus-column left")
+vidow.bind("Mod+wheel-down", "focus-column right")
 vidow.bind("Mod+T", "spawn touch $RUNDIR/keybind-fired")
 vidow.on("*", "echo \"\$VIDOW_EVENT|\$VIDOW_TRIGGER|\$VIDOW_ACTION|\$VIDOW_NAME|\$VIDOW_ENABLED|\$VIDOW_OUTPUT|\$VIDOW_APP_ID|\$VIDOW_ERROR|\$VIDOW_DISPLAY|\$VIDOW_TYPE|\$VIDOW_KIND\" >> $EVLOG")
 EOF

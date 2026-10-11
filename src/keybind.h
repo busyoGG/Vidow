@@ -21,37 +21,73 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+#include <wayland-client-protocol.h> /* enum wl_pointer_axis（滚轮绑定要用） */
 #include <wayland-util.h>
 
 #include <xkbcommon/xkbcommon.h>
 
 struct vidow_server;
 
+/* 触发时机：按下（默认）还是松开。 */
+enum vidow_bind_on {
+	VIDOW_BIND_PRESS = 0,
+	VIDOW_BIND_RELEASE,
+};
+
+/* 触发源：键盘键 / 鼠标按键 / 滚轮。三类共用一张绑定表、一套动作字符串。 */
+enum vidow_bind_src {
+	VIDOW_SRC_KEY = 0,
+	VIDOW_SRC_MOUSE,   /* button = BTN_* */
+	VIDOW_SRC_WHEEL,   /* axis + axis_dir */
+};
+
 struct vidow_keybind {
 	struct wl_list link; /* vidow_server.keybinds */
 	char trigger[64];    /* 原样记着，日志和 list 里用 */
 	char action[128];
 	uint32_t mods;       /* WLR_MODIFIER_* 的掩码，0 = 不看修饰键 */
-	xkb_keysym_t keysym;
+	xkb_keysym_t keysym; /* VIDOW_SRC_KEY：主键；单独修饰键时是 NoSymbol */
 	/* 抑制期间也生效（vidow.bind 第三个参数 { inhibited = true }）。 */
 	bool inhibited;
+	enum vidow_bind_on on;
+	enum vidow_bind_src src;
+	uint32_t button;            /* VIDOW_SRC_MOUSE：BTN_LEFT 这种 */
+	enum wl_pointer_axis axis;  /* VIDOW_SRC_WHEEL：纵向还是横向 */
+	int axis_dir;               /* VIDOW_SRC_WHEEL：+1 / -1（下/右 是 +1） */
+	/* 触发里**只有修饰键**（`vidow.bind("Mod", …)`）：按一下 Super 那种。 */
+	bool modifier_only;
 };
 
 bool vidow_keybind_init(struct vidow_server *server);
 
-/* 加一条绑定。失败时把原因写进 err（不超过 errlen），返回 NULL。 */
+/* 加一条绑定。on_release = 松开才触发（vidow.bind 的 { on = "release" }）。
+ * 失败时把原因写进 err（不超过 errlen），返回 NULL。 */
 struct vidow_keybind *vidow_keybind_add(struct vidow_server *server,
 		const char *trigger, const char *action, bool inhibited,
-		char *err, size_t errlen);
+		bool on_release, char *err, size_t errlen);
 
 /* 清空全部绑定（config.lua 重载时用：重载等于重新声明一遍）。 */
 void vidow_keybind_clear(struct vidow_server *server);
 
 /* 有按键来了：命中哪条绑定就执行哪条，返回是否吃掉了这个按键。
  * 没命中的按键照旧透传给客户端。inhibited = 现在焦点那个表面有生效中的抑制
- * （那就只认标记了 inhibited 的那几条，见 keyboardgrab.c）。 */
+ * （那就只认标记了 inhibited 的那几条，见 keyboardgrab.c）。
+ *
+ * pressed = 按下还是松开。三种情况：
+ *   1) 普通绑定 + on=press：按下时命中就执行（现在这样），吞掉那次按下；
+ *   2) 普通绑定 + on=release：按下时记下来（那次按下也吞掉），松开时执行；
+ *   3) 单独一个修饰键（`vidow.bind("Mod", …)`）：按下武装，期间按下任何别的
+ *      键或鼠标键就解除，松开且其它修饰键都松了才执行（「按一下 Super 开全景」
+ *      要的就是这个 —— 否则 Super+Q 会顺带触发）。 */
 bool vidow_keybind_key(struct vidow_server *server, xkb_keysym_t sym,
-		uint32_t mods, bool inhibited);
+		bool pressed, uint32_t mods, bool inhibited);
+
+/* 鼠标按键 / 滚轮来了（同一个绑定表，动作字符串同一套）。返回是否吃掉。 */
+bool vidow_keybind_button(struct vidow_server *server, uint32_t button,
+		bool pressed, uint32_t mods, bool inhibited);
+bool vidow_keybind_wheel(struct vidow_server *server,
+		enum wl_pointer_axis axis, double amount, uint32_t mods,
+		bool inhibited);
 
 /* 执行一个动作字符串（键位绑定和 VIDOW_TEST_ACTION 测试钩子共用）。 */
 bool vidow_action_run(struct vidow_server *server, const char *action);

@@ -52,6 +52,11 @@ rm -rf "$RUNDIR"
 mkdir -p "$CFGDIR/.config/vidow" "$RUNDIR/run"
 chmod 700 "$RUNDIR/run"
 cat > "$CFGDIR/.config/vidow/config.lua" <<'CFG'
+-- 指针手势（拖动 / 改列宽 / 滚轮换列）现在是键位：合成器不内置，测试也得自己绑。
+vidow.bind("Mod+mouse-left", "interactive-move")
+vidow.bind("Mod+mouse-right", "interactive-resize")
+vidow.bind("Mod+wheel-up", "focus-column left")
+vidow.bind("Mod+wheel-down", "focus-column right")
 scale = "1"
 gaps = 10
 window_move_ms = 0

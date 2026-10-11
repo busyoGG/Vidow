@@ -78,6 +78,9 @@ window_open_ms = 60
 window_close_ms = 60
 window_move_ms = 60
 $1
+-- 指针手势是键位（合成器不内置）：第 7 轮「按住 super 滚轮换列」那条断言要它
+vidow.bind("Mod+wheel-up", "focus-column left")
+vidow.bind("Mod+wheel-down", "focus-column right")
 CFG
 }
 

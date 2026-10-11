@@ -106,6 +106,11 @@ start_vidow() { # <额外配置行> [blur 那一行，缺省 blur_enabled = fals
 	# 注意：同一个名字在配置里**第一次赋值**才算数（后面那行是普通 Lua 全局），
 	# 所以 blur 开关得在这儿替换，不能塞在 $1 里再写一遍。
 	cat > "$CFGDIR/.config/vidow/config.lua" <<CFG
+-- 指针手势（拖动 / 改列宽 / 滚轮换列）现在是键位：合成器不内置，测试也得自己绑。
+vidow.bind("Mod+mouse-left", "interactive-move")
+vidow.bind("Mod+mouse-right", "interactive-resize")
+vidow.bind("Mod+wheel-up", "focus-column left")
+vidow.bind("Mod+wheel-down", "focus-column right")
 scale = "1"
 gaps = 10
 window_open_ms = 0

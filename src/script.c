@@ -729,14 +729,33 @@ static int l_bind(lua_State *L) {
 	/* 第三个参数（可选）：{ inhibited = true } = 焦点那个表面抑制着快捷键时
 	 * 这条绑定照样生效（逃生口，见 keybind.h / keyboardgrab.c）。 */
 	bool inhibited = false;
+	/* { on = "release" } = 松开才触发（默认按下触发；单独一个修饰键的绑定默认
+	 * 就是松开触发，见 keybind.c）。 */
+	bool on_release = false;
 	if (lua_istable(L, 3)) {
 		lua_getfield(L, 3, "inhibited");
 		inhibited = lua_toboolean(L, -1) != 0;
 		lua_pop(L, 1);
+		lua_getfield(L, 3, "on");
+		if (lua_isstring(L, -1)) {
+			const char *on = lua_tostring(L, -1);
+			if (strcmp(on, "release") == 0 || strcmp(on, "up") == 0) {
+				on_release = true;
+			} else if (strcmp(on, "press") == 0 ||
+					strcmp(on, "down") == 0) {
+				on_release = false;
+			} else {
+				lua_pop(L, 1);
+				return luaL_error(L, "vidow.bind 的 on 只能是 "
+					"\"press\"（默认）或 \"release\"，给的是 '%s'",
+					on);
+			}
+		}
+		lua_pop(L, 1);
 	}
 	char err[160];
-	if (vidow_keybind_add(s->server, trigger, action, inhibited, err,
-			sizeof(err)) == NULL) {
+	if (vidow_keybind_add(s->server, trigger, action, inhibited, on_release,
+			err, sizeof(err)) == NULL) {
 		return luaL_error(L, "%s", err);
 	}
 	lua_pushboolean(L, 1);
