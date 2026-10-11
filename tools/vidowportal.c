@@ -517,7 +517,18 @@ static void style_load(void) {
 		"separator.footer { background-color: %s; min-height: 1px; }\n"
 		"stackswitcher { background-color: transparent; padding: 3px; }\n"
 		"stackswitcher button { background-image: none; background-color: transparent; border: none; box-shadow: none; padding: 14px 44px; color: %s; font-weight: 600; min-height: 22px; }\n"
-		"stackswitcher button:checked { color: %s; }\n",
+		"stackswitcher button:checked { color: %s; }\n"
+		/* 键盘焦点的指示器：GTK 默认画的是**虚线**（选中那张再叠一圈虚线，看着像
+		 * 「两个高亮」，用户报的「奇怪的虚线框」就是它）。卡片和 tab 的选中态本来
+		 * 就是强调色描边 / 强调色块，焦点不用再画一遍；底栏那两个按钮没有别的指示，
+		 * 给一条强调色实线。 */
+		"stackswitcher button:focus { outline-style: none; }\n"
+		"button.card:focus { outline-style: solid; outline-width: 2px; "
+		"outline-color: %s; outline-offset: -3px; }\n"
+		/* 选中的那张本来就有强调色描边：焦点再画一圈就成了「两个高亮」。 */
+		"button.card:checked:focus { outline-style: none; }\n"
+		"button.primary:focus, button.ghost:focus { outline-style: solid; "
+		"outline-width: 2px; outline-color: %s; outline-offset: -7px; }\n",
 		pal->bg,
 		pal->bg,
 		pal->text,
@@ -538,7 +549,9 @@ static void style_load(void) {
 		pal->text,
 		pal->border,
 		pal->dim,
-		on_accent);
+		on_accent,
+		accent,
+		accent);
 	GtkCssProvider *provider = gtk_css_provider_new();
 	GError *err = NULL;
 	gtk_css_provider_load_from_data(provider, css, -1, &err);
@@ -692,6 +705,13 @@ static gboolean pill_draw(GtkWidget *widget, cairo_t *cr, gpointer data) {
 /* 占位（虚拟屏幕 / 还没框的区域）：虚线框也是超椭圆 —— CSS 的 border 只会画矩形。 */
 static gboolean placeholder_draw(GtkWidget *widget, cairo_t *cr, gpointer data) {
 	(void)data;
+	/* 这张卡已经有真预览了（region_row_apply 会把 class 摘掉）就别再画虚线框 ——
+	 * 这个 draw 回调是挂在控件上的，摘 class 不会把它摘掉，不自己问一句的话真缩略图
+	 * 上会叠一个「奇怪的虚线框」。 */
+	if (!gtk_style_context_has_class(gtk_widget_get_style_context(widget),
+			"placeholder")) {
+		return FALSE;
+	}
 	GtkAllocation a;
 	gtk_widget_get_allocation(widget, &a);
 	if (a.width < 4 || a.height < 4) {
