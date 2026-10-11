@@ -942,6 +942,7 @@ VIDOW_TEST_RENDERER=gles2 ./test-screencast.sh
 ./test-blur2out.sh                  # 两块屏（1 倍 + 2 倍）下私有模糊区域的金字塔缓冲每帧都复用（6 项断言）
 ./test-config.sh                     # 配置系统：一个 Lua 文件 + 改了就自动重载 + vidow.exec 的选项（全 headless，24 项断言）
 ./test-binds.sh                      # 键位全是配置给的：没配置=没有键位、默认那套能用、换键位、动作字符串（全 headless，35 项断言）
+./test-gesture.sh                    # 触控板手势：三指横扫跟手拖视口 / 四指竖扫 / 捏合 / 按住（全 headless，注入，26 项断言）
 ./test-config-include.sh             # 配置拆成好几份：vidow.include() 的路径/顺序/报错 + 改哪份都自动重载（全 headless，25 项断言）
 ./test-defaultconfig.sh              # 默认配置按类别拆成 configs/（--default-config / --write-config）+ 配置族的表写法 + 说明的完整性（全 headless，45 项断言）
 ./test-gap.sh                        # 间距：一个数管全部 + 单边/内间距覆盖 + 「两条 50% 正好装进一屏」（全 headless，34 项断言）
@@ -1013,11 +1014,34 @@ vidow.bind("Mod+Q", "close-window")        -- 动作字符串见下面那张表
 vidow.bind("Mod+Return", "spawn kitty")    -- spawn 后面跟一条 shell 命令
 ```
 
-第三个参数（可选，选项表）现在只有一个字段 `inhibited`：
+**触发怎么写**（一张表收三类：键盘键、鼠标按键、滚轮）：
+
+```lua
+vidow.bind("Mod+Q", "close-window")                     -- 键盘键（按下触发，默认）
+vidow.bind("Mod+mouse-left",  "interactive-move")       -- 鼠标左键
+vidow.bind("Mod+mouse-right", "interactive-resize")     -- 鼠标右键
+vidow.bind("Mod+wheel-up",    "focus-column left")      -- 滚轮（一个方向一条）
+vidow.bind("Mod", "toggle-overview")                    -- 单独一个修饰键
+vidow.bind("Super_L", "toggle-overview")                -- 只认左边那个 Super
+```
+
+鼠标按键写 `mouse-left` / `mouse-middle` / `mouse-back` / `mouse-forward`（也认
+`BTN_LEFT` 和 `mouse-274` 这种编号）——**别写 `left`**，那个在键名表里是**方向键**。
+滚轮写 `wheel-up` / `wheel-down` / `wheel-left` / `wheel-right`。
+
+**单独一个修饰键**（`vidow.bind("Mod", …)`）是 **tap 语义**：按下武装 → 期间按下任何
+别的键或鼠标键就作废 → 松开（且其它修饰键都松了）才触发。不这样定的话 `Super+Q` 会
+顺带把「只按了 Super」那条也跑掉。写 `Super_L` / `Super_R` 可以只认某一侧。
+
+第三个参数（可选，选项表）现在有两个字段：
 
 ```lua
 vidow.bind("Mod+Escape", "quit", { inhibited = true })
+vidow.bind("Mod+W", "close-window", { on = "release" })  -- 松开才触发
 ```
+
+`on = "press"`（默认）/ `"release"`：松开触发的那条**按下那一下也一起吞掉**（只吞松开
+的话客户端会以为这个键一直按着）。单独一个修饰键默认就是 `release`。
 
 意思是「焦点那个表面**抑制着快捷键**时这条照样生效」（默认 `false`）。抑制来自
 `zwp_keyboard_shortcuts_inhibit_manager_v1` —— 虚拟机的窗口 / 远程桌面客户端会说
@@ -1051,10 +1075,14 @@ vidow.bind("Mod+Escape", "quit", { inhibited = true })
 | `Ctrl+Alt+F1`…`F12` | 切 tty（只有真机、有会话时才接管；嵌套里这组键交给宿主） |
 | — | 特殊工作区 / 具名工作区**默认不绑**，要就自己 `vidow.bind("Mod+C", "workspace chat")` |
 
-指针手势（`Mod+左键拖动` / `Mod+右键拖动` / `Mod+滚轮`）不是键位：它们要的是「按着
-Mod 用鼠标」，改不了键（要改就是改 `src/input.c` 里的 `MOD_KEY`）。`Mod+右键拖动`
-在浮动窗口上改的是它自己的几何，在平铺窗口上改的是**列宽**（平铺窗口的高度是布局
-给的：整块可用高，没有「单个窗口的高度」这个概念，所以纵向拖不改东西）。
+指针手势（`Mod+左键拖动` / `Mod+右键拖动` / `Mod+滚轮`）**就是键位**（见上面那张表）：
+默认配置里绑的是 `interactive-move` / `interactive-resize`（目标 = 光标底下那个窗口）
+和 `focus-column left|right`。合成器**一个手势都不内置** —— 不绑就没有，想换键就改
+`vidow.bind("Mod+mouse-…")`，想换动作就换成别的动作字符串。`Mod+右键拖动`在浮动窗口
+上改的是它自己的几何，在平铺窗口上改的是**列宽**（平铺窗口的高度是布局给的：整块可用
+高，没有「单个窗口的高度」这个概念，所以纵向拖不改东西）。
+
+没绑的滚轮照旧转发给客户端（应用里的滚动不受影响）。
 
 鼠标左键点击窗口即聚焦并滚动到该列；点击 layer 表面（启动器）时按需交出键盘焦点。
 
@@ -1065,6 +1093,37 @@ overview 里：左键点窗口 = 选中它并缩回去，点空白 = 取消，`E
 确认；这期间键盘不给客户端（窗口马上就要换，给谁都可能给错）。
 
 普通滚轮事件转发给客户端，不用于滚动视口（用 `Mod+滚轮` 或 `Mod+H/L`）。
+
+## 触控板手势（`vidow.gesture{}`）
+
+```lua
+vidow.gesture{ fingers = 3, swipe = "view" }                     -- 连续：跟手拖视口
+vidow.gesture{ fingers = 4, direction = "up",   action = "workspace up" }
+vidow.gesture{ fingers = 4, direction = "down", action = "workspace down" }
+vidow.gesture{ fingers = 2, pinch = "out",      action = "cycle-column-width" }
+vidow.gesture{ fingers = 2, pinch = "in",       action = "cycle-column-width" }
+vidow.gesture{ fingers = 3, hold = true,        action = "toggle-overview" }
+```
+
+和键位一个规矩：**合成器一个手势都不内置**，动作字符串也是同一套（`vidow_action_run`）。
+一条手势 = `fingers` + 「哪种手势」（`swipe` / `direction` / `pinch` / `hold` **写且只写一个**）
++ `action`（`swipe = "view"` 那条不用动作，它自己拖视口）。
+
+| 写法 | 语义 |
+| `swipe = "view"` | **连续**：手指拖着条带走，视口跟着动；松手按拖了多远决定「吸附到相邻那条列」（≥ 100px）还是「弹回原位」（160ms 缓动）。拖的过程中**不换焦点**，也不跑 arrange 里那套「把焦点列滚回可见区」——手指说了算 |
+| `direction = "left\|right\|up\|down"` | **离散**：整个手势结束后看累计位移的主方向对不对得上，对得上且够远（`distance`，默认 300）才触发 |
+| `pinch = "in\|out"` | 捏合：`scale` 相对手势开始偏离 ≥ 0.1 才算 |
+| `hold = true` | libinput 的 hold（手指按住不动）：`hold_begin` 当场触发 |
+
+单位：libinput 的手势位移是**归一化到 1000dpi** 的（1 单位 ≈ 0.025mm，手指划 1cm ≈ 394
+单位）。`speed`（只对 `swipe = "view"`）是「1 单位 → 多少逻辑像素」，默认 0.3（= 手指
+1cm ≈ 屏幕 118px）；`distance`（只对 `direction`）是阈值，单位同上。
+
+libinput 的手势只在**触控板**上发（鼠标 / 触摸屏不发），headless 里也没有 —— 测试走
+注入那条路：`vidowmsg gesture swipe-begin 3` / `gesture swipe-update 3 dx dy` /
+`gesture swipe-end [--cancel]` / `gesture pinch-begin 2` / `gesture pinch-update 2 scale` /
+`gesture pinch-end` / `gesture hold-begin 3` / `gesture hold-end`，注入直接调
+`src/gesture.c` 的同一批函数，判据见 `./test-gesture.sh`。
 
 ## 快捷键抑制与 X11 的键盘抓取
 
@@ -1673,7 +1732,7 @@ vidow 自己的，比如 `vidow-wayland-1.sock`）；`ipc_socket` 可以写死�
 | `outputs` | 每块屏：连接器名 / 描述 / make / model、`enabled`、`scale`、`transform`、刷新率、物理尺寸、布局矩形、`usable_area`、`viewport_x`、活动 / 显示着的工作区、它上面的工作区 / 窗口 / layer、**所有可用模式**、`adaptive_sync` / `vrr_supported`、`depth` / `render_format`、`primaries` / `transfer_functions` / `hdr_capable`（这块屏**自己报**的色彩能力，HDR 可行性就看它）、模糊贴图状态 |
 | `layers` | 每个 layer surface：`namespace`、`layer`、`output`、`mapped`、`exclusive_zone`、`keyboard_interactivity`、`anchor`、`margin`、想要 / 实际尺寸、几何 |
 | `config` | **配置表的全部键值**（跟 `config.lua` 里 `vidow.get` 读到的是同一个东西）；`config` + `key` 只取一个 |
-| `keybinds` / `rules` | 键位表（触发串 + 动作串）、窗口规则（含「这一条到底写没写」的 null 语义） |
+| `keybinds` / `gestures` / `rules` | 键位表（触发串 + 动作串）、触控板手势表（触发串 + 动作串 + 手指数 + 哪种手势）、窗口规则（含「这一条到底写没写」的 null 语义） |
 | `seats` / `input` | seat 的能力列表、当前键盘的布局 / repeat / LED、所有键盘（含虚拟键盘和 vidow 自己的注入键盘 `vidow-inject`）、光标位置、当前的交互式 grab、指针约束（`pointer_constraint`：`type` / `lifetime` / `window` /
 `cursor`）、键盘那两个（`shortcuts_inhibited`：焦点那个表面有没有生效中的抑制；`keyboard_grab`：`null` 或 `{type: xwayland, window}`，X11 抓着键盘时）、拿着键盘的 layer surface |
 | `tokens` | 活着的 xdg-activation 令牌（app_id、serial 校验过没过、活了多久） |
@@ -2625,7 +2684,7 @@ layer 的模糊底衬把 layer surface 自己的缓冲当 mask 传进去，窗�
     ├── 11-activation.lua        窗口激活
     ├── 12-portal.lua            xdg-desktop-portal
     ├── 13-cursor.lua            指针
-    ├── 14-keys.lua              键位（合成器不内置，默认这一套）+ 工作区 / 窗口规则
+    ├── 14-keys.lua              键位 + 触控板手势（合成器都不内置，默认这一套）+ 工作区 / 窗口规则
     ├── 15-mru.lua               Alt+Tab 的最近窗口切换器
     └── 16-env.lua               会话环境（和 systemd 用户管理器对账）/ 自启动 / 事件钩子
 ```
@@ -4539,6 +4598,43 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
       - 判据：`test-fullscreen-scroll.sh` 新增 9 条（非全屏的 look 有边框 2 / 圆角 12 / 阴影 8，
         全屏之后都是 0；左上角那一点是全屏窗口自己的内容而不是圆角外面的背景；浮动的全屏
         geometry = 0,0 1280x720、退出全屏回到原来的浮动尺寸）；47 项全过。
+
+210. **绑定系统重做：鼠标按键 / 滚轮 / 单独一个修饰键 / 松开触发 + 触控板手势**（用户：「指针手势
+      也要允许配置 快捷键允许单独一个修饰键（看看什么方案比较好）」，补一句「和普通键位绑定一样，
+      只不过加入鼠标按键」+「一起做连续版，顺便所有键位绑定的逻辑改一下，分为按下触发和释放触发」）
+
+      - **一张表收三类触发**：`vidow.bind` 现在收键盘键、鼠标按键（`mouse-left` / `mouse-middle`
+        / `mouse-back` / `mouse-forward`，也认 `BTN_LEFT` 和编号）、滚轮（`wheel-up/down/left/right`）
+        —— 动作字符串还是同一套（`vidow_action_run`）。**`left` / `right` 不能拿来写鼠标键**：
+        键名表里它们已经是方向键了，直接改会悄悄改掉方向键的绑定。
+      - **两种触发时机**：`{ on = "press" }`（默认）/ `{ on = "release" }`。松开触发的那条连
+        按下那一下也一起吞（只吞松开的话客户端会以为键一直按着）；按下时把命中的那条记在
+        `pending[]` 里，松开时按**按下那一刻**的修饰键掩码再匹配一次。
+      - **单独一个修饰键**（`vidow.bind("Mod", …)`）：**tap 语义** —— 按下武装、期间按下任何别的
+        键或鼠标键就作废、松开且其它修饰键都松了才触发。为什么不能「按下就触发」：`Super+Q` 会
+        顺带把「只按了 Super」那条也跑掉。`Super_L` / `Super_R` 可以只认某一侧。默认时机是
+        `release`（单独一个修饰键写 `press` 没意义）。
+      - **三个指针手势改成「动作 + 绑定」**：原来写死在 `input.c`（`MOD_KEY` + 按钮硬编码）的
+        `Mod+左键拖` / `Mod+右键拖` / `Mod+滚轮` 现在是两个新动作 `interactive-move` /
+        `interactive-resize`（目标 = **光标底下那个窗口**，浮窗改几何、平铺拖动 / 改列宽）+ 滚轮换列
+        用现成的 `focus-column`，默认配置里给了这四条绑定。**没绑就没有**（和键位同一条规矩），
+        没绑的滚轮照旧转发给客户端。测试注入的 `pointer-button … mod`（force_mod）现在参与绑定匹配
+        —— 测试环境没有真键盘，拖拽要求按着 Mod。
+      - **触控板手势**（`vidow.gesture{}`，新文件 `src/gesture.c`）：`swipe = "view"`（**连续**：
+        手指拖着条带走，松手按拖了多远吸附到相邻那条列 / 弹回原位）、`direction = …`（离散，松手按
+        主方向触发，阈值 `distance`）、`pinch = "in|out"`、`hold = true`。挂在 `wlr_pointer` 的
+        swipe / pinch / hold 信号上（libinput 只对触控板发这些）。连续那条的关键是 `arrange` 的
+        Pass 2：手指拖的时候视口由 `output->gesture_viewport` 说了算，**不跑**「把焦点列滚回可见区」
+        那套（不然刚把焦点列拖出屏幕就被它拽回来），松手再用 160ms 缓动滑到「不做手势时该在的位置」。
+        位移单位是 libinput 的归一化单位（1000dpi），`speed` 默认 0.3 = 手指 1cm ≈ 屏幕 118px。
+      - **注入钩子**：`vidowmsg gesture swipe-begin 3` / `swipe-update 3 dx dy` / `swipe-end [--cancel]`
+        / `pinch-begin|update|end` / `hold-begin|end` —— 直接调 gesture.c 的同一批函数（这台机器上
+        没有触控板，真机手势没法量）。`vidowmsg state` 里多了 `gestures` 数组。
+      - 验证：`./test-gesture.sh`（5 轮 21 项）—— 没配置就没手势（注入了也不跑动作）、四指上扫够远
+        才触发 / 方向没绑不算 / 太短不算 / cancelled 不算、捏合 scale 过阈值才算、按住当场触发、
+        三指横扫拖动中视口跟手（1270 → 910）且焦点不动、松手吸附到相邻那条列（焦点换成前一条、
+        视口停在它的左边缘）、太短和 cancelled 都弹回原位；`./test-binds.sh`、`./test-defaultconfig.sh`
+        照旧全过（11 个吃写死手势的测试配置里补上了那四条绑定）。
 
 209. **选择器两个虚线框**（用户：「第一个tab存在一个奇怪的虚线框，选中item的时候item的名字还预览图
       一开始的时候会有两个单独的高亮」）

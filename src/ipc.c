@@ -29,6 +29,7 @@
 #include <wlr/util/log.h>
 
 #include "env.h"
+#include "gesture.h"
 #include "hooks.h"
 #include "ipcstate.h"
 #include "json.h"
@@ -1742,6 +1743,71 @@ static bool cmd_pointer_scroll(struct vidow_server *server, struct jval *req,
 	return true;
 }
 
+/* 触控板手势的注入：`vidowmsg gesture swipe-begin 3` / `gesture swipe-update 3 dx dy`
+ * / `gesture swipe-end` / `gesture pinch-begin 2` / `gesture pinch-update 2 scale` /
+ * `gesture pinch-end` / `gesture hold-begin 3` / `gesture hold-end`。
+ *
+ * 走的**就是** libinput 手势那条路（gesture.c 的同一批函数），所以测试量到的
+ * 「手势怎么派发、视口怎么跟手、松手怎么吸附」都是真代码。 */
+static bool cmd_gesture(struct vidow_server *server, struct jval *req,
+		struct jbuf *out, char *err, size_t errlen) {
+	if (!vidow_inject_allowed(server, err, errlen)) {
+		return false;
+	}
+	const char *kind = jget_str(req, "kind");
+	if (kind == NULL || kind[0] == '\0') {
+		kind = jget_str(req, "gesture");
+	}
+	if (kind == NULL || kind[0] == '\0') {
+		snprintf(err, errlen, "要 kind（swipe-begin / swipe-update / "
+			"swipe-end / pinch-begin / pinch-update / pinch-end / "
+			"hold-begin / hold-end）");
+		return false;
+	}
+	long long fingers = 0;
+	jget_int(req, "fingers", &fingers);
+	double a = 0.0, b = 0.0;
+	bool has_a = jget_double(req, "a", &a) || jget_double(req, "dx", &a);
+	bool has_b = jget_double(req, "b", &b) || jget_double(req, "dy", &b);
+	jget_double(req, "scale", &a);
+	bool cancel = false;
+	jget_bool(req, "cancel", &cancel);
+	(void)has_a;
+	(void)has_b;
+	if (strcmp(kind, "swipe-begin") == 0) {
+		vidow_gesture_swipe_begin(server, (int)fingers);
+	} else if (strcmp(kind, "swipe-update") == 0) {
+		vidow_gesture_swipe_update(server, (int)fingers, a, b);
+	} else if (strcmp(kind, "swipe-end") == 0) {
+		vidow_gesture_swipe_end(server, cancel);
+	} else if (strcmp(kind, "pinch-begin") == 0) {
+		vidow_gesture_pinch_begin(server, (int)fingers);
+	} else if (strcmp(kind, "pinch-update") == 0) {
+		/* a（位置参数）就是 scale；没给 = 1.0（等于没捏）。 */
+		vidow_gesture_pinch_update(server, (int)fingers,
+			a > 0.0 ? a : 1.0);
+	} else if (strcmp(kind, "pinch-end") == 0) {
+		vidow_gesture_pinch_end(server, cancel);
+	} else if (strcmp(kind, "hold-begin") == 0) {
+		vidow_gesture_hold_begin(server, (int)fingers);
+	} else if (strcmp(kind, "hold-end") == 0) {
+		vidow_gesture_hold_end(server, cancel);
+	} else {
+		snprintf(err, errlen, "不认识的 kind '%s'（swipe-begin / "
+			"swipe-update / swipe-end / pinch-begin / pinch-update / "
+			"pinch-end / hold-begin / hold-end）", kind);
+		return false;
+	}
+	jb_obj(out);
+	jb_key(out, "gesture");
+	jb_obj(out);
+	jb_kv_str(out, "kind", kind);
+	jb_kv_int(out, "fingers", fingers);
+	jb_obj_end(out);
+	jb_obj_end(out);
+	return true;
+}
+
 /* state = tap（默认）/ press / release；keys = "ctrl+shift+t" / "Return" / "a"。 */
 static bool cmd_send_key(struct vidow_server *server, struct jval *req,
 		struct jbuf *out, char *err, size_t errlen) {
@@ -2387,6 +2453,9 @@ static bool ipc_run(struct vidow_server *server, struct ipc_client *c,
 	}
 	if (strcmp(cmd, "pointer_scroll") == 0) {
 		return cmd_pointer_scroll(server, req, out, err, errlen);
+	}
+	if (strcmp(cmd, "gesture") == 0) {
+		return cmd_gesture(server, req, out, err, errlen);
 	}
 	if (strcmp(cmd, "send_key") == 0) {
 		return cmd_send_key(server, req, out, err, errlen);

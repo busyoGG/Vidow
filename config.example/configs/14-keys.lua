@@ -79,6 +79,17 @@ for i = 1, 9 do
 	vidow.bind("Mod+Shift+" .. i, "move " .. i)
 end
 
+-- 触控板手势（vidow.gesture{}）—— 和键位一个规矩：合成器一个都不内置。
+-- 三指横扫 = 跟着手指拖视口（连续；松手按拖了多远决定「吸附到相邻那条列」还是
+-- 「弹回原位」）；四指竖扫 = 换工作区；三指按住 = 全景。
+-- 捏合默认没绑（要就自己加，比如 vidow.gesture{ fingers = 2, pinch = "out",
+-- action = "cycle-column-width" }）。位移是 libinput 的归一化单位（1000dpi），
+-- speed 是「1 单位 → 多少像素」（默认 0.3 = 手指划 1cm ≈ 屏幕 118px）。
+vidow.gesture{ fingers = 3, swipe = "view" }
+vidow.gesture{ fingers = 4, direction = "up",   action = "workspace up" }
+vidow.gesture{ fingers = 4, direction = "down", action = "workspace down" }
+vidow.gesture{ fingers = 3, hold = true, action = "toggle-overview" }
+
 -- 切 tty（只有真机、有会话时才接管；嵌套 / headless 里这组键交给宿主）
 for i = 1, 12 do
 	vidow.bind("Ctrl+Alt+F" .. i, "switch-vt " .. i)

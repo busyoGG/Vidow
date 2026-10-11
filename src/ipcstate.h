@@ -31,6 +31,7 @@ void vidow_ipc_json_layer(struct jbuf *b, struct vidow_server *server,
 		struct vidow_layer_surface *ls);
 void vidow_ipc_json_config(struct jbuf *b, struct vidow_server *server);
 void vidow_ipc_json_keybinds(struct jbuf *b, struct vidow_server *server);
+void vidow_ipc_json_gestures(struct jbuf *b, struct vidow_server *server);
 void vidow_ipc_json_rules(struct jbuf *b, struct vidow_server *server);
 void vidow_ipc_json_seats(struct jbuf *b, struct vidow_server *server);
 void vidow_ipc_json_input(struct jbuf *b, struct vidow_server *server);

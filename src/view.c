@@ -2089,26 +2089,34 @@ static void output_arrange(struct vidow_server *server,
 	if (max_viewport < 0) {
 		max_viewport = 0;
 	}
-	struct vidow_view *focus = server->focused;
-	if (focus != NULL && focus->float_mode == VIDOW_FLOAT_FOLLOW &&
-			focus->parent != NULL) {
-		/* scroll to where the dialog's parent lives */
-		focus = focus->parent;
-	}
-	struct vidow_column *focused_col =
-		focus != NULL ? focus->column : NULL;
-	if (focused_col != NULL && focused_col->output == output->wlr_output) {
-		/* 聚焦的这条列「在条带上多宽」—— 全屏的那条算一整屏，所以聚焦它时
-		 * 视口正好落在它的 offset 上（= 全屏窗口左边缘贴着屏左边缘），聚焦
-		 * 它旁边那条时才把全屏整块推到屏外（并排露出来）。 */
-		int cw = column_has_fullscreen(focused_col) ? work.width :
-			focused_col->width;
-		int right = focused_col->offset + cw;
-		if (right > viewport + work.width) {
-			viewport = right - work.width;
+	/* 手指正拖着条带（三指横扫那种连续手势）：这期间视口是手指说了算 —— 不跑
+	 * 下面那套「把焦点列滚回可见区」，不然刚把焦点列拖出屏幕就会被它拽回来。
+	 * 松手那段吸附动画也走这里（gesture_drag 一直挂到动画结束）。 */
+	if (output->gesture_drag) {
+		viewport = output->gesture_viewport;
+	} else {
+		struct vidow_view *focus = server->focused;
+		if (focus != NULL && focus->float_mode == VIDOW_FLOAT_FOLLOW &&
+				focus->parent != NULL) {
+			/* scroll to where the dialog's parent lives */
+			focus = focus->parent;
 		}
-		if (focused_col->offset < viewport) {
-			viewport = focused_col->offset;
+		struct vidow_column *focused_col =
+			focus != NULL ? focus->column : NULL;
+		if (focused_col != NULL &&
+				focused_col->output == output->wlr_output) {
+			/* 聚焦的这条列「在条带上多宽」—— 全屏的那条算一整屏，所以聚焦
+			 * 它时视口正好落在它的 offset 上（= 全屏窗口左边缘贴着屏左边缘），
+			 * 聚焦它旁边那条时才把全屏整块推到屏外（并排露出来）。 */
+			int cw = column_has_fullscreen(focused_col) ? work.width :
+				focused_col->width;
+			int right = focused_col->offset + cw;
+			if (right > viewport + work.width) {
+				viewport = right - work.width;
+			}
+			if (focused_col->offset < viewport) {
+				viewport = focused_col->offset;
+			}
 		}
 	}
 	if (viewport < 0) {

@@ -72,6 +72,9 @@ static void usage(void) {
 "      toggle-overview / move-cursor x y [--relative] / cursor-shake / quit\n"
 "注入：move-cursor x y / pointer-button click|press|release [键] [连点数] /\n"
 "      pointer-scroll dx dy / send-key [tap|press|release] 组合键 / type-text 文字 /\n"
+"      gesture swipe-begin 3 / gesture swipe-update 3 dx dy / gesture swipe-end /\n"
+"      gesture pinch-begin 2 / gesture pinch-update 2 scale / gesture pinch-end /\n"
+"      gesture hold-begin 3 / gesture hold-end（触控板手势，走 libinput 那条路） /\n"
 "      （合成鼠标键盘事件，等于操控整个桌面；按键只给客户端，不触发 vidow 的\n"
 "        快捷键。默认开着，见 config 的 input_injection）\n"
 "订阅：watch [事件名…]\n"
@@ -148,7 +151,7 @@ static void json_value_data(FILE *out, const char *v) {
 static const char *positional_key(const char *cmd, int index) {
 	static const struct {
 		const char *cmd;
-		const char *keys[4];
+		const char *keys[5];
 	} maps[] = {
 		{ "focus-workspace", { "workspace", NULL } },
 		{ "create-workspace", { "name", NULL } },
@@ -196,6 +199,9 @@ static const char *positional_key(const char *cmd, int index) {
 		{ "cursor-shake", { NULL } },
 		{ "pointer-button", { "state", "button", "count", NULL } },
 		{ "pointer-scroll", { "dx", "dy", NULL } },
+		/* 触控板手势注入：vidowmsg gesture <kind> [fingers] [a] [b]
+		 * （swipe-update 的 a/b 是 dx/dy；pinch-update 的 a 是 scale） */
+		{ "gesture", { "kind", "fingers", "a", "b", NULL } },
 		{ "send-key", { "state", "keys", NULL } },
 		{ "type-text", { "text", NULL } },
 	};
@@ -203,7 +209,7 @@ static const char *positional_key(const char *cmd, int index) {
 		if (strcmp(maps[i].cmd, cmd) != 0) {
 			continue;
 		}
-		for (int k = 0; k < 4; k++) {
+		for (int k = 0; k < 5; k++) {
 			if (maps[i].keys[k] == NULL) {
 				return NULL;
 			}

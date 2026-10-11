@@ -1,3 +1,4 @@
+#include "gesture.h"
 #include "ipc.h"
 #include "server.h"
 
@@ -552,6 +553,67 @@ void vidow_pointer_button(struct vidow_server *server, uint32_t button,
 	}
 }
 
+/* ------------------------------------------------------------ 触控板手势
+ *
+ * libinput 的 swipe / pinch / hold 原样转给 gesture.c（那里管配置表和「拖视口」）。
+ * 手势事件也是指针事件：没有触控板（headless / 只有鼠标）时一个都不会来。 */
+static void server_pointer_swipe_begin(struct wl_listener *listener, void *data) {
+	struct vidow_server *server =
+		wl_container_of(listener, server, pointer_swipe_begin);
+	struct wlr_pointer_swipe_begin_event *event = data;
+	vidow_gesture_swipe_begin(server, (int)event->fingers);
+}
+
+static void server_pointer_swipe_update(struct wl_listener *listener, void *data) {
+	struct vidow_server *server =
+		wl_container_of(listener, server, pointer_swipe_update);
+	struct wlr_pointer_swipe_update_event *event = data;
+	vidow_gesture_swipe_update(server, (int)event->fingers, event->dx,
+		event->dy);
+}
+
+static void server_pointer_swipe_end(struct wl_listener *listener, void *data) {
+	struct vidow_server *server =
+		wl_container_of(listener, server, pointer_swipe_end);
+	struct wlr_pointer_swipe_end_event *event = data;
+	vidow_gesture_swipe_end(server, event->cancelled);
+}
+
+static void server_pointer_pinch_begin(struct wl_listener *listener, void *data) {
+	struct vidow_server *server =
+		wl_container_of(listener, server, pointer_pinch_begin);
+	struct wlr_pointer_pinch_begin_event *event = data;
+	vidow_gesture_pinch_begin(server, (int)event->fingers);
+}
+
+static void server_pointer_pinch_update(struct wl_listener *listener, void *data) {
+	struct vidow_server *server =
+		wl_container_of(listener, server, pointer_pinch_update);
+	struct wlr_pointer_pinch_update_event *event = data;
+	vidow_gesture_pinch_update(server, (int)event->fingers, event->scale);
+}
+
+static void server_pointer_pinch_end(struct wl_listener *listener, void *data) {
+	struct vidow_server *server =
+		wl_container_of(listener, server, pointer_pinch_end);
+	struct wlr_pointer_pinch_end_event *event = data;
+	vidow_gesture_pinch_end(server, event->cancelled);
+}
+
+static void server_pointer_hold_begin(struct wl_listener *listener, void *data) {
+	struct vidow_server *server =
+		wl_container_of(listener, server, pointer_hold_begin);
+	struct wlr_pointer_hold_begin_event *event = data;
+	vidow_gesture_hold_begin(server, (int)event->fingers);
+}
+
+static void server_pointer_hold_end(struct wl_listener *listener, void *data) {
+	struct vidow_server *server =
+		wl_container_of(listener, server, pointer_hold_end);
+	struct wlr_pointer_hold_end_event *event = data;
+	vidow_gesture_hold_end(server, event->cancelled);
+}
+
 static void server_cursor_axis(struct wl_listener *listener, void *data) {
 	struct vidow_server *server = wl_container_of(listener, server, cursor_axis);
 	struct wlr_pointer_axis_event *event = data;
@@ -683,6 +745,31 @@ bool vidow_input_init(struct vidow_server *server) {
 	wl_signal_add(&server->cursor->events.axis, &server->cursor_axis);
 	server->cursor_frame.notify = server_cursor_frame;
 	wl_signal_add(&server->cursor->events.frame, &server->cursor_frame);
+
+	server->pointer_swipe_begin.notify = server_pointer_swipe_begin;
+	wl_signal_add(&server->cursor->events.swipe_begin,
+		&server->pointer_swipe_begin);
+	server->pointer_swipe_update.notify = server_pointer_swipe_update;
+	wl_signal_add(&server->cursor->events.swipe_update,
+		&server->pointer_swipe_update);
+	server->pointer_swipe_end.notify = server_pointer_swipe_end;
+	wl_signal_add(&server->cursor->events.swipe_end,
+		&server->pointer_swipe_end);
+	server->pointer_pinch_begin.notify = server_pointer_pinch_begin;
+	wl_signal_add(&server->cursor->events.pinch_begin,
+		&server->pointer_pinch_begin);
+	server->pointer_pinch_update.notify = server_pointer_pinch_update;
+	wl_signal_add(&server->cursor->events.pinch_update,
+		&server->pointer_pinch_update);
+	server->pointer_pinch_end.notify = server_pointer_pinch_end;
+	wl_signal_add(&server->cursor->events.pinch_end,
+		&server->pointer_pinch_end);
+	server->pointer_hold_begin.notify = server_pointer_hold_begin;
+	wl_signal_add(&server->cursor->events.hold_begin,
+		&server->pointer_hold_begin);
+	server->pointer_hold_end.notify = server_pointer_hold_end;
+	wl_signal_add(&server->cursor->events.hold_end,
+		&server->pointer_hold_end);
 
 	server->request_cursor.notify = server_request_cursor;
 	wl_signal_add(&server->seat->events.request_set_cursor,

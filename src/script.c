@@ -1,4 +1,5 @@
 #include "env.h"
+#include "gesture.h"
 #include "hooks.h"
 #include "json.h"
 #include "server.h"
@@ -11,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 
 #include <lua.h>
@@ -786,6 +788,103 @@ static const char *table_string(lua_State *L, int index, const char *key) {
 	return value;
 }
 
+/* vidow.gesture{ … }：触控板手势（见 gesture.h）。
+ *
+ *   vidow.gesture{ fingers = 3, swipe = "view" }                    -- 连续拖视口
+ *   vidow.gesture{ fingers = 4, direction = "up",   action = "workspace up" }
+ *   vidow.gesture{ fingers = 2, pinch = "out",      action = "cycle-column-width" }
+ *   vidow.gesture{ fingers = 3, hold = true,        action = "toggle-overview" }
+ *
+ * 一条手势 = fingers + 一个「哪种手势」的字段（swipe / direction / pinch / hold）
+ * + action（`swipe = "view"` 那条不用动作：它自己拖视口）。 */
+static int l_gesture(lua_State *L) {
+	struct vidow_script *s = script_of(L);
+	if (!lua_istable(L, 1)) {
+		return luaL_error(L, "vidow.gesture 要一个表，比如 "
+			"vidow.gesture{ fingers = 3, swipe = \"view\" }");
+	}
+	lua_getfield(L, 1, "fingers");
+	int fingers = lua_isnumber(L, -1) ? (int)lua_tointeger(L, -1) : 0;
+	lua_pop(L, 1);
+
+	struct vidow_gesture_opts opts = { .fingers = fingers,
+		.kind = VIDOW_GESTURE_VIEW, .axis = WL_POINTER_AXIS_VERTICAL_SCROLL,
+		.dir = 0 };
+	const char *what = NULL;
+	const char *arg = NULL;
+	const char *swipe = table_string(L, 1, "swipe");
+	const char *direction = table_string(L, 1, "direction");
+	const char *pinch = table_string(L, 1, "pinch");
+	lua_getfield(L, 1, "hold");
+	bool hold = lua_toboolean(L, -1) != 0;
+	lua_pop(L, 1);
+	int n_kinds = (swipe != NULL) + (direction != NULL) + (pinch != NULL) +
+		(hold ? 1 : 0);
+	if (n_kinds != 1) {
+		return luaL_error(L, "vidow.gesture 里 swipe / direction / pinch / "
+			"hold 要**写且只写一个**（现在写了 %d 个）", n_kinds);
+	}
+	if (swipe != NULL) {
+		if (strcmp(swipe, "view") != 0) {
+			return luaL_error(L, "swipe 只认 \"view\"（跟手拖视口），"
+				"要「松手按方向触发一条动作」用 direction");
+		}
+		opts.kind = VIDOW_GESTURE_VIEW;
+		opts.axis = WL_POINTER_AXIS_HORIZONTAL_SCROLL;
+		what = "swipe";
+	} else if (direction != NULL) {
+		opts.kind = VIDOW_GESTURE_SWIPE;
+		if (strcasecmp(direction, "left") == 0) {
+			opts.axis = WL_POINTER_AXIS_HORIZONTAL_SCROLL;
+			opts.dir = -1;
+		} else if (strcasecmp(direction, "right") == 0) {
+			opts.axis = WL_POINTER_AXIS_HORIZONTAL_SCROLL;
+			opts.dir = 1;
+		} else if (strcasecmp(direction, "up") == 0) {
+			opts.axis = WL_POINTER_AXIS_VERTICAL_SCROLL;
+			opts.dir = -1;
+		} else if (strcasecmp(direction, "down") == 0) {
+			opts.axis = WL_POINTER_AXIS_VERTICAL_SCROLL;
+			opts.dir = 1;
+		} else {
+			return luaL_error(L, "direction 只认 left / right / up / down"
+				"，给的是 '%s'", direction);
+		}
+		what = "direction";
+		arg = direction;
+	} else if (pinch != NULL) {
+		opts.kind = VIDOW_GESTURE_PINCH;
+		if (strcasecmp(pinch, "in") == 0) {
+			opts.dir = -1;
+		} else if (strcasecmp(pinch, "out") == 0) {
+			opts.dir = 1;
+		} else {
+			return luaL_error(L, "pinch 只认 in / out，给的是 '%s'",
+				pinch);
+		}
+		what = "pinch";
+		arg = pinch;
+	} else {
+		opts.kind = VIDOW_GESTURE_HOLD;
+		what = "hold";
+	}
+	lua_getfield(L, 1, "speed");
+	opts.speed = lua_isnumber(L, -1) ? lua_tonumber(L, -1) : 0.0;
+	lua_pop(L, 1);
+	lua_getfield(L, 1, "distance");
+	opts.distance = lua_isnumber(L, -1) ? lua_tonumber(L, -1) : 0.0;
+	lua_pop(L, 1);
+	const char *action = table_string(L, 1, "action");
+	char err[200];
+	if (vidow_gesture_add(s->server, &opts, action, err, sizeof(err)) == NULL) {
+		return luaL_error(L, "%s", err);
+	}
+	(void)what;
+	(void)arg;
+	lua_pushboolean(L, 1);
+	return 1;
+}
+
 /* vidow.rule{ … }：一条窗口规则 / 图层规则。字段表在 rule.c 的
  * vidow_rule_fields[]（匹配 + 作用一起），这里只负责「从 Lua 表里按类型取值」。
  *
@@ -1431,6 +1530,7 @@ static void register_api(struct vidow_script *s) {
 		{ "get", l_get },
 		{ "log", l_log },
 		{ "bind", l_bind },
+		{ "gesture", l_gesture },
 		{ "workspace_create", l_workspace_create },
 		{ "workspace_special", l_workspace_special },
 		{ "workspace_list", l_workspace_list },
@@ -1930,6 +2030,7 @@ bool vidow_script_load(struct vidow_server *server) {
 	/* 重载 = 重新声明一遍键位、窗口规则和每块屏的配置：清掉旧的，免得 SIGHUP
 	 * 之后越攒越多（删掉的 vidow.output 行要真的消失）。 */
 	vidow_keybind_clear(server);
+	vidow_gesture_clear(server);
 	vidow_rule_clear(server);
 	vidow_output_conf_clear(server);
 	/* 重载 = 重新读一遍配置：先回到默认值（再压上环境变量）。配置文件里删掉的

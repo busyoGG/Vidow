@@ -136,6 +136,7 @@ sources = files(
   'src/hotplug.c',
   'src/workspace.c',
   'src/keybind.c',
+  'src/gesture.c',
   'src/rule.c',
   'src/overview.c',
   'src/mru.c',

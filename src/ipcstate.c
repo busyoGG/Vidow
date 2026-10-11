@@ -1,5 +1,6 @@
 /* 把内部状态变成 JSON（见 ipcstate.h）。这一份**只读**：不发命令、不改状态，
  * 除了往订阅者的连接上写事件。 */
+#include "gesture.h"
 #include "ipcstate.h"
 
 #include <limits.h>
@@ -795,6 +796,23 @@ void vidow_ipc_json_keybinds(struct jbuf *b, struct vidow_server *server) {
 	jb_arr_end(b);
 }
 
+void vidow_ipc_json_gestures(struct jbuf *b, struct vidow_server *server) {
+	jb_arr(b);
+	struct vidow_gesture *it;
+	wl_list_for_each(it, &server->gestures, link) {
+		jb_obj(b);
+		jb_kv_str(b, "trigger", it->trigger);
+		jb_kv_str(b, "action", it->action);
+		jb_kv_int(b, "fingers", it->fingers);
+		jb_kv_str(b, "kind",
+			it->kind == VIDOW_GESTURE_VIEW ? "view" :
+			it->kind == VIDOW_GESTURE_SWIPE ? "swipe" :
+			it->kind == VIDOW_GESTURE_PINCH ? "pinch" : "hold");
+		jb_obj_end(b);
+	}
+	jb_arr_end(b);
+}
+
 void vidow_ipc_json_rules(struct jbuf *b, struct vidow_server *server) {
 	jb_arr(b);
 	struct vidow_rule *rule;
@@ -1270,6 +1288,7 @@ void vidow_ipc_json_state(struct jbuf *b, struct vidow_server *server) {
 	jb_kv_int(b, "workspaces", (long long)wl_list_length(&server->workspaces));
 	jb_kv_int(b, "layers", (long long)wl_list_length(&server->layers));
 	jb_kv_int(b, "keybinds", (long long)wl_list_length(&server->keybinds));
+	jb_kv_int(b, "gestures", (long long)wl_list_length(&server->gestures));
 	jb_kv_int(b, "rules", (long long)wl_list_length(&server->rules));
 	jb_kv_int(b, "clients",
 		(long long)wl_list_length(wl_display_get_client_list(server->display)));
@@ -1299,6 +1318,8 @@ void vidow_ipc_json_state(struct jbuf *b, struct vidow_server *server) {
 	vidow_ipc_json_seats(b, server);
 	jb_key(b, "keybinds");
 	vidow_ipc_json_keybinds(b, server);
+	jb_key(b, "gestures");
+	vidow_ipc_json_gestures(b, server);
 	jb_key(b, "rules");
 	vidow_ipc_json_rules(b, server);
 	jb_key(b, "config");

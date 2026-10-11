@@ -2,6 +2,7 @@
 #include "env.h"
 #include "hooks.h"
 #include "ipc.h"
+#include "gesture.h"
 
 #include <signal.h>
 #include <stdlib.h>
@@ -312,6 +313,7 @@ int main(int argc, char *argv[]) {
 	 * 建好 —— 第一块屏「插上」（output-added）就发生在几行之后。 */
 	vidow_hooks_init(&server);
 	vidow_keybind_init(&server);
+	vidow_gesture_init(&server);
 	vidow_rule_init(&server);
 	vidow_output_conf_init(&server);
 	/* 没量过 X 屏幕之前先当它认这个属性（不夹缩放）：量到了再说，见 xwayland.c */

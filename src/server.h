@@ -686,6 +686,10 @@ struct vidow_output {
 	 * 拔线时 wlroots 已经把 wlr_output->name 收走了，那时候再按名字找就晚了。 */
 	struct vidow_output_memory *memory;
 	double viewport_x;          /* horizontal scroll offset of the column strip */
+	/* 手指正拖着条带（三指横扫那种连续手势）：这期间视口由 gesture_viewport
+	 * 说了算，arrange 不做「把焦点列滚回可见区」那套（见 view.c 的 Pass 2）。 */
+	bool gesture_drag;
+	double gesture_viewport;
 	/* 上一次在这块屏上亮着的工作区（focus-workspace-previous / auto-back-and-forth） */
 	uint64_t prev_ws_id;
 	int64_t last_frame_ns;      /* last frame event, for the animation watchdog */
@@ -1610,6 +1614,7 @@ struct vidow_server {
 	struct wl_list columns;   /* vidow_column.link（所有列的并集，顺序 = 工作区顺序） */
 	struct wl_list workspaces; /* vidow_workspace.link */
 	struct wl_list keybinds;   /* vidow_keybind.link */
+	struct wl_list gestures;   /* vidow_gesture.link（触控板手势） */
 	struct wl_list rules;      /* vidow_rule.link（窗口规则） */
 	struct wl_list output_confs; /* vidow_output_conf.link（每块屏一组配置） */
 	struct wl_list test_actions; /* vidow_test_action.link（VIDOW_TEST_ACTION） */
@@ -1636,6 +1641,15 @@ struct vidow_server {
 	struct wl_listener cursor_button;
 	struct wl_listener cursor_axis;
 	struct wl_listener cursor_frame;
+	/* 触控板手势（libinput 的 swipe / pinch / hold，见 gesture.c）。 */
+	struct wl_listener pointer_swipe_begin;
+	struct wl_listener pointer_swipe_update;
+	struct wl_listener pointer_swipe_end;
+	struct wl_listener pointer_pinch_begin;
+	struct wl_listener pointer_pinch_update;
+	struct wl_listener pointer_pinch_end;
+	struct wl_listener pointer_hold_begin;
+	struct wl_listener pointer_hold_end;
 	struct wl_listener request_cursor;
 	struct wl_listener request_set_selection;
 	struct wl_listener request_set_primary_selection;
