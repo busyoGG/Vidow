@@ -91,14 +91,14 @@
 #define THUMB_W 176
 #define THUMB_H 110
 /* 缩略图圆角半径（外观：卡片里的预览切个圆角，别是一张硬边截图）。 */
-#define THUMB_RADIUS 5.0
+#define THUMB_RADIUS 10.0
 /* 圆角用**超椭圆**（squircle）：|x/a|^n + |y/b|^n = 1，n=2 是普通的圆角圆弧，
  * n 越大越「方中带圆」（KDE Plasma 6 / macOS 那种）。GTK 的 border-radius 只会画
  * 圆弧，所以卡片 / 按钮 / tab 的底都是我们自己用 cairo 画的（CSS 里设成透明）。 */
 #define SQUIRCLE_N 4.0
-#define CARD_RADIUS 8.0
-#define BUTTON_RADIUS 8.0
-#define TAB_RADIUS 8.0
+#define CARD_RADIUS 16.0
+#define BUTTON_RADIUS 16.0
+#define TAB_RADIUS 16.0
 /* 卡片内边距 / 对话框内容区留白（CSS 里 button.card 的 padding 是 6，这里跟着走）。 */
 #define CARD_PAD 7
 #define CONTENT_PAD 16
@@ -166,7 +166,6 @@ struct row {
 	int vw, vh;     /* ROW_VIRTUAL：要建的虚拟屏幕逻辑尺寸 */
 	GtkWidget *image;
 	GtkWidget *toggle;
-	GtkWidget *badge;  /* 缩略图右上角那个对勾（选中才显示） */
 	GtkWidget *label;  /* ROW_REGION：选了区域之后要改它的名字 / 小字 */
 	GtkWidget *sub;
 };
@@ -503,13 +502,12 @@ static void style_load(void) {
 		"headerbar { background-color: %s; background-image: none; color: %s; border-bottom: 1px solid %s; box-shadow: none; min-height: 38px; padding: 0 6px; }\n"
 		"headerbar .title { color: %s; font-weight: 700; font-size: 13px; }\n"
 		"headerbar .subtitle { color: %s; font-size: 10px; }\n"
-		"headerbar button { background-image: none; background-color: transparent; border: none; box-shadow: none; border-radius: 6px; min-width: 26px; min-height: 26px; }\n"
+		"headerbar button { background-image: none; background-color: transparent; border: none; box-shadow: none; border-radius: 12px; min-width: 26px; min-height: 26px; }\n"
 		"headerbar button:hover { background-color: %s; }\n"
 		"label.hint { color: %s; font-size: 12px; }\n"
 		"label.section { color: %s; font-size: 10px; font-weight: 700; }\n"
 		"label.card-title { color: %s; font-size: 12px; }\n"
 		"label.card-sub { color: %s; font-size: 10px; }\n"
-		"label.badge { background-color: %s; color: %s; border-radius: 10px; min-width: 15px; min-height: 15px; padding: 1px 3px; font-size: 10px; font-weight: 700; }\n"
 		"image.placeholder { border: none; color: %s; }\n"
 		"button.card { background-image: none; background-color: transparent; border: none; padding: 6px; box-shadow: none; }\n"
 		"button.card:checked label.card-title { color: %s; font-weight: 700; }\n"
@@ -518,7 +516,7 @@ static void style_load(void) {
 		"button.ghost { background-image: none; background-color: transparent; color: %s; border: none; padding: 6px 20px; box-shadow: none; text-shadow: none; }\n"
 		"separator.footer { background-color: %s; min-height: 1px; }\n"
 		"stackswitcher { background-color: transparent; padding: 3px; }\n"
-		"stackswitcher button { background-image: none; background-color: transparent; border: none; box-shadow: none; padding: 8px 22px; color: %s; font-weight: 600; min-height: 20px; }\n"
+		"stackswitcher button { background-image: none; background-color: transparent; border: none; box-shadow: none; padding: 14px 44px; color: %s; font-weight: 600; min-height: 22px; }\n"
 		"stackswitcher button:checked { color: %s; }\n",
 		pal->bg,
 		pal->bg,
@@ -533,8 +531,6 @@ static void style_load(void) {
 		pal->dim,
 		pal->text,
 		pal->dim,
-		accent,
-		on_accent,
 		pal->dim,
 		accent,
 		on_accent,
@@ -710,7 +706,162 @@ static gboolean placeholder_draw(GtkWidget *widget, cairo_t *cr, gpointer data) 
 	return FALSE;
 }
 
-/* tab 那条分段控件的外框。 */
+/* tab 高亮块：选中那段不是按钮自己画的，是**分段控件的容器**画的（容器先画、按钮
+ * 后画，所以高亮在文字底下）。放在容器里才能让它在切换时从上一段滑到新的一段 ——
+ * 用户：「切换动画是tab高亮，不是item」（item = 下面那一页内容）。 */
+#define TAB_ANIM_MS 200.0
+/* 高亮块比它那一段（按钮）**内缩**这么多：外框（分段控件）大小由按钮的 padding 决定，
+ * 内缩只影响高亮块自己 —— 用户要的「外框大小不变、高亮变小，padding 大一点」。 */
+#define TAB_HL_INSET 5.0
+static struct {
+	GtkWidget *switcher;
+	GtkWidget *stack;
+	guint tick_id;
+	bool inited;            /* 第一次画直接落到当前那段上（不滑） */
+	double x, y, w, h;      /* 现在的高亮块（switcher 坐标） */
+	double fx, fy, fw, fh;  /* 起点 */
+	double tx, ty, tw, th;  /* 终点 */
+	int64_t t0;             /* 起点时刻（微秒） */
+} tab_hl;
+
+/* 分段控件里的按钮，按页序收（深度优先，左到右 = 第 1..N 页）。 */
+static void collect_buttons(GtkWidget *w, GPtrArray *out) {
+	if (GTK_IS_BUTTON(w)) {
+		g_ptr_array_add(out, w);
+		return;
+	}
+	if (!GTK_IS_CONTAINER(w)) {
+		return;
+	}
+	GList *kids = gtk_container_get_children(GTK_CONTAINER(w));
+	for (GList *l = kids; l != NULL; l = l->next) {
+		collect_buttons(l->data, out);
+	}
+	g_list_free(kids);
+}
+
+/* 第 idx 段（页）的框，switcher 坐标系。 */
+static bool tab_hl_rect(int idx, GtkAllocation *out) {
+	if (tab_hl.switcher == NULL || idx < 0) {
+		return false;
+	}
+	GPtrArray *btns = g_ptr_array_new();
+	collect_buttons(tab_hl.switcher, btns);
+	bool ok = false;
+	if ((guint)idx < btns->len) {
+		GtkWidget *b = g_ptr_array_index(btns, idx);
+		gtk_widget_get_allocation(b, out);
+		/* 光拿 allocation 不够：那个坐标系不是父容器的（踩过：容器才 57 高，
+		 * 按钮的 allocation.y 却是 102，高亮块画到容器外面去了）。翻译一遍。 */
+		gint bx = 0, by = 0;
+		if (gtk_widget_translate_coordinates(b, tab_hl.switcher, 0, 0, &bx, &by)) {
+			out->x = bx;
+			out->y = by;
+		}
+		/* 高亮块往里缩一圈（外框不动，缩的是高亮）。 */
+		double i = TAB_HL_INSET;
+		if (out->width > 4 * i && out->height > 4 * i) {
+			out->x += (int)i;
+			out->y += (int)i;
+			out->width -= (int)(2 * i);
+			out->height -= (int)(2 * i);
+		}
+		ok = out->width > 4;
+	}
+	g_ptr_array_free(btns, TRUE);
+	return ok;
+}
+
+/* 现在显示的是第几页。 */
+static int stack_visible_index(void) {
+	if (tab_hl.stack == NULL) {
+		return -1;
+	}
+	GtkWidget *vis = gtk_stack_get_visible_child(GTK_STACK(tab_hl.stack));
+	if (vis == NULL) {
+		return -1;
+	}
+	GList *pages = gtk_container_get_children(GTK_CONTAINER(tab_hl.stack));
+	int idx = -1, i = 0;
+	for (GList *l = pages; l != NULL; l = l->next, i++) {
+		if (l->data == vis) {
+			idx = i;
+			break;
+		}
+	}
+	g_list_free(pages);
+	return idx;
+}
+
+/* 一帧：起点 → 终点插值（ease-out cubic），到点收工。 */
+static gboolean tab_hl_tick(GtkWidget *widget, GdkFrameClock *clock, gpointer data) {
+	(void)clock;
+	(void)data;
+	double k = (double)(g_get_monotonic_time() - tab_hl.t0) / 1000.0 / TAB_ANIM_MS;
+	if (k >= 1.0) {
+		tab_hl.x = tab_hl.tx;
+		tab_hl.y = tab_hl.ty;
+		tab_hl.w = tab_hl.tw;
+		tab_hl.h = tab_hl.th;
+		tab_hl.tick_id = 0;
+		gtk_widget_queue_draw(widget);
+		return G_SOURCE_REMOVE;
+	}
+	double e = 1.0 - pow(1.0 - k, 3.0);
+	tab_hl.x = tab_hl.fx + (tab_hl.tx - tab_hl.fx) * e;
+	tab_hl.y = tab_hl.fy + (tab_hl.ty - tab_hl.fy) * e;
+	tab_hl.w = tab_hl.fw + (tab_hl.tw - tab_hl.fw) * e;
+	tab_hl.h = tab_hl.fh + (tab_hl.th - tab_hl.fh) * e;
+	gtk_widget_queue_draw(widget);
+	return G_SOURCE_CONTINUE;
+}
+
+/* 换页了：把高亮块从当前位置滑到新的那一段。 */
+static void on_stack_visible_child(GObject *obj, GParamSpec *pspec, gpointer data) {
+	(void)obj;
+	(void)pspec;
+	(void)data;
+	GtkAllocation a;
+	if (!tab_hl_rect(stack_visible_index(), &a)) {
+		return;
+	}
+	if (!tab_hl.inited) {
+		tab_hl.x = tab_hl.tx = (double)a.x;
+		tab_hl.y = tab_hl.ty = (double)a.y;
+		tab_hl.w = tab_hl.tw = (double)a.width;
+		tab_hl.h = tab_hl.th = (double)a.height;
+		tab_hl.inited = true;
+		return;
+	}
+	tab_hl.fx = tab_hl.x;
+	tab_hl.fy = tab_hl.y;
+	tab_hl.fw = tab_hl.w;
+	tab_hl.fh = tab_hl.h;
+	tab_hl.tx = (double)a.x;
+	tab_hl.ty = (double)a.y;
+	tab_hl.tw = (double)a.width;
+	tab_hl.th = (double)a.height;
+	tab_hl.t0 = g_get_monotonic_time();
+	if (tab_hl.tick_id != 0) {
+		gtk_widget_remove_tick_callback(tab_hl.switcher, tab_hl.tick_id);
+	}
+	tab_hl.tick_id = gtk_widget_add_tick_callback(tab_hl.switcher, tab_hl_tick,
+		NULL, NULL);
+}
+
+/* 对话框关掉时把高亮块那套状态清干净（tick 回调挂在控件上，别留着指向已销毁的控件）。 */
+static void on_switcher_destroy(GtkWidget *w, gpointer data) {
+	(void)data;
+	if (tab_hl.switcher != w) {
+		return;
+	}
+	tab_hl.switcher = NULL;
+	tab_hl.stack = NULL;
+	tab_hl.tick_id = 0;
+	tab_hl.inited = false;
+}
+
+/* tab 那条分段控件：外框 + 高亮块（都在按钮底下）。 */
 static gboolean switcher_draw(GtkWidget *widget, cairo_t *cr, gpointer data) {
 	(void)data;
 	GtkAllocation a;
@@ -721,10 +872,28 @@ static gboolean switcher_draw(GtkWidget *widget, cairo_t *cr, gpointer data) {
 	squircle_path(cr, 0.5, 0.5, a.width - 1.0, a.height - 1.0, TAB_RADIUS + 3.0);
 	cairo_hex(cr, pal->border, 1.0);
 	cairo_fill(cr);
+	if (tab_hl.tick_id == 0) {
+		/* 不在动画里：直接跟真实布局走（第一次画 / 窗口改尺寸 / 收尾都算这种）。
+		 * 别只在「第一次画」时取一次 —— 第一次画的时机可能还在布局中间，取到的是
+		 * 中间态的坐标（踩过：拿到 y=105，那块在容器外面，于是高亮块根本看不见）。 */
+		GtkAllocation t;
+		if (tab_hl_rect(stack_visible_index(), &t)) {
+			tab_hl.x = tab_hl.tx = (double)t.x;
+			tab_hl.y = tab_hl.ty = (double)t.y;
+			tab_hl.w = tab_hl.tw = (double)t.width;
+			tab_hl.h = tab_hl.th = (double)t.height;
+			tab_hl.inited = true;
+		}
+	}
+	if (tab_hl.inited) {
+		squircle_path(cr, tab_hl.x, tab_hl.y, tab_hl.w, tab_hl.h, TAB_RADIUS);
+		cairo_hex(cr, accent, 1.0);
+		cairo_fill(cr);
+	}
 	return FALSE;
 }
 
-/* 一个 tab：选中的那段填强调色（padding 就是 CSS 里 button 的 padding）。 */
+/* 一个 tab：选中的那段由容器画（高亮块要能滑动，见上），这里只画悬停底色。 */
 static gboolean tab_draw(GtkWidget *widget, cairo_t *cr, gpointer data) {
 	(void)data;
 	GtkAllocation a;
@@ -733,12 +902,11 @@ static gboolean tab_draw(GtkWidget *widget, cairo_t *cr, gpointer data) {
 		return FALSE;
 	}
 	GtkStateFlags st = gtk_widget_get_state_flags(widget);
-	if ((st & GTK_STATE_FLAG_CHECKED) != 0) {
-		squircle_path(cr, 0, 0, a.width, a.height, TAB_RADIUS);
-		cairo_hex(cr, accent, 1.0);
-		cairo_fill(cr);
-	} else if ((st & GTK_STATE_FLAG_PRELIGHT) != 0) {
-		squircle_path(cr, 0, 0, a.width, a.height, TAB_RADIUS);
+	bool checked = (st & GTK_STATE_FLAG_CHECKED) != 0;
+	if (!checked && (st & GTK_STATE_FLAG_PRELIGHT) != 0) {
+		/* 悬停底色和高亮块同一圈内缩（不然悬停是满格、选中是内缩，两副样子）。 */
+		double i = TAB_HL_INSET;
+		squircle_path(cr, i, i, a.width - 2 * i, a.height - 2 * i, TAB_RADIUS);
 		cairo_hex(cr, pal->hover, 1.0);
 		cairo_fill(cr);
 	}
@@ -2231,10 +2399,6 @@ static void on_toggle(GtkToggleButton *button, gpointer data) {
 				region_pick_start();
 			}
 		}
-		if (r->badge != NULL) {
-			/* 缩略图角上那个对勾跟着选中状态走（no_show_all 挂着，只由这里控制）。 */
-			gtk_widget_set_visible(r->badge, on);
-		}
 		if (on) {
 			n++;
 		}
@@ -2290,22 +2454,10 @@ static struct row *add_card(GtkWidget *grid, int col, int line, enum row_kind ki
 		add_class(image, "placeholder");
 		g_signal_connect(image, "draw", G_CALLBACK(placeholder_draw), NULL);
 	}
-	/* 缩略图右上角的对勾（选中才显示，见 on_toggle）。GtkOverlay 盖在图上，
-	 * 对齐到右上角 —— 就是 KDE 选择器那种「选中的那张角上有个勾」。 */
-	GtkWidget *badge = gtk_label_new("✓");
-	add_class(badge, "badge");
-	gtk_widget_set_halign(badge, GTK_ALIGN_END);
-	gtk_widget_set_valign(badge, GTK_ALIGN_START);
-	gtk_widget_set_margin_end(badge, 6);
-	gtk_widget_set_margin_top(badge, 6);
-	gtk_widget_set_no_show_all(badge, TRUE);
-	gtk_widget_set_visible(badge, FALSE);
-	GtkWidget *overlay = gtk_overlay_new();
-	gtk_container_add(GTK_CONTAINER(overlay), image);
-	gtk_overlay_add_overlay(GTK_OVERLAY(overlay), badge);
-	gtk_box_pack_start(GTK_BOX(card), overlay, FALSE, FALSE, 0);
+	/* 选没选中只看卡片自己：强调色 2px 描边 + 底衬淡染（见 card_draw）。以前缩略图
+	 * 右上角还挂一个对勾，用户说去掉。 */
+	gtk_box_pack_start(GTK_BOX(card), image, FALSE, FALSE, 0);
 	r->image = image;
-	r->badge = badge;
 
 	GtkWidget *label = gtk_label_new(title);
 	gtk_label_set_xalign(GTK_LABEL(label), 0.0);
@@ -2685,13 +2837,21 @@ static void dialog_show(struct request *req) {
 	 * 一页一个 grid。只列应用真的在要的那几种来源；只剩一个 tab 时那条控件收起来
 	 * （一个按钮的分段控件看着莫名其妙）。 */
 	GtkWidget *stack = gtk_stack_new();
+	/* 页内容不滑（用户：「切换动画是tab高亮，不是item」）：动画在下面那条分段控件的
+	 * 高亮块上（见 tab_hl）。三页高度对齐（取最高的那页）：切 tab 时对话框不跳。 */
 	gtk_stack_set_transition_type(GTK_STACK(stack), GTK_STACK_TRANSITION_TYPE_NONE);
-	/* 三页高度对齐（取最高的那页）：切 tab 的时候对话框不会一跳一跳。 */
 	gtk_stack_set_hhomogeneous(GTK_STACK(stack), TRUE);
 	gtk_stack_set_vhomogeneous(GTK_STACK(stack), TRUE);
 
 	GtkWidget *switcher = gtk_stack_switcher_new();
 	gtk_stack_switcher_set_stack(GTK_STACK_SWITCHER(switcher), GTK_STACK(stack));
+	/* 高亮块归这个容器画（每开一次对话框重新来过）。 */
+	tab_hl.switcher = switcher;
+	tab_hl.stack = stack;
+	tab_hl.tick_id = 0;
+	tab_hl.inited = false;
+	g_signal_connect(stack, "notify::visible-child",
+		G_CALLBACK(on_stack_visible_child), NULL);
 	gtk_widget_set_halign(switcher, GTK_ALIGN_CENTER);
 	gtk_widget_set_no_show_all(switcher, TRUE);
 	gtk_box_pack_start(GTK_BOX(box), switcher, FALSE, FALSE, 0);
@@ -2784,6 +2944,7 @@ static void dialog_show(struct request *req) {
 	}
 
 	g_signal_connect(switcher, "draw", G_CALLBACK(switcher_draw), NULL);
+	g_signal_connect(switcher, "destroy", G_CALLBACK(on_switcher_destroy), NULL);
 	GList *tabs = gtk_container_get_children(GTK_CONTAINER(switcher));
 	for (GList *it = tabs; it != NULL; it = it->next) {
 		g_signal_connect(it->data, "draw", G_CALLBACK(tab_draw), NULL);
