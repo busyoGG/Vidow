@@ -799,7 +799,7 @@ if [ -n "${DGEO:-}" ]; then
 	sleep 1
 	DGEO=$(wait_dialog)
 	set -- $DGEO
-	# 分段控件居中排布（两段各约 133 宽，垂直位置约 97px）
+	# 分段控件居中排布（两段各约 81 宽、整条 y 约 82..116，中线约 99px）
 	$VM --socket "$IPC" move-cursor $(( $1 + $3 / 2 + 66 )) $(( $2 + 97 )) >/dev/null 2>&1
 	sleep 0.3
 	$VM --socket "$IPC" pointer-button click left >/dev/null 2>&1

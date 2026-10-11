@@ -516,7 +516,13 @@ static void style_load(void) {
 		"button.ghost { background-image: none; background-color: transparent; color: %s; border: none; padding: 6px 20px; box-shadow: none; text-shadow: none; }\n"
 		"separator.footer { background-color: %s; min-height: 1px; }\n"
 		"stackswitcher { background-color: transparent; padding: 3px; }\n"
-		"stackswitcher button { background-image: none; background-color: transparent; border: none; box-shadow: none; padding: 14px 44px; color: %s; font-weight: 600; min-height: 22px; }\n"
+		/* 分段控件别占地方。两个坑：
+		 *   min-width —— 主题给 stackswitcher 的按钮留了 ~100px 的地板，光调
+		 *     padding 收不下去（量过：padding 44/30/10 三档，每段都卡在 ~160），
+		 *     得把它按掉才真的跟着 padding 走；
+		 *   竖 8 / 横 22 / 字 12 —— 整条 ≈34 高、一段 ≈64 宽，和底栏按钮一个量级。
+		 * 原来是 14px 44px（整条 ≈50 高、一段 ≈197 宽），三个 tab 比正文卡片还大。 */
+		"stackswitcher button { background-image: none; background-color: transparent; border: none; box-shadow: none; padding: 8px 22px; color: %s; font-weight: 600; font-size: 12px; min-width: 0; min-height: 18px; }\n"
 		"stackswitcher button:checked { color: %s; }\n"
 		/* 键盘焦点的指示器：GTK 默认画的是**虚线**（选中那张再叠一圈虚线，看着像
 		 * 「两个高亮」，用户报的「奇怪的虚线框」就是它）。卡片和 tab 的选中态本来
