@@ -469,6 +469,9 @@ int main(int argc, char *argv[]) {
 	vidow_configwatch_finish(&server);
 	vidow_capturemask_finish(&server);
 	/* 输入设备的账本（见 input.c）：报事件用的那些，设备自己没了就没了 */
+	/* 手指还拖着条带时退出：把手势状态清掉（不然 arrange 一直绕过「把焦点列滚回
+	 * 可见区」那条，退出前最后一帧可能怪怪的）。 */
+	vidow_gesture_finish(&server);
 	vidow_input_finish(&server);
 	vidow_ipc_finish(&server);
 	vidow_clipboard_finish(&server);
