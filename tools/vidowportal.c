@@ -58,6 +58,7 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <math.h>
 #include <fcntl.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -91,6 +92,13 @@
 #define THUMB_H 110
 /* 缩略图圆角半径（外观：卡片里的预览切个圆角，别是一张硬边截图）。 */
 #define THUMB_RADIUS 5.0
+/* 圆角用**超椭圆**（squircle）：|x/a|^n + |y/b|^n = 1，n=2 是普通的圆角圆弧，
+ * n 越大越「方中带圆」（KDE Plasma 6 / macOS 那种）。GTK 的 border-radius 只会画
+ * 圆弧，所以卡片 / 按钮 / tab 的底都是我们自己用 cairo 画的（CSS 里设成透明）。 */
+#define SQUIRCLE_N 4.0
+#define CARD_RADIUS 8.0
+#define BUTTON_RADIUS 8.0
+#define TAB_RADIUS 8.0
 /* 卡片内边距 / 对话框内容区留白（CSS 里 button.card 的 padding 是 6，这里跟着走）。 */
 #define CARD_PAD 7
 #define CONTENT_PAD 16
@@ -489,62 +497,52 @@ static void style_load(void) {
 		0.299 * ar + 0.587 * ag + 0.114 * ab > 0.62 ? "#1b1e20" : "#ffffff");
 
 	char *css = g_strdup_printf(
-		"window { background-color: %1$s; }\n"
-		"window .background { background-color: %1$s; color: %3$s; }\n"
-		/* 框选区域那层浮层是**透明**的（不冻屏，底下的画面照常刷新）。 */
-		"window.transparent, window.transparent .background,"
-		"  window.transparent headerbar { background-color: transparent;"
-		"  background-image: none; border: none; box-shadow: none; }\n"
-		"headerbar { background-color: %1$s; background-image: none;"
-		"  color: %3$s; border-bottom: 1px solid %4$s; box-shadow: none;"
-		"  min-height: 38px; padding: 0 6px; }\n"
-		"headerbar .title { color: %3$s; font-weight: 700; font-size: 13px; }\n"
-		"headerbar button { color: %3$s; }\n"
-		"headerbar .subtitle { color: %5$s; font-size: 10px; }\n"
-		"headerbar button { background-image: none; background-color: transparent;"
-		"  border: none; box-shadow: none; border-radius: 6px; min-width: 26px;"
-		"  min-height: 26px; }\n"
-		"headerbar button:hover { background-color: %6$s; }\n"
-		"label.hint { color: %5$s; font-size: 12px; }\n"
-		"label.section { color: %5$s; font-size: 10px; font-weight: 700; }\n"
-		"label.card-title { color: %3$s; font-size: 12px; }\n"
-		"label.card-sub { color: %5$s; font-size: 10px; }\n"
-		"label.badge { background-color: %2$s; color: %9$s; border-radius: 10px;"
-		"  min-width: 15px; min-height: 15px; padding: 1px 3px;"
-		"  font-size: 10px; font-weight: 700; }\n"
-		"image.placeholder { border: 1px dashed %4$s; border-radius: 6px;"
-		"  color: %5$s; }\n"
-		"button.card { background-image: none; background-color: %10$s;"
-		"  border: 1px solid %4$s; border-radius: 8px; padding: 6px;"
-		"  box-shadow: none; }\n"
-		"button.card:hover { background-color: %6$s; border-color: %2$s; }\n"
-		"button.card:checked { background-color: %11$s;"
-		"  border: 2px solid %2$s; }\n"
-		"button.card:checked label.card-title { color: %2$s; font-weight: 700; }\n"
-		"button.primary { background-image: none; background-color: %2$s;"
-		"  color: %9$s; border: 1px solid %2$s; border-radius: 6px;"
-		"  padding: 6px 20px; font-weight: 700; box-shadow: none;"
-		"  text-shadow: none; }\n"
-		"button.primary:hover { background-color: %12$s; border-color: %12$s; }\n"
-		"button.primary:disabled { background-color: %13$s;"
-		"  border-color: %13$s; color: %14$s; }\n"
-		"button.ghost { background-image: none; background-color: %7$s;"
-		"  color: %3$s; border: 1px solid %8$s; border-radius: 6px;"
-		"  padding: 6px 20px; box-shadow: none; text-shadow: none; }\n"
-		"button.ghost:hover { background-color: %6$s; }\n"
-		"separator.footer { background-color: %4$s; min-height: 1px; }\n"
-		/* 顶上的 tab（GtkStackSwitcher）：KDE 那种分段控件 —— 选中的填强调色淡底。 */
-		"stackswitcher { background-color: %4$s; border-radius: 8px;"
-		"  padding: 2px; }\n"
-		"stackswitcher button { background-image: none;"
-		"  background-color: transparent; border: none; box-shadow: none;"
-		"  border-radius: 6px; padding: 5px 16px; color: %5$s;"
-		"  font-weight: 600; min-height: 20px; }\n"
-		"stackswitcher button:hover { background-color: %6$s; }\n"
-		"stackswitcher button:checked { background-color: %2$s; color: %9$s; }\n",
-		pal->bg, accent, pal->text, pal->border, pal->dim, pal->hover, pal->btn,
-		pal->btn_border, on_accent, pal->base, accent_soft, accent_hover,
-		pal->off_bg, pal->off_text);
+		"window { background-color: %s; }\n"
+		"window .background { background-color: %s; color: %s; }\n"
+		"window.transparent, window.transparent .background, window.transparent headerbar { background-color: transparent; background-image: none; border: none; box-shadow: none; }\n"
+		"headerbar { background-color: %s; background-image: none; color: %s; border-bottom: 1px solid %s; box-shadow: none; min-height: 38px; padding: 0 6px; }\n"
+		"headerbar .title { color: %s; font-weight: 700; font-size: 13px; }\n"
+		"headerbar .subtitle { color: %s; font-size: 10px; }\n"
+		"headerbar button { background-image: none; background-color: transparent; border: none; box-shadow: none; border-radius: 6px; min-width: 26px; min-height: 26px; }\n"
+		"headerbar button:hover { background-color: %s; }\n"
+		"label.hint { color: %s; font-size: 12px; }\n"
+		"label.section { color: %s; font-size: 10px; font-weight: 700; }\n"
+		"label.card-title { color: %s; font-size: 12px; }\n"
+		"label.card-sub { color: %s; font-size: 10px; }\n"
+		"label.badge { background-color: %s; color: %s; border-radius: 10px; min-width: 15px; min-height: 15px; padding: 1px 3px; font-size: 10px; font-weight: 700; }\n"
+		"image.placeholder { border: none; color: %s; }\n"
+		"button.card { background-image: none; background-color: transparent; border: none; padding: 6px; box-shadow: none; }\n"
+		"button.card:checked label.card-title { color: %s; font-weight: 700; }\n"
+		"button.primary { background-image: none; background-color: transparent; color: %s; border: none; padding: 6px 20px; font-weight: 700; box-shadow: none; text-shadow: none; }\n"
+		"button.primary:disabled { color: %s; }\n"
+		"button.ghost { background-image: none; background-color: transparent; color: %s; border: none; padding: 6px 20px; box-shadow: none; text-shadow: none; }\n"
+		"separator.footer { background-color: %s; min-height: 1px; }\n"
+		"stackswitcher { background-color: transparent; padding: 3px; }\n"
+		"stackswitcher button { background-image: none; background-color: transparent; border: none; box-shadow: none; padding: 8px 22px; color: %s; font-weight: 600; min-height: 20px; }\n"
+		"stackswitcher button:checked { color: %s; }\n",
+		pal->bg,
+		pal->bg,
+		pal->text,
+		pal->bg,
+		pal->text,
+		pal->border,
+		pal->text,
+		pal->dim,
+		pal->hover,
+		pal->dim,
+		pal->dim,
+		pal->text,
+		pal->dim,
+		accent,
+		on_accent,
+		pal->dim,
+		accent,
+		on_accent,
+		pal->off_text,
+		pal->text,
+		pal->border,
+		pal->dim,
+		on_accent);
 	GtkCssProvider *provider = gtk_css_provider_new();
 	GError *err = NULL;
 	gtk_css_provider_load_from_data(provider, css, -1, &err);
@@ -571,6 +569,180 @@ static void remove_class(GtkWidget *w, const char *name) {
 	if (w != NULL) {
 		gtk_style_context_remove_class(gtk_widget_get_style_context(w), name);
 	}
+}
+
+/* 超椭圆（squircle）圆角矩形路径：四角各按 |cos|^(2/n) / |sin|^(2/n) 采样。
+ * n=2 就是普通的圆角；n=4 是常见的那种「方中带圆」。 */
+static void squircle_path(cairo_t *cr, double x, double y, double w, double h,
+		double r) {
+	if (w < 1.0 || h < 1.0) {
+		cairo_new_sub_path(cr);
+		return;
+	}
+	if (r < 0.5) {
+		cairo_rectangle(cr, x, y, w, h);
+		return;
+	}
+	if (r > w / 2.0) {
+		r = w / 2.0;
+	}
+	if (r > h / 2.0) {
+		r = h / 2.0;
+	}
+	double e = 2.0 / SQUIRCLE_N;
+	const int steps = 10;
+	cairo_new_sub_path(cr);
+	/* 顺时针：右上角 → 右下角 → 左下角 → 左上角。 */
+	for (int c = 0; c < 4; c++) {
+		double cx = (c == 0 || c == 1) ? x + w - r : x + r;
+		double cy = (c == 0 || c == 3) ? y + r : y + h - r;
+		for (int i = 0; i <= steps; i++) {
+			double t = (G_PI / 2.0) * (double)i / (double)steps;
+			double ct = pow(fabs(cos(t)), e), st = pow(fabs(sin(t)), e);
+			double px, py;
+			switch (c) {
+			case 0:  /* 右上：从 (x+w-r, y) 走到 (x+w, y+r) */
+				px = cx + r * st;
+				py = cy - r * ct;
+				break;
+			case 1:  /* 右下：从 (x+w, y+h-r) 走到 (x+w-r, y+h) */
+				px = cx + r * ct;
+				py = cy + r * st;
+				break;
+			case 2:  /* 左下：从 (x+r, y+h) 走到 (x, y+h-r) */
+				px = cx - r * st;
+				py = cy + r * ct;
+				break;
+			default: /* 左上：从 (x, y+r) 走到 (x+r, y) */
+				px = cx - r * ct;
+				py = cy - r * st;
+				break;
+			}
+			if (c == 0 && i == 0) {
+				cairo_move_to(cr, px, py);
+			} else {
+				cairo_line_to(cr, px, py);
+			}
+		}
+	}
+	cairo_close_path(cr);
+}
+
+static void cairo_hex(cairo_t *cr, const char *hex, double alpha) {
+	double r, g, b;
+	hex2rgb(hex, &r, &g, &b);
+	cairo_set_source_rgba(cr, r, g, b, alpha);
+}
+
+/* 卡片 / 按钮 / tab 的底都是我们画的（超椭圆圆角），CSS 里对应的背景和边框都是
+ * 透明的 —— 这几个 handler 画完 return FALSE，GTK 接着把里面的内容画上去。 */
+static gboolean card_draw(GtkWidget *widget, cairo_t *cr, gpointer data) {
+	(void)data;
+	GtkAllocation a;
+	gtk_widget_get_allocation(widget, &a);
+	if (a.width < 4 || a.height < 4) {
+		return FALSE;
+	}
+	GtkStateFlags st = gtk_widget_get_state_flags(widget);
+	bool checked = (st & GTK_STATE_FLAG_CHECKED) != 0;
+	bool hover = (st & GTK_STATE_FLAG_PRELIGHT) != 0;
+	bool insens = (st & GTK_STATE_FLAG_INSENSITIVE) != 0;
+	double bw = checked ? 2.0 : 1.0;
+	squircle_path(cr, bw / 2.0, bw / 2.0, a.width - bw, a.height - bw, CARD_RADIUS);
+	if (checked) {
+		cairo_hex(cr, accent_soft, 1.0);
+	} else if (hover && !insens) {
+		cairo_hex(cr, pal->hover, 1.0);
+	} else {
+		cairo_hex(cr, pal->base, insens ? 0.5 : 1.0);
+	}
+	cairo_fill_preserve(cr);
+	if (checked) {
+		cairo_hex(cr, accent, 1.0);
+	} else if (hover && !insens) {
+		cairo_hex(cr, accent, 0.5);
+	} else {
+		cairo_hex(cr, pal->border, 1.0);
+	}
+	cairo_set_line_width(cr, bw);
+	cairo_stroke(cr);
+	return FALSE;
+}
+
+/* primary=1 是「共享」，0 是「取消」。 */
+static gboolean pill_draw(GtkWidget *widget, cairo_t *cr, gpointer data) {
+	bool primary = GPOINTER_TO_INT(data) != 0;
+	GtkAllocation a;
+	gtk_widget_get_allocation(widget, &a);
+	if (a.width < 4 || a.height < 4) {
+		return FALSE;
+	}
+	GtkStateFlags st = gtk_widget_get_state_flags(widget);
+	bool insens = (st & GTK_STATE_FLAG_INSENSITIVE) != 0;
+	bool hover = (st & GTK_STATE_FLAG_PRELIGHT) != 0;
+	squircle_path(cr, 0.5, 0.5, a.width - 1.0, a.height - 1.0, BUTTON_RADIUS);
+	if (primary) {
+		cairo_hex(cr, insens ? pal->off_bg : (hover ? accent_hover : accent), 1.0);
+	} else {
+		cairo_hex(cr, insens ? pal->off_bg : (hover ? pal->hover : pal->btn), 1.0);
+	}
+	cairo_fill_preserve(cr);
+	cairo_hex(cr, insens ? pal->off_bg : (primary ? accent : pal->btn_border), 1.0);
+	cairo_set_line_width(cr, 1.0);
+	cairo_stroke(cr);
+	return FALSE;
+}
+
+/* 占位（虚拟屏幕 / 还没框的区域）：虚线框也是超椭圆 —— CSS 的 border 只会画矩形。 */
+static gboolean placeholder_draw(GtkWidget *widget, cairo_t *cr, gpointer data) {
+	(void)data;
+	GtkAllocation a;
+	gtk_widget_get_allocation(widget, &a);
+	if (a.width < 4 || a.height < 4) {
+		return FALSE;
+	}
+	double dashes[2] = { 4.0, 4.0 };
+	squircle_path(cr, 0.5, 0.5, a.width - 1.0, a.height - 1.0, CARD_RADIUS - 1.0);
+	cairo_set_dash(cr, dashes, 2, 0);
+	cairo_hex(cr, pal->border, 1.0);
+	cairo_set_line_width(cr, 1.0);
+	cairo_stroke(cr);
+	return FALSE;
+}
+
+/* tab 那条分段控件的外框。 */
+static gboolean switcher_draw(GtkWidget *widget, cairo_t *cr, gpointer data) {
+	(void)data;
+	GtkAllocation a;
+	gtk_widget_get_allocation(widget, &a);
+	if (a.width < 4 || a.height < 4) {
+		return FALSE;
+	}
+	squircle_path(cr, 0.5, 0.5, a.width - 1.0, a.height - 1.0, TAB_RADIUS + 3.0);
+	cairo_hex(cr, pal->border, 1.0);
+	cairo_fill(cr);
+	return FALSE;
+}
+
+/* 一个 tab：选中的那段填强调色（padding 就是 CSS 里 button 的 padding）。 */
+static gboolean tab_draw(GtkWidget *widget, cairo_t *cr, gpointer data) {
+	(void)data;
+	GtkAllocation a;
+	gtk_widget_get_allocation(widget, &a);
+	if (a.width < 4 || a.height < 4) {
+		return FALSE;
+	}
+	GtkStateFlags st = gtk_widget_get_state_flags(widget);
+	if ((st & GTK_STATE_FLAG_CHECKED) != 0) {
+		squircle_path(cr, 0, 0, a.width, a.height, TAB_RADIUS);
+		cairo_hex(cr, accent, 1.0);
+		cairo_fill(cr);
+	} else if ((st & GTK_STATE_FLAG_PRELIGHT) != 0) {
+		squircle_path(cr, 0, 0, a.width, a.height, TAB_RADIUS);
+		cairo_hex(cr, pal->hover, 1.0);
+		cairo_fill(cr);
+	}
+	return FALSE;
 }
 
 /* ------------------------------------------------------------ 抓帧缓冲 */
@@ -735,13 +907,7 @@ static GdkPixbuf *pixbuf_rounded(GdkPixbuf *pix, double radius, double border_al
 		return (GdkPixbuf *)g_object_ref(pix);
 	}
 	cairo_t *cr = cairo_create(surf);
-	double r = radius;
-	cairo_new_sub_path(cr);
-	cairo_arc(cr, w - r, r, r, -G_PI / 2.0, 0);
-	cairo_arc(cr, w - r, h - r, r, 0, G_PI / 2.0);
-	cairo_arc(cr, r, h - r, r, G_PI / 2.0, G_PI);
-	cairo_arc(cr, r, r, r, G_PI, 3.0 * G_PI / 2.0);
-	cairo_close_path(cr);
+	squircle_path(cr, 0, 0, w, h, radius);
 	cairo_save(cr);
 	cairo_clip(cr);
 	gdk_cairo_set_source_pixbuf(cr, pix, 0, 0);
@@ -1568,8 +1734,9 @@ static void request_finish(struct request *req, uint32_t response, GVariant *res
 static void session_close(struct session *s, const char *why);
 static void dialog_show(struct request *req);
 static void start_show_next(void);
-/* 框选浮层（定义在后面）：对话框被关掉 / 换掉的时候要顺手收掉它。 */
+/* 框选浮层（定义在后面）：对话框被关掉 / 换掉的时候要顺手收掉它；卡片点一下也开它。 */
 static void region_pick_close(bool restore_dialog);
+static void region_pick_start(void);
 static void region_pick_destroy(void);
 
 /* 当前这个 Start 处理完了（选完 / 取消 / 超时）：接着弹排队里的下一个。
@@ -2054,6 +2221,16 @@ static void on_toggle(GtkToggleButton *button, gpointer data) {
 				}
 			}
 		}
+		/* 「区域」那张卡：点它（= 选中它）就是「去框一块」—— 不用另做一个按钮。
+		 * 只有真被点的时候才算（button != NULL）：进来默认选中第一行那条路不算，
+		 * 不然一开对话框就弹浮层。已经有区域了就不动（再点一下是取消选中）。 */
+		if (on && button != NULL && GTK_WIDGET(button) == r->toggle &&
+				r->kind == ROW_REGION) {
+			struct region_row *reg = r->ptr;
+			if (reg == NULL || reg->w < 2) {
+				region_pick_start();
+			}
+		}
 		if (r->badge != NULL) {
 			/* 缩略图角上那个对勾跟着选中状态走（no_show_all 挂着，只由这里控制）。 */
 			gtk_widget_set_visible(r->badge, on);
@@ -2111,6 +2288,7 @@ static struct row *add_card(GtkWidget *grid, int col, int line, enum row_kind ki
 			GTK_ICON_SIZE_DIALOG);
 		gtk_image_set_pixel_size(GTK_IMAGE(image), 44);
 		add_class(image, "placeholder");
+		g_signal_connect(image, "draw", G_CALLBACK(placeholder_draw), NULL);
 	}
 	/* 缩略图右上角的对勾（选中才显示，见 on_toggle）。GtkOverlay 盖在图上，
 	 * 对齐到右上角 —— 就是 KDE 选择器那种「选中的那张角上有个勾」。 */
@@ -2148,6 +2326,8 @@ static struct row *add_card(GtkWidget *grid, int col, int line, enum row_kind ki
 	}
 
 	gtk_widget_set_tooltip_text(toggle, title);
+	/* 底自己画（超椭圆圆角）：CSS 里 button.card 的背景 / 边框是透明的。 */
+	g_signal_connect(toggle, "draw", G_CALLBACK(card_draw), NULL);
 	g_signal_connect(toggle, "toggled", G_CALLBACK(on_toggle), NULL);
 	g_signal_connect(toggle, "button-press-event", G_CALLBACK(on_card_press), NULL);
 	r->toggle = toggle;
@@ -2196,7 +2376,6 @@ struct region_pick {
 
 static struct region_pick *region_pick;
 static struct row *region_row;   /* 对话框里那一行（可能还没有） */
-static GtkWidget *region_pick_button; /* 「选择区域…」那个按钮 */
 static struct output *output_under_pointer(void); /* 后面才定义 */
 
 /* 框选那一层怎么画（截图框选和这里共用）：框外压暗一层、强调色边框、左上角一个
@@ -2273,9 +2452,6 @@ static void region_row_apply(struct region_row *reg, struct output *host, int x,
 	if (r->toggle != NULL) {
 		gtk_widget_set_sensitive(r->toggle, TRUE);
 		gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(r->toggle), TRUE);
-	}
-	if (region_pick_button != NULL) {
-		gtk_button_set_label(GTK_BUTTON(region_pick_button), "重新选择…");
 	}
 	log_info("区域：%s 上 %d,%d %dx%d（%.1fx → %dx%d 像素）",
 		host != NULL ? host->name : "?", x, y, w, h, (double)reg->scale,
@@ -2365,11 +2541,18 @@ static void region_pick_close(bool restore_dialog) {
 	if (region_pick == NULL) {
 		return;
 	}
+	bool picked = region_row != NULL && region_row->ptr != NULL &&
+		((struct region_row *)region_row->ptr)->w >= 2;
 	if (region_pick->win != NULL) {
 		gtk_widget_destroy(region_pick->win);
 	}
 	free(region_pick);
 	region_pick = NULL;
+	/* 还没框出区域就取消（Esc）：这张卡跟着取消选中 —— 点它的本意是「选它」，
+	 * 没框成就不该算选上（不然「共享」会为一个空区域亮着）。 */
+	if (!picked && region_row != NULL && region_row->toggle != NULL) {
+		gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(region_row->toggle), FALSE);
+	}
 	if (restore_dialog && dialog != NULL) {
 		gtk_widget_show(dialog);
 		gtk_window_present(GTK_WINDOW(dialog));
@@ -2458,13 +2641,6 @@ static GtkWidget *tab_page(GtkWidget *stack, const char *title) {
 	gtk_container_add(GTK_CONTAINER(sw), grid);
 	gtk_stack_add_titled(GTK_STACK(stack), sw, title, title);
 	return grid;
-}
-
-/* 「选择区域…」按钮：开框选浮层（活的、不冻屏）。 */
-static void on_pick_region_clicked(GtkButton *button, gpointer data) {
-	(void)button;
-	(void)data;
-	region_pick_start();
 }
 
 /* 弹对话框。多选（multiple）时用复选，否则单选（点一个就把别的取消）。 */
@@ -2601,21 +2777,18 @@ static void dialog_show(struct request *req) {
 		pages++;
 		struct region_row *reg = calloc(1, sizeof(*reg));
 		struct row *r = reg != NULL ? add_card(grid_reg, 0, 0, ROW_REGION, reg,
-			"屏幕区域", "还没选：点下面的按钮框一块") : NULL;
+			"屏幕区域", "点一下框一块屏") : NULL;
 		if (r != NULL) {
 			region_row = r;
-			/* 还没框出来之前不能选（选了也没东西可录）。 */
-			gtk_widget_set_sensitive(r->toggle, FALSE);
 		}
-		GtkWidget *pick = gtk_button_new_with_label("选择区域…");
-		add_class(pick, "ghost");
-		gtk_widget_set_halign(pick, GTK_ALIGN_START);
-		gtk_widget_set_margin_top(pick, 4);
-		gtk_grid_attach(GTK_GRID(grid_reg), pick, 0, 1, CARD_COLS, 1);
-		g_signal_connect(pick, "clicked", G_CALLBACK(on_pick_region_clicked), NULL);
-		region_pick_button = pick;
 	}
 
+	g_signal_connect(switcher, "draw", G_CALLBACK(switcher_draw), NULL);
+	GList *tabs = gtk_container_get_children(GTK_CONTAINER(switcher));
+	for (GList *it = tabs; it != NULL; it = it->next) {
+		g_signal_connect(it->data, "draw", G_CALLBACK(tab_draw), NULL);
+	}
+	g_list_free(tabs);
 	if (pages > 1) {
 		gtk_widget_set_no_show_all(switcher, FALSE);
 		gtk_widget_show(switcher);
@@ -2647,6 +2820,8 @@ static void dialog_show(struct request *req) {
 	gtk_container_add(GTK_CONTAINER(buttons), share);
 	share_button = share;
 
+	g_signal_connect(cancel, "draw", G_CALLBACK(pill_draw), GINT_TO_POINTER(0));
+	g_signal_connect(share, "draw", G_CALLBACK(pill_draw), GINT_TO_POINTER(1));
 	g_signal_connect(cancel, "clicked", G_CALLBACK(on_cancel_clicked), NULL);
 	g_signal_connect(share, "clicked", G_CALLBACK(on_share_clicked), NULL);
 	g_signal_connect(win, "key-press-event", G_CALLBACK(on_dialog_key), NULL);

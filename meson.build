@@ -367,7 +367,7 @@ executable('vidow-portal',
   ['tools/vidowportal.c', sc_client_header, sc_client_code,
    zkde_client_header, zkde_client_code, xdo_client_header, xdo_client_code,
    etl_header, etl_code, eics_header, eics_code, eicc_header, eicc_code],
-  dependencies: [wayland_client_dep, gtk3_dep, png_dep],
+  dependencies: [wayland_client_dep, gtk3_dep, png_dep, math_dep],
   include_directories: include_directories('.'),
   install: false)
 
