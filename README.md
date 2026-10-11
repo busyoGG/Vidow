@@ -909,7 +909,10 @@ python3 test-float.py        # 三个真实 GTK 窗口，验证浮动模式自�
 ./test-portal.sh raw-gtk             # vidow 不碰 portal 配置，手写一份单独验证协议
 ./test-portal.sh raw-kde             # 同上，换成 KDE
 ./test-portalenv.sh                 # 启动推进 / 退出还原 systemd 用户管理器环境 + 录屏后端探测（19 项断言）
-./test-screencast.sh                 # KDE 的录屏 portal 全链路：协议 → 对话框 → PipeWire node → 真出帧（9 项断言）
+./test-screencast.sh                 # KDE 的录屏 portal 全链路：协议 → 对话框 → PipeWire node → 真出帧（11 项断言）
+VIDOW_TEST_RENDERER=gles2 ./test-screencast.sh
+                                     # 同上，但走真 GPU（gles2）：额外验 dmabuf 直通（dmabuf_frames > 0、
+                                     # readback_ms == 0）。默认 pixman 那条路没有 dmabuf，走回读
 ./test-dpi.sh                        # 混合 DPI + XWayland（全 headless，15 项断言；含「QT_SCALE_FACTOR 不许设」）
 ./test-x11scale.sh                   # X11 逐窗口缩放桥 x11_scale=1（全 headless，16 项断言）
 ./test-scrollcull.sh                 # 滚出视口的列 / 半块越界的列都不画到隔壁显示器；有人录屏 / 预览时也一样；静止窗口滚到视口外照样出帧（全 headless + grim 逐像素，36 项断言）
@@ -2793,20 +2796,41 @@ portal_capture = "none"  -- ScreenCast / Screenshot 两行都不写
 多少次）/ `cap_ms`（上限）—— 修好之后 `grabs ≈ frames`，而 `commits` 可以远大于它俩。
 
 **一帧的主线程成本**也报出来了（同一个 `screencast` 块）：`grab_ms` / `grab_ms_max`（整块
-离屏渲染，把场景画进抓帧缓冲）和 `readback_ms`（从那张缓冲回读到 PipeWire 的 memfd ——
-GPU→CPU 的同步拷贝）。**回读是大头**：实测 2560x1440 上一帧回读 6.2ms、渲染 1.4ms（4K 按
-面积算回读 ~14ms）。也就是说「录制时整个桌面（连光标）都顿」剩下那部分不是渲染，是每帧
-33MB（4K）的拷贝 —— 上限压着它只能减少次数，去不掉单次成本。
+离屏渲染，把场景画进抓帧缓冲）、`readback_ms`（从那张缓冲回读到 PipeWire 缓冲 —— GPU→CPU
+的同步拷贝）、`sync_ms`（直通那条路上「等 GPU 把这一帧画完」）。走直通时 `readback_ms == 0`
+且 `dmabuf_frames > 0`；退回回读时 `dmabuf_frames == 0`。
 
-**dmabuf 直通没做成（记一笔，免得下次从头踩）**：想法是抓帧直接渲染进我们自己的一块交换链、
-把缓冲的 fd 交给消费者，像素不落 CPU。写到一半发现 PipeWire 这一层**缓冲是消费者分配的**：
-我们一报 `SPA_DATA_DmaBuf`，消费者就去要 dmabuf 型的缓冲，而 GStreamer 的 pipewiresrc（以及
-我们自己的 `cursorprobe`）的分配器建不出来 —— 实测直接 `error alloc buffers: 不支持的操作`
-（ENOTSUP）、一帧都拿不到（`test-portal-own.sh` 里试过，报成 flags choice 则退回 memfd、
-不报错但也不会用 dmabuf）。要做到底需要：① 一个**能分配 dmabuf 的消费者**来验（真机上 OBS
-那条路，或者给 `cursorprobe` 加一个 gbm 分配的 `--dmabuf`）；② 想清楚 fd 的所有权与生命周期
-（消费者没还回来之前那块缓冲不能复用）。那之前这条路的止疼办法是把上限压低（见 `cap_ms`）
-或者降低录制分辨率。
+**「录制时整个桌面（连光标）都顿」的根子就是那笔回读**：它在**合成器主线程**上做（PipeWire
+的 loop 挂在 Wayland 的 event loop 上），实测 2560x1440 一帧 6.2ms、4K 一帧 ~14ms —— 每发
+一帧桌面就冻这么久，上限（`cap_ms`）压着它只能减少次数、去不掉单次成本。Hyprland /
+xdg-desktop-portal-wlr 那边这笔拷贝在 **portal 进程**里做、合成器只交一张 dmabuf，所以它们
+不顿；vidow 的 zkde 流是**合成器自己建的**（协议就是这么定的），只能在合成器这边把它消掉。
+
+**现在是 dmabuf 直通（零拷贝）**：抓帧渲染进一张 **linear** 交换链，缓冲由**我们**分配
+（`PW_STREAM_FLAG_ALLOC_BUFFERS`），fd 在 `add_buffer` 里交给消费者，像素一帧都不落 CPU。
+实测 1280x720 一帧的主线程成本：**7.6ms（渲染 1.4 + 回读 6.2）→ 0.33ms**（只剩「等 GPU 把
+这一帧画完」）。
+
+踩过的两个坑（写在这儿，免得下次重走）：
+
+1. **缓冲必须由生产者分配**。PipeWire 默认是**消费者**分配缓冲：它建池那一刻就把内存包死了
+   （GStreamer 的 `gstpipewirepool` 只 wrap 一次：`wrap data (MemFd 2) 4096 3686400`），之后
+   我们每帧往 `spa_data` 里塞什么 fd 它都看不见 —— 实测塞 dmabuf 出去，消费者读的还是它自己
+   那张 memfd，六帧全黑。所以要用 `PW_STREAM_FLAG_ALLOC_BUFFERS` + `add_buffer` 事件把内存
+   填进去。另外**一个槽一张、fd 从头到尾不变**：消费者只认建池时包进去的那张。
+2. **报修饰符会把 GStreamer 的 caps 协商整死**（实测 `handle_format_change` 直接断言失败、
+   一帧都拿不到），而**不报**修饰符时消费者的默认假设就是 linear（modifier 0）—— 所以抓帧
+   直接渲染进 linear 缓冲，两边默认值就对上了，一个修饰符都不用谈。抓帧自己那张缓冲是
+   tiled + DCC 两平面的（实测 `mod=0x200000028a6bf04 n=2`），交给消费者它也没法 import。
+
+还有一笔省不掉的账：**交出去之前要等 GPU 把这一帧画完**（`sync_ms`，实测 0.3ms）。消费者
+（OBS / 浏览器 / gst）多半是把这块内存 mmap 下来在 CPU 上读，它没有任何办法知道 GPU 写完
+没有 —— 不等就是读到还没画进去的那张（实测全白/全黑）。真要做到不等，得给消费者带**显式
+同步**（dma-fence / syncobj，`SPA_DATA_SyncObj`），那是另一件事。
+
+消费者不认 dmabuf（协商出来是 memfd）时，我们自己建一张 memfd + mmap、回读进去；连 linear
+交换链都建不出来的会话（`WLR_RENDERER=pixman`，缓冲是 shm）就完全退回老路（消费者分配 memfd
++ 回读）。`VIDOW_SC_NO_DMABUF=1` 强制走回读那条路（A/B 用）。
 
 实测（`./test-portal-own.sh`，53 项）：私有 dbus + headless vidow → `vidow.portal` 落地、
 `vidow-portal` 占住总线名 → 前端把 ScreenCast / Screenshot 指到它 → 选择器画在 vidow 上
@@ -4481,6 +4505,39 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
         全屏之后都是 0；左上角那一点是全屏窗口自己的内容而不是圆角外面的背景；浮动的全屏
         geometry = 0,0 1280x720、退出全屏回到原来的浮动尺寸）；47 项全过。
 
+204. **录屏 dmabuf 直通（零拷贝）：主线程一帧 7.6ms → 0.33ms**（用户：「hyprland portal 录屏
+     就不会这样，肯定哪里代码写错了」）
+
+      用户说得对，203 那个「dmabuf 做不了」的结论错了。真正的错在两处：
+
+      1. 缓冲得由**生产者**分配（`PW_STREAM_FLAG_ALLOC_BUFFERS` + `add_buffer` 事件里把内存
+         填进去）。默认那条路是**消费者**分配：它建池那一刻就把内存包死了（GStreamer 的
+         `gstpipewirepool` 只 wrap 一次：`wrap data (MemFd 2) 4096 3686400`），我们之后每帧往
+         `spa_data` 里塞什么 fd 它都看不见 —— 实测塞 dmabuf 出去，消费者读的还是它自己那张
+         memfd，六帧全黑。而且**一个槽得一张、fd 从头到尾不变**（消费者只认建池时包进去的那张）。
+      2. 得让抓帧渲染进一张 **linear** 缓冲：报 `SPA_FORMAT_VIDEO_modifier` 会把 gst 的 caps
+         协商整死，不报时消费者的默认假设就是 linear（modifier 0）；而抓帧自己那张是 tiled +
+         DCC 两平面的（实测 `mod=0x200000028a6bf04 n=2`），交给消费者它也没法 import。
+
+      做法：`vidow_grab_target_new()`（capture.c）建一张 linear XRGB8888 交换链；
+      screencast 给每个 PipeWire 缓冲槽配一张（`struct vidow_sc_slot` —— 一槽一张、fd 不变），
+      抓帧渲染进它，fd 在 `add_buffer` 里交给消费者；**交出去之前 `vidow_grab_sync()` 等 GPU
+      把这一帧画完**（消费者多半是 mmap 下来在 CPU 上读，它没法知道 GPU 写完没有 —— 不等就是
+      读到还没画进去的那张，实测全白）。消费者不认 dmabuf 就自己建一张 memfd + mmap 回读进去；
+      连 linear 交换链都建不出来（`WLR_RENDERER=pixman`，缓冲是 shm）完全退回老路。
+      `VIDOW_SC_NO_DMABUF=1` 强制走回读（A/B 对比用）。
+
+      - `vidowmsg state` 的 `screencast` 多两个字段：`sync_ms`（等 GPU 那笔）和
+        `dmabuf_frames`（直通发了多少帧，> 0 才算这条路活着）；`readback_ms` 只摊在真回读过
+        的帧上（直通帧不摊进去，不然平均值会假的好看）。
+      - `test-screencast.sh` 多一个渲染器开关（`VIDOW_TEST_RENDERER=gles2`）和 3 条直通断言，
+        并把消费者的帧率限到 5fps —— 不限速时帧是**爆发式**的（消费者一还缓冲我们就抓一张），
+        六帧全在同一瞬间抓，「屏幕变了帧跟着变」那条断言就成了掷骰子（gles2 下必红）。pixman
+        那条路（默认，不需要 GPU）照样全过，11 项。
+      - 实测（headless 真 GPU，1280x720 的流）：`readback_ms` **0**、`sync_ms` **0.33ms**、
+        `dmabuf_frames` 6/6 —— 也就是主线程每帧只剩「等 GPU 把这一帧画完」这一笔（2560x1440
+        上回读那笔本来是 6.2ms）。
+
 203. **录屏的一帧成本量出来了：回读是大头**（用户补充「我说的录制掉帧是整个桌面，我观察的
      是光标」）
 
@@ -4490,16 +4547,16 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
       | 字段 | 是什么 |
       | --- | --- |
       | `grab_ms` / `grab_ms_max` | 整块离屏渲染（把场景画进抓帧缓冲）的平均 / 最大耗时 |
-      | `readback_ms` | 从抓帧缓冲回读到 PipeWire 的 memfd（GPU→CPU 同步拷贝）的平均耗时 |
+      | `readback_ms` | 从抓帧缓冲回读到 PipeWire 缓冲（GPU→CPU 同步拷贝）的平均耗时 |
+      | `sync_ms` | dmabuf 直通那条路上「等 GPU 把这一帧画完」的平均耗时 |
+      | `dmabuf_frames` | 走 dmabuf 直通（零拷贝）发出去的帧数，> 0 才算直通是活的 |
 
       - 实测（真 GPU、headless 2560x1440 的流）：**回读 6.19ms、渲染 1.41ms** —— 拷贝是渲染的
         4.4 倍，4K 上按面积算回读 ~14ms。「录屏时整个桌面（光标）都顿」剩下那部分就是它。
-      - 试过 dmabuf 直通（抓帧渲染进自己的交换链 + 把 fd 交给消费者，像素不落 CPU），**没做成**：
-        PipeWire 这一层的缓冲是**消费者**分配的，我们报 `SPA_DATA_DmaBuf` 之后消费者的分配器
-        建不出来（`error alloc buffers: 不支持的操作`，ENOTSUP）→ 一帧都拿不到；报成 flags
-        choice 则安静地退回 memfd（不报错，但也不会用 dmabuf）。要做到底得先有一个**能分配
-        dmabuf 的消费者**来验（OBS 那条路 / 给 `cursorprobe` 加 gbm 分配的 `--dmabuf`）。
-        这段结论写进 README 的「录屏的发帧节奏」一节了，代码没留半成品。
+      - 这一版试过 dmabuf 直通，当时判断「没做成」（PipeWire 这层的缓冲是**消费者**分配的，
+        我们报 `SPA_DATA_DmaBuf` 之后消费者的分配器建不出来：`error alloc buffers: 不支持的操作`）。
+        **那个判断是错的**，204 里做成了 —— 缓冲得由**生产者**分配（`ALLOC_BUFFERS`）。两条
+        仍然成立的结论：缓冲必须生产者分配、`SPA_FORMAT_VIDEO_modifier` 不能报。
       - 顺带一个坑：给 EnumFormat 报 `SPA_FORMAT_VIDEO_modifier` 会让 GStreamer 的
         pipewiresrc 协商不出固定 caps（`handle_format_change` 断言失败、一帧都拿不到），
         所以**不报**（不报 = 修饰符 0 = LINEAR）。

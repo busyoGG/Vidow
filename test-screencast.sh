@@ -77,10 +77,19 @@ cat >"$HOME_DIR/.config/vidow/portals.conf" <<'EOF'
 org.freedesktop.impl.portal.ScreenCast=kde
 EOF
 
+# 渲染器：默认 pixman（不需要 GPU，哪儿都能跑）。VIDOW_TEST_RENDERER=gles2 走真
+# GPU —— **只有那条路上才有 dmabuf**（录屏直通那条路：抓帧缓冲直接当 dmabuf 交给
+# 消费者，一帧不落 CPU），所以直通那几条断言也只在那种模式下跑（见内层第 9 节）。
+RENDERER=${VIDOW_TEST_RENDERER:-pixman}
+RENDER_ENVS=(WLR_RENDERER="$RENDERER")
+if [ "$RENDERER" = gles2 ]; then
+	RENDER_ENVS+=(WLR_RENDER_DRM_DEVICE=${VIDOW_TEST_DRM_DEVICE:-/dev/dri/renderD128})
+fi
+
 # 真 XDG_RUNTIME_DIR：portal 要连用户会话里的 PipeWire，换到临时目录就连不上了。
 XDG_RUNTIME_DIR=/run/user/1000 HOME="$HOME_DIR" \
-WLR_BACKENDS=headless WLR_HEADLESS_OUTPUTS=1 WLR_RENDERER=pixman \
-VIDOW_LOG=info VIDOW_PORTAL_NO_RESTART=1 \
+env WLR_BACKENDS=headless WLR_HEADLESS_OUTPUTS=1 "${RENDER_ENVS[@]}" \
+	VIDOW_LOG=info VIDOW_PORTAL_NO_RESTART=1 \
 	./build/vidow >"$LOG/vidow.log" 2>&1 &
 VIDOW_PID=$!
 for i in $(seq 1 40); do
@@ -131,7 +140,7 @@ CONTROL
 # 内层：私有 dbus 里跑前端 + KDE 后端 + 真请求 + 真消费。结果打成 PASS/FAIL 行。
 cat >"$LOG/inner.sh" <<'INNER'
 set -u
-R="$1"; SOCK="$2"; IPC="$3"
+R="$1"; SOCK="$2"; IPC="$3"; RENDERER="$4"
 VM=/home/busyo/Dev/Vidow/build/vidowmsg
 pass() { echo "  PASS  $1"; }
 fail() { echo "  FAIL  $1"; }
@@ -200,7 +209,11 @@ fi
 
 # --- 6/7 真消费：连上那个 node 拿帧，屏幕动起来帧要跟着变 -------------------
 if [ -n "${NODE:-}" ]; then
+	# 帧率先给个上限：不限速的话帧是**爆发式**的（消费者一还缓冲我们就抓一张），
+	# 六帧全在同一瞬间抓 —— 「屏幕变了帧跟着变」那条断言就成了掷骰子（gles2 下
+	# 必红）。限到 5fps 之后帧是摊开的，那条断言才有意义（顺带也测了发帧节奏）。
 	timeout 60 gst-launch-1.0 -q pipewiresrc path="$NODE" num-buffers=6 \
+		! video/x-raw,framerate=5/1 \
 		! videoconvert ! pngenc ! multifilesink location="$R/f-%02d.png" \
 		>"$R/gst.log" 2>&1 &
 	GST=$!
@@ -228,6 +241,36 @@ if [ -n "${NODE:-}" ]; then
 	else
 		fail "帧没变（$NF 帧全一样）—— 说明喂的是同一张图"
 	fi
+	# --- 9 直通（dmabuf）：抓帧缓冲直接当 dmabuf 交给消费者 ---------------
+	# 这一条是「录制的时候整个桌面卡」那个 bug 的判据：回读（GPU→CPU 同步拷贝）
+	# 是主线程上的（2560x1440 一帧 6.2ms），走直通之后 readback_ms 必须是 0。
+	# pixman 会话里根本没有 dmabuf（缓冲是 shm），这条路走不了 —— 那种模式下
+	# dmabuf_frames 恒为 0，正常。
+	if [ "$RENDERER" = gles2 ]; then
+		DB=$($VM --socket "$IPC" state 2>/dev/null | python3 -c '
+import json,sys
+st=json.load(sys.stdin)
+sc=st.get("screencast") or []
+print(sum(s.get("dmabuf_frames",0) for s in sc),
+      max([s.get("readback_ms",0) for s in sc] or [0]),
+      max([s.get("sync_ms",0) for s in sc] or [0]))
+')
+		set -- $DB
+		if [ "${1:-0}" -gt 0 ]; then
+			pass "走 dmabuf 直通发了 ${1} 帧（一帧不落 CPU）"
+		else
+			fail "一帧都没走 dmabuf 直通（$RENDERER 下应该有）—— 又退回回读了"
+		fi
+		if [ "${2:-1}" = "0" ] || [ "${2:-1}" = "0.0" ]; then
+			pass "回读成本 0ms（直通那条路上没有 GPU→CPU 拷贝）"
+		else
+			fail "回读还有 ${2}ms —— 直通没生效"
+		fi
+		pass "等 GPU 画完那笔 ${3:-?}ms（消费者要 mmap 读这块内存，这笔省不掉）"
+	else
+		pass "pixman 会话：没有 dmabuf，走回读（直通那条路在 gles2 下测）"
+	fi
+
 	# 静止的屏幕 + 晚连上来的消费者：得靠心跳（1Hz）给帧，否则要等到下一次画面
 	# 变化才有第一帧 —— 套件里负载高的时候 gst 连晚了，就是这么红的。
 	timeout 30 gst-launch-1.0 -q pipewiresrc path="$NODE" num-buffers=2 \
@@ -252,7 +295,7 @@ grep -aq "^  FAIL" "$LOG/control.out" && FAILED=1
 
 mark "4/5/6/7 私有 dbus 会话里跑真链路"
 WAYLAND_DISPLAY="$SOCK" timeout 300 dbus-run-session -- bash "$LOG/inner.sh" \
-	"$RUNDIR" "$SOCK" "$IPC" >"$LOG/inner.out" 2>&1
+	"$RUNDIR" "$SOCK" "$IPC" "$RENDERER" >"$LOG/inner.out" 2>&1
 sed -n 's/^\(  \(PASS\|FAIL\).*\)$/\1/p' "$LOG/inner.out"
 grep -aq "^  FAIL" "$LOG/inner.out" && FAILED=1
 

@@ -262,7 +262,7 @@ bool vidow_win_grab_frame_box(struct vidow_win_grab *grab, int out_w, int out_h,
  *
  * **不看损伤**：静止的窗口本来就没有新损伤，按损伤判就等于不给帧。 */
 struct wlr_buffer *vidow_win_grab_render(struct vidow_win_grab *grab,
-		int out_w, int out_h) {
+		int out_w, int out_h, struct wlr_swapchain *target) {
 	struct wlr_box box = {0};
 	if (!mirror_extents(grab, &box)) {
 		return NULL;
@@ -309,8 +309,17 @@ struct wlr_buffer *vidow_win_grab_render(struct vidow_win_grab *grab,
 	wlr_output_state_set_enabled(&state, true);
 	wlr_output_state_set_custom_mode(&state, out_w, out_h, 0);
 
+	/* target 非空 = 录屏直通：渲染进调用方那张 linear 交换链，出图直接当 dmabuf
+	 * 交给消费者。尺寸对不上就不用它（同 capture.c 里那条注释）。 */
+	struct wlr_swapchain *sc = NULL;
+	if (target != NULL && target->width == out_w && target->height == out_h) {
+		sc = target;
+	}
+	struct wlr_scene_output_state_options opts = { .swapchain = sc };
+
 	struct wlr_buffer *buffer = NULL;
-	if (wlr_scene_output_build_state(grab->scene_output, &state, NULL)) {
+	if (wlr_scene_output_build_state(grab->scene_output, &state,
+			sc != NULL ? &opts : NULL)) {
 		buffer = state.buffer;
 		if (buffer != NULL) {
 			wlr_buffer_lock(buffer);
@@ -319,8 +328,13 @@ struct wlr_buffer *vidow_win_grab_render(struct vidow_win_grab *grab,
 	wlr_output_state_finish(&state);
 
 	if (buffer == NULL) {
-		wlr_log(WLR_ERROR, "wincapture: %s 渲染失败（%dx%d，缩放 %.3f）",
-			grab_label(grab), out_w, out_h, scale);
+		if (sc != NULL) {
+			wlr_log(WLR_DEBUG, "wincapture: %s 直通交换链没空闲缓冲，这帧跳过",
+				grab_label(grab));
+		} else {
+			wlr_log(WLR_ERROR, "wincapture: %s 渲染失败（%dx%d，缩放 %.3f）",
+				grab_label(grab), out_w, out_h, scale);
+		}
 		return NULL;
 	}
 
@@ -557,7 +571,7 @@ static void win_source_size(struct vidow_win_source *src, int *w, int *h) {
 static bool source_render(struct vidow_win_source *src) {
 	int w = 0, h = 0;
 	win_source_size(src, &w, &h);
-	struct wlr_buffer *buffer = vidow_win_grab_render(src->grab, w, h);
+	struct wlr_buffer *buffer = vidow_win_grab_render(src->grab, w, h, NULL);
 	if (buffer == NULL) {
 		return false;
 	}

@@ -109,18 +109,74 @@ static struct vidow_capture *capture_for_output(struct vidow_server *server,
 	return output->capture;
 }
 
+/* 等这一帧的 GPU 真的画完（把命令流冲干净）。
+ *
+ * 为什么直通那条路必须等：这块缓冲的内存是**直接交给消费者**的，而消费者
+ * （GStreamer 的 pipewiresrc、浏览器那套）常常是 mmap 下来在 CPU 上读 —— 它没有
+ * 任何办法知道 GPU 写完没有。不等的话它读到的是**还没画进去的那张**：实测 gst
+ * 那边六帧全白（刚分配出来的显存就是白的），而同一张缓冲走回读就是对的（因为
+ * glReadPixels 本身就是同步点）。
+ *
+ * 读 1×1 一个像素是「把命令流冲干净」最省事的做法：数据量可以忽略，代价是等 GPU
+ * 把这一帧画完 —— 那笔钱本来就要花，只是从「消费者那边读不对」变成「我们这边等」。
+ * 真要做到不等，得给消费者带**显式同步**（dma-fence / syncobj，见 SPA_DATA_SyncObj），
+ * 那是另一件事。 */
+void vidow_grab_sync(struct wlr_renderer *renderer, struct wlr_buffer *buffer) {
+	struct wlr_texture *texture = wlr_texture_from_buffer(renderer, buffer);
+	if (texture == NULL) {
+		return;
+	}
+	uint32_t px = 0;
+	wlr_texture_read_pixels(texture, &(struct wlr_texture_read_pixels_options){
+		.data = &px,
+		.format = DRM_FORMAT_XRGB8888,
+		.stride = 4,
+		.src_box = (struct wlr_box){ .width = 1, .height = 1 },
+	});
+	wlr_texture_destroy(texture);
+}
+
+/* 录屏直通那条路要一张 **linear** 交换链（出一张 dmabuf 交给消费者）。
+ *
+ * 为什么要 linear：dmabuf 的排布（修饰符）在 SPA 里要单独协商，而报修饰符会把
+ * GStreamer 的 pipewiresrc 的 caps 协商整死（实测 handle_format_change 直接断言
+ * 失败、一帧都拿不到）；**不报**修饰符时消费者的默认假设就是 linear（modifier 0）
+ * —— 所以让抓帧渲染进一张 linear 缓冲，两边默认值就对上了，一个修饰符都不用谈。
+ *
+ * 建不出来（pixman / shm 分配器根本没有 dmabuf）返回 NULL，调用方退回老路
+ * （消费者按 memfd 分配 + 回读）。 */
+struct wlr_swapchain *vidow_grab_target_new(struct vidow_server *server,
+		int width, int height) {
+	if (width <= 0 || height <= 0) {
+		return NULL;
+	}
+	struct wlr_drm_format_set set = {0};
+	struct wlr_swapchain *sc = NULL;
+	if (wlr_drm_format_set_add(&set, DRM_FORMAT_XRGB8888,
+			DRM_FORMAT_MOD_LINEAR)) {
+		sc = wlr_swapchain_create(server->allocator, width, height,
+			set.formats);
+	}
+	wlr_drm_format_set_finish(&set);
+	return sc;
+}
+
 /* 渲染场景里的一个矩形，返回**加锁的**缓冲（调用方负责 wlr_buffer_unlock）。遮挡
  * 由调用方负责压好（vidow_capturemask_hold/release）。
  *
  * box 是**布局坐标**（逻辑坐标，不是像素），scale 是「逻辑 → 像素」的换算，
  * 出图尺寸 = round(box.width * scale) × round(box.height * scale)。整屏抓帧就是
  * 「box = 这块屏在布局里的框、scale = 这块屏的缩放」，按区域抓帧是请求里那个框。
- * 按窗口抓帧不走这儿（窗口单独渲染，见 wincapture.c）。 */
+ * 按窗口抓帧不走这儿（窗口单独渲染，见 wincapture.c）。
+ *
+ * target 非空 = 渲染进**调用方那张** linear 交换链（录屏 dmabuf 直通），空 = 渲染
+ * 进抓帧自己的交换链（老行为，给截图 / 按窗口抓帧用）。 */
 /* 同上，但出图尺寸**给死**（<=0 表示按 box × scale 算）。整屏抓帧用给死的那条：
  * 缩放不是整数时「逻辑框 × 缩放」round 回来可能差一两个像素，而客户端缓冲是照
  * 输出尺寸建的（见 capture_render）。 */
 static struct wlr_buffer *capture_render_box_size(struct vidow_capture *cap,
-		const struct wlr_box *box, double scale, int width, int height) {
+		const struct wlr_box *box, double scale, int width, int height,
+		struct wlr_swapchain *target) {
 	if (scale <= 0) {
 		return NULL;
 	}
@@ -158,8 +214,20 @@ static struct wlr_buffer *capture_render_box_size(struct vidow_capture *cap,
 	wlr_output_state_set_enabled(&state, true);
 	wlr_output_state_set_custom_mode(&state, width, height, 0);
 
+	/* 出图目标只认**尺寸正好对上**的那张：交换链是调用方按流尺寸建的，对不上
+	 * （比如消费者协商了个别的尺寸）就不能拿它当渲染目标 —— 渲染器会按 state
+	 * 的模式去配，配不上那一趟直接失败。对不上就不给目标，调用方自己看着办
+	 * （抓帧自己的交换链 + 回读）。 */
+	struct wlr_swapchain *sc = NULL;
+	if (target != NULL && target->width == width &&
+			target->height == height) {
+		sc = target;
+	}
+	struct wlr_scene_output_state_options opts = { .swapchain = sc };
+
 	struct wlr_buffer *buffer = NULL;
-	if (wlr_scene_output_build_state(cap->scene_output, &state, NULL)) {
+	if (wlr_scene_output_build_state(cap->scene_output, &state,
+			sc != NULL ? &opts : NULL)) {
 		buffer = state.buffer;
 		if (buffer != NULL) {
 			wlr_buffer_lock(buffer);
@@ -168,7 +236,14 @@ static struct wlr_buffer *capture_render_box_size(struct vidow_capture *cap,
 	wlr_output_state_finish(&state);
 
 	if (buffer == NULL) {
-		wlr_log(WLR_ERROR, "抓帧: %s 渲染失败", cap->output->name);
+		if (sc != NULL) {
+			/* 直通那条路的交换链只有 4 张，全被消费者攥着的时候这一帧
+			 * 出不来 —— 不是错误，下一帧就好了。 */
+			wlr_log(WLR_DEBUG, "抓帧: %s 直通交换链没空闲缓冲，这帧跳过",
+				cap->output->name);
+		} else {
+			wlr_log(WLR_ERROR, "抓帧: %s 渲染失败", cap->output->name);
+		}
 	}
 	return buffer;
 }
@@ -181,7 +256,8 @@ static struct wlr_buffer *capture_render_box_size(struct vidow_capture *cap,
  * 1280x720 建的 —— 尺寸对不上，拷贝那一步就失败（踩过：scale=1.7 的屏上
  * grim 全挂，test-blurscale.sh 第一条断言红）。按区域 / 按窗口抓帧没这个问题：
  * 那种流的尺寸本来就是「框 × 缩放」算出来的，两边同一个来源。 */
-static struct wlr_buffer *capture_render(struct vidow_capture *cap) {
+static struct wlr_buffer *capture_render(struct vidow_capture *cap,
+		struct wlr_swapchain *target) {
 	struct wlr_output *output = cap->output;
 	if (output->width <= 0 || output->height <= 0) {
 		return NULL;
@@ -189,19 +265,27 @@ static struct wlr_buffer *capture_render(struct vidow_capture *cap) {
 	struct wlr_box box;
 	wlr_output_layout_get_box(cap->server->output_layout, output, &box);
 	return capture_render_box_size(cap, &box, output->scale, output->width,
-		output->height);
+		output->height, target);
 }
 
 /* 按 box × scale 算出图尺寸的那条（区域 / 窗口抓帧用）。 */
 static struct wlr_buffer *capture_render_box(struct vidow_capture *cap,
-		const struct wlr_box *box, double scale) {
-	return capture_render_box_size(cap, box, scale, 0, 0);
+		const struct wlr_box *box, double scale, struct wlr_swapchain *target) {
+	return capture_render_box_size(cap, box, scale, 0, 0, target);
 }
 
-/* 抓一块屏幕上的任意矩形（布局坐标）。给「按区域录屏 / 截图」用。 */
-struct wlr_buffer *vidow_capture_grab_box(struct vidow_server *server,
-		struct wlr_output *output, const struct wlr_box *box, double scale) {
-	if (output == NULL || box == NULL || box->width <= 0 || box->height <= 0) {
+/* 抓帧的**通用入口**：box 为 NULL = 整块输出，否则是那块屏上的一个矩形。
+ *
+ * target 非空 = 录屏直通：渲染进调用方那张 linear 交换链，出图能直接当 dmabuf
+ * 交给消费者（见 vidow_grab_target_get）。target 为空 = 老行为（抓帧自己的
+ * 交换链），截图 / screencopy / ext-copy 都走这条。 */
+struct wlr_buffer *vidow_capture_grab_into(struct vidow_server *server,
+		struct wlr_output *output, const struct wlr_box *box, double scale,
+		struct wlr_swapchain *target) {
+	if (output == NULL) {
+		return NULL;
+	}
+	if (box != NULL && (box->width <= 0 || box->height <= 0)) {
 		return NULL;
 	}
 	struct vidow_capture *cap = capture_for_output(server, output);
@@ -209,9 +293,22 @@ struct wlr_buffer *vidow_capture_grab_box(struct vidow_server *server,
 		return NULL;
 	}
 	vidow_capturemask_hold(server);
-	struct wlr_buffer *buffer = capture_render_box(cap, box, scale);
+	struct wlr_buffer *buffer = box != NULL ?
+		capture_render_box(cap, box, scale, target) :
+		capture_render(cap, target);
+	if (buffer != NULL && box == NULL) {
+		/* 遮挡把原图压掉了，这里再把「块状版本」画回去（capture = "mosaic"）。
+		 * 放在这里两条抓帧路（screencopy / ext-copy）就都盖到了。 */
+		vidow_capture_paint_mosaic(server, output, buffer);
+	}
 	vidow_capturemask_release(server);
 	return buffer;
+}
+
+/* 抓一块屏幕上的任意矩形（布局坐标）。给「按区域录屏 / 截图」用。 */
+struct wlr_buffer *vidow_capture_grab_box(struct vidow_server *server,
+		struct wlr_output *output, const struct wlr_box *box, double scale) {
+	return vidow_capture_grab_into(server, output, box, scale, NULL);
 }
 
 /* --------------------------------------------------------------- 光标 */
@@ -556,19 +653,7 @@ void vidow_capture_paint_mosaic(struct vidow_server *server,
 
 struct wlr_buffer *vidow_capture_grab(struct vidow_server *server,
 		struct wlr_output *output) {
-	struct vidow_capture *cap = capture_for_output(server, output);
-	if (cap == NULL) {
-		return NULL;
-	}
-	vidow_capturemask_hold(server);
-	struct wlr_buffer *buffer = capture_render(cap);
-	if (buffer != NULL) {
-		/* 遮挡把原图压掉了，这里再把「块状版本」画回去（capture = "mosaic"）。
-		 * 放在这里两条抓帧路（screencopy / ext-copy）就都盖到了。 */
-		vidow_capture_paint_mosaic(server, output, buffer);
-	}
-	vidow_capturemask_release(server);
-	return buffer;
+	return vidow_capture_grab_into(server, output, NULL, 0, NULL);
 }
 
 /* 光标抓帧源（pointer cursor session）：结构要先定义，输出源那边会用到它。 */

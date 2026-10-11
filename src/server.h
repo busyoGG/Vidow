@@ -2149,6 +2149,24 @@ struct wlr_buffer *vidow_capture_grab(struct vidow_server *server,
 struct wlr_buffer *vidow_capture_grab_box(struct vidow_server *server,
 		struct wlr_output *output, const struct wlr_box *box, double scale);
 
+/* 抓帧的通用入口（上面两条都是它的特例）：box 为 NULL = 整块输出。
+ *
+ * target 非空 = **录屏 dmabuf 直通**：渲染进调用方那张 linear 交换链，出图能直接
+ * 当 dmabuf 交给 PipeWire 消费者（不落 CPU，见 screencast.c）。线性是必须的 ——
+ * 不报修饰符时消费者的默认假设就是 linear。尺寸变了会重建（*target 由调用方
+ * 持有、负责 destroy）。target 为空 = 抓帧自己的交换链（老行为）。 */
+struct wlr_buffer *vidow_capture_grab_into(struct vidow_server *server,
+		struct wlr_output *output, const struct wlr_box *box, double scale,
+		struct wlr_swapchain *target);
+/* 建一张 linear 交换链当出图目标（录屏 dmabuf 直通用的那一种）。建不出来
+ * （pixman / 没有 dmabuf）返回 NULL —— 调用方退回老行为（回读）。 */
+struct wlr_swapchain *vidow_grab_target_new(struct vidow_server *server,
+		int width, int height);
+/* 等这一帧的 GPU 真的画完（把命令流冲干净）。直通那条路把缓冲内存直接交给消费者
+ * 时必须调：消费者（gst / 浏览器）常常是 mmap 下来在 CPU 上读，不等就是读到还没画
+ * 进去的那张（实测全白）。回读那条路不用调（glReadPixels 本身就是同步点）。 */
+void vidow_grab_sync(struct wlr_renderer *renderer, struct wlr_buffer *buffer);
+
 /* layer 的内容节点（surface 的 buffer）：wlroots 把它包在 subsurface tree 里，
  * 所以要递归找。抓帧遮挡（capturemask.c）和马赛克（capture.c）都要用它。 */
 struct wlr_scene_buffer *vidow_layer_surface_buffer(
@@ -2271,12 +2289,20 @@ struct vidow_sc_stream_stats {
 	unsigned long long grabs;  /* 整帧抓了多少次（整块离屏渲染 + 回读） */
 	unsigned long long commits;/* 看见多少次输出提交 */
 	unsigned long long throttled; /* 消费者来要帧但被节奏上限挡下的次数 */
+	/* 走 dmabuf 直通（把抓帧缓冲的 fd 直接交给消费者，一帧不落 CPU）发出去的
+	 * 帧数。> 0 说明零拷贝那条路是活的；pixman 那种没有 dmabuf 的会话里它恒为
+	 * 0（全走回读），正常。 */
+	unsigned long long dmabuf_frames;
 	/* 一帧的主线程成本（毫秒，平均值）：grab = 整块离屏渲染，readback = 从
 	 * 抓帧缓冲回读到 PipeWire 的 memfd。录制时桌面卡不卡就看这两个数 ——
 	 * 实测 2560x1440 上回读 6.2ms、渲染 1.4ms，拷贝是渲染的 4 倍多。 */
 	double grab_ms;
 	double grab_ms_max;
 	double readback_ms;
+	/* dmabuf 直通每帧在等 GPU 画完的那笔时间（毫秒，平均值）。走直通时它是
+	 * 主线程上唯一剩下的大头（回读那笔变成 0）：实测就是「一帧渲染 + 冲命令
+	 * 流」的时间。 */
+	double sync_ms;
 	long long last_send_ms;    /* 上一帧是什么时候发的（单调时钟毫秒），-1 = 还没发过 */
 };
 bool vidow_screencast_stream_stats(const struct vidow_screencast_stream *stream,
@@ -2537,7 +2563,7 @@ struct wlr_output *vidow_win_grab_output(struct vidow_server *server,
 /* 渲染一帧：窗口等比缩放摆进 out_w × out_h（剩下的边是黑的），返回**加锁的**缓冲
  * （调用方 unlock）。out_w / out_h 给 0 = 按窗口自己的尺寸（1:1）。不看损伤。 */
 struct wlr_buffer *vidow_win_grab_render(struct vidow_win_grab *grab,
-		int out_w, int out_h);
+		int out_w, int out_h, struct wlr_swapchain *target);
 struct wlr_swapchain *vidow_win_grab_swapchain(struct vidow_win_grab *grab);
 /* 抓帧框（**布局坐标**）+「布局逻辑 → 流像素」的缩放，和 render 里那次等比摆放
  * 是同一套算法：`(布局坐标 - 框原点) × 缩放` = 流里的像素位置。录屏的光标按它

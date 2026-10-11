@@ -729,7 +729,12 @@ static const char *sc_kind_name(enum vidow_sc_kind kind) {
  * 跟 frames 一个量级（消费者要一帧才抓一帧）。
  *
  * 「录制的时候整个桌面卡」再往下查就看 grab_ms / readback_ms 哪一半贵：
- * 4K 一帧 33MB，readback_ms 是大头 → 该给消费者 dmabuf（像素不落 CPU）。 */
+ * 4K 一帧 33MB，readback_ms 是大头 → 该给消费者 dmabuf（像素不落 CPU）。
+ *
+ * 现在 readback_ms 是 0 才对：帧走 dmabuf 直通交给消费者（dmabuf_frames 数它），
+ * 一帧都不落 CPU —— 那条路要抓帧渲染进一张 linear 缓冲（见 capture.c 的
+ * vidow_grab_target_get）。dmabuf_frames == 0 且 frames > 0 = 退回回读那条路
+ * （pixman / 没有 dmabuf 的会话，或者消费者不认 dmabuf）。 */
 void vidow_ipc_json_screencast(struct jbuf *b, struct vidow_server *server) {
 	jb_arr(b);
 	if (server->screencast != NULL) {
@@ -752,9 +757,11 @@ void vidow_ipc_json_screencast(struct jbuf *b, struct vidow_server *server) {
 			jb_kv_uint(b, "grabs", st.grabs);
 			jb_kv_uint(b, "commits", st.commits);
 			jb_kv_uint(b, "throttled", st.throttled);
+			jb_kv_uint(b, "dmabuf_frames", st.dmabuf_frames);
 			jb_kv_double(b, "grab_ms", st.grab_ms);
 			jb_kv_double(b, "grab_ms_max", st.grab_ms_max);
 			jb_kv_double(b, "readback_ms", st.readback_ms);
+			jb_kv_double(b, "sync_ms", st.sync_ms);
 			jb_kv_uint(b, "cursor_pushes", stream->cursor_pushes);
 			jb_kv_int(b, "last_send_ms", st.last_send_ms);
 			jb_obj_end(b);

@@ -385,9 +385,11 @@ for s in streams:
     print("      （%s：发帧 %d、抓帧 %d、输出提交 %d、消费者 %.0ffps、上限 %.1fms）" %
           (s.get("kind"), s["frames"], s["grabs"], s["commits"],
            s.get("consumer_fps", 0), s.get("cap_ms", 0)))
-    print("      （一帧的主线程成本：抓帧渲染 %.2fms（最多 %.2fms）、回读 %.2fms）" %
-          (s.get("grab_ms", 0), s.get("grab_ms_max", 0), s.get("readback_ms", 0)))
-    for k in ("grab_ms", "grab_ms_max", "readback_ms"):
+    print("      （一帧的主线程成本：抓帧渲染 %.2fms（最多 %.2fms）、回读 %.2fms、"
+          "等 GPU %.2fms；dmabuf 直通 %d 帧）" %
+          (s.get("grab_ms", 0), s.get("grab_ms_max", 0), s.get("readback_ms", 0),
+           s.get("sync_ms", 0), s.get("dmabuf_frames", 0)))
+    for k in ("grab_ms", "grab_ms_max", "readback_ms", "sync_ms", "dmabuf_frames"):
         if k not in s:
             missing.append(k)
     if s["grabs"] > s["frames"] + 2:
@@ -396,7 +398,8 @@ if missing:
     print("  FAIL  state.screencast 少了成本字段：%s" % ", ".join(sorted(set(missing))))
     bad += 1
 else:
-    print("  PASS  每路流都报了一帧的主线程成本（grab_ms / grab_ms_max / readback_ms）")
+    print("  PASS  每路流都报了一帧的主线程成本（grab_ms / readback_ms / sync_ms / "
+          "dmabuf_frames）")
 if bad == 0:
     print("  PASS  抓帧次数跟着发帧次数走（不是每次输出提交都抓一整帧）")
 else:

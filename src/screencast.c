@@ -1,3 +1,6 @@
+/* memfd_create / MFD_CLOEXEC（自己分配缓冲那条路，见 pw_stream_add_buffer）。 */
+#define _GNU_SOURCE
+
 /*
  * screencast.c — zkde_screencast_unstable_v1：KWin 的私有录屏协议。
  *
@@ -17,11 +20,23 @@
  *
  * 关键点：**PipeWire 流是合成器建的**（created 给的是合成器自己那个 node 的 id），
  * 客户端拿这个 id 去 pw_stream_connect(PW_DIRECTION_INPUT, node) 消费。所以这个模块
- * 同时是个 PipeWire 生产者：把输出的一帧渲染出来，喂进一个 memfd 缓冲。
+ * 同时是个 PipeWire 生产者：把输出的一帧渲染出来，交给消费者。
+ *
+ * 交给消费者的方式（这一块是「录制的时候整个桌面卡」那个 bug 的核心，见
+ * pw_stream_fill / pw_stream_add_buffer）：
+ *
+ *   能建出 linear dmabuf（gles2 / gbm 那套）→ 缓冲**我们自己分配**
+ *   （PW_STREAM_FLAG_ALLOC_BUFFERS），每个槽一张 linear 交换链，fd 交给消费者，
+ *   像素一帧都不落 CPU。消费者那边（OBS / 浏览器 / gst 的 pipewiresrc）自己
+ *   决定是采样还是拷贝，**那笔开销就不在合成器主线程上了**。
+ *
+ *   建不出来（pixman / 没有 dmabuf）→ 老路：消费者按 memfd 分配，我们
+ *   wlr_texture_read_pixels 回读进去（GPU→CPU 同步拷贝，2560x1440 一帧 6.2ms、
+ *   4K 一帧 14ms，全占在主线程上）。
  *
  * 线程模型：PipeWire 的 loop 直接挂进 wl_event_loop（pw_loop_get_fd + pw_loop_iterate），
  * 全程在合成器主线程上跑 —— 不用锁、不用跨线程往 Wayland 资源上写事件。代价是喂帧
- * 那一下（一次 read_pixels）会占住主线程，跟 screencopy 的行为一致。
+ * 那一下会占住主线程（直通那条约 0.3ms = 等 GPU 把这一帧画完，回读那条 6ms+）。
  *
  * 光标模式（pointer_mode，协议里的 enum pointer）：hidden / embedded / metadata。
  */
@@ -29,9 +44,12 @@
 #include "ipc.h"
 #include "server.h"
 
+#include <fcntl.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 #include <wayland-server-core.h>
 #include <wlr/backend/headless.h>
@@ -39,6 +57,9 @@
 #include <wlr/types/wlr_ext_foreign_toplevel_list_v1.h>
 #include <wlr/types/wlr_output.h>
 #include <wlr/types/wlr_output_layout.h>
+#include <wlr/render/dmabuf.h>
+#include <wlr/render/drm_format_set.h>
+#include <wlr/render/swapchain.h>
 #include <wlr/util/log.h>
 
 #include <drm_fourcc.h>
@@ -84,8 +105,29 @@ struct vidow_sc_pw {
 	size_t n_known;
 };
 
+/* 一个 PipeWire 缓冲槽 —— 只在**缓冲由我们分配**时才有（PW_STREAM_FLAG_ALLOC_BUFFERS，
+ * 见 pw_stream_add_buffer）。一路流有几个槽就有几份。
+ *
+ * 为什么必须「一槽一张、fd 从头到尾不变」：消费者是在**建缓冲池那一刻**把 fd 包成
+ * 自己的缓冲的（实测 GStreamer 的 gstpipewirepool 只 wrap 一次：`wrap data
+ * (MemFd 2) 4096 3686400`），之后每帧只看 chunk（offset / size / stride）。所以
+ * 「每帧换一张 dmabuf」这条路走不通 —— 换了它也读不到，读的还是它建池时包进去的
+ * 那块内存（实测：六帧全黑）。 */
+struct vidow_sc_slot {
+	/* dmabuf：一张**只有 1 张缓冲**的 linear 交换链 —— 既是渲染目标，也是交给
+	 * 消费者的那张图（fd 不变，见上）。 */
+	struct wlr_swapchain *swapchain;
+	uint32_t stride;
+	/* 消费者只要 memfd（不认 dmabuf）时：我们自己建一张 memfd + mmap，回读进去。 */
+	int memfd;
+	void *map;
+	size_t map_size;
+	/* 这个槽上一次交出去的缓冲，我们攥着锁（消费者还在读那块内存）。 */
+	struct wlr_buffer *frame;
+};
+
 /* 一路流。抓帧走 vidow 自己那条路（vidow_capture_grab：遮挡 / 马赛克都盖到了），
- * 像素进 PipeWire 的 memfd 缓冲。 */
+ * 像素进 PipeWire 的缓冲（能 dmabuf 就直通，不然回读）。 */
 struct vidow_sc_pw_stream {
 	struct vidow_screencast_stream *stream;
 	struct vidow_sc_pw *pw;
@@ -142,6 +184,20 @@ struct vidow_sc_pw_stream {
 	int64_t grab_ns;
 	int64_t readback_ns;
 	int64_t grab_ns_max;
+	/* dmabuf 直通那条路每帧要**等 GPU 把这一帧画完**（vidow_grab_sync：消费者
+	 * 可能 mmap 读这块内存，不等就是读到空白）。这笔等待是主线程上的，单独记
+	 * 一笔 —— 它和 readback_ns 不会同时出现（走直通就没有回读）。 */
+	int64_t sync_ns;
+	/* 缓冲**我们自己分配**（PW_STREAM_FLAG_ALLOC_BUFFERS）：能建出 linear
+	 * 交换链（= 有 dmabuf，gles2 / gbm）就为 true。false 时退回老路：消费者
+	 * 按 memfd 分配，我们回读进去（pixman 那种会话）。 */
+	bool own_buffers;
+	/* 协商出来的缓冲尺寸（add_buffer 里按它建缓冲）。 */
+	uint32_t buf_w, buf_h, buf_stride;
+	size_t buf_size;
+	/* 真的按 dmabuf 交出去的帧数：> 0 才说明直通这条路是活的。 */
+	uint64_t dmabuf_frames;
+	bool dmabuf_logged;
 };
 
 /* 光标在这一路里的状态（见 vidow_sc_pw_stream 的 cursor_state）。 */
@@ -159,12 +215,13 @@ enum {
 	(sizeof(struct spa_meta_cursor) + sizeof(struct spa_meta_bitmap) + \
 	 (size_t)VIDOW_CURSOR_MAX_PX * VIDOW_CURSOR_MAX_PX * 4)
 
-static void pw_stream_fill(struct vidow_sc_pw_stream *ps,
-		struct pw_buffer *buffer);
+static bool pw_stream_fill(struct vidow_sc_pw_stream *ps,
+		struct pw_buffer *buffer, struct vidow_sc_slot *slot);
 static void stream_fill_cursor(struct vidow_sc_pw_stream *ps, struct spa_buffer *buf);
 static void stream_announce_cursor_meta(struct vidow_sc_pw_stream *ps);
 static void stream_announce(struct vidow_sc_pw_stream *ps);
-static struct wlr_buffer *stream_grab(struct vidow_sc_pw_stream *ps);
+static struct wlr_buffer *stream_grab(struct vidow_sc_pw_stream *ps,
+		struct wlr_swapchain *target);
 
 /* loop 可读 → 跑一轮 PipeWire 的事件循环。 */
 static int pw_loop_ready(int fd, uint32_t mask, void *data) {
@@ -395,6 +452,13 @@ static void pw_stream_param_changed(void *data, uint32_t id,
 			nw, nh, stream->out_w, stream->out_h);
 		stream->out_w = (int)nw;
 		stream->out_h = (int)nh;
+		/* 缓冲尺寸跟着改：下面 stream_announce_cursor_meta 会把 Buffers 参数
+		 * 按新尺寸重报一遍（PipeWire 于是重建缓冲池、再来一轮 add_buffer），
+		 * 那会儿就是照这两个数建缓冲的（见 pw_stream_add_buffer）。 */
+		ps->buf_w = nw;
+		ps->buf_h = nh;
+		ps->buf_stride = nw * 4;
+		ps->buf_size = (size_t)ps->buf_stride * nh;
 	}
 	wlr_log(WLR_INFO, "screencast: 协商到 %ux%u（spa 格式 %u）",
 		ps->video.size.width, ps->video.size.height, ps->video.format);
@@ -456,6 +520,132 @@ static bool stream_send_due(struct vidow_sc_pw_stream *ps) {
 	return vidow_now_ns() - ps->last_send_ns >= iv;
 }
 
+/* 一帧交出去之后，那张缓冲的锁由谁拿着。
+ *
+ * dmabuf 那条路是把**这块内存**交出去的（fd 挂在消费者的缓冲上），消费者还在读它
+ * —— 所以锁得一直攥着：存在槽上（slot->frame），等这个槽回到我们手上（下一次填
+ * 它 / 槽要拆了）再放开。攥着还有一个作用：交换链那一格不会被下一次抓帧复用（我们
+ * 从来不写消费者还在读的那块内存）。
+ *
+ * 回读那条路不需要（像素已经拷进缓冲了，抓帧缓冲当场就能放）。 */
+static void stream_hold_frame(struct vidow_sc_slot *slot,
+		struct wlr_buffer *frame) {
+	struct wlr_buffer *old = slot->frame;
+	slot->frame = frame;
+	if (old != NULL) {
+		wlr_buffer_unlock(old);
+	}
+}
+
+/* 缓冲由我们分配时：给每个槽配一张缓冲（add_buffer 事件）。
+ *
+ * 消费者的选择（datas[0].type）说了算：能 dmabuf 就给一张 linear 交换链的 fd
+ * （零拷贝，见 vidow_grab_target_get / vidow_grab_sync），否则自己建一张 memfd +
+ * mmap（回读进去 —— 比「每帧换 dmabuf」可靠，见 struct vidow_sc_slot 那段）。 */
+static void pw_stream_add_buffer(void *data, struct pw_buffer *buffer) {
+	struct vidow_sc_pw_stream *ps = data;
+	struct spa_buffer *buf = buffer->buffer;
+	if (!ps->own_buffers || buf->n_datas < 1) {
+		return; /* 缓冲是消费者分配的：槽里什么都不用挂 */
+	}
+	uint32_t width = ps->buf_w, height = ps->buf_h;
+	size_t size = ps->buf_size;
+	if (width == 0 || height == 0 || size == 0) {
+		return;
+	}
+	struct vidow_sc_slot *slot = calloc(1, sizeof(*slot));
+	if (slot == NULL) {
+		return;
+	}
+	slot->memfd = -1;
+	slot->stride = ps->buf_stride;
+
+	/* 消费者要 dmabuf（而且它的槽是 dmabuf 型的）→ 建一张 linear 交换链。
+	 * 尺寸 / stride 对不上就不走这条：消费者是按**它协商到的** stride 去解释
+	 * 内存的（caps 里那个），跟这张缓冲的实际 stride 不一致就是斜的。 */
+	if ((buf->datas[0].type & (1u << SPA_DATA_DmaBuf)) != 0) {
+		struct wlr_swapchain *sc = vidow_grab_target_new(
+			ps->stream->sc->server, (int)width, (int)height);
+		struct wlr_buffer *probe = sc != NULL ?
+			wlr_swapchain_acquire(sc) : NULL;
+		struct wlr_dmabuf_attributes at;
+		if (probe != NULL && wlr_buffer_get_dmabuf(probe, &at) &&
+				at.n_planes == 1 && at.fd[0] >= 0 &&
+				at.stride[0] == ps->buf_stride) {
+			struct spa_data *d = &buf->datas[0];
+			d->type = SPA_DATA_DmaBuf;
+			d->flags = SPA_DATA_FLAG_READABLE | SPA_DATA_FLAG_MAPPABLE;
+			d->fd = at.fd[0];
+			d->data = NULL;
+			d->mapoffset = 0;
+			d->maxsize = (uint32_t)size;
+			slot->swapchain = sc;
+			slot->stride = at.stride[0];
+		}
+		if (probe != NULL) {
+			/* 马上放开：渲染那一趟会自己再取（攥着不放的话那一趟取不到
+			 * 缓冲，见 pw_stream_fill 里那个渲染目标）。 */
+			wlr_buffer_unlock(probe);
+		}
+		if (slot->swapchain == NULL && sc != NULL) {
+			wlr_swapchain_destroy(sc);
+		}
+	}
+
+	if (slot->swapchain == NULL) {
+		/* memfd 兜底（消费者不认 dmabuf）：自己建一张，回读进去。 */
+		int fd = memfd_create("vidow-screencast", MFD_CLOEXEC);
+		if (fd < 0) {
+			free(slot);
+			return;
+		}
+		void *map = MAP_FAILED;
+		if (ftruncate(fd, (off_t)size) == 0) {
+			map = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+		}
+		if (map == MAP_FAILED) {
+			close(fd);
+			free(slot);
+			return;
+		}
+		struct spa_data *d = &buf->datas[0];
+		d->type = SPA_DATA_MemFd;
+		d->flags = SPA_DATA_FLAG_READABLE | SPA_DATA_FLAG_MAPPABLE;
+		d->fd = fd;
+		d->data = map;
+		d->mapoffset = 0;
+		d->maxsize = (uint32_t)size;
+		slot->memfd = fd;
+		slot->map = map;
+		slot->map_size = size;
+	}
+	buffer->user_data = slot;
+	wlr_log(WLR_DEBUG, "screencast: 槽就绪（%ux%u，%s，stride %u）", width, height,
+		slot->swapchain != NULL ? "dmabuf" : "memfd", slot->stride);
+}
+
+/* 槽要拆了（流在拆 / 缓冲池重建）：把我们攥着的缓冲放开，内存还回去。 */
+static void pw_stream_remove_buffer(void *data, struct pw_buffer *buffer) {
+	(void)data;
+	struct vidow_sc_slot *slot = buffer->user_data;
+	buffer->user_data = NULL;
+	if (slot == NULL) {
+		return;
+	}
+	if (slot->frame != NULL) {
+		wlr_buffer_unlock(slot->frame);
+		slot->frame = NULL;
+	}
+	wlr_swapchain_destroy(slot->swapchain);
+	if (slot->map != NULL) {
+		munmap(slot->map, slot->map_size);
+	}
+	if (slot->memfd >= 0) {
+		close(slot->memfd);
+	}
+	free(slot);
+}
+
 /* 图转起来了 → 把手上那一帧填进去。手上没有（流刚建好、或者消费者刚连上来）
  * 就当场抓一帧：屏幕静止时没有任何输出提交，不这么做消费者一个缓冲都拿不到 ——
  * 表现是「连上了但一直是黑的」。 */
@@ -465,12 +655,16 @@ static void pw_stream_process(void *data) {
 	if (buffer == NULL) {
 		return;
 	}
+	/* 缓冲由我们分配时，这个槽的 user_data 是它的槽（含渲染目标 —— 交出去的
+	 * 那张 dmabuf 就是渲染进去的那张，fd 不能变，见 struct vidow_sc_slot）。 */
+	struct vidow_sc_slot *slot = buffer->user_data;
 	/* 到点才抓：上限见 stream_send_due。没到点就只把缓冲还回去（不填）——
 	 * 消费者那一格拿到的是空缓冲，但它本来就不该在这时候要帧（是我们催早了）。 */
 	if (ps->pending == NULL) {
 		if (stream_send_due(ps)) {
 			int64_t t0 = vidow_now_ns();
-			ps->pending = stream_grab(ps);
+			ps->pending = stream_grab(ps,
+				slot != NULL ? slot->swapchain : NULL);
 			int64_t dt = vidow_now_ns() - t0;
 			ps->grab_ns += dt;
 			if (dt > ps->grab_ns_max) {
@@ -481,8 +675,13 @@ static void pw_stream_process(void *data) {
 		}
 	}
 	if (ps->pending != NULL) {
-		pw_stream_fill(ps, buffer);
-		wlr_buffer_unlock(ps->pending);
+		/* 填成功且走的是 dmabuf 直通：这块内存交出去了，锁跟着槽走
+		 * （见 stream_hold_frame），这里不能放。 */
+		if (pw_stream_fill(ps, buffer, slot)) {
+			stream_hold_frame(slot, ps->pending);
+		} else {
+			wlr_buffer_unlock(ps->pending);
+		}
 		ps->pending = NULL;
 	}
 	pw_stream_queue_buffer(ps->pw_stream, buffer);
@@ -493,17 +692,51 @@ static const struct pw_stream_events pw_stream_events = {
 	.state_changed = pw_stream_state_changed,
 	.param_changed = pw_stream_param_changed,
 	.process = pw_stream_process,
+	.add_buffer = pw_stream_add_buffer,
+	.remove_buffer = pw_stream_remove_buffer,
 };
 
 /* ------------------------------------------------------------ 抓帧 → 缓冲 */
 
+/* 诊断开关 VIDOW_SC_NO_DMABUF=1：强制走回读那条路（连自己的 dmabuf 都不建）。
+ *
+ * 两个用处：录屏还卡的时候 A/B 一下「卡是不是直通这条路带来的」；以及消费者不认
+ * dmabuf 时留个后门。 */
+static bool vidow_sc_no_dmabuf(void) {
+	static int cached = -1;
+	if (cached < 0) {
+		const char *e = getenv("VIDOW_SC_NO_DMABUF");
+		cached = e != NULL && e[0] != '\0' && strcmp(e, "0") != 0;
+	}
+	return cached != 0;
+}
+
 /* 把 ps->pending 那一帧写进 PipeWire 的缓冲。格式固定 BGRx（= DRM XRGB8888），
- * 尺寸取协商结果（我们只报了输出像素尺寸一种，所以协商结果就是它）。 */
-static void pw_stream_fill(struct vidow_sc_pw_stream *ps,
-		struct pw_buffer *buffer) {
+ * 尺寸取协商结果（我们只报了输出像素尺寸一种，所以协商结果就是它）。
+ *
+ * 返回 true = 这块内存是**直接交出去的**（dmabuf 直通），锁归调用方管
+ * （见 stream_hold_frame）；false = 像素是拷进去的（回读 / 没填成），抓帧缓冲
+ * 调用方当场放掉。
+ *
+ * 三条路（slot 非空 = 缓冲是我们自己分配的，见 pw_stream_add_buffer）：
+ *   slot 有交换链 —— **dmabuf 直通**：fd 在 add_buffer 那一刻就交给消费者了
+ *                   （它建池时包进去的，fd 一变它就再也读不到新画面），这里只
+ *                   更新 chunk（哪一块是新的），外加**等 GPU 画完**
+ *                   （vidow_grab_sync：消费者多半是 mmap 下来在 CPU 上读）。
+ *   slot 有 memfd —— 回读进我们自己那张 memfd。
+ *   没有 slot   —— 老路：消费者按 memfd 分配，回读进它的映射。
+ *
+ * 为什么直通是重点：回读那一趟（wlr_texture_read_pixels，GPU→CPU 同步拷贝）是
+ * **在合成器主线程上**做的（PipeWire 的 loop 挂在 Wayland 的 event loop 上，见
+ * pw_loop_open），2560x1440 一帧 6.2ms、4K 一帧 14ms —— 录制期间每发一帧就把
+ * 桌面冻住这么久，光标跟着卡（用户报的就是这个）。Hyprland / xdpw 那边这条拷贝
+ * 在 **portal 进程**里做，合成器只交一张 dmabuf，所以它们不卡；vidow 的 zkde 流是
+ * **合成器自己建的**（协议就是这么定的），只能在这里把它消掉。 */
+static bool pw_stream_fill(struct vidow_sc_pw_stream *ps,
+		struct pw_buffer *buffer, struct vidow_sc_slot *slot) {
 	struct spa_buffer *buf = buffer->buffer;
-	if (buf->n_datas < 1 || buf->datas[0].data == NULL) {
-		return;
+	if (buf->n_datas < 1) {
+		return false;
 	}
 	struct wlr_buffer *src = ps->pending;
 	uint32_t width = (uint32_t)src->width;
@@ -514,17 +747,51 @@ static void pw_stream_fill(struct vidow_sc_pw_stream *ps,
 	}
 	size_t stride = (size_t)width * 4;
 	size_t size = stride * height;
+
+	if (slot != NULL && slot->swapchain != NULL) {
+		struct spa_chunk *chunk = buf->datas[0].chunk;
+		if (chunk == NULL) {
+			return false;
+		}
+		/* 先把这一帧等完再交出去（消费者可能直接 mmap 读这块内存，见
+		 * vidow_grab_sync）。这笔等待是「GPU 把这一帧画完」，本来就要花。 */
+		int64_t sync_t0 = vidow_now_ns();
+		vidow_grab_sync(ps->stream->output->renderer, src);
+		ps->sync_ns += vidow_now_ns() - sync_t0;
+		chunk->offset = 0;
+		chunk->size = slot->stride * (uint32_t)height;
+		chunk->stride = (int32_t)slot->stride;
+		chunk->flags = SPA_CHUNK_FLAG_NONE;
+		ps->dmabuf_frames++;
+		ps->frames++;
+		ps->last_send_ns = vidow_now_ns();
+		if (!ps->dmabuf_logged) {
+			ps->dmabuf_logged = true;
+			wlr_log(WLR_INFO, "screencast: dmabuf 直通交帧（%ux%u stride %u）"
+				"—— 不再回读，消费者直接读那块内存", width, height,
+				slot->stride);
+		}
+		if (ps->stream->pointer_mode ==
+				ZKDE_SCREENCAST_UNSTABLE_V1_POINTER_METADATA) {
+			stream_fill_cursor(ps, buf);
+		}
+		return true;
+	}
+
+	if (buf->datas[0].data == NULL) {
+		return false;
+	}
 	if (buf->datas[0].maxsize < size) {
 		wlr_log(WLR_ERROR, "screencast: PipeWire 缓冲太小（%u < %zu）",
 			buf->datas[0].maxsize, size);
-		return;
+		return false;
 	}
 
 	int64_t rb_t0 = vidow_now_ns();
 	struct wlr_texture *texture = wlr_texture_from_buffer(
 		ps->stream->output->renderer, src);
 	if (texture == NULL) {
-		return;
+		return false;
 	}
 	bool ok = wlr_texture_read_pixels(texture,
 		&(struct wlr_texture_read_pixels_options){
@@ -538,16 +805,17 @@ static void pw_stream_fill(struct vidow_sc_pw_stream *ps,
 		});
 	wlr_texture_destroy(texture);
 	if (!ok) {
-		return;
+		return false;
 	}
 	ps->readback_ns += vidow_now_ns() - rb_t0;
 
 	if (buf->datas[0].chunk == NULL) {
-		return;
+		return false;
 	}
 	buf->datas[0].chunk->offset = 0;
 	buf->datas[0].chunk->size = size;
 	buf->datas[0].chunk->stride = (int32_t)stride;
+	buf->datas[0].chunk->flags = SPA_CHUNK_FLAG_NONE;
 
 	ps->frames++;
 	ps->last_send_ns = vidow_now_ns();
@@ -571,6 +839,7 @@ static void pw_stream_fill(struct vidow_sc_pw_stream *ps,
 	if (ps->stream->pointer_mode == ZKDE_SCREENCAST_UNSTABLE_V1_POINTER_METADATA) {
 		stream_fill_cursor(ps, buf);
 	}
+	return false;
 }
 
 /* -------------------------------------------------- 光标元数据（metadata）
@@ -609,7 +878,9 @@ static void stream_announce_cursor_meta(struct vidow_sc_pw_stream *ps) {
 		SPA_PARAM_BUFFERS_size, SPA_POD_Int((int)(stride * (size_t)stream->out_h)),
 		SPA_PARAM_BUFFERS_stride, SPA_POD_Int((int)stride),
 		SPA_PARAM_BUFFERS_dataType,
-			SPA_POD_CHOICE_FLAGS_Int(1 << SPA_DATA_MemFd),
+			SPA_POD_CHOICE_FLAGS_Int(ps->own_buffers ?
+				((1 << SPA_DATA_DmaBuf) | (1 << SPA_DATA_MemFd)) :
+				(1 << SPA_DATA_MemFd)),
 		0);
 	params[1] = spa_pod_builder_add_object(&builder,
 		SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta,
@@ -762,7 +1033,8 @@ static void stream_fill_cursor(struct vidow_sc_pw_stream *ps, struct spa_buffer 
  *   REGION            这块屏上的一个矩形（布局坐标 + 缩放）
  *   WINDOW            只这一个窗口（取景器渲染，见 wincapture.c）
  */
-static struct wlr_buffer *stream_grab(struct vidow_sc_pw_stream *ps) {
+static struct wlr_buffer *stream_grab(struct vidow_sc_pw_stream *ps,
+		struct wlr_swapchain *target) {
 	struct vidow_screencast_stream *stream = ps->stream;
 	if (stream->output == NULL) {
 		return NULL;
@@ -773,8 +1045,8 @@ static struct wlr_buffer *stream_grab(struct vidow_sc_pw_stream *ps) {
 	double cursor_scale = 0;
 	switch (stream->kind) {
 	case VIDOW_SC_REGION:
-		frame = vidow_capture_grab_box(stream->sc->server, stream->output,
-			&stream->box, stream->scale);
+		frame = vidow_capture_grab_into(stream->sc->server, stream->output,
+			&stream->box, stream->scale, target);
 		cursor_box = stream->box;
 		cursor_scale = stream->scale;
 		break;
@@ -789,12 +1061,13 @@ static struct wlr_buffer *stream_grab(struct vidow_sc_pw_stream *ps) {
 			return NULL;
 		}
 		frame = vidow_win_grab_render(stream->win_grab, stream->out_w,
-			stream->out_h);
+			stream->out_h, target);
 		break;
 	case VIDOW_SC_OUTPUT:
 	case VIDOW_SC_VIRTUAL:
 	default:
-		frame = vidow_capture_grab(stream->sc->server, stream->output);
+		frame = vidow_capture_grab_into(stream->sc->server, stream->output,
+			NULL, 0, target);
 		break;
 	}
 	if (frame == NULL) {
@@ -937,12 +1210,19 @@ bool vidow_screencast_stream_stats(const struct vidow_screencast_stream *stream,
 	out->grabs = ps->grabs;
 	out->commits = ps->commits;
 	out->throttled = ps->throttled;
+	out->dmabuf_frames = ps->dmabuf_frames;
+	if (ps->dmabuf_frames > 0) {
+		out->sync_ms = (double)ps->sync_ns / (double)ps->dmabuf_frames / 1e6;
+	}
 	if (ps->grabs > 0) {
 		out->grab_ms = (double)ps->grab_ns / (double)ps->grabs / 1e6;
 	}
 	out->grab_ms_max = (double)ps->grab_ns_max / 1e6;
-	if (ps->frames > 0) {
-		out->readback_ms = (double)ps->readback_ns / (double)ps->frames / 1e6;
+	/* 回读那半只摊在**真的回读过**的帧上（dmabuf 直通的帧没花这笔钱，摊进去
+	 * 会把平均值稀释成假的好看）。 */
+	if (ps->frames > ps->dmabuf_frames) {
+		out->readback_ms = (double)ps->readback_ns /
+			(double)(ps->frames - ps->dmabuf_frames) / 1e6;
 	}
 	if (ps->last_send_ns > 0) {
 		out->last_send_ms = ps->last_send_ns / 1000000;
@@ -1000,6 +1280,22 @@ void vidow_sc_pw_stream_start(struct vidow_screencast_stream *stream) {
 	stream->out_w = width;
 	stream->out_h = height;
 	size_t stride = (size_t)width * 4;
+	ps->buf_w = (uint32_t)width;
+	ps->buf_h = (uint32_t)height;
+	ps->buf_stride = (uint32_t)stride;
+	ps->buf_size = stride * (size_t)height;
+
+	/* 缓冲**我们自己分配**（PW_STREAM_FLAG_ALLOC_BUFFERS）+ 给消费者一张 linear
+	 * dmabuf：能建出 linear 交换链（gles2 / gbm 那套）就这么干，一帧不落 CPU。
+	 * 建不出来（pixman / 根本没有 dmabuf）退回老路 —— 消费者按 memfd 分配、
+	 * 我们回读进去。这里只是探一下「能不能」，真正的缓冲在 add_buffer 里按槽建
+	 * （见 pw_stream_add_buffer）。 */
+	if (!vidow_sc_no_dmabuf()) {
+		struct wlr_swapchain *probe = vidow_grab_target_new(sc->server, width,
+			height);
+		ps->own_buffers = probe != NULL;
+		wlr_swapchain_destroy(probe);
+	}
 
 	char name[128];
 	snprintf(name, sizeof(name), "vidow-screencast-%s", output->name);
@@ -1077,14 +1373,24 @@ void vidow_sc_pw_stream_start(struct vidow_screencast_stream *stream) {
 		SPA_PARAM_BUFFERS_size, SPA_POD_Int((int)(stride * (size_t)height)),
 		SPA_PARAM_BUFFERS_stride, SPA_POD_Int((int)stride),
 		SPA_PARAM_BUFFERS_dataType,
-			SPA_POD_CHOICE_FLAGS_Int(1 << SPA_DATA_MemFd),
+			SPA_POD_CHOICE_FLAGS_Int(ps->own_buffers ?
+				((1 << SPA_DATA_DmaBuf) | (1 << SPA_DATA_MemFd)) :
+				(1 << SPA_DATA_MemFd)),
 		0);
 	params[1] = spa_pod_builder_pop(&builder, &frame);
 
 	/* 光标元数据不在这里报：得等格式协商完（见 stream_announce_cursor_meta）。 */
 
+	/* 缓冲由我们分配：PipeWire 建槽、我们在 add_buffer 里把内存填进去
+	 * （dmabuf 或 memfd，见 pw_stream_add_buffer）。不这么做的话槽是**消费者**
+	 * 分配的，它建池那一刻就把内存包死了 —— 我们每帧往里塞什么 fd 它都看不见
+	 * （实测：塞 dmabuf 六帧全黑）。 */
+	int flags = PW_STREAM_FLAG_DRIVER | PW_STREAM_FLAG_MAP_BUFFERS;
+	if (ps->own_buffers) {
+		flags |= PW_STREAM_FLAG_ALLOC_BUFFERS;
+	}
 	int res = pw_stream_connect(ps->pw_stream, PW_DIRECTION_OUTPUT, PW_ID_ANY,
-		PW_STREAM_FLAG_DRIVER | PW_STREAM_FLAG_MAP_BUFFERS, params, 2);
+		flags, params, 2);
 	if (res < 0) {
 		vidow_screencast_stream_fail(stream, "vidow: 连不上 PipeWire 图");
 		return;
@@ -1105,15 +1411,19 @@ void vidow_sc_pw_stream_destroy(struct vidow_screencast_stream *stream) {
 		ps->pending = NULL;
 	}
 	/* 这路流一共给了多少帧：跟「第一帧」那条对着看，「有流但黑屏 / 不动」是
-	 * 帧不够还是帧本身有问题，一眼分得出来。 */
-	wlr_log(WLR_INFO, "screencast: 这路流给了 %llu 帧（其中 %llu 帧是指针动了催的）",
-		(unsigned long long)ps->frames,
+	 * 帧不够还是帧本身有问题，一眼分得出来。dmabuf 那个数 > 0 = 直通这条路
+	 * 真的用上了（0 = 退回回读，比如 pixman 会话里根本没有 dmabuf）。 */
+	wlr_log(WLR_INFO, "screencast: 这路流给了 %llu 帧（%llu 帧走 dmabuf 直通，"
+		"%llu 帧是指针动了催的）", (unsigned long long)ps->frames,
+		(unsigned long long)ps->dmabuf_frames,
 		(unsigned long long)(stream->cursor_pushes));
 	if (ps->output_commit.link.prev != NULL) {
 		wl_list_remove(&ps->output_commit.link);
 	}
 	if (ps->pw_stream != NULL) {
 		spa_hook_remove(&ps->listener);
+		/* 拆流会把缓冲池里每个槽都走一遍 remove_buffer（我们攥着的抓帧
+		 * 缓冲在那儿放开），所以交换链要在它**之后**拆。 */
 		pw_stream_destroy(ps->pw_stream);
 		ps->pw_stream = NULL;
 	}
