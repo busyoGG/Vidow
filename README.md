@@ -2770,7 +2770,7 @@ portal 相关的两个键：
 | --- | --- |
 | vidow 启动时 | 写 `~/.local/share/xdg-desktop-portal/portals/vidow.portal`（总线名 + 接口清单）、把 `<会话名>-portals.conf` 里的 ScreenCast / Screenshot 指向 `vidow`、把 `vidow-portal` 起起来占住那个总线名 |
 | 前端（xdg-desktop-portal） | 只做转发；PipeWire 的 fd 也是它自己连的（`OpenPipeWireRemote` 在前端里，`nm -D` 能看到 `pw_context_connect` / `pw_core_steal_fd`） |
-| vidow-portal | 实现 `org.freedesktop.impl.portal.ScreenCast`（CreateSession / SelectSources / Start）和 `Screenshot`（Screenshot / PickColor）。Start 时弹 GTK3 选择器，**按来源分组**：每块屏一行（`zwlr_screencopy_manager_v1` 抓帧的实时缩略图 + `wl_output.name`）、每个窗口一行（`ext-foreign-toplevel-list-v1` 拿列表、`ext-image-copy-capture` 的窗口源抓缩略图）、虚拟屏幕一行；点「共享」后按行发 `stream_output` / `stream_window` / `stream_virtual_output`，等 `created(node)` 把 node id 报回前端 |
+| vidow-portal | 实现 `org.freedesktop.impl.portal.ScreenCast`（CreateSession / SelectSources / Start）和 `Screenshot`（Screenshot / PickColor）。Start 时弹 GTK3 选择器，**按来源分三个 tab**：屏幕（每块屏一张卡，`zwlr_screencopy_manager_v1` 抓帧的实时缩略图 + `wl_output.name`；虚拟屏幕那张卡也在这页）、窗口（`ext-foreign-toplevel-list-v1` 拿列表、`ext-image-copy-capture` 的窗口源抓缩略图）、区域（框一块屏）；点「共享」后按行发 `stream_output` / `stream_window` / `stream_virtual_output` / `stream_region`，等 `created(node)` 把 node id 报回前端。报给前端的 `position` 是**布局逻辑坐标**，从 `xdg-output` 的 `logical_position` 读（`wl_output.geometry` 的 x/y 在 wlroots 下恒为 0,0，以前就是拿它当位置 = 两块屏都报 0,0） |
 | vidow | 建一路 PipeWire 流（memfd 缓冲、BGRx），抓帧走 vidow 自己那条路：整块输出 / 输出上的任意矩形（`stream_region`）/ 单个窗口（渲染时把别的窗口和 layer 关掉）/ 现场加的虚拟输出（headless 后端 + 一块真输出，能摆窗口、进布局） |
 
 这样录屏**不依赖 KDE**、也不用把 `XDG_CURRENT_DESKTOP` 说成 KDE —— 会话名还是 `Vidow`，
@@ -2781,6 +2781,14 @@ portal_capture = "kde"   -- 借 KDE 的：要配 portal_desktop = "KDE"（代价
 portal_capture = "wlr"   -- 借 xdg-desktop-portal-wlr：没有选择器，直接给第一块屏
 portal_capture = "none"  -- ScreenCast / Screenshot 两行都不写
 ```
+
+**选择器分三个 tab：屏幕 / 窗口 / 区域**（用户：「屏幕/窗口/区域 共享分为三个tab」）。顶上一条
+分段控件（`GtkStackSwitcher`，选中那段填强调色），下面一页一个网格；**只列应用真的在要的那几种
+来源**，只剩一个 tab 时那条控件收起来。虚拟屏幕并进「屏幕」页（它本来就是「再来一块屏」）。
+「区域」页点「选择区域…」铺一层**全屏透明浮层**，在**正在动的画面上**拖一个框（不冻屏 —— 冻屏是
+截图那条路），松手记下这块区域（卡片上换成那块区域的实时缩略图），按「共享」就录它；坐标按协议
+要的口径换算：`stream_region` 要**布局逻辑坐标**（相对那块屏的坐标 + 那块屏在布局里的位置），
+报给前端的 `size` 是**像素**尺寸（逻辑 × scale）。
 
 **选择器长什么样**（`tools/vidowportal.c`，用户：「portal 样式弄得好看一点现代一点，更接近 kde
 一点」）：配色走 Breeze —— 底 `#eff0f1`、白卡片、强调色取 KDE 的 `DecorationFocus`
@@ -4518,6 +4526,30 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
       - 判据：`test-fullscreen-scroll.sh` 新增 9 条（非全屏的 look 有边框 2 / 圆角 12 / 阴影 8，
         全屏之后都是 0；左上角那一点是全屏窗口自己的内容而不是圆角外面的背景；浮动的全屏
         geometry = 0,0 1280x720、退出全屏回到原来的浮动尺寸）；47 项全过。
+
+206. **选择器分三个 tab：屏幕 / 窗口 / 区域**（用户：「屏幕/窗口/区域 共享分为三个tab」）
+
+      顶上一条分段控件（`GtkStackSwitcher`，选中那段填强调色），下面一页一个网格；**只列应用真的
+      在要的那几种来源**，只剩一个 tab 时那条控件收起来；虚拟屏幕并进「屏幕」页（它本来就是「再来
+      一块屏」）。三页高度对齐（`vhomogeneous`），切 tab 时对话框不会一跳一跳。
+
+      **「区域」页**：点「选择区域…」铺一层全屏透明浮层，在**正在动的画面上**拖一个框 —— 用户要的
+      「点区域选择拖框 但不要冻屏」，所以浮层是 RGBA + CSS `.transparent`（画上去的只有框外那层压暗、
+      框线和尺寸标签），底下照常刷新（headless 里量过：浮层挂着时动一下光标，两帧不一样）。
+      松手记下这块区域、卡片上换成那块区域的**实时缩略图**（`capture_output_region`），按「共享」录它。
+      坐标口径：`stream_region` 要**布局逻辑坐标**（相对那块屏 + 那块屏在布局里的位置）、scale 一起
+      给过去，报给前端的 `size` 是**像素**尺寸。
+
+      **顺手挖出来一个真 bug**：选择器报给前端的 `position` 一直是 0,0 —— 它读的是
+      `wl_output.geometry` 的 x/y，而 wlroots 那对**恒为 0,0**（`wayland-info` 实测两块屏都是 0,0，
+      而 xdg-output 的 `logical_position` 是 0,0 / 1280,0）。现在按标准读 `xdg-output`（新 vendor 一份
+      `protocols/xdg-output-unstable-v1.xml` + meson 生成客户端代码），录屏 position 和框选区域的
+      坐标都对上了。**这个 bug 以前就影响显示器那一路的 position**（第二块屏录出来位置是 0,0）。
+
+      验证：`test-portal-own.sh` 新增 6c2 那一轮 8 项（tab 切得过去、浮层弹出来/关得掉、区域坐标
+      120,100 500x300、合成器收到的是布局坐标 1400,100 500x300、报给前端的 size 1000,600 = ×2 缩放、
+      真出帧），外加 6a 新增一项钉住 position（1280, 0）；全套仍只剩那条老账（`光标位置不对`，改之前
+      就红）。headless + grim 逐版截图：三个 tab、框选浮层、框完的卡片、深色版都看过。
 
 205. **选择器换成 Breeze 那一套样子**（用户：「portal 样式弄得好看一点现代一点，更接近 kde 一点」）
 

@@ -326,6 +326,29 @@ else
 	fail "流尺寸不对：报的是 ${SIZE:-没拿到}，${SOUT1:-?} 的像素尺寸是 ${EXP1:-没算出来}"
 fi
 
+# position 报的是**布局逻辑坐标**（前端要的口径）。以前这里一直是 0,0 —— 因为读的
+# 是 wl_output.geometry 的 x/y，而 wlroots 那对恒为 0,0；现在读 xdg-output 的
+# logical_position。期望值同样现算，不写死。
+POS=$(grep -ao "position': ([0-9-]*, [0-9-]*)" "$R/probe.txt" 2>/dev/null | head -1 |
+	grep -o "[0-9-]*, [0-9-]*")
+EXPPOS=$($VM --socket "$IPC" outputs 2>/dev/null | python3 -c '
+import json,sys
+want = sys.argv[1]
+try:
+    outs = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for o in outs:
+    if o["name"] == want:
+        print("%d, %d" % (o["layout"]["x"], o["layout"]["y"]))
+        break
+' "${SOUT1:-}")
+if [ -n "${POS:-}" ] && [ "${POS:-}" = "${EXPPOS:-}" ]; then
+	pass "流的 position = 那块屏在布局里的位置（$POS）"
+else
+	fail "流的 position 不对：报的是 ${POS:-没拿到}，${SOUT1:-?} 在布局里是 ${EXPPOS:-没算出来}"
+fi
+
 # --- 7 真消费 ---------------------------------------------------------------
 if [ -n "${NODE:-}" ]; then
 	timeout 60 gst-launch-1.0 -q pipewiresrc path="$NODE" num-buffers=6 \
@@ -554,8 +577,9 @@ fi
 timeout 150 python3 /home/busyo/Dev/Vidow/tools/screencastprobe.py --types 2 \
 	--cursor-mode 4 --timeout 60 --hold 30 >"$R/probe6.txt" 2>&1 &
 # 这一轮走**双击卡片预览**那条交互（用户要的：预览在上、名字在下，点预览就是选，
-# 双击直接确认），顺带把它钉住。第一张卡片的预览中心 = 对话框原点 +（108, 182）：
-# 边框 12 + 标题一行 + 段落标题一行 + 预览 176x110 的中心。
+# 双击直接确认），顺带把它钉住。第一张卡片的预览中心 = 对话框原点 +（112, 140）：
+# 提示一行 + 卡片内边距 6 + 预览 176x110 的中心（这一轮只列窗口 = 只有一个 tab，
+# 顶上的分段控件不显示；三个 tab 时卡片还要往下让出那条控件的高度）。
 DGEO=$(wait_dialog)
 if [ -n "${DGEO:-}" ]; then
 	# 对话框上屏之后还会被客户端「居中」一次（GTK 的 GTK_WIN_POS_CENTER_ALWAYS）：
@@ -563,8 +587,8 @@ if [ -n "${DGEO:-}" ]; then
 	sleep 1
 	DGEO=$(wait_dialog)
 	set -- $DGEO
-	CARD_X=$(( $1 + 108 ))
-	CARD_Y=$(( $2 + 182 ))
+	CARD_X=$(( $1 + 112 ))
+	CARD_Y=$(( $2 + 140 ))
 	# 落点得真在对话框里（偏移写错了会点到别的窗口上，静默不确认，很难查）。
 	if [ "$CARD_X" -lt "$1" ] || [ "$CARD_X" -gt $(( $1 + $3 )) ] ||
 			[ "$CARD_Y" -lt "$2" ] || [ "$CARD_Y" -gt $(( $2 + $4 )) ]; then
@@ -754,6 +778,99 @@ if [ "${NOUT2:-9}" -eq "${NOUT0:-1}" ]; then
 	pass "这一路流结束之后虚拟输出被拔掉了（回到 $NOUT2 块）"
 else
 	fail "虚拟输出没拔掉（还有 $NOUT2 块输出，基线 $NOUT0 块）"
+fi
+
+# --- 6c2 区域（框一块屏来录） ----------------------------------------------
+#
+# 「区域」是选择器里的第三个 tab：点「选择区域…」铺一层全屏浮层，在**活的**画面上
+# 拖一个框（不冻屏 —— 冻屏是截图那条路），松手把这块区域记下来，再按「共享」。
+# 这一轮钉住：tab 切得过去、浮层能拖、区域坐标报得对（协议要的是**布局逻辑坐标**，
+# 报给前端的 size 是像素尺寸）、合成器收到的就是那块区域、消费者真出帧。
+echo; echo "== 6c2. 按区域录屏（框一块，不冻屏） =="
+timeout 150 python3 /home/busyo/Dev/Vidow/tools/screencastprobe.py --types 1 \
+	--timeout 60 --hold 20 >"$R/probe-reg.txt" 2>&1 &
+DGEO=$(wait_dialog)
+if [ -n "${DGEO:-}" ]; then
+	pass "区域那轮的选择器弹出来了（types=1：屏幕 + 区域两个 tab）"
+else
+	fail "区域那轮没等到选择器"
+fi
+if [ -n "${DGEO:-}" ]; then
+	sleep 1
+	DGEO=$(wait_dialog)
+	set -- $DGEO
+	# 分段控件居中排布（两段各约 133 宽，垂直位置约 97px）
+	$VM --socket "$IPC" move-cursor $(( $1 + $3 / 2 + 66 )) $(( $2 + 97 )) >/dev/null 2>&1
+	sleep 0.3
+	$VM --socket "$IPC" pointer-button click left >/dev/null 2>&1
+	sleep 0.8
+	# 「选择区域…」按钮：区域那一页卡片下面一行（卡片 176x110 + 名字，约 328px 处）
+	$VM --socket "$IPC" move-cursor $(( $1 + 82 )) $(( $2 + 328 )) >/dev/null 2>&1
+	sleep 0.3
+	$VM --socket "$IPC" pointer-button click left >/dev/null 2>&1
+	sleep 1.5
+	if $VM --socket "$IPC" windows 2>/dev/null | grep -aq "选择区域"; then
+		pass "框选浮层弹出来了（全屏，没冻屏）"
+	else
+		fail "点了「选择区域…」但浮层没出来"
+	fi
+	# 在活的画面上拖一块。**坐标是布局逻辑坐标**，而且得拖在浮层所在那块屏上
+	# （浮层跟着光标走：光标在 HEADLESS-2，对话框也在那儿）——HEADLESS-2 在布局
+	# x=1280、缩放 2，所以拖 1400,100 → 1900,400 = 这块屏上的 120,100 500x300。
+	$VM --socket "$IPC" move-cursor 1400 100 >/dev/null 2>&1
+	sleep 0.3
+	$VM --socket "$IPC" pointer-button press left >/dev/null 2>&1
+	sleep 0.3
+	$VM --socket "$IPC" move-cursor 1900 400 >/dev/null 2>&1
+	sleep 0.5
+	$VM --socket "$IPC" pointer-button release left >/dev/null 2>&1
+	sleep 1.2
+	if $VM --socket "$IPC" windows 2>/dev/null | grep -aq "选择区域"; then
+		fail "松手之后框选浮层没关掉"
+	else
+		pass "松手之后浮层关掉、回到选择器（区域记下来了）"
+	fi
+	if grep -aq "区域：.*拖一个框" "$R/helper.log" 2>/dev/null; then
+		pass "后端日志记着开了框选浮层"
+	else
+		fail "后端日志没记框选：$(tail -3 "$R/helper.log" 2>/dev/null | tr '\n' ' ')"
+	fi
+	if grep -aq "区域：.*上 120,100 500x300" "$R/helper.log" 2>/dev/null; then
+		pass "框出来的区域是 120,100 500x300（相对那块屏的逻辑坐标）"
+	else
+		fail "区域坐标不对：$(grep -a "区域：" "$R/helper.log" 2>/dev/null | tail -2 | tr '\n' ' ')"
+	fi
+	# 按「共享」（浮层那次点击之后默认选中的就是刚框好的区域，回车同一条路）
+	wait_and_share
+fi
+NODEREG=$(wait_node "$R/probe-reg.txt")
+if [ -n "${NODEREG:-}" ]; then
+	pass "区域流拿到了 node（node=$NODEREG）"
+else
+	fail "区域流没拿到 node：$(tail -3 "$R/probe-reg.txt" 2>/dev/null | tr '\n' ' ')"
+fi
+if grep -aq "请求录区域 1400,100 500x300" "$R/vidow.log" 2>/dev/null; then
+	pass "合成器收到的就是框的那块区域（协议要布局坐标：1400,100 500x300）"
+else
+	fail "合成器没收到那块区域：$(grep -a "请求录区域" "$R/vidow.log" 2>/dev/null | tail -1)"
+fi
+RSIZE=$(grep -ao "size': ([0-9]*, [0-9]*)" "$R/probe-reg.txt" 2>/dev/null | head -1 |
+	grep -o "[0-9]*, [0-9]*" | tr -d ' ')
+if [ "${RSIZE:-}" = "1000,600" ]; then
+	pass "报给前端的 size = 区域的**像素**尺寸（500x300 逻辑 × 缩放 2 = 1000, 600）"
+else
+	fail "报给前端的 size 不对：${RSIZE:-空}（想要 1000,600 = 500x300 逻辑 × 缩放 2）"
+fi
+if [ -n "${NODEREG:-}" ]; then
+	timeout 40 gst-launch-1.0 -q pipewiresrc path="$NODEREG" num-buffers=2 \
+		! videoconvert ! pngenc ! multifilesink location="$R/reg-%02d.png" \
+		>"$R/gst-reg.log" 2>&1
+	NR=$(ls "$R"/reg-*.png 2>/dev/null | wc -l)
+	if [ "$NR" -ge 2 ]; then
+		pass "区域流真出帧（$NR 帧）"
+	else
+		fail "区域流只拿到 $NR 帧：$(head -2 "$R/gst-reg.log" 2>/dev/null | tr '\n' ' ')"
+	fi
 fi
 
 # --- 6d 截图 / 取色（Screenshot / PickColor） ------------------------------

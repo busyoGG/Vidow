@@ -79,6 +79,7 @@
 #include "ext-image-capture-source-v1-client-protocol.h"
 #include "ext-image-copy-capture-v1-client-protocol.h"
 #include "wlr-screencopy-unstable-v1-client-protocol.h"
+#include "xdg-output-unstable-v1-client-protocol.h"
 #include "zkde-screencast-unstable-v1-client-protocol.h"
 
 #define BUS_NAME "org.freedesktop.impl.portal.desktop.vidow"
@@ -147,23 +148,28 @@ enum row_kind {
 	ROW_OUTPUT = 0,
 	ROW_WINDOW,
 	ROW_VIRTUAL,
+	ROW_REGION,
 };
 
 struct row {
 	enum row_kind kind;
-	void *ptr;      /* ROW_OUTPUT: struct output *，ROW_WINDOW: struct toplevel * */
+	void *ptr;      /* ROW_OUTPUT: struct output *，ROW_WINDOW: struct toplevel *，
+	                 * ROW_REGION: struct region_row * */
 	int vw, vh;     /* ROW_VIRTUAL：要建的虚拟屏幕逻辑尺寸 */
 	GtkWidget *image;
 	GtkWidget *toggle;
-	GtkWidget *badge; /* 缩略图右上角那个对勾（选中才显示） */
+	GtkWidget *badge;  /* 缩略图右上角那个对勾（选中才显示） */
+	GtkWidget *label;  /* ROW_REGION：选了区域之后要改它的名字 / 小字 */
+	GtkWidget *sub;
 };
 
 /* ------------------------------------------------------------ 输出 */
 
 struct output {
 	struct wl_output *wl;
+	struct zxdg_output_v1 *xdg;   /* 逻辑位置 / 逻辑尺寸（见下面 output_xdg_*） */
 	char name[64];
-	int x, y;      /* 布局坐标（逻辑） */
+	int x, y;      /* 布局坐标（逻辑）：来自 xdg-output 的 logical_position */
 	int w, h;      /* 逻辑尺寸 = 模式像素 / scale */
 	int px_w, px_h;
 	int scale;
@@ -180,6 +186,18 @@ struct output {
 	int bw, bh, stride;
 	uint32_t format;
 	bool y_invert;
+};
+
+/* 用户框出来的一块屏（「区域」那个 tab）。坐标是**相对这块屏的逻辑坐标** ——
+ * screencopy 的区域抓帧要的就是这个口径，交给合成器的 stream_region 要的是布局
+ * 坐标（相对坐标 + 这块屏在布局里的位置，见 dialog_accept）。
+ *
+ * 缩略图复用 struct output 那一整套（shm 缓冲 / listener / busy），所以这里嵌一份。 */
+struct region_row {
+	struct output thumb;
+	struct output *host;
+	int x, y, w, h;
+	int scale;
 };
 
 struct stream {
@@ -267,6 +285,9 @@ static struct wl_display *wl;
 static struct wl_registry *registry;
 static struct wl_shm *shm;
 static struct zwlr_screencopy_manager_v1 *scmgr;
+/* 输出的**逻辑位置 / 逻辑尺寸**只在 xdg-output 里（wl_output.geometry 那对 x/y
+ * wlroots 一直发 0,0），选择器报的 position、框选区域的坐标都要它。 */
+static struct zxdg_output_manager_v1 *xdg_output_mgr;
 static struct zkde_screencast_unstable_v1 *zkde;
 static struct ext_foreign_toplevel_list_v1 *tlist;
 static struct ext_foreign_toplevel_image_capture_source_manager_v1 *win_src_mgr;
@@ -470,6 +491,10 @@ static void style_load(void) {
 	char *css = g_strdup_printf(
 		"window { background-color: %1$s; }\n"
 		"window .background { background-color: %1$s; color: %3$s; }\n"
+		/* 框选区域那层浮层是**透明**的（不冻屏，底下的画面照常刷新）。 */
+		"window.transparent, window.transparent .background,"
+		"  window.transparent headerbar { background-color: transparent;"
+		"  background-image: none; border: none; box-shadow: none; }\n"
 		"headerbar { background-color: %1$s; background-image: none;"
 		"  color: %3$s; border-bottom: 1px solid %4$s; box-shadow: none;"
 		"  min-height: 38px; padding: 0 6px; }\n"
@@ -507,7 +532,16 @@ static void style_load(void) {
 		"  color: %3$s; border: 1px solid %8$s; border-radius: 6px;"
 		"  padding: 6px 20px; box-shadow: none; text-shadow: none; }\n"
 		"button.ghost:hover { background-color: %6$s; }\n"
-		"separator.footer { background-color: %4$s; min-height: 1px; }\n",
+		"separator.footer { background-color: %4$s; min-height: 1px; }\n"
+		/* 顶上的 tab（GtkStackSwitcher）：KDE 那种分段控件 —— 选中的填强调色淡底。 */
+		"stackswitcher { background-color: %4$s; border-radius: 8px;"
+		"  padding: 2px; }\n"
+		"stackswitcher button { background-image: none;"
+		"  background-color: transparent; border: none; box-shadow: none;"
+		"  border-radius: 6px; padding: 5px 16px; color: %5$s;"
+		"  font-weight: 600; min-height: 20px; }\n"
+		"stackswitcher button:hover { background-color: %6$s; }\n"
+		"stackswitcher button:checked { background-color: %2$s; color: %9$s; }\n",
 		pal->bg, accent, pal->text, pal->border, pal->dim, pal->hover, pal->btn,
 		pal->btn_border, on_accent, pal->base, accent_soft, accent_hover,
 		pal->off_bg, pal->off_text);
@@ -530,6 +564,12 @@ static void style_load(void) {
 static void add_class(GtkWidget *w, const char *name) {
 	if (w != NULL) {
 		gtk_style_context_add_class(gtk_widget_get_style_context(w), name);
+	}
+}
+
+static void remove_class(GtkWidget *w, const char *name) {
+	if (w != NULL) {
+		gtk_style_context_remove_class(gtk_widget_get_style_context(w), name);
 	}
 }
 
@@ -1286,6 +1326,26 @@ static gboolean preview_tick(gpointer data) {
 		if (row->image == NULL) {
 			continue;
 		}
+		if (row->kind == ROW_REGION) {
+			/* 区域那一行：抓的框里那一块（坐标是相对这块屏的逻辑坐标，
+			 * screencopy 的 capture_output_region 要的就是这个口径）。 */
+			struct region_row *reg = row->ptr;
+			if (scmgr == NULL || reg == NULL || reg->host == NULL ||
+					reg->w < 2 || reg->h < 2 || reg->thumb.busy) {
+				continue;
+			}
+			reg->thumb.busy = true;
+			reg->thumb.frame = zwlr_screencopy_manager_v1_capture_output_region(
+				scmgr, 0, reg->host->wl, reg->x, reg->y, reg->w, reg->h);
+			if (reg->thumb.frame == NULL) {
+				reg->thumb.busy = false;
+				continue;
+			}
+			zwlr_screencopy_frame_v1_add_listener(reg->thumb.frame, &frame_listener,
+				&reg->thumb);
+			wl_display_flush(wl);
+			continue;
+		}
 		if (row->kind == ROW_OUTPUT) {
 			struct output *out = row->ptr;
 			if (scmgr == NULL || out->busy) {
@@ -1313,6 +1373,56 @@ static gboolean preview_tick(gpointer data) {
 }
 
 /* ------------------------------------------------------------ wl_output */
+
+/* xdg-output：逻辑位置 / 逻辑尺寸 / 名字。这是「这块屏在布局里的哪儿」的**正确
+ * 来源** —— wl_output.geometry 的 x/y 在 wlroots 下恒为 0,0（wayland-info 实测
+ * 两块屏都是 0,0，而 xdg-output 的 logical_position 是 0,0 / 1280,0）。 */
+static void output_xdg_logical_position(void *data, struct zxdg_output_v1 *xdg,
+		int32_t x, int32_t y) {
+	struct output *out = data;
+	(void)xdg;
+	out->x = x;
+	out->y = y;
+}
+
+static void output_xdg_logical_size(void *data, struct zxdg_output_v1 *xdg,
+		int32_t w, int32_t h) {
+	struct output *out = data;
+	(void)xdg;
+	if (w > 0 && h > 0) {
+		out->w = w;
+		out->h = h;
+	}
+}
+
+static void output_xdg_name(void *data, struct zxdg_output_v1 *xdg,
+		const char *name) {
+	struct output *out = data;
+	(void)xdg;
+	if (name != NULL && name[0] != '\0') {
+		snprintf(out->name, sizeof(out->name), "%s", name);
+	}
+}
+
+static void output_xdg_description(void *data, struct zxdg_output_v1 *xdg,
+		const char *description) {
+	(void)data;
+	(void)xdg;
+	(void)description;
+}
+
+static void output_xdg_done(void *data, struct zxdg_output_v1 *xdg) {
+	(void)data;
+	(void)xdg;
+}
+
+static const struct zxdg_output_v1_listener output_xdg_listener = {
+	.logical_position = output_xdg_logical_position,
+	.logical_size = output_xdg_logical_size,
+	.name = output_xdg_name,
+	.description = output_xdg_description,
+	.done = output_xdg_done,
+};
 
 static void output_geometry(void *data, struct wl_output *wl_output, int32_t x, int32_t y,
 		int32_t physical_width, int32_t physical_height, int32_t subpixel,
@@ -1399,7 +1509,17 @@ static void registry_global(void *data, struct wl_registry *reg, uint32_t name,
 		out->wl = wl_registry_bind(reg, name, &wl_output_interface,
 			version < 4 ? version : 4);
 		wl_output_add_listener(out->wl, &output_listener, out);
+		if (xdg_output_mgr != NULL) {
+			out->xdg = zxdg_output_manager_v1_get_xdg_output(xdg_output_mgr,
+				out->wl);
+			if (out->xdg != NULL) {
+				zxdg_output_v1_add_listener(out->xdg, &output_xdg_listener, out);
+			}
+		}
 		outputs = g_list_append(outputs, out);
+	} else if (strcmp(interface, zxdg_output_manager_v1_interface.name) == 0) {
+		xdg_output_mgr = wl_registry_bind(reg, name,
+			&zxdg_output_manager_v1_interface, version < 3 ? version : 3);
 	} else if (strcmp(interface, zwlr_screencopy_manager_v1_interface.name) == 0) {
 		scmgr = wl_registry_bind(reg, name, &zwlr_screencopy_manager_v1_interface, 3);
 	} else if (strcmp(interface, zkde_screencast_unstable_v1_interface.name) == 0) {
@@ -1448,6 +1568,9 @@ static void request_finish(struct request *req, uint32_t response, GVariant *res
 static void session_close(struct session *s, const char *why);
 static void dialog_show(struct request *req);
 static void start_show_next(void);
+/* 框选浮层（定义在后面）：对话框被关掉 / 换掉的时候要顺手收掉它。 */
+static void region_pick_close(bool restore_dialog);
+static void region_pick_destroy(void);
 
 /* 当前这个 Start 处理完了（选完 / 取消 / 超时）：接着弹排队里的下一个。
  *
@@ -1800,6 +1923,28 @@ static void dialog_accept(void) {
 				tl->app_id != NULL ? tl->app_id : "");
 			break;
 		}
+		case ROW_REGION: {
+			struct region_row *reg = row->ptr;
+			if (reg == NULL || reg->host == NULL || reg->w < 2 || reg->h < 2) {
+				free(st);
+				continue;
+			}
+			/* 协议要的是**布局逻辑坐标**（x/y 是整块工作区里的位置，不是相对
+			 * 这块屏的），尺寸也是逻辑的；scale 一起给过去，合成器按它乘出像素。
+			 * 报给前端的 size 用像素尺寸 —— 和 output 那一路一个口径。 */
+			st->obj = zkde_screencast_unstable_v1_stream_region(zkde,
+				reg->host->x + reg->x, reg->host->y + reg->y, (uint32_t)reg->w,
+				(uint32_t)reg->h, wl_fixed_from_int(reg->scale), pointer);
+			st->x = reg->host->x + reg->x;
+			st->y = reg->host->y + reg->y;
+			st->w = reg->w * reg->scale;
+			st->h = reg->h * reg->scale;
+			st->source_type = SOURCE_TYPE_MONITOR;
+			snprintf(st->label, sizeof(st->label), "区域 %dx%d @ %d,%d（%s）",
+				reg->w, reg->h, reg->host->x + reg->x, reg->host->y + reg->y,
+				reg->host->name);
+			break;
+		}
 		case ROW_VIRTUAL: {
 			char name[64];
 			snprintf(name, sizeof(name), "vidow-virtual-%d", row->vw);
@@ -1879,6 +2024,7 @@ static void on_dialog_destroy(GtkWidget *widget, gpointer data) {
 	(void)widget;
 	(void)data;
 	/* 被合成器关掉（或者我们自己 destroy）时也要把请求收干净。 */
+	region_pick_close(false);
 	if (pending != NULL && !pending->done) {
 		dialog_cancel();
 	}
@@ -1957,9 +2103,11 @@ static struct row *add_card(GtkWidget *grid, int col, int line, enum row_kind ki
 
 	GtkWidget *image = gtk_image_new();
 	gtk_widget_set_size_request(image, THUMB_W, THUMB_H);
-	if (kind == ROW_VIRTUAL) {
-		/* 虚拟屏幕没有画面可预览：占位图标 + 虚线框，别留一块空白让人以为坏了。 */
-		gtk_image_set_from_icon_name(GTK_IMAGE(image), "video-display-symbolic",
+	if (kind == ROW_VIRTUAL || kind == ROW_REGION) {
+		/* 还没有画面可预览（虚拟屏幕本来就没有；区域还没框）：占位图标 + 虚线框，
+		 * 别留一块空白让人以为坏了。区域框好之后会换成真的缩略图。 */
+		gtk_image_set_from_icon_name(GTK_IMAGE(image),
+			kind == ROW_REGION ? "edit-select-all-symbolic" : "video-display-symbolic",
 			GTK_ICON_SIZE_DIALOG);
 		gtk_image_set_pixel_size(GTK_IMAGE(image), 44);
 		add_class(image, "placeholder");
@@ -1987,6 +2135,7 @@ static struct row *add_card(GtkWidget *grid, int col, int line, enum row_kind ki
 	gtk_widget_set_size_request(label, THUMB_W, -1);
 	add_class(label, "card-title");
 	gtk_box_pack_start(GTK_BOX(card), label, FALSE, FALSE, 0);
+	r->label = label;
 
 	if (sub != NULL && sub[0] != '\0') {
 		GtkWidget *sub_label = gtk_label_new(sub);
@@ -1995,6 +2144,7 @@ static struct row *add_card(GtkWidget *grid, int col, int line, enum row_kind ki
 		gtk_widget_set_size_request(sub_label, THUMB_W, -1);
 		add_class(sub_label, "card-sub");
 		gtk_box_pack_start(GTK_BOX(card), sub_label, FALSE, FALSE, 0);
+		r->sub = sub_label;
 	}
 
 	gtk_widget_set_tooltip_text(toggle, title);
@@ -2028,9 +2178,300 @@ static int card_place(GtkWidget *grid, int *col, int line, enum row_kind kind,
 	return line;
 }
 
+/* ------------------------------------------------- 框选区域（活的，不冻屏）
+ *
+ * 「区域」那个 tab 里的「选择区域…」：铺一层全屏浮层，用户在**正在动**的画面上拖
+ * 一个框。和截图那个框选（shot_*）的区别就是不冻屏 —— 浮层是透明的（RGBA visual +
+ * CSS 里 .transparent 那条），画上去的只有框外那层压暗、框线和尺寸标签，底下的画面
+ * 照常刷新。松手就把这块区域记到那一行上（坐标是**相对这块屏的逻辑坐标**）。
+ */
+
+struct region_pick {
+	struct output *host;
+	GtkWidget *win;
+	GtkWidget *area;
+	bool dragging;
+	int x0, y0, x1, y1;
+};
+
+static struct region_pick *region_pick;
+static struct row *region_row;   /* 对话框里那一行（可能还没有） */
+static GtkWidget *region_pick_button; /* 「选择区域…」那个按钮 */
+static struct output *output_under_pointer(void); /* 后面才定义 */
+
+/* 框选那一层怎么画（截图框选和这里共用）：框外压暗一层、强调色边框、左上角一个
+ * 「宽 × 高」标签。k = 画出来的图 ÷ 屏幕像素（活的那条路是 1）。 */
+static void draw_region_overlay(cairo_t *cr, int aw, int ah, int x0, int y0, int x1,
+		int y1, double k) {
+	double rx0 = x0 < x1 ? x0 : x1;
+	double ry0 = y0 < y1 ? y0 : y1;
+	double rx1 = x0 > x1 ? x0 : x1;
+	double ry1 = y0 > y1 ? y0 : y1;
+	cairo_set_source_rgba(cr, 0, 0, 0, 0.35);
+	cairo_rectangle(cr, 0, 0, aw, ry0);
+	cairo_rectangle(cr, 0, ry1, aw, ah - ry1);
+	cairo_rectangle(cr, 0, ry0, rx0, ry1 - ry0);
+	cairo_rectangle(cr, rx1, ry0, aw - rx1, ry1 - ry0);
+	cairo_fill(cr);
+
+	double ar, ag, ab;
+	hex2rgb(accent, &ar, &ag, &ab);
+	cairo_set_source_rgba(cr, ar, ag, ab, 1.0);
+	cairo_set_line_width(cr, 2);
+	cairo_rectangle(cr, rx0 + 1, ry0 + 1, rx1 - rx0 - 2, ry1 - ry0 - 2);
+	cairo_stroke(cr);
+
+	int pw = (int)((rx1 - rx0) / (k > 0 ? k : 1) + 0.5);
+	int ph = (int)((ry1 - ry0) / (k > 0 ? k : 1) + 0.5);
+	char label[64];
+	snprintf(label, sizeof(label), "%d × %d", pw, ph);
+	cairo_select_font_face(cr, "sans", CAIRO_FONT_SLANT_NORMAL,
+		CAIRO_FONT_WEIGHT_BOLD);
+	cairo_set_font_size(cr, 12);
+	cairo_text_extents_t ext;
+	cairo_text_extents(cr, label, &ext);
+	double lx = rx0, ly = ry0 - 8;
+	if (ly < 20) {
+		ly = ry1 + 8; /* 贴到选区下沿，别顶出屏幕 */
+	}
+	cairo_set_source_rgba(cr, ar, ag, ab, 0.95);
+	cairo_rectangle(cr, lx, ly - ext.height - 4, ext.width + 12, ext.height + 9);
+	cairo_fill(cr);
+	double tr, tg, tb;
+	hex2rgb(on_accent, &tr, &tg, &tb);
+	cairo_set_source_rgba(cr, tr, tg, tb, 1.0);
+	cairo_move_to(cr, lx + 6, ly + 1);
+	cairo_show_text(cr, label);
+}
+
+/* 把框好的区域记到那一行上：卡片换成真缩略图、名字和小字都更新、顺手选中它。 */
+static void region_row_apply(struct region_row *reg, struct output *host, int x, int y,
+		int w, int h, int scale) {
+	reg->host = host;
+	reg->x = x;
+	reg->y = y;
+	reg->w = w;
+	reg->h = h;
+	reg->scale = scale > 0 ? scale : 1;
+	if (region_row == NULL) {
+		return;
+	}
+	struct row *r = region_row;
+	if (r->label != NULL) {
+		gtk_label_set_text(GTK_LABEL(r->label), "屏幕区域");
+	}
+	if (r->sub != NULL) {
+		char sub[128];
+		snprintf(sub, sizeof(sub), "%d × %d @ %d,%d", w, h, x, y);
+		gtk_label_set_text(GTK_LABEL(r->sub), sub);
+	}
+	/* 占位图标撤掉（真缩略图马上就来了）。 */
+	if (r->image != NULL) {
+		gtk_image_clear(GTK_IMAGE(r->image));
+		remove_class(r->image, "placeholder");
+	}
+	if (r->toggle != NULL) {
+		gtk_widget_set_sensitive(r->toggle, TRUE);
+		gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(r->toggle), TRUE);
+	}
+	if (region_pick_button != NULL) {
+		gtk_button_set_label(GTK_BUTTON(region_pick_button), "重新选择…");
+	}
+	log_info("区域：%s 上 %d,%d %dx%d（%.1fx → %dx%d 像素）",
+		host != NULL ? host->name : "?", x, y, w, h, (double)reg->scale,
+		w * reg->scale, h * reg->scale);
+	preview_tick(NULL); /* 立刻抓一张，别等下一拍 */
+}
+
+static gboolean region_pick_draw(GtkWidget *widget, cairo_t *cr, gpointer data) {
+	struct region_pick *rp = data;
+	int aw = gtk_widget_get_allocated_width(widget);
+	int ah = gtk_widget_get_allocated_height(widget);
+	if (rp->dragging || (rp->x1 != 0 && rp->y1 != 0)) {
+		draw_region_overlay(cr, aw, ah, rp->x0, rp->y0, rp->x1, rp->y1, 1.0);
+	}
+	return TRUE;
+}
+
+static gboolean region_pick_press(GtkWidget *widget, GdkEventButton *event,
+		gpointer data) {
+	struct region_pick *rp = data;
+	(void)widget;
+	if (event->button != 1) {
+		return TRUE;
+	}
+	rp->dragging = true;
+	rp->x0 = rp->x1 = (int)event->x;
+	rp->y0 = rp->y1 = (int)event->y;
+	gtk_widget_queue_draw(rp->area);
+	return TRUE;
+}
+
+static gboolean region_pick_motion(GtkWidget *widget, GdkEventMotion *event,
+		gpointer data) {
+	struct region_pick *rp = data;
+	(void)widget;
+	if (!rp->dragging) {
+		return TRUE;
+	}
+	rp->x1 = (int)event->x;
+	rp->y1 = (int)event->y;
+	gtk_widget_queue_draw(rp->area);
+	return TRUE;
+}
+
+static gboolean region_pick_release(GtkWidget *widget, GdkEventButton *event,
+		gpointer data) {
+	struct region_pick *rp = data;
+	(void)widget;
+	if (event->button != 1 || !rp->dragging) {
+		return TRUE;
+	}
+	rp->dragging = false;
+	int x0 = rp->x0 < rp->x1 ? rp->x0 : rp->x1;
+	int y0 = rp->y0 < rp->y1 ? rp->y0 : rp->y1;
+	int w = (rp->x0 > rp->x1 ? rp->x0 : rp->x1) - x0;
+	int h = (rp->y0 > rp->y1 ? rp->y0 : rp->y1) - y0;
+	if (w < 8 || h < 8) {
+		/* 手抖点了一下：不当作选好了，留在浮层上继续框。 */
+		rp->x1 = rp->x0;
+		rp->y1 = rp->y0;
+		gtk_widget_queue_draw(rp->area);
+		return TRUE;
+	}
+	if (region_row != NULL && region_row->ptr != NULL) {
+		region_row_apply(region_row->ptr, rp->host, x0, y0, w, h,
+			rp->host != NULL ? rp->host->scale : 1);
+	}
+	region_pick_destroy();
+	return TRUE;
+}
+
+static gboolean region_pick_key(GtkWidget *widget, GdkEventKey *event,
+		gpointer data) {
+	(void)widget;
+	(void)data;
+	if (event->keyval == GDK_KEY_Escape) {
+		log_info("区域：用户取消");
+		region_pick_destroy();
+		return TRUE;
+	}
+	return FALSE;
+}
+
+/* 关掉浮层。restore_dialog=false 用在「对话框正在被换掉 / 已经关了」的时候 ——
+ * 那时候不能再去 show 一个已经不存在的对话框。 */
+static void region_pick_close(bool restore_dialog) {
+	if (region_pick == NULL) {
+		return;
+	}
+	if (region_pick->win != NULL) {
+		gtk_widget_destroy(region_pick->win);
+	}
+	free(region_pick);
+	region_pick = NULL;
+	if (restore_dialog && dialog != NULL) {
+		gtk_widget_show(dialog);
+		gtk_window_present(GTK_WINDOW(dialog));
+	}
+}
+
+static void region_pick_destroy(void) {
+	region_pick_close(true);
+}
+
+static gboolean region_pick_fullscreen(gpointer data) {
+	gtk_window_fullscreen(GTK_WINDOW(data));
+	return G_SOURCE_REMOVE;
+}
+
+/* 开框选浮层（全屏、透明、不冻屏）。 */
+static void region_pick_start(void) {
+	if (region_pick != NULL) {
+		return;
+	}
+	struct output *host = output_under_pointer();
+	if (host == NULL && outputs != NULL) {
+		host = outputs->data;
+	}
+	if (host == NULL) {
+		log_info("区域：一块屏都没有，框不了");
+		return;
+	}
+	if (dialog != NULL) {
+		gtk_widget_hide(dialog);
+	}
+	struct region_pick *rp = calloc(1, sizeof(*rp));
+	if (rp == NULL) {
+		return;
+	}
+	rp->host = host;
+	GtkWidget *win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+	gtk_window_set_title(GTK_WINDOW(win), "选择区域");
+	gtk_window_set_decorated(GTK_WINDOW(win), FALSE);
+	/* 透明浮层：窗口和它那个 .background 节点都不画底（CSS 里的 .transparent）。 */
+	add_class(win, "transparent");
+	GdkVisual *visual = gdk_screen_get_rgba_visual(gdk_screen_get_default());
+	if (visual != NULL) {
+		gtk_widget_set_visual(win, visual);
+	}
+	gtk_widget_set_app_paintable(win, TRUE);
+	GtkWidget *area = gtk_drawing_area_new();
+	gtk_widget_set_events(area, GDK_BUTTON_PRESS_MASK | GDK_BUTTON_RELEASE_MASK |
+		GDK_POINTER_MOTION_MASK);
+	gtk_container_add(GTK_CONTAINER(win), area);
+	g_signal_connect(area, "draw", G_CALLBACK(region_pick_draw), rp);
+	g_signal_connect(area, "button-press-event", G_CALLBACK(region_pick_press), rp);
+	g_signal_connect(area, "button-release-event", G_CALLBACK(region_pick_release),
+		rp);
+	g_signal_connect(area, "motion-notify-event", G_CALLBACK(region_pick_motion),
+		rp);
+	g_signal_connect(win, "key-press-event", G_CALLBACK(region_pick_key), rp);
+	rp->win = win;
+	rp->area = area;
+	region_pick = rp;
+	gtk_widget_show_all(win);
+	/* 全屏要等上屏之后再要（和截图那条一样：第一次 commit 之前发的会被丢掉）。 */
+	g_timeout_add(80, region_pick_fullscreen, win);
+	GdkWindow *gw = gtk_widget_get_window(win);
+	if (gw != NULL) {
+		GdkCursor *cursor = gdk_cursor_new_for_display(gdk_display_get_default(),
+			GDK_CROSSHAIR);
+		gdk_window_set_cursor(gw, cursor);
+		g_object_unref(cursor);
+	}
+	log_info("区域：在 %s 上拖一个框（不冻屏，Esc 取消）", host->name);
+}
+
+/* 一个 tab 页：一个 grid 装在一层滚动区里（每页各自滚；页高 = 内容的自然高度，
+ * 装不下才滚）。返回那个 grid，调用方往里摆卡片。 */
+static GtkWidget *tab_page(GtkWidget *stack, const char *title) {
+	GtkWidget *grid = gtk_grid_new();
+	gtk_grid_set_row_spacing(GTK_GRID(grid), 8);
+	gtk_grid_set_column_spacing(GTK_GRID(grid), 12);
+	gtk_widget_set_margin_top(grid, 2);
+	GtkWidget *sw = gtk_scrolled_window_new(NULL, NULL);
+	gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(sw), GTK_POLICY_NEVER,
+		GTK_POLICY_AUTOMATIC);
+	/* 别设 max_content_height：那个数比内容大就会凭空把页撑高（踩过：多出 53px）。 */
+	gtk_scrolled_window_set_propagate_natural_height(GTK_SCROLLED_WINDOW(sw), TRUE);
+	gtk_container_add(GTK_CONTAINER(sw), grid);
+	gtk_stack_add_titled(GTK_STACK(stack), sw, title, title);
+	return grid;
+}
+
+/* 「选择区域…」按钮：开框选浮层（活的、不冻屏）。 */
+static void on_pick_region_clicked(GtkButton *button, gpointer data) {
+	(void)button;
+	(void)data;
+	region_pick_start();
+}
+
 /* 弹对话框。多选（multiple）时用复选，否则单选（点一个就把别的取消）。 */
 static void dialog_show(struct request *req) {
 	struct session *s = req->session;
+	/* 上一轮要是还停在框选浮层上（会话被关掉那种），先收掉再弹新的。 */
+	region_pick_close(false);
 	uint32_t types = s->types != 0 ? s->types : SOURCE_TYPE_MONITOR;
 	GtkWidget *win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
 	gtk_window_set_title(GTK_WINDOW(win), "共享屏幕");
@@ -2064,85 +2505,120 @@ static void dialog_show(struct request *req) {
 	add_class(label, "hint");
 	gtk_box_pack_start(GTK_BOX(box), label, FALSE, FALSE, 0);
 
-	GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
-	gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll),
-		GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
-	/* 让滚动区把内容的自然高度顶给窗口：对话框就正好是「内容那么高」，底下不留
-	 * 一大块空白。给不了这么高的时候（小屏、被合成器裁）它自己滚动 —— 不要设
-	 * max_content_height，那个数比内容大就会凭空把窗口撑高（踩过：多出 53px）。 */
-	gtk_scrolled_window_set_propagate_natural_height(GTK_SCROLLED_WINDOW(scroll),
-		TRUE);
-	gtk_box_pack_start(GTK_BOX(box), scroll, TRUE, TRUE, 0);
+	/* 屏幕 / 窗口 / 区域三个 tab：上面一条分段控件（GtkStackSwitcher），下面
+	 * 一页一个 grid。只列应用真的在要的那几种来源；只剩一个 tab 时那条控件收起来
+	 * （一个按钮的分段控件看着莫名其妙）。 */
+	GtkWidget *stack = gtk_stack_new();
+	gtk_stack_set_transition_type(GTK_STACK(stack), GTK_STACK_TRANSITION_TYPE_NONE);
+	/* 三页高度对齐（取最高的那页）：切 tab 的时候对话框不会一跳一跳。 */
+	gtk_stack_set_hhomogeneous(GTK_STACK(stack), TRUE);
+	gtk_stack_set_vhomogeneous(GTK_STACK(stack), TRUE);
 
-	GtkWidget *grid = gtk_grid_new();
-	gtk_grid_set_row_spacing(GTK_GRID(grid), 8);
-	gtk_grid_set_column_spacing(GTK_GRID(grid), 12);
-	gtk_container_add(GTK_CONTAINER(scroll), grid);
+	GtkWidget *switcher = gtk_stack_switcher_new();
+	gtk_stack_switcher_set_stack(GTK_STACK_SWITCHER(switcher), GTK_STACK(stack));
+	gtk_widget_set_halign(switcher, GTK_ALIGN_CENTER);
+	gtk_widget_set_no_show_all(switcher, TRUE);
+	gtk_box_pack_start(GTK_BOX(box), switcher, FALSE, FALSE, 0);
+
+	gtk_box_pack_start(GTK_BOX(box), stack, TRUE, TRUE, 0);
 
 	g_list_free_full(rows, g_free);
 	rows = NULL;
+	region_row = NULL;
 
 	int line = 0;
 	int col = 0;
+	int pages = 0;
 	struct row *first = NULL;
-	if ((types & SOURCE_TYPE_MONITOR) != 0 && outputs != NULL) {
-		add_section(grid, line++, "屏幕");
+
+	/* 屏幕：每块真屏一张卡；应用要是也要虚拟屏幕，那张卡跟在后面（它本来就是
+	 * 「再来一块屏」，所以放同一页，前面加个小标题分开）。 */
+	if ((types & (SOURCE_TYPE_MONITOR | SOURCE_TYPE_VIRTUAL)) != 0) {
+		GtkWidget *grid_out = tab_page(stack, "屏幕");
+		line = 0;
 		col = 0;
-		for (GList *it = outputs; it != NULL; it = it->next) {
-			struct output *out = it->data;
-			char text[128];
-			snprintf(text, sizeof(text), "%d × %d", out->w, out->h);
-			line = card_place(grid, &col, line, ROW_OUTPUT, out,
-				out->name[0] != '\0' ? out->name : "输出", text);
+		pages++;
+		if ((types & SOURCE_TYPE_MONITOR) != 0) {
+			for (GList *it = outputs; it != NULL; it = it->next) {
+				struct output *out = it->data;
+				char text[128];
+				snprintf(text, sizeof(text), "%d × %d", out->w, out->h);
+				line = card_place(grid_out, &col, line, ROW_OUTPUT, out,
+					out->name[0] != '\0' ? out->name : "输出", text);
+			}
+			if (col != 0) {
+				line++;
+				col = 0;
+			}
 		}
-		if (col != 0) {
-			line++;
+		if ((types & SOURCE_TYPE_VIRTUAL) != 0) {
+			/* 虚拟屏幕：合成器会现加一块 headless 输出（能摆窗口、进布局）。
+			 * 尺寸取最大那块屏的逻辑尺寸 —— 用户想要的是「再来一块能用的屏」。 */
+			int vw = 1920, vh = 1080;
+			for (GList *it = outputs; it != NULL; it = it->next) {
+				struct output *out = it->data;
+				if (out->w > vw || out->h > vh) {
+					vw = out->w;
+					vh = out->h;
+				}
+			}
+			add_section(grid_out, line++, "虚拟屏幕");
 			col = 0;
+			char text[128];
+			snprintf(text, sizeof(text), "%d × %d", vw, vh);
+			struct row *r = add_card(grid_out, col, line, ROW_VIRTUAL, NULL,
+				"新建一块虚拟屏幕", text);
+			line++;
+			if (r != NULL) {
+				r->vw = vw;
+				r->vh = vh;
+			}
 		}
 	}
+
+	/* 窗口。 */
 	if ((types & SOURCE_TYPE_WINDOW) != 0) {
-		int n = 0;
+		GtkWidget *grid_win = tab_page(stack, "窗口");
+		line = 0;
+		col = 0;
+		pages++;
 		for (GList *it = toplevels; it != NULL; it = it->next) {
 			struct toplevel *tl = it->data;
 			if (tl->handle == NULL) {
 				continue;
 			}
-			if (n == 0) {
-				add_section(grid, line++, "窗口");
-				col = 0;
-			}
-			line = card_place(grid, &col, line, ROW_WINDOW, tl,
+			line = card_place(grid_win, &col, line, ROW_WINDOW, tl,
 				tl->title != NULL && tl->title[0] != '\0' ? tl->title : "(没标题)",
 				tl->app_id != NULL ? tl->app_id : "");
-			n++;
-		}
-		if (col != 0) {
-			line++;
-			col = 0;
 		}
 	}
-	if ((types & SOURCE_TYPE_VIRTUAL) != 0) {
-		/* 虚拟屏幕：合成器会现加一块 headless 输出（能摆窗口、进布局）。
-		 * 尺寸取最大那块屏的逻辑尺寸 —— 用户想要的是「再来一块能用的屏」。 */
-		int vw = 1920, vh = 1080;
-		for (GList *it = outputs; it != NULL; it = it->next) {
-			struct output *out = it->data;
-			if (out->w > vw || out->h > vh) {
-				vw = out->w;
-				vh = out->h;
-			}
-		}
-		add_section(grid, line++, "虚拟屏幕");
+
+	/* 区域：框一块屏（应用只要窗口时不显示 —— 区域是屏上的一块）。 */
+	if ((types & SOURCE_TYPE_MONITOR) != 0) {
+		GtkWidget *grid_reg = tab_page(stack, "区域");
+		line = 0;
 		col = 0;
-		char text[128];
-		snprintf(text, sizeof(text), "%d × %d", vw, vh);
-		struct row *r = add_card(grid, col, line, ROW_VIRTUAL, NULL,
-			"新建一块虚拟屏幕", text);
-		line++;
+		pages++;
+		struct region_row *reg = calloc(1, sizeof(*reg));
+		struct row *r = reg != NULL ? add_card(grid_reg, 0, 0, ROW_REGION, reg,
+			"屏幕区域", "还没选：点下面的按钮框一块") : NULL;
 		if (r != NULL) {
-			r->vw = vw;
-			r->vh = vh;
+			region_row = r;
+			/* 还没框出来之前不能选（选了也没东西可录）。 */
+			gtk_widget_set_sensitive(r->toggle, FALSE);
 		}
+		GtkWidget *pick = gtk_button_new_with_label("选择区域…");
+		add_class(pick, "ghost");
+		gtk_widget_set_halign(pick, GTK_ALIGN_START);
+		gtk_widget_set_margin_top(pick, 4);
+		gtk_grid_attach(GTK_GRID(grid_reg), pick, 0, 1, CARD_COLS, 1);
+		g_signal_connect(pick, "clicked", G_CALLBACK(on_pick_region_clicked), NULL);
+		region_pick_button = pick;
+	}
+
+	if (pages > 1) {
+		gtk_widget_set_no_show_all(switcher, FALSE);
+		gtk_widget_show(switcher);
 	}
 
 	/* 默认选中第一行（不管是屏幕、窗口还是虚拟屏幕）：KDE 的选择器也是这样，
@@ -2184,6 +2660,11 @@ static void dialog_show(struct request *req) {
 		if (r->kind == ROW_OUTPUT) {
 			((struct output *)r->ptr)->image = r->image;
 			((struct output *)r->ptr)->toggle = r->toggle;
+		} else if (r->kind == ROW_REGION) {
+			/* 区域那行的缩略图复用抓帧那一套（见 struct region_row）。 */
+			struct region_row *reg = r->ptr;
+			reg->thumb.image = r->image;
+			reg->thumb.toggle = r->toggle;
 		}
 	}
 	if (first != NULL) {
@@ -3035,50 +3516,9 @@ static gboolean shot_draw(GtkWidget *widget, cairo_t *cr, gpointer data) {
 		g_object_unref(scaled);
 	}
 	if (sh->dragging || (sh->x1 != 0 && sh->y1 != 0)) {
-		double rx0 = sh->x0 < sh->x1 ? sh->x0 : sh->x1;
-		double ry0 = sh->y0 < sh->y1 ? sh->y0 : sh->y1;
-		double rx1 = sh->x0 > sh->x1 ? sh->x0 : sh->x1;
-		double ry1 = sh->y0 > sh->y1 ? sh->y0 : sh->y1;
-		/* 选区之外压暗一层（KDE 的截图工具就是这样，选中的那块才跳出来），
-		 * 边框用强调色，尺寸标签贴在选区左上角。 */
-		cairo_set_source_rgba(cr, 0, 0, 0, 0.35);
-		cairo_rectangle(cr, 0, 0, aw, ry0);
-		cairo_rectangle(cr, 0, ry1, aw, ah - ry1);
-		cairo_rectangle(cr, 0, ry0, rx0, ry1 - ry0);
-		cairo_rectangle(cr, rx1, ry0, aw - rx1, ry1 - ry0);
-		cairo_fill(cr);
-
-		double ar, ag, ab;
-		hex2rgb(accent, &ar, &ag, &ab);
-		cairo_set_source_rgba(cr, ar, ag, ab, 1.0);
-		cairo_set_line_width(cr, 2);
-		cairo_rectangle(cr, rx0 + 1, ry0 + 1, rx1 - rx0 - 2, ry1 - ry0 - 2);
-		cairo_stroke(cr);
-
-		/* 尺寸标签（换算回屏幕像素 —— 画的时候是等比缩过的）。 */
-		int pw = (int)((rx1 - rx0) / (k > 0 ? k : 1) + 0.5);
-		int ph = (int)((ry1 - ry0) / (k > 0 ? k : 1) + 0.5);
-		char label[64];
-		snprintf(label, sizeof(label), "%d × %d", pw, ph);
-		cairo_select_font_face(cr, "sans", CAIRO_FONT_SLANT_NORMAL,
-			CAIRO_FONT_WEIGHT_BOLD);
-		cairo_set_font_size(cr, 12);
-		cairo_text_extents_t ext;
-		cairo_text_extents(cr, label, &ext);
-		double lx = rx0, ly = ry0 - 8;
-		if (ly < 20) {
-			ly = ry1 + 8; /* 贴到选区下沿，别顶出屏幕 */
-		}
-		cairo_set_source_rgba(cr, ar, ag, ab, 0.95);
-		cairo_rectangle(cr, lx, ly - ext.height - 4, ext.width + 12,
-			ext.height + 9);
-		cairo_fill(cr);
-		/* 标签底色是强调色，字用「强调色上该用什么颜色」（浅色强调色时是深字）。 */
-		double tr, tg, tb;
-		hex2rgb(on_accent, &tr, &tg, &tb);
-		cairo_set_source_rgba(cr, tr, tg, tb, 1.0);
-		cairo_move_to(cr, lx + 6, ly + 1);
-		cairo_show_text(cr, label);
+		/* 和「区域」那个 tab 的框选共用一套画法（框外压暗 + 强调色框 + 尺寸标签），
+		 * 区别只是这里底下铺的是冻住的那一帧。 */
+		draw_region_overlay(cr, aw, ah, sh->x0, sh->y0, sh->x1, sh->y1, k);
 	}
 	return TRUE;
 }

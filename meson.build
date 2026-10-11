@@ -345,6 +345,18 @@ zkde_client_code = custom_target('zkde-screencast-unstable-v1-client-protocol.c'
   input: zkde_xml,
   output: 'zkde-screencast-unstable-v1-client-protocol.c',
   command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
+# 输出的**逻辑位置**（布局坐标）只在 xdg-output 里，wl_output.geometry 那对 x/y
+# wlroots 一直发 0,0 —— 选择器要报「这块屏在布局里的哪儿」（录屏的 position、
+# 框选区域的坐标都要它），所以这个协议也得给客户端生成一份。
+xdo_xml = 'protocols/xdg-output-unstable-v1.xml'
+xdo_client_header = custom_target('xdg-output-unstable-v1-client-protocol.h',
+  input: xdo_xml,
+  output: 'xdg-output-unstable-v1-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'])
+xdo_client_code = custom_target('xdg-output-unstable-v1-client-protocol.c',
+  input: xdo_xml,
+  output: 'xdg-output-unstable-v1-client-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
 
 gtk3_dep = dependency('gtk+-3.0')
 # 截图要写 PNG（portal 的 Screenshot 接口回的是个文件 URI）。
@@ -353,7 +365,7 @@ png_dep = dependency('libpng')
 # tools/capture.c 生成过了（etl_* / eics_* / eicc_*），这里直接复用。
 executable('vidow-portal',
   ['tools/vidowportal.c', sc_client_header, sc_client_code,
-   zkde_client_header, zkde_client_code,
+   zkde_client_header, zkde_client_code, xdo_client_header, xdo_client_code,
    etl_header, etl_code, eics_header, eics_code, eicc_header, eicc_code],
   dependencies: [wayland_client_dep, gtk3_dep, png_dep],
   include_directories: include_directories('.'),
