@@ -3,7 +3,16 @@
 
 给模糊测试提供有对比度的内容：渐变底 + 硬边方块，模糊之后边缘会糊开，
 可以量化。用法：WAYLAND_DISPLAY=wayland-0 python3 tools/wall.py
+
+也可以画一块纯色、换个 namespace —— 测试「全景用另一张壁纸」时要同时起两块
+（规则按 namespace 匹配，见 rule.c 的 overview）：
+
+    python3 tools/wall.py                       # 渐变 + 方块，namespace wall
+    python3 tools/wall.py "#ff00ff"             # 纯洋红，namespace wall
+    python3 tools/wall.py "#ff00ff" wall2       # 纯洋红，namespace wall2
 """
+import sys
+
 import gi
 
 gi.require_version('Gtk', '3.0')
@@ -11,13 +20,20 @@ gi.require_version('GtkLayerShell', '0.1')
 import cairo  # noqa: E402
 from gi.repository import Gtk, GtkLayerShell  # noqa: E402
 
+color = sys.argv[1] if len(sys.argv) > 1 else None
+namespace = sys.argv[2] if len(sys.argv) > 2 else 'wall'
+rgb = None
+if color is not None:
+    hexs = color.lstrip('#')
+    rgb = tuple(int(hexs[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
+
 
 class Wall(Gtk.Window):
     def __init__(self):
         super().__init__()
         GtkLayerShell.init_for_window(self)
         GtkLayerShell.set_layer(self, GtkLayerShell.Layer.BACKGROUND)
-        GtkLayerShell.set_namespace(self, 'wall')
+        GtkLayerShell.set_namespace(self, namespace)
         for edge in (GtkLayerShell.Edge.TOP, GtkLayerShell.Edge.BOTTOM,
                      GtkLayerShell.Edge.LEFT, GtkLayerShell.Edge.RIGHT):
             GtkLayerShell.set_anchor(self, edge, True)
@@ -30,6 +46,11 @@ class Wall(Gtk.Window):
     def on_draw(self, widget, cr):
         w = widget.get_allocated_width()
         h = widget.get_allocated_height()
+        if rgb is not None:
+            cr.set_source_rgb(*rgb)
+            cr.paint()
+            return False
+
         grad = cairo.LinearGradient(0, 0, w, h)
         grad.add_color_stop_rgb(0.0, 0.04, 0.06, 0.14)
         grad.add_color_stop_rgb(0.5, 0.14, 0.24, 0.46)

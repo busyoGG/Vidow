@@ -41,6 +41,19 @@ enum vidow_capture_mode {
 	VIDOW_CAPTURE_MOSAIC,
 };
 
+/* 图层规则 overview：这个 layer surface 进全景的时候怎么办。
+ *   OFF  照常（默认：background / bottom 层跟着进全景，top / overlay 层收起）
+ *   ONLY 只在全景里露出来（桌面时收起来）—— 全景专用壁纸走这条
+ *   HIDE 全景里收起来
+ * niri 的 place-within-backdrop 是同一个需求的另一种说法：那边有工作区带，
+ * 「放进 backdrop」和「只在全景里露」是两件事；vidow 只有一条带、壁纸本来
+ * 就不跟着缩放，所以只需要「什么时候露」这一个开关。 */
+enum vidow_overview_mode {
+	VIDOW_OVERVIEW_OFF = 0,
+	VIDOW_OVERVIEW_ONLY,
+	VIDOW_OVERVIEW_HIDE,
+};
+
 /* 马赛克块边长（屏幕像素）的默认值：16px 的块在 1080p 上大概 120 格宽，
  * 看得出版面、看不出字。 */
 #define VIDOW_CAPTURE_MOSAIC_DEFAULT 16
@@ -135,6 +148,8 @@ enum vidow_rule_act {
 	VRA_NOISE,
 	VRA_BLUR,              /* false = 它背后不模糊（全局 blur_enabled 仍是总开关） */
 	VRA_BLUR_XRAY,         /* 重叠时也用整屏那份底衬 */
+	/* 图层专属：进全景的时候露不露（见 enum vidow_overview_mode） */
+	VRA_OVERVIEW,
 	VRA_COUNT
 };
 
@@ -223,6 +238,7 @@ enum vidow_rule_kind {
 	RK_ACT_STR,
 	RK_ACT_COLOR,
 	RK_ACT_CAPTURE,
+	RK_ACT_OVERVIEW,
 };
 
 /* 这个字段管哪一边（不适用 = 这条规则对那一边不匹配）。 */
@@ -265,6 +281,8 @@ bool vidow_rule_set_act_str(struct vidow_rule *rule, int slot, const char *value
 bool vidow_rule_set_act_color(struct vidow_rule *rule, int slot,
 		const char *value, char *err, size_t errlen);
 bool vidow_rule_set_capture(struct vidow_rule *rule, int slot,
+		const char *value, char *err, size_t errlen);
+bool vidow_rule_set_overview(struct vidow_rule *rule, int slot,
 		const char *value, char *err, size_t errlen);
 void vidow_rule_set_literal(struct vidow_rule *rule, bool literal);
 

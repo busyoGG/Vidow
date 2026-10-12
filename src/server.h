@@ -1132,6 +1132,10 @@ struct vidow_layer_surface {
 	 * 和上面那个 capture_hidden 不是一回事 —— 那个是模糊底衬的临时藏法。 */
 	int capture_mode;   /* enum vidow_capture_mode */
 	int capture_mosaic; /* 马赛克块边长（屏幕像素） */
+	/* 进全景的时候露不露（规则 overview = "only" / "hide"，见 rule.h 的
+	 * enum vidow_overview_mode）：只在 overview.c 里用，是它盖在
+	 * 「整棵树一起开 / 关」上面的一层逐 surface 覆盖。 */
+	int overview_mode;
 	bool mask_opacity;
 	float mask_saved_fx;
 	float mask_saved_surf;
@@ -2655,6 +2659,9 @@ bool vidow_overview_init(struct vidow_server *server);
 bool vidow_overview_active(const struct vidow_server *server);
 void vidow_overview_toggle(struct vidow_server *server);
 void vidow_overview_exit(struct vidow_server *server);
+/* 图层规则的 overview 改了之后，把逐 surface 的「全景里露不露」重算一遍
+ * （rule.c 的 apply_layer 调）—— 不然要等下次开关全景才生效。 */
+void vidow_overview_refresh_layers(struct vidow_server *server);
 /* 每帧渲染前调一次：算好变换（t 变了、布局变了都靠它）并把窗口摆一遍。 */
 void vidow_overview_update(struct vidow_server *server);
 /* 世界坐标 -> 屏幕坐标（t = 0 时是恒等变换）。 */

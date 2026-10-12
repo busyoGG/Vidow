@@ -679,6 +679,11 @@ void vidow_ipc_json_layer(struct jbuf *b, struct vidow_server *server,
 	jb_kv_str(b, "capture", ls->capture_mode == VIDOW_CAPTURE_HIDE ? "hide" :
 		ls->capture_mode == VIDOW_CAPTURE_MOSAIC ? "mosaic" : "off");
 	jb_kv_int(b, "capture_mosaic", ls->capture_mosaic);
+	/* 图层规则给的「全景里露不露」（见 rule.c 的 overview）。only 的那种现在
+	 * 多半是关着的 —— 它只在全景里出现，别拿它当「桌面上的壁纸」。 */
+	jb_kv_str(b, "overview", ls->overview_mode == VIDOW_OVERVIEW_ONLY ? "only" :
+		ls->overview_mode == VIDOW_OVERVIEW_HIDE ? "hide" : "off");
+	jb_kv_bool(b, "shown", ls->scene != NULL && ls->scene->tree->node.enabled);
 	/* 规则算出来的开合动画与不透明度：这块面板现在「该」怎么样看这里，
 	 * 不用去量像素（alpha 是动画那一刻的值，动画停了恒为 1）。 */
 	jb_key(b, "rule");
@@ -704,6 +709,15 @@ void vidow_ipc_json_layers(struct jbuf *b, struct vidow_server *server) {
 	jb_arr_end(b);
 }
 
+/* 这个 layer surface 现在真的画在屏上吗：mapped + 场景节点是开着的。规则
+ * overview = "only" 的在全景没开的时候节点是关的（见 overview.c），所以这一个
+ * 判据同时管住了「被规则收起来的」和「被全景整棵收起来的」。 */
+static bool layer_drawn(const struct vidow_layer_surface *ls) {
+	return ls->layer_surface != NULL && ls->layer_surface->surface != NULL &&
+		ls->layer_surface->surface->mapped && ls->scene != NULL &&
+		ls->scene->tree->node.enabled;
+}
+
 /* 谁在画桌面背景（壁纸）。壁纸**不**是 vidow 画的：它是 layer-shell 的
  * background 层（swaybg / swww / quickshell 都走这条路），vidow 只在谁都没画
  * 的时候垫一层 background_color。这个查询就是给 shell 用的：「这屏的壁纸有人
@@ -719,15 +733,22 @@ void vidow_ipc_json_background(struct jbuf *b, struct vidow_server *server) {
 	jb_obj(b);
 	jb_kv_str(b, "color", hex);
 
-	/* 画背景的那几个 surface（background 层，按 vidow_server.layers 的顺序）。 */
+	/* 画背景的那几个 surface（background 层，按 vidow_server.layers 的顺序）。
+	 * visible = 现在真的画在屏上的那几个：规则 overview = "only" 的在全景没开
+	 * 的时候是关着的（见 overview.c），别把它算成「桌面上的壁纸」。 */
 	int n = 0;
+	int visible = 0;
 	struct vidow_layer_surface *ls;
 	wl_list_for_each(ls, &server->layers, link) {
 		if (ls->layer == ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND) {
 			n++;
+			if (layer_drawn(ls)) {
+				visible++;
+			}
 		}
 	}
 	jb_kv_int(b, "clients", n);
+	jb_kv_int(b, "visible", visible);
 
 	jb_key(b, "surfaces");
 	jb_arr(b);
@@ -750,9 +771,7 @@ void vidow_ipc_json_background(struct jbuf *b, struct vidow_server *server) {
 		int covering = 0;
 		wl_list_for_each(ls, &server->layers, link) {
 			if (ls->layer != ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND ||
-					ls->output != output || ls->layer_surface == NULL ||
-					ls->layer_surface->surface == NULL ||
-					!ls->layer_surface->surface->mapped) {
+					ls->output != output || !layer_drawn(ls)) {
 				continue;
 			}
 			if (ls->geom.width >= box.width && ls->geom.height >= box.height) {
@@ -943,6 +962,12 @@ void vidow_ipc_json_rules(struct jbuf *b, struct vidow_server *server) {
 					"hide" :
 					rule->aval[f->slot].i == VIDOW_CAPTURE_MOSAIC ?
 					"mosaic" : "off");
+				break;
+			case RK_ACT_OVERVIEW:
+				jb_str(b, rule->aval[f->slot].i == VIDOW_OVERVIEW_ONLY ?
+					"only" :
+					rule->aval[f->slot].i == VIDOW_OVERVIEW_HIDE ?
+					"hide" : "off");
 				break;
 			default:
 				jb_null(b);

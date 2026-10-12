@@ -142,6 +142,13 @@ end
 --                                "hide"（不出现）/ "mosaic"（打马赛克）
 --     capture_mosaic = 24        马赛克的块边长（屏幕像素，默认 16，最小 2）；只在
 --                                capture = "mosaic" 时有用，单独写不算一个作用
+--     overview = "only"          进全景（Mod+O）的时候露不露："off"（默认，照常）/
+--                                "only"（只在全景里显示）/ "hide"（全景里收起来）。
+--                                只对图层有意义。**全景里换一张壁纸就靠它**：起第二个
+--                                壁纸客户端（比如 awww-daemon -n ov，它的 layer
+--                                namespace 是 awww-daemonov），再按 namespace 匹配
+--                                （见下面 examples 里那条）。桌面上它连画都不画，所以
+--                                也不会进窗口的模糊底衬；全景里看到的是底衬那一份。
 --     anim = false               不做开合动画（窗口 / 图层都是：开、关都瞬间到位）
 --     open_ms = 500              开启动画时长（毫秒；覆盖全局 window_open_ms /
 --                                layer_open_ms，0 = 不做这个动画）
@@ -163,9 +170,9 @@ end
 --     blur = false               它背后不模糊（true = 平铺窗口也模糊）
 --     blur_xray = true           重叠时也用整屏那份底衬（糊的是壁纸）
 --
---   图层规则能用的作用：capture / capture_mosaic / anim / open_ms / close_ms /
---   opacity / blur —— 其余（force_render、hz、float、装饰参数…）都是窗口专有，
---   写进图层规则 = 这条规则谁也不匹配（当场看得出来，不会悄悄生效）。
+--   图层规则能用的作用：capture / capture_mosaic / overview / anim / open_ms /
+--   close_ms / opacity / blur —— 其余（force_render、hz、float、装饰参数…）都是
+--   窗口专有，写进图层规则 = 这条规则谁也不匹配（当场看得出来，不会悄悄生效）。
 --   开窗时兑现一次（重载规则**不**搬已经开着的窗口，也不改它们的尺寸）：
 --     float = true               强制浮动（false = 强制平铺；对话框那类自动识别让位）
 --     workspace = "chat"         开在哪块工作区：具名工作区（没有就建）/ 特殊工作区
@@ -182,6 +189,7 @@ end
 --   vidow.rule{ title = "^预览", force_render = true, hz = 15 }
 --   vidow.rule{ class = "Steam", focus_on_open = false }
 --   vidow.rule{ namespace = "^notifications$", capture = "hide" }
+--   vidow.rule{ namespace = "^awww-daemonov", overview = "only" }   -- 全景壁纸
 --   vidow.rule{ layer = "^background$", anim = false }   -- 壁纸不做入场动画
 --   vidow.rule{ namespace = "^waybar$", opacity = 0.9, close_ms = 0 }
 --   vidow.rule{ exe = "^wechat$", x11_scale = 1 }     -- 没有 app_id 的应用按进程认

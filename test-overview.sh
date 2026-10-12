@@ -18,6 +18,9 @@
 #      三种配色下窗口本身都不暗
 #  10) 全景里的壁纸模糊（overview_blur）：开了之后壁纸的硬边摊开（跨边缘最大跳变
 #      掉到 1/4 以下），窗口本身不跟着糊
+#  11) 全景用另一张壁纸（图层规则 overview = "only"）：namespace 匹配上的那块
+#      background 层 surface 桌面上一点不画、进全景才露出来、退出又收起；规则热改
+#      （only ↔ off）当场生效；vidowmsg background / layers 如实报出它
 set -u
 cd "$(dirname "$0")"
 
@@ -235,6 +238,52 @@ stop_clients
 kill -TERM -- "-$VIDOW_PGID" 2>/dev/null
 sleep 0.6
 
+# ---------------------------------------------------------------- 全景用另一张壁纸
+mark "全景用另一张壁纸（图层规则 overview = \"only\"）"
+# 两块 background 层 surface：wall.py 画桌面，第二块（namespace wall2）只在全景里
+# 露面。规则写在配置里（14-keys.lua 那一族），namespace 匹配。
+cat > "$CFGDIR/.config/vidow/config.lua" <<'EOF'
+scale = "1"
+xwayland = false
+window_open_ms = 150
+window_close_ms = 150
+window_move_ms = 150
+background_color = "#101010"
+overview_blur = true
+vidow.bind("Mod+O", "toggle-overview")
+vidow.rule{ namespace = "^wall2$", overview = "only" }
+EOF
+start_vidow 1
+python3 tools/wall.py >/dev/null 2>&1 &
+sleep 1.2
+grim "$RUNDIR/ovbg-wall.png"
+python3 tools/wall.py "#ff00ff" wall2 >/dev/null 2>&1 &
+sleep 1.5
+grim "$RUNDIR/ovbg-desk.png"
+./build/vidowmsg background > "$RUNDIR/ovbg-bg.json" 2>&1
+./build/vidowmsg layers > "$RUNDIR/ovbg-layers.json" 2>&1
+wtype -M logo -k o >/dev/null 2>&1
+sleep 1.1
+grim "$RUNDIR/ovbg-overview.png"
+wtype -k Escape >/dev/null 2>&1
+sleep 1.1
+grim "$RUNDIR/ovbg-back.png"
+# 热改规则：only -> off，那块就变成普通壁纸（盖住桌面）
+sed -i 's/overview = "only"/overview = "off"/' \
+	"$CFGDIR/.config/vidow/config.lua"
+./build/vidowmsg reload-config >/dev/null 2>&1
+sleep 1.4
+grim "$RUNDIR/ovbg-off.png"
+sed -i 's/overview = "off"/overview = "only"/' \
+	"$CFGDIR/.config/vidow/config.lua"
+./build/vidowmsg reload-config >/dev/null 2>&1
+sleep 1.4
+grim "$RUNDIR/ovbg-only2.png"
+cp "$LOG" "$RUNDIR/log-ovbg.txt"
+stop_clients
+kill -TERM -- "-$VIDOW_PGID" 2>/dev/null
+sleep 0.6
+
 leftover=0
 for pid in $VIDOW_PIDS; do
 	kill -0 "$pid" 2>/dev/null && leftover=$((leftover + 1))
@@ -244,7 +293,7 @@ done
 
 # ---------------------------------------------------------------- 量结果
 python3 - "$LOG" "$SNAP" "$RUNDIR" <<'PY'
-import re, sys
+import json, re, sys
 from PIL import Image
 
 rundir = sys.argv[3]
@@ -544,6 +593,90 @@ blur_cfg = open("%s/blur-cfg.json" % rundir, encoding="utf-8",
                 errors="replace").read()
 check("false" in blur_cfg,
       "get-config 读回 overview_blur：%s" % " ".join(blur_cfg.split()))
+
+print()
+print("== 全景用另一张壁纸（图层规则 overview = \"only\"）==")
+# 两块 background 层 surface 叠着：wall.py（渐变，桌面那张）和 wall2（纯洋红）。
+# 规则 overview = "only" 让 wall2 只在全景里露面 —— 桌面上它连**画**都不该画
+# （节点是关的，所以也不进窗口的模糊底衬），全景里才露出来（压暗 + 糊过）。
+
+
+def is_magenta(p):
+    r, g, b = p
+    return r > 200 and b > 200 and g < 90
+
+
+def is_gold(p):
+    r, g, b = p
+    return r > 170 and r - b > 110 and g - b > 80 and g > 120
+
+
+def frac(im, pred, step=3):
+    hit = tot = 0
+    for y in range(0, im.size[1], step):
+        for x in range(0, im.size[0], step):
+            tot += 1
+            if pred(im.getpixel((x, y))):
+                hit += 1
+    return 100.0 * hit / tot
+
+
+desk = image("ovbg-desk")
+gold_pct = frac(desk, is_gold)
+mag_pct = frac(desk, is_magenta)
+check(gold_pct > 5, "桌面上还是 wall.py 那张壁纸（金色 %.0f%%）" % gold_pct)
+check(mag_pct == 0,
+      "overview = \"only\" 那块桌面上一点没画（洋红 %.0f%%）" % mag_pct)
+
+ov = image("ovbg-overview")
+# 全景里那张是**底衬**（模糊那份画在遮罩下面）：压暗 + 糊过，取的是色相关系。
+dim_mag = frac(ov, lambda p: p[0] > 50 and p[2] > 50 and
+               abs(p[0] - p[2]) < 70 and p[1] < p[0] - 25 and p[1] < p[2] - 25)
+check(dim_mag > 50, "全景里露出来的就是它（压暗过的洋红 %.0f%%）" % dim_mag)
+
+back = image("ovbg-back")
+check(frac(back, is_magenta) == 0 and frac(back, is_gold) > 5,
+      "退出全景之后又收起来了（洋红 0%%，金色 %.0f%%）" % frac(back, is_gold))
+
+# 热改规则：规则得当场生效，不能等下次开关全景
+off = image("ovbg-off")
+off_pct = frac(off, is_magenta)
+check(off_pct > 50,
+      "规则热改成 \"off\" 之后它当场变成普通壁纸，盖住桌面（洋红 %.0f%%）"
+      % off_pct)
+only2 = image("ovbg-only2")
+check(frac(only2, is_magenta) == 0,
+      "再改回 \"only\" 也当场生效（洋红 %.0f%%）" % frac(only2, is_magenta))
+
+# 查询接口：两块都算 client，但「现在真的画着」的只有一块
+bg = json.loads(open("%s/ovbg-bg.json" % rundir, encoding="utf-8",
+                     errors="replace").read())
+check(bg.get("clients") == 2, "background 报出两块壁纸 client（%s）"
+      % bg.get("clients"))
+check(bg.get("visible") == 1, "其中「画着的」只有一块（visible=%s）"
+      % bg.get("visible"))
+check(bg.get("outputs", [{}])[0].get("covered") is True,
+      "covered 只看画着的那块（wall.py 铺满了）")
+
+lay = json.loads(open("%s/ovbg-layers.json" % rundir, encoding="utf-8",
+                      errors="replace").read())
+lay = lay["layers"] if isinstance(lay, dict) and "layers" in lay else lay
+by_ns = {l.get("namespace"): l for l in lay if l.get("layer") == "background"}
+check(by_ns.get("wall2", {}).get("overview") == "only",
+      "layers 报出 wall2 的 overview 规则（%s）"
+      % by_ns.get("wall2", {}).get("overview"))
+check(by_ns.get("wall2", {}).get("shown") is False and
+      by_ns.get("wall", {}).get("shown") is True,
+      "shown 如实反映「现在画没画」（wall2=%s wall=%s）"
+      % (by_ns.get("wall2", {}).get("shown"),
+         by_ns.get("wall", {}).get("shown")))
+
+ovbg_log = open("%s/log-ovbg.txt" % rundir, encoding="utf-8",
+                errors="replace").read()
+check("全景里 = 只在全景里显示" in ovbg_log and "全景里 = 照常" in ovbg_log,
+      "规则生效有日志（rule: layer wall2 全景里 = …）")
+check("Assertion" not in ovbg_log and "abort" not in ovbg_log.lower(),
+      "这一段日志里没有 assert / abort")
 
 check("Assertion" not in single and "abort" not in single.lower() and
       "Assertion" not in two and "abort" not in two.lower(),

@@ -1020,6 +1020,19 @@ static int l_rule(lua_State *L) {
 			}
 			break;
 		}
+		case RK_ACT_OVERVIEW: {
+			const char *text = lua_type(L, -1) == LUA_TSTRING ?
+				lua_tostring(L, -1) : NULL;
+			if (text == NULL) {
+				ok = false;
+				snprintf(err, sizeof(err), "要 \"off\" / \"only\" / "
+					"\"hide\"");
+			} else {
+				ok = vidow_rule_set_overview(rule, field->slot, text, err,
+					sizeof(err));
+			}
+			break;
+		}
 		default:
 			ok = false;
 			snprintf(err, sizeof(err), "不认识的字段类型");
@@ -1092,6 +1105,11 @@ static void push_rule_field(lua_State *L, const struct vidow_rule *rule,
 		lua_pushstring(L, rule->aval[field->slot].i == VIDOW_CAPTURE_HIDE ?
 			"hide" : rule->aval[field->slot].i == VIDOW_CAPTURE_MOSAIC ?
 			"mosaic" : "off");
+		break;
+	case RK_ACT_OVERVIEW:
+		lua_pushstring(L, rule->aval[field->slot].i == VIDOW_OVERVIEW_ONLY ?
+			"only" : rule->aval[field->slot].i == VIDOW_OVERVIEW_HIDE ?
+			"hide" : "off");
 		break;
 	default:
 		lua_pushnil(L);

@@ -93,6 +93,11 @@ const struct vidow_rule_field vidow_rule_fields[] = {
 		VIDOW_RULE_WINDOW | VIDOW_RULE_LAYER,
 		"马赛克的块边长（屏幕像素，默认 16，最小 2）；只在 capture = "
 		"\"mosaic\" 时有用，单独写不算一个作用" },
+	{ "overview", RK_ACT_OVERVIEW, VRA_OVERVIEW, VIDOW_RULE_LAYER,
+		"进全景的时候怎么露面：\"only\"（只在全景里显示）/ \"hide\"（全景里"
+		"收起来）；不写就照常。全景用另一张壁纸靠它 —— 跑第二个壁纸客户端"
+		"（比如 awww-daemon -n ov，namespace 就成了 awww-daemonov）再按 "
+		"namespace 匹配" },
 	/* 开窗时兑现一次的 */
 	{ "float", RK_ACT_BOOL, VRA_FLOAT, VIDOW_RULE_WINDOW,
 		"true = 强制浮动（对话框那类本来就会浮的不用写），false = 强制平铺" },
@@ -373,6 +378,28 @@ bool vidow_rule_set_capture(struct vidow_rule *rule, int slot,
 	return true;
 }
 
+bool vidow_rule_set_overview(struct vidow_rule *rule, int slot,
+		const char *value, char *err, size_t errlen) {
+	if (rule == NULL || slot < 0 || slot >= VRA_COUNT) {
+		return false;
+	}
+	int mode;
+	if (value == NULL || value[0] == '\0' || strcmp(value, "off") == 0) {
+		mode = VIDOW_OVERVIEW_OFF;
+	} else if (strcmp(value, "only") == 0) {
+		mode = VIDOW_OVERVIEW_ONLY;
+	} else if (strcmp(value, "hide") == 0) {
+		mode = VIDOW_OVERVIEW_HIDE;
+	} else {
+		snprintf(err, errlen, "只能是 \"off\"、\"only\" 或 \"hide\"，"
+			"给的是 \"%s\"", value);
+		return false;
+	}
+	rule->aset[slot] = true;
+	rule->aval[slot].i = mode;
+	return true;
+}
+
 void vidow_rule_set_literal(struct vidow_rule *rule, bool literal) {
 	if (rule != NULL) {
 		rule->literal = literal;
@@ -582,6 +609,12 @@ static void log_rule(const struct vidow_rule *rule) {
 			snprintf(value, sizeof(value), "%s",
 				rule->aval[f->slot].i == VIDOW_CAPTURE_HIDE ? "hide" :
 				rule->aval[f->slot].i == VIDOW_CAPTURE_MOSAIC ? "mosaic" :
+				"off");
+			break;
+		case RK_ACT_OVERVIEW:
+			snprintf(value, sizeof(value), "%s",
+				rule->aval[f->slot].i == VIDOW_OVERVIEW_ONLY ? "only" :
+				rule->aval[f->slot].i == VIDOW_OVERVIEW_HIDE ? "hide" :
 				"off");
 			break;
 		default:
@@ -1089,6 +1122,21 @@ static void apply_layer(struct vidow_server *server,
 			capture == VIDOW_CAPTURE_MOSAIC ? "马赛克" : "关");
 	}
 	ls->capture_mosaic = capture_mosaic;
+
+	/* 全景里怎么露面（overview = "only" / "hide"）：开关是在 overview.c 的
+	 * overview_layers_apply 里落的，规则一改就得让新的立刻生效 —— 不然要等到
+	 * 下次开关全景才看见。全景没开的时候也只动这一件事，很便宜。 */
+	int overview = VIDOW_OVERVIEW_OFF;
+	if (eff->set[VRA_OVERVIEW]) {
+		overview = (int)eff->val[VRA_OVERVIEW].i;
+	}
+	if (ls->overview_mode != overview) {
+		ls->overview_mode = overview;
+		wlr_log(WLR_INFO, "rule: layer %s 全景里 = %s", ns,
+			overview == VIDOW_OVERVIEW_ONLY ? "只在全景里显示" :
+			overview == VIDOW_OVERVIEW_HIDE ? "收起来" : "照常");
+	}
+	vidow_overview_refresh_layers(server);
 
 	/* 开合动画与不透明度（rule.c 的 vidow_rule_anim / vidow_rule_opacity）：
 	 * 时长是**用的时候**现读的（layer.c 的 layer_open_anim / layer_snapshot_close），

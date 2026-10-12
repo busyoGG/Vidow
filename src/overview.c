@@ -71,6 +71,68 @@ bool vidow_overview_active(const struct vidow_server *server) {
 	return server->overview.t > 0.0 || server->overview.on;
 }
 
+/* 图层规则的 overview：盖在 overview_apply 里那几刀「整棵树一起开关」上面，
+ * 逐个 surface 决定它在全景里露不露。
+ *
+ *   only —— 只在全景里露出来（桌面时收起来）。**全景专用壁纸走这条**：跑第二个
+ *           壁纸客户端（awww-daemon -n ov → namespace "awww-daemonov"），再
+ *           vidow.rule{ namespace=…, overview="only" }。
+ *           桌面时它的场景节点是关的，所以既不会盖住桌面壁纸，也不会进窗口的
+ *           模糊底衬（底衬抓的就是这几棵树）。
+ *   hide —— 全景里收起来（比如全景里不想看见壁纸，只剩兜底色）。
+ *
+ * 默认（没写规则）保持 overview_apply 那套：background / bottom 层跟着进全景，
+ * top / overlay 层收起。对 top / overlay 层写 only 没有意义 —— 那两棵树在全景
+ * 里是整棵关掉的，逐 surface 开不回来（要开得先改那几刀）。 */
+static bool overview_layers_apply(struct vidow_server *server) {
+	bool on = server->overview.t > 0.002;
+	bool changed = false;
+	struct vidow_layer_surface *ls;
+	wl_list_for_each(ls, &server->layers, link) {
+		if (ls->scene == NULL || ls->layer_surface == NULL ||
+				ls->layer_surface->surface == NULL ||
+				!ls->layer_surface->surface->mapped) {
+			continue;
+		}
+		/* 抓底衬的时候 fx.c 会临时把某些 surface 的节点关掉（它要的底衬不能
+		 * 含它自己），记在 capture_hidden 上 —— 那一笔不是我们的，别抢。 */
+		if (ls->capture_hidden) {
+			continue;
+		}
+		bool want;
+		switch (ls->overview_mode) {
+		case VIDOW_OVERVIEW_ONLY:
+			want = on;
+			break;
+		case VIDOW_OVERVIEW_HIDE:
+			want = !on;
+			break;
+		default:
+			/* 规则没写（或者刚从 only / hide 改回来）：恢复默认的「开着」。
+			 * top / overlay 层在全景里由上面那几刀整棵树关掉，逐 surface
+			 * 点亮它也不起作用 —— 所以这里一律 true 是安全的。 */
+			want = true;
+			break;
+		}
+		if (ls->scene->tree->node.enabled == want) {
+			continue;
+		}
+		wlr_scene_node_set_enabled(&ls->scene->tree->node, want);
+		changed = true;
+	}
+	return changed;
+}
+
+/* 规则改了就重算一遍（rule.c 的 apply_layer 调）。 */
+void vidow_overview_refresh_layers(struct vidow_server *server) {
+	/* 开关变了要重抓底衬：全景里看到的那张壁纸是**底衬**（模糊那份画在遮罩
+	 * 下面），不重抓就还是上一张 —— 全景里另一张壁纸只在「开全景的那一刻」
+	 * 换过来，抓的正是这一笔。 */
+	if (overview_layers_apply(server)) {
+		vidow_backdrop_damage(server, true);
+	}
+}
+
 /* 算好这一帧的 scale / cam / 输出矩形，并把所有窗口按它摆一遍。 */
 static void overview_apply(struct vidow_server *server) {
 	struct vidow_overview *ov = &server->overview;
@@ -155,12 +217,15 @@ static void overview_apply(struct vidow_server *server) {
 		}
 	}
 
+	/* 上面那几刀是整棵树一起开关；图层规则可以逐个 surface 覆盖它 */
+	bool layers_changed = overview_layers_apply(server);
+
 	/* 所有窗口重新摆一遍：变换在 vidow_view_apply_anim 里生效 */
 	struct vidow_view *view;
 	wl_list_for_each(view, &server->views, link) {
 		vidow_view_apply_anim(view);
 	}
-	vidow_backdrop_damage(server, false);
+	vidow_backdrop_damage(server, layers_changed);
 }
 
 /* ------------------------------------------------------------- 进出 */
