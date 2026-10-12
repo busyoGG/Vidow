@@ -140,13 +140,9 @@ void vidow_xwayland_grab_assert(struct vidow_server *server) {
 	if (server->keyboard_layer != NULL) {
 		return;
 	}
-	struct wlr_keyboard *kb = wlr_seat_get_keyboard(seat);
-	if (kb != NULL) {
-		wlr_seat_keyboard_notify_enter(seat, g->surface, kb->keycodes,
-			kb->num_keycodes, &kb->modifiers);
-	} else {
-		wlr_seat_keyboard_notify_enter(seat, g->surface, NULL, 0, NULL);
-	}
+	/* g->surface 理论上还在（表面死了会自己从名单上摘掉），但这个壳兜底：
+	 * 真要是 NULL，wlroots 那边是 assert，宁可清焦点也不能把合成器 abort 掉。 */
+	vidow_seat_focus_surface(seat, g->surface);
 }
 
 /* grab 结束了（客户端销毁对象 / 连接断了 / 抓着键盘的表面死了）：把焦点还给

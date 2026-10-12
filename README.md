@@ -5048,6 +5048,30 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
         底衬是**半透明混合**的（量到 (107,66,38)，金色和洋红混在一起）。验证 / 截图时加
         `--transition-type none`。
 
+227. **窗口还没有表面时给焦点 → 合成器 abort**（用户：「启动 proton 游戏会导致 vidow 崩溃」）
+
+     - 现场：`coredumpctl` 里 22:08 那个 SIGABRT（7.1M），栈是
+       `server_cursor_axis → vidow_pointer_axis → vidow_keybind_wheel → vidow_action_run
+       → vidow_focus_column → vidow_focus_view`，最后一句是
+       `vidow: types/seat/wlr_seat_keyboard.c:309: wlr_seat_keyboard_notify_enter:
+       Assertion 'surface' failed.` —— 滚一下滚轮（`Mod+滚轮` = focus-column）换焦点时，
+       目标窗口的 `vidow_view_surface()` 是 NULL，wlroots 那个函数第一行就是
+       `assert(surface)`，于是 abort。
+     - 为什么是 wine / Proton：X11 的窗口先建出来、也能拿到焦点，但表面还没到（或者
+       刚销毁）—— 日志里那一段就是 `HSR (wine) 的日志` 那个窗口 `float mode 0 -> 1 -> 0`
+       来回跳、`clip: … 不裁（屏框 0,0 0x0）`，全是这半秒钟的过渡态。
+     - 修法：加 `vidow_seat_focus_surface(seat, surface)`（`src/input.c`），**所有**
+       给窗口键盘焦点的地方都从这里走；surface 是 NULL 就
+       `wlr_seat_keyboard_notify_clear_focus()`（语义就是「这会儿没人该拿键盘」），
+       不往 wlroots 那个 assert 里送。顺带把 `vidow_xwayland_grab_assert` 也换成它。
+     - 验证（临时故障注入，测完删掉）：让 `vidow_focus_view` 对某一个窗口假装
+       「表面还没到」，然后滚轮换焦点 —— 旧代码复现出一模一样的
+       `Assertion 'surface' failed`（把合成器打死），新代码活下来、焦点正常落在
+       那个窗口上、日志里 0 条 assertion。注入代码没留下。
+     - 另一件事：21:13 那个 SIGSEGV 不是这条 —— 栈是
+       `cmd_clipboard_history_get → jget_bool`，是当时那个还没修的剪贴板 IPC bug
+       （`jget_bool` 第三个参数传了 `false` 当出参），已经在本轮 225 里修掉了。
+
 226. **滚轮 + 修饰键那三组绑定**（用户：「还需要 alt + 滚轮切换工作区 alt+shift+滚轮切换窗口工作区
      ctrl+alt+滚轮交换窗口位置」）
 

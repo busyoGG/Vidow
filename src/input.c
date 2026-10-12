@@ -1219,6 +1219,33 @@ bool vidow_inject_pointer_button(struct vidow_server *server, const char *name,
 	return true;
 }
 
+/* 键盘焦点按到某个表面上（所有 notify_enter 都从这里走）。
+ *
+ * 为什么要这个壳：wlr_seat_keyboard_notify_enter 里第一行就是 assert(surface)，
+ * 传 NULL 不是「不给焦点」而是直接把合成器 abort —— 实测崩在这儿的场景是 wine /
+ * Proton 的游戏起来时：X11 的窗口已经建出来、也拿到了焦点，但表面还没到（或者
+ * 刚销毁），这时候滚一下滚轮（Mod+滚轮 = focus-column）就 abort 了。NULL 的语义
+ * 就是「没人该拿键盘」，所以清掉焦点。 */
+void vidow_seat_focus_surface(struct wlr_seat *seat,
+		struct wlr_surface *surface) {
+	if (seat == NULL) {
+		return;
+	}
+	if (surface == NULL) {
+		wlr_log(WLR_DEBUG, "键盘焦点: 目标窗口还没有表面（NULL），先清掉焦点"
+			"（等它真有表面了会再进来一次）");
+		wlr_seat_keyboard_notify_clear_focus(seat);
+		return;
+	}
+	struct wlr_keyboard *kb = wlr_seat_get_keyboard(seat);
+	if (kb != NULL) {
+		wlr_seat_keyboard_notify_enter(seat, surface, kb->keycodes,
+			kb->num_keycodes, &kb->modifiers);
+	} else {
+		wlr_seat_keyboard_notify_enter(seat, surface, NULL, 0, NULL);
+	}
+}
+
 bool vidow_inject_pointer_scroll(struct vidow_server *server, double dx,
 		double dy, bool discrete, char *err, size_t errlen) {
 	if (!vidow_inject_allowed(server, err, errlen)) {

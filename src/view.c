@@ -2734,13 +2734,9 @@ void vidow_focus_view(struct vidow_view *view) {
 			/* An exclusive layer surface owns the keyboard: activate the
 			 * view, but do not steal focus. */
 		} else {
-			struct wlr_keyboard *kb = wlr_seat_get_keyboard(seat);
-			if (kb != NULL) {
-				wlr_seat_keyboard_notify_enter(seat, surface, kb->keycodes,
-					kb->num_keycodes, &kb->modifiers);
-			} else {
-				wlr_seat_keyboard_notify_enter(seat, surface, NULL, 0, NULL);
-			}
+			/* surface 可能是 NULL（wine / Proton 的游戏起来时：窗口先到、
+			 * 表面还没到）。vidow_seat_focus_surface 会清焦点而不是 abort。 */
+			vidow_seat_focus_surface(seat, surface);
 		}
 	}
 

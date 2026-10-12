@@ -1937,6 +1937,13 @@ void vidow_im_modifiers(struct vidow_server *server, struct wlr_keyboard *kb);
 /* 键盘焦点变了：把 text-input 的 enter/leave 转给客户端。 */
 void vidow_im_focus(struct vidow_server *server, struct wlr_surface *surface);
 
+/* 把键盘焦点按到某个表面上。**surface 可能是 NULL**（Xwayland 的窗口刚建出来 /
+ * 表面刚销毁但窗口还在 —— wine 那些游戏起来时会来回好几趟），所以统一从这里走：
+ * wlroots 的 wlr_seat_keyboard_notify_enter 里是 assert(surface)，传 NULL 就是
+ * 把合成器 abort 掉。NULL 时改成「清掉键盘焦点」。 */
+void vidow_seat_focus_surface(struct wlr_seat *seat,
+		struct wlr_surface *surface);
+
 /* ---------------------------------------------------------------- config */
 
 /* 配置文件只有一个，而且是 Lua（见 script.c）：~/.config/vidow/config.lua。
