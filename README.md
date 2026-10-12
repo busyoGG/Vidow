@@ -1657,8 +1657,8 @@ debounce 才落到时间戳上；往那个窗口打字算明确使用，debounce
 | `mru_max_height` | `480` | 预览高度上限（大屏上别让一个窗口占满屏） |
 | `mru_min_scale` | `0.05` | 再挤也不能比它更小 |
 | `mru_backdrop_alpha` | `0.8` | 后面那层压暗的浓度 |
-| `mru_card_padding` | `8` | 每项背后那张卡片比预览大多少（逻辑像素） |
-| `mru_card_radius` | `16` | 卡片的圆角半径（超椭圆，和 portal 的选择器同一种圆角） |
+| `mru_card_padding` | `8` | 每项背后那张卡片比预览大多少（逻辑像素）；比半径小时按半径算 |
+| `mru_card_radius` | `12` | 卡片的圆角半径（超椭圆，和 portal 的选择器同一种圆角） |
 | `mru_card_color` | `#2f3336e6` | 卡片底色 |
 | `mru_card_border` / `_color` | `1` / `#3b4045ff` | 卡片描边宽度与颜色 |
 | `mru_highlight_border` / `_color` | `2` / `#3daee9ff` | 选中那张卡片的描边宽度与强调色 |
@@ -1678,6 +1678,15 @@ debounce 才落到时间戳上；往那个窗口打字算明确使用，debounce
 **按覆盖率算出来的小图**（4×4 超采样抗锯齿），中间三条直边用普通矩形铺 —— 九宫格那套。四个角
 共用同一张图，靠 transform 翻过去用。像素走自实现的最小 `wlr_buffer`（`begin_data_ptr_access`），
 GLES2 / pixman 两条渲染器都吃，不用 GL 上下文。
+
+两个坑（都踩过）：
+
+- **内边距至少给到半径**：预览是个方块，圆弧伸进预览那块区域就会被窗口盖住 —— 看着就是
+  「缺角」。所以实际内边距 = `max(card_padding, card_radius)`，半径 r 时圆弧正好贴着预览的角。
+- **别拿 `node->buffer` 判「有没有图」**：wlroots 上传完纹理就把 buffer unlock 掉，锁归零 →
+  发 `events.release` → 场景把 `scene_buffer->buffer` 清成 NULL（**纹理还在，照样能画**）。
+  拿它当判据的话，面板一开要刷好几次，第二次刷新就把角节点关掉、圆角就没了。判据得是卡片
+  自己记的 `fill_buf` / `ring_buf`。
 
 ### 鼠标
 
@@ -4634,6 +4643,23 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
       - 判据：`test-fullscreen-scroll.sh` 新增 9 条（非全屏的 look 有边框 2 / 圆角 12 / 阴影 8，
         全屏之后都是 0；左上角那一点是全屏窗口自己的内容而不是圆角外面的背景；浮动的全屏
         geometry = 0,0 1280x720、退出全屏回到原来的浮动尺寸）；47 项全过。
+
+214. **修掉切换器卡片的「缺角」**（用户：「1.圆角缺角了」）
+
+      - **症状**：卡片四角那段圆弧没画出来（四条直边还在），看着就是圆角被啃掉一块。
+      - **原因一：角节点被误关掉**。wlroots 上传完纹理就把 `wlr_buffer` unlock 掉，锁归零 →
+        发 `events.release` → `scene_buffer_handle_buffer_release` 把 `scene_buffer->buffer`
+        清成 NULL（**纹理还留着，照样能画**）。而 `mru_buf_put()` 原来拿 `node->buffer == NULL`
+        当「没图」的判据 —— 面板一开要刷好几次，第二次刷新就把角节点关掉了。改成拿卡片自己记的
+        `card->fill_buf / ring_buf` 当判据（有没有图是卡片说了算，不是节点说了算）。
+      - **原因二：半径比内边距大**。预览是个方块，圆弧一旦伸进预览那块区域就被窗口盖住。现在
+        实际内边距 = `max(mru_card_padding, mru_card_radius)`（`mru_card_pad()`），半径 r 时圆弧
+        正好贴着预览的角。默认半径从 16 收到 12（和窗口自己的 `corner_radius` 同值），内边距
+        默认还是 8 → 实际内边距 12。
+      - **测试**：`test-mru.sh` 补了 3 条**量像素**的断言（46 → 49）：圆角那段弧所在的
+        `(cx, cy+6)`（直边矩形从 `cy+12` 才开始，所以这一点只有角节点能画）必须是描边色；
+        角尖 `(cx, cy)` 必须是空的（既不是描边也不是底）。之前那 46 条只量了直边，这个 bug
+        才溜过去。
 
 213. **切换器的每一项改成 portal 那种卡片，并且能用鼠标点**（用户：「mru样式也调整一下，也改的像
       portal的item类似，且需要支持鼠标点击功能」）

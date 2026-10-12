@@ -316,10 +316,12 @@ static const struct entry entries[] = {
 		"切换器后面那层压暗的浓度（0 = 不压暗）" },
 	{ "mru_card_padding", K_INT, OFF(mru_card_padding),
 		SZ(mru_card_padding), 14,
-		"每一项背后那张卡片比预览大多少（逻辑像素）：预览到卡片边缘那圈" },
+		"每一项背后那张卡片比预览大多少（逻辑像素）：预览到卡片边缘那圈。比 "
+		"mru_card_radius 小时按半径算（不然窗口会把圆角盖掉）" },
 	{ "mru_card_radius", K_INT, OFF(mru_card_radius),
 		SZ(mru_card_radius), 14,
-		"卡片的圆角半径（逻辑像素，超椭圆 —— 和 portal 的选择器同一种圆角）" },
+		"卡片的圆角半径（逻辑像素，超椭圆 —— 和 portal 的选择器同一种圆角）。"
+		"半径会把内边距顶到至少这么大，圆弧才不会被窗口盖住" },
 	{ "mru_card_color", K_COLOR, OFF(mru_card_color),
 		SZ(mru_card_color), 14,
 		"卡片的底色（RRGGBB 或 RRGGBBAA）" },
@@ -780,7 +782,7 @@ static void defaults(struct vidow_config *cfg) {
 	 * 描边 #3b4045；强调色默认取 KDE Breeze 蓝 #3daee9 —— 和 portal 用同一个
 	 * 强调色（portal 那边读 kdeglobals，这里没法读，就按默认值来）。 */
 	cfg->mru_card_padding = 8;
-	cfg->mru_card_radius = 16;
+	cfg->mru_card_radius = 12;   /* 和窗口自己的 corner_radius 同值 */
 	cfg->mru_card_color[0] = 0x2f / 255.0f;
 	cfg->mru_card_color[1] = 0x33 / 255.0f;
 	cfg->mru_card_color[2] = 0x36 / 255.0f;

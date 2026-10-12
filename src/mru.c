@@ -262,6 +262,14 @@ static double mru_slot_zoom(const struct vidow_config *cfg, int base_w,
 	return zoom;
 }
 
+/* 卡片的内边距：预览是方的，圆角一旦超出内边距，窗口就会把圆弧盖掉（看着就是
+ * 「缺角」），所以内边距至少给到半径那么大 —— 半径 r 时圆弧正好贴着预览的角。 */
+static int mru_card_pad(const struct vidow_config *cfg) {
+	int pad = cfg->mru_card_padding < 0 ? 0 : cfg->mru_card_padding;
+	int r = cfg->mru_card_radius < 0 ? 0 : cfg->mru_card_radius;
+	return r > pad ? r : pad;
+}
+
 /* 把一张卡片摆在 (x, y)（卡片尺寸 cw×ch）：卡片记在 cx/cy/cw/ch（鼠标命中按它
  * 算），预览缩进内边距摆在卡片里。 */
 static void mru_slot_place(struct vidow_mru_slot *slot, int x, int y, int cw,
@@ -294,7 +302,7 @@ static void mru_layout(struct vidow_server *server) {
 	/* 每一项背后那张卡片比预览大一圈（内边距 pad）。排版按**卡片**算：居中、
 	 * 「装不下就整体缩」、相邻之间隔多少，量的都是卡片的边；预览摆在卡片里缩进
 	 * pad。下面这一段里的 w / h 都是卡片尺寸。 */
-	int pad = cfg->mru_card_padding < 0 ? 0 : cfg->mru_card_padding;
+	int pad = mru_card_pad(cfg);
 
 	/* 先把每个预览的尺寸算出来（先按最大缩放，grid 装不下时再统一缩）。 */
 	int n = mru->n;
@@ -776,13 +784,18 @@ static void mru_rect_put(struct wlr_scene_rect *rc, int x, int y, int w, int h) 
 	wlr_scene_node_set_enabled(&rc->node, true);
 }
 
-/* 摆一个圆角节点（没图或尺寸非正 = 不画）。 */
-static void mru_buf_put(struct wlr_scene_buffer *node, int x, int y, int w,
-		int h) {
+/* 摆一个圆角节点（has_img = 这张卡片画过角图；尺寸非正或没图 = 不画）。
+ *
+ * 判据必须是「卡片自己有没有图」，不能看 node->buffer：wlroots 上传完纹理就把
+ * buffer unlock 掉，锁归零 → 发 release → 场景把 node->buffer 清成 NULL（纹理还
+ * 留着，照样能画）。要是拿 node->buffer 当判据，第二次刷新就会把角节点关掉，
+ * 圆角就「缺角」了。 */
+static void mru_buf_put(struct wlr_scene_buffer *node, bool has_img, int x,
+		int y, int w, int h) {
 	if (node == NULL) {
 		return;
 	}
-	if (w <= 0 || h <= 0 || node->buffer == NULL) {
+	if (w <= 0 || h <= 0 || !has_img) {
 		wlr_scene_node_set_enabled(&node->node, false);
 		return;
 	}
@@ -847,10 +860,11 @@ static void mru_card_place(struct vidow_server *server,
 	int cxs[4] = { x, x + w - r, x, x + w - r };
 	int cys[4] = { y, y, y + h - r, y + h - r };
 	for (int k = 0; k < 4; k++) {
-		mru_buf_put(card->fill_c[k], cxs[k], cys[k], round ? r : 0,
-			round ? r : 0);
-		mru_buf_put(card->ring_c[k], cxs[k], cys[k],
-			round && bwp > 0 ? r : 0, round && bwp > 0 ? r : 0);
+		mru_buf_put(card->fill_c[k], card->fill_buf != NULL, cxs[k],
+			cys[k], round ? r : 0, round ? r : 0);
+		mru_buf_put(card->ring_c[k], card->ring_buf != NULL, cxs[k],
+			cys[k], round && bwp > 0 ? r : 0,
+			round && bwp > 0 ? r : 0);
 	}
 	/* 描边：直边四条（圆角那四段由角节点补）。 */
 	float ring_pm[4] = { ring[0] * ring[3], ring[1] * ring[3],
