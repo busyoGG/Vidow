@@ -94,10 +94,10 @@ const struct vidow_rule_field vidow_rule_fields[] = {
 		"马赛克的块边长（屏幕像素，默认 16，最小 2）；只在 capture = "
 		"\"mosaic\" 时有用，单独写不算一个作用" },
 	{ "overview", RK_ACT_OVERVIEW, VRA_OVERVIEW, VIDOW_RULE_LAYER,
-		"进全景的时候怎么露面：\"only\"（只在全景里显示）/ \"hide\"（全景里"
-		"收起来）；不写就照常。全景用另一张壁纸靠它 —— 跑第二个壁纸客户端"
-		"（比如 awww-daemon -n ov，namespace 就成了 awww-daemonov）再按 "
-		"namespace 匹配" },
+		"进全景的时候露不露：\"always\"（默认，照常）/ \"only\"（只在全景里"
+		"显示）/ \"never\"（全景里不出现）。全景用另一张壁纸靠它 —— 跑第二个"
+		"壁纸客户端（比如 awww-daemon -n ov，namespace 就成了 awww-daemonov）"
+		"再按 namespace 匹配，写 \"only\"" },
 	/* 开窗时兑现一次的 */
 	{ "float", RK_ACT_BOOL, VRA_FLOAT, VIDOW_RULE_WINDOW,
 		"true = 强制浮动（对话框那类本来就会浮的不用写），false = 强制平铺" },
@@ -384,14 +384,14 @@ bool vidow_rule_set_overview(struct vidow_rule *rule, int slot,
 		return false;
 	}
 	int mode;
-	if (value == NULL || value[0] == '\0' || strcmp(value, "off") == 0) {
-		mode = VIDOW_OVERVIEW_OFF;
+	if (value == NULL || value[0] == '\0' || strcmp(value, "always") == 0) {
+		mode = VIDOW_OVERVIEW_ALWAYS;
 	} else if (strcmp(value, "only") == 0) {
 		mode = VIDOW_OVERVIEW_ONLY;
-	} else if (strcmp(value, "hide") == 0) {
-		mode = VIDOW_OVERVIEW_HIDE;
+	} else if (strcmp(value, "never") == 0) {
+		mode = VIDOW_OVERVIEW_NEVER;
 	} else {
-		snprintf(err, errlen, "只能是 \"off\"、\"only\" 或 \"hide\"，"
+		snprintf(err, errlen, "只能是 \"always\"、\"only\" 或 \"never\"，"
 			"给的是 \"%s\"", value);
 		return false;
 	}
@@ -614,8 +614,8 @@ static void log_rule(const struct vidow_rule *rule) {
 		case RK_ACT_OVERVIEW:
 			snprintf(value, sizeof(value), "%s",
 				rule->aval[f->slot].i == VIDOW_OVERVIEW_ONLY ? "only" :
-				rule->aval[f->slot].i == VIDOW_OVERVIEW_HIDE ? "hide" :
-				"off");
+				rule->aval[f->slot].i == VIDOW_OVERVIEW_NEVER ? "never" :
+				"always");
 			break;
 		default:
 			snprintf(value, sizeof(value), "?");
@@ -1123,10 +1123,10 @@ static void apply_layer(struct vidow_server *server,
 	}
 	ls->capture_mosaic = capture_mosaic;
 
-	/* 全景里怎么露面（overview = "only" / "hide"）：开关是在 overview.c 的
+	/* 全景里露不露（overview = "only" / "never"）：开关是在 overview.c 的
 	 * overview_layers_apply 里落的，规则一改就得让新的立刻生效 —— 不然要等到
 	 * 下次开关全景才看见。全景没开的时候也只动这一件事，很便宜。 */
-	int overview = VIDOW_OVERVIEW_OFF;
+	int overview = VIDOW_OVERVIEW_ALWAYS;
 	if (eff->set[VRA_OVERVIEW]) {
 		overview = (int)eff->val[VRA_OVERVIEW].i;
 	}
@@ -1134,7 +1134,7 @@ static void apply_layer(struct vidow_server *server,
 		ls->overview_mode = overview;
 		wlr_log(WLR_INFO, "rule: layer %s 全景里 = %s", ns,
 			overview == VIDOW_OVERVIEW_ONLY ? "只在全景里显示" :
-			overview == VIDOW_OVERVIEW_HIDE ? "收起来" : "照常");
+			overview == VIDOW_OVERVIEW_NEVER ? "不出现" : "照常");
 	}
 	vidow_overview_refresh_layers(server);
 

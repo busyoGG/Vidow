@@ -142,13 +142,15 @@ end
 --                                "hide"（不出现）/ "mosaic"（打马赛克）
 --     capture_mosaic = 24        马赛克的块边长（屏幕像素，默认 16，最小 2）；只在
 --                                capture = "mosaic" 时有用，单独写不算一个作用
---     overview = "only"          进全景（Mod+O）的时候露不露："off"（默认，照常）/
---                                "only"（只在全景里显示）/ "hide"（全景里收起来）。
---                                只对图层有意义。**全景里换一张壁纸就靠它**：起第二个
---                                壁纸客户端（比如 awww-daemon -n ov，它的 layer
---                                namespace 是 awww-daemonov），再按 namespace 匹配
---                                （见下面 examples 里那条）。桌面上它连画都不画，所以
---                                也不会进窗口的模糊底衬；全景里看到的是底衬那一份。
+--     overview = "only"          进全景（Mod+O）的时候露不露："always"（默认，照常）/
+--                                "only"（只在全景里显示）/ "never"（全景里不出现）。
+--                                只对图层有意义（top / overlay 层写 always / only 也开不
+--                                回来：那两棵在全景里是整棵关掉的）。**全景里换一张
+--                                壁纸就靠它**：起第二个壁纸客户端（比如 awww-daemon
+--                                -n ov，它的 layer namespace 是 awww-daemonov），再按
+--                                namespace 匹配写 "only"（见下面 examples 里那条）。
+--                                桌面上它连画都不画，所以也不会进窗口的模糊底衬；全景
+--                                里看到的是底衬那一份。
 --     anim = false               不做开合动画（窗口 / 图层都是：开、关都瞬间到位）
 --     open_ms = 500              开启动画时长（毫秒；覆盖全局 window_open_ms /
 --                                layer_open_ms，0 = 不做这个动画）

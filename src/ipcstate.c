@@ -682,7 +682,7 @@ void vidow_ipc_json_layer(struct jbuf *b, struct vidow_server *server,
 	/* 图层规则给的「全景里露不露」（见 rule.c 的 overview）。only 的那种现在
 	 * 多半是关着的 —— 它只在全景里出现，别拿它当「桌面上的壁纸」。 */
 	jb_kv_str(b, "overview", ls->overview_mode == VIDOW_OVERVIEW_ONLY ? "only" :
-		ls->overview_mode == VIDOW_OVERVIEW_HIDE ? "hide" : "off");
+		ls->overview_mode == VIDOW_OVERVIEW_NEVER ? "never" : "always");
 	jb_kv_bool(b, "shown", ls->scene != NULL && ls->scene->tree->node.enabled);
 	/* 规则算出来的开合动画与不透明度：这块面板现在「该」怎么样看这里，
 	 * 不用去量像素（alpha 是动画那一刻的值，动画停了恒为 1）。 */
@@ -966,8 +966,8 @@ void vidow_ipc_json_rules(struct jbuf *b, struct vidow_server *server) {
 			case RK_ACT_OVERVIEW:
 				jb_str(b, rule->aval[f->slot].i == VIDOW_OVERVIEW_ONLY ?
 					"only" :
-					rule->aval[f->slot].i == VIDOW_OVERVIEW_HIDE ?
-					"hide" : "off");
+					rule->aval[f->slot].i == VIDOW_OVERVIEW_NEVER ?
+					"never" : "always");
 				break;
 			default:
 				jb_null(b);

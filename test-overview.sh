@@ -268,17 +268,22 @@ grim "$RUNDIR/ovbg-overview.png"
 wtype -k Escape >/dev/null 2>&1
 sleep 1.1
 grim "$RUNDIR/ovbg-back.png"
-# 热改规则：only -> off，那块就变成普通壁纸（盖住桌面）
-sed -i 's/overview = "only"/overview = "off"/' \
+# 热改规则：only -> always，那块就变成普通壁纸（盖住桌面）
+sed -i 's/overview = "only"/overview = "always"/' \
 	"$CFGDIR/.config/vidow/config.lua"
 ./build/vidowmsg reload-config >/dev/null 2>&1
 sleep 1.4
-grim "$RUNDIR/ovbg-off.png"
-sed -i 's/overview = "off"/overview = "only"/' \
+grim "$RUNDIR/ovbg-always.png"
+sed -i 's/overview = "always"/overview = "only"/' \
 	"$CFGDIR/.config/vidow/config.lua"
 ./build/vidowmsg reload-config >/dev/null 2>&1
 sleep 1.4
 grim "$RUNDIR/ovbg-only2.png"
+# 取值写错要当场报错，而且报出三个能写的名字（老名字 off / hide 也得被拒）
+printf 'vidow.rule{ namespace = "^wall2$", overview = "hide" }\n' \
+	>> "$CFGDIR/.config/vidow/config.lua"
+./build/vidowmsg reload-config > "$RUNDIR/ovbg-bad.txt" 2>&1
+sleep 0.6
 cp "$LOG" "$RUNDIR/log-ovbg.txt"
 stop_clients
 kill -TERM -- "-$VIDOW_PGID" 2>/dev/null
@@ -639,11 +644,11 @@ check(frac(back, is_magenta) == 0 and frac(back, is_gold) > 5,
       "退出全景之后又收起来了（洋红 0%%，金色 %.0f%%）" % frac(back, is_gold))
 
 # 热改规则：规则得当场生效，不能等下次开关全景
-off = image("ovbg-off")
-off_pct = frac(off, is_magenta)
-check(off_pct > 50,
-      "规则热改成 \"off\" 之后它当场变成普通壁纸，盖住桌面（洋红 %.0f%%）"
-      % off_pct)
+always = image("ovbg-always")
+always_pct = frac(always, is_magenta)
+check(always_pct > 50,
+      "规则热改成 \"always\" 之后它当场变成普通壁纸，盖住桌面（洋红 %.0f%%）"
+      % always_pct)
 only2 = image("ovbg-only2")
 check(frac(only2, is_magenta) == 0,
       "再改回 \"only\" 也当场生效（洋红 %.0f%%）" % frac(only2, is_magenta))
@@ -675,6 +680,10 @@ ovbg_log = open("%s/log-ovbg.txt" % rundir, encoding="utf-8",
                 errors="replace").read()
 check("全景里 = 只在全景里显示" in ovbg_log and "全景里 = 照常" in ovbg_log,
       "规则生效有日志（rule: layer wall2 全景里 = …）")
+bad = open("%s/ovbg-bad.txt" % rundir, encoding="utf-8",
+           errors="replace").read() + ovbg_log
+check('\"always\"、\"only\" 或 \"never\"' in bad,
+      "取值写错当场报错，并报出三个能写的名字（老名字 off / hide 也拒）")
 check("Assertion" not in ovbg_log and "abort" not in ovbg_log.lower(),
       "这一段日志里没有 assert / abort")
 

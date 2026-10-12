@@ -1132,7 +1132,7 @@ struct vidow_layer_surface {
 	 * 和上面那个 capture_hidden 不是一回事 —— 那个是模糊底衬的临时藏法。 */
 	int capture_mode;   /* enum vidow_capture_mode */
 	int capture_mosaic; /* 马赛克块边长（屏幕像素） */
-	/* 进全景的时候露不露（规则 overview = "only" / "hide"，见 rule.h 的
+	/* 进全景的时候露不露（规则 overview = "only" / "never"，见 rule.h 的
 	 * enum vidow_overview_mode）：只在 overview.c 里用，是它盖在
 	 * 「整棵树一起开 / 关」上面的一层逐 surface 覆盖。 */
 	int overview_mode;

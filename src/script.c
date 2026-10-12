@@ -1025,8 +1025,8 @@ static int l_rule(lua_State *L) {
 				lua_tostring(L, -1) : NULL;
 			if (text == NULL) {
 				ok = false;
-				snprintf(err, sizeof(err), "要 \"off\" / \"only\" / "
-					"\"hide\"");
+				snprintf(err, sizeof(err), "要 \"always\" / \"only\" / "
+					"\"never\"");
 			} else {
 				ok = vidow_rule_set_overview(rule, field->slot, text, err,
 					sizeof(err));
@@ -1108,8 +1108,8 @@ static void push_rule_field(lua_State *L, const struct vidow_rule *rule,
 		break;
 	case RK_ACT_OVERVIEW:
 		lua_pushstring(L, rule->aval[field->slot].i == VIDOW_OVERVIEW_ONLY ?
-			"only" : rule->aval[field->slot].i == VIDOW_OVERVIEW_HIDE ?
-			"hide" : "off");
+			"only" : rule->aval[field->slot].i == VIDOW_OVERVIEW_NEVER ?
+			"never" : "always");
 		break;
 	default:
 		lua_pushnil(L);

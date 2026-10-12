@@ -41,17 +41,20 @@ enum vidow_capture_mode {
 	VIDOW_CAPTURE_MOSAIC,
 };
 
-/* 图层规则 overview：这个 layer surface 进全景的时候怎么办。
- *   OFF  照常（默认：background / bottom 层跟着进全景，top / overlay 层收起）
- *   ONLY 只在全景里露出来（桌面时收起来）—— 全景专用壁纸走这条
- *   HIDE 全景里收起来
+/* 图层规则 overview：这个 layer surface 进全景的时候露不露。
+ *   ALWAYS 照常（默认：background / bottom 层跟着进全景，top / overlay 层收起）
+ *   ONLY   只在全景里露出来（桌面时收起来）—— 全景专用壁纸走这条
+ *   NEVER  全景里不出现
+ * 名字读作「全景里：总是 / 只有它 / 从不」。ALWAYS 对 top / overlay 层没有意义 ——
+ * 那两棵在全景里是整棵关掉的，逐 surface 点亮也开不回来（要开得先改 overview.c
+ * 那几刀）。
  * niri 的 place-within-backdrop 是同一个需求的另一种说法：那边有工作区带，
  * 「放进 backdrop」和「只在全景里露」是两件事；vidow 只有一条带、壁纸本来
  * 就不跟着缩放，所以只需要「什么时候露」这一个开关。 */
 enum vidow_overview_mode {
-	VIDOW_OVERVIEW_OFF = 0,
+	VIDOW_OVERVIEW_ALWAYS = 0,
 	VIDOW_OVERVIEW_ONLY,
-	VIDOW_OVERVIEW_HIDE,
+	VIDOW_OVERVIEW_NEVER,
 };
 
 /* 马赛克块边长（屏幕像素）的默认值：16px 的块在 1080p 上大概 120 格宽，

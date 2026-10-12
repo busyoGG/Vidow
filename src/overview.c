@@ -74,16 +74,16 @@ bool vidow_overview_active(const struct vidow_server *server) {
 /* 图层规则的 overview：盖在 overview_apply 里那几刀「整棵树一起开关」上面，
  * 逐个 surface 决定它在全景里露不露。
  *
- *   only —— 只在全景里露出来（桌面时收起来）。**全景专用壁纸走这条**：跑第二个
+ *   only  —— 只在全景里露出来（桌面时收起来）。**全景专用壁纸走这条**：跑第二个
  *           壁纸客户端（awww-daemon -n ov → namespace "awww-daemonov"），再
  *           vidow.rule{ namespace=…, overview="only" }。
  *           桌面时它的场景节点是关的，所以既不会盖住桌面壁纸，也不会进窗口的
  *           模糊底衬（底衬抓的就是这几棵树）。
- *   hide —— 全景里收起来（比如全景里不想看见壁纸，只剩兜底色）。
+ *   never —— 全景里不出现（比如全景里不想看见壁纸，只剩兜底色）。
  *
- * 默认（没写规则）保持 overview_apply 那套：background / bottom 层跟着进全景，
- * top / overlay 层收起。对 top / overlay 层写 only 没有意义 —— 那两棵树在全景
- * 里是整棵关掉的，逐 surface 开不回来（要开得先改那几刀）。 */
+ * 默认 always（没写规则）保持 overview_apply 那套：background / bottom 层跟着进
+ * 全景，top / overlay 层收起。对 top / overlay 层写 always / only 都没有意义 ——
+ * 那两棵树在全景里是整棵关掉的，逐 surface 开不回来（要开得先改那几刀）。 */
 static bool overview_layers_apply(struct vidow_server *server) {
 	bool on = server->overview.t > 0.002;
 	bool changed = false;
@@ -104,13 +104,13 @@ static bool overview_layers_apply(struct vidow_server *server) {
 		case VIDOW_OVERVIEW_ONLY:
 			want = on;
 			break;
-		case VIDOW_OVERVIEW_HIDE:
+		case VIDOW_OVERVIEW_NEVER:
 			want = !on;
 			break;
 		default:
-			/* 规则没写（或者刚从 only / hide 改回来）：恢复默认的「开着」。
-			 * top / overlay 层在全景里由上面那几刀整棵树关掉，逐 surface
-			 * 点亮它也不起作用 —— 所以这里一律 true 是安全的。 */
+			/* always：规则没写（或者刚从 only / never 改回来）—— 恢复默认的
+			 * 「开着」。top / overlay 层在全景里由上面那几刀整棵树关掉，
+			 * 逐 surface 点亮它也不起作用，所以这里一律 true 是安全的。 */
 			want = true;
 			break;
 		}

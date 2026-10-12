@@ -484,7 +484,7 @@ end
 | 作用（外观） | `decor`（`false` = 不画装饰）、`opacity`、`corner_radius`、`border_width`、`border_color`、`border_color_focus`、`shadow_radius`、`shadow_color`、`shadow_offset_x`、`shadow_offset_y`、`noise`、`blur`（`false` = 它背后不模糊，`true` = 平铺窗口也模糊）、`blur_xray`。没写的用全局配置；**全局开关（`decor_enabled` / `blur_enabled`）是总闸**，规则只能收窄不能突破。`vidowmsg windows` 的 `look` 那一块就是「这个窗口现在长什么样」—— 规则有没有生效看它，不用量像素 |
 | 作用（开窗时兑现一次） | `float`（`true` 强制浮动 / `false` 强制平铺）、`workspace`（具名工作区，没有就建 / `special:名字` / 序号）、`output`（开在哪块屏）、`width` / `height`（浮动窗口开多大）、`center`、`fullscreen`、`maximize`、`minimize`、`column_width`（这个窗口新开的列有多宽）。**重载规则不搬已经开着的窗口，也不改它们的尺寸** —— 「开出来什么样」和「现在什么样」是两回事 |
 | 覆盖顺序 | 按配置里的先后逐条套用，**后面的覆盖前面的**；一条规则只动它写了的字段，谁都没写的字段用默认值 |
-| 图层规则能用的作用 | `capture`、`capture_mosaic`、`overview`（进全景的时候露不露：`"off"` / `"only"`（只在全景里显示）/ `"hide"`（全景里收起来）—— **全景里换一张壁纸就靠它**，见「全景里换一张壁纸」那节）、`anim`、`open_ms`、`close_ms`、`opacity`（面板**自己的内容**多透 —— 底衬那份模糊不跟着淡，和窗口那边 `u_opacity` 只乘内容 + 边框是同一个语义）、`blur`。其余作用都是窗口专有，写进图层规则 = 这条规则谁也不匹配（当场看得出来，不会悄悄生效）。`vidowmsg layers` 的 `rule` 那一块是算出来的 `anim` / `open_ms` / `close_ms` / `opacity`，另有 `overview` / `shown` 两个字段报「全景里怎么露面」和「现在画没画」 |
+| 图层规则能用的作用 | `capture`、`capture_mosaic`、`overview`（进全景的时候露不露：`"always"`（默认，照常）/ `"only"`（只在全景里显示）/ `"never"`（全景里不出现）—— **全景里换一张壁纸就靠它**，见「全景里换一张壁纸」那节）、`anim`、`open_ms`、`close_ms`、`opacity`（面板**自己的内容**多透 —— 底衬那份模糊不跟着淡，和窗口那边 `u_opacity` 只乘内容 + 边框是同一个语义）、`blur`。其余作用都是窗口专有，写进图层规则 = 这条规则谁也不匹配（当场看得出来，不会悄悄生效）。`vidowmsg layers` 的 `rule` 那一块是算出来的 `anim` / `open_ms` / `close_ms` / `opacity`，另有 `overview` / `shown` 两个字段报「全景里怎么露面」和「现在画没画」 |
 | 生效时机 | 建窗口时判一次；标题 / class 变了再判一次；`SIGHUP` 重载规则后把已经开着的窗口全部重判 |
 | 节流 | `force_render_hz = <每秒几帧>`（默认 60，`0` = 不限速）；规则里写 `hz = <n>` 可以逐窗口覆盖。补帧要主动排下一帧，不限速时会一直出帧（headless 后端上量到过 2500fps），所以默认按刷新率给 |
 | X11 缩放桥 | `x11_scale = <n>`：这个 X11 窗口的缓冲区按 `n` 倍声明（逻辑尺寸 = 缓冲 / `n`）。`x11_scale = 1` = 「这个客户端没按 `GDK_SCALE` 画，别除」—— 微信登录窗那类固定尺寸、不认 env 的程序在 2 倍屏上就不会只剩 1/4 面积。见「X11 的 HiDPI」那节，回归判据 `test-x11scale.sh` |
@@ -1689,8 +1689,11 @@ vidow.rule{ namespace = "^awww-daemonov", overview = "only" }
 
 - `overview = "only"`：这块 surface **只在全景里**画。桌面上它的场景节点是关的 —— 既不挡
   桌面那张壁纸，**也不进窗口的模糊底衬**（共享底衬抓的就是这几棵树）。
-- `overview = "hide"`：反过来，进全景的时候收起来（比如全景里只想要兜底色）。
-- 不写 = 照常（跟以前一样，跟着进全景，被遮罩压暗 / `overview_blur` 糊掉）。
+- `overview = "never"`：反过来，进全景的时候不出现（比如全景里只想要兜底色）。
+- `overview = "always"`（默认，也可以不写）：照常，跟着进全景，被遮罩压暗 /
+  `overview_blur` 糊掉。
+- 名字读作「全景里：总是 / 只有它 / 从不」。`always` / `only` 对 top / overlay 层没用 ——
+  那两棵在全景里是整棵关掉的，逐 surface 点亮也开不回来。
 - 规则热改**当场生效**（`vidowmsg reload-config` / `SIGHUP`），不用等下次开关全景。
 - 全景里看到的是**共享底衬那一份**：`overview_blur` 开着时是糊过的 + 遮罩压暗到 43%。
   想让全景那张也清清楚楚，把 `overview_blur` 关掉（`configs/17-overview.lua`）。
@@ -1714,7 +1717,7 @@ vidow.rule{ namespace = "^awww-daemonov", overview = "only" }
 ### 测试
 
 ```bash
-./test-overview.sh   # 63 项：日志 + 像素
+./test-overview.sh   # 64 项：日志 + 像素
 ./test-background.sh # 19 项：桌面背景（兜底色 / 查询 / 事件）
 ```
 
@@ -1928,7 +1931,7 @@ vidow 自己的，比如 `vidow-wayland-1.sock`）；`ipc_socket` 可以写死�
 | `columns` | 每条列：`id`、`width_fraction`、`maximized`（是不是最大化的那条列，最大化时 `width_fraction` 顶到 1.0）、算出来的 `width` / `offset`、序号、里面的窗口 |
 | `workspaces` | 每块工作区：名字、`special`、`active` / `visible` / `shown`、住哪块屏 / 归属哪块屏、滚动位置、列与窗口、离开时的焦点窗口（**特殊工作区也在列表里**，`special = true`；Lua 的 `vidow.workspace_list()` 不给它） |
 | `outputs` | 每块屏：连接器名 / 描述 / make / model、`enabled`、`scale`、`transform`、刷新率、物理尺寸、布局矩形、`usable_area`、`viewport_x`、活动 / 显示着的工作区、它上面的工作区 / 窗口 / layer、**所有可用模式**、`adaptive_sync` / `vrr_supported`、`depth` / `render_format`、`primaries` / `transfer_functions` / `hdr_capable`（这块屏**自己报**的色彩能力，HDR 可行性就看它）、模糊贴图状态 |
-| `layers` | 每个 layer surface：`namespace`、`layer`、`output`、`mapped`、`exclusive_zone`、`keyboard_interactivity`、`anchor`、`margin`、想要 / 实际尺寸、几何、`capture` / `capture_mosaic`（抓帧遮挡规则）、`overview`（进全景怎么露面）+ `shown`（现在画没画）、`rule`（算出来的开合动画 / 不透明度） |
+| `layers` | 每个 layer surface：`namespace`、`layer`、`output`、`mapped`、`exclusive_zone`、`keyboard_interactivity`、`anchor`、`margin`、想要 / 实际尺寸、几何、`capture` / `capture_mosaic`（抓帧遮挡规则）、`overview`（进全景怎么露面：`always` / `only` / `never`）+ `shown`（现在画没画）、`rule`（算出来的开合动画 / 不透明度） |
 | `config` | **配置表的全部键值**（跟 `config.lua` 里 `vidow.get` 读到的是同一个东西）；`config` + `key` 只取一个 |
 | `keybinds` / `gestures` / `rules` | 键位表（触发串 + 动作串）、触控板手势表（触发串 + 动作串 + 手指数 + 哪种手势）、窗口规则（含「这一条到底写没写」的 null 语义） |
 | `seats` / `input` | seat 的能力列表、当前键盘的布局 / repeat / LED、所有键盘（含虚拟键盘和 vidow 自己的注入键盘 `vidow-inject`）、光标位置、当前的交互式 grab、指针约束（`pointer_constraint`：`type` / `lifetime` / `window` /
@@ -4817,7 +4820,8 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
 
 223. **全景里可以换一张壁纸（图层规则 `overview = "only"`，niri 的 `place-within-backdrop` 那件事）**
       （用户：「overview 的背景可以设置成不一样的吗 用 swww（好像改名了，但我忘了软件改成什么名字」
-      → 「不能用 layer 吗 我看 niri 有办法」）
+      → 「不能用 layer 吗 我看 niri 有办法」→ 「命名改的直观一点」，取值从 off / only / hide
+      改成了 always / only / never）
 
       - **先说 niri 是怎么干的**：它有一条 `layer-rule { match namespace="^wallpaper$";
         place-within-backdrop true }`，把某块 background 层的 surface 放进 overview 的底衬里，
@@ -4825,8 +4829,8 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
         背景」。vidow 这边不需要「搬进底衬」—— **壁纸本来就不跟全景缩放**（缩的只有窗口，
         `vidow_view_apply_anim`），缺的只是一个「什么时候露面」的开关。
       - 新增图层规则作用 `overview`（`src/rule.h` 的 `enum vidow_overview_mode`、`VRA_OVERVIEW`、
-        `RK_ACT_OVERVIEW`）：`"off"`（默认，照常）/ `"only"`（只在全景里显示）/ `"hide"`（全景里
-        收起来）。`only` 就是用户要的那件事：**跑第二个壁纸客户端、按 namespace 匹配**。
+        `RK_ACT_OVERVIEW`）：`"always"`（默认，照常）/ `"only"`（只在全景里显示）/ `"never"`（全景里
+        不出现）—— 名字读作「全景里：总是 / 只有它 / 从不」。`only` 就是用户要的那件事：**跑第二个壁纸客户端、按 namespace 匹配**。
       - 落在 `overview.c` 的 `overview_layers_apply()`：盖在原来那几刀「整棵树一起开关」
         （popups / top / overlay / im）**上面**，逐个 surface 改自己那棵树的 `enabled`。规则改完
         当场生效（`apply_layer()` 里调 `vidow_overview_refresh_layers()`），不用等下次开关全景。
@@ -4835,7 +4839,7 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
            节点画在遮罩下面，盖住 live 的 layer），不 `vidow_backdrop_damage(server, true)` 就还是
            上一张 —— 表现是「进全景了，但糊的还是桌面那张」。第一次跑测试量到 s3 全是渐变色调
            （(20,20)=(71,62,26)），补上这一笔之后是压暗过的洋红 100%。
-        2. 规则从 `only` 改回 `off` 时**必须把节点点亮回来**（第一版 `OFF` 直接 `continue`，那块
+        2. 规则从 `only` 改回 `always` 时**必须把节点点亮回来**（第一版 `always` 那一支直接 `continue`，那块
            壁纸就永远关着了）。另外 `off` 那一支不能抢 `fx.c` 的 `capture_hidden`（抓底衬时它会
            临时关掉某些 surface 的节点，那一笔不是我们的）。
       - 查询接口跟着修：`vidowmsg background` 多报一个 `visible`（**现在真的画着**几块），
@@ -4843,8 +4847,8 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
         （它会以为这屏有人管了，自己不画）。`vidowmsg layers` 每块多 `overview` / `shown` 两个字段。
       - **证据**（headless 1280x720，两块 background 层 surface：wall.py 渐变 + 纯洋红）：
         桌面 洋红 0% / 金色 16%；进全景 压暗过的洋红 100%；退出 洋红 0% / 金色 16%；
-        规则热改成 `off` 当场 洋红 100%（盖住桌面）、改回 `only` 又 0%。
-        `test-overview.sh` 50 → 63 项；`tools/wall.py` 顺手支持「颜色 + namespace」两个参数
+        规则热改成 `always` 当场 洋红 100%（盖住桌面）、改回 `only` 又 0%。
+        `test-overview.sh` 50 → 64 项；`tools/wall.py` 顺手支持「颜色 + namespace」两个参数
         （`python3 tools/wall.py "#ff00ff" wall2`），默认行为一个字没动。
       - **真客户端也验过一遍**（`awww` 0.12.1，两个 daemon + 两张纯色图）：`layers` 报出
         `awww-daemon` / `awww-daemonov` 两块，后者 `overview=only shown=False`；桌面金色 100% /
