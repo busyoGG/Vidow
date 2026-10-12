@@ -342,15 +342,35 @@ static int anim_watchdog(void *data) {
 	wl_list_for_each(output, &server->outputs, link) {
 		int64_t iv = watchdog_interval_ns(output, dragging);
 		int64_t since = now - output->last_render_ns;
-		if (since >= iv) {
+		/* 后端还活着（帧事件还在按自己的节奏来）就别自己推。
+		 *
+		 * 这个看门狗本来只该给**嵌套**后端兜底（宿主合成器只在有损伤时才给我们
+		 * 帧）。真机上（DRM）它按帧间隔的 1.25 倍自己推，偶尔就会和帧事件撞在
+		 * 同一个 vblank 里 —— 那一帧提交上去后端直接拒掉（
+		 * "Failed to page-flip output: a page-flip is already pending"），屏幕
+		 * 上永远看不到它，动画里就是一顿一卡。用户日志里 51 条这个错误，全部
+		 * 紧跟在 swap-window / 切工作区后面（= 动画在跑 = 看门狗刚被叫起来）。
+		 *
+		 * 判据用「上一帧事件过去多久」：超过 2 个间隔没来，才算后端不给帧了，
+		 * 这时才接管（原来「窗口停在最后一帧」那条路照旧有人管）。 */
+		int64_t since_frame = output->last_frame_ns != 0 ?
+			now - output->last_frame_ns : INT64_MAX;
+		bool backend_live = since_frame <= 2 * iv;
+		if (since >= iv && !backend_live) {
 			vidow_output_render(output); /* 后端欠着这一帧，自己补上 */
 			since = 0;
 			iv = watchdog_interval_ns(output, dragging);
 		}
-		/* 下一轮就在「这个间隔还剩多久」之后 —— 按剩余时间排，而不是固定
+		/* 下一轮就在「该干活的那一刻」之后 —— 按剩余时间排，而不是固定
 		 * 4ms / 16ms 地空转：4ms 一轮的话，10ms 的目标节奏实际会落成 12ms
-		 * （4 的整数倍），白丢 20% 的帧。 */
-		int64_t left = (iv - since) / 1000000 + 1;
+		 * （4 的整数倍），白丢 20% 的帧。后端还活着的时候等的不是「渲染间隔」
+		 * 而是「它沉默够久」，不然 1ms 一轮空转。 */
+		int64_t left_ns = backend_live ? (2 * iv - since_frame)
+			: (iv - since);
+		if (left_ns < 0) {
+			left_ns = 0;
+		}
+		int64_t left = left_ns / 1000000 + 1;
 		if (wait_ms == 0 || left < wait_ms) {
 			wait_ms = left;
 		}

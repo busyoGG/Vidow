@@ -5048,6 +5048,35 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
         底衬是**半透明混合**的（量到 (107,66,38)，金色和洋红混在一起）。验证 / 截图时加
         `--transition-type none`。
 
+228. **动画看门狗在真机上多推一帧 → 后端把这一帧拒掉**（用户：「第一个 kitty 窗口的透明度在仿佛变化」）
+
+     - 先排除的：vidow 里没有透明度动画（配置里没有 opacity/fade 这类键，
+       `opacity` 只是 `window_opacity` 的别名），用户配置里 `window_opacity = 1`。
+       他那个 kitty 是 `background_opacity 0.8` + `background_blur 1`（kitty 自己
+       的配置），所以「透明度在变」看到的其实是**它背后那一块**在变。
+     - 复现：headless + 用户整套配置 + 半透明 kitty，静止连拍 24 帧逐像素比 ——
+       除了 kitty 自己闪的终端光标（36 像素）**一像素不差**；把另一个窗口压上来
+       再拿开、回到同一布局，也还是一像素不差。所以静止 / 重叠切换这条路是干净的，
+       问题要么在真机的提交路径上，要么得看他屏幕上到底什么样。
+     - 真机日志里唯一的异常：51 条
+       `connector DP-3: Failed to page-flip output: a page-flip is already pending`，
+       而且**全部紧跟在 `swap-window` / 切工作区后面**（= 动画在跑 = 看门狗刚被叫
+       起来）。wlroots 那边这条是 `goto out`：这一帧直接不提交。
+     - 根因：`anim_watchdog` 是给**嵌套**后端兜底的（宿主合成器只在有损伤时才给
+       帧），但它无条件按「帧间隔的 1.25 倍」自己推帧。真机（DRM）上帧事件本来每
+       vblank 就来，它推的这一帧偶尔和帧事件撞进同一个 vblank → 一帧里提交两次 →
+       第二次被拒。用户日志里那些是 3 条挤在 13ms 里。
+     - 修法：判据改成「后端沉默」。上一帧事件过去还没超过 2 个间隔（`2 * iv`）就
+       不自己推，等它；超过才算后端不给帧了，看门狗接管（原来「窗口停在最后一帧」
+       那条路照旧有人管）。等待时长也跟着改成「等后端沉默够久」而不是「等渲染
+       间隔」，否则会 1ms 一轮空转。
+     - 补充：这一帧不是丢了 —— wlroots 的 `pending_commit_damage` 要等提交**成功**
+       才清（`scene_output_handle_commit`），所以损伤会留到下一帧重提交。屏幕上的
+       表现是这一帧晚一个 vblank，也就是动画里一顿。
+     - 验证：`test-drag-stall.sh`（看门狗接管那条路）、`test-blur2out.sh`、
+       `test-blurnooverlap.sh`、`test-blurcache.sh`、`test-closeanim.sh` 全过。
+       真机上「还有没有 page-flip 报错」得等他重启一次看。
+
 227. **窗口还没有表面时给焦点 → 合成器 abort**（用户：「启动 proton 游戏会导致 vidow 崩溃」）
 
      - 现场：`coredumpctl` 里 22:08 那个 SIGABRT（7.1M），栈是
