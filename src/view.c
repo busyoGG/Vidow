@@ -482,20 +482,13 @@ static void view_apply_fullscreen(struct vidow_view *view, bool want,
 	}
 	view->fullscreen = want;
 	vidow_view_set_fullscreen(view, want);
-	/* 全屏的窗口立刻拿焦点。
+	/* 全屏**不抢焦点**（Hyprland 的规矩：全屏请求不改变焦点；要抢焦点的客户端
+	 * 自己发 _NET_ACTIVE_WINDOW / xdg_activation，那条路照旧）。
 	 *
-	 * 为什么必须有这一条：视口钉在**聚焦那条列**上，而全屏那块在条带上占一整屏
-	 * 宽 —— 一个**没有焦点**的窗口自己进全屏（X11 游戏最常见：启动器把它拉起来
-	 * 时焦点还在终端上，或者它失焦后自己又进全屏），就会被摆在旁边半屏外。用户
-	 * 报的正是这个：「游戏一直在右半屏、左半屏是别人（看着像空着，点上去还有交
-	 * 互），像是两个窗口交换了位置」。聚焦它 = 视口对准它，整块屏归它。
-	 *
-	 * 只管画在屏幕上的窗口（别的工作区里的窗口自己进全屏不该把人拽过去）。 */
-	if (want && view->mapped && !view->minimized &&
-			vidow_workspace_view_visible(view->server, view) &&
-			view->server->focused != view) {
-		vidow_focus_view(view);
-	}
+	 * 上一版这里是「全屏的窗口立刻拿焦点」，为了修「没焦点的窗口自己进全屏会被摆
+	 * 在半屏外」。结果更糟：游戏会**反复**在关/开之间切全屏（用户日志里
+	 * 04:24.600 关 → 04:24.650 开，04:27 / 04:31 各一轮），每开一次就把焦点从用户
+	 * 手里抢回去一次 —— 用户报的「全屏窗口一直 fullscreen 抢焦点」。 */
 	vidow_arrange(view->server);
 	vidow_ipc_emit_window(view->server, "window-fullscreen-changed", view);
 	wlr_log(WLR_INFO, "全屏: %s %s（%s）",
