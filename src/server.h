@@ -236,6 +236,10 @@ struct vidow_config {
 	bool clipboard;
 	bool clipboard_primary;
 	int clipboard_max_bytes;
+	/* 历史：clipboard_history 是保留条数（0 = 不留历史），
+	 * clipboard_history_bytes 是这份历史的总内存预算。两个上限谁先到谁先淘汰。 */
+	int clipboard_history;
+	int clipboard_history_bytes;
 
 	/* xdg-desktop-portal 后端选择（见 portalconf.c）。portal_desktop 是 vidow
 	 * 设给自己的 XDG_CURRENT_DESKTOP，也是 <name>-portals.conf 的那个 name；
@@ -1273,6 +1277,10 @@ struct vidow_im {
 #define VIDOW_CLIP_MIMES_MAX 32  /* 一份内容最多缓存几个 mime 类型 */
 #define VIDOW_CLIP_INCR_CHUNK (64 * 1024) /* INCR 分块大小（ICCCM 惯例） */
 #define VIDOW_CLIP_TIMEOUT_MS 5000        /* 对方不吭声时的兜底 */
+/* 一条历史里留几份 mime：浏览器复制一次带 text/html + text/plain + image/png +
+ * text/uri-list 好几份，全留太占内存（见 clipboard.c 的 history_push，按 mime_rank
+ * 挑最顺手的几份）。 */
+#define VIDOW_CLIP_HIST_MIMES 6
 
 enum vidow_clip_kind {
 	VIDOW_CLIP_CLIPBOARD,
@@ -1340,6 +1348,22 @@ struct vidow_clip_pull {
 	uint64_t deadline_ms;
 };
 
+/* 一条剪贴板历史。内容是从当时那份选区内容里拷出来的**独立副本**（选区内容随时
+ * 会被下一次复制覆盖），所以这里自带 data 生命周期，跟 vidow_clip_selection 无关。
+ *
+ * 用途：GUI（tools/vidowclip.py）列出历史、点一条复制回来；`vidowmsg clipboard-history*`
+ * 也能用。见 clipboard.c 的 history_push。 */
+struct vidow_clip_hist_entry {
+	struct wl_list link; /* vidow_clipboard.history（最新在前） */
+	uint64_t id;         /* 单调递增，GUI 指认条目用（下标会随新条目飘） */
+	uint64_t time_ms;    /* 什么时候进来的（CLOCK_MONOTONIC） */
+	bool primary;        /* 从哪个选区来的 */
+	bool from_x11;       /* 那份内容当时是从 X11 取来的 */
+	int nmimes;
+	struct vidow_clip_mime mimes[VIDOW_CLIP_HIST_MIMES];
+	size_t bytes;        /* 所有 mime 的字节和（算内存预算用） */
+};
+
 struct vidow_clip_selection {
 	struct vidow_server *server;
 	struct vidow_clipboard *clip;
@@ -1405,6 +1429,13 @@ struct vidow_clipboard {
 
 	struct vidow_clip_selection clip;
 	struct vidow_clip_selection primary;
+
+	/* 历史（最新在前）。count / bytes 是当下占用的条数与字节数，push 时按
+	 * clipboard_history / clipboard_history_bytes 两个上限从尾部淘汰。 */
+	struct wl_list history; /* struct vidow_clip_hist_entry */
+	int hist_count;
+	size_t hist_bytes;
+	uint64_t hist_next_id;
 };
 
 /* ------------------------------------------------------------------ server */

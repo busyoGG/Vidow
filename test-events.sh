@@ -150,12 +150,13 @@ want = ['keybind', 'ipc-action', 'window-activated', 'drag-started', 'drag-ended
         'input-device-removed', 'screencast-started', 'screencast-stopped',
         'config-failed', 'window-opened', 'window-closed', 'workspace-activated',
         'column-maximize-changed', 'clipboard-changed', 'primary-changed',
+        'clipboard-history-changed',
         'mru-committed', 'overview-toggled', 'config-reloaded', 'layer-mapped']
 print(','.join(sorted(n for n in want if n not in names)) or '-')
 print(d['count'])
 " 2>/dev/null)
 MISS=${MISSING%$'\n'*}; N=${MISSING##*$'\n'}
-[ "$MISS" = "-" ] && pass "22 个抽样事件名一个不缺（一共 $N 个）" || fail "少了：$MISS"
+[ "$MISS" = "-" ] && pass "23 个抽样事件名一个不缺（一共 $N 个）" || fail "少了：$MISS"
 [ "$N" -ge 40 ] && pass "事件总数 $N（>=40）" || fail "事件总数才 $N"
 
 # ------------------------------------------------------------ 2) 键位 / 动作

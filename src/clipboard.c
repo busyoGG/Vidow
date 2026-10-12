@@ -1,9 +1,11 @@
 #include "server.h"
 #include "clipboard.h"
 #include "ipc.h"
+#include "ipcstate.h"
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -53,6 +55,9 @@ static int mime_rank(const char *mime) {
 	if (strcmp(mime, "UTF8_STRING") == 0) return 2;
 	if (strcmp(mime, "STRING") == 0) return 3;
 	if (strcmp(mime, "text/uri-list") == 0) return 4;
+	/* 文件复制的「真身」：文件管理器认这个才是复制文件，历史里得跟着 uri-list
+	 * 一起留下（所以给同一个档位，别让它掉出前面几份）。 */
+	if (strcmp(mime, "x-special/gnome-copied-files") == 0) return 4;
 	if (strncmp(mime, "text/", 5) == 0) return 5;
 	if (strcmp(mime, "image/png") == 0) return 6;
 	if (strcmp(mime, "image/bmp") == 0) return 7;
@@ -206,20 +211,25 @@ static bool sel_has_data(struct vidow_clip_selection *sel) {
 	return false;
 }
 
-/* 挑一份内容：指定类型就找那个，否则按 mime_rank 挑最顺手的。 */
-static struct vidow_clip_mime *sel_pick(struct vidow_clip_selection *sel,
+/* 从一张类型表里挑一份：指定 mime 就找那个，否则按 mime_rank 挑最顺手的。
+ * 只认「取全了、没超上限、真有字节」的类型。历史条目（数组）和当前内容（sel）
+ * 共用这一份规则。 */
+static struct vidow_clip_mime *mime_pick(struct vidow_clip_mime *mimes, int n,
 		const char *want) {
 	if (want != NULL) {
-		struct vidow_clip_mime *m = sel_find(sel, want);
-		if (m != NULL && m->complete && !m->overflow) {
-			return m;
+		for (int i = 0; i < n; ++i) {
+			if (strcmp(mimes[i].mime, want) != 0) {
+				continue;
+			}
+			return mimes[i].complete && !mimes[i].overflow &&
+				mimes[i].len > 0 ? &mimes[i] : NULL;
 		}
 		return NULL;
 	}
 	struct vidow_clip_mime *best = NULL;
 	int best_rank = 1000;
-	for (int i = 0; i < sel->nmimes; ++i) {
-		struct vidow_clip_mime *m = &sel->mimes[i];
+	for (int i = 0; i < n; ++i) {
+		struct vidow_clip_mime *m = &mimes[i];
 		if (!m->complete || m->overflow || m->len == 0) {
 			continue;
 		}
@@ -230,6 +240,12 @@ static struct vidow_clip_mime *sel_pick(struct vidow_clip_selection *sel,
 		}
 	}
 	return best;
+}
+
+/* 挑一份内容：指定类型就找那个，否则按 mime_rank 挑最顺手的。 */
+static struct vidow_clip_mime *sel_pick(struct vidow_clip_selection *sel,
+		const char *want) {
+	return mime_pick(sel->mimes, sel->nmimes, want);
 }
 
 /* 往一份内容后面接字节。超过上限就把这份整个丢掉（留着「取不全」的残片没意义）。 */
@@ -267,6 +283,8 @@ static void sel_flush_waiters(struct vidow_clip_selection *sel);
 static void sel_flush_outs(struct vidow_clip_selection *sel);
 static void sel_tick_arm(struct vidow_clip_selection *sel);
 static void sel_emit(struct vidow_clip_selection *sel, const char *what);
+static void history_push(struct vidow_clip_selection *sel);
+static void history_evict(struct vidow_server *server);
 static void sel_unpublish(struct vidow_clip_selection *sel);
 static void fetch_reset(struct vidow_clip_selection *sel);
 static void pull_destroy(struct vidow_clip_pull *pull);
@@ -565,6 +583,11 @@ static void pull_finish(struct vidow_clip_pull *pull, const char *why) {
 		}
 	}
 	pull_destroy(pull);
+	/* 最后一个类型也拉完了：这份内容齐了，记一条历史。中途的快照会存下半截内容，
+	 * 所以只在 pulls 空了以后记。 */
+	if (wl_list_empty(&sel->pulls)) {
+		history_push(sel);
+	}
 	sel_flush_waiters(sel);
 	sel_flush_outs(sel);
 	sel_emit(sel, why);
@@ -855,6 +878,8 @@ static void fetch_next(struct vidow_clip_selection *sel) {
 		}
 	}
 	staging_commit(sel);
+	/* X11 来的这一份现在成了当前内容：记一条历史（见下面的 history_push）。 */
+	history_push(sel);
 	sel->from_x11 = true;
 	sel_publish(sel);
 	wlr_log(WLR_INFO, "剪贴板: 从 X11 取到 %s 的 %d 个类型（共 %zu 字节）",
@@ -1665,6 +1690,8 @@ bool vidow_clipboard_init(struct vidow_server *server) {
 	clip->proxy_primary = XCB_WINDOW_NONE;
 	clip->active = server->config.clipboard;
 
+	wl_list_init(&clip->history);
+
 	sel_init(clip, &clip->clip, VIDOW_CLIP_CLIPBOARD, XCB_ATOM_NONE,
 		"clipboard", false);
 	sel_init(clip, &clip->primary, VIDOW_CLIP_PRIMARY, XCB_ATOM_NONE,
@@ -1722,6 +1749,10 @@ void vidow_clipboard_apply_config(struct vidow_server *server) {
 	struct vidow_clipboard *clip = &server->clipboard;
 	bool want = server->config.clipboard;
 	bool want_primary = want && server->config.clipboard_primary;
+
+	/* 历史条数改了：调小（或关掉）就得马上腾地方，不然「关掉历史」之后内存还
+	 * 攥着几百 MB 不放。 */
+	history_evict(server);
 
 	if (!want_primary && (clip->primary.published != NULL ||
 			clip->primary.published_primary != NULL ||
@@ -1816,6 +1847,7 @@ void vidow_clipboard_finish(struct vidow_server *server) {
 	}
 	sel_unpublish(&clip->clip);
 	sel_unpublish(&clip->primary);
+	vidow_clipboard_history_clear(server);
 
 	struct vidow_clip_selection *list[2] = {&clip->clip, &clip->primary};
 	for (int i = 0; i < 2; ++i) {
@@ -1852,6 +1884,394 @@ void vidow_clipboard_finish(struct vidow_server *server) {
 	}
 	clip->conn = NULL;
 	clip->active = false;
+}
+
+/* ============================================================== 历史 */
+
+/* 为什么要有：剪贴板桥本身只保一份「当前内容」，复制第二遍第一份就没了。GUI
+ * （tools/vidowclip.py）和 `vidowmsg clipboard-history*` 要的是「刚才那几份还在，
+ * 点一下能拿回来」—— 那就是这份环形缓存。
+ *
+ * 内存：每条按 mime_rank 留最多 VIDOW_CLIP_HIST_MIMES 份内容（浏览器复制一次带
+ * html + plain + png 好几份，全留太占），总量由 clipboard_history（条数）和
+ * clipboard_history_bytes（字节）两个上限一起管，超了从最旧那头淘汰。 */
+
+static void hist_entry_free(struct vidow_clip_hist_entry *e) {
+	if (e == NULL) {
+		return;
+	}
+	for (int i = 0; i < e->nmimes; ++i) {
+		mime_clear(&e->mimes[i]);
+	}
+	free(e);
+}
+
+static struct vidow_clip_hist_entry *hist_find(struct vidow_clipboard *clip,
+		uint64_t id) {
+	struct vidow_clip_hist_entry *e;
+	wl_list_for_each(e, &clip->history, link) {
+		if (e->id == id) {
+			return e;
+		}
+	}
+	return NULL;
+}
+
+/* 把当前内容拷成一条独立的历史条目。挑不出东西（全是空的）返回 NULL。 */
+static struct vidow_clip_hist_entry *hist_snapshot(
+		struct vidow_clip_selection *sel) {
+	bool used[VIDOW_CLIP_MIMES_MAX] = {false};
+	struct vidow_clip_hist_entry *e = calloc(1, sizeof(*e));
+	if (e == NULL) {
+		return NULL;
+	}
+	for (int k = 0; k < VIDOW_CLIP_HIST_MIMES; ++k) {
+		int best = -1, best_rank = 1000;
+		for (int i = 0; i < sel->nmimes; ++i) {
+			struct vidow_clip_mime *m = &sel->mimes[i];
+			if (used[i] || !m->complete || m->overflow || m->len == 0) {
+				continue;
+			}
+			int rank = mime_rank(m->mime);
+			if (rank < best_rank) {
+				best_rank = rank;
+				best = i;
+			}
+		}
+		if (best < 0) {
+			break;
+		}
+		used[best] = true;
+		struct vidow_clip_mime *src = &sel->mimes[best];
+		struct vidow_clip_mime *dst = &e->mimes[e->nmimes];
+		dst->mime = strdup(src->mime);
+		dst->data = malloc(src->len);
+		if (dst->mime == NULL || dst->data == NULL) {
+			hist_entry_free(e);
+			return NULL;
+		}
+		memcpy(dst->data, src->data, src->len);
+		dst->len = src->len;
+		dst->complete = true;
+		dst->atom = XCB_ATOM_NONE;
+		e->nmimes++;
+		e->bytes += src->len;
+	}
+	if (e->nmimes == 0) {
+		hist_entry_free(e);
+		return NULL;
+	}
+	e->time_ms = now_ms();
+	e->primary = sel->primary;
+	e->from_x11 = sel->from_x11;
+	return e;
+}
+
+/* 两份内容一模一样吗（类型名、长度、字节全比）。挑出来的类型顺序是确定的
+ * （按 mime_rank），所以直接按下标比。 */
+static bool hist_same(struct vidow_clip_hist_entry *a,
+		struct vidow_clip_hist_entry *b) {
+	if (a->nmimes != b->nmimes) {
+		return false;
+	}
+	for (int i = 0; i < a->nmimes; ++i) {
+		if (strcmp(a->mimes[i].mime, b->mimes[i].mime) != 0 ||
+				a->mimes[i].len != b->mimes[i].len ||
+				memcmp(a->mimes[i].data, b->mimes[i].data,
+					a->mimes[i].len) != 0) {
+			return false;
+		}
+	}
+	return true;
+}
+
+/* 超了条数 / 内存预算就从最旧那头淘汰。兜底留一条：单条自己就超预算时也留着，
+ * 否则「复制了一张 40MB 的图」会当场把整个历史清空。 */
+static void history_evict(struct vidow_server *server) {
+	struct vidow_clipboard *clip = &server->clipboard;
+	int max = server->config.clipboard_history;
+	if (max < 0) {
+		max = 0;
+	}
+	size_t budget = server->config.clipboard_history_bytes > 0
+		? (size_t)server->config.clipboard_history_bytes : SIZE_MAX;
+	while (clip->hist_count > max ||
+			(clip->hist_bytes > budget && clip->hist_count > 1)) {
+		if (wl_list_empty(&clip->history)) {
+			break;
+		}
+		struct vidow_clip_hist_entry *e =
+			wl_container_of(clip->history.prev, e, link);
+		wl_list_remove(&e->link);
+		clip->hist_count--;
+		clip->hist_bytes -= e->bytes;
+		hist_entry_free(e);
+	}
+}
+
+/* 当前内容换人了：记一条历史。去重（同一份内容再复制一次 = 把那条挪到最前面，
+ * 不新增），并且只在数据齐了以后记 —— Wayland 那边还在拉的时候先不记，否则会
+ * 存下半截内容。 */
+static void history_push(struct vidow_clip_selection *sel) {
+	struct vidow_server *server = sel->server;
+	struct vidow_clipboard *clip = &server->clipboard;
+	if (!server->config.clipboard || server->config.clipboard_history <= 0) {
+		return;
+	}
+	if (!wl_list_empty(&sel->pulls) || !sel_has_data(sel)) {
+		return;
+	}
+	struct vidow_clip_hist_entry *e = hist_snapshot(sel);
+	if (e == NULL) {
+		return;
+	}
+	struct vidow_clip_hist_entry *it;
+	wl_list_for_each(it, &clip->history, link) {
+		if (it->bytes != e->bytes || it->primary != e->primary ||
+				!hist_same(it, e)) {
+			continue;
+		}
+		hist_entry_free(e);
+		wl_list_remove(&it->link);
+		it->time_ms = now_ms();
+		wl_list_insert(&clip->history, &it->link);
+		vidow_ipc_emit_clipboard_history(server, "dup");
+		return;
+	}
+	e->id = ++clip->hist_next_id;
+	wl_list_insert(&clip->history, &e->link);
+	clip->hist_count++;
+	clip->hist_bytes += e->bytes;
+	history_evict(server);
+	vidow_ipc_emit_clipboard_history(server, "push");
+}
+
+/* 第 index 条（0 = 最新）。下标会随新条目飘，GUI 指认条目该用 id（见 ipc.c）。 */
+struct vidow_clip_hist_entry *vidow_clipboard_history_at(
+		struct vidow_server *server, int index) {
+	struct vidow_clipboard *clip = &server->clipboard;
+	struct vidow_clip_hist_entry *e;
+	int i = 0;
+	wl_list_for_each(e, &clip->history, link) {
+		if (i++ == index) {
+			return e;
+		}
+	}
+	return NULL;
+}
+
+void vidow_clipboard_history_clear(struct vidow_server *server) {
+	struct vidow_clipboard *clip = &server->clipboard;
+	struct vidow_clip_hist_entry *e, *tmp;
+	wl_list_for_each_safe(e, tmp, &clip->history, link) {
+		wl_list_remove(&e->link);
+		hist_entry_free(e);
+	}
+	clip->hist_count = 0;
+	clip->hist_bytes = 0;
+	vidow_ipc_emit_clipboard_history(server, "clear");
+}
+
+bool vidow_clipboard_history_delete(struct vidow_server *server, uint64_t id) {
+	struct vidow_clipboard *clip = &server->clipboard;
+	struct vidow_clip_hist_entry *e = hist_find(clip, id);
+	if (e == NULL) {
+		return false;
+	}
+	wl_list_remove(&e->link);
+	clip->hist_count--;
+	clip->hist_bytes -= e->bytes;
+	hist_entry_free(e);
+	vidow_ipc_emit_clipboard_history(server, "delete");
+	return true;
+}
+
+bool vidow_clipboard_history_get(struct vidow_server *server, uint64_t id,
+		const char *mime, unsigned char **data, size_t *len,
+		const char **mime_out) {
+	struct vidow_clip_hist_entry *e =
+		hist_find(&server->clipboard, id);
+	if (e == NULL) {
+		return false;
+	}
+	struct vidow_clip_mime *m = mime_pick(e->mimes, e->nmimes, mime);
+	if (m == NULL) {
+		return false;
+	}
+	unsigned char *copy = malloc(m->len > 0 ? m->len : 1);
+	if (copy == NULL) {
+		return false;
+	}
+	memcpy(copy, m->data, m->len);
+	*data = copy;
+	*len = m->len;
+	if (mime_out != NULL) {
+		*mime_out = m->mime;
+	}
+	return true;
+}
+
+/* 把某条历史变成当前内容（两边都发布出去）：GUI 的「点一下复制回来」走这里。
+ * 发布走的是和客户端复制同一条路（sel_publish），所以 X11 那边 xwm 会照旧去抢
+ * owner、请求照样归我们答。 */
+bool vidow_clipboard_history_use(struct vidow_server *server, uint64_t id) {
+	struct vidow_clipboard *clip = &server->clipboard;
+	if (!server->config.clipboard) {
+		return false;
+	}
+	struct vidow_clip_hist_entry *e = hist_find(clip, id);
+	if (e == NULL) {
+		return false;
+	}
+	struct vidow_clip_selection *sel =
+		e->primary ? &clip->primary : &clip->clip;
+	if (e->primary && !server->config.clipboard_primary) {
+		return false;
+	}
+	sel_reset(sel);
+	sel->from_x11 = e->from_x11;
+	for (int i = 0; i < e->nmimes; ++i) {
+		struct vidow_clip_mime *src = &e->mimes[i];
+		struct vidow_clip_mime *dst = sel_add(sel, src->mime, XCB_ATOM_NONE);
+		if (dst == NULL) {
+			break;
+		}
+		mime_append(dst, src->data, src->len, clip_max(server));
+		dst->complete = true;
+	}
+	sel_publish(sel);
+	/* 会命中去重：这条挪到最前面（刚用过的东西该在最上面）。 */
+	history_push(sel);
+	sel_emit(sel, "history-use");
+	return true;
+}
+
+/* ------------------------------------------------- 文件复制（uri-list） */
+
+/* 拼字符串用的小缓冲（这里要拼三份，长度事先不知道）。 */
+struct clip_strbuf {
+	char *buf;
+	size_t len, cap;
+};
+
+static void sb_add(struct clip_strbuf *sb, const char *data, size_t len) {
+	if (sb->len + len + 1 > sb->cap) {
+		size_t cap = sb->cap > 0 ? sb->cap : 256;
+		while (cap < sb->len + len + 1) {
+			cap *= 2;
+		}
+		char *next = realloc(sb->buf, cap);
+		if (next == NULL) {
+			/* 失败了就把整条路封死（buf=NULL + cap=0）：后面谁再往里塞都塞不进，
+			 * 最后统一按「拼不出来」处理。 */
+			free(sb->buf);
+			sb->buf = NULL;
+			sb->cap = 0;
+			return;
+		}
+		sb->buf = next;
+		sb->cap = cap;
+	}
+	memcpy(sb->buf + sb->len, data, len);
+	sb->len += len;
+	sb->buf[sb->len] = '\0';
+}
+
+static void sb_add_str(struct clip_strbuf *sb, const char *s) {
+	sb_add(sb, s, strlen(s));
+}
+
+/* 路径 -> file:// URI。按 RFC 3986 只留 unreserved 和 '/'，其余百分号转义
+ * （中文路径、空格、# 都在这里过一遍）。 */
+static void sb_add_uri(struct clip_strbuf *sb, const char *path) {
+	static const char hex[] = "0123456789ABCDEF";
+	sb_add_str(sb, "file://");
+	char abs[PATH_MAX];
+	if (path[0] != '/') {
+		char cwd[PATH_MAX];
+		if (getcwd(cwd, sizeof(cwd)) != NULL) {
+			int n = snprintf(abs, sizeof(abs), "%s/%s", cwd, path);
+			if (n < 0 || (size_t)n >= sizeof(abs)) {
+				return; /* 拼出来太长：宁可不给，也不给个截断的路径 */
+			}
+			path = abs;
+		}
+	}
+	for (const unsigned char *p = (const unsigned char *)path; *p != '\0'; p++) {
+		bool keep = (*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+			(*p >= '0' && *p <= '9') || *p == '-' || *p == '.' ||
+			*p == '_' || *p == '~' || *p == '/';
+		if (keep) {
+			sb_add(sb, (const char *)p, 1);
+		} else {
+			char esc[3] = {'%', hex[*p >> 4], hex[*p & 0xf]};
+			sb_add(sb, esc, 3);
+		}
+	}
+}
+
+/* 把一批文件路径放进剪贴板。三份类型：
+ *   text/uri-list                  RFC 2483，每行一个 file:// URI
+ *   x-special/gnome-copied-files   GNOME / KDE 的文件管理器认这个才真「复制文件」，
+ *                                  只有 uri-list 时多半会粘成一段路径文本
+ *   text/plain;charset=utf-8       给终端这类只要文本的（一行一个路径）
+ * 路径不存在也照放（剪贴板是「客户端说的话」，不该由合成器去校验）。 */
+bool vidow_clipboard_set_files(struct vidow_server *server, int kind,
+		char *const *paths, int npaths) {
+	struct vidow_clipboard *clip = &server->clipboard;
+	struct vidow_clip_selection *sel =
+		kind == VIDOW_CLIP_PRIMARY ? &clip->primary : &clip->clip;
+	if (!server->config.clipboard || npaths <= 0 || paths == NULL) {
+		return false;
+	}
+	if (kind == VIDOW_CLIP_PRIMARY && !server->config.clipboard_primary) {
+		return false;
+	}
+	struct clip_strbuf uri = {0}, gnome = {0}, plain = {0};
+	sb_add_str(&uri, "");
+	sb_add_str(&gnome, "copy\n");
+	sb_add_str(&plain, "");
+	for (int i = 0; i < npaths; ++i) {
+		if (paths[i] == NULL || paths[i][0] == '\0') {
+			continue;
+		}
+		sb_add_uri(&uri, paths[i]);
+		sb_add_str(&uri, "\r\n");
+		/* gnome-copied-files 用 '\n' 分隔（不带 uri-list 那种 \r） */
+		sb_add_uri(&gnome, paths[i]);
+		sb_add_str(&gnome, "\n");
+		sb_add_str(&plain, paths[i]);
+		sb_add_str(&plain, "\n");
+	}
+	if (uri.buf == NULL || gnome.buf == NULL || plain.buf == NULL) {
+		free(uri.buf);
+		free(gnome.buf);
+		free(plain.buf);
+		return false;
+	}
+	static const char *mimes[3] = {
+		"text/uri-list",
+		"x-special/gnome-copied-files",
+		"text/plain;charset=utf-8",
+	};
+	const char *datas[3] = {uri.buf, gnome.buf, plain.buf};
+	sel_reset(sel);
+	sel->from_x11 = false;
+	for (int i = 0; i < 3; ++i) {
+		struct vidow_clip_mime *m = sel_add(sel, mimes[i], XCB_ATOM_NONE);
+		if (m == NULL) {
+			break;
+		}
+		mime_append(m, datas[i], strlen(datas[i]), clip_max(server));
+		m->complete = true;
+	}
+	free(uri.buf);
+	free(gnome.buf);
+	free(plain.buf);
+	sel_publish(sel);
+	history_push(sel);
+	sel_emit(sel, "ipc-set-files");
+	return true;
 }
 
 /* ================================================== IPC 用：取 / 塞 / 清 */
@@ -1897,6 +2317,7 @@ bool vidow_clipboard_set(struct vidow_server *server, int kind, const char *mime
 	mime_append(m, data, len, clip_max(server));
 	m->complete = true;
 	sel_publish(sel);
+	history_push(sel);
 	sel_emit(sel, "ipc-set");
 	return true;
 }

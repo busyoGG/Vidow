@@ -239,6 +239,12 @@ static const struct entry entries[] = {
 	{ "clipboard_max_bytes", K_INT, OFF(clipboard_max_bytes),
 		SZ(clipboard_max_bytes), 6,
 		"每种类型在内存里留的副本上限（字节），超了丢这个类型" },
+	{ "clipboard_history", K_INT, OFF(clipboard_history),
+		SZ(clipboard_history), 6,
+		"剪贴板历史留几条（0 = 不留历史；见 tools/vidowclip.py）" },
+	{ "clipboard_history_bytes", K_INT, OFF(clipboard_history_bytes),
+		SZ(clipboard_history_bytes), 6,
+		"剪贴板历史总共占多少字节，超了从最旧那条开始丢" },
 
 	{ "ipc",             K_BOOL,   OFF(ipc),             SZ(ipc), 7,
 		"开 IPC socket（vidowmsg、状态栏、脚本靠它）" },
@@ -454,9 +460,11 @@ static const struct group_field shader_fields[] = {
 	{ "idle",    "shader_idle" },
 };
 static const struct group_field clipboard_fields[] = {
-	{ "enabled",   "clipboard" },
-	{ "primary",   "clipboard_primary" },
-	{ "max_bytes", "clipboard_max_bytes" },
+	{ "enabled",     "clipboard" },
+	{ "primary",     "clipboard_primary" },
+	{ "max_bytes",   "clipboard_max_bytes" },
+	{ "history",     "clipboard_history" },
+	{ "history_bytes", "clipboard_history_bytes" },
 };
 static const struct group_field ipc_fields[] = {
 	{ "enabled", "ipc" },
@@ -865,6 +873,8 @@ static void defaults(struct vidow_config *cfg) {
 	cfg->clipboard = true;
 	cfg->clipboard_primary = true;
 	cfg->clipboard_max_bytes = 32 * 1024 * 1024;
+	cfg->clipboard_history = 32;
+	cfg->clipboard_history_bytes = 64 * 1024 * 1024;
 	cfg->window_open_ms = 180;
 	cfg->window_close_ms = 140;
 	cfg->window_move_ms = 190;
@@ -1096,9 +1106,11 @@ void vidow_config_log(const struct vidow_config *cfg) {
 		cfg->input_injection ? "on" : "off");
 	wlr_log(WLR_INFO, "config: cursor_shake=%s scale=%.2f（摇晃指针就放大，好找）",
 		cfg->cursor_shake ? "on" : "off", cfg->cursor_shake_scale);
-	wlr_log(WLR_INFO, "config: clipboard=%s primary=%s max=%d 字节",
+	wlr_log(WLR_INFO, "config: clipboard=%s primary=%s max=%d 字节"
+		" history=%d 条/%d 字节",
 		cfg->clipboard ? "on" : "off",
-		cfg->clipboard_primary ? "on" : "off", cfg->clipboard_max_bytes);
+		cfg->clipboard_primary ? "on" : "off", cfg->clipboard_max_bytes,
+		cfg->clipboard_history, cfg->clipboard_history_bytes);
 	wlr_log(WLR_INFO,
 		"config: scale=%s xwayland=%s xscale=%s xenv=%s（每块屏的缩放 / 位置见"
 		"上面的 output 配置行）",

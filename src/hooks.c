@@ -60,6 +60,7 @@ static const char *event_names[] = {
 	"background-changed",
 	"clipboard-changed",
 	"primary-changed",
+	"clipboard-history-changed",
 	"mru-shown",
 	"mru-opened",
 	"mru-committed",

@@ -1559,7 +1559,9 @@ static bool cmd_set_config(struct vidow_server *server, struct jval *req,
 	}
 	/* 剪贴板那几个键改了要重新评估「接不接管」 */
 	if (strcmp(key, "clipboard") == 0 ||
-			strcmp(key, "clipboard_primary") == 0) {
+			strcmp(key, "clipboard_primary") == 0 ||
+			strcmp(key, "clipboard_history") == 0 ||
+			strcmp(key, "clipboard_history_bytes") == 0) {
 		vidow_clipboard_apply_config(server);
 	}
 	/* 激活令牌那两个键改了要重设定时器 */
@@ -2064,8 +2066,11 @@ static bool cmd_clipboard_get(struct vidow_server *server, struct jval *req,
 			free(text);
 		}
 	}
-	if (jget_bool(req, "base64", false) ||
-			!vidow_clipboard_mime_is_text(mime_out)) {
+	/* 注意 jget_bool 的第三个参数是「写哪」，传值进去等于传 NULL —— 客户端只要
+	 * 明写 {"base64":false} 就会写到空指针上（踩过：GUI 崩合成器）。 */
+	bool want_b64 = false;
+	jget_bool(req, "base64", &want_b64);
+	if (want_b64 || !vidow_clipboard_mime_is_text(mime_out)) {
 		jb_kv_base64(out, "base64", data, len);
 	}
 	jb_obj_end(out);
@@ -2123,6 +2128,222 @@ static bool cmd_clipboard_set(struct vidow_server *server, struct jval *req,
 		kind == VIDOW_CLIP_PRIMARY ? "primary" : "clipboard");
 	jb_kv_str(out, "mime", mime);
 	jb_kv_uint(out, "size", len);
+	jb_obj_end(out);
+	return true;
+}
+
+/* ------------------------------------------------------------ 历史 */
+
+/* 指认一条历史：--id N（稳定，GUI 用）或 --index N（0 = 最新，人敲命令行用；
+ * 缺省 0 = 最新那条）。 */
+static bool clip_hist_target(struct vidow_server *server, struct jval *req,
+		uint64_t *id, char *err, size_t errlen) {
+	long long want_id = -1, want_index = 0;
+	if (jget_int(req, "id", &want_id) && want_id >= 0) {
+		*id = (uint64_t)want_id;
+		return true;
+	}
+	if (!jget_int(req, "index", &want_index) &&
+			!jget_int(req, "at", &want_index)) {
+		want_index = 0;
+	}
+	struct vidow_clip_hist_entry *e =
+		vidow_clipboard_history_at(server, (int)want_index);
+	if (e == NULL) {
+		snprintf(err, errlen, "历史里没有第 %lld 条（现在 %d 条）",
+			want_index, server->clipboard.hist_count);
+		return false;
+	}
+	*id = e->id;
+	return true;
+}
+
+static bool cmd_clipboard_history(struct vidow_server *server, struct jval *req,
+		struct jbuf *out, char *err, size_t errlen) {
+	(void)req;
+	(void)err;
+	(void)errlen;
+	struct vidow_clipboard *clip = &server->clipboard;
+	jb_obj(out);
+	jb_kv_bool(out, "enabled", server->config.clipboard_history > 0);
+	jb_kv_int(out, "count", clip->hist_count);
+	jb_kv_uint(out, "bytes", clip->hist_bytes);
+	jb_kv_int(out, "limit", server->config.clipboard_history);
+	jb_kv_int(out, "limit_bytes", server->config.clipboard_history_bytes);
+	jb_key(out, "entries");
+	jb_arr(out);
+	struct vidow_clip_hist_entry *e;
+	int i = 0;
+	wl_list_for_each(e, &clip->history, link) {
+		vidow_ipc_json_clip_hist_entry(out, server, e, i++);
+	}
+	jb_arr_end(out);
+	jb_obj_end(out);
+	return true;
+}
+
+static bool cmd_clipboard_history_get(struct vidow_server *server,
+		struct jval *req, struct jbuf *out, char *err, size_t errlen) {
+	uint64_t id = 0;
+	if (!clip_hist_target(server, req, &id, err, errlen)) {
+		return false;
+	}
+	char mime_buf[256];
+	const char *mime = jtext(req, "mime", mime_buf, sizeof(mime_buf));
+	if (mime == NULL) {
+		mime = jtext(req, "type", mime_buf, sizeof(mime_buf));
+	}
+	unsigned char *data = NULL;
+	size_t len = 0;
+	const char *mime_out = NULL;
+	if (!vidow_clipboard_history_get(server, id, mime, &data, &len,
+			&mime_out)) {
+		snprintf(err, errlen, "第 %llu 条历史里没有%s",
+			(unsigned long long)id, mime != NULL ? mime : "内容");
+		return false;
+	}
+	jb_obj(out);
+	jb_kv_uint(out, "id", id);
+	jb_kv_str(out, "mime", mime_out);
+	jb_kv_uint(out, "size", len);
+	if (vidow_clipboard_mime_is_text(mime_out)) {
+		size_t n = len;
+		while (n > 0 && data[n - 1] == '\0') {
+			n--;
+		}
+		char *text = malloc(n + 1);
+		if (text != NULL) {
+			memcpy(text, data, n);
+			text[n] = '\0';
+			jb_kv_str(out, "text", text);
+			free(text);
+		}
+	}
+	bool want_b64 = false;
+	jget_bool(req, "base64", &want_b64);
+	if (want_b64 || !vidow_clipboard_mime_is_text(mime_out)) {
+		jb_kv_base64(out, "base64", data, len);
+	}
+	jb_obj_end(out);
+	free(data);
+	return true;
+}
+
+static bool cmd_clipboard_history_use(struct vidow_server *server,
+		struct jval *req, struct jbuf *out, char *err, size_t errlen) {
+	uint64_t id = 0;
+	if (!clip_hist_target(server, req, &id, err, errlen)) {
+		return false;
+	}
+	if (!vidow_clipboard_history_use(server, id)) {
+		snprintf(err, errlen, "第 %llu 条拿不回来（剪贴板关了？）",
+			(unsigned long long)id);
+		return false;
+	}
+	struct vidow_clip_hist_entry *e = NULL;
+	struct vidow_clip_hist_entry *it;
+	wl_list_for_each(it, &server->clipboard.history, link) {
+		if (it->id == id) {
+			e = it;
+			break;
+		}
+	}
+	wlr_log(WLR_INFO, "ipc: 历史第 %llu 条复制回剪贴板",
+		(unsigned long long)id);
+	jb_obj(out);
+	jb_kv_uint(out, "id", id);
+	jb_kv_bool(out, "ok", true);
+	jb_kv_str(out, "selection", e != NULL && e->primary ?
+		"primary" : "clipboard");
+	jb_obj_end(out);
+	return true;
+}
+
+static bool cmd_clipboard_history_delete(struct vidow_server *server,
+		struct jval *req, struct jbuf *out, char *err, size_t errlen) {
+	uint64_t id = 0;
+	if (!clip_hist_target(server, req, &id, err, errlen)) {
+		return false;
+	}
+	if (!vidow_clipboard_history_delete(server, id)) {
+		snprintf(err, errlen, "第 %llu 条删不掉（已经没了？）",
+			(unsigned long long)id);
+		return false;
+	}
+	jb_obj(out);
+	jb_kv_uint(out, "id", id);
+	jb_kv_bool(out, "deleted", true);
+	jb_kv_int(out, "count", server->clipboard.hist_count);
+	jb_obj_end(out);
+	return true;
+}
+
+static bool cmd_clipboard_history_clear(struct vidow_server *server,
+		struct jval *req, struct jbuf *out, char *err, size_t errlen) {
+	(void)req;
+	(void)err;
+	(void)errlen;
+	vidow_clipboard_history_clear(server);
+	wlr_log(WLR_INFO, "ipc: 清空剪贴板历史");
+	jb_obj(out);
+	jb_kv_bool(out, "cleared", true);
+	jb_obj_end(out);
+	return true;
+}
+
+/* 把一批文件路径放进剪贴板（GUI 的「复制文件」和命令行都用它）。 */
+static bool cmd_clipboard_set_files(struct vidow_server *server,
+		struct jval *req, struct jbuf *out, char *err, size_t errlen) {
+	int kind = VIDOW_CLIP_CLIPBOARD;
+	if (!clip_kind(server, req, &kind, err, errlen)) {
+		return false;
+	}
+	struct jval *arr = jget(req, "files");
+	if (arr == NULL || arr->t != J_ARR) {
+		arr = jget(req, "paths");
+	}
+	if (arr == NULL || arr->t != J_ARR || arr->n == 0) {
+		snprintf(err, errlen, "要 files: [路径…]");
+		return false;
+	}
+	char **paths = calloc(arr->n, sizeof(char *));
+	if (paths == NULL) {
+		snprintf(err, errlen, "内存不够");
+		return false;
+	}
+	int n = 0, skipped = 0;
+	for (size_t i = 0; i < arr->n; ++i) {
+		if (arr->items[i]->t != J_STR || arr->items[i]->str == NULL) {
+			continue;
+		}
+		/* 只要绝对路径：我们和调用方不是一个进程，相对路径按谁的 cwd 解都是错的 */
+		if (arr->items[i]->str[0] != '/') {
+			skipped++;
+			continue;
+		}
+		paths[n++] = arr->items[i]->str;
+	}
+	if (n == 0) {
+		snprintf(err, errlen, "路径要写绝对路径（从 / 开头）%s",
+			skipped > 0 ? "——给的全是相对的" : "");
+		free(paths);
+		return false;
+	}
+	bool ok = vidow_clipboard_set_files(server, kind, paths, n);
+	free(paths);
+	if (!ok) {
+		snprintf(err, errlen, "塞不进去（剪贴板关了？没给路径？）");
+		return false;
+	}
+	if (skipped > 0) {
+		wlr_log(WLR_INFO, "ipc: 跳过 %d 个非绝对路径", skipped);
+	}
+	wlr_log(WLR_INFO, "ipc: %s = %d 个文件",
+		kind == VIDOW_CLIP_PRIMARY ? "primary" : "剪贴板", n);
+	jb_obj(out);
+	jb_kv_str(out, "selection",
+		kind == VIDOW_CLIP_PRIMARY ? "primary" : "clipboard");
+	jb_kv_int(out, "files", n);
 	jb_obj_end(out);
 	return true;
 }
@@ -2259,6 +2480,24 @@ static bool ipc_run(struct vidow_server *server, struct ipc_client *c,
 	}
 	if (strcmp(cmd, "clipboard_clear") == 0) {
 		return cmd_clipboard_clear(server, req, out, err, errlen);
+	}
+	if (strcmp(cmd, "clipboard_history") == 0) {
+		return cmd_clipboard_history(server, req, out, err, errlen);
+	}
+	if (strcmp(cmd, "clipboard_history_get") == 0) {
+		return cmd_clipboard_history_get(server, req, out, err, errlen);
+	}
+	if (strcmp(cmd, "clipboard_history_use") == 0) {
+		return cmd_clipboard_history_use(server, req, out, err, errlen);
+	}
+	if (strcmp(cmd, "clipboard_history_delete") == 0) {
+		return cmd_clipboard_history_delete(server, req, out, err, errlen);
+	}
+	if (strcmp(cmd, "clipboard_history_clear") == 0) {
+		return cmd_clipboard_history_clear(server, req, out, err, errlen);
+	}
+	if (strcmp(cmd, "clipboard_set_files") == 0) {
+		return cmd_clipboard_set_files(server, req, out, err, errlen);
 	}
 	if (strcmp(cmd, "pick_window") == 0) {
 		return cmd_pick_window(server, req, out, err, errlen);

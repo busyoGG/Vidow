@@ -1,5 +1,6 @@
 /* 把内部状态变成 JSON（见 ipcstate.h）。这一份**只读**：不发命令、不改状态，
  * 除了往订阅者的连接上写事件。 */
+#include "clipboard.h"
 #include "gesture.h"
 #include "ipcstate.h"
 
@@ -1447,6 +1448,82 @@ void vidow_ipc_json_state(struct jbuf *b, struct vidow_server *server) {
 	jb_obj_end(b);
 }
 
+/* 一条历史（GUI 列表 / clipboard-history 命令用）。
+ *
+ * 挑出来的那份（"mime"）永远是 e->mimes[0]：快照时就是按 mime_rank 从小到大放
+ * 进去的（见 clipboard.c 的 hist_snapshot）。"text" 只给前 4KB 预览，要全文或原图
+ * 用 clipboard-history-get。"files" 是 text/uri-list 解析出来的（文件复制那一条，
+ * GUI 靠它显示文件名、决定点下去是「复制文件」还是「复制文本」）。 */
+void vidow_ipc_json_clip_hist_entry(struct jbuf *b, struct vidow_server *server,
+		struct vidow_clip_hist_entry *e, int index) {
+	(void)server;
+	jb_obj(b);
+	jb_kv_uint(b, "id", e->id);
+	jb_kv_int(b, "index", index);
+	jb_kv_str(b, "selection", e->primary ? "primary" : "clipboard");
+	jb_kv_str(b, "origin", e->from_x11 ? "x11" : "wayland");
+	jb_kv_int(b, "age_ms", (long long)(now_ms() - e->time_ms));
+	jb_kv_uint(b, "bytes", e->bytes);
+	jb_kv_int(b, "types", e->nmimes);
+	jb_key(b, "mimes");
+	jb_arr(b);
+	int uri = -1;
+	for (int i = 0; i < e->nmimes; ++i) {
+		jb_str(b, e->mimes[i].mime);
+		if (strcmp(e->mimes[i].mime, "text/uri-list") == 0) {
+			uri = i;
+		}
+	}
+	jb_arr_end(b);
+
+	struct vidow_clip_mime *pick = e->nmimes > 0 ? &e->mimes[0] : NULL;
+	jb_kv_str(b, "mime", pick != NULL ? pick->mime : NULL);
+	jb_kv_uint(b, "size", pick != NULL ? pick->len : 0);
+	if (pick != NULL && vidow_clipboard_mime_is_text(pick->mime)) {
+		size_t n = pick->len > 4096 ? 4096 : pick->len;
+		while (n > 0 && pick->data[n - 1] == '\0') {
+			n--;
+		}
+		char *text = malloc(n + 1);
+		if (text != NULL) {
+			memcpy(text, pick->data, n);
+			text[n] = '\0';
+			jb_kv_str(b, "text", text);
+			free(text);
+		}
+	}
+	jb_kv_bool(b, "is_file", uri >= 0);
+	jb_key(b, "files");
+	jb_arr(b);
+	if (uri >= 0) {
+		/* uri-list 的行分隔是 CRLF（RFC 2483），'#' 开头是注释行。 */
+		const unsigned char *data = e->mimes[uri].data;
+		size_t len = e->mimes[uri].len, start = 0;
+		for (size_t i = 0; i <= len; ++i) {
+			if (i < len && data[i] != '\n') {
+				continue;
+			}
+			size_t end = i;
+			while (end > start && (data[end - 1] == '\r' ||
+					data[end - 1] == '\n')) {
+				end--;
+			}
+			if (end > start && data[start] != '#') {
+				char *line = malloc(end - start + 1);
+				if (line != NULL) {
+					memcpy(line, data + start, end - start);
+					line[end - start] = '\0';
+					jb_str(b, line);
+					free(line);
+				}
+			}
+			start = i + 1;
+		}
+	}
+	jb_arr_end(b);
+	jb_obj_end(b);
+}
+
 /* --------------------------------------------------------------- 事件 */
 
 /* 一个事件的信封：{"event":..., "time_ms":..., "data":{...}} 加换行。 */
@@ -1651,6 +1728,27 @@ void vidow_ipc_emit_clipboard(struct vidow_server *server,
 	struct clip_ev ev = {.sel = sel, .what = what};
 	emit(server, sel->primary ? "primary-changed" : "clipboard-changed",
 		payload_clipboard, &ev);
+}
+
+/* 历史变了（增 / 删 / 清 / 同一条挪到最前）。payload 只报条数和字节数 —— 列表本身
+ * 由客户端收到事件后自己 clipboard-history 拉一遍（省得每条事件都带几十 KB 预览）。 */
+static void payload_clip_hist(struct jbuf *b, struct vidow_server *server,
+		void *data) {
+	jb_obj(b);
+	jb_kv_str(b, "reason", data);
+	jb_kv_int(b, "count", server->clipboard.hist_count);
+	jb_kv_uint(b, "bytes", server->clipboard.hist_bytes);
+	jb_obj_end(b);
+}
+
+void vidow_ipc_emit_clipboard_history(struct vidow_server *server,
+		const char *what) {
+	if (server == NULL ||
+			!vidow_event_wanted(server, "clipboard-history-changed")) {
+		return;
+	}
+	emit(server, "clipboard-history-changed", payload_clip_hist,
+		(void *)what);
 }
 
 void vidow_ipc_emit_layer(struct vidow_server *server, const char *event,

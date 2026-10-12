@@ -78,6 +78,11 @@ static void usage(void) {
 "      gesture hold-begin 3 / gesture hold-end（触控板手势，走 libinput 那条路） /\n"
 "      （合成鼠标键盘事件，等于操控整个桌面；按键只给客户端，不触发 vidow 的\n"
 "        快捷键。默认开着，见 config 的 input_injection）\n"
+"剪贴板：clipboard（状态）/ clipboard-get [--mime 类型] / clipboard-set --text 文本 /\n"
+"      clipboard-clear / clipboard-set-files 路径…（放文件，管理器粘出来是「复制文件」）/\n"
+"      clipboard-history（列历史）/ clipboard-history-get 第几条 [--mime 类型] /\n"
+"      clipboard-history-use 第几条（复制回剪贴板）/ clipboard-history-delete 第几条 /\n"
+"      clipboard-history-clear（第几条：0 = 最新，也认 --id）\n"
 "订阅：watch [事件名…]\n"
 "\n"
 "指认目标：--id N / --app-id 名字 / --title 子串 / --output 输出名 / --workspace 名字\n"
@@ -205,6 +210,11 @@ static const char *positional_key(const char *cmd, int index) {
 		{ "gesture", { "kind", "fingers", "a", "b", NULL } },
 		{ "send-key", { "state", "keys", NULL } },
 		{ "type-text", { "text", NULL } },
+		/* 剪贴板历史：位置参数是「第几条」（0 = 最新），也认 --id（稳定）。 */
+		{ "clipboard-history-get", { "index", "mime", NULL } },
+		{ "clipboard-history-use", { "index", NULL } },
+		{ "clipboard-history-delete", { "index", NULL } },
+		{ "clipboard-history-clear", { NULL } },
 	};
 	for (size_t i = 0; i < sizeof(maps) / sizeof(maps[0]); i++) {
 		if (strcmp(maps[i].cmd, cmd) != 0) {
@@ -492,6 +502,18 @@ int main(int argc, char *argv[]) {
 					/* action：后面几个词拼成一条动作字符串 */
 					fputs(",\"action\":", f);
 					json_escape(f, positional[0]);
+					break;
+				}
+				if (strcmp(cmd, "clipboard-set-files") == 0) {
+					/* clipboard-set-files 路径…：位置参数全收进 files 数组 */
+					fputs(",\"files\":[", f);
+					for (int j = 0; j < n_positional; j++) {
+						if (j > 0) {
+							fputc(',', f);
+						}
+						json_escape(f, positional[j]);
+					}
+					fputc(']', f);
 					break;
 				}
 				const char *key = positional_key(cmd, i);

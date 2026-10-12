@@ -29,7 +29,9 @@
 - **剪贴板桥**（`src/clipboard.c`）：自己接管的 X11 ↔ Wayland 剪贴板 / PRIMARY 同步，
   **不看焦点**（wlroots 那份只在 X11 窗口聚焦时才同步）、两边各留一份内存副本（源应用退出
   之后照样能粘贴）、INCR 双向支持；开关与上限都在配置里（`clipboard` / `clipboard_primary` /
-  `clipboard_max_bytes`）
+  `clipboard_max_bytes`）；带**历史**（`clipboard_history` 条数 + `clipboard_history_bytes`
+  字节预算，复制过的都能翻回来，文件复制连 `uri-list` + `gnome-copied-files` 一起留着）和
+  一个 GUI（`tools/vidowclip.py`，GTK3）
 - layer-shell：背景/底层/顶层/覆盖四层，支持 exclusive zone（顶栏占位）与键盘独占
 - 输入：键盘（xkb + 快捷键）、指针（移动/点击/滚轮/拖动）、虚拟键盘与虚拟指针（可自动化测试）
 - 输出：热插拔、`request_state` 尺寸变更后自动重排、`wl_output` + `zxdg_output_manager_v1`
@@ -1955,7 +1957,8 @@ vidow 自己的，比如 `vidow-wayland-1.sock`）；`ipc_socket` 可以写死�
 | 列 | `focus-column`、`move-column`、`cycle-column-width`、`set-column-width`（`fraction` 绝对值 / `delta` 相对）、`expand-column-to-available-width`、`center-column`、`toggle-maximize-column`、`set-maximize-column`（`maximized` true/false）、`expel-window-from-column`（把窗口从列里拎出来单独成列，`direction` 不写 = 右边） |
 | 工作区 | `focus-workspace`（名字 / `next` / `prev` / `index`）、`toggle-special`（= `focus-special`）、`create-workspace`、`move-workspace-to-output` |
 | 输出 | `output-power`（`on` / `off` / `toggle`）、`output-enable` / `output-disable` / `output-toggle`、`output-scale`（数字或 `auto`）、`output-transform`、`output-mode`（宽 高 [刷新率]）、`output-position`、`output-focus` |
-| 剪贴板 | `clipboard`（查状态）、`clipboard-get`（取数据：文本或 base64）、`clipboard-set`（放数据：文本 / base64 / 指定 mime / 指定选区）、`clipboard-clear` |
+| 剪贴板 | `clipboard`（查状态）、`clipboard-get`（取数据：文本或 base64）、`clipboard-set`（放数据：文本 / base64 / 指定 mime / 指定选区）、`clipboard-set-files`（`files` = 路径数组，发 uri-list + gnome-copied-files，见「文件复制」）、`clipboard-clear` |
+| 剪贴板历史 | `clipboard-history`（条数 / 字节 / 上限 / 条目表：id、预览、mime、文件表）、`clipboard-history-get`（`id` 或 `index` + 可选 `mime` / `base64`，取全文）、`clipboard-history-use`（拿回剪贴板）、`clipboard-history-delete`、`clipboard-history-clear` |
 | 合成器 | `action`（键位那套动作字符串）、`set-config` / `get-config`、`reload-config`、`toggle-overview`、`mru`（最近窗口台账 + 面板几何）、`move-cursor`、`quit` |
 | 输入注入 | `pointer-button`（`click` / `press` / `release` + `button` / `count`）、`pointer-scroll`（`dx` / `dy` / `discrete`）、`send-key`（`state` + `keys`）、`type-text`（`text`）；见下面「输入注入」一节 |
 | 订阅 | `subscribe`（可带 `events` 过滤器）、`unsubscribe` |
@@ -2002,6 +2005,7 @@ vidow 自己的，比如 `vidow-wayland-1.sock`）；`ipc_socket` 可以写死�
 | `output-power-changed` | 某块屏开了或关了（`name` + `enabled`；窗口和布局一件没动，见「关屏」那条） |
 | `layer-mapped` / `layer-unmapped` / `layer-closed` | layer surface 上屏 / 下屏 / 没了 |
 | `clipboard-changed` / `primary-changed` | 剪贴板 / 选区的内容或状态变了（载荷是那一刻的状态对象，跟 `clipboard` 命令一样） |
+| `clipboard-history-changed` | 历史变了（`reason` = `push`（新记一条）/ `dup`（重复，挪到最前）/ `delete` / `clear`，外加那一刻的 `count` / `bytes`） |
 | `mru-shown` / `mru-opened` / `mru-committed` / `mru-cancelled` | Alt+Tab 切换器：面板显形 / 打开 / 选定 / 取消（没有载荷，去查 `mru`） |
 | `keybind` | 绑好的键被按下（`trigger` = `Mod+1` 这样的触发串、`action` = 那条动作串） |
 | `ipc-action` | 从 IPC 来的动作（`action` + `source: "ipc"`）—— 和键位那条分开报，「谁按的」分得清 |
@@ -2446,10 +2450,69 @@ Wayland 客户端复制时，wlroots 的 xwm 会**替它**在 X 那边声明选�
 clipboard = 1                 # 默认开；0 = 不接管，退回 wlroots 那套（只有 X 窗口聚焦时才同步）
 clipboard_primary = 1         # 默认开；0 = 连 PRIMARY（选区）也不碰
 clipboard_max_bytes = 33554432   # 每种 mime 的内存副本上限
+clipboard_history = 32        # 历史留几条；0 = 不留（当场清空，之后也不记）
+clipboard_history_bytes = 67108864   # 历史的字节预算（到顶就从头挤，但至少留一条）
 ```
 
 `set-config` / SIGHUP 都能热切换：关掉时会把已经发布的选区收回（`sel_unpublish`），X 侧的
-监听窗口与 XFixes 注册一起摘掉，退出路径上不留东西。
+监听窗口与 XFixes 注册一起摘掉，退出路径上不留东西。`clipboard_history` / 
+`clipboard_history_bytes` 也是热的：改成 0 当场清空历史。
+
+### 历史
+
+`clipboard_history` 条（默认 32），新的在前。一条历史 = 一次复制的内容快照：从 X11 取回来的、
+从 Wayland 拉过来的、IPC 塞进去的、以及「从历史里拿回来」的都会记。
+
+- **只留需要的几个类型**：按 `mime_rank`（见下）从前往后留 6 个 —— 够装下「文本 + uri-list +
+  gnome-copied-files」这种一份内容带三四种类型的常见情况，又不会为一份复制把几十个类型全留一遍。
+- **去重**：内容一样（字节数 + 选区 + 每个类型逐字节比）就不新记，把老的那条挪到最前（事件里
+  `reason` 是 `dup`）。所以反复复制同一段文字不会把历史刷爆。
+- **淘汰**：超过 `clipboard_history` 条、或总字节超过 `clipboard_history_bytes` 时，从最旧的
+  那头删；**至少留一条**（刚复制完就把自己挤掉就没意义了）。
+- **快照的时机**：只有数据**取完**才记（X11 侧 `staging` commit 完 / Wayland 侧管道读完），
+  不会记半份。
+- 拿回来的路径和客户端复制是同一条：`clipboard-history-use` 走 `sel_publish()`，xwm 去 X 那边
+  声明所有权，我们的缓存照常应答 X 的 `SelectionRequest` —— 所以「拿回来」之后**谁**来粘都行。
+
+### 文件复制
+
+一份「文件复制」在 X11 / Wayland 里其实是三个类型一起发：
+
+| 类型 | 内容 | 谁认 |
+| --- | --- | --- |
+| `text/uri-list` | `file:///路径` 每行一条，CRLF 结尾 | 文件管理器、X11 程序 |
+| `x-special/gnome-copied-files` | 第一行 `copy`，后面每行一个 URI（LF） | GNOME / Nautilus、Thunar |
+| `text/plain;charset=utf-8` | 路径文本，每行一条 | 终端、编辑器 |
+
+```bash
+vidowmsg clipboard-set-files /tmp/a.txt "/tmp/带 空格 的名字.txt"
+```
+
+路径按 RFC 3986 百分号编码（`空格` → `%20`、中文也编），`file://` 前缀自己补。
+因为 `text/plain` 的 rank 排在 `uri-list` 前面，`clipboard-get` / 预览里默认看到的是**路径文本**；
+文件管理器看到的仍是 uri-list，两边不打架。历史里这种条目标成 `is_file`，并且
+`x-special/gnome-copied-files` 与 `uri-list` 同档保留 —— 从历史拿回来的时候还是**复制文件**，
+不会退化成一段路径文本。
+
+### 图形界面：`tools/vidowclip.py`
+
+```bash
+python3 tools/vidowclip.py                 # 窗口（GTK3，需要 python3-gi）
+python3 tools/vidowclip.py --socket /path/to/vidow-wayland-0.sock
+python3 tools/vidowclip.py --check         # 不建窗口，只把 IPC 走一遍（脚本里用）
+```
+
+一个独立窗口（不是 layer surface，也不进合成器内部），走的是和 `vidowmsg` 完全相同的 IPC：
+订阅 `clipboard-changed` / `primary-changed` / `clipboard-history-changed`，500ms 兜底拉一次
+状态（订阅断了也不瞎）。窗口里：
+
+- **状态条**：CLIPBOARD / PRIMARY 现在是谁的（`origin`、X owner、几个类型、多少字节）。
+- **历史列表**：时间 / 类型 / 来源 / 一行预览；双击（或选中后按「复制回剪贴板」）= 拿回来。
+  文件条目按「复制回剪贴板」是**原样**发布三个类型（文件管理器粘出来是复制文件）；
+  想按路径重新拼一份（文件改名/移动后用）用「复制文件」。
+- **预览**：文本全文、图片缩略图（`image/*` 直接画）、文件条目列出路径。
+- **开关**：同步剪贴板 / 同步 PRIMARY / 历史条数 / 历史内存预算 —— 改一下就是一次 `set-config`。
+- **塞内容**：一行文本塞进剪贴板；「清空剪贴板」「清空历史」「删除」各一个按钮。
 
 ### IPC
 
@@ -2458,7 +2521,13 @@ vidowmsg clipboard                       # 状态：来源 / X owner / 在取数
 vidowmsg clipboard-get                   # 取剪贴板（文本直接给，别的类型给 base64 + mime）
 vidowmsg clipboard-get --selection primary
 vidowmsg clipboard-set "hello"           # 放剪贴板（也可以 --mime image/png --base64）
+vidowmsg clipboard-set-files /tmp/a.txt  # 放「复制文件」（uri-list + gnome-copied-files）
 vidowmsg clipboard-clear
+vidowmsg clipboard-history               # 历史：条数 / 上限 / 条目（id、预览、mime、文件表）
+vidowmsg clipboard-history-get 0         # 第 0 条（0 = 最新）的全文，也可 --id
+vidowmsg clipboard-history-use 1         # 第 1 条拿回剪贴板（文件条目拿回来还是文件）
+vidowmsg clipboard-history-delete 2      # 删第 2 条（也认 --id）
+vidowmsg clipboard-history-clear
 ```
 
 状态里 `origin` 说明这份数据现在是谁的（`wayland` / `x11` / `none`），`x_owner` 是 X 那边的
@@ -3818,7 +3887,8 @@ src/ipcstate.c IPC 的状态视图：把内部状态序列化成 JSON（窗口/�
                输入/令牌/动画…）、组装事件信封。只读，不改状态
 src/json.c     极简 JSON（纯 C，不碰 wlroots）：写出（jb_*）+ 读入（jparse），tools/jsontest.c
                直接拿这份源码编译来自检。IPC 的每条消息都从这儿过，所以它自己也有测试
-src/clipboard.c X11 <-> Wayland 剪贴板桥（自己接管，不用 wlroots 那份带焦点闸门的）：
+src/clipboard.c X11 <-> Wayland 剪贴板桥（自己接管，不用 wlroots 那份带焦点闸门的）+ 历史
+                （按 mime_rank 留前 6 个类型、去重挪到最前、超条数/字节从最旧的淘汰）：
                拦 xwm 连接上的选区事件、两边各留一份内存副本、INCR 双向 —— 详见「剪贴板」
 src/portal.c   portal 要的协议：xdg-foreign v1+v2（共用 registry）、
                foreign-toplevel-management、ext-foreign-toplevel-list + 截图源
@@ -3856,6 +3926,8 @@ tools/preinit.c   状态请求抢跑客户端：surface 还没 initialized（一
                   set_maximized / set_minimized / set_fullscreen；`--after-commit` 是
                   对照组（上屏之后再发）—— 专门撞 schedule_configure 里那句
                   `assert(surface->initialized)`
+tools/vidowclip.py 剪贴板 GUI（GTK3）：状态 / 历史 / 预览 / 拿回来 / 热开关，
+                  走的是和 vidowmsg 同一条 IPC；`--check` 不建窗口只走 IPC
 tools/pattern.py  四象限测试窗口（验证 shader 管线方向与颜色）
 tools/glass.py    半透明定尺寸窗口（验证窗口透明度与背景模糊）
                    VIDOW_TEST_EMPTY=1 时不画内容，只剩装饰 + 模糊
@@ -3984,7 +4056,9 @@ test-vt.sh        tty 的 VT 切换：headless 下验「认得 Ctrl+Alt+F2（F1.
                   就是 VT 键）、不接管、不吃键」，`switch-vt` 动作 / 越界号优雅失败，
                   config 里绑的 switch-vt 走同一条路（真机上生效的就是它）
 test-clipboard.sh 剪贴板桥：接管、X11->Wayland、Wayland->X11、PRIMARY、INCR（大块）、
-                  错误路径与事件、配置热切换（关掉退回 wlroots 那套）、退出与清理
+                  错误路径与事件、配置热切换（关掉退回 wlroots 那套）、退出与清理，
+                  外加历史（去重 / 淘汰 / 拿回来 / 删除 / 关掉当场清空）、文件复制
+                  （uri-list + gnome-copied-files 逐字节核对）、`vidowclip.py --check`
 test-hotplug.sh   真拔一块 headless 输出再以同名插回来：列 / 浮动窗口 / layer surface
                   的归属与还原（顺序、列宽、滚动位置、平移量、四象限像素）
 test-layerwin.sh  top / overlay 层的模糊里必须含窗口（纯蓝窗口 + 压在它上面的面板，
@@ -4968,6 +5042,42 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
       - 另一个踩到的坑（不是 vidow 的）：`awww img` 默认带过渡动画，动画没跑完就进全景，抓到的
         底衬是**半透明混合**的（量到 (107,66,38)，金色和洋红混在一起）。验证 / 截图时加
         `--transition-type none`。
+
+225. **剪贴板加历史 + 一个 GUI**（用户：「内置的剪贴板同步需要一个 GUI」，以及「需要能从剪贴板
+     历史里面复制内容，剪贴板历史里如果是文件路径（file 前缀）则复制文件」）
+
+     - **历史**（`src/clipboard.c` + `src/server.h`）：`clipboard_history` 条（默认 32）+
+       `clipboard_history_bytes` 字节预算（默认 64 MiB），新的在前。快照只在数据**取完**时才记
+       （X11 侧 `staging` commit 完 / Wayland 侧管道读完），一条按 `mime_rank` 留前 6 个类型
+       （够装「文本 + uri-list + gnome-copied-files」这种一份内容带好几个类型的情况）。
+       去重（逐类型比字节）只把老的那条挪到最前、**不新增**；超条数或超字节从最旧的删，
+       但**至少留一条**。两个配置都是热的（改成 0 当场清空，之后不再记）。
+     - **拿回来**：`clipboard-history-use` 走的是和客户端复制**同一条** `sel_publish()` 路
+       （xwm 去 X 那边声明所有权、我们的内存副本应答 `SelectionRequest`），所以拿回来之后
+       谁粘都行，不挑焦点。
+     - **文件复制**（用户那条要求的正解）：`clipboard-set-files <路径…>` 一次发三个类型 ——
+       `text/uri-list`（CRLF）、`x-special/gnome-copied-files`（第一行 `copy`，LF）、
+       `text/plain;charset=utf-8`（路径文本）；路径按 RFC 3986 百分号编码（空格 `%20`、中文也编）。
+       因为 `text/plain` 的 rank 更靠前，`clipboard-get` / 预览默认看到的是路径文本，文件管理器
+       看到的仍是 uri-list，两边不打架。历史里这种条目标 `is_file`，并且把
+       `gnome-copied-files` 提到和 `uri-list` 同一档 rank —— 它不会被挤出前 6，从历史拿回来
+       还是**复制文件**，不会退化成一段路径文本。
+     - **GUI**（`tools/vidowclip.py`，GTK3 / `python3-gi`）：状态条（CLIPBOARD / PRIMARY 各自的
+       origin、X owner、类型数、字节数）、历史列表（双击 = 拿回来）、预览（文本全文 / 图片缩略图 /
+       文件路径表）、热开关（剪贴板 / PRIMARY / 历史条数 / 历史预算）、塞一行文本与三个清空按钮。
+       走的是和 `vidowmsg` **完全相同**的 IPC（订阅 `clipboard-changed` / `primary-changed` /
+       `clipboard-history-changed`，500ms 兜底拉一次），没有第二条私有通道；`--check` 不建窗口、
+       只把 IPC 走一遍（脚本里判断能不能用）。
+     - **顺手修掉一个老 bug**（GUI 第一次跑就崩在它上面）：`ipc.c` 里两处
+       `jget_bool(req, "base64", false)` —— 第三个参数是**写哪**，传 `false` 就是 NULL；
+       客户端只要明写 `{"base64":false}`（JSON 布尔，不是字符串），合成器就写到空指针上。
+       `cmd_clipboard_get` 那处是原来就有的，两处一起改成局部变量。
+     - 判据：`./test-clipboard.sh` 从 68 项加到 **111 项**（新增 H 段 43 项：X11 与 IPC 两条路
+       都进历史、去重不新增且 id 不变、上限到了淘汰最旧的、`use` / `delete` / 越界报错、
+       文件复制三个类型逐字节核对（含 `%20` 与中文的百分号编码）、`gnome-copied-files` 里
+       uri-list 还在、`clipboard_history=0` 当场清空且不再记、`clipboard-history-changed` 事件、
+       `vidowclip.py --check`），**全过**。GUI 的样子在 headless 上截过图逐张看过（文本 / 图片 /
+       文件三种预览、开关与列表）。
 
 224. **测试套件清一遍：删掉 25 处「测了等于没测」和死代码，顺手修好两条一直是红的判据**
       （用户：「检查一下测试项目，去掉无用和没必要的测试」）

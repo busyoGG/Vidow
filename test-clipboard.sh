@@ -181,10 +181,10 @@ PY
 ipc() { python3 "$JF" "$SOCK" "$1"; }
 jf() { python3 "$JF" "$SOCK" "$1" "$2"; }
 eval_resp() { python3 -c '
-import json, sys
+import base64, json, sys
 resp = json.loads(sys.argv[1])
 try:
-    print(eval(sys.argv[2], {"resp": resp, "json": json}))
+    print(eval(sys.argv[2], {"resp": resp, "json": json, "base64": base64}))
 except Exception as exc:
     print("ERR:%s" % exc)' "$1" "$2"; }
 
@@ -526,7 +526,173 @@ start_holder "$RUNDIR/in.txt" xclip -selection primary -in
 sleep 0.7
 ck "primary 又能同步了" "$(clip_text primary)" "$G3"
 
-mark "H) 退出与清理"
+mark "H) 历史与文件复制"
+
+stop_holder
+jf '{"cmd":"set-config","key":"clipboard_history","value":"3"}' 'resp["ok"]' >/dev/null
+jf '{"cmd":"clipboard-history-clear"}' 'resp["ok"]' >/dev/null
+check "清空后 0 条" '{"cmd":"clipboard-history"}' 'resp["result"]["count"]' '0'
+check "上限报 3" '{"cmd":"clipboard-history"}' 'resp["result"]["limit"]' '3'
+
+H1="hist-from-x11-$$"
+printf '%s' "$H1" > "$RUNDIR/in.txt"
+start_holder "$RUNDIR/in.txt" xclip -selection clipboard -in
+sleep 0.7
+ck "X11 拷的这份进了历史" "$(clip_text)" "$H1"
+check "历史 1 条" '{"cmd":"clipboard-history"}' 'resp["result"]["count"]' '1'
+check "内容对" '{"cmd":"clipboard-history"}' \
+	'resp["result"]["entries"][0]["text"]' "$H1"
+check "来源记成 x11" '{"cmd":"clipboard-history"}' \
+	'resp["result"]["entries"][0]["origin"]' 'x11'
+check "是剪贴板不是选区" '{"cmd":"clipboard-history"}' \
+	'resp["result"]["entries"][0]["selection"]' 'clipboard'
+check "id 是正整数" '{"cmd":"clipboard-history"}' \
+	'resp["result"]["entries"][0]["id"] > 0' 'True'
+stop_holder
+
+H2="hist-ipc-$$"
+jf "{\"cmd\":\"clipboard-set\",\"text\":\"$H2\"}" 'resp["ok"]' >/dev/null
+sleep 0.3
+check "IPC 塞的也进历史（新的在最前）" '{"cmd":"clipboard-history"}' \
+	'[e["text"] for e in resp["result"]["entries"]]' "['$H2', '$H1']"
+ID_BEFORE=$(jf '{"cmd":"clipboard-history"}' 'resp["result"]["entries"][0]["id"]')
+jf "{\"cmd\":\"clipboard-set\",\"text\":\"$H2\"}" 'resp["ok"]' >/dev/null
+sleep 0.3
+check "同样的内容再塞不新增（去重）" '{"cmd":"clipboard-history"}' \
+	'resp["result"]["count"]' '2'
+check "id 也没变（是挪到最前，不是新记一条）" '{"cmd":"clipboard-history"}' \
+	'resp["result"]["entries"][0]["id"]' "$ID_BEFORE"
+
+# 上限 3 条：塞第 4 份时把最旧的挤掉
+H3="hist-three-$$"
+H4="hist-four-$$"
+jf "{\"cmd\":\"clipboard-set\",\"text\":\"$H3\"}" 'resp["ok"]' >/dev/null
+jf "{\"cmd\":\"clipboard-set\",\"text\":\"$H4\"}" 'resp["ok"]' >/dev/null
+sleep 0.3
+check "到上限就不涨了" '{"cmd":"clipboard-history"}' 'resp["result"]["count"]' '3'
+check "最旧的被淘汰" '{"cmd":"clipboard-history"}' \
+	'[e["text"] for e in resp["result"]["entries"]]' \
+	"['$H4', '$H3', '$H2']"
+
+# 拿回来：按 index 选第 2 条（0 = 最新）
+jf '{"cmd":"clipboard-history-use","index":1}' 'resp["ok"]' >/dev/null
+sleep 0.3
+ck "use 第 2 条后剪贴板是它" "$(clip_text)" "$H3"
+check "用过的挪到最前（去重不新增）" '{"cmd":"clipboard-history"}' \
+	'[e["text"] for e in resp["result"]["entries"]]' \
+	"['$H3', '$H4', '$H2']"
+check "还是 3 条" '{"cmd":"clipboard-history"}' 'resp["result"]["count"]' '3'
+
+# 删
+jf '{"cmd":"clipboard-history-delete","index":0}' 'resp["ok"]' >/dev/null
+check "删掉最新一条后 2 条" '{"cmd":"clipboard-history"}' 'resp["result"]["count"]' '2'
+check "删的是那一条" '{"cmd":"clipboard-history"}' \
+	'[e["text"] for e in resp["result"]["entries"]]' "['$H4', '$H2']"
+jf '{"cmd":"clipboard-history-delete","id":99999}' 'resp["ok"]' >/dev/null
+check "删不存在的 id 不动历史" '{"cmd":"clipboard-history"}' 'resp["result"]["count"]' '2'
+check "越界 index 报错" '{"cmd":"clipboard-history-delete","index":9}' 'resp["ok"]' 'False'
+
+# 文件复制：file:// 的要连着 uri-list + gnome-copied-files 一起发
+printf 'hello\n' > "$RUNDIR/f1.txt"
+printf 'world\n' > "$RUNDIR/f2 空格.txt"
+jf "{\"cmd\":\"clipboard-set-files\",\"files\":[\"$RUNDIR/f1.txt\",\"$RUNDIR/f2 空格.txt\"]}" \
+	'resp["ok"]' >/dev/null
+sleep 0.3
+check "uri-list 两条" '{"cmd":"clipboard-get","mime":"text/uri-list"}' \
+	'len(resp["result"]["text"].splitlines())' '2'
+check "第一条 URI 对" '{"cmd":"clipboard-get","mime":"text/uri-list"}' \
+	'resp["result"]["text"].splitlines()[0]' "file://$RUNDIR/f1.txt"
+check "空格被百分号编码（按 RFC 3986，中文也是）" \
+	'{"cmd":"clipboard-get","mime":"text/uri-list"}' \
+	'resp["result"]["text"].splitlines()[1]' \
+	"file://$RUNDIR/f2%20%E7%A9%BA%E6%A0%BC.txt"
+check "gnome-copied-files 头是 copy" \
+	'{"cmd":"clipboard-get","mime":"x-special/gnome-copied-files"}' \
+	'base64.b64decode(resp["result"]["base64"]).decode().split("\n")[0]' 'copy'
+check "gnome 第二行是第一条文件" \
+	'{"cmd":"clipboard-get","mime":"x-special/gnome-copied-files"}' \
+	'base64.b64decode(resp["result"]["base64"]).decode().split("\n")[1]' \
+	"file://$RUNDIR/f1.txt"
+check "默认取到的是路径文本（终端粘出来是路径）" '{"cmd":"clipboard-get"}' \
+	'resp["result"]["text"]' "$(printf '%s\n%s\n' "$RUNDIR/f1.txt" "$RUNDIR/f2 空格.txt")"
+check "历史里这条认成文件" '{"cmd":"clipboard-history"}' \
+	'resp["result"]["entries"][0]["is_file"]' 'True'
+check "历史里列出 2 个文件" '{"cmd":"clipboard-history"}' \
+	'len(resp["result"]["entries"][0]["files"])' '2'
+check "历史里文件 URI 对" '{"cmd":"clipboard-history"}' \
+	'resp["result"]["entries"][0]["files"][0]' "file://$RUNDIR/f1.txt"
+check "历史里也留着 gnome 那个类型（不然复制回来就不是文件了）" \
+	'{"cmd":"clipboard-history"}' \
+	'"x-special/gnome-copied-files" in resp["result"]["entries"][0]["mimes"]' 'True'
+check "历史取全文拿得到 uri-list" \
+	'{"cmd":"clipboard-history-get","index":0,"mime":"text/uri-list"}' \
+	'resp["result"]["text"].splitlines()[0]' "file://$RUNDIR/f1.txt"
+jf '{"cmd":"clipboard-history-use","index":0}' 'resp["ok"]' >/dev/null
+sleep 0.3
+check "文件那条复制回来还是文件（uri-list 还在）" \
+	'{"cmd":"clipboard-get","mime":"text/uri-list"}' \
+	'resp["result"]["text"].splitlines()[0]' "file://$RUNDIR/f1.txt"
+check "gnome 那份也还在" \
+	'{"cmd":"clipboard-get","mime":"x-special/gnome-copied-files"}' \
+	'base64.b64decode(resp["result"]["base64"]).decode().split("\n")[0]' 'copy'
+
+# 关掉历史 = 当场清空 + 不再记
+jf '{"cmd":"set-config","key":"clipboard_history","value":"0"}' 'resp["ok"]' >/dev/null
+sleep 0.3
+check "clipboard_history=0 当场清空" '{"cmd":"clipboard-history"}' \
+	'resp["result"]["count"]' '0'
+check "报 enabled=false" '{"cmd":"clipboard-history"}' 'resp["result"]["enabled"]' 'False'
+jf '{"cmd":"clipboard-set","text":"history-off-$$"}' 'resp["ok"]' >/dev/null
+sleep 0.3
+check "关掉之后不再记" '{"cmd":"clipboard-history"}' 'resp["result"]["count"]' '0'
+jf '{"cmd":"set-config","key":"clipboard_history","value":"4"}' 'resp["ok"]' >/dev/null
+sleep 0.3
+jf '{"cmd":"clipboard-set","text":"history-on-$$"}' 'resp["ok"]' >/dev/null
+sleep 0.3
+check "打开之后又记了" '{"cmd":"clipboard-history"}' 'resp["result"]["count"]' '1'
+check "上限跟着变" '{"cmd":"clipboard-history"}' 'resp["result"]["limit"]' '4'
+
+# 事件（先清空，好让下面这条 push 的 count 是确定的 1）
+jf '{"cmd":"clipboard-history-clear"}' 'resp["ok"]' >/dev/null
+timeout 20 ./build/vidowmsg --socket "$SOCK" --raw watch clipboard-history-changed \
+	> "$WATCH_FILE" 2>&1 &
+WATCH_PID=$!
+sleep 0.8
+jf '{"cmd":"clipboard-set","text":"history-event-$$"}' 'resp["ok"]' >/dev/null
+sleep 0.8
+kill "$WATCH_PID" 2>/dev/null
+WATCH_PID=""
+ck_has "收到 clipboard-history-changed 事件" "$(cat "$WATCH_FILE" 2>/dev/null)" \
+	'clipboard-history-changed'
+# --raw 给的是紧凑 JSON（没空格），别拿 '"reason": "push"' 去 grep
+hist_event_field() {
+	python3 -c '
+import json, sys
+for line in open(sys.argv[1]):
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        ev = json.loads(line)
+    except ValueError:
+        continue
+    if ev.get("event") == "clipboard-history-changed":
+        print(ev.get("data", {}).get(sys.argv[2], ""))
+        break' "$WATCH_FILE" "$1"
+}
+ck "事件里 reason=push" "$(hist_event_field reason)" 'push'
+ck "事件里带条数" "$(hist_event_field count)" '1'
+
+# GUI（GTK）那条 IPC 通路：不建窗口，只把命令走一遍
+if python3 -c 'import gi' 2>/dev/null; then
+	ck "vidowclip.py --check 走得通" \
+		"$(python3 ./tools/vidowclip.py --check > "$RUNDIR/clipcheck.log" 2>&1; echo $?)" '0'
+	ck_has "--check 报出了历史条数" "$(cat "$RUNDIR/clipcheck.log")" 'history'
+else
+	echo "  SKIP  vidowclip.py --check（这台没装 python3-gi）"
+fi
+
+mark "I) 退出与清理"
 
 check "quit 干净退出" '{"cmd":"quit"}' 'resp["ok"]' 'True'
 sleep 1.5

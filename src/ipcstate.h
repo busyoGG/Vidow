@@ -12,6 +12,7 @@
 struct vidow_server;
 struct vidow_view;
 struct vidow_clip_selection;
+struct vidow_clip_hist_entry;
 struct vidow_column;
 struct vidow_layer_surface;
 struct vidow_workspace;
@@ -46,6 +47,12 @@ void vidow_ipc_json_xwayland(struct jbuf *b, struct vidow_server *server);
  * 事件（x11 / wayland-set / clear / ...），IPC 里能看出来是谁在动。 */
 void vidow_ipc_json_clipboard(struct jbuf *b, struct vidow_server *server,
 		struct vidow_clip_selection *sel, const char *what);
+/* 一条剪贴板历史（index 是它在列表里的位置，0 = 最新）。 */
+void vidow_ipc_json_clip_hist_entry(struct jbuf *b, struct vidow_server *server,
+		struct vidow_clip_hist_entry *e, int index);
+/* 历史变了：clipboard-history-changed 事件（what = push / dup / delete / clear）。 */
+void vidow_ipc_emit_clipboard_history(struct vidow_server *server,
+		const char *what);
 void vidow_ipc_json_windows(struct jbuf *b, struct vidow_server *server);
 void vidow_ipc_json_workspaces(struct jbuf *b, struct vidow_server *server);
 void vidow_ipc_json_outputs(struct jbuf *b, struct vidow_server *server);
