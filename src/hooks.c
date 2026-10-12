@@ -57,6 +57,7 @@ static const char *event_names[] = {
 	"layer-mapped",
 	"layer-unmapped",
 	"layer-closed",
+	"background-changed",
 	"clipboard-changed",
 	"primary-changed",
 	"mru-shown",

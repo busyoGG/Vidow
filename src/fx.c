@@ -1792,6 +1792,9 @@ static bool layer_blur_wanted(struct vidow_server *server,
 static bool layer_blur_frame(struct vidow_server *server,
 		struct vidow_output *output, struct vidow_layer_surface *ls);
 static void layer_blur_capture_visible(struct vidow_server *server, bool on);
+/* overview 里那张糊掉的壁纸（整屏，垫在压暗遮罩下面）。 */
+static void vidow_overview_blur_frame(struct vidow_server *server,
+		struct vidow_output *output);
 
 static int blur_levels_for(struct vidow_server *server, int w, int h) {
 	int levels = server->config.blur_levels;
@@ -2474,6 +2477,9 @@ void vidow_blur_update(struct vidow_output *output) {
 		 * 节点：别一帧有、一帧没有地闪。 */
 		(void)layer_blur_frame(server, output, ls);
 	}
+
+	/* overview：整屏一张糊掉的壁纸（niri 那样），垫在压暗遮罩下面。 */
+	vidow_overview_blur_frame(server, output);
 }
 
 /* ------------------------------------------------------------------- draw */
@@ -3300,13 +3306,129 @@ static bool layer_blur_frame(struct vidow_server *server,
 	return true;
 }
 
+/* overview 里那张糊掉的壁纸。
+ *
+ * 跟 bottom 层 layer surface 的底衬是同一套（共享底衬 output->blur_tex + blur_only
+ * 那次装饰渲染），区别只有两点：它摊满整块屏，而且画在 layer_overview_dim 那棵树
+ * 里（壁纸之上、窗口之下）—— 全景里缩小的窗口底下就是一整片糊壁纸，niri 那个味道。
+ *
+ * 拿不到共享底衬（没开模糊 / 这屏还没有底衬）就什么都不画，退回「只压暗」：遮罩
+ * 还在，不至于变成一块没压过的壁纸。 */
+static void vidow_overview_blur_frame(struct vidow_server *server,
+		struct vidow_output *output) {
+	struct vidow_overview *ov = &server->overview;
+	struct vidow_fx_target *fx = &ov->fx;
+
+	/* 只画 overview 锁的那块屏，而且得真在展开（t > 0）。 */
+	bool want = ov->output == output->wlr_output && ov->t > 0.002 &&
+		server->config.overview_blur && server->config.blur_enabled;
+	if (!want || output->blur_tex == NULL) {
+		if (fx->node != NULL) {
+			wlr_scene_node_set_enabled(&fx->node->node, false);
+		}
+		ov->fx_on = false;
+		return;
+	}
+
+	struct wlr_box box = {0};
+	wlr_output_layout_get_box(server->output_layout, output->wlr_output, &box);
+	if (box.width < 1 || box.height < 1) {
+		ov->fx_on = false;
+		return;
+	}
+	double scale = output->wlr_output->scale;
+	if (!(scale > 0.0)) {
+		scale = 1.0;
+	}
+	int logical_w = box.width, logical_h = box.height;
+	int px_w = (int)lround((double)logical_w * scale);
+	int px_h = (int)lround((double)logical_h * scale);
+	if (px_w < 1 || px_h < 1 || px_w > MAX_TARGET_PX || px_h > MAX_TARGET_PX) {
+		ov->fx_on = false;
+		return;
+	}
+
+	if (fx->node == NULL) {
+		fx->node = wlr_scene_buffer_create(server->layer_overview_dim, NULL);
+		if (fx->node == NULL) {
+			ov->fx_on = false;
+			return;
+		}
+		fx->node->point_accepts_input = fx_node_rejects_input;
+		/* 垫在压暗遮罩下面（遮罩比它先建）。 */
+		wlr_scene_node_lower_to_bottom(&fx->node->node);
+	}
+	fx->blur_only = true;
+	fx->active = true;
+	fx->blur = true;
+	/* 恒等映射：这块元素就是整块屏，没有「窗口几何」那层偏移（跟 layer 底衬
+	 * 一样，这一路不经过 vidow_fx_begin，字段得自己填）。 */
+	fx->tex_off_x = 0.0f;
+	fx->tex_off_y = 0.0f;
+	fx->tex_scale_x = 1.0f;
+	fx->tex_scale_y = 1.0f;
+
+	if (fx->buf[0] == NULL || fx->w != px_w || fx->h != px_h ||
+			fabs(fx->scale - scale) > 1e-3) {
+		drop_targets(fx);
+		for (int i = 0; i < 2; i++) {
+			fx->buf[i] = vidow_alloc_target(server, px_w, px_h);
+			if (fx->buf[i] == NULL) {
+				drop_targets(fx);
+				ov->fx_on = false;
+				return;
+			}
+		}
+		fx->w = px_w;
+		fx->h = px_h;
+		fx->content_w = px_w;
+		fx->content_h = px_h;
+		fx->px_pad = 0;
+		fx->dst_w = logical_w;
+		fx->dst_h = logical_h;
+		fx->scale = scale;
+		fx->blur_drawn = 0; /* 尺寸变了，必须重画 */
+	}
+	/* region = NULL：这张贴图盖的就是整块屏，着色器按「元素在输出上的位置」
+	 * 采样（u_origin = ox*scale - 输出原点），跟 bottom 层那条路一样。 */
+	blur_assign(fx, output->blur_tex, false, output->blur_id, NULL);
+	if (fx->blur_drawn == fx->blur_ver) {
+		ov->fx_on = true; /* 已经画的就是这一版 */
+		wlr_scene_node_set_enabled(&fx->node->node, true);
+		return;
+	}
+
+	struct wlr_buffer *target = pick_free(fx->buf);
+	if (target == NULL) {
+		return; /* 两个目标都还在飞：留着上一帧那张，别闪 */
+	}
+	static const float no_border[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+	struct vidow_look look = {0};
+	look.opacity = 1.0;
+	look.blur = true;
+	look.decor = false;
+	/* mask = NULL：整块屏都要糊，不按元素 alpha 剔（blur_only 且 mask == NULL
+	 * 时着色器自己把阈值归零，见 decor_draw）。 */
+	decor_draw(server, fx, target, server->empty_tex, NULL, no_border,
+		box.x, box.y, 1.0, scale, &look);
+	wlr_scene_node_set_position(&fx->node->node, box.x, box.y);
+	wlr_scene_buffer_set_dest_size(fx->node, logical_w, logical_h);
+	wlr_scene_buffer_set_opacity(fx->node, fx->masked ? 0.0f : 1.0f);
+	pixman_region32_t damage;
+	pixman_region32_init_rect(&damage, 0, 0, logical_w, logical_h);
+	wlr_scene_buffer_set_buffer_with_damage(fx->node, target, &damage);
+	pixman_region32_fini(&damage);
+	wlr_scene_node_set_enabled(&fx->node->node, true);
+	fx->blur_drawn = fx->blur_ver;
+	ov->fx_on = true;
+}
+
 static void layer_blur_capture_visible(struct vidow_server *server, bool on) {
 	struct vidow_layer_surface *ls;
 	wl_list_for_each(ls, &server->layers, link) {
 		if (ls->fx.node != NULL) {
 			wlr_scene_node_set_enabled(&ls->fx.node->node, on);
-		}
-		/* 光藏模糊节点不够：**会被模糊的那个 surface 本身**也不能进底衬。
+		}		/* 光藏模糊节点不够：**会被模糊的那个 surface 本身**也不能进底衬。
 		 * bottom 层的面板（dock 这类）自己也在抓的树里，它要的那份底衬如果含它
 		 * 自己，模糊里就会浮出一个自己的影子（半透明的地方透出「自己的糊版」）。
 		 * 藏之前记一笔，免得回填的时候把本来就该藏着的东西点亮。 */

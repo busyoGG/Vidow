@@ -293,6 +293,13 @@ struct vidow_config {
 	/* 全景（overview，见 src/overview.c）：压在壁纸之上、窗口之下的那层遮罩。
 	 * 颜色带 alpha（RRGGBBAA），alpha 就是「压多暗」，0 = 不压暗。 */
 	float overview_dim_color[4];
+	/* 全景里把壁纸糊掉（niri 那样）：模糊的那张壁纸直接摊满整块屏，垫在遮罩
+	 * 下面。关掉（或者 blur_enabled = false / 没有可用底衬）就只剩压暗。 */
+	bool overview_blur;
+
+	/* 桌面底色：没有壁纸客户端（layer-shell 的 background 层）时垫在最底下的
+	 * 颜色，有壁纸客户端时被它盖住。RRGGBB 或 RRGGBBAA。 */
+	float background_color[4];
 };
 
 /* gap 的唯一算法：单独设了就用它，没设（-1）跟随统一值 gaps；其余负值当 0
@@ -435,31 +442,6 @@ struct vidow_blur_set {
 	uint64_t gen;  /* scene generation this pyramid was built for */
 	double offset; /* kawase 采样步长，建这张金字塔时用的 */
 	bool valid;
-};
-
-/* niri 风格的 overview：把整条列带缩到一块屏里看全景，点谁就去谁。
- *
- * 场景是全局的（一个窗口的位置就是「世界坐标」），所以 overview 不动布局、不改
- * 客户端尺寸，只给每个窗口算一个「世界 -> 屏幕」的变换：
- *
- *     screen = out_center + (world - cam) * scale
- *
- * t = 0（正常）：scale = 1、cam = 那块屏的中心 —— 正好是恒等变换，进出都不突变；
- * t = 1（展开）：scale 刚好把整条列带铺进工作区，cam = 列带中心（+ 滚轮平移）。
- * 每帧算一次，所有窗口共用（见 view.c 的 vidow_view_apply_anim）。 */
-struct vidow_overview {
-	bool on;                 /* 目标状态（动画朝它走） */
-	double t;                /* 0..1，当前进度 */
-	double anim_from;        /* 这次动画的起点 t（中途反向就从这儿接着走） */
-	double scale;            /* 由 t 算出的缩放 */
-	double cam_x, cam_y;     /* 由 t 算出的相机中心（世界坐标） */
-	double pan;              /* 滚轮平移（世界坐标），换列时清零 */
-	bool swallow_release;    /* 点选退出后，把它对应的那次松手也吃掉 */
-	double out_cx, out_cy;   /* 展开时铺在哪块屏的中心 */
-	int out_x, out_y, out_w, out_h; /* 那块屏的布局位置（遮罩用） */
-	struct wlr_output *output;      /* 进入时锁定的那块屏 */
-	struct wlr_scene_rect *dim;     /* 压暗壁纸的遮罩 */
-	struct vidow_anim *anim;
 };
 
 /* Alt+Tab 切换器（niri 的 recent windows）。台账和切换器都在 mru.c，这里只放
@@ -643,6 +625,37 @@ struct vidow_fx_target {
 	/* 正在被拖出果冻形变（见 jelly.c）：装饰结果由果冻那个节点显示，这个节点
 	 * 透明度压 0 让位。同样必须是标志位（每帧都会被写回去）。 */
 	bool jelly;
+};
+
+/* niri 风格的 overview：把整条列带缩到一块屏里看全景，点谁就去谁。
+ *
+ * 场景是全局的（一个窗口的位置就是「世界坐标」），所以 overview 不动布局、不改
+ * 客户端尺寸，只给每个窗口算一个「世界 -> 屏幕」的变换：
+ *
+ *     screen = out_center + (world - cam) * scale
+ *
+ * t = 0（正常）：scale = 1、cam = 那块屏的中心 —— 正好是恒等变换，进出都不突变；
+ * t = 1（展开）：scale 刚好把整条列带铺进工作区，cam = 列带中心（+ 滚轮平移）。
+ * 每帧算一次，所有窗口共用（见 view.c 的 vidow_view_apply_anim）。
+ *
+ * 定义放在 vidow_fx_target 之后：里面内嵌了一个 fx 目标（糊掉的那张壁纸）。 */
+struct vidow_overview {
+	bool on;                 /* 目标状态（动画朝它走） */
+	double t;                /* 0..1，当前进度 */
+	double anim_from;        /* 这次动画的起点 t（中途反向就从这儿接着走） */
+	double scale;            /* 由 t 算出的缩放 */
+	double cam_x, cam_y;     /* 由 t 算出的相机中心（世界坐标） */
+	double pan;              /* 滚轮平移（世界坐标），换列时清零 */
+	bool swallow_release;    /* 点选退出后，把它对应的那次松手也吃掉 */
+	double out_cx, out_cy;   /* 展开时铺在哪块屏的中心 */
+	int out_x, out_y, out_w, out_h; /* 那块屏的布局位置（遮罩用） */
+	struct wlr_output *output;      /* 进入时锁定的那块屏 */
+	struct wlr_scene_rect *dim;     /* 压暗壁纸的遮罩 */
+	/* 糊掉的那张壁纸（overview_blur）：摊满整块屏、垫在遮罩下面。复用 fx 那条
+	 * 路（跟 layer 的底衬同一套：共享底衬 + blur_only，见 fx.c）。 */
+	struct vidow_fx_target fx;
+	bool fx_on;                     /* 这一帧真的画上了 */
+	struct vidow_anim *anim;
 };
 
 /* 「有人正拿着这个窗口」（窗口截图源：录屏 / 窗口预览）。记录挂在窗口上，源自己
@@ -1487,6 +1500,11 @@ struct vidow_server {
 	struct wlr_allocator *allocator;
 
 	struct wlr_scene *scene;
+	/* 桌面底色（background_color）：垫在**所有东西**下面。壁纸由 layer-shell
+	 * 的 background 层客户端画（swaybg / swww / shell），这个只是「谁都没画」
+	 * 时的兜底，所以它在 layer_background 下面一层。 */
+	struct wlr_scene_tree *layer_backdrop;
+	struct wlr_scene_rect *backdrop;
 	struct wlr_scene_tree *layer_background;
 	/* overview 的压暗遮罩：夹在壁纸和窗口之间（见 overview.c） */
 	struct wlr_scene_tree *layer_overview_dim;
@@ -2735,6 +2753,9 @@ void vidow_float_grab_update(struct vidow_server *server, double lx,
 		double ly);
 void vidow_float_end_grab(struct vidow_server *server);
 void vidow_arrange_layers(struct vidow_server *server);
+/* 桌面底色（background_color）落到场景里：颜色 + 整个布局的包围盒。配置重载、
+ * 输出变化、启动时各调一次（幂等）。 */
+void vidow_background_apply(struct vidow_server *server);
 bool vidow_layer_focus_surface(struct vidow_server *server,
 		struct wlr_surface *surface);
 

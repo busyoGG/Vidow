@@ -16,6 +16,8 @@
 #      on 决定；以前直接把 t 当进度用，退出会把「进入」重放一遍再瞬间跳回去）
 #   9) 遮罩颜色可配（overview_dim_color）：默认压暗、alpha 0 = 不压暗、换色就染色，
 #      三种配色下窗口本身都不暗
+#  10) 全景里的壁纸模糊（overview_blur）：开了之后壁纸的硬边摊开（跨边缘最大跳变
+#      掉到 1/4 以下），窗口本身不跟着糊
 set -u
 cd "$(dirname "$0")"
 
@@ -204,11 +206,30 @@ dim_shot() { # dim_shot <名字> [颜色]
 	wtype -k Escape >/dev/null 2>&1
 	sleep 0.9
 }
+# 这一段量的是「遮罩把壁纸压到多少」，得先关掉壁纸模糊（默认是开的），不然
+# 采到的金色方块是糊过的边。模糊单独一轮量（见下面「全景里的壁纸模糊」）。
+./build/vidowmsg set-config overview_blur false >/dev/null 2>&1
+sleep 0.3
 dim_shot dim-default
 dim_shot dim-off "#00000000"
 dim_shot dim-red "#ff000099"
 ./build/vidowmsg get-config overview_dim_color > "$RUNDIR/dim-cfg.json" 2>&1
 ./build/vidowmsg set-config overview_dim_color "紫色" > "$RUNDIR/dim-bad.txt" 2>&1
+./build/vidowmsg set-config overview_dim_color "#05050899" >/dev/null 2>&1
+
+# 全景里的壁纸模糊：同一屏、同一个遮罩，只切 overview_blur。
+ov_shot() { # ov_shot <名字> <true|false>
+	./build/vidowmsg set-config overview_blur "$2" >/dev/null 2>&1
+	sleep 0.4
+	wtype -M logo -k o >/dev/null 2>&1
+	sleep 1.0
+	grim "$RUNDIR/$1.png"
+	wtype -k Escape >/dev/null 2>&1
+	sleep 0.9
+}
+ov_shot ov-blur-on true
+ov_shot ov-blur-off false
+./build/vidowmsg get-config overview_blur > "$RUNDIR/blur-cfg.json" 2>&1
 cp "$LOG" "$RUNDIR/log-dim.txt"
 stop_clients
 kill -TERM -- "-$VIDOW_PGID" 2>/dev/null
@@ -471,6 +492,58 @@ dim_log = open("%s/log-dim.txt" % rundir, encoding="utf-8",
                errors="replace").read()
 check("Assertion" not in dim_log and "abort" not in dim_log.lower(),
       "遮罩那一段日志里没有 assert / abort")
+
+print()
+print("== 全景里的壁纸模糊（overview_blur）==")
+# 判据：壁纸自己那些硬边（wall.py 的金色方块）在全景里有没有被糊开 —— 跨边缘
+# 扫一条线，量相邻采样点的最大跳变。原图是硬边（一下跳完），糊过就摊成好几步。
+def is_gold(p):
+    r, g, b = p
+    return r > 170 and r - b > 110 and g - b > 80 and g > 120
+
+
+edge = None
+for y in range(2, 300, 2):
+    for x in range(2, 1270, 2):
+        if (is_gold(wall.getpixel((x, y))) and
+                not is_gold(wall.getpixel((x + 6, y))) and
+                not is_gold(wall.getpixel((x + 14, y)))):
+            edge = (x, y)
+            break
+    if edge is not None:
+        break
+check(edge is not None, "壁纸里找到一条硬边（%s）" % (edge,))
+
+
+def edge_step(im, edge):
+    x, y = edge
+    vals = [im.getpixel((x + dx, y)) for dx in range(-14, 22, 3)]
+    return max(max(abs(a - b) for a, b in zip(p, q))
+               for p, q in zip(vals, vals[1:])), vals
+
+
+if edge is not None:
+    for name in ("ov-blur-off", "ov-blur-on"):
+        step, vals = edge_step(image(name), edge)
+        check(True, "%s：跨边缘最大跳变 %d" % (name, step))
+    off, _ = edge_step(image("ov-blur-off"), edge)
+    on, _ = edge_step(image("ov-blur-on"), edge)
+    check(off > 40, "overview_blur = false 时壁纸还是硬边（跳变 %d）" % off)
+    check(on * 4 < off,
+          "overview_blur = true 时壁纸被糊开（跳变 %d → %d，不到 1/4）" % (off, on))
+
+    # 窗口本身不能跟着糊：全景里窗口还是原色
+    im = image("ov-blur-on")
+    px = [im.getpixel((x, y)) for y in range(200, 500, 20)
+          for x in range(240, 1200, 20)]
+    check(any(p == (255, 0, 0) for p in px) and
+          any(p == (0, 0, 255) for p in px),
+          "缩小的窗口本身没被糊（采样里还有纯红 / 纯蓝）")
+
+blur_cfg = open("%s/blur-cfg.json" % rundir, encoding="utf-8",
+                errors="replace").read()
+check("false" in blur_cfg,
+      "get-config 读回 overview_blur：%s" % " ".join(blur_cfg.split()))
 
 check("Assertion" not in single and "abort" not in single.lower() and
       "Assertion" not in two and "abort" not in two.lower(),

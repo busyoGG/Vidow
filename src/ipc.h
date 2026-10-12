@@ -81,6 +81,9 @@ void vidow_ipc_emit_output(struct vidow_server *server, const char *event,
 /* layer-mapped / layer-unmapped / layer-closed */
 void vidow_ipc_emit_layer(struct vidow_server *server, const char *event,
 		struct vidow_layer_surface *ls);
+/* background-changed：background 层（壁纸）的 surface 上/下屏了 —— 载荷是整个
+ * 背景状态（跟 vidowmsg background 一样），不是单个 surface。 */
+void vidow_ipc_emit_background(struct vidow_server *server, const char *event);
 /* column-maximize-changed：载荷是那条列的完整对象（列最大化的列宽会变成 1.0）。 */
 void vidow_ipc_emit_column(struct vidow_server *server, const char *event,
 		struct vidow_column *col);

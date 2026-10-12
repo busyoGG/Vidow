@@ -2226,6 +2226,8 @@ static void output_arrange(struct vidow_server *server,
 
 void vidow_arrange(struct vidow_server *server) {
 	struct vidow_output *output;
+	/* 桌面底色跟着输出布局走（拔线 / 改位置 / 改分辨率都会走到这儿）。 */
+	vidow_background_apply(server);
 	/* Moving windows changes what is behind every other window.
 	 *
 	 * 但拖动的时候每动一下都会重摆一次（被拖的那个窗口的 geom 跟着光标走）：

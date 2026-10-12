@@ -192,6 +192,10 @@ static void overview_done(void *data, bool cancelled) {
 	if (!ov->on) {
 		ov->output = NULL;
 		ov->pan = 0.0;
+		/* 收掉那张糊壁纸的缓冲（整屏那么大，4K 上两份 33MB）。场景节点留着
+		 * ——它挂在 layer_overview_dim 那棵树上，下次进来接着用。 */
+		vidow_fx_end(server, &ov->fx);
+		ov->fx_on = false;
 	}
 	/* 进 / 出都重判一次「谁该出现在场景里」：overview 里**所有**窗口都要画
 	 * （缩到画面里），所以滚出视口被剔除的那些得先放回来；退出之后又要按框剔除

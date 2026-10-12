@@ -1588,7 +1588,7 @@ t = 1（展开）   scale = 刚好装下整条列带      → cam = 列带中心
 | 相机 | 跟着焦点列走（`Mod+H/L` 换列 = 平移视图）；滚轮给一个用户平移量，换列时清零 |
 | 只看一块屏 | 进 overview 时锁定当时聚焦的那块屏；别的屏上的窗口淡出（`alpha *= 1 - t`），弹出物 / 通知 / 输入法候选框这些屏幕空间的东西收起来 |
 | 背景 | 一块遮罩把壁纸压暗（`layer_overview_dim`：夹在壁纸之上、窗口之下），缩小的窗口浮在上面。颜色和浓度可配：`overview_dim_color = "#05050899"`（RRGGBBAA，alpha = 压多暗，`#00000000` = 不压暗） |
-| 模糊 | overview 里不采样背景模糊（那套 UV 按窗口自己的位置算，缩小之后对不上） |
+| 模糊 | 窗口自己的背景模糊在全景里不采样（那套 UV 按窗口自己的位置算，缩小之后对不上）；壁纸另走一条 —— `overview_blur`（默认开）把**共享底衬**（壁纸 + background / bottom 层跑完 kawase 那张）摊满整块屏，垫在遮罩下面（`fx.c` 的 `vidow_overview_blur_frame`） |
 
 ### 进出动画的方向（`t` 永远 0 → 1）
 
@@ -1618,14 +1618,52 @@ ov->t = ov->on ? from + (1.0 - from) * t     /* 进：from → 1 */
 
 | 保证 | 说明 |
 | --- | --- |
-| 叠放 | `layer_background` 是最底下那棵树（`main.c` 按创建顺序叠），窗口、面板、overview 遮罩都在它上面 |
+| 叠放 | `layer_background` 在最底下那几棵树里（`main.c` 按创建顺序叠），窗口、面板、overview 遮罩都在它上面；它下面只有一层 `background_color` 的兜底纯色 |
 | 铺满 | 四个边都 anchor 的 layer surface 按输出的完整布局框摆（`vidow_arrange_layers`），跟随输出热插拔 / 改分辨率 |
 | 参与模糊 | 窗口的背景模糊把「壁纸 + background / bottom 层」一起当底衬抓（`fx.c` 的共享底衬），所以 `blur_all` / `blur_xray` 糊的就是外部画的壁纸；`background` 层自己跳过（底衬里已经有它，垫一层等于画重） |
 | 不做入场动画 | 需要的话给它一条规则：`vidow.rule{ layer = "^background$", anim = false }` |
-| overview 里被压暗 | 遮罩在壁纸之上（`layer_overview_dim`），所以全景里外部壁纸同样被压暗（默认压到 43%） |
+| overview 里被压暗 / 糊掉 | 遮罩在壁纸之上（`layer_overview_dim`），所以全景里外部壁纸同样被压暗（默认压到 43%）、`overview_blur` 开着时还会被糊掉 |
+| 谁在画 / 变了通知 | `vidowmsg background` 报当前状态（见下），`background-changed` 事件在壁纸上/下屏时发一次 |
 
-**没有壁纸客户端时**：vidow 不画任何底 —— 屏幕就是渲染器的清屏色（黑）。想有兜底就
-自己起一个（`vidow.exec_once{ "swaybg -i ~/图片/wall.png" }`），或者让 shell 常驻画背景层。
+**兜底色 `background_color`**（`configs/18-background.lua`，默认 `#14161cff`）：谁都没画
+壁纸时垫在最底下的纯色，有壁纸就被完全盖住。所以「没有壁纸客户端」不是一块死黑。
+
+**给 shell / 脚本用的查询**（`vidowmsg background`，别名 `wallpaper`）：
+
+```json
+{
+  "color": "#14161cff",
+  "clients": 1,
+  "surfaces": [ { "id": 3, "namespace": "wall", "layer": "background",
+                  "output": "HEADLESS-1", "geometry": { "x":0,"y":0,"width":1280,"height":720 },
+                  "mapped": true, … } ],
+  "outputs": [ { "name": "HEADLESS-1", "covered": true, "covering": 1 } ]
+}
+```
+
+- `clients` = background 层的 surface 个数；`surfaces[]` 就是它们的完整 layer 对象。
+- `outputs[].covered` = 这块屏的壁纸有人画了（有个 mapped 的 background surface 铺满它）。
+  常驻的 shell（quickshell 那种）靠它决定「这屏要不要我上」。
+- **事件**：`background-changed`（IPC `watch` 和 `vidow.on()` 都收得到），载荷就是上面
+  这一份状态。上屏、下屏、客户端退出各发一次 —— 别去轮询。
+
+```lua
+-- 有别的壁纸客户端时就不画，没有就自己上一张：shell 侧大概这么用。
+-- 钩子回调拿到 (表, 原始 JSON)：表里有 event / time_ms / data，data 就是上面那份。
+vidow.on("background-changed", function(ev)
+    for _, o in ipairs(ev.data.outputs) do
+        if not o.covered then
+            vidow.exec("swaybg -o " .. o.name .. " -i ~/图片/wall.png")
+        end
+    end
+end)
+```
+
+**想让 swww / swaybg / Noctalia 来管**：直接起就行，vidow 这边不用配 ——
+`vidow.exec_once{ "swww-daemon" }`，然后 `swww img ~/图片/wall.png`。它们走的就是
+上面那条 background 层契约（跟 `tools/wall.py` 一模一样）。Noctalia 的壁纸也一样：
+它在 `noctalia-wallpaper` 这个 namespace 上画一块 background 层的 surface（每块屏一块、
+铺满整屏），vidow 认的就是这一层。
 
 ### 两个坑
 
@@ -1640,7 +1678,8 @@ ov->t = ov->on ? from + (1.0 - from) * t     /* 进：from → 1 */
 ### 测试
 
 ```bash
-./test-overview.sh   # 43 项：日志 + 像素
+./test-overview.sh   # 50 项：日志 + 像素
+./test-background.sh # 19 项：桌面背景（兜底色 / 查询 / 事件）
 ```
 
 判据：`overview: 进入（… N 个窗口，占 WxH 缩到 S，铺在工作区 …）` 加每个窗口一行
@@ -1649,6 +1688,7 @@ ov->t = ov->on ? from + (1.0 - from) * t     /* 进：from → 1 */
 **没有被压暗**；壁纸被压暗了；`Esc` 退出后画面回到原样（只允许取整带来的零星像素差）；
 **退出时 `t` 单调从 1 降到 0、有中间态**（不反弹）；**遮罩配色**（默认压暗到 43% /
 `#00000000` 不压暗 / `#ff000099` 染红，三种配色下窗口里都还有纯红 `255,0,0`）；
+**壁纸模糊**（跨边缘最大跳变 97 → 6，窗口本身不糊）；
 点某个窗口 → `overview: 选中 X` + 退出 + 那一列被滚进视野；两块屏时只缩当前那块、另一块
 屏上的窗口淡出。
 
@@ -1860,6 +1900,7 @@ vidow 自己的，比如 `vidow-wayland-1.sock`）；`ipc_socket` 可以写死�
 | `tokens` | 活着的 xdg-activation 令牌（app_id、serial 校验过没过、活了多久） |
 | `memories` | 热插拔记忆（每块见过的屏：在不在、上次的布局位置、离开时的滚动位置和焦点） |
 | `anims` | 正在跑的动画（tag / 进度 / 时长 / 缓动）+ 正在淡出的关闭快照 |
+| `background`（别名 `wallpaper`） | 谁在画桌面背景：`color`（兜底底色）+ `clients` + `surfaces[]`（background 层的 layer 对象）+ 每块屏 `covered`（有人铺满了没有） |
 | `im` / `overview` / `xwayland` / `cursor` / `focused` | 输入法状态、全景状态（相机 / 缩放）、XWayland 的开关与全局缩放、光标坐标、焦点三件套 |
 
 几何是**布局坐标**，跟 `place` 日志、grim 的像素坐标是同一套（单屏时就是屏幕坐标）。
@@ -1925,9 +1966,10 @@ vidow 自己的，比如 `vidow-wayland-1.sock`）；`ipc_socket` 可以写死�
 | `input-device-added` / `input-device-removed` | 输入设备插拔（`name` + `type`：keyboard / pointer / touch / tablet…；虚拟键盘也算，名字就是协议给的 `wlr_virtual_keyboard_v1`） |
 | `xwayland-ready` | X 服务真的起来了（懒启动，第一个 X 客户端连上来才有这一下）：`display` + `scale` |
 | `screencast-started` / `screencast-stopped` | 有人开始 / 结束录屏了这一路（`output` / `kind` = output / window / region / virtual / `streams` = 还剩几路） |
+| `background-changed` | 画壁纸的那个 background 层 surface 上屏 / 下屏 / 没了（载荷 = `vidowmsg background` 那一份状态，不是单个 surface） |
 | `overview-toggled` / `config-reloaded` / `config-failed` | 全景开关、配置重载、配置没跑成（`config-failed` 带 `error`） |
 
-事件全名单跟着代码走：`vidowmsg events`（现在 42 个）。名字由调用方定的**自定义事件**
+事件全名单跟着代码走：`vidowmsg events`（现在 43 个）。名字由调用方定的**自定义事件**
 （`vidowmsg emit my-event`）不在名单里，订阅和钩子照样能听。
 
 `subscribe` 可以带过滤器：`{"cmd":"subscribe","events":["window-opened"]}`，只收订了的
@@ -2809,7 +2851,8 @@ layer 的模糊底衬把 layer surface 自己的缓冲当 mask 传进去，窗�
     ├── 14-keys.lua              键位 + 触控板手势（合成器都不内置，默认这一套）+ 工作区 / 窗口规则
     ├── 15-mru.lua               Alt+Tab 的最近窗口切换器
     ├── 16-env.lua               会话环境（和 systemd 用户管理器对账）/ 自启动 / 事件钩子
-    └── 17-overview.lua          全景（overview）的遮罩配色（壁纸归 background 层，不在这里）
+    ├── 17-overview.lua          全景（overview）的遮罩配色 + 壁纸模糊
+    └── 18-background.lua        桌面底色（没壁纸客户端时的兜底；壁纸归 background 层）
 ```
 
 `vidow.include("configs/01-gaps.lua")` 就是「把那份文件就地展开」，和抄在这里一个意思：
@@ -3806,7 +3849,11 @@ test-layerwin.sh  top / overlay 层的模糊里必须含窗口（纯蓝窗口 + 
                   量面板那块截屏的 B-R 与区域底衬 dump）
 test-overview.sh  Mod+O 全景：缩放比例/位置/顺序、四象限像素、遮罩只压背景不压窗口、
                   Esc 退出后画面还原、退出时 t 单调不反弹、遮罩配色（默认/不压暗/染色）、
-                  点选、两块屏时只看当前那块
+                  壁纸模糊（硬边摊开）、点选、两块屏时只看当前那块
+test-background.sh
+                  桌面背景归谁画：没壁纸客户端时整屏是 background_color（像素）、
+                  查询的 clients / covered / surface 几何、壁纸客户端退出后回到兜底色、
+                  background-changed 上屏下屏各一次（载荷带 clients）、background_color 热改
 test-mru.sh       Alt+Tab 的最近窗口切换器：台账顺序、按住期间焦点不动、连点往前走、
                   松开提交、Esc 取消、快速点一下（按住 < open_delay）不显形但照样切窗口、
                   strip 装不下横向滚且选中的完整可见、grid 换行 / 每行上限 / 装不下整体
@@ -4730,6 +4777,48 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
       - 判据：`test-fullscreen-scroll.sh` 新增 9 条（非全屏的 look 有边框 2 / 圆角 12 / 阴影 8，
         全屏之后都是 0；左上角那一点是全屏窗口自己的内容而不是圆角外面的背景；浮动的全屏
         geometry = 0,0 1280x720、退出全屏回到原来的浮动尺寸）；47 项全过。
+
+222. **全景里的壁纸可以糊掉（`overview_blur`，默认开）**（用户：「给 overview 也加背景模糊（niri 那种糊壁纸）」）
+
+      - 做法：复用 layer 那条底衬路 —— 共享底衬（`output->blur_tex`，就是「壁纸 + background /
+        bottom 层」跑完 kawase 那张）+ `blur_only` 那次装饰渲染，只是把目标摊成整块屏，画在
+        `layer_overview_dim` 那棵树里（壁纸之上、窗口之下）、垫在压暗遮罩下面。跟 layer 的
+        bottom 层底衬是同一套代码路径（`fx.c` 的 `vidow_overview_blur_frame`）。
+      - **一帧只画一次**：模糊结果跟着 `blur_ver` 走（底衬变了才重画），全景动画期间那张缓冲
+        一直复用 —— 每帧只是把已经画好的 buffer 挂上去。
+      - 拿不到共享底衬（没开 `blur_enabled` / 这屏还没有底衬）就什么都不画，退回「只压暗」：
+        遮罩还在，不会变成一块没压过的壁纸。退出全景时把缓冲放掉（4K 上两份 33MB）。
+      - **证据**（`wall.py` 的金色方块，跨边缘扫一条线量最大跳变）：关掉 97（硬边）→ 打开 6；
+        窗口本身还是纯红 / 纯蓝（没跟着糊）。`test-overview.sh` 43 → 50 项。
+
+221. **桌面背景归谁画：兜底色 + 查询 + 事件**（用户：「背景允许其他软件配置 例如 swww 或 shell，需要一个方案」）
+
+      - **契约没变**（vidow 不画壁纸，壁纸永远是 layer-shell `background` 层的客户端画的：
+        swaybg / swww / quickshell / Noctalia / `tools/wall.py`），补的是三件缺口：
+      - **兜底色 `background_color`**（`configs/18-background.lua`，默认 `#14161cff`）：新建一层
+        `layer_backdrop` 垫在 `layer_background` **下面**，尺寸取整个输出布局的包围盒。以前谁都
+        没画壁纸时屏幕是渲染器的清屏色（一块死黑），现在至少是底色。
+      - **`vidowmsg background`**（别名 `wallpaper`）：报 `color` + `clients` + `surfaces[]`
+        （background 层的完整 layer 对象）+ 每块屏 `covered`（有个 mapped 的 background surface
+        铺满它）。常驻 shell 靠它决定「这屏要不要我上」。
+      - **`background-changed` 事件**：background 层的 surface 上屏 / 下屏 / 没了各发一次，载荷
+        就是上面那份状态（不是单个 surface）。IPC `watch` 和 `vidow.on()` 都能听。
+      - **三个坑**：
+        1. 退出时 `wl_display_destroy()` 会把输出一块块拆掉，每块都走一遍 `vidow_arrange()`，
+           而那时 `wlr_output_layout` 已经销毁 —— 兜底色那次 `wlr_output_layout_get_box` 直接
+           **SIGBUS**（gdb 里抓到的：`wlr_output_layout_get_box` ← `vidow_background_apply` ←
+           `vidow_arrange` ← `output_destroy`）。加 `shutting_down` 那道门（跟 output.c 同一招）。
+        2. 事件载荷是**当场现数**的：`layer-closed` 在 `wl_list_remove(&ls->link)` 之前发，那时候
+           数 `clients` 会把这块已经死掉的 surface 数进去（事件说 1、查询说 0）。画壁纸的那一块
+           改成摘链 + free 之后再发。
+        3. 查询里 `covered` 要求 surface 是 **mapped** 且几何铺满整块屏：只看「有没有 surface」
+           会把正在退出（已 unmapped）的那块算成有壁纸，shell 就不会去接管了。
+      - **测试**：新增 `test-background.sh`（19 项）：没客户端时整屏是 `background_color`（量像素）、
+        查询的 clients / covered / surface 几何、客户端退出后回到兜底色、`background-changed`
+        上屏下屏各一次且载荷带 `clients`、`background_color` 热改（含 alpha 0）。
+      - **Noctalia 的壁纸能用**（用户问）：查了正在跑的 Hyprland 会话，它的壁纸就是
+        `namespace: noctalia-wallpaper` 的一块 **background 层** surface（每块屏一块、铺满整屏，
+        `hyprctl layers` 里在 layer level 0）—— 跟 swaybg 走的是同一条契约，vidow 认。
 
 220. **全景的遮罩颜色可配（`overview_dim_color`）**（用户：「overview背景也允许配置」）
 

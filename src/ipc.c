@@ -2188,6 +2188,10 @@ static bool ipc_run(struct vidow_server *server, struct ipc_client *c,
 		vidow_ipc_json_layers(out, server);
 		return true;
 	}
+	if (strcmp(cmd, "background") == 0 || strcmp(cmd, "wallpaper") == 0) {
+		vidow_ipc_json_background(out, server);
+		return true;
+	}
 	if (strcmp(cmd, "keybinds") == 0) {
 		vidow_ipc_json_keybinds(out, server);
 		return true;

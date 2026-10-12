@@ -1717,6 +1717,9 @@ static void exec_once_flush(struct vidow_server *server) {
 void vidow_config_sync(struct vidow_server *server) {
 	vidow_ipc_apply_config(server);
 	vidow_xwayland_apply_config(server);
+	/* 桌面底色（background_color）可能被改过；启动时也是这儿第一次把它填上
+	 * （main.c 建那一层的时候配置还没跑）。 */
+	vidow_background_apply(server);
 	/* 配置可能改了 scale / xwayland_scale，或者给某块屏写了新的一组
 	 * vidow.output{…}：改到的输出立刻换缩放，XWayland 的全局缩放也跟着重算。
 	 * 布局位置同理。 */

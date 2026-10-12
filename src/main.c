@@ -368,6 +368,15 @@ int main(int argc, char *argv[]) {
 	server.scene_layout =
 		wlr_scene_attach_output_layout(server.scene, server.output_layout);
 	/* Scene trees are stacked in creation order: bottom-most first. */
+	/* 桌面底色（background_color）：比壁纸还底下 —— 壁纸是 background 层的客户端
+	 * 画的，这个只是「谁都没画」时的兜底（见 layer.c 的 vidow_background_apply）。
+	 * 颜色和尺寸由 vidow_background_apply 在配置跑完 / 输出变化时填。 */
+	server.layer_backdrop = wlr_scene_tree_create(&server.scene->tree);
+	server.backdrop = wlr_scene_rect_create(server.layer_backdrop, 1, 1,
+		(const float[4]){ 0.0f, 0.0f, 0.0f, 0.0f });
+	if (server.backdrop != NULL) {
+		wlr_scene_node_set_enabled(&server.backdrop->node, false);
+	}
 	server.layer_background = wlr_scene_tree_create(&server.scene->tree);
 	/* overview 的压暗遮罩：紧贴壁纸之上、窗口之下 */
 	server.layer_overview_dim = wlr_scene_tree_create(&server.scene->tree);

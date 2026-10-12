@@ -50,6 +50,9 @@ void vidow_ipc_json_windows(struct jbuf *b, struct vidow_server *server);
 void vidow_ipc_json_workspaces(struct jbuf *b, struct vidow_server *server);
 void vidow_ipc_json_outputs(struct jbuf *b, struct vidow_server *server);
 void vidow_ipc_json_layers(struct jbuf *b, struct vidow_server *server);
+/* 谁在画桌面背景（壁纸）：background 层的 surface + 每块屏「有没有人画」+
+ * 谁都没画时垫的 background_color。 */
+void vidow_ipc_json_background(struct jbuf *b, struct vidow_server *server);
 /* 录屏那几路流（zkde_screencast）：发帧节奏 / 抓帧次数 —— 「录制把显示器帧率
  * 拖下去」这类报告靠它定案。 */
 void vidow_ipc_json_screencast(struct jbuf *b, struct vidow_server *server);

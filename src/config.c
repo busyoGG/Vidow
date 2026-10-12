@@ -94,6 +94,11 @@ static const struct section sections[] = {
 	 * 见 README「背景（壁纸）」一节。这里配的是它上面那层遮罩。 */
 	{ "全景（overview）", "17-overview.lua",
 		"Mod+O 把整条列带缩到一屏里看全景；配的是壁纸之上、窗口之下那层遮罩" },
+	/* 桌面背景（18-…）：壁纸本身归 layer-shell 的 background 层客户端，这一份
+	 * 只有「谁都没画」时的兜底色。 */
+	{ "桌面背景", "18-background.lua",
+		"壁纸由 layer-shell 的 background 层客户端画（swaybg / swww / quickshell 都行，"
+		"见 README「背景（壁纸）归谁画」）；这里只有没有壁纸客户端时垫在最底下的颜色" },
 };
 #define N_SECTIONS ((int)(sizeof(sections) / sizeof(sections[0])))
 /* 「键位 / 工作区 / 规则」那一节：它不是配置键，entries[] 里没有它，打印也
@@ -354,6 +359,14 @@ static const struct entry entries[] = {
 		"全景里压在壁纸上的那层遮罩的颜色（RRGGBB 或 RRGGBBAA）：alpha 就是"
 		"压多暗，默认 #05050899（60%）；0 = 不压暗，壁纸原样，缩小的窗口直接"
 		"浮在上面" },
+	{ "overview_blur", K_BOOL, OFF(overview_blur), SZ(overview_blur), 16,
+		"全景里把壁纸糊掉（niri 那样）：整屏一张模糊的壁纸垫在遮罩下面。要"
+		"blur_enabled 也开着（模糊那套是共用的）；拿不到底衬就退回只压暗" },
+
+	{ "background_color", K_COLOR, OFF(background_color),
+		SZ(background_color), 17,
+		"桌面底色：没有任何壁纸客户端（layer-shell 的 background 层 —— "
+		"swaybg / swww / shell 都算）时垫在最底下的颜色，有壁纸就看不见它" },
 };
 
 /* ------------------------------------------------------------ 配置组
@@ -833,6 +846,16 @@ static void defaults(struct vidow_config *cfg) {
 	cfg->overview_dim_color[1] = 0x05 / 255.0f;
 	cfg->overview_dim_color[2] = 0x08 / 255.0f;
 	cfg->overview_dim_color[3] = 0.6f;
+	/* 全景里把壁纸糊掉（niri 那样）。默认开 —— 但只有 blur_enabled 也开着才
+	 * 有得糊（那套底衬是共用的），关掉模糊就自动退回「只压暗」。 */
+	cfg->overview_blur = true;
+
+	/* 桌面底色：深灰蓝。没有壁纸客户端时至少不是一块死黑，也不会让人以为
+	 * 「合成器挂了」（黑屏）。 */
+	cfg->background_color[0] = 0x14 / 255.0f;
+	cfg->background_color[1] = 0x16 / 255.0f;
+	cfg->background_color[2] = 0x1c / 255.0f;
+	cfg->background_color[3] = 1.0f;
 
 	cfg->cursor_shake = true;
 	cfg->cursor_shake_scale = 2.0;

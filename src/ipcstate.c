@@ -704,6 +704,71 @@ void vidow_ipc_json_layers(struct jbuf *b, struct vidow_server *server) {
 	jb_arr_end(b);
 }
 
+/* 谁在画桌面背景（壁纸）。壁纸**不**是 vidow 画的：它是 layer-shell 的
+ * background 层（swaybg / swww / quickshell 都走这条路），vidow 只在谁都没画
+ * 的时候垫一层 background_color。这个查询就是给 shell 用的：「这屏的壁纸有人
+ * 管了吗，我要不要自己上」。 */
+void vidow_ipc_json_background(struct jbuf *b, struct vidow_server *server) {
+	char hex[10];
+	snprintf(hex, sizeof(hex), "#%02x%02x%02x%02x",
+		(int)(server->config.background_color[0] * 255.0f + 0.5f),
+		(int)(server->config.background_color[1] * 255.0f + 0.5f),
+		(int)(server->config.background_color[2] * 255.0f + 0.5f),
+		(int)(server->config.background_color[3] * 255.0f + 0.5f));
+
+	jb_obj(b);
+	jb_kv_str(b, "color", hex);
+
+	/* 画背景的那几个 surface（background 层，按 vidow_server.layers 的顺序）。 */
+	int n = 0;
+	struct vidow_layer_surface *ls;
+	wl_list_for_each(ls, &server->layers, link) {
+		if (ls->layer == ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND) {
+			n++;
+		}
+	}
+	jb_kv_int(b, "clients", n);
+
+	jb_key(b, "surfaces");
+	jb_arr(b);
+	wl_list_for_each(ls, &server->layers, link) {
+		if (ls->layer == ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND) {
+			vidow_ipc_json_layer(b, server, ls);
+		}
+	}
+	jb_arr_end(b);
+
+	/* 每块屏一行：这块屏的壁纸有没有人画（有个 mapped 的 background surface
+	 * 铺满它就算有）。shell 常驻画背景时靠这个判断「是不是轮到我了」。 */
+	jb_key(b, "outputs");
+	jb_arr(b);
+	struct vidow_output *output;
+	wl_list_for_each(output, &server->outputs, link) {
+		struct wlr_box box;
+		wlr_output_layout_get_box(server->output_layout, output->wlr_output,
+			&box);
+		int covering = 0;
+		wl_list_for_each(ls, &server->layers, link) {
+			if (ls->layer != ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND ||
+					ls->output != output || ls->layer_surface == NULL ||
+					ls->layer_surface->surface == NULL ||
+					!ls->layer_surface->surface->mapped) {
+				continue;
+			}
+			if (ls->geom.width >= box.width && ls->geom.height >= box.height) {
+				covering++;
+			}
+		}
+		jb_obj(b);
+		jb_kv_str(b, "name", output->wlr_output->name);
+		jb_kv_bool(b, "covered", covering > 0);
+		jb_kv_int(b, "covering", covering);
+		jb_obj_end(b);
+	}
+	jb_arr_end(b);
+	jb_obj_end(b);
+}
+
 /* ------------------------------------------------------- 录屏（screencast） */
 
 static const char *sc_kind_name(enum vidow_sc_kind kind) {
@@ -1486,6 +1551,19 @@ void vidow_ipc_emit_window_closed(struct vidow_server *server, uint64_t id,
 	}
 	struct closed_info info = { .id = id, .title = title, .app_id = app_id };
 	emit(server, "window-closed", payload_closed, &info);
+}
+
+static void payload_background(struct jbuf *b, struct vidow_server *server,
+		void *data) {
+	(void)data;
+	vidow_ipc_json_background(b, server);
+}
+
+void vidow_ipc_emit_background(struct vidow_server *server, const char *event) {
+	if (!vidow_event_wanted(server, event)) {
+		return;
+	}
+	emit(server, event, payload_background, NULL);
 }
 
 static void payload_focus(struct jbuf *b, struct vidow_server *server,

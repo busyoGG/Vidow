@@ -23,6 +23,47 @@ static struct wlr_scene_tree *layer_tree(struct vidow_server *server,
 	}
 }
 
+/* 桌面底色（background_color）：垫在所有东西下面的一层纯色。
+ *
+ * 壁纸本身是 background 层的客户端画的（swaybg / swww / quickshell），vidow 只
+ * 负责「谁都没画的时候别是一块死黑」。所以这层在最底下（main.c 里建在
+ * layer_background 之前），有壁纸时被完全盖住。
+ *
+ * 尺寸取整个输出布局的包围盒：多屏之间那点缝（用户手动摆位置摆出来的）没有输出
+ * 在那儿，画了也看不见；换成「一块屏一个矩形」要多维护一套增删 / 挪位的账，不值。
+ * 输出热插拔 / 改位置（vidow_arrange）、配置重载（vidow_config_sync）都会再调一次。
+ *
+ * shutting_down 那道门是必须的：退出时 wl_display_destroy() 会把输出一个个拆掉，
+ * 每拆一块都会走一遍 vidow_arrange()，而那时候 wlr_output_layout 已经被销毁了 ——
+ * 不挡就是 SIGBUS（gdb 里实测：wlr_output_layout_get_box -> vidow_background_apply
+ * -> vidow_arrange -> output_destroy）。 */
+void vidow_background_apply(struct vidow_server *server) {
+	if (server->backdrop == NULL || server->shutting_down) {
+		return;
+	}
+	const float *c = server->config.background_color;
+	wlr_scene_rect_set_color(server->backdrop, c);
+
+	struct wlr_box box = {0};
+	wlr_output_layout_get_box(server->output_layout, NULL, &box);
+	if (box.width < 1 || box.height < 1 || c[3] <= 0.0f) {
+		wlr_scene_node_set_enabled(&server->backdrop->node, false);
+		return;
+	}
+	wlr_scene_rect_set_size(server->backdrop, box.width, box.height);
+	wlr_scene_node_set_position(&server->backdrop->node, box.x, box.y);
+	wlr_scene_node_set_enabled(&server->backdrop->node, true);
+}
+
+/* 「谁在画壁纸」变了（background 层的 surface 上屏 / 下屏 / 没了）：发一个事件。
+ * shell 常驻画背景时靠它决定要不要接管（vidowmsg background 能看到当前状态）。 */
+static void background_changed(struct vidow_layer_surface *ls) {
+	if (ls->layer != ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND) {
+		return;
+	}
+	vidow_ipc_emit_background(ls->server, "background-changed");
+}
+
 /* Position every layer surface and recompute each output's usable area.
  * Called whenever the set of layer surfaces changes.
  *
@@ -313,6 +354,7 @@ static void layer_surface_map(struct wl_listener *listener, void *data) {
 	vidow_arrange_layers(server);
 	vidow_arrange(server);
 	vidow_ipc_emit_layer(server, "layer-mapped", ls);
+	background_changed(ls);
 }
 
 static void layer_surface_unmap(struct wl_listener *listener, void *data) {
@@ -326,6 +368,7 @@ static void layer_surface_unmap(struct wl_listener *listener, void *data) {
 	vidow_arrange_layers(server);
 	vidow_arrange(server);
 	vidow_ipc_emit_layer(server, "layer-unmapped", ls);
+	background_changed(ls);
 }
 
 static void layer_surface_commit(struct wl_listener *listener, void *data) {
@@ -359,6 +402,10 @@ static void layer_surface_destroy(struct wl_listener *listener, void *data) {
 	(void)data;
 	struct vidow_layer_surface *ls = wl_container_of(listener, ls, destroy);
 	struct vidow_server *server = ls->server;
+	/* 这一块是不是画壁纸的：free(ls) 之后还得知道，而且那时候再发事件 ——
+	 * 事件载荷里的 clients 是**当场现数**的，在链表摘掉之前发就会数到这块已经
+	 * 死掉的 surface（查询和事件对不上）。 */
+	bool was_background = ls->layer == ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND;
 
 	wlr_log(WLR_DEBUG, "layer closed %s layer=%u",
 		ls->layer_surface->namespace ?: "?", ls->layer);
@@ -381,6 +428,9 @@ static void layer_surface_destroy(struct wl_listener *listener, void *data) {
 	vidow_backdrop_damage(server, true);
 	vidow_arrange_layers(server);
 	vidow_arrange(server);
+	if (was_background) {
+		vidow_ipc_emit_background(server, "background-changed");
+	}
 }
 
 static void layer_surface_new_popup(struct wl_listener *listener, void *data) {
