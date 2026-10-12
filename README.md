@@ -2593,6 +2593,15 @@ grim 两张图**内圈逐像素一样**；差的只有最外 1px（3996 个像�
 的边缘抗锯齿（`radius = 0` 时 `smoothstep(-1, 1, d)` 让最外那圈落在 0.84 上），全屏窗口
 贴到屏幕边，这圈就落在屏幕最外沿。两个方向都是静态的 1px，不是闪一下。
 
+- 切换那一帧的损伤是**整块输出**：改透明度、开关节点都会让场景节点自己报出整块，实测
+  切换帧的 `scene_output->damage_ring` 正好是 `0,0..1280,720`（整屏），两个方向都是 ——
+  所以不会留下上一帧的残影（那是「跳一下」的来源）。
+- 真 GPU 上一样：`WLR_RENDERER=gles2 ./test-scanout.sh`（EGL 1.5 / radeonsi）11 项全过，
+  像素差的还是那 3996 个边缘像素（最大 37/255）—— 和 pixman 一个数，说明那圈差是着色器
+  边缘抗锯齿、不是渲染器差异。
+- 真机自查（你自己的 tty）：`VIDOW_LOG=debug ./run.sh` → 全屏一个视频 → 日志里
+  `grep -a "Direct scan-out"` 应该看到 `enabled`（退全屏 `disabled`），并且 `scanout:`
+  两行就在它前面。
 - 日志（`VIDOW_LOG=debug`）：`scanout: <窗口> 交给场景直画（全屏 + 装饰全零）` /
   `scanout: <窗口> 回到合成（装饰 / 模糊 / 动画又要了）`，紧跟着 wlroots 自己那句
   `Direct scan-out enabled` / `disabled`（`types/scene/wlr_scene.c`）。
