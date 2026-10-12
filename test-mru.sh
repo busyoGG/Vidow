@@ -5,7 +5,8 @@
 #   1) 台账：窗口依次开出来 → `vidowmsg mru` 的 recent 顺序 = 最后开的在最前
 #   2) 按住显示：按住 Alt 连点 Tab 期间 active/showing 为真、**焦点先不动**，
 #      日志 `mru: 面板显形`，每个窗口一条预览（几何都在屏内）
-#   3) 连点 Tab 往前走：选中项按 recent 顺序一格一格走
+#   3) 连点 Tab 往前走：选中项按**屏幕顺序**（左→右）一格一格走；一进来选中的
+#      那格还是「最近用过的那扇」（两个顺序分开）
 #   4) 松开提交：松开 Alt → 日志 `mru: 提交`，焦点落到选中的那个
 #   5) Esc 取消：焦点原地不动
 #   6) 快速点一下（按住时间 < open_delay）：窗口切了，但面板从没显形（画面没动）
@@ -207,10 +208,17 @@ else
 	fail "窗口被动了：$(diff <(echo "$before_geo") <(echo "$during_geo") | head -4)"
 fi
 
-# 选中的是「当前窗口的下一个」（p4）
+# 一进来选中的是「最近用过的那扇」= 当前窗口 p5 之前的那扇 p4（**不是**屏幕顺序的
+# 第一个 p1）—— 面板的顺序和选中的那一格是两件事
 sel_title=$(mq 'next((e["title"] for e in d["entries"] if e["selected"]), "(无)")')
-[ "$sel_title" = "p4" ] && pass "选中 = p4（当前窗口的下一个）" \
+[ "$sel_title" = "p4" ] && pass "选中 = p4（最近用过的那扇，不是屏幕最左边那扇）" \
 	|| fail "选中 = $sel_title（id $sel）"
+
+# 面板顺序 = 屏幕顺序：entries 里窗口的 x 必须递增（滚出去的不在清单里，所以只
+# 断言「顺序」，不断言「有几个」）
+x_asc=$(mq "all(d['entries'][i]['x'] <= d['entries'][i+1]['x'] for i in range(len(d['entries']) - 1))")
+[ "$x_asc" = "True" ] && pass "卡片从左到右按屏幕顺序排（$(mq '" ".join(e["title"] for e in d["entries"])')）" \
+	|| fail "卡片顺序和屏幕对不上：$(mq "[(e['title'], e['x']) for e in d['entries']]")"
 
 # 几何：都在屏内；strip 一行 = 同一个 y
 read -r wx wy ww wh <<<"$(work_box)"
@@ -330,14 +338,25 @@ grep -aq "mru: 提交" "$LOG" && pass "日志：提交" || fail "日志里没有
 	|| fail "焦点是 $(focused_title)，不是 p4"
 [ "$(mq 'd["showing"]')" = "False" ] && pass "面板关掉了" || fail "面板还开着"
 
-mark "4) 连点 Tab 往前走两格"
+mark "4) 连点 Tab：顺着屏幕顺序走（不是按使用时间）"
+# 先收小一点，让 5 张卡片全都在屏里：不然「滚到选中的那张可见」会把左边/右边的
+# 卡片挤出清单，清单长度就跟着选中项变（第 7 轮专门测那个滚动）
+./build/vidowmsg set-config mru_max_scale 0.25 >/dev/null 2>&1
+./build/vidowmsg set-config mru_max_height 200 >/dev/null 2>&1
 hold_tabs 2 2500
 sleep 0.7
+# 面板顺序 = **屏幕顺序**（开窗顺序就是从左到右）：p1 p2 p3 p4 p5
+order=$(mq '" ".join(e["title"] for e in d["entries"])')
+[ "$order" = "p1 p2 p3 p4 p5" ] && pass "面板顺序 = 屏幕顺序（$order）" \
+	|| fail "面板顺序不是屏幕顺序：$order"
+# 初始选中的还是「最近用过的那扇」= p5（清单最后一格，不是第一格 p1），再按一下
+# Tab = 往右一格 → 到头绕回第一格 p1
 sel2=$(mq 'next((e["title"] for e in d["entries"] if e["selected"]), "(无)")')
-[ "$sel2" = "p3" ] && pass "两次 Tab 之后选中 = p3" || fail "两次 Tab 之后选中 = $sel2"
+[ "$sel2" = "p1" ] && pass "初始选中 p5（最近用过的那扇）→ 再走一格绕回 p1" \
+	|| fail "两次 Tab 之后选中 = $sel2（期望 p1：p5 是清单最后一格）"
 wait $WTYPE_PID 2>/dev/null
 sleep 0.8
-[ "$(focused_title)" = "p3" ] && pass "松开后焦点 = p3" || fail "松开后焦点 = $(focused_title)"
+[ "$(focused_title)" = "p1" ] && pass "松开后焦点 = p1" || fail "松开后焦点 = $(focused_title)"
 
 mark "5) Esc 取消：焦点原地不动"
 hold_tabs 1 2000
@@ -348,7 +367,7 @@ sleep 0.8
 grep -aq "mru: 取消" "$LOG" && pass "日志：取消" || fail "日志里没有「取消」"
 wait $WTYPE_PID 2>/dev/null
 sleep 0.6
-[ "$(focused_title)" = "p3" ] && pass "焦点还是 p3（没被取消那一下搬走）" \
+[ "$(focused_title)" = "p1" ] && pass "焦点还是 p1（没被取消那一下搬走）" \
 	|| fail "焦点变成 $(focused_title) 了"
 
 # ---------------------------------------------------------------- 延迟

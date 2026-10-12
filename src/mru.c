@@ -181,6 +181,38 @@ static int mru_cmp(const void *a, const void *b) {
 	return va->mru_ts > vb->mru_ts ? -1 : 1; /* 新的在前 */
 }
 
+/* 屏幕顺序：先按屏（左→右），再按工作区序号，最后按窗口在屏上的位置（左→右、
+ * 一列里上→下）。同一个工作区里，这就是你眼睛看到的那一排。 */
+static int mru_cmp_screen(const void *a, const void *b) {
+	const struct vidow_view *va = *(const struct vidow_view *const *)a;
+	const struct vidow_view *vb = *(const struct vidow_view *const *)b;
+	struct wlr_box boa = {0}, bob = {0};
+	if (va->output != NULL) {
+		wlr_output_layout_get_box(va->server->output_layout, va->output, &boa);
+	}
+	if (vb->output != NULL) {
+		wlr_output_layout_get_box(vb->server->output_layout, vb->output, &bob);
+	}
+	int oa = boa.x, ob = bob.x;
+	if (oa != ob) {
+		return oa < ob ? -1 : 1;
+	}
+	int wa = va->ws != NULL ? vidow_workspace_index(va->ws) : 0;
+	int wb = vb->ws != NULL ? vidow_workspace_index(vb->ws) : 0;
+	if (wa != wb) {
+		return wa < wb ? -1 : 1;
+	}
+	struct wlr_box ba = vidow_view_screen_box(va);
+	struct wlr_box bb = vidow_view_screen_box(vb);
+	if (ba.x != bb.x) {
+		return ba.x < bb.x ? -1 : 1;
+	}
+	if (ba.y != bb.y) {
+		return ba.y < bb.y ? -1 : 1;
+	}
+	return 0;
+}
+
 size_t vidow_mru_collect(struct vidow_server *server, const char *app_id_filter,
 		struct vidow_view **out, size_t max) {
 	size_t n = 0;
@@ -1211,6 +1243,9 @@ static void mru_build_order(struct vidow_server *server) {
 	struct vidow_mru *mru = &server->mru;
 	struct vidow_view *list[MRU_MAX];
 	size_t n = vidow_mru_collect(server, mru->filter_app_id, list, MRU_MAX);
+	/* 清单按**屏幕顺序**排（左→右、同列上→下）：面板摆出来就是屏幕的小地图，
+	 * 连点 Tab 也顺着这个顺序走。**一进来选中哪一扇**不在这儿定 —— 那看「最近
+	 * 用过」，见 mru_pick_initial()。 */
 	mru->n = 0;
 	for (size_t i = 0; i < n; i++) {
 		if (!mru_in_scope(server, list[i])) {
@@ -1218,9 +1253,40 @@ static void mru_build_order(struct vidow_server *server) {
 		}
 		mru->order[mru->n++] = list[i];
 	}
-	if (n >= MRU_MAX) {
-		wlr_log(WLR_INFO, "mru: 窗口多于 %d 个，只列最近这些", MRU_MAX);
+	if (mru->n > 1) {
+		qsort(mru->order, mru->n, sizeof(mru->order[0]), mru_cmp_screen);
 	}
+	if (n >= MRU_MAX) {
+		wlr_log(WLR_INFO, "mru: 窗口多于 %d 个，只列这些", MRU_MAX);
+	}
+}
+
+/* 一进来选中哪一扇：还是按**最近用过**（vidow_mru_collect 给的就是那个顺序），
+ * 从最近的那头找第一个不是当前焦点的；dir < 0（Alt+Shift+Tab）从最旧的那头起。
+ * 面板的顺序是屏幕顺序，选中的那一格跟着使用时间走 —— 两个顺序是分开的。 */
+static struct vidow_view *mru_pick_initial(struct vidow_server *server, int dir) {
+	struct vidow_mru *mru = &server->mru;
+	struct vidow_view *list[MRU_MAX];
+	size_t n = vidow_mru_collect(server, mru->filter_app_id, list, MRU_MAX);
+	struct vidow_view *keep[MRU_MAX];
+	size_t m = 0;
+	for (size_t i = 0; i < n; i++) {
+		if (mru_in_scope(server, list[i])) {
+			keep[m++] = list[i];
+		}
+	}
+	if (m == 0) {
+		return NULL;
+	}
+	if (dir < 0) {
+		return keep[m - 1];
+	}
+	for (size_t i = 0; i < m; i++) {
+		if (keep[i] != server->focused) {
+			return keep[i];
+		}
+	}
+	return keep[0];
 }
 
 void vidow_mru_open(struct vidow_server *server, int dir, const char *app_id,
@@ -1256,25 +1322,19 @@ void vidow_mru_open(struct vidow_server *server, int dir, const char *app_id,
 		mru->on = false;
 		return;
 	}
-	/* 选中项：清单里第一个**不是当前焦点**的窗口。 */
-	int start = 0;
-	for (int i = 0; i < mru->n; i++) {
-		if (mru->order[i] != server->focused) {
-			start = i;
-			break;
-		}
+	/* 选中项：**最近用过**的那一扇（不是屏幕顺序里的第一个）—— Alt+Tab 一下
+	 * 还是回到刚才那扇，接着按 Tab 才顺着屏幕往右走。 */
+	mru->selected = mru_pick_initial(server, dir);
+	if (mru->selected == NULL) {
+		mru->selected = mru->order[0];
 	}
-	if (dir < 0) {
-		start = mru->n - 1;
-	}
-	mru->selected = mru->order[start];
 	if (mru->open_timer != NULL && server->config.mru_open_delay_ms > 0) {
 		wl_event_source_timer_update(mru->open_timer,
 			server->config.mru_open_delay_ms);
 	} else {
 		mru_open_timer_fire(server);
 	}
-	wlr_log(WLR_INFO, "mru: 打开（%d 个窗口，%s，延迟 %dms）", mru->n,
+	wlr_log(WLR_INFO, "mru: 打开（%d 个窗口，%s，按屏幕顺序，延迟 %dms）", mru->n,
 		server->config.mru_layout == VIDOW_MRU_GRID ? "网格" : "一行",
 		server->config.mru_open_delay_ms);
 	mru_log_state(server, "打开");
