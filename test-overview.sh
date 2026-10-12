@@ -577,9 +577,6 @@ def edge_step(im, edge):
 
 
 if edge is not None:
-    for name in ("ov-blur-off", "ov-blur-on"):
-        step, vals = edge_step(image(name), edge)
-        check(True, "%s：跨边缘最大跳变 %d" % (name, step))
     off, _ = edge_step(image("ov-blur-off"), edge)
     on, _ = edge_step(image("ov-blur-on"), edge)
     check(off > 40, "overview_blur = false 时壁纸还是硬边（跳变 %d）" % off)

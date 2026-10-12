@@ -206,7 +206,7 @@ slice_grep() {
 }
 
 set -- $(stats "$OFF1" "$OFF2")
-OWN1=$1; FRAMES1=$2
+FRAMES1=$2
 if [ "$FRAMES1" -ge 20 ] 2>/dev/null; then
 	pass "阶段一渲染了 $FRAMES1 帧（说明确实在跑）"
 else
@@ -221,7 +221,7 @@ else
 fi
 
 set -- $(stats "$OFF3" "$END")
-OWN2=$1; FRAMES2=$2
+FRAMES2=$2
 WTOP2=$(slice_grep "$OFF3" "$END" 'own region wtop.*150,150')
 if [ "$WTOP2" -ge 20 ] 2>/dev/null; then
 	pass "损伤落在 A 的区域里时确实重抓：A 重抓 $WTOP2 次带着那一笔（150,150）/ $FRAMES2 帧"

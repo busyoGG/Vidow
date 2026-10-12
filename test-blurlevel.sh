@@ -20,7 +20,6 @@ FAILED=0
 VIDOW_PID=""
 CLIENT_PIDS=""
 
-pass() { echo "  PASS  $1"; }
 fail() { echo "  FAIL  $1"; FAILED=1; }
 
 cleanup() {

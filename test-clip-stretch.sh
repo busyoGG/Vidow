@@ -30,12 +30,11 @@ cd "$(dirname "$0")"
 
 RUNDIR=/tmp/vidow-clipstretch-test
 FAILED=0
-CASE_FAILED=0
 VIDOW_PID=""
 CLIENT_PIDS=""
 
 pass() { echo "  PASS  $1"; }
-fail() { echo "  FAIL  $1"; FAILED=1; CASE_FAILED=1; }
+fail() { echo "  FAIL  $1"; FAILED=1; }
 mark() { echo; echo "== $1 =="; }
 
 cleanup() {
@@ -65,7 +64,6 @@ run_case() {
 	local name="$1" decor="$2"
 	local dir="$RUNDIR/$name"
 	mark "$name（decor_enabled = $decor）"
-	CASE_FAILED=0
 	VIDOW_PID=""
 	CLIENT_PIDS=""
 	rm -rf "$dir"; mkdir -p "$dir/home/.config/vidow" "$dir/run"

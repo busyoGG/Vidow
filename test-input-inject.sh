@@ -129,13 +129,6 @@ start_wev() {
 
 msg() { ./build/vidowmsg --raw "$@" 2>&1; }
 
-is_ok() { # stdin: JSON
-	python3 -c 'import json,sys
-try:
-    print("true" if json.loads(sys.stdin.read()).get("ok") else "false")
-except Exception:
-    print("false")'
-}
 
 # wev 日志里某类事件的行（只留事件那一行，方便肉眼核对顺序）
 wev_lines() { # <正则>

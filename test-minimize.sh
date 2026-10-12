@@ -165,13 +165,6 @@ check() { # <期望> <实际> <说明>
 	fi
 }
 
-check_ne() { # <不期望> <实际> <说明>
-	if [ "$1" != "$2" ]; then
-		pass "$3（$2）"
-	else
-		fail "$3（不该是 $1）"
-	fi
-}
 
 spawn_pattern() { # <标题>
 	python3 tools/pattern.py "$1" >/dev/null 2>&1 &

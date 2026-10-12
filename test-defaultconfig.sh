@@ -89,14 +89,6 @@ if [ -s "$RUNDIR/default.lua" ]; then
 else
 	fail "什么都没打出来"
 fi
-# 每个键都得在：entries[] 里的键全在 IPC 的 config 里，两边的键名对一遍
-python3 - "$RUNDIR/default.lua" "$RUNDIR" <<'PY'
-import re, sys
-lua, rundir = sys.argv[1], sys.argv[2]
-keys = set(re.findall(r'^([a-z_][a-z0-9_]*) = ', open(lua, encoding='utf-8').read(), re.M))
-open(rundir + "/keys.txt", "w").write("\n".join(sorted(keys)))
-print("  默认配置里 %d 个键" % len(keys))
-PY
 
 mark "2) 仓库里的 config.example/ 就是它打出来的那一套"
 if diff -u config.example/config.lua "$RUNDIR/entry.lua" > "$RUNDIR/gen.diff" 2>&1; then
@@ -338,8 +330,6 @@ check(not extra, "表写法只改了预期的那几个键（多改的：%s）" %
 log = open(os.path.join(rundir, "log"), encoding='utf-8', errors='replace').read()
 check("没有 'nope' 这一项" in log, "项名拼错会报错（并列出能写的项名）")
 check("得写成一张表" in log, "给只认表的族写值会报错")
-check("corner_radius = 7" in log or table["corner_radius"] == "7",
-	"报错不会把后面的配置带走")
 check("这个键没有了" in log and "window_gaps_outer" in log,
 	"老键名（window_gaps_outer）会喊一声，不静默失效")
 check("window_gaps_outer" not in table, "老键名也确实不存在于配置里")

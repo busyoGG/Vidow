@@ -223,7 +223,6 @@ openwin g-view-b
 [ "$(nwin)" = "2" ] && pass "两个窗口（两条列）" || fail "窗口数不对：$(nwin)"
 BASE=$(viewport)
 FOCUS0=$(focused_title)
-pass "起点：视口 $BASE，焦点 $FOCUS0"
 # 手指往**右**划 1200 单位（×0.3 = 360px，往左划会撞到条带末端被 clamp 卡住）：
 # 视口跟手变小，焦点**不动**（还没松手）
 gesture swipe-begin 3

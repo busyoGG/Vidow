@@ -32,5 +32,5 @@ vidow.include("configs/13-cursor.lua")     -- 指针
 vidow.include("configs/14-keys.lua")       -- 键位 / 工作区 / 规则
 vidow.include("configs/15-mru.lua")        -- 最近窗口（Alt+Tab）
 vidow.include("configs/16-env.lua")        -- 会话环境 / 自启动 / 事件钩子
-vidow.include("configs/17-overview.lua")  -- 全景（overview）
-vidow.include("configs/18-background.lua") -- 桌面背景（壁纸归 background 层，这里是兜底色）
+vidow.include("configs/17-overview.lua")   -- 全景（overview）
+vidow.include("configs/18-background.lua") -- 桌面背景

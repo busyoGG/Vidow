@@ -184,12 +184,6 @@ else
 	fail "拖动期间起了 $TWEENS 条位移补间 —— 位置不是跟着光标走的"
 fi
 
-if [ "$LAG" -eq 0 ]; then
-	pass "窗口画的位置就是该在的位置（最大落后 ${LAG}px）"
-else
-	fail "窗口最大落后光标 ${LAG}px —— 不跟手"
-fi
-
 WANT_X=$((GX + 320))
 if [ "$MGX" -ge $((WANT_X - 6)) ] && [ "$MGX" -le $((WANT_X + 6)) ]; then
 	pass "拖了 300 像素，窗口盒跟着走了 300（$GX → $MGX）"

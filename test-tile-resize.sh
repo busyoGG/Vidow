@@ -113,14 +113,6 @@ for w in json.load(sys.stdin):
         print("%d %d %d %d" % (g["x"], g["y"], g["width"], g["height"]))
         break'
 }
-workw() { # 可用宽（列宽比例的换算基准）：拖到 100% 时那一列的像素宽
-	./build/vidowmsg outputs 2>/dev/null | python3 -c '
-import sys, json
-for o in json.load(sys.stdin):
-    if o.get("enabled"):
-        print(o["logical_width"] - 20)   # 减去左右各 10 的 gaps
-        break'
-}
 
 # 每次起拖前重算落点：窗口中心（列宽一改它就挪了）。
 at_window() {

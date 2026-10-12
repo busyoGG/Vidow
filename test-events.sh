@@ -126,13 +126,6 @@ start_vidow() {
 		tail -1 | cut -d= -f2)
 }
 
-stop_vidow() {
-	local pid
-	our_vidow_pids | while read -r pid; do
-		kill -TERM "$pid" 2>/dev/null
-	done
-	waitgone || kill_stray_vidows
-}
 
 openwin() { python3 tools/pattern.py "$1" >/dev/null 2>&1 & sleep 1.6; }
 # 等日志里出现某一行（最多 4 秒）

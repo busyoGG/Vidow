@@ -326,7 +326,7 @@ end
 ### 测试
 
 ```bash
-./test-workspace.sh   # 59 项断言：切工作区只显示那一块（日志 + 四象限像素）、
+./test-workspace.sh   # 58 项断言：切工作区只显示那一块（日志 + 四象限像素）、
                         # 配置建工作区 / 特殊工作区不进 list、特殊工作区跟随聚焦的屏、
                         # 拔屏时工作区跟列走、键位绑定表
 ```
@@ -669,7 +669,7 @@ blit 进客户端缓冲，ext-copy 的输出源监听 `output->events.commit` �
 ```
 
 ```bash
-./test-wincapture-scale.sh  # 17 项断言：窗口抓帧源（ext-image-copy-capture 的窗口源）
+./test-wincapture-scale.sh  # 16 项断言：窗口抓帧源（ext-image-copy-capture 的窗口源）
                          # 的尺寸中途变了怎么办 —— 两块屏（1 倍 + 2 倍）之间挪窗口，
                          # 这一路流的像素尺寸跟着变（逻辑 × scale），合成器重发
                          # buffer_size：验它只回一次 failed（回第二次就是拿 free 掉
@@ -807,9 +807,9 @@ wlroots 的 `wlr_xdg_activation_v1` 把校验写死在内部：serial 不对，`
 ### 测试
 
 ```bash
-./test-focus.sh   # 61 项断言：基线（新窗口默认抢焦点）→ focus_on_open = false（不抢键盘
+./test-focus.sh   # 60 项断言：基线（新窗口默认抢焦点）→ focus_on_open = false（不抢键盘
                   # 但窗口照常画出来，像素为证）→ 激活请求把藏起来的工作区端出来（像素：
-                  # 激活前黑、激活后画出来）→ 特殊工作区同理 → 令牌过期 vs 不过期（对照）
+                  # 激活前只有兜底色、激活后画出来）→ 特殊工作区同理 → 令牌过期 vs 不过期（对照）
                   # → focus_on_activate = false（请求被挡下）→ 还没上屏就请求（先记下来）
                   # → 守护进程式激活（令牌不带 surface，认 activate 里那个）→ serial 校验
                   # 不过：默认不理 vs 开关打开就理 vs 窗口规则按应用开口子（同一个客户端
@@ -909,7 +909,7 @@ python3 test-float.py        # 三个真实 GTK 窗口，验证浮动模式自�
 ./test-portal.sh raw-gtk             # vidow 不碰 portal 配置，手写一份单独验证协议
 ./test-portal.sh raw-kde             # 同上，换成 KDE
 ./test-portalenv.sh                 # 启动推进 / 退出还原 systemd 用户管理器环境 + 录屏后端探测（19 项断言）
-./test-screencast.sh                 # KDE 的录屏 portal 全链路：协议 → 对话框 → PipeWire node → 真出帧（11 项断言）
+./test-screencast.sh                 # KDE 的录屏 portal 全链路：协议 → 对话框 → PipeWire node → 真出帧（10 项断言）
 VIDOW_TEST_RENDERER=gles2 ./test-screencast.sh
                                      # 同上，但走真 GPU（gles2）：额外验 dmabuf 直通（dmabuf_frames > 0、
                                      # readback_ms == 0）。默认 pixman 那条路没有 dmabuf，走回读
@@ -921,9 +921,9 @@ VIDOW_TEST_RENDERER=gles2 ./test-screencast.sh
 ./test-fullscreen-2out.sh            # 同上，但在**混合 DPI 两块屏**上：全屏占自己那块整屏（2 倍屏上就是整个 4K）、越界那半块不画到隔壁屏（全 headless + grim 逐像素，16 项断言）
 ./test-mixdpi.sh                     # 跨屏拖窗口：拖着的那段就按对面那块屏的倍率烘（全 headless，7 项断言）
 ./test-vt.sh                         # tty 的 VT 切换（Ctrl+Alt+F1..F12 / switch-vt 动作）（全 headless，11 项断言）
-./test-focus.sh                      # 焦点规则 + 激活请求（全 headless，61 项断言）
+./test-focus.sh                      # 焦点规则 + 激活请求（全 headless，60 项断言）
 ./test-ipc.sh                        # IPC：状态输出 / 命令 / 事件 / 多屏（全 headless，162 项断言）
-./test-hooks.sh                      # 事件钩子（config.lua 的 vidow.on）：命令钩子 / Lua 钩子 / "*" / 自定义事件 / 摘钩子 / 出错不连累别人（全 headless，30 项断言）
+./test-hooks.sh                      # 事件钩子（config.lua 的 vidow.on）：命令钩子 / Lua 钩子 / "*" / 自定义事件 / 摘钩子 / 出错不连累别人（全 headless，29 项断言）
 ./test-events.sh                     # 事件的丰富度：keybind / ipc-action / window-activated / 拖拽 / 屏开关 / X11 起来 / 输入设备插拔 / 配置出错（全 headless，28 项断言）
 ./test-env.sh                        # 会话环境：和 systemd 用户管理器两个方向对账 + exec-once 自启动（全 headless，42 项断言）
 ./test-input-inject.sh               # 输入注入：鼠标 / 键盘合成事件到客户端（全 headless，54 项断言）
@@ -940,12 +940,12 @@ VIDOW_TEST_RENDERER=gles2 ./test-screencast.sh
 ./test-blurnooverlap.sh              # 窗口不再重叠之后，模糊底衬和「从没重叠过」时逐像素一样（5 项断言）
 ./test-pixman-renderer.sh            # 软件渲染器（pixman）下不崩：装饰关掉、窗口照常上屏（5 项断言）
 ./test-blur2out.sh                  # 两块屏（1 倍 + 2 倍）下私有模糊区域的金字塔缓冲每帧都复用（6 项断言）
-./test-config.sh                     # 配置系统：一个 Lua 文件 + 改了就自动重载 + vidow.exec 的选项（全 headless，24 项断言）
+./test-config.sh                     # 配置系统：一个 Lua 文件 + 改了就自动重载 + vidow.exec 的选项（全 headless，23 项断言）
 ./test-binds.sh                      # 键位全是配置给的：没配置=没有键位、默认那套能用、换键位、动作字符串（全 headless，35 项断言）
-./test-gesture.sh                    # 触控板手势：三指横扫跟手拖视口 / 四指竖扫 / 捏合 / 按住（全 headless，注入，26 项断言）
+./test-gesture.sh                    # 触控板手势：三指横扫跟手拖视口 / 四指竖扫 / 捏合 / 按住（全 headless，注入，25 项断言）
 ./test-widthanim.sh                  # 列宽过渡：cycle / 最大化 / IPC 改宽按 column_width_ms 补间，隔壁列不给位移补间（全 headless，30 项断言）
-./test-config-include.sh             # 配置拆成好几份：vidow.include() 的路径/顺序/报错 + 改哪份都自动重载（全 headless，25 项断言）
-./test-defaultconfig.sh              # 默认配置按类别拆成 configs/（--default-config / --write-config）+ 配置族的表写法 + 说明的完整性（全 headless，45 项断言）
+./test-config-include.sh             # 配置拆成好几份：vidow.include() 的路径/顺序/报错 + 改哪份都自动重载（全 headless，24 项断言）
+./test-defaultconfig.sh              # 默认配置按类别拆成 configs/（--default-config / --write-config）+ 配置族的表写法 + 说明的完整性（全 headless，44 项断言）
 ./test-gap.sh                        # 间距：一个数管全部 + 单边/内间距覆盖 + 「两条 50% 正好装进一屏」（全 headless，34 项断言）
 ./test-layerblur.sh                  # 半透明状态栏背后的模糊（全 headless，4 项断言）
 ./test-blurscale.sh                  # 模糊在高 DPI 倍率下的底衬覆盖 + 对位（1/1.7/2 倍，7 项断言）
@@ -959,18 +959,18 @@ VIDOW_TEST_RENDERER=gles2 ./test-screencast.sh
 ./test-bounce.sh                     # 入场过冲 / 关闭回弹（q 弹曲线真的落到屏幕上了，5 项断言）
 ./test-closeanim.sh                  # 关闭动画：默认曲线下还看得见 + 不带窗口装饰 + 隔壁那块的位移补间中段还在路上（17 项断言）
 ./test-focusclose.sh                 # 关窗口后焦点落谁身上：右边最近的顶上（21 项断言）
-./test-lastoutput.sh                  # 屏没了不许留野指针、没屏时开窗不许崩（拔一块 / 最后一块没了，22 项断言）
+./test-lastoutput.sh                  # 屏没了不许留野指针、没屏时开窗不许崩（拔一块 / 最后一块没了，21 项断言）
 ./test-actsurface.sh                  # 激活令牌攥着的 surface 先没了也不能崩（8 项断言）
 ./test-idlewake.sh                   # 空载一次都不该醒（抓帧看门狗按需启动）+ 静止屏幕抓帧照样成（7 项）
 ./test-frametrace.sh                 # 帧追踪：某块屏的帧链断了（窗口停在最后一帧）要报出来（17 项断言）
 ./test-dmabuf-update.sh              # dmabuf 客户端（kate）的新画面必须真的上屏（5 项断言）
 ./test-preinit.sh                    # 状态请求抢在第一次 commit 之前（set_maximized /
                                      #   set_minimized / set_fullscreen）不许把合成器打死（22 项断言）
-./test-drag.sh                       # 拖窗口：拖得动 / 跨屏改归属 / 平铺按落点插入（12 项）
+./test-drag.sh                       # 拖窗口：拖得动 / 跨屏改归属 / 平铺按落点插入（10 项）
 ./test-drag-insert.sh                # 拖平铺窗口的落点：插进已有列 / 新开一条列（左右两边的缝都算）/ 落点预览块（23 项）
 ./test-expel.sh                      # 把窗口从列里拎出来单独成列（niri 的 expel-window-from-column：动作 / IPC / 左右 / 拖到右边与空白处 / 取不出来的两种情形，32 项）
-./test-drag-stall.sh                 # 后端不给帧事件时，拖动照样跟手（浮窗 + 平铺两个case，10 项断言）
-./test-drag-follow.sh                # 拖动跟手 + 松手后把指针位置补给客户端（9 项断言）
+./test-drag-stall.sh                 # 后端不给帧事件时，拖动照样跟手（浮窗 + 平铺两个case，9 项断言）
+./test-drag-follow.sh                # 拖动跟手 + 松手后把指针位置补给客户端（8 项断言）
 ./test-popup2out.sh                  # 不在布局原点上的窗口，弹出物要摆在自己那块屏上（13 项断言）
 ./test-ws-dynamic.sh                 # 动态工作区：栈底空位 / 空了就收 / 序号夹住 / 具名永存（9 项）
 ./test-dpi.sh                        # 混合 DPI + XWayland：装饰缓冲按**窗口几何**算（见 SSD 那节）
@@ -1717,7 +1717,7 @@ vidow.rule{ namespace = "^awww-daemonov", overview = "only" }
 ### 测试
 
 ```bash
-./test-overview.sh   # 64 项：日志 + 像素
+./test-overview.sh   # 63 项：日志 + 像素
 ./test-background.sh # 19 项：桌面背景（兜底色 / 查询 / 事件）
 ```
 
@@ -4865,6 +4865,33 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
       - 另一个踩到的坑（不是 vidow 的）：`awww img` 默认带过渡动画，动画没跑完就进全景，抓到的
         底衬是**半透明混合**的（量到 (107,66,38)，金色和洋红混在一起）。验证 / 截图时加
         `--transition-type none`。
+
+224. **测试套件清一遍：删掉 25 处「测了等于没测」和死代码，顺手修好两条一直是红的判据**
+      （用户：「检查一下测试项目，去掉无用和没必要的测试」）
+
+      - **85 个 `test-*.sh` 全过了一遍**：每个文件在 README 里都有独立的场景靶子，**没有整文件
+        冗余**（blur 家族那 11 个文件的靶子也逐个对过）。删掉的是三类：
+        ① **恒真判据 10 处** —— `check(True, ...)` 只打印数字、无条件的 `pass` 6 条；
+        `test-drag-stall.sh` 里「grep 日志里有没有 `vidow ready`」（日志只增不减，启动时已经
+        `exit 1` 过一遍，永远为真）；`test-config.sh` 里「别的文件动了不重载」（那个文件写在
+        `$RUNDIR`，根本不在被监视的目录里，而且真重载了值也还是 33）；
+        ② **同文件重复 5 处** —— 条件被另一条蕴含：`TWEENS==0` → `LAG==0`、
+        `focus_on_open=false` 被更长的 `… focus_on_activate=nil` 包含、`W2=2×W1` → `S2≠S1`、
+        背靠背查同一个进程的存活、同一个 `getcfg gaps` 断言两遍；
+        ③ **死代码 10 处** —— `DISPLAY_NOW` 全仓只出现一次且分支体是空语句、
+        `pc`/`pd`/`OWN1`/`OWN2`/`pt`/`rt`/`CASE_FAILED` 算了没人用、写了没人读的 `keys.txt`
+        与 `log-N.txt`、8 个定义了没人调的函数、12 个文件里没用上的 `pass()`/`fail()`。
+      - **其中两条判据一直在骗自己**，一并修掉：`test-defaultconfig.sh` 的
+        `check("corner_radius = 7" in log or table["corner_radius"] == "7")` —— `or` 的后半已被
+        上一条断言保证，而日志里根本没有带空格的 `corner_radius = 7`（打出来的是
+        `corner_radius=7）`），整条一直靠 `or` 活着，删掉；`test-focus.sh` 的两条像素判据拿
+        `(0,0,0)` 当「窗口没画出来」，可兜底色默认是 `#14161c`（= 20,22,28，比容差 24 差一点点
+        超出去）——**这两条是真·红的**（改动前跑也是红的），改成 `DESKTOP = (20, 22, 28)`。
+      - **`config.example/config.lua` 跟 `--default-config` 走散了**：`18-background.lua` 那行的
+        注释被手改长过、`17-overview.lua` 那行少一格对齐。按 README 说的「`config.example/` 就是
+        `--write-config` 写出来的那一套」重新生成，`test-defaultconfig.sh` 的逐字比对恢复。
+      - 判据：改到的 35 个测试逐个重跑（serially），**全过**；`test-events.sh` 头一次报
+        「Mod+T 没生效」是偶发，复跑过。README 里各测试的项数跟着减（-1 到 -2）。
 
 222. **全景里的壁纸可以糊掉（`overview_blur`，默认开）**（用户：「给 overview 也加背景模糊（niri 那种糊壁纸）」）
 

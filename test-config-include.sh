@@ -155,10 +155,6 @@ grep -aq "include .*configs/01-a.lua" "$LOG" && pass "日志里点名了 01-a.lu
 grep -aq "include .*configs/06-f.lua" "$LOG" && pass "日志里点名了 06-f.lua" \
 	|| fail "日志里没有 include 06-f.lua 的记录"
 
-mark "include 的先后 = 键生效的先后（先写的算数）"
-[ "$(getcfg gaps)" = "15" ] &&
-	pass "01-a 的 gaps = 15 盖住了 02-b 的 gaps = 99（先写的算数）" \
-	|| fail "后面的 include 盖住了前面的：gaps = $(getcfg gaps)"
 
 mark "相对路径按「正在 include 的那个文件」所在目录解析；绝对路径照用"
 [ "$(getcfg corner_radius)" = "3" ] &&

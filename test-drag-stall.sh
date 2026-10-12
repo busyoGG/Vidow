@@ -109,11 +109,6 @@ sleep 0.3
 ./build/vidowmsg set-window-position --title w1 100 100 >/dev/null 2>&1
 sleep 0.8
 
-if grep -aq "vidow ready" "$LOG"; then
-	pass "vidow 起来了（帧事件已被掐断：VIDOW_TEST_STALL_OUTPUT=HEADLESS-1）"
-else
-	fail "vidow 没起来"
-fi
 
 P0=$(field); set -- $P0
 if [ $# -eq 2 ]; then

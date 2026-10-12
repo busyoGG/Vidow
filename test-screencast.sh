@@ -266,7 +266,6 @@ print(sum(s.get("dmabuf_frames",0) for s in sc),
 		else
 			fail "回读还有 ${2}ms —— 直通没生效"
 		fi
-		pass "等 GPU 画完那笔 ${3:-?}ms（消费者要 mmap 读这块内存，这笔省不掉）"
 	else
 		pass "pixman 会话：没有 dmabuf，走回读（直通那条路在 gles2 下测）"
 	fi

@@ -26,7 +26,6 @@ FAILED=0
 VIDOW_PID=""
 CLIENT_PIDS=""
 
-pass() { echo "  PASS  $1"; }
 fail() { echo "  FAIL  $1"; FAILED=1; }
 mark() { echo; echo "== $1 =="; }
 
@@ -35,7 +34,6 @@ cleanup() {
 	for p in $CLIENT_PIDS; do kill "$p" 2>/dev/null; done
 	sleep 0.4
 	[ -n "$VIDOW_PID" ] && kill -KILL -- "-$VIDOW_PID" 2>/dev/null
-	rm -f /tmp/vidow-bd-*.raw /tmp/vidow-blur-*.raw /tmp/vidow-bd-*.txt /tmp/vidow-blur-*.txt
 	[ -n "${VIDOW_TEST_KEEP:-}" ] || rm -rf "$RUNDIR"
 	# vidow 的调试转储写死在 /tmp（vidow-blur-N.raw 那些）：它们是我们自己丢的，
 	# 收尾一起带走，别在 /tmp 里堆着。
@@ -185,8 +183,8 @@ for tag in ('s1', 's2', 's17'):
 	# 2) 面板背后的亮斑真的被糊开了：比没被盖住的那个宽
 	pc = centroid(shot, px, py, 70, 20)
 	rc = centroid(shot, rx, ry, 50, 32)
-	ps, pt = sigma(shot, pc[0], pc[1], 60)
-	rs, rt = sigma(shot, rc[0], rc[1], 50)
+	ps, _ = sigma(shot, pc[0], pc[1], 60)
+	rs, _ = sigma(shot, rc[0], rc[1], 50)
 	if ps > rs * 1.25:
 		print(f"  PASS  scale={scale}：面板背后的亮斑糊开了（σ {ps:.1f} vs 未被盖住 {rs:.1f}）")
 	else:

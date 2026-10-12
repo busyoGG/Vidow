@@ -20,7 +20,6 @@ FAILED=0
 VIDOW_PID=""
 CLIENT_PIDS=""
 
-pass() { echo "  PASS  $1"; }
 fail() { echo "  FAIL  $1"; FAILED=1; }
 mark() { echo; echo "== $1 =="; }
 
@@ -78,7 +77,6 @@ EOF
 	sleep 2
 	grep -aq "layer map testbar" "$LOG" || fail "levels=$levels：状态栏没上屏"
 	grim -o HEADLESS-1 "$out" 2>/dev/null || fail "levels=$levels：grim 失败"
-	cp "$LOG" "$RUNDIR/log-$levels.txt"
 	./build/vidowmsg state > "$RUNDIR/state-$levels.json" 2>/dev/null
 	kill -TERM -- "-$VIDOW_PID" 2>/dev/null
 	sleep 0.5

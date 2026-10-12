@@ -133,13 +133,6 @@ start_vidow() {
 		tail -1 | cut -d= -f2)
 }
 
-stop_vidow() {
-	local pid
-	our_vidow_pids | while read -r pid; do
-		kill -TERM "$pid" 2>/dev/null
-	done
-	waitgone || kill_stray_vidows
-}
 
 openwin() { # openwin <标题>
 	python3 tools/pattern.py "$1" >/dev/null 2>&1 &
@@ -204,7 +197,6 @@ grep -aq "^open:window-opened:pattern.py:th-1$" "$HKDIR/open.log" &&
 	pass "\$VIDOW_EVENT / \$VIDOW_APP_ID / \$VIDOW_TITLE 都对（$(cat "$HKDIR/open.log")）" \
 	|| fail "环境变量不对：$(cat "$HKDIR/open.log")"
 # 没有 IPC 订阅者（本测试全程不订阅）也能跑 —— 上面这两条就是证据
-pass "（本测试一个订阅者都没有，钩子照样收到事件）"
 
 # ------------------------------------------------------------ 3) "*" 与 Lua
 mark "3) '*' 收全部事件 / Lua 钩子的载荷"

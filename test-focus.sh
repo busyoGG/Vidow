@@ -493,7 +493,8 @@ def point_of(name):
 	return text
 
 RED = (255, 0, 0)
-BLACK = (0, 0, 0)
+# 窗口没画出来时看到的是兜底色（background_color 默认 #14161c = 20,22,28）
+DESKTOP = (20, 22, 28)
 
 def near(got, want, tol=24):
 	return max(abs(a - b) for a, b in zip(got, want)) <= tol
@@ -512,8 +513,6 @@ print("== 2) focus_on_open = false：不抢键盘，但窗口照常出现 ==")
 b = log("log-2.txt")
 check(re.search(r"rule: app_id=demo .*focus_on_open=false", b)
 	is not None, "规则读进来了（日志里写了 focus_on_open=false）")
-check(re.search(r"rule 1: app_id=demo focus_on_open=false", b) is not None,
-	"vidow.rules() 查得回 focus_on_open=false")
 check(re.search(r"rule 1: app_id=demo focus_on_open=false focus_on_activate=nil",
 	b) is not None, "没写的字段查回来是 nil（「没管它」≠「管了、给了默认值」）")
 check("map: 演示 不抢焦点（窗口规则 focus_on_open = false）" in b,
@@ -541,7 +540,7 @@ check(re.search(r"workspace: 切到 \S+ 上的第 2 块", b) is not None,
 	"工作区真的切过去了")
 check(re.search(r"焦点: .* -> 演示", b) is not None, "焦点给了它")
 p = point_of("point-3.txt")
-check(near(pixel("s3-hidden", p), BLACK),
+check(near(pixel("s3-hidden", p), DESKTOP),
 	"激活之前它确实藏起来了（像素 %s）" % (pixel("s3-hidden", p),))
 check(near(pixel("s3-shown", p), RED),
 	"激活之后它画在屏幕上（像素 %s）" % (pixel("s3-shown", p),))
@@ -555,7 +554,7 @@ check(re.search(r"激活: 演示 在特殊工作区 scratch 上，把它开到 H
 check(re.search(r"workspace: 打开特殊工作区 scratch（显示在 HEADLESS-1 上", b)
 	is not None, "日志里写清了它显示在哪块屏上")
 p = point_of("point-4.txt")
-check(near(pixel("s4-hidden", p), BLACK),
+check(near(pixel("s4-hidden", p), DESKTOP),
 	"激活之前它藏在特殊工作区里（像素 %s）" % (pixel("s4-hidden", p),))
 check(near(pixel("s4-shown", p), RED),
 	"激活之后它画在屏幕上（像素 %s）" % (pixel("s4-shown", p),))

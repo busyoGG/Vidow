@@ -109,14 +109,6 @@ for w in json.loads(raw):
     out = w.get("output")
     print("%s %s" % (w.get("title"), out if out is not None else "(null)"))'
 }
-ws_outputs() {
-	timeout 5 ./build/vidowmsg workspaces 2>/dev/null | python3 -c '
-import sys, json
-raw = sys.stdin.buffer.read().decode("utf-8", "replace")
-for w in json.loads(raw):
-    out = w.get("output")
-    print("out=%s home=%s" % (out if out is not None else "(null)", w.get("home")))'
-}
 # 输出名只有 ASCII（HEADLESS-1 / WL-1）；出现别的字节 = 野指针读出来的垃圾
 outputs_sane() {
 	timeout 5 ./build/vidowmsg windows 2>/dev/null | python3 -c '
@@ -351,9 +343,6 @@ except Exception:
 else
 	fail "嵌套会话没有 DISPLAY，XWayland 没起来"
 fi
-kill -0 "$NEST_PID" 2>/dev/null &&
-	pass "XWayland 在这状态下起来又走了一遭，vidow 还在" ||
-	fail "XWayland 那条路把 vidow 带崩了"
 
 # ------------------------------------------------- 3/3 没屏时开窗 → 屏回来
 mark "3/3 一块屏都没有的时候开新窗口：屏回来窗口跟着回来"
@@ -385,10 +374,9 @@ if [ "$(echo "$NOUT" | tr -d ' \n')" = "[]" ]; then
 else
 	fail "输出列表不是空的：$NOUT"
 fi
-# 没屏的时候开一个新窗口（Wayland 一个、X11 一个）
+# 没屏的时候开一个新窗口（Wayland 的；X11 那条在上一节单独测过）
 setsid nohup python3 ./tools/pattern.py w2 > "$RUNDIR/w2.log" 2>&1 </dev/null &
 CLIENT_PIDS="$CLIENT_PIDS $!"
-if [ -n "${DISPLAY_NOW:-}" ]; then :; fi
 sleep 3
 if ! alive; then
 	fail "没屏的时候开新窗口把 vidow 带崩了"

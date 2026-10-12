@@ -101,7 +101,6 @@ GAP=10
 ORIGIN=$((X0 - GAP))
 # 另一块屏的原点：两块屏横着排，各 1280 宽
 OTHER_ORIGIN=$((ORIGIN == 0 ? 1280 : 0))
-pass "浮动窗口 w1 在 $OUT0 上，起点 $X0,$Y0（这块屏原点 x=$ORIGIN，另一块 x=$OTHER_ORIGIN）"
 
 # 从窗口里起拖，往右拖 200（y 不动：窗口 700 高，屏 720 高，竖着没地方走）
 act "pointer-motion $((X0 + 300)) $((Y0 + 300))"
@@ -162,7 +161,6 @@ CLIENT_PIDS="$CLIENT_PIDS $!"
 sleep 1.6
 W1OUT=$(field w1 2); W2OUT=$(field w2 2)
 W2X=$(field w2 4); W2Y=$(field w2 5)
-pass "两个平铺窗口：w1 在 $W1OUT，w2 在 $W2OUT（w2 在 $W2X,$W2Y）"
 
 # 拖 w2 到 w1 那块屏**最左边那条外层 gap 里**（= 新开一条列插到最前面，不是插
 # 进 w1 那条列 —— 光标再往右挪一点就落在 w1 窗口身上了，那是 niri 的 InColumn）

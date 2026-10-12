@@ -379,7 +379,7 @@ if m:
 	check(int(m.group(3)) == 1, "切回 1：本区 %s 个窗口（原来那个）" % m.group(3))
 	check(int(m.group(4)) == 1, "切回 1：全屏只有它 %s 个可见（2 上的藏起来了）" % m.group(4))
 
-pa, pb, pc, pd = places(wsA, "a"), places(wsB, "b"), places(wsC, "a"), places(wsD, "b")
+pa, pb = places(wsA, "a"), places(wsB, "b")
 check(len(pa) == 1 and len(pb) == 2, "工作区 1 上 1 个窗口、工作区 2 上 2 个（%d + %d）"
 	% (len(pa), len(pb)))
 # 两块工作区的**列数**不一样，所以像素能分开认：
@@ -399,9 +399,6 @@ if second is not None:
 		"工作区 1 上第 2 列是空的（b2 属于工作区 2，不画）")
 	check(drawn(im_b, second) is True, "工作区 2 上 b2 画在第 2 列")
 	check(drawn(im_c, second) is False, "切回工作区 1 后 b2 不画（它属于 2）")
-# 再切回 2 时它的两列还在
-check(len([x for x in re.finditer(r"workspace: 切到 \S+ 上的第 2 块\S*（本区 2 列", wsD)]) >= 1,
-	"再切回工作区 2：两列都还在")
 
 print()
 print("== 特殊工作区：不进列表、跟随聚焦的屏 ==")

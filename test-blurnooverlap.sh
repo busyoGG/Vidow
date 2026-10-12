@@ -29,8 +29,6 @@ LOG="$RUNDIR/log"
 FAILED=0
 VIDOW_PGID=""
 
-pass() { echo "  PASS  $1"; }
-fail() { echo "  FAIL  $1"; FAILED=1; }
 mark() { echo; echo "== $1 =="; }
 
 cleanup() {

@@ -37,7 +37,6 @@ VIDOW_PID=""
 CLIENT_PIDS=""
 WIN_PID=""
 
-pass() { echo "  PASS  $1"; }
 fail() { echo "  FAIL  $1"; FAILED=1; }
 
 cleanup() {

@@ -50,42 +50,8 @@ is_ours() {
 	return 1
 }
 
-# 杀掉我们起的某个客户端。**从大 pid 往小 pid 杀**：先杀父进程的话子进程会被
-# init 收养，is_ours 就认不出它了（踩过：wl-copy fork 出来的那个一直活着，
-# 「客户端退出」这一段就白测了）。
-kill_prog() {
-	local pat=$1
-	local pids=""
-	for p in /proc/[0-9]*; do
-		local pid=${p#/proc/}
-		[ "$pid" = "$$" ] && continue
-		local cmd
-		cmd=$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null) || continue
-		case "$cmd" in
-		*"$pat"*) is_ours "$pid" && pids="$pids $pid" ;;
-		esac
-	done
-	[ -z "$pids" ] && return 1
-	for pid in $(echo $pids | tr ' ' '\n' | sort -rn); do
-		kill -9 "$pid" 2>/dev/null
-	done
-	return 0
-}
-
-# 等某个客户端真的没了（最多 4 秒）
-wait_prog_gone() {
-	local pat=$1
-	for _ in $(seq 1 16); do
-		if ! kill_prog "$pat" >/dev/null 2>&1; then
-			return 0
-		fi
-		sleep 0.25
-	done
-	return 1
-}
-
 # xclip 和 wl-copy 都会 fork 一个「持有选择」的子进程，父进程立刻退出 —— 子进程被
-# init 收养之后 is_ours 就认不出它了（踩过：kill_prog 杀不掉它，「客户端退出」那几条
+# init 收养之后 is_ours 就认不出它了（踩过：早先那种「扫 /proc 找 pid 再杀」杀不掉它，
 # 断言其实一直在骗自己：客户端还活着，seat 上的选择当然没变）。所以：整组起
 # （setsid 让它当组长），整组杀（kill -- -PGID）。
 CLIENT_PGID=""

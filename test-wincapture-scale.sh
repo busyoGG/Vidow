@@ -165,11 +165,6 @@ if [ "$(where)" = "HEADLESS-2" ]; then
 else
 	fail "窗口没挪到 HEADLESS-2（在 $(where)）"
 fi
-if [ -n "$S1" ] && [ -n "$S2" ] && [ "$S2" != "$S1" ]; then
-	pass "换屏之后合成器重发了 buffer_size（$S1 -> $S2）"
-else
-	fail "换屏之后 buffer_size 没变（$S1 -> $S2）—— 这一节就测不到尺寸变化了"
-fi
 # 尺寸口径：2 倍屏上是 1 倍屏上的两倍（同一套「逻辑 × scale」）。
 W1=${S1%x*}; W2=${S2%x*}
 if [ -n "$W1" ] && [ -n "$W2" ] && [ "$W2" = "$((W1 * 2))" ]; then

@@ -72,15 +72,6 @@ export WAYLAND_DISPLAY=$(grep -ao "WAYLAND_DISPLAY=[a-z0-9-]*" "$LOG" |
 	tail -1 | cut -d= -f2)
 
 alive() { kill -0 "$VIDOW_PID" 2>/dev/null; }
-wait_for() { # <grep 模式> <最多等几秒>
-	local i
-	for i in $(seq 1 $(( $2 * 4 ))); do
-		grep -aq "$1" "$LOG" && return 0
-		alive || return 1
-		sleep 0.25
-	done
-	return 1
-}
 
 mark "1/3 令牌攥着 surface，surface 先没了"
 # 0 秒就用令牌请求激活（令牌在 map 时就建好了、带 set_surface），2 秒时把窗口
