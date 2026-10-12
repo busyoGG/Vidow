@@ -185,6 +185,8 @@ static const struct entry entries[] = {
 	{ "column_width_ms", K_INT,    OFF(column_width_ms), SZ(column_width_ms), 3,
 		"列宽变化的过渡时长（cycle-column-width / 列最大化 / IPC 改宽；0 = 直接"
 		"到位。拖动改宽不补间 —— 那个必须跟手）" },
+	{ "workspace_switch_ms", K_INT, OFF(workspace_switch_ms), SZ(workspace_switch_ms), 3,
+		"切工作区的过渡时长（旧的推开、新的从另一边进来；0 = 直接换）" },
 	{ "layer_open_ms",   K_INT,    OFF(layer_open_ms),   SZ(layer_open_ms), 3,
 		"layer-shell（状态栏、通知、挂件）出现的动画时长" },
 	{ "layer_close_ms",  K_INT,    OFF(layer_close_ms),  SZ(layer_close_ms), 3,
@@ -879,6 +881,7 @@ static void defaults(struct vidow_config *cfg) {
 	cfg->window_close_ms = 140;
 	cfg->window_move_ms = 190;
 	cfg->column_width_ms = 200;
+	cfg->workspace_switch_ms = 200;
 	cfg->layer_open_ms = 200;
 	cfg->layer_close_ms = 150;
 	cfg->easing = VIDOW_EASE_OUT_CUBIC;

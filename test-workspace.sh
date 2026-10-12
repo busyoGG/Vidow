@@ -62,6 +62,10 @@ xwayland = false
 window_open_ms = 80
 window_close_ms = 80
 window_move_ms = 80
+-- 切工作区的过渡关掉：这个测试断言的是**稳定之后**的状态（日志里那行
+-- 「全屏 N 个可见」是切换当下数出来的，过渡里旧的那块还画着、数字会多一个；
+-- 截图也在过渡结束前抓）。过渡本身是动画，不在这儿测。
+workspace_switch_ms = 0
 -- 工作区由用户建；键位由用户绑。
 for i = 1, 4 do
 	vidow.workspace_create(tostring(i))

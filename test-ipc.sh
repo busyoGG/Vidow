@@ -83,6 +83,9 @@ scale = "1"
 xwayland = false
 window_open_ms = 60
 window_move_ms = 60
+-- 切工作区的过渡关掉：这个测试断言的是稳定状态（过渡里旧的那块还画着，
+-- 刚切完就去 pick-window 会挑到它）。过渡本身是动画，不在这儿测。
+workspace_switch_ms = 0
 EOF
 
 # ------------------------------------------------------------ 工具
@@ -235,6 +238,9 @@ scale = "1"
 xwayland = false
 window_open_ms = 60
 window_move_ms = 60
+-- 切工作区的过渡关掉：这个测试断言的是稳定状态（过渡里旧的那块还画着，
+-- 刚切完就去 pick-window 会挑到它）。过渡本身是动画，不在这儿测。
+workspace_switch_ms = 0
 for i = 1, 3 do vidow.workspace_create(tostring(i)) end
 vidow.workspace_special("scratch")
 vidow.bind("Mod+1", "workspace 1")

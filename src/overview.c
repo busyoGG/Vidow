@@ -296,6 +296,9 @@ void vidow_overview_toggle(struct vidow_server *server) {
 	ov->on = true;
 	ov->output = server->focused_output;
 	ov->pan = 0.0;
+	/* 切工作区的过渡还在滑就先收住：overview 按每块工作区自己的几何算缩略图，
+	 * 正滑着的那块会摆歪（而且它下一帧就要被缩放动画接管）。 */
+	vidow_workspace_slide_cancel(server);
 	/* 缩下去的窗口不该还挂着指针焦点（否则客户端以为鼠标还在它身上） */
 	wlr_seat_pointer_notify_clear_focus(server->seat);
 	overview_start(server);

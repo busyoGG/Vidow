@@ -483,6 +483,15 @@ static void ws_destroy(struct vidow_server *server,
 			view->ws = NULL;
 		}
 	}
+	/* 正被某个过渡推着（理论上去不到：空的才收，空的也不起过渡 —— 留一手）：
+	 * 先把那条过渡收干净，别留一个指向 free 掉的工作区的指针。 */
+	struct vidow_output *out;
+	wl_list_for_each(out, &server->outputs, link) {
+		if (out->slide_from == ws && out->slide_anim != NULL) {
+			vidow_anim_cancel(out->slide_anim);
+			out->slide_anim = NULL;
+		}
+	}
 	wl_list_remove(&ws->link);
 	free(ws);
 }
@@ -704,6 +713,9 @@ struct vidow_workspace *vidow_workspace_shown(struct vidow_server *server) {
 	return vidow_workspace_active(server);
 }
 
+static struct vidow_output *output_of(struct vidow_server *server,
+		struct wlr_output *wlr_output);
+
 bool vidow_workspace_view_visible(struct vidow_server *server,
 		struct vidow_view *view) {
 	if (view == NULL || view->popup) {
@@ -729,7 +741,14 @@ bool vidow_workspace_view_visible(struct vidow_server *server,
 	}
 	struct vidow_workspace *active =
 		vidow_workspace_active_for(server, output);
-	return active != NULL && view->ws == active;
+	if (active != NULL && view->ws == active) {
+		return true;
+	}
+	/* 切工作区的过渡里，正在被推开的那块**也画**，但那条不算「可见」——
+	 * 这里只答「它属于现在显示着的那块工作区吗」。要画的那一份在
+	 * view.c 的 vidow_view_should_park() 里单独放行（pick-window / 切换器 /
+	 * 录屏这些问「可见」的地方不能被过渡里那半屏旧窗口带偏）。 */
+	return false;
 }
 
 /* wlr_output 找它对应的 vidow_output：滚动偏移住在那儿（按输出名记的）。 */
@@ -884,6 +903,156 @@ static void ws_adopt_view(struct vidow_workspace *target,
 	}
 }
 
+/* ----------------------------------------------- 切工作区的过渡（纵向滑动） */
+
+/* 一块屏上只有一块普通工作区亮着（见 vidow_workspace_shown_for），所以「切工作
+ * 区」本来是瞬间换人。这里给它一个过渡：旧的那块往上/下推开，新的从另一边进来 ——
+ * niri 的纵向滑动。
+ *
+ * 做法：过渡期间两块工作区**都在场景里**，各自的纵向偏移存在 ws->slide_y 里；
+ * 摆位在 view.c 的 output_arrange（它按各自的偏移把两块都摆一遍），可见性由
+ * vidow_workspace_view_visible 放行。推开的距离是整块屏高 —— 到位时旧的那块
+ * 正好整块落在屏外，被 vidow_view_should_park 停到停车位（不画）。
+ *
+ * 一帧一帧地重摆（每帧 vidow_arrange），所以窗口的位置**是过渡推出来的**：过渡
+ * 期间 vidow_place_view 不给每个窗口起位移补间（见 server.h 的 workspace_slide_n），
+ * 整块工作区刚性跟着曲线走。 */
+struct ws_slide {
+	struct vidow_server *server;
+	struct vidow_output *output;
+	struct vidow_workspace *from;
+	struct vidow_workspace *to;
+	struct vidow_anim *anim;
+	int height; /* 推开多远：整块屏高 */
+	int dir;    /* +1 = 新的从下面进来（旧往上走），-1 = 反过来 */
+};
+
+static void slide_update(void *data, double t, double linear) {
+	(void)linear;
+	struct ws_slide *sl = data;
+	if (sl->from == NULL || sl->to == NULL || sl->output == NULL) {
+		return;
+	}
+	double off = (double)sl->height * t;
+	if (sl->dir > 0) {
+		sl->from->slide_y = -off;
+		sl->to->slide_y = (double)sl->height - off;
+	} else {
+		sl->from->slide_y = off;
+		sl->to->slide_y = off - (double)sl->height;
+	}
+	vidow_arrange(sl->server);
+	vidow_output_schedule_frame(sl->server, sl->output->wlr_output,
+		"切工作区过渡");
+}
+
+static void slide_done(void *data, bool cancelled) {
+	(void)cancelled;
+	struct ws_slide *sl = data;
+	if (sl->from != NULL) {
+		sl->from->slide_y = 0.0;
+	}
+	if (sl->to != NULL) {
+		sl->to->slide_y = 0.0;
+	}
+	if (sl->server->workspace_slide_n > 0) {
+		sl->server->workspace_slide_n--;
+	}
+	if (sl->output != NULL) {
+		if (sl->output->slide_from == sl->from) {
+			sl->output->slide_from = NULL;
+		}
+		if (sl->output->slide_anim == sl->anim) {
+			sl->output->slide_anim = NULL;
+		}
+	}
+	if (sl->from != NULL && sl->to != NULL) {
+		vidow_arrange(sl->server);
+	}
+	free(sl);
+}
+
+/* 这块工作区里有没有「看得见的东西」（列里的窗口 / 浮窗）。空的就没必要滑 ——
+ * 而且空工作区可能当场就被 vidow_workspace_cleanup 收掉，别留着它的指针。 */
+static bool ws_has_something(struct vidow_workspace *ws) {
+	if (ws->floats > 0) {
+		return true;
+	}
+	struct vidow_column *col;
+	wl_list_for_each(col, &ws->columns, link) {
+		struct vidow_view *view;
+		wl_list_for_each(view, &col->views, column_link) {
+			if (view->mapped && !view->minimized && !view->popup) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+/* 这块屏上换工作区了：起一条过渡（config 的 workspace_switch_ms，0 = 不起）。 */
+static void slide_start(struct vidow_server *server, struct vidow_output *output,
+		struct vidow_workspace *from, struct vidow_workspace *to) {
+	if (output == NULL || from == NULL || to == NULL || from == to) {
+		return;
+	}
+	/* 还在滑的那条先掐掉：它的 done 会把偏移清零、把计数减回去。 */
+	if (output->slide_anim != NULL) {
+		vidow_anim_cancel(output->slide_anim);
+		output->slide_anim = NULL;
+	}
+	if (server->config.workspace_switch_ms <= 0 || !ws_has_something(from)) {
+		return;
+	}
+	struct wlr_box box = {0};
+	wlr_output_layout_get_box(server->output_layout, output->wlr_output, &box);
+	int height = box.height > 0 ? box.height : 1080;
+
+	struct ws_slide *sl = calloc(1, sizeof(*sl));
+	if (sl == NULL) {
+		return;
+	}
+	sl->server = server;
+	sl->output = output;
+	sl->from = from;
+	sl->to = to;
+	sl->height = height;
+	/* 新的在栈里比旧的靠下 → 它从下面进来（旧往上走）。 */
+	sl->dir = vidow_workspace_index(to) > vidow_workspace_index(from) ? 1 : -1;
+
+	output->slide_from = from;
+	server->workspace_slide_n++;
+	sl->anim = vidow_anim_start(server, "切工作区",
+		server->config.workspace_switch_ms, server->config.easing,
+		slide_update, slide_done, sl);
+	if (sl->anim == NULL) {
+		output->slide_from = NULL;
+		server->workspace_slide_n--;
+		free(sl);
+		return;
+	}
+	output->slide_anim = sl->anim;
+	wlr_log(WLR_DEBUG, "workspace: 过渡 %s -> %s（%dms，%s）",
+		from->named ? from->name : "(没名字)",
+		to->named ? to->name : "(没名字)",
+		server->config.workspace_switch_ms, sl->dir > 0 ? "新的从下面进来" : "新的从上面进来");
+}
+
+/* 把所有屏上正跑的过渡收干净（到位、不滑动）：overview 打开时用 —— 它按每块
+ * 工作区自己的几何算缩略图，正滑着的那块会摆歪。 */
+void vidow_workspace_slide_cancel(struct vidow_server *server) {
+	if (server == NULL) {
+		return;
+	}
+	struct vidow_output *output;
+	wl_list_for_each(output, &server->outputs, link) {
+		if (output->slide_anim != NULL) {
+			vidow_anim_cancel(output->slide_anim);
+			output->slide_anim = NULL;
+		}
+	}
+}
+
 bool vidow_workspace_activate(struct vidow_server *server,
 		struct vidow_workspace *ws) {
 	if (server == NULL || ws == NULL || ws->special) {
@@ -947,6 +1116,8 @@ bool vidow_workspace_activate(struct vidow_server *server,
 	if (out != NULL) {
 		out->viewport_x = ws->viewport_x;
 	}
+	/* 旧的那块开始让位（过渡期间它还画着，正从屏上滑出去）。 */
+	slide_start(server, out, prev, ws);
 
 	int shown = vidow_workspace_apply_visibility(server);
 	if (server->focused != NULL && server->focused->ws != ws) {

@@ -1443,6 +1443,27 @@ static void view_capture_holds_clear(struct vidow_view *view) {
 	}
 }
 
+/* 切工作区的过渡里「正被推开的那一块」上的窗口：它不属于现在显示着的工作区
+ * （vidow_workspace_view_visible 为假），但过渡期间照样得画 —— 它正从屏上滑
+ * 出去。滑到屏外之后 should_park 最后那条 !in_output_box 会把它停掉。
+ *
+ * 只放行「画」：可见性本身不含它，所以 pick-window / 切换器清单 / 录屏判据都
+ * 不会被过渡里那半屏旧窗口带偏（test-ipc.sh 的「空工作区上 pick-window 是
+ * null」就是这个坑）。 */
+static bool view_sliding_out(struct vidow_server *server,
+		const struct vidow_view *view) {
+	if (view->ws == NULL || view->output == NULL) {
+		return false;
+	}
+	struct vidow_output *output;
+	wl_list_for_each(output, &server->outputs, link) {
+		if (output->wlr_output == view->output) {
+			return output->slide_from == view->ws;
+		}
+	}
+	return false;
+}
+
 /* 「它现在该停到所有输出框外面吗」—— 判据只有这一份：workspace.c 的可见性那一趟
  * 和 view_anim_place（每帧现算）都问它。
  *
@@ -1454,7 +1475,8 @@ bool vidow_view_should_park(struct vidow_server *server,
 	if (view->popup || !view->mapped || view->scene_tree == NULL) {
 		return false; /* 弹出物 / 还没上屏的：各有各的路（见 workspace.c） */
 	}
-	if (!vidow_workspace_view_visible(server, view)) {
+	if (!vidow_workspace_view_visible(server, view) &&
+			!view_sliding_out(server, view)) {
 		return true; /* 最小化 / 工作区被藏起来：也不画 */
 	}
 	if (view->float_mode != VIDOW_FLOAT_NONE || view->dragging ||
@@ -2031,6 +2053,19 @@ void vidow_place_view(struct vidow_view *view, int x, int y, int w, int h) {
 	 *
 	 * 放在 moved 判断**后面**：没动的窗口照旧走上面那条（手里正跑着位移补间
 	 * 的那种不该被过渡掐掉）。 */
+	/* 切工作区的过渡正跑着：这一帧所有窗口的纵向位移**是过渡本身推出来的** ——
+	 * 每帧重起一次位移补间的话它们会一直吊在过渡后面（和上面列宽那条一个道理），
+	 * 看着就是「工作区滑过去了、窗口还在原地飘」。过渡期间直接落位，整块工作区
+	 * 刚性跟着曲线走。 */
+	if (view->server->workspace_slide_n > 0) {
+		vidow_anim_cancel(view->anim_move);
+		view->anim_move = NULL;
+		view->anim_off_x = 0.0;
+		view->anim_off_y = 0.0;
+		vidow_view_apply_anim(view);
+		return;
+	}
+
 	if (view->server->column_anim_n > 0) {
 		vidow_anim_cancel(view->anim_move);
 		view->anim_move = NULL;
@@ -2097,6 +2132,65 @@ struct wlr_box vidow_work_area(struct vidow_server *server,
 /* 这一帧该按哪个比例画（定义在下面「列宽过渡」那一段）：补间在跑就是补间当前
  * 值，否则就是逻辑值。arrange 在上面，先声明一下。 */
 static double column_layout_fraction(const struct vidow_column *col);
+
+/* 摆一块工作区的列（Pass 3 那一套）。
+ *
+ * slide_y：切工作区过渡里这块工作区被推开的纵向偏移（正常 0）。
+ * viewport：用这块工作区自己的滚动位置 —— 过渡期间两块工作区各滚各的。
+ * fullscreen_out：列里那个全屏窗口（过渡里被推开的那块传 NULL：它那块不参与
+ *   「谁该压在别人上面」的收口，它正在走人）。 */
+static void arrange_columns(struct wl_list *shown,
+		const struct wlr_box *work, const struct wlr_box *full_box,
+		int inner, double viewport, int slide_y,
+		struct vidow_view **fullscreen_out) {
+	struct vidow_column *col;
+	wl_list_for_each(col, shown, link) {
+		int x = work->x + col->offset - (int)viewport;
+		/* 全屏的那块也**跟着条带走**：左边缘 = 它自己那条列画在屏上的位置，
+		 * 尺寸给整块屏。它在条带上占一整屏宽（见 Pass 1 那个 slot），所以
+		 * 聚焦旁边那条列时它整块滑到屏外、旁边的列并排露出来；它自己那条列
+		 * 被聚焦时视口正好落在它的 offset 上 —— 左边缘 0，严丝合缝盖住整屏。
+		 * 滑出去那半块由 view_clip_box 裁在自己那块屏里（不会画到隔壁显示器）。 */
+		int fx = full_box->x + col->offset - (int)viewport;
+
+		/* 记一笔「这块列画在屏上的哪一块」：拖动找落点（drag.c）要按**屏幕上
+		 * 看得见的**几何算，而全屏那列占一整屏、整列最小化的宽度是 0 这些
+		 * 规矩只有这里知道。 */
+		bool col_full = column_has_fullscreen(col);
+		col->screen_x = col_full ? fx : x;
+		col->slot_width = col_full ? work->width : col->width;
+
+		int n = 0;
+		struct vidow_view *view;
+		wl_list_for_each(view, &col->views, column_link) {
+			if (!view_shows(view)) {
+				continue;
+			}
+			if (view->fullscreen && view->mapped) {
+				if (fullscreen_out != NULL) {
+					*fullscreen_out = view;
+				}
+				vidow_place_view(view, fx, full_box->y + slide_y,
+					full_box->width, full_box->height);
+				continue;
+			}
+			n++;
+		}
+		if (n == 0) {
+			continue;
+		}
+
+		int y = work->y + slide_y;
+		wl_list_for_each(view, &col->views, column_link) {
+			if (!view_shows(view) || (view->fullscreen && view->mapped)) {
+				continue;
+			}
+			int h = (work->height - (n - 1) * inner) / n;
+			vidow_place_view(view, x, y, col->width, h);
+			y += h + inner;
+		}
+	}
+}
 
 static void output_arrange(struct vidow_server *server,
 		struct vidow_output *output) {
@@ -2194,51 +2288,19 @@ static void output_arrange(struct vidow_server *server,
 	 * 最小化的窗口不摆放（它原来的几何留着，放回来那次 arrange 会重算），
 	 * 也不参与 n —— 同列剩下的窗口因此自己撑满。 */
 	struct vidow_view *fullscreen = NULL;
-	wl_list_for_each(col, shown, link) {
-		int x = work.x + col->offset - (int)viewport;
-		/* 全屏的那块也**跟着条带走**：左边缘 = 它自己那条列画在屏上的位置，
-		 * 尺寸给整块屏。它在条带上占一整屏宽（见 Pass 1 那个 slot），所以
-		 * 聚焦旁边那条列时它整块滑到屏外、旁边的列并排露出来；它自己那条列
-		 * 被聚焦时视口正好落在它的 offset 上 —— 左边缘 0，严丝合缝盖住整屏。
-		 * 滑出去那半块由 view_clip_box 裁在自己那块屏里（不会画到隔壁显示器）。 */
-		int fx = full_box.x + col->offset - (int)viewport;
-
-		/* 记一笔「这块列画在屏上的哪一块」：拖动找落点（drag.c）要按**屏幕上
-		 * 看得见的**几何算，而全屏那列占一整屏、整列最小化的宽度是 0 这些
-		 * 规矩只有这里知道。 */
-		bool col_full = column_has_fullscreen(col);
-		col->screen_x = col_full ? fx : x;
-		col->slot_width = col_full ? work.width : col->width;
-
-		int n = 0;
-		struct vidow_view *view;
-		wl_list_for_each(view, &col->views, column_link) {
-			if (!view_shows(view)) {
-				continue;
-			}
-			if (view->fullscreen && view->mapped) {
-				fullscreen = view;
-				vidow_place_view(view, fx, full_box.y, full_box.width,
-					full_box.height);
-				continue;
-			}
-			n++;
-		}
-		if (n == 0) {
-			continue;
-		}
-
-		int y = work.y;
-		wl_list_for_each(view, &col->views, column_link) {
-			if (!view_shows(view) || (view->fullscreen && view->mapped)) {
-				continue;
-			}
-			int h = (work.height - (n - 1) * inner) / n;
-			vidow_place_view(view, x, y, col->width, h);
-			y += h + inner;
-		}
+	struct vidow_workspace *shown_ws =
+		vidow_workspace_shown_for(server, output->wlr_output);
+	/* 切工作区的过渡里被推开的那块先摆：它和现在这块都占着同一块屏，谁后摆
+	 * 谁留下的 col->screen_x / slot_width 就归谁用（拖动找落点读的是这两个），
+	 * 这两个值该是**当前这块**工作区的。 */
+	if (output->slide_from != NULL) {
+		arrange_columns(&output->slide_from->columns, &work, &full_box,
+			inner, output->slide_from->viewport_x,
+			(int)lround(output->slide_from->slide_y), NULL);
 	}
-
+	arrange_columns(shown, &work, &full_box, inner, viewport,
+		shown_ws != NULL ? (int)lround(shown_ws->slide_y) : 0,
+		&fullscreen);
 	vidow_float_place_all(server, output);
 
 	/* 浮动的全屏窗口也要占满**整块屏**（和列里的全屏同一个 full_box）：以前只有

@@ -524,11 +524,17 @@ static void mru_layout(struct vidow_server *server) {
 	mru->slot_n = n_used;
 	/* 滚出去 / 挤出去的那些预览不画：场景是全局坐标，摆在工作区外面的预览
 	 * 会落到隔壁那块屏上。置空 = 这一项不画（缩略图也不画），选中的那个由上面
-	 * 的滚动保证在画面里。 */
+	 * 的滚动保证在画面里。
+	 *
+	 * 判的是**整张卡片**（`cx/cy/cw/ch`，比缩略图大一圈卡片边距），不是缩略图：
+	 * 卡片的底、描边和四个圆角是各自独立的场景节点（`wlr_scene_rect` / 自己的
+	 * 小 buffer），裁不了 —— 只判缩略图的话，半张卡片露在工作区外的那一半就
+	 * 画到隔壁显示器上了（用户报的「开大量窗口、滚动清单时，超出视口的窗口会
+	 * 在另一个显示器显示」：量到 22627 个像素落在隔壁屏上）。 */
 	for (int i = 0; i < n_used; i++) {
 		struct vidow_mru_slot *slot = &mru->slot[i];
-		struct wlr_box at = { slot->x, slot->y, slot->w, slot->h };
-		if (!wlr_box_intersection(&(struct wlr_box){0}, &at, &work)) {
+		struct wlr_box card = { slot->cx, slot->cy, slot->cw, slot->ch };
+		if (!wlr_box_contains_box(&work, &card)) {
 			slot->view = NULL;
 		}
 	}

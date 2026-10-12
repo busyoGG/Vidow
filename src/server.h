@@ -133,6 +133,9 @@ struct vidow_config {
 	 * 拖动改宽（Mod+右键拖）不走它 —— 那个必须跟手。见 view.c 的
 	 * vidow_column_set_width。 */
 	int column_width_ms;
+	/* 切工作区的过渡时长（0 = 直接换，不动画）。旧的推开、新的从另一边进来，
+	 * 见 workspace.c 的 slide_start。 */
+	int workspace_switch_ms;
 	int layer_open_ms;
 	int layer_close_ms;
 	enum vidow_easing easing;
@@ -727,6 +730,11 @@ struct vidow_output {
 	 * 拔线时 wlroots 已经把 wlr_output->name 收走了，那时候再按名字找就晚了。 */
 	struct vidow_output_memory *memory;
 	double viewport_x;          /* horizontal scroll offset of the column strip */
+	/* 切工作区的过渡：正在被推开的（旧的）那块工作区，和驱动它的动画。
+	 * 过渡期间 arrange 会把 slide_from 的列也摆一遍（按它自己的 slide_y），
+	 * 见 view.c 的 output_arrange 和 workspace.c 的 slide_start。 */
+	struct vidow_workspace *slide_from;
+	struct vidow_anim *slide_anim;
 	/* 手指正拖着条带（三指横扫那种连续手势）：这期间视口由 gesture_viewport
 	 * 说了算，arrange 不做「把焦点列滚回可见区」那套（见 view.c 的 Pass 2）。 */
 	bool gesture_drag;
@@ -1772,6 +1780,9 @@ struct vidow_server {
 	 * （见 view.c 的 vidow_place_view）。用计数不用 bool：连着来两条 IPC 改宽
 	 * 就是两条列同时在过渡。 */
 	int column_anim_n;
+	/* 正在跑切工作区过渡的工作区数（正常 0）：> 0 时 vidow_place_view 直接落位，
+	 * 不给每个窗口起位移补间 —— 整块工作区要刚性跟着过渡曲线走。 */
+	int workspace_slide_n;
 	/* 探针：最近一次拖拽移动事件的时刻（见 output.c 的拖拽延迟统计） */
 	int64_t grab_ev_ns;
 	/* 平铺改宽（Mod+右键拖）：起拖时的光标 x 和那一列的像素宽。改宽按**增量**

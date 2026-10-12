@@ -13,6 +13,8 @@ window_close_ms = 140
 window_move_ms = 190
 -- 列宽变化的过渡时长（cycle-column-width / 列最大化 / IPC 改宽；0 = 直接到位。拖动改宽不补间 —— 那个必须跟手）
 column_width_ms = 200
+-- 切工作区的过渡时长（旧的推开、新的从另一边进来；0 = 直接换）
+workspace_switch_ms = 200
 -- layer-shell（状态栏、通知、挂件）出现的动画时长
 layer_open_ms = 200
 -- layer-shell 消失的动画时长

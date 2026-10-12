@@ -57,6 +57,11 @@ struct vidow_workspace {
 
 	/* 这块工作区里有几个浮窗（浮窗不进列，数出来才能算「空不空」） */
 	int floats;
+
+	/* 切工作区过渡里这块工作区被推开的纵向偏移（布局像素，正常是 0）。
+	 * 摆位在 view.c 的 output_arrange：过渡期间两块工作区都在场景里，
+	 * 各自按这个偏移摆一遍。见 workspace.c 的 slide_start。 */
+	double slide_y;
 };
 
 /* 建（或取）一块普通工作区：
@@ -104,6 +109,10 @@ struct vidow_workspace *vidow_workspace_special_shown(
 /* 切到某块工作区（切的是它现在所在的那块屏）：藏旧的、亮新的、还原滚动位置和焦点。 */
 bool vidow_workspace_activate(struct vidow_server *server,
 		struct vidow_workspace *ws);
+
+/* 把正跑的切工作区过渡收干净（到位、不滑动）。overview 打开时用：它按每块
+ * 工作区自己的几何算缩略图，正滑着的那块会摆歪。 */
+void vidow_workspace_slide_cancel(struct vidow_server *server);
 
 /* 开关特殊工作区（跟随当前聚焦的屏）。再调一次 = 关掉。 */
 bool vidow_workspace_toggle_special(struct vidow_server *server,
