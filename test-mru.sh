@@ -19,6 +19,8 @@
 #  11) 鼠标悬停：点亮指针底下那一张，**选中项不动**；挪到空白处悬停清掉
 #  12) 鼠标点击：点哪张卡片就切到哪个窗口（不用等松修饰键），面板当场收起，
 #      松手被吃掉（没漏给客户端）
+#  14) 工作区范围：默认 scope = workspace（只看当前工作区），换成 all 之后别的
+#      工作区的窗口也进清单
 #  13) 浮层：切换器**不动窗口** —— 面板开着期间每个窗口的位置/尺寸一字不变；
 #      卡片里画的是窗口内容（缩略图，全亮），桌面那层被压暗（面板浮在窗口之上）；
 #      预览走装饰管线 → 形状和真窗口一样（圆角 / 描边 / 阴影）
@@ -493,7 +495,37 @@ geo_ok=$(mq "all(e['x'] >= $wx and e['y'] >= $wy and e['x'] + e['w'] <= $wx + $w
 wait $WTYPE_PID 2>/dev/null
 sleep 0.8
 
-mark "11) 收尾"
+# ---------------------------------------------------------------- 工作区范围
+
+mark "11) 工作区范围：默认只看当前工作区（mru_scope = workspace）"
+# 在第 2 块工作区开一个 p6：默认范围下它不该进清单
+./build/vidowmsg focus-workspace 2 >/dev/null 2>&1
+sleep 0.6
+python3 tools/pattern.py p6 >/dev/null 2>&1 &
+sleep 1.6
+./build/vidowmsg focus-workspace 1 >/dev/null 2>&1
+sleep 0.8
+hold_tabs 1 2500
+sleep 0.7
+scope=$(mq 'd["scope"]')
+cnt=$(mq 'd["count"]')
+[ "$scope" = "workspace" ] && pass "默认范围 = workspace" || fail "默认范围 = $scope"
+[ "$cnt" = "5" ] && pass "只看当前工作区：清单 5 个（不含别的区的 p6）" \
+	|| fail "清单 $cnt 个（期望 5）：$(mq '" ".join(e["title"] for e in d["entries"])')"
+wait $WTYPE_PID 2>/dev/null
+sleep 0.6
+# 换成 all：别的区的 p6 也进来
+./build/vidowmsg set-config mru_scope all >/dev/null 2>&1
+hold_tabs 1 2500
+sleep 0.7
+cnt=$(mq 'd["count"]')
+[ "$cnt" = "6" ] && pass "scope = all：清单 6 个（p6 也进来）" \
+	|| fail "清单 $cnt 个（期望 6）"
+wait $WTYPE_PID 2>/dev/null
+sleep 0.6
+./build/vidowmsg set-config mru_scope workspace >/dev/null 2>&1
+
+mark "12) 收尾"
 ./build/vidowmsg set-config mru_layout strip >/dev/null 2>&1
 ./build/vidowmsg set-config mru_max_scale 0.5 >/dev/null 2>&1
 [ "$(mq 'd["showing"]')" = "False" ] && pass "面板已收起" || fail "面板还开着"

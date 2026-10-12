@@ -294,8 +294,8 @@ static const struct entry entries[] = {
 		"按住多久面板才显形（毫秒）：快速点一下 Alt+Tab 只想切窗口、不该整屏闪一下，"
 		"0 = 立刻显形" },
 	{ "mru_scope",       K_MRU_SCOPE, OFF(mru_scope),    SZ(mru_scope), 14,
-		"列哪些窗口：all（所有屏所有工作区）/ workspace（当前工作区）/ output"
-		"（当前这块屏）" },
+		"列哪些窗口：workspace（默认，当前工作区）/ all（所有屏所有工作区）/ "
+		"output（当前这块屏）" },
 	{ "mru_layout",      K_MRU_LAYOUT, OFF(mru_layout),  SZ(mru_layout), 14,
 		"排版：strip = 一行，装不下横向滚；grid = 不滚，按 mru_per_row 换行铺在"
 		"屏幕里（装不下就整体缩小预览）" },
@@ -777,7 +777,9 @@ static void defaults(struct vidow_config *cfg) {
 	cfg->mru_enabled = true;
 	cfg->mru_debounce_ms = 750;
 	cfg->mru_open_delay_ms = 150;
-	cfg->mru_scope = VIDOW_MRU_ALL;
+	/* 默认只看**当前工作区**：切换器是「这块工作区里切窗口」，跨工作区那种
+	 * 用 mru_scope = "all" 打开（也可以在绑定上单独给：scope=all）。 */
+	cfg->mru_scope = VIDOW_MRU_WORKSPACE;
 	cfg->mru_layout = VIDOW_MRU_STRIP;
 	cfg->mru_per_row = 5;
 	cfg->mru_gap = 16;

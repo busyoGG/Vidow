@@ -11,8 +11,8 @@ mru_enabled = true
 mru_debounce_ms = 750
 -- 按住多久面板才显形（毫秒）：快速点一下 Alt+Tab 只想切窗口、不该整屏闪一下，0 = 立刻显形
 mru_open_delay_ms = 150
--- 列哪些窗口：all（所有屏所有工作区）/ workspace（当前工作区）/ output（当前这块屏）
-mru_scope = "all"
+-- 列哪些窗口：workspace（默认，当前工作区）/ all（所有屏所有工作区）/ output（当前这块屏）
+mru_scope = "workspace"
 -- 排版：strip = 一行，装不下横向滚；grid = 不滚，按 mru_per_row 换行铺在屏幕里（装不下就整体缩小预览）
 mru_layout = "strip"
 -- grid 一行最多几个（窗口再多就换行）
@@ -47,5 +47,5 @@ mru_hover_color = "#3daee980"
 mru_highlight_border = 2
 -- 强调色：选中那张卡片的描边、以及它的底色（底 = 卡片底混 12% 这个色）
 mru_highlight_color = "#3daee9ff"
--- 这一族也能写成一张表，只写要改的项（mru = { enabled = true, debounce_ms = 750, open_delay_ms = 150, scope = "all", layout = "strip", per_row = 5, gap = 16, row_gap = 16, max_scale = 0.5, max_height = 480, min_scale = 0.05, backdrop_alpha = 0.6, card_padding = 8, card_radius = 12, card_color = "#2f3336e6", card_border = 1, card_border_color = "#3b4045ff", hover_border = 2, hover_color = "#3daee980", highlight_border = 2, highlight_color = "#3daee9ff" }）
+-- 这一族也能写成一张表，只写要改的项（mru = { enabled = true, debounce_ms = 750, open_delay_ms = 150, scope = "workspace", layout = "strip", per_row = 5, gap = 16, row_gap = 16, max_scale = 0.5, max_height = 480, min_scale = 0.05, backdrop_alpha = 0.6, card_padding = 8, card_radius = 12, card_color = "#2f3336e6", card_border = 1, card_border_color = "#3b4045ff", hover_border = 2, hover_color = "#3daee980", highlight_border = 2, highlight_color = "#3daee9ff" }）
 --     不写表也行：mru = true（一个值管全部）
