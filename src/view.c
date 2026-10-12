@@ -1504,7 +1504,15 @@ bool vidow_view_should_park(struct vidow_server *server,
 	}
 	if (!vidow_workspace_view_visible(server, view) &&
 			!view_sliding_out(server, view)) {
-		return true; /* 最小化 / 工作区被藏起来：也不画 */
+		/* overview 里**这块屏上别的工作区也要画**（它们上下排成一列，见
+		 * overview.c）—— 平时「藏起来的工作区不画」，全景里得放回来，不然
+		 * 那一行是空的。最小化的照旧不画（它连列里都不占位置，摆不出坐标）；
+		 * 别的屏上的照旧停着（全景只看一块屏）。 */
+		bool in_overview = vidow_overview_active(server) &&
+			view->output == server->overview.output && !view->minimized;
+		if (!in_overview) {
+			return true; /* 最小化 / 工作区被藏起来：也不画 */
+		}
 	}
 	if (view->float_mode != VIDOW_FLOAT_NONE || view->dragging ||
 			vidow_overview_active(server)) {
@@ -1546,6 +1554,25 @@ static void view_park_pos(const struct vidow_view *view, int *px, int *py) {
 	*py = all.y - 65536;
 }
 
+/* overview 里这个窗口的透明度：别的屏上的淡出（老规矩）、**同一块屏上别的工作区**
+ * 的跟着 t 淡入淡出 —— 它们平时不画，全景里才露出来，不这么办进出时会「啪」地
+ * 冒出来 / 消失。摆位（view_anim_place）和重烘（vidow_view_anim_bake）必须算出
+ * 同一个值，所以只有这一份。 */
+static double view_overview_alpha(struct vidow_server *server,
+		struct vidow_view *view) {
+	double alpha = view->anim_alpha;
+	if (server->overview.t <= 0.0 || server->overview.output == NULL) {
+		return alpha;
+	}
+	if (view->output != server->overview.output) {
+		return alpha * (1.0 - server->overview.t);
+	}
+	if (!vidow_workspace_view_visible(server, view)) {
+		return alpha * server->overview.t;
+	}
+	return alpha;
+}
+
 /* 「摆在哪」落到场景节点上：位置 / 透明度 / overview 的显示尺寸 / 装饰的采样
  * 偏移和 ext-background-effect 的区域。**便宜**，拖动跟手时每个指针事件都走这条。
  * 装饰图的重烘（贵：整块窗口那么大的离屏渲染）在 vidow_view_anim_bake 里，一帧
@@ -1556,21 +1583,17 @@ static void view_anim_place(struct vidow_view *view) {
 	if (view->scene_tree == NULL) {
 		return;
 	}
-	int wx = view->geom.x + (int)lround(view->anim_off_x);
-	int wy = view->geom.y + (int)lround(view->anim_off_y);
 
-	/* overview 里：位置走「世界 -> 屏幕」变换，内容尺寸乘上缩放；
-	 * 不在那块屏上的窗口淡出（overview 只看一块屏上的列带）。 */
+	/* overview 里：位置走「工作区局部 -> 屏幕」变换（每块工作区一行，见
+	 * overview.c），内容尺寸乘上缩放；不在这块屏上 / 不在现在这块工作区里的
+	 * 窗口淡出。 */
 	struct vidow_server *server = view->server;
 	double ov = vidow_overview_scale(server);
-	double alpha = view->anim_alpha;
+	double alpha = view_overview_alpha(server, view);
 	int x = 0, y = 0;
-	if (server->overview.t > 0.0 && server->overview.output != NULL &&
-			view->output != server->overview.output) {
-		alpha *= 1.0 - server->overview.t;
-	}
 	double sx_mapped = 0, sy_mapped = 0;
-	vidow_overview_map(server, wx, wy, &sx_mapped, &sy_mapped);
+	vidow_overview_map(server, view, view->anim_off_x, view->anim_off_y,
+		&sx_mapped, &sy_mapped);
 	x = (int)lround(sx_mapped);
 	y = (int)lround(sy_mapped);
 
@@ -1672,20 +1695,15 @@ void vidow_view_anim_bake(struct vidow_view *view) {
 	if (view_scanout_switch(view)) {
 		return;
 	}
-	int wx = view->geom.x + (int)lround(view->anim_off_x);
-	int wy = view->geom.y + (int)lround(view->anim_off_y);
 	struct vidow_server *server = view->server;
 	double ov = vidow_overview_scale(server);
-	double alpha = view->anim_alpha;
+	double alpha = view_overview_alpha(server, view);
 	int x = 0, y = 0;
 	/* 摆位那份（view_anim_place）怎么算的，这里就得怎么算：重烘的位置和缩放
 	 * 必须跟场景节点上那套一致，差一个像素就是糊 / 错位。 */
-	if (server->overview.t > 0.0 && server->overview.output != NULL &&
-			view->output != server->overview.output) {
-		alpha *= 1.0 - server->overview.t;
-	}
 	double sx_mapped = 0, sy_mapped = 0;
-	vidow_overview_map(server, wx, wy, &sx_mapped, &sy_mapped);
+	vidow_overview_map(server, view, view->anim_off_x, view->anim_off_y,
+		&sx_mapped, &sy_mapped);
 	x = (int)lround(sx_mapped);
 	y = (int)lround(sy_mapped);
 
@@ -2217,6 +2235,62 @@ static void arrange_columns(struct wl_list *shown,
 			y += h + inner;
 		}
 	}
+}
+
+int vidow_workspace_preview_layout(struct vidow_server *server,
+		struct vidow_workspace *ws, int work_w, int work_h,
+		void (*cb)(struct vidow_view *view, int x, int y, int w, int h,
+			void *data),
+		void *data) {
+	if (server == NULL || ws == NULL || work_w < 1 || work_h < 1) {
+		return 0;
+	}
+	int inner = vidow_gap_inner(&server->config);
+	int cursor = 0;
+	struct vidow_column *col;
+	/* 就是上面 arrange_columns 那一套（Pass 1 + Pass 3），只是**不写进
+	 * view->geom**、坐标从工作区左上角起算：overview 要摆的是藏起来的工作区，
+	 * 它们从来没被 arrange 过 —— col->offset / view->geom 还是上次显示时的老值
+	 * （窗口被挪进来时新列的 offset 甚至是 0），照着画会叠在一起。 */
+	wl_list_for_each(col, &ws->columns, link) {
+		/* 整列都最小化了：这条列不占位置（宽度 0），剩下的列自然合拢。 */
+		if (!column_has_shown_views(col)) {
+			continue;
+		}
+		int width = vidow_column_width_px(&server->config, work_w,
+			column_layout_fraction(col));
+		bool col_full = column_has_fullscreen(col);
+		int x = cursor;
+		int n = 0;
+		struct vidow_view *view;
+		wl_list_for_each(view, &col->views, column_link) {
+			if (!view_shows(view)) {
+				continue;
+			}
+			if (view->fullscreen && view->mapped) {
+				if (cb != NULL) {
+					cb(view, x, 0, work_w, work_h, data);
+				}
+				continue;
+			}
+			n++;
+		}
+		int y = 0;
+		wl_list_for_each(view, &col->views, column_link) {
+			if (!view_shows(view) || (view->fullscreen && view->mapped)) {
+				continue;
+			}
+			int h = (work_h - (n - 1) * inner) / n;
+			if (cb != NULL) {
+				cb(view, x, y, width, h, data);
+			}
+			y += h + inner;
+		}
+		/* 全屏的那条列在条带上占**一整屏**（同 Pass 1）：条带宽度 / 滚动范围
+		 * 都按它算，全景里它也就跟着滚。 */
+		cursor += (col_full ? work_w : width) + inner;
+	}
+	return cursor > 0 ? cursor - inner : 0;
 }
 
 static void output_arrange(struct vidow_server *server,

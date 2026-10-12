@@ -655,10 +655,12 @@ void vidow_pointer_axis(struct vidow_server *server,
 	/* 有些设备只发离散值（老鼠标），所以两个都看 */
 	double amount = delta != 0 ? delta : delta_discrete;
 
-	/* overview 里滚轮平移相机（世界坐标的一小步；换列会把平移清零、改回跟焦点走） */
+	/* overview 里滚轮滚的是**工作区列表**（上下预览那一列），一次一格。往下滚
+	 * （amount > 0）就往下看后面的工作区。窗口自己的横向预览不归它管 —— 那是
+	 * 「移动窗口焦点」那些键的事（跟着工作区自己的视口走，见 overview.c）。 */
 	if (vidow_overview_active(server)) {
 		if (amount != 0) {
-			vidow_overview_pan(server, amount > 0 ? 60 : -60);
+			vidow_overview_scroll(server, amount > 0 ? 60 : -60);
 		}
 		return;
 	}

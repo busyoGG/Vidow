@@ -3,69 +3,35 @@
 
 #include <math.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include <wlr/util/log.h>
 
-/* niri 风格的 overview：把一块屏上的整条列带缩到这块屏里看全景，点谁就去谁。
+/* niri 风格的 overview：把一块屏上的**所有工作区**上下排成一列看全景，每块工作区
+ * 缩成一条「这块屏」那么大的区域，点谁就去谁。
  *
- * 场景是全局的，所以这里不动布局、不改客户端尺寸，只算一个「世界 -> 屏幕」的变换
- * （见 server.h 里 struct vidow_overview 的注释），view.c 的 vidow_view_apply_anim
- * 负责把它套到每个窗口的场景节点上。
+ * 场景是全局的，所以这里不动布局、不改客户端尺寸，只算一个「工作区局部 -> 屏幕」
+ * 的变换（每块工作区一行，见 server.h 里 struct vidow_overview 的注释），view.c 的
+ * vidow_view_apply_anim 负责把它套到每个窗口的场景节点上。
+ *
+ * 三件事各归各的输入：
+ *   - 列表纵向滚动（list_scroll）：滚轮，一次一格；
+ *   - 行内横向滚动：跟着**那块工作区自己的视口**（焦点在工作区里换窗口时它自己会
+ *     动，见 view.c 的 output_arrange Pass 2）—— 所以「移动窗口焦点的键」动的是行内
+ *     预览，不是整条相机乱跑；
+ *   - 每行的区域 / 背景板（plate）：让「上下排布」看得见。
  *
  * t = 0 时必须是**恒等变换**：进出的动画都在 t 上插值，t = 0 那一端不能有跳变。 */
 
-/* 这块屏上「所有窗口」在世界坐标里的范围（用每个窗口实际摆好的 geom，
- * 所以带上了视口的滚动偏移 —— 正好是它们现在真正在的地方）。 */
-static bool strip_box(struct vidow_server *server,
-		struct wlr_output *output, struct wlr_box *out) {
-	bool any = false;
-	int x0 = 0, x1 = 0, y0 = 0, y1 = 0;
-
-	struct vidow_view *view;
-	wl_list_for_each(view, &server->views, link) {
-		if (view->output != output || view->popup || !view->mapped ||
-				view->geom.width < 1 || view->geom.height < 1) {
-			continue;
-		}
-		/* overview 看的是**现在显示着的那块工作区**：藏起来的工作区不在场
-		 * （它们的 geom 还是上次显示时的老值，算进去会把镜头拉偏）。 */
-		if (!vidow_workspace_view_visible(server, view)) {
-			continue;
-		}
-		int left = view->geom.x, right = left + view->geom.width;
-		int top = view->geom.y, bottom = top + view->geom.height;
-		if (!any) {
-			x0 = left;
-			x1 = right;
-			y0 = top;
-			y1 = bottom;
-			any = true;
-			continue;
-		}
-		if (left < x0) {
-			x0 = left;
-		}
-		if (right > x1) {
-			x1 = right;
-		}
-		if (top < y0) {
-			y0 = top;
-		}
-		if (bottom > y1) {
-			y1 = bottom;
-		}
-	}
-	if (!any) {
-		return false;
-	}
-	*out = (struct wlr_box){
-		.x = x0,
-		.y = y0,
-		.width = x1 - x0,
-		.height = y1 - y0,
-	};
-	return true;
-}
+/* 行间距（屏幕像素，写死）：列表的「一条一条」就靠它 + 每行的背景板看出来。 */
+#define OV_ROW_GAP 12
+/* 一行的最小屏幕高（占工作区的比例）。工作区多到纵向排不下时行不再继续缩，列表就
+ * 比屏高 —— 滚轮才有得滚（见 vidow_overview_scroll）。 */
+#define OV_ROW_MIN_SCALE 0.25
+/* 背景板的浓度：遮罩 alpha 的多少倍（写死，不另加配置项）。**必须跟着遮罩走**：
+ * overview_dim_color 的 alpha = 0（不压暗壁纸）时它得跟着一起没有，壁纸像素原样
+ * （test-overview.sh 拿壁纸像素断言这条）。 */
+#define OV_PLATE_ALPHA 0.25
 
 bool vidow_overview_active(const struct vidow_server *server) {
 	return server->overview.t > 0.0 || server->overview.on;
@@ -133,39 +99,314 @@ void vidow_overview_refresh_layers(struct vidow_server *server) {
 	}
 }
 
-/* 算好这一帧的 scale / cam / 输出矩形，并把所有窗口按它摆一遍。 */
+/* ------------------------------------------------- 行表（上下排布） */
+
+/* 记下这块屏的工作区（摆行 / 遮罩都用它）。框是空的 = 这块屏还没就绪。 */
+static bool overview_work_area(struct vidow_server *server,
+		struct wlr_box *work) {
+	struct vidow_overview *ov = &server->overview;
+	if (ov->output == NULL) {
+		return false;
+	}
+	struct wlr_box box = vidow_work_area(server, ov->output);
+	if (box.width < 1 || box.height < 1) {
+		return false;
+	}
+	ov->out_x = box.x;
+	ov->out_y = box.y;
+	ov->out_w = box.width;
+	ov->out_h = box.height;
+	if (work != NULL) {
+		*work = box;
+	}
+	return true;
+}
+
+/* 这块工作区有没有东西可看（有窗口的画着，最小化的不算 —— 它在全景里是停着的）。
+ * **空的工作区不摆行**：vidow 在每块屏的栈尾永远留一块空工作区（见 workspace.c 的
+ * vidow_workspace_ensure_bottom），把它也摆一行的话「一块工作区 + 一个空位」就会
+ * 各占半屏，真正要看的东西平白小一半，而那块空的什么信息都没有。当前这块工作区
+ * 例外：空也摆（用户就在那儿，得看得见自己在哪）。 */
+static bool ws_has_content(struct vidow_server *server,
+		struct vidow_workspace *ws) {
+	struct vidow_view *view;
+	wl_list_for_each(view, &server->views, link) {
+		if (view->ws != ws || view->popup || !view->mapped ||
+				view->minimized) {
+			continue;
+		}
+		if (view->geom.width < 1 || view->geom.height < 1) {
+			continue;
+		}
+		return true;
+	}
+	return false;
+}
+
+/* 这块屏上有哪些工作区（上下排布的次序 = 工作区在列表里的先后，也就是配置里的声明
+ * 顺序）。特殊工作区也算一行 —— 它的 output 只在「正显示着」时才指向这块屏，没显示
+ * 的时候自然混不进来（见 workspace.c）。行表按需分配、复用（板子留着，下次进来接
+ * 着用）。 */
+static int rows_build(struct vidow_server *server) {
+	struct vidow_overview *ov = &server->overview;
+	struct vidow_workspace *shown =
+		vidow_workspace_shown_for(server, ov->output);
+	int n = 0;
+	ov->n_skipped = 0;
+	struct vidow_workspace *ws;
+	wl_list_for_each(ws, &server->workspaces, link) {
+		if (ws->output != ov->output) {
+			continue;
+		}
+		if (ws != shown && !ws_has_content(server, ws)) {
+			ov->n_skipped++;
+			continue;
+		}
+		if (n == ov->cap_rows) {
+			int cap = ov->cap_rows > 0 ? ov->cap_rows * 2 : 4;
+			struct vidow_ov_row *rows =
+				realloc(ov->rows, (size_t)cap * sizeof(*rows));
+			if (rows == NULL) {
+				break; /* 内存没了：就摆这几行 */
+			}
+			memset(rows + ov->cap_rows, 0,
+				(size_t)(cap - ov->cap_rows) * sizeof(*rows));
+			ov->rows = rows;
+			ov->cap_rows = cap;
+		}
+		ov->rows[n].ws = ws;
+		n++;
+	}
+	ov->n_rows = n;
+	return n;
+}
+
+static struct vidow_ov_row *row_of(struct vidow_server *server,
+		struct vidow_workspace *ws) {
+	struct vidow_overview *ov = &server->overview;
+	if (ws == NULL) {
+		return NULL;
+	}
+	for (int i = 0; i < ov->n_rows; i++) {
+		if (ov->rows[i].ws == ws) {
+			return &ov->rows[i];
+		}
+	}
+	return NULL;
+}
+
+/* 这一行现在滚到哪儿了：显示着的那块工作区要用**当前**视口（它跟着焦点走，见
+ * output_arrange 的 Pass 2），藏起来的那几块用它们自己离开时记下的。 */
+static double row_viewport(struct vidow_server *server,
+		struct vidow_workspace *ws) {
+	struct vidow_overview *ov = &server->overview;
+	if (ws == vidow_workspace_shown_for(server, ov->output)) {
+		struct vidow_output *output = vidow_output_lookup(server, ov->output);
+		if (output != NULL) {
+			return output->viewport_x;
+		}
+	}
+	return ws->viewport_x;
+}
+
+/* 每行条带多宽（工作区局部像素）：按列宽比例现算 —— 藏起来的工作区从来没被 arrange
+ * 过，col->offset / view->geom 都是老值，照着画会叠在一起。 */
+static void rows_scale(struct vidow_server *server) {
+	struct vidow_overview *ov = &server->overview;
+	int work_w = ov->out_w, work_h = ov->out_h;
+	if (ov->n_rows <= 0 || work_w < 1 || work_h < 1) {
+		ov->scale = 1.0;
+		ov->row_h = 0.0;
+		return;
+	}
+	int max_band = 0;
+	for (int i = 0; i < ov->n_rows; i++) {
+		struct vidow_ov_row *row = &ov->rows[i];
+		row->band_w = vidow_workspace_preview_layout(server, row->ws,
+			work_w, work_h, NULL, NULL);
+		if (row->band_w > max_band) {
+			max_band = row->band_w;
+		}
+	}
+
+	/* 缩放：横向要让**最宽的那条带**铺得进这一行（留 4% 边），纵向要让所有行排得
+	 * 下。行多到纵向排不下就按最小行高兜底 —— 列表比屏高，滚轮才有得滚。只有两
+	 * 列时别放大（放大反而糊），所以封顶 1.0。 */
+	double fit_w = max_band > 0 ?
+		(double)work_w * 0.92 / (double)max_band : 1.0;
+	double fit_h = 0.92 / (double)ov->n_rows;
+	if (fit_h < OV_ROW_MIN_SCALE) {
+		fit_h = OV_ROW_MIN_SCALE;
+	}
+	double scale = fit_w < fit_h ? fit_w : fit_h;
+	if (scale > 1.0) {
+		scale = 1.0;
+	}
+	ov->scale = scale;
+	ov->row_h = (double)work_h * scale;
+}
+
+static double rows_total(const struct vidow_overview *ov) {
+	return (double)ov->n_rows * ov->row_h
+		+ (double)(ov->n_rows > 0 ? ov->n_rows - 1 : 0) * OV_ROW_GAP;
+}
+
+/* 这一行的区域 / 背景板：和遮罩同一层（窗口之下），铺满工作区那么宽 —— 「上下排布」
+ * 就靠它 + 行间距看出来。浓度跟着遮罩的 alpha 走（见 OV_PLATE_ALPHA）。 */
+static void plate_apply(struct vidow_server *server, struct vidow_ov_row *row) {
+	struct vidow_overview *ov = &server->overview;
+	if (row->plate == NULL) {
+		row->plate = wlr_scene_rect_create(server->layer_overview_dim, 1, 1,
+			(float[4]){ 0.0f, 0.0f, 0.0f, 0.0f });
+		if (row->plate == NULL) {
+			return;
+		}
+		wlr_scene_node_set_enabled(&row->plate->node, false);
+	}
+	const float *dim = server->config.overview_dim_color;
+	/* 场景的 rect 颜色是**预乘**的（跟 fx 那套着色器一样：配置里存直乘，用的时候
+	 * 乘上 alpha）。踩过一次：直接给直乘颜色，场景当预乘用 —— 板子不减暗，反而
+	 * 每通道加了 dim.rgb 那点亮度（0.02×255 ≈ +5）。 */
+	float a = (float)(dim[3] * ov->t * OV_PLATE_ALPHA);
+	float c[4] = { dim[0] * a, dim[1] * a, dim[2] * a, a };
+	int h = (int)lround(ov->row_h);
+	wlr_scene_rect_set_color(row->plate, c);
+	wlr_scene_rect_set_size(row->plate, ov->out_w, h > 0 ? h : 1);
+	wlr_scene_node_set_position(&row->plate->node, ov->out_x, row->y);
+	wlr_scene_node_set_enabled(&row->plate->node, ov->t > 0.002 && a > 0.0f);
+}
+
+/* 把行摆到屏幕上：每行的顶边（含列表滚动）和条带原点（含行内横向滚动），再把每行的
+ * 背景板摆好。t = 1 那一端的几何都在这儿定，vidow_overview_map 只按 t 插值。 */
+static void rows_place(struct vidow_server *server) {
+	struct vidow_overview *ov = &server->overview;
+	if (ov->n_rows <= 0 || ov->out_w < 1 || ov->out_h < 1) {
+		return;
+	}
+	double total = rows_total(ov);
+	double max_scroll = total - (double)ov->out_h;
+	if (max_scroll < 0.0) {
+		max_scroll = 0.0;
+	}
+	if (ov->list_scroll > max_scroll) {
+		ov->list_scroll = max_scroll;
+	}
+	if (ov->list_scroll < 0.0) {
+		ov->list_scroll = 0.0;
+	}
+	/* 排得下就上下居中（好看些），排不下才按 list_scroll 滚。 */
+	double top = total <= (double)ov->out_h ?
+		(double)ov->out_y + ((double)ov->out_h - total) / 2.0 :
+		(double)ov->out_y - ov->list_scroll;
+
+	for (int i = 0; i < ov->n_rows; i++) {
+		struct vidow_ov_row *row = &ov->rows[i];
+		row->y = (int)lround(top + (double)i * (ov->row_h + OV_ROW_GAP));
+		/* 行内横向滚动：跟着这块工作区自己的视口（焦点在工作区里换窗口时它自己
+		 * 会动），但夹住 —— 全景是缩小看的，条带整体滑出这一行的区域就看不见了
+		 * （测试也按日志里的坐标采样像素）。视口 0 = 条带居中，视口越大越往左
+		 * 滑，最多滑到左边缘对齐。 */
+		double slack = (double)ov->out_w - (double)row->band_w * ov->scale;
+		if (slack < 0.0) {
+			slack = 0.0;
+		}
+		double want = row_viewport(server, row->ws) * ov->scale;
+		if (want > slack) {
+			want = slack;
+		}
+		if (want < 0.0) {
+			want = 0.0;
+		}
+		row->content_x = (double)ov->out_x + (slack - want) / 2.0;
+		plate_apply(server, row);
+	}
+	/* 上次进来时行更多：多出来的板子关掉（留着下次用）。 */
+	for (int i = ov->n_rows; i < ov->cap_rows; i++) {
+		if (ov->rows[i].plate != NULL) {
+			wlr_scene_node_set_enabled(&ov->rows[i].plate->node, false);
+		}
+	}
+}
+
+/* 进来先把列表滚到「现在这块工作区」那一行看得见的地方（列表比屏高时才用得上）。 */
+static void rows_scroll_to_active(struct vidow_server *server) {
+	struct vidow_overview *ov = &server->overview;
+	struct vidow_workspace *shown =
+		vidow_workspace_shown_for(server, ov->output);
+	double total = rows_total(ov);
+	double max_scroll = total - (double)ov->out_h;
+	if (max_scroll <= 0.0) {
+		ov->list_scroll = 0.0;
+		return;
+	}
+	for (int i = 0; i < ov->n_rows; i++) {
+		if (ov->rows[i].ws != shown) {
+			continue;
+		}
+		double want = (double)i * (ov->row_h + OV_ROW_GAP)
+			- ((double)ov->out_h - ov->row_h) / 2.0;
+		if (want > max_scroll) {
+			want = max_scroll;
+		}
+		ov->list_scroll = want > 0.0 ? want : 0.0;
+		return;
+	}
+	ov->list_scroll = 0.0;
+}
+
+/* 窗口在它那一行里的位置和尺寸（工作区局部坐标，不含行内横向滚动）。
+ * 进列的窗口按列宽比例现算（藏起来的工作区从来没被 arrange 过）；浮窗 / 弹出物不进
+ * 列，用它们自己的几何（浮窗不跟着条带滚，所以不减视口）。返回 false = 这个窗口在
+ * 这一行里没有位置（最小化之类，全景里不画）。 */
+struct row_local_ctx {
+	struct vidow_view *want;
+	bool found;
+	int x, y, w, h;
+};
+
+static void row_local_cb(struct vidow_view *view, int x, int y, int w, int h,
+		void *data) {
+	struct row_local_ctx *ctx = data;
+	if (view == ctx->want) {
+		ctx->found = true;
+		ctx->x = x;
+		ctx->y = y;
+		ctx->w = w;
+		ctx->h = h;
+	}
+}
+
+static bool row_view_rect(struct vidow_server *server,
+		const struct vidow_ov_row *row, struct vidow_view *view,
+		double *lx, double *ly, int *lw, int *lh) {
+	if (view->popup) {
+		return false;
+	}
+	if (view->float_mode != VIDOW_FLOAT_NONE || view->column == NULL) {
+		*lx = view->geom.x - server->overview.out_x;
+		*ly = view->geom.y - server->overview.out_y;
+		*lw = view->geom.width;
+		*lh = view->geom.height;
+		return view->geom.width > 0 && view->geom.height > 0;
+	}
+	struct row_local_ctx ctx = { .want = view };
+	vidow_workspace_preview_layout(server, row->ws, server->overview.out_w,
+		server->overview.out_h, row_local_cb, &ctx);
+	if (!ctx.found) {
+		return false;
+	}
+	*lx = ctx.x;
+	*ly = ctx.y;
+	*lw = ctx.w;
+	*lh = ctx.h;
+	return true;
+}
+
+/* 算好这一帧的行布局，并把所有窗口按它摆一遍。 */
 static void overview_apply(struct vidow_server *server) {
 	struct vidow_overview *ov = &server->overview;
-	struct wlr_output *output = ov->output;
-	if (output == NULL) {
+	if (!overview_work_area(server, NULL)) {
 		return;
-	}
-
-	struct wlr_box work = vidow_work_area(server, output);
-	if (work.width < 1 || work.height < 1) {
-		return;
-	}
-	ov->out_x = work.x;
-	ov->out_y = work.y;
-	ov->out_w = work.width;
-	ov->out_h = work.height;
-
-	/* 恒等那一端：scale = 1、相机在世界坐标的屏中心 */
-	double id_cx = work.x + work.width / 2.0;
-	double id_cy = work.y + work.height / 2.0;
-	double to_cx = id_cx, to_cy = id_cy, to_scale = 1.0;
-
-	struct wlr_box strip;
-	if (strip_box(server, output, &strip)) {
-		/* 展开那一端：整条带（留 4% 边）铺进工作区，相机跟到带中心 */
-		double sx = (double)work.width * 0.92 / (double)strip.width;
-		double sy = (double)work.height * 0.92 / (double)strip.height;
-		to_scale = sx < sy ? sx : sy;
-		if (to_scale > 1.0) {
-			to_scale = 1.0; /* 只有两列时别放大：放大反而糊 */
-		}
-		to_cx = strip.x + strip.width / 2.0 + ov->pan;
-		to_cy = strip.y + strip.height / 2.0;
 	}
 
 	double t = ov->t;
@@ -175,20 +416,21 @@ static void overview_apply(struct vidow_server *server) {
 	if (t > 1.0) {
 		t = 1.0;
 	}
-	ov->scale = 1.0 + (to_scale - 1.0) * t;
-	ov->cam_x = id_cx + (to_cx - id_cx) * t;
-	ov->cam_y = id_cy + (to_cy - id_cy) * t;
-	ov->out_cx = id_cx;
-	ov->out_cy = id_cy;
+
+	/* 这一帧的缩略图：先按工作区列表把行摆出来（t = 1 那一端的几何），再按 t
+	 * 插值（在 vidow_overview_map 里）。 */
+	rows_build(server);
+	rows_scale(server);
+	rows_place(server);
 
 	/* 遮罩：压暗壁纸，让缩小的窗口浮在上面。盖住那块屏（用它的整个布局框）。
 	 * 颜色和浓度都是配置给的（overview_dim_color，见 17-overview.lua）。 */
 	if (ov->dim != NULL) {
 		struct wlr_box box = {0};
-		wlr_output_layout_get_box(server->output_layout, output, &box);
+		wlr_output_layout_get_box(server->output_layout, ov->output, &box);
 		if (box.width < 1) {
-			box = (struct wlr_box){ .x = work.x, .y = work.y,
-				.width = work.width, .height = work.height };
+			box = (struct wlr_box){ .x = ov->out_x, .y = ov->out_y,
+				.width = ov->out_w, .height = ov->out_h };
 		}
 		const float *c = server->config.overview_dim_color;
 		float dim[4] = { c[0], c[1], c[2], (float)(c[3] * t) };
@@ -256,15 +498,15 @@ static void overview_done(void *data, bool cancelled) {
 	overview_apply(server);
 	if (!ov->on) {
 		ov->output = NULL;
-		ov->pan = 0.0;
+		ov->list_scroll = 0.0;
 		/* 收掉那张糊壁纸的缓冲（整屏那么大，4K 上两份 33MB）。场景节点留着
 		 * ——它挂在 layer_overview_dim 那棵树上，下次进来接着用。 */
 		vidow_fx_end(server, &ov->fx);
 		ov->fx_on = false;
 	}
-	/* 进 / 出都重判一次「谁该出现在场景里」：overview 里**所有**窗口都要画
-	 * （缩到画面里），所以滚出视口被剔除的那些得先放回来；退出之后又要按框剔除
-	 * 一次（不然它们会一直显示着，串到隔壁屏上）。 */
+	/* 进 / 出都重判一次「谁该出现在场景里」：overview 里**这块屏上所有工作区**
+	 * 的窗口都要画（缩到画面里），所以平时按工作区藏起来的那些得先放回来；退出
+	 * 之后又要按框剔除一次（不然它们会一直显示着，串到隔壁屏上）。 */
 	vidow_workspace_apply_visibility(server);
 }
 
@@ -295,7 +537,7 @@ void vidow_overview_toggle(struct vidow_server *server) {
 	}
 	ov->on = true;
 	ov->output = server->focused_output;
-	ov->pan = 0.0;
+	ov->list_scroll = 0.0;
 	/* 切工作区的过渡还在滑就先收住：overview 按每块工作区自己的几何算缩略图，
 	 * 正滑着的那块会摆歪（而且它下一帧就要被缩放动画接管）。 */
 	vidow_workspace_slide_cancel(server);
@@ -303,37 +545,58 @@ void vidow_overview_toggle(struct vidow_server *server) {
 	wlr_seat_pointer_notify_clear_focus(server->seat);
 	overview_start(server);
 
-	/* 顺手把每个窗口在 overview 里的位置算出来打一行：一是让日志能自证，
-	 * 二是测试要拿它做像素断言（缩放后的矩形）。 */
-	struct wlr_box strip;
-	if (strip_box(server, ov->output, &strip)) {
-		struct wlr_box work = vidow_work_area(server, ov->output);
-		double sx = (double)work.width * 0.92 / (double)strip.width;
-		double sy = (double)work.height * 0.92 / (double)strip.height;
-		double scale = sx < sy ? sx : sy;
-		if (scale > 1.0) {
-			scale = 1.0;
-		}
-		wlr_log(WLR_INFO, "overview: 进入（%s 上 %d 个窗口，占 %dx%d 缩到 %.3f，"
-			"铺在工作区 %dx%d 里）", ov->output->name,
-			wl_list_length(&server->views), strip.width, strip.height,
-			scale, work.width, work.height);
+	/* 顺手把每块工作区、每个窗口在 overview 里的位置算出来打一行：一是让日志能
+	 * 自证，二是测试要拿它做像素断言（缩放后的矩形）。打的是 t = 1 那一端的几何
+	 * （map 按 t 插值，所以这些值跟动画进度无关）。 */
+	if (overview_work_area(server, NULL)) {
+		rows_build(server);
+		rows_scale(server);
+		rows_scroll_to_active(server);
+		rows_place(server);
 
-		int id_cx = work.x + work.width / 2;
-		int id_cy = work.y + work.height / 2;
-		int to_cx = strip.x + strip.width / 2;
-		int to_cy = strip.y + strip.height / 2;
+		int max_band = 0;
+		int n_win = 0;
 		struct vidow_view *view;
 		wl_list_for_each(view, &server->views, link) {
 			if (view->output != ov->output || !view->mapped) {
 				continue;
 			}
-			int x = (int)lround(id_cx + (view->geom.x - to_cx) * scale);
-			int y = (int)lround(id_cy + (view->geom.y - to_cy) * scale);
+			n_win++;
+		}
+		for (int i = 0; i < ov->n_rows; i++) {
+			if (ov->rows[i].band_w > max_band) {
+				max_band = ov->rows[i].band_w;
+			}
+		}
+		wlr_log(WLR_INFO, "overview: 进入（%s 上 %d 个窗口，占 %dx%d 缩到 %.3f，"
+			"铺在工作区 %dx%d 里）", ov->output->name, n_win, max_band,
+			ov->n_rows * ov->out_h, ov->scale, ov->out_w, ov->out_h);
+		if (ov->n_skipped > 0) {
+			wlr_log(WLR_INFO, "overview: %d 块空工作区没摆行（没东西可看，"
+				"摆了白占地方）", ov->n_skipped);
+		}
+		double total = rows_total(ov);
+		if (total > (double)ov->out_h + 1.0) {
+			wlr_log(WLR_INFO, "overview: %d 块工作区排下来 %.0f 高，比工作区 %d 高"
+				" —— 滚轮上下滚列表", ov->n_rows, total, ov->out_h);
+		}
+		wl_list_for_each(view, &server->views, link) {
+			if (view->output != ov->output || !view->mapped) {
+				continue;
+			}
+			struct vidow_ov_row *row = row_of(server, view->ws);
+			double lx = 0, ly = 0;
+			int lw = 0, lh = 0;
+			if (row == NULL || !row_view_rect(server, row, view, &lx, &ly,
+					&lw, &lh)) {
+				continue; /* 最小化的：全景里不画 */
+			}
 			wlr_log(WLR_INFO, "overview: 窗口 %s -> 屏幕 %d,%d %dx%d（缩放 %.3f）",
 				vidow_view_title(view) != NULL ? vidow_view_title(view) : "(无题)",
-				x, y, (int)lround(view->geom.width * scale),
-				(int)lround(view->geom.height * scale), scale);
+				(int)lround(row->content_x + lx * ov->scale),
+				(int)lround((double)row->y + ly * ov->scale),
+				(int)lround((double)lw * ov->scale),
+				(int)lround((double)lh * ov->scale), ov->scale);
 		}
 	} else {
 		wlr_log(WLR_INFO, "overview: 进入（%s 上没有列）", ov->output->name);
@@ -347,7 +610,7 @@ void vidow_overview_exit(struct vidow_server *server) {
 		return;
 	}
 	ov->on = false;
-	ov->pan = 0.0;
+	ov->list_scroll = 0.0;
 	overview_start(server);
 	wlr_log(WLR_INFO, "overview: 退出");
 	vidow_ipc_emit_note(server, "overview-toggled");
@@ -355,33 +618,41 @@ void vidow_overview_exit(struct vidow_server *server) {
 
 /* ------------------------------------------------------------- 坐标 */
 
-void vidow_overview_map(struct vidow_server *server, double wx, double wy,
-		double *sx, double *sy) {
+void vidow_overview_map(struct vidow_server *server, struct vidow_view *view,
+		double ox, double oy, double *sx, double *sy) {
 	const struct vidow_overview *ov = &server->overview;
-	if (ov->t <= 0.0) {
-		*sx = wx;
-		*sy = wy;
-		return;
+	/* 恒等那一端：窗口自己的位置 + 它自己的动画偏移（t = 0 必须一点不差）。 */
+	double oxr = (double)(int)lround(ox);
+	double oyr = (double)(int)lround(oy);
+	double wx = view->geom.x + oxr;
+	double wy = view->geom.y + oyr;
+	*sx = wx;
+	*sy = wy;
+	if (ov->t <= 0.0 || ov->output == NULL || view->output != ov->output) {
+		return; /* 不在这块屏上：原样（靠 alpha 淡出） */
 	}
-	*sx = ov->out_cx + (wx - ov->cam_x) * ov->scale;
-	*sy = ov->out_cy + (wy - ov->cam_y) * ov->scale;
-}
-
-void vidow_overview_unmap(struct vidow_server *server, double sx, double sy,
-		double *wx, double *wy) {
-	const struct vidow_overview *ov = &server->overview;
-	if (ov->t <= 0.0 || ov->scale <= 0.0) {
-		*wx = sx;
-		*wy = sy;
-		return;
+	const struct vidow_ov_row *row = row_of(server, view->ws);
+	double lx = 0, ly = 0;
+	int lw = 0, lh = 0;
+	if (row == NULL || !row_view_rect(server, row, view, &lx, &ly, &lw, &lh)) {
+		return; /* 不在这块屏的工作区里 / 最小化：原样 */
 	}
-	*wx = ov->cam_x + (sx - ov->out_cx) / ov->scale;
-	*wy = ov->cam_y + (sy - ov->out_cy) / ov->scale;
+	/* 展开那一端：这一行里的位置。中间在「原来在哪」和「行里在哪」之间线性插值
+	 * —— 进出的动画都在 t 上走，t = 0 那一端正好是原样。 */
+	double x1 = row->content_x + (lx + oxr) * ov->scale;
+	double y1 = (double)row->y + (ly + oyr) * ov->scale;
+	*sx = wx + (x1 - wx) * ov->t;
+	*sy = wy + (y1 - wy) * ov->t;
 }
 
 double vidow_overview_scale(const struct vidow_server *server) {
 	const struct vidow_overview *ov = &server->overview;
-	return ov->t > 0.0 ? ov->scale : 1.0;
+	if (ov->t <= 0.0) {
+		return 1.0;
+	}
+	/* 缩放也按 t 插值：窗口的内容尺寸（base_dst × 这个值）得跟位置一起走，
+	 * 不然 t 小的时候内容已经缩了、位置还在原处。 */
+	return 1.0 + (ov->scale - 1.0) * ov->t;
 }
 
 /* ------------------------------------------------------------- 交互 */
@@ -413,13 +684,18 @@ bool vidow_overview_click(struct vidow_server *server, double sx, double sy) {
 	return true;
 }
 
-/* 滚轮：平移相机（世界坐标）。换列（Mod+H/L）会把平移清零、改回跟焦点走。 */
-void vidow_overview_pan(struct vidow_server *server, double dx) {
+/* 滚轮：滚的是**工作区列表**（上下预览），不是窗口、更不是相机 —— 一次一格
+ * （写死 60 屏幕像素）。列表排得下的时候夹在 0 上，滚不动。
+ *
+ * 以前这里是平移相机（ov->pan）：列带比屏宽，一直滚就把整条带滚出屏外（用户报的
+ * 「滚轮一直滚会左右滚动窗口，会跨屏」）。行内横向预览现在跟**那块工作区自己的
+ * 视口**走 —— 也就是「移动窗口焦点」那些键，滚轮不再碰它。 */
+void vidow_overview_scroll(struct vidow_server *server, double dy) {
 	struct vidow_overview *ov = &server->overview;
 	if (!vidow_overview_active(server)) {
 		return;
 	}
-	ov->pan += dx;
+	ov->list_scroll += dy;
 	overview_apply(server);
 }
 
@@ -433,7 +709,8 @@ void vidow_overview_update(struct vidow_server *server) {
 bool vidow_overview_init(struct vidow_server *server) {
 	/* 层本身由 main.c 按叠放顺序创建（紧贴壁纸之上、窗口之下），这里只放遮罩。
 	 * 别再 wlr_scene_tree_create 一次：那会新建一层挂到最后，遮罩就跑窗口上面去了
-	 * （踩过一次：overview 里连窗口都被一起压暗）。 */
+	 * （踩过一次：overview 里连窗口都被一起压暗）。每行的背景板也挂在这棵树上
+	 * （plate_apply 里按需创建），所以它们一样垫在窗口下面。 */
 	server->overview.dim = wlr_scene_rect_create(server->layer_overview_dim, 1, 1,
 		(float[4]){ 0.0f, 0.0f, 0.0f, 0.0f });
 	if (server->overview.dim == NULL) {

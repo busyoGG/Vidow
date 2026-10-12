@@ -1175,14 +1175,13 @@ void vidow_ipc_json_overview(struct jbuf *b, struct vidow_server *server) {
 	jb_kv_bool(b, "target", server->overview.on);
 	jb_kv_double(b, "t", server->overview.t);
 	jb_kv_double(b, "scale", vidow_overview_scale(server));
-	jb_kv_double(b, "pan", server->overview.pan);
 	jb_kv_str(b, "output", server->overview.output != NULL ?
 		server->overview.output->name : NULL);
-	jb_key(b, "camera");
-	jb_obj(b);
-	jb_kv_double(b, "x", server->overview.cam_x);
-	jb_kv_double(b, "y", server->overview.cam_y);
-	jb_obj_end(b);
+	/* 上下排布的工作区列表：几行、一行多高、列表滚到哪儿了（以前报的是相机
+	 * 位置 + 滚轮平移，那是「一条列带 + 一个相机」的模型，已经没了）。 */
+	jb_kv_int(b, "rows", server->overview.n_rows);
+	jb_kv_double(b, "row_h", server->overview.row_h);
+	jb_kv_double(b, "list_scroll", server->overview.list_scroll);
 	jb_obj_end(b);
 }
 

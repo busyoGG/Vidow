@@ -641,28 +641,56 @@ struct vidow_fx_target {
 	bool jelly;
 };
 
-/* niri 风格的 overview：把整条列带缩到一块屏里看全景，点谁就去谁。
+/* overview 里的一行 = 这块屏上的一块工作区。行表按需分配、复用（见 rows）。
+ *
+ * 每行自己的三个数：
+ *   band_w    —— 这块工作区的条带（工作区局部像素）有多宽；
+ *   y         —— 这一行的区域在屏幕上的顶边；
+ *   content_x —— 条带原点画在屏幕上的 x（已经含**行内横向滚动**：跟着这块工作区
+ *                自己的视口走，见 overview.c）。
+ * plate 是这一行的区域 / 背景板（和遮罩同一层，垫在窗口下面）—— 「上下排布」就是
+ * 靠它 + 行间距看出来的。 */
+struct vidow_ov_row {
+	struct vidow_workspace *ws;
+	struct wlr_scene_rect *plate;
+	int band_w;
+	int y;
+	double content_x;
+};
+
+/* niri 风格的 overview：把这块屏上的**所有工作区**上下排成一列看全景（每块工作区
+ * 缩成一条「这块屏」那么大的区域），点谁就去谁。
  *
  * 场景是全局的（一个窗口的位置就是「世界坐标」），所以 overview 不动布局、不改
- * 客户端尺寸，只给每个窗口算一个「世界 -> 屏幕」的变换：
+ * 客户端尺寸，只给每个窗口算一个「工作区局部 -> 屏幕」的变换：
  *
- *     screen = out_center + (world - cam) * scale
+ *     screen = 那一行的 (content_x, y) + (局部坐标 + 动画偏移) * scale
  *
- * t = 0（正常）：scale = 1、cam = 那块屏的中心 —— 正好是恒等变换，进出都不突变；
- * t = 1（展开）：scale 刚好把整条列带铺进工作区，cam = 列带中心（+ 滚轮平移）。
- * 每帧算一次，所有窗口共用（见 view.c 的 vidow_view_apply_anim）。
+ * t = 0（正常）必须是**恒等变换**（scale = 1、位置就是它自己摆在哪），进出的动画
+ * 都在 t 上插值，两端都不能突变；t = 1（展开）就是上面的式子。每帧算一次，所有
+ * 窗口共用（见 view.c 的 vidow_view_apply_anim）。
+ *
+ * 三件事各归各的输入：
+ *   - 列表纵向滚动（list_scroll）：滚轮，一次一格 —— 列表比工作区高时才有得滚；
+ *   - 行内横向滚动：跟着**那块工作区自己的视口**（焦点在工作区里换窗口时它自己
+ *     会动，见 view.c 的 output_arrange Pass 2）—— 所以「移动窗口焦点的键」动的是
+ *     行内预览，不是整条相机乱跑；
+ *   - 每行的区域 / 背景板：浓度跟着遮罩的 alpha 走（不另加配置项，alpha = 0
+ *     「不压暗」时它跟着一起消失，壁纸原样）。
  *
  * 定义放在 vidow_fx_target 之后：里面内嵌了一个 fx 目标（糊掉的那张壁纸）。 */
 struct vidow_overview {
 	bool on;                 /* 目标状态（动画朝它走） */
 	double t;                /* 0..1，当前进度 */
 	double anim_from;        /* 这次动画的起点 t（中途反向就从这儿接着走） */
-	double scale;            /* 由 t 算出的缩放 */
-	double cam_x, cam_y;     /* 由 t 算出的相机中心（世界坐标） */
-	double pan;              /* 滚轮平移（世界坐标），换列时清零 */
+	double scale;            /* 由 t 算出的缩放（所有行共用一个） */
+	struct vidow_ov_row *rows;      /* 行表（每行 = 一块工作区），按需分配、复用 */
+	int n_rows, cap_rows;
+	int n_skipped;           /* 这块屏上没摆行的空工作区（栈尾那块空位之类） */
+	double list_scroll;      /* 列表纵向滚动（屏幕像素），滚轮控制 */
+	double row_h;            /* 一行的屏幕高（= 工作区高 × scale） */
 	bool swallow_release;    /* 点选退出后，把它对应的那次松手也吃掉 */
-	double out_cx, out_cy;   /* 展开时铺在哪块屏的中心 */
-	int out_x, out_y, out_w, out_h; /* 那块屏的布局位置（遮罩用） */
+	int out_x, out_y, out_w, out_h; /* 那块屏的工作区（摆行 / 遮罩都用它） */
 	struct wlr_output *output;      /* 进入时锁定的那块屏 */
 	struct wlr_scene_rect *dim;     /* 压暗壁纸的遮罩 */
 	/* 糊掉的那张壁纸（overview_blur）：摊满整块屏、垫在遮罩下面。复用 fx 那条
@@ -2720,6 +2748,18 @@ void vidow_view_restore(struct vidow_view *view);
 bool vidow_view_restore_last(struct vidow_server *server);
 bool vidow_view_toggle_minimized(struct vidow_view *view);
 
+/* 一块**没在显示**的工作区的条带长什么样：每个窗口摆在哪（工作区局部坐标，
+ * 不含视口滚动）+ 条带总宽。overview 拿它画缩略图 —— 藏起来的工作区从来没被
+ * arrange 过，col->offset / view->geom 还是上次显示时的老值，不能直接用。
+ * 规矩和 output_arrange 的 Pass 1 / Pass 3 是同一套（列宽按比例、整列最小化的
+ * 不占位置、全屏占一整屏、同列上下平分可用高），只是**不写进 view->geom**。
+ * cb 为 NULL 时只算条带宽度。返回条带总宽。 */
+int vidow_workspace_preview_layout(struct vidow_server *server,
+		struct vidow_workspace *ws, int work_w, int work_h,
+		void (*cb)(struct vidow_view *view, int x, int y, int w, int h,
+			void *data),
+		void *data);
+
 /* ------------------------------------------------------------- overview */
 
 bool vidow_overview_init(struct vidow_server *server);
@@ -2731,16 +2771,15 @@ void vidow_overview_exit(struct vidow_server *server);
 void vidow_overview_refresh_layers(struct vidow_server *server);
 /* 每帧渲染前调一次：算好变换（t 变了、布局变了都靠它）并把窗口摆一遍。 */
 void vidow_overview_update(struct vidow_server *server);
-/* 世界坐标 -> 屏幕坐标（t = 0 时是恒等变换）。 */
-void vidow_overview_map(struct vidow_server *server, double wx, double wy,
-		double *sx, double *sy);
-/* 屏幕坐标 -> 世界坐标（点谁选谁要用）。 */
-void vidow_overview_unmap(struct vidow_server *server, double sx, double sy,
-		double *wx, double *wy);
+/* 工作区局部坐标 -> 屏幕坐标。ox/oy 是窗口自己的动画偏移（开窗 / 关窗补间，
+ * 布局像素），跟着一起缩。t = 0 时是恒等变换。 */
+void vidow_overview_map(struct vidow_server *server, struct vidow_view *view,
+		double ox, double oy, double *sx, double *sy);
 double vidow_overview_scale(const struct vidow_server *server);
 /* 点一下：选中命中的那列（返回 true = 这次点击被 overview 吃掉了）。 */
 bool vidow_overview_click(struct vidow_server *server, double sx, double sy);
-void vidow_overview_pan(struct vidow_server *server, double dx);
+/* 滚轮：滚的是工作区列表（上下预览），不是窗口。 */
+void vidow_overview_scroll(struct vidow_server *server, double dy);
 
 /* -------------------------------------------------- MRU（Alt+Tab 切换器） */
 
