@@ -280,7 +280,8 @@ end
 | `workspace up` / `down`（`next` / `prev` 同义） | 上/下切一块（到头就停住） |
 | `workspace previous` | 回到上一块切过的工作区 |
 | `move <n>` / `move <名字>` | 把焦点窗口（列 / 浮窗）搬到那块工作区 |
-| `move up` / `move down` | 搬到相邻的那块工作区 |
+| `move up` / `move down` | 搬到相邻的那块工作区（**不跟过去**：人留在原来那块，焦点落到剩下的窗口上） |
+| `move up follow` / `move down follow` | 同上，但**跟着走**：搬完连人带屏一起切到那块工作区，焦点还给搬过去的那个窗口（默认键位 `Alt+Shift+滚轮` 用的就是这条）。`follow` 只跟 `up` / `down` 搭 |
 | `move-workspace up` / `down` | 整块工作区在这块屏上上/下移一位 |
 | `workspace-name <名字>` | 给当前这块工作区起名（之后它就不会被自动收掉；不带参数 = 去掉名字） |
 | `special <名字>` | 开/关那个特殊工作区（名字没建过就现建） |
@@ -1075,7 +1076,7 @@ vidow.bind("Mod+W", "close-window", { on = "release" })  -- 松开才触发
 | `Mod+Enter` | 启动终端 |
 | `Mod+滚轮` | 焦点左/右移一列 |
 | `Alt+滚轮` | 工作区上/下切一块 |
-| `Alt+Shift+滚轮` | 把当前窗口搬到上/下一块工作区（搬完**不跟过去**） |
+| `Alt+Shift+滚轮` | 把当前窗口搬到上/下一块工作区（`move up follow`：**跟着走**） |
 | `Ctrl+Alt+滚轮` | 和左右相邻的窗口换位置（滚上 = 和左边那个换） |
 | `Mod+Escape` | 退出合成器（绑成 `{ inhibited = true }`：抑制期间也生效，见下节） |
 | `Mod+U` / `Mod+I` | 工作区上/下切一块（niri 的默认键位） |
@@ -1957,7 +1958,7 @@ vidow 自己的，比如 `vidow-wayland-1.sock`）；`ipc_socket` 可以写死�
 
 | 类别 | 命令 |
 | --- | --- |
-| 窗口 | `focus-window`、`activate-window`（= 点通知：先把工作区端出来再给焦点）、`close-window`、`minimize-window`、`unminimize-window`（不带参数 = 最近收起来的那个）、`toggle-minimize`、`toggle-floating`、`set-floating`、`toggle-fullscreen`、`set-fullscreen`、`set-window-size`、`set-window-position`、`center-window`、`set-window-force-render`、`focus-window-direction`、`move-window-direction`、`move-window-to-workspace`、`move-window-to-special`、`move-window-to-output` |
+| 窗口 | `move up\|down [follow]`（`follow` = 搬完跟着走）、`focus-window`、`activate-window`（= 点通知：先把工作区端出来再给焦点）、`close-window`、`minimize-window`、`unminimize-window`（不带参数 = 最近收起来的那个）、`toggle-minimize`、`toggle-floating`、`set-floating`、`toggle-fullscreen`、`set-fullscreen`、`set-window-size`、`set-window-position`、`center-window`、`set-window-force-render`、`focus-window-direction`、`move-window-direction`、`move-window-to-workspace`、`move-window-to-special`、`move-window-to-output` |
 | 列 | `focus-column`、`move-column`、`cycle-column-width`、`set-column-width`（`fraction` 绝对值 / `delta` 相对）、`expand-column-to-available-width`、`center-column`、`toggle-maximize-column`、`set-maximize-column`（`maximized` true/false）、`expel-window-from-column`（把窗口从列里拎出来单独成列，`direction` 不写 = 右边）、`swap-window`（和相邻列里同层的窗口换位置，`direction` 必写） |
 | 工作区 | `focus-workspace`（名字 / `next` / `prev` / `index`）、`toggle-special`（= `focus-special`）、`create-workspace`、`move-workspace-to-output` |
 | 输出 | `output-power`（`on` / `off` / `toggle`）、`output-enable` / `output-disable` / `output-toggle`、`output-scale`（数字或 `auto`）、`output-transform`、`output-mode`（宽 高 [刷新率]）、`output-position`、`output-focus` |
@@ -5063,8 +5064,12 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
      - 拿真事件量过：注入 `send-key press alt` + `pointer-scroll`（走的就是真鼠标那条
        `vidow_pointer_axis`），三组都按预期生效；`Ctrl+Alt+滚轮上` 在 `[a1] | [a2] | [a3]`
        上把 a2 和 a1 对调、焦点跟着 a2 走，滚回来还原。
-     - 记一笔行为：`Alt+Shift+滚轮` 搬完**不跟过去**（焦点留在原工作区，落到剩下的窗口上），
-       这是 `move up/down` 本来的语义（和 `Mod+Shift+U/I` 一致）。
+     - `Alt+Shift+滚轮` 要**跟着走**：`move up/down` 本来的语义是不跟（人留在原工作区，
+       和 `Mod+Shift+U/I` 一致），所以给 `move` 加了个 `follow` 词 ——
+       `move up follow` / `move down follow` = 搬完连人带屏切到那块工作区、焦点还给搬过去的
+       那个窗口。默认键位就用这条；老写法一个字节没动（`Mod+Shift+U/I` 还是搬完不跟）。
+       `follow` 只跟 `up` / `down` 搭，拼错（`move down folow` / `move chat follow`）会报人话
+       并且什么都不做。
 
 225. **剪贴板加历史 + 一个 GUI**（用户：「内置的剪贴板同步需要一个 GUI」，以及「需要能从剪贴板
      历史里面复制内容，剪贴板历史里如果是文件路径（file 前缀）则复制文件」）

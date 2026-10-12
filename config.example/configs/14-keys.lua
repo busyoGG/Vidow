@@ -58,8 +58,8 @@ vidow.bind("Mod+wheel-down", "focus-column right")
 -- Alt+滚轮 = 换工作区（往上 = 上一块），Alt+Shift+滚轮 = 把当前窗口搬到那块去
 vidow.bind("Alt+wheel-up", "workspace up")
 vidow.bind("Alt+wheel-down", "workspace down")
-vidow.bind("Alt+Shift+wheel-up", "move up")
-vidow.bind("Alt+Shift+wheel-down", "move down")
+vidow.bind("Alt+Shift+wheel-up", "move up follow")
+vidow.bind("Alt+Shift+wheel-down", "move down follow")
 -- Ctrl+Alt+滚轮 = 和左右相邻的窗口换位置（往上 = 和左边那个换）
 vidow.bind("Ctrl+Alt+wheel-up", "swap-window left")
 vidow.bind("Ctrl+Alt+wheel-down", "swap-window right")

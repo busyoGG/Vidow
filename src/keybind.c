@@ -688,7 +688,8 @@ static bool action_workspace_switch(struct vidow_server *server,
 }
 
 /* 焦点窗口搬到相邻的那块工作区（`move up` / `move down`）。 */
-static bool action_move_step(struct vidow_server *server, int direction) {
+static bool action_move_step(struct vidow_server *server, int direction,
+		bool follow) {
 	struct vidow_view *view = server->focused;
 	if (view == NULL || view->ws == NULL || view->ws->special ||
 			view->ws->output == NULL) {
@@ -702,7 +703,16 @@ static bool action_move_step(struct vidow_server *server, int direction) {
 	}
 	struct vidow_workspace *target =
 		vidow_workspace_at(server, view->ws->output, idx);
-	return target != NULL && vidow_workspace_move_view(server, view, target);
+	if (target == NULL || !vidow_workspace_move_view(server, view, target)) {
+		return false;
+	}
+	if (follow) {
+		/* 「跟着走」：搬完连人一起过去。先切到那块工作区（屏也跟着走），再把焦点
+		 * 放回搬过来的这个窗口 —— activate 只会挑它自己记着的那个，可能是别的。 */
+		vidow_workspace_activate(server, target);
+		vidow_focus_view(view);
+	}
+	return true;
 }
 
 /* 光标底下那个窗口（指针手势动作用的：按下那一刻谁在光标下面，就拖谁）。 */
@@ -799,14 +809,41 @@ bool vidow_action_run(struct vidow_server *server, const char *action) {
 	}
 	if (strcmp(name, "move") == 0) {
 		if (arg == NULL || arg[0] == '\0') {
-			wlr_log(WLR_ERROR, "move 要带参数（move 2 / move chat / move up）");
+			wlr_log(WLR_ERROR, "move 要带参数（move 2 / move chat / move up / "
+				"move up follow）");
 			return false;
 		}
-		if (strcasecmp(arg, "up") == 0) {
-			return action_move_step(server, -1);
+		/* `move up follow`：搬完连人一起过去（默认的 `Alt+Shift+滚轮` 就是这条）。
+		 * 第一个词是方向，后面那个词只认 follow。 */
+		char dir[64];
+		size_t i = 0;
+		while (arg[i] != '\0' && arg[i] != ' ' && i + 1 < sizeof(dir)) {
+			dir[i] = arg[i];
+			i++;
 		}
-		if (strcasecmp(arg, "down") == 0) {
-			return action_move_step(server, 1);
+		dir[i] = '\0';
+		const char *extra = arg + i;
+		while (*extra == ' ') {
+			extra++;
+		}
+		bool follow = false;
+		if (extra[0] != '\0') {
+			if (strcasecmp(extra, "follow") != 0) {
+				wlr_log(WLR_ERROR, "move: 只认 `move <方向> follow`，多出来的是 "
+					"'%s'", extra);
+				return false;
+			}
+			follow = true;
+		}
+		if (strcasecmp(dir, "up") == 0) {
+			return action_move_step(server, -1, follow);
+		}
+		if (strcasecmp(dir, "down") == 0) {
+			return action_move_step(server, 1, follow);
+		}
+		if (follow) {
+			wlr_log(WLR_ERROR, "move: follow 只跟 up / down 搭（`move up follow`）");
+			return false;
 		}
 		return vidow_workspace_move_focused(server, arg);
 	}
