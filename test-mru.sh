@@ -19,7 +19,8 @@
 #  12) 鼠标点击：点哪张卡片就切到哪个窗口（不用等松修饰键），面板当场收起，
 #      松手被吃掉（没漏给客户端）
 #  13) 浮层：切换器**不动窗口** —— 面板开着期间每个窗口的位置/尺寸一字不变；
-#      卡片里画的是窗口内容（缩略图，全亮），桌面那层被压暗（面板浮在窗口之上）
+#      卡片里画的是窗口内容（缩略图，全亮），桌面那层被压暗（面板浮在窗口之上）；
+#      预览走装饰管线 → 形状和真窗口一样（圆角 / 描边 / 阴影）
 set -u
 cd "$(dirname "$0")"
 
@@ -294,6 +295,19 @@ else
 	fail "卡片里没有缩略图 / 被压暗了（$t1_px，期望窗口那种纯色）"
 fi
 
+# 预览的形状 = 窗口的形状：预览走的是**装饰管线**（和屏幕上那扇窗口同一条），所以
+# 角上是切掉的（角尖那点是卡片底，不是窗口内容）。直接摆客户端 buffer 的话角尖
+# 就是内容本身 —— 这条正好把两条路分开。
+prev_tip=$(pix "$RUNDIR/during.png" "$t1_x" "$t1_y")
+prev_in=$(pix "$RUNDIR/during.png" $((t1_x + 6)) $((t1_y + 6)))
+read -r pt_r pt_g pt_b <<<"$prev_tip"
+read -r pi_r pi_g pi_b <<<"$prev_in"
+if [ $((pt_r + pt_g + pt_b)) -lt 220 ] && [ $((pi_r + pi_g + pi_b)) -gt 300 ]; then
+	pass "预览也是圆角（角尖 $prev_tip 是切掉的，里面 $prev_in 是窗口内容）"
+else
+	fail "预览角没切（角尖 $prev_tip / 里面 $prev_in）—— 可能退回方角那条路了"
+fi
+
 # 面板浮在窗口之上：卡片底下那些窗口被压暗层盖住了 —— 拿「窗口自己那块地儿、又在
 # 面板外面」的一点量（工作区底边那条：卡片是竖着居中的，底下留着空）。
 dim_x=$((wx + 30))
@@ -386,6 +400,24 @@ sleep 0.4
 	|| fail "选中项被鼠标改成 $(mq 'd["selected"]') 了"
 [ "$(mq "next((e['title'] for e in d['entries'] if e['hover']), '(无)')")" = "$(mq "next((e['title'] for e in d['entries'] if e['id'] == $hv_id), '(无)')")" ] \
 	&& pass "悬停的就是命中的那一项" || fail "悬停项和命中项对不上"
+# 悬停的描边：默认和选中那张**同宽**（2px），但颜色是强调色半透明 —— 所以比选中
+# 那张淡。两条都量像素（描边色是可配的，默认值就写在这儿）。
+grim "$RUNDIR/hover.png" >/dev/null 2>&1
+read -r hx hy hw <<<"$(mj "next((e['cx'], e['cy'], e['cw']) for e in d['entries'] if e['hover'])")"
+read -r sx2 sy2 sw2 <<<"$(mj "next((e['cx'], e['cy'], e['cw']) for e in d['entries'] if e['selected'])")"
+hv_edge=$(pix "$RUNDIR/hover.png" $((hx + hw / 2)) $((hy + 1)))
+sel_edge2=$(pix "$RUNDIR/hover.png" $((sx2 + sw2 / 2)) $((sy2 + 1)))
+color_like "$hv_edge" "53 117 152" 30 \
+	&& pass "悬停那张的描边点亮了（$hv_edge）" \
+	|| fail "悬停描边颜色不对（$hv_edge，期望 ≈ 53 117 152）"
+read -r he_r he_g he_b <<<"$hv_edge"
+read -r se_r se_g se_b <<<"$sel_edge2"
+if [ "$he_g" -lt "$se_g" ] && [ "$he_r" -lt "$se_r" ]; then
+	pass "悬停的描边比选中的淡（悬停 $hv_edge < 选中 $sel_edge2）"
+else
+	fail "悬停描边没比选中淡（$hv_edge vs $sel_edge2）"
+fi
+
 # 挪到卡片外面（条子上方的空白）→ 悬停清掉
 msg move-cursor $((wx + ww / 2)) $((wy + 4))
 sleep 0.4

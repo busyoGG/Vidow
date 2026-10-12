@@ -331,6 +331,12 @@ static const struct entry entries[] = {
 	{ "mru_card_border_color", K_COLOR, OFF(mru_card_border_color),
 		SZ(mru_card_border_color), 14,
 		"卡片描边的颜色；鼠标底下那张换成 mru_highlight_color（半透明）" },
+	{ "mru_hover_border", K_INT, OFF(mru_hover_border),
+		SZ(mru_hover_border), 14,
+		"鼠标底下那张的描边宽度（逻辑像素，0 = 不描边）；比选中那张淡一点" },
+	{ "mru_hover_color", K_COLOR, OFF(mru_hover_color),
+		SZ(mru_hover_color), 14,
+		"鼠标底下那张的描边颜色（默认 = 强调色半透明，所以比选中那张淡）" },
 	{ "mru_highlight_border", K_INT, OFF(mru_highlight_border),
 		SZ(mru_highlight_border), 14,
 		"选中的那张卡片的描边宽度（0 = 不画描边）" },
@@ -455,6 +461,8 @@ static const struct group_field mru_fields[] = {
 	{ "card_color",        "mru_card_color" },
 	{ "card_border",       "mru_card_border" },
 	{ "card_border_color", "mru_card_border_color" },
+	{ "hover_border",      "mru_hover_border" },
+	{ "hover_color",       "mru_hover_color" },
 	{ "highlight_border",  "mru_highlight_border" },
 	{ "highlight_color",   "mru_highlight_color" },
 };
@@ -792,6 +800,14 @@ static void defaults(struct vidow_config *cfg) {
 	cfg->mru_card_border_color[1] = 0x40 / 255.0f;
 	cfg->mru_card_border_color[2] = 0x45 / 255.0f;
 	cfg->mru_card_border_color[3] = 1.0f;
+	/* 鼠标底下那张：和选中那张同一个颜色、同一档宽度，只是**半透明** ——
+	 * 「点亮了、还没选中」这个区别靠浓度说，不靠粗细说（默认值就是强调色的半透明
+	 * 版；想换个颜色自己写 mru_hover_color）。 */
+	cfg->mru_hover_border = 2;
+	cfg->mru_hover_color[0] = 0x3d / 255.0f;
+	cfg->mru_hover_color[1] = 0xae / 255.0f;
+	cfg->mru_hover_color[2] = 0xe9 / 255.0f;
+	cfg->mru_hover_color[3] = 0.5f;
 	cfg->mru_highlight_border = 2;
 	cfg->mru_highlight_color[0] = 0x3d / 255.0f;
 	cfg->mru_highlight_color[1] = 0xae / 255.0f;

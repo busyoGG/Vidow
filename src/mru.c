@@ -530,7 +530,9 @@ struct vidow_mru_buf {
 };
 
 struct vidow_mru_card {
-	struct wlr_scene_buffer *thumb;     /* 窗口内容的缩略图（客户端那份 buffer） */
+	struct vidow_fx_target fx;          /* 预览：走装饰管线画（形状和真窗口一样） */
+	bool fx_on;                         /* 装饰管线这条能走（没装饰时退回下面那条） */
+	struct wlr_scene_buffer *thumb;     /* 退回那条：直接摆客户端那份 buffer */
 	struct wlr_scene_buffer *fill_c[4]; /* 四个圆角（底） */
 	struct wlr_scene_rect *fill_e[3];   /* 中 / 左 / 右三条直边 */
 	struct wlr_scene_buffer *ring_c[4]; /* 四个圆角（描边） */
@@ -751,6 +753,10 @@ static struct vidow_mru_card *mru_card_get(struct vidow_server *server, int i) {
 	if (!ok) {
 		return NULL;
 	}
+	/* 预览走装饰管线（和屏幕上那扇窗口同一条）：圆角 / 边框 / 阴影 / 模糊都照
+	 * 窗口自己的规则来，所以「预览的形状 = 窗口的形状」。装饰关着 / 没 GL 的
+	 * 时候 vidow_fx_begin 返回 false，那就退回「直接摆客户端 buffer」那条。 */
+	card->fx_on = vidow_fx_begin(server, &card->fx, mru->tree, NULL);
 	mru_card_hide(card, false);
 	mru->card[i] = card;
 	if (i + 1 > mru->card_n) {
@@ -890,20 +896,62 @@ static void mru_card_place(struct vidow_server *server,
  * 等于「把窗口内容缩小一份」，而窗口本身一动没动（这就是切换器要的效果：面板是
  * 新内容，原来那块屏照旧）。宽高比按 buffer 自己的算：塞不下就等比缩到框里居中，
  * 不拉伸（窗口逻辑尺寸和 buffer 尺寸偶尔对不上，别赌）。 */
-static void mru_card_thumb(struct vidow_mru_card *card,
-		const struct vidow_view *view, const struct wlr_box *box) {
-	if (card->thumb == NULL) {
+static void mru_card_thumb_off(struct vidow_mru_card *card) {
+	if (card->fx.node != NULL) {
+		wlr_scene_node_set_enabled(&card->fx.node->node, false);
+	}
+	if (card->thumb != NULL) {
+		wlr_scene_buffer_set_buffer(card->thumb, NULL);
+		wlr_scene_node_set_enabled(&card->thumb->node, false);
+	}
+}
+
+static void mru_card_thumb(struct vidow_server *server,
+		struct vidow_mru_card *card, const struct vidow_view *view,
+		const struct wlr_box *box, double zoom) {
+	if (card->thumb == NULL || box->width <= 0 || box->height <= 0) {
 		return;
 	}
 	struct wlr_scene_buffer *src = view->scene_surface != NULL ?
 		view->scene_surface->buffer : NULL;
 	struct wlr_buffer *buf = src != NULL ? src->buffer : NULL;
-	if (buf == NULL || box->width <= 0 || box->height <= 0 ||
-			buf->width <= 0 || buf->height <= 0) {
-		/* 还没上屏 / 客户端刚把 buffer 收走：留着卡片底，这一帧不画缩略图。 */
-		wlr_scene_buffer_set_buffer(card->thumb, NULL);
-		wlr_scene_node_set_enabled(&card->thumb->node, false);
+	if (buf == NULL || buf->width <= 0 || buf->height <= 0) {
+		/* 还没上屏 / 客户端刚把 buffer 收走：留着卡片底，这一帧不画预览。 */
+		mru_card_thumb_off(card);
 		return;
+	}
+
+	/* 首选：装饰管线把窗口重画一遍（缩到预览那么大）。离屏那张图里已经有圆角、
+	 * 边框、阴影 —— 预览的形状和屏幕上那扇窗口一模一样，而且这些参数来自窗口
+	 * 自己的规则（不是这儿另算一份）。 */
+	if (card->fx_on && card->fx.node != NULL && zoom > 0.0) {
+		struct vidow_fx_geo geo = vidow_view_fx_geo(view);
+		if (geo.w > 0 && geo.h > 0) {
+			int cw = (int)lround((double)geo.w * zoom);
+			int ch = (int)lround((double)geo.h * zoom);
+			int px = box->x + (box->width - cw) / 2;
+			int py = box->y + (box->height - ch) / 2;
+			double out_scale = 1.0;
+			if (server->mru.output != NULL && server->mru.output->scale > 0.0) {
+				out_scale = server->mru.output->scale;
+			}
+			card->fx.anim_scale = 1.0;
+			/* 「客户端声明的有效源区域」抄窗口那一份（没裁过的那版）：照场景节点
+			 * 自己的 src_box 会把「裁到屏里剩下的那一小条」当成整块内容。 */
+			card->fx.content_box = view->fx.content_box;
+			wlr_scene_node_set_enabled(&card->fx.node->node, true);
+			if (vidow_fx_frame(server, &card->fx, src, &geo, px, py,
+					px, py, 1.0, server->focused == view,
+					view->fullscreen, out_scale * zoom, zoom,
+					&view->rule_eff)) {
+				if (card->thumb->buffer != NULL) {
+					wlr_scene_buffer_set_buffer(card->thumb, NULL);
+				}
+				wlr_scene_node_set_enabled(&card->thumb->node, false);
+				return;
+			}
+			wlr_scene_node_set_enabled(&card->fx.node->node, false);
+		}
 	}
 	/* 只取「可见窗口」那一块：自己画装饰的客户端（GTK）会把表面做大一圈画阴影，
 	 * 那圈留白不要 —— 取法跟装饰着色器一致（归一化坐标 × buffer 尺寸）。全 0 =
@@ -948,6 +996,9 @@ static void mru_card_hide(struct vidow_mru_card *card, bool free_buf) {
 	if (card == NULL) {
 		return;
 	}
+	if (card->fx.node != NULL) {
+		wlr_scene_node_set_enabled(&card->fx.node->node, false);
+	}
 	if (card->thumb != NULL) {
 		wlr_scene_node_set_enabled(&card->thumb->node, false);
 	}
@@ -972,6 +1023,8 @@ static void mru_card_hide(struct vidow_mru_card *card, bool free_buf) {
 	if (!free_buf) {
 		return;
 	}
+	/* 离屏那张装饰图放掉（节点留着复用，下次显形 fx_begin 再开）。 */
+	vidow_fx_end(NULL, &card->fx);
 	if (card->thumb != NULL) {
 		/* 缩略图那份 buffer 是客户端的，不是我们的：只是不再引用它。 */
 		wlr_scene_buffer_set_buffer(card->thumb, NULL);
@@ -1026,8 +1079,8 @@ static void mru_card_style(const struct vidow_server *server,
 		}
 		*bw = cfg->mru_highlight_border;
 	} else if (view == mru->hover) {
-		ring[3] *= 0.5f;
-		*bw = cfg->mru_card_border;
+		memcpy(ring, cfg->mru_hover_color, sizeof(float) * 4);
+		*bw = cfg->mru_hover_border;
 	} else {
 		memcpy(ring, cfg->mru_card_border_color, sizeof(float) * 4);
 		*bw = cfg->mru_card_border;
@@ -1087,7 +1140,7 @@ static void mru_scene_apply(struct vidow_server *server) {
 		struct wlr_box at = { slot->cx, slot->cy, slot->cw, slot->ch };
 		mru_card_place(server, card, &at, fill, ring, bw);
 		struct wlr_box thumb = { slot->x, slot->y, slot->w, slot->h };
-		mru_card_thumb(card, slot->view, &thumb);
+		mru_card_thumb(server, card, slot->view, &thumb, slot->zoom);
 	}
 	/* 上一轮排了、这一轮没排到的（窗口少了 / 清单短了）也收起来。 */
 	for (int i = mru->slot_n; i < mru->card_n; i++) {

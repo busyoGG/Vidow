@@ -39,9 +39,13 @@ mru_card_color = "#2f3336e6"
 mru_card_border = 1
 -- 卡片描边的颜色；鼠标底下那张换成 mru_highlight_color（半透明）
 mru_card_border_color = "#3b4045ff"
+-- 鼠标底下那张的描边宽度（逻辑像素，0 = 不描边）；比选中那张淡一点
+mru_hover_border = 2
+-- 鼠标底下那张的描边颜色（默认 = 强调色半透明，所以比选中那张淡）
+mru_hover_color = "#3daee980"
 -- 选中的那张卡片的描边宽度（0 = 不画描边）
 mru_highlight_border = 2
 -- 强调色：选中那张卡片的描边、以及它的底色（底 = 卡片底混 12% 这个色）
 mru_highlight_color = "#3daee9ff"
--- 这一族也能写成一张表，只写要改的项（mru = { enabled = true, debounce_ms = 750, open_delay_ms = 150, scope = "all", layout = "strip", per_row = 5, gap = 16, row_gap = 16, max_scale = 0.5, max_height = 480, min_scale = 0.05, backdrop_alpha = 0.6, card_padding = 8, card_radius = 12, card_color = "#2f3336e6", card_border = 1, card_border_color = "#3b4045ff", highlight_border = 2, highlight_color = "#3daee9ff" }）
+-- 这一族也能写成一张表，只写要改的项（mru = { enabled = true, debounce_ms = 750, open_delay_ms = 150, scope = "all", layout = "strip", per_row = 5, gap = 16, row_gap = 16, max_scale = 0.5, max_height = 480, min_scale = 0.05, backdrop_alpha = 0.6, card_padding = 8, card_radius = 12, card_color = "#2f3336e6", card_border = 1, card_border_color = "#3b4045ff", hover_border = 2, hover_color = "#3daee980", highlight_border = 2, highlight_color = "#3daee9ff" }）
 --     不写表也行：mru = true（一个值管全部）

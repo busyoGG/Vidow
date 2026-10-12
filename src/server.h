@@ -284,7 +284,9 @@ struct vidow_config {
 	int mru_card_radius;
 	float mru_card_color[4];
 	int mru_card_border;
+	int mru_hover_border;
 	float mru_card_border_color[4];
+	float mru_hover_color[4];
 	int mru_highlight_border;
 	float mru_highlight_color[4];
 };
