@@ -1691,6 +1691,12 @@ struct vidow_server {
 	int output_x, output_y;
 
 	struct wl_list anims;    /* vidow_anim.link */
+	/* 正在跑 vidow_anim_tick()。这个标志是给 vidow_anim_cancel() 看的：tick
+	 * 用 wl_list_for_each_safe 迭代，tmp 是「下一个」的裸指针，谁在这时候
+	 * free 掉另一个 anim，tmp 立刻变野指针 —— 崩在 vidow_output_render →
+	 * vidow_anim_tick（真机 coredump 里那个 0x2500000f00 就是踩了 free 掉的
+	 * anim 的 update 函数指针）。所以 tick 期间只标 cancelled，由 tick 自己收尾。 */
+	bool anim_ticking;
 	struct wl_list closing; /* vidow_closing.link */
 	struct wl_list shaders; /* vidow_shader.link */
 	bool shader_ok;         /* GLES2 custom shader path usable */

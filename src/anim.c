@@ -78,9 +78,12 @@ void vidow_anim_cancel(struct vidow_anim *anim) {
 	if (anim == NULL || anim->finished) {
 		return;
 	}
-	if (anim->running) {
-		/* Called from inside update(): let the tick loop finish with it so we
-		 * never free the struct we are currently standing on. */
+	if (anim->running || anim->server->anim_ticking) {
+		/* 在 tick 里被取消（自己正在 update，或者是别的 anim 的 update/done
+		 * 回调里转过来的 —— 后者最典型：done 里 vidow_arrange()，而 arrange
+		 * 又会取消别的窗口的移动动画）。tick 用的是 wl_list_for_each_safe，
+		 * tmp 是「下一个」的裸指针：这里要是 free 了，tmp 当场变野指针，下一
+		 * 轮就跳进已释放的 update 里。只标 cancelled，让 tick 自己收尾。 */
 		anim->cancelled = true;
 		return;
 	}
@@ -101,6 +104,8 @@ void vidow_anim_tick(struct vidow_server *server) {
 		return;
 	}
 	int64_t now = vidow_now_ns();
+	bool was_ticking = server->anim_ticking;
+	server->anim_ticking = true;
 
 	struct vidow_anim *anim, *tmp;
 	wl_list_for_each_safe(anim, tmp, &server->anims, link) {
@@ -139,4 +144,5 @@ void vidow_anim_tick(struct vidow_server *server) {
 			free(anim);
 		}
 	}
+	server->anim_ticking = was_ticking;
 }

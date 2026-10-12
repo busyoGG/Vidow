@@ -5048,6 +5048,30 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
         底衬是**半透明混合**的（量到 (107,66,38)，金色和洋红混在一起）。验证 / 截图时加
         `--transition-type none`。
 
+232. **快速切工作区崩在动画 tick 里**（用户：「工作区快速滚动会崩溃」）
+
+     - 现场：`coredumpctl` 里 23:20 / 23:21 / 23:21 / 23:23 连着四个 SIGSEGV（`./build/vidow`），
+       栈是 `output_frame → vidow_output_render`（跳到一个垃圾地址，比如
+       `0x2500000f00`）和 `output_frame → vidow_output_render → vidow_anim_tick`。
+       垃圾地址 = **函数指针取自已经 free 掉的内存**。
+     - 为什么：`vidow_anim_tick()` 用 `wl_list_for_each_safe` 迭代 `server->anims`，
+       `tmp` 是「下一个」的裸指针。而回调里会**取消别的 anim** —— 最典型就是切工作区的
+       `done` 回调：`slide_done` → `vidow_arrange()` → `vidow_place_view()` →
+       `vidow_anim_cancel(anim_move)`（窗口的移动动画）。`vidow_anim_cancel()` 只有
+       「anim 自己正在 update」那一层保护（`anim->running`），从 **done 回调**里转进来的
+       这次取消不在保护范围内：当场 `wl_list_remove` + `free`，`tmp` 立刻变野指针，下一轮
+       迭代就跳进已释放的 `update`。窗口有动画（`window_move_ms` / `column_width_ms`）时
+       快速切工作区 = 每次都撞上，所以「滚快一点就崩」。
+     - 修法：`struct vidow_server` 加 `anim_ticking`（`src/server.h`），`vidow_anim_tick()`
+       进出时置位/还原；`vidow_anim_cancel()` 在 tick 期间**只标 `cancelled`**，交给 tick
+       自己收尾（和它原来处理「自己正在 update」那条路一个语义：done 照样只跑一次，只是
+       挪到这一轮 tick 的末尾）。
+     - 验证（临时脚本 `/tmp/zz-animcrash.sh`，测完删掉：4 块工作区各 3 个窗口、
+       `window_open_ms/close_ms/move_ms/column_width_ms/workspace_switch_ms` 全开、
+       每 30ms 一次 `workspace up/down`）：**修之前第 1 次切换就 SIGSEGV**（coredump 栈和
+       用户那份一模一样），修之后 120 次快滚活下来、日志 0 条崩溃痕迹。
+     - `test-closeanim.sh`、`test-workspace.sh` 全过。
+
 231. **X11 客户端自己改 `_NET_WM_STATE` 要全屏，vidow 收不到**（用户：「proton 游戏启动的
      时候会有半屏空位，然后窗口不是全画幅，而是半屏大小（带窗口装饰），然后会一直在屏幕的
      右半屏」）
