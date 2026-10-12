@@ -293,6 +293,7 @@ end
 | `focus-column <方向>` / `move-column <方向>` | 焦点左/右移一列 / 当前列左/右移一位 |
 | `focus-window <方向>` / `move-window <方向>` | 列内焦点下/上移 / 列内窗口下/上移 |
 | `expel-window-from-column [left\|right]`（`expel-window` 同义） | 把焦点窗口从它那条列里拎出来、单独成一条新列（niri 的 expel-window-from-column；不写方向 = 右边）。列里只剩它一个 / 它是浮窗时什么都不做。**同一个动作拖拽也能触发**：把窗口拖到列带的缝上 / 空白处就是「取出来成新列」（见 `Mod+左键拖动`） |
+| `swap-window <left\|right>` | 和相邻那列里的窗口**换个位置**：两个窗口各自住进对方那一格，焦点跟着自己走（列里只有一个窗口时 = 两条列的内容对调）。和谁换：对方那列里**同一层**那个窗口（层数不够就取最后一个），整列都最小化了的列跳过。浮窗 / 那个方向没有别的列时什么都不做 |
 | `close-window` | 关掉焦点窗口 |
 | `toggle-floating` | 焦点窗口 平铺 ⇄ 浮动 |
 | `toggle-fullscreen`（`fullscreen` 同义） | 焦点窗口全屏开关 |
@@ -1073,6 +1074,9 @@ vidow.bind("Mod+W", "close-window", { on = "release" })  -- 松开才触发
 | `Mod+M` / `Mod+Shift+M` | 收起当前窗口 / 放回最近收起来的那个（见「最小化」一节） |
 | `Mod+Enter` | 启动终端 |
 | `Mod+滚轮` | 焦点左/右移一列 |
+| `Alt+滚轮` | 工作区上/下切一块 |
+| `Alt+Shift+滚轮` | 把当前窗口搬到上/下一块工作区（搬完**不跟过去**） |
+| `Ctrl+Alt+滚轮` | 和左右相邻的窗口换位置（滚上 = 和左边那个换） |
 | `Mod+Escape` | 退出合成器（绑成 `{ inhibited = true }`：抑制期间也生效，见下节） |
 | `Mod+U` / `Mod+I` | 工作区上/下切一块（niri 的默认键位） |
 | `Mod+Shift+U` / `Mod+Shift+I` | 把当前窗口搬到上/下一块工作区 |
@@ -1954,7 +1958,7 @@ vidow 自己的，比如 `vidow-wayland-1.sock`）；`ipc_socket` 可以写死�
 | 类别 | 命令 |
 | --- | --- |
 | 窗口 | `focus-window`、`activate-window`（= 点通知：先把工作区端出来再给焦点）、`close-window`、`minimize-window`、`unminimize-window`（不带参数 = 最近收起来的那个）、`toggle-minimize`、`toggle-floating`、`set-floating`、`toggle-fullscreen`、`set-fullscreen`、`set-window-size`、`set-window-position`、`center-window`、`set-window-force-render`、`focus-window-direction`、`move-window-direction`、`move-window-to-workspace`、`move-window-to-special`、`move-window-to-output` |
-| 列 | `focus-column`、`move-column`、`cycle-column-width`、`set-column-width`（`fraction` 绝对值 / `delta` 相对）、`expand-column-to-available-width`、`center-column`、`toggle-maximize-column`、`set-maximize-column`（`maximized` true/false）、`expel-window-from-column`（把窗口从列里拎出来单独成列，`direction` 不写 = 右边） |
+| 列 | `focus-column`、`move-column`、`cycle-column-width`、`set-column-width`（`fraction` 绝对值 / `delta` 相对）、`expand-column-to-available-width`、`center-column`、`toggle-maximize-column`、`set-maximize-column`（`maximized` true/false）、`expel-window-from-column`（把窗口从列里拎出来单独成列，`direction` 不写 = 右边）、`swap-window`（和相邻列里同层的窗口换位置，`direction` 必写） |
 | 工作区 | `focus-workspace`（名字 / `next` / `prev` / `index`）、`toggle-special`（= `focus-special`）、`create-workspace`、`move-workspace-to-output` |
 | 输出 | `output-power`（`on` / `off` / `toggle`）、`output-enable` / `output-disable` / `output-toggle`、`output-scale`（数字或 `auto`）、`output-transform`、`output-mode`（宽 高 [刷新率]）、`output-position`、`output-focus` |
 | 剪贴板 | `clipboard`（查状态）、`clipboard-get`（取数据：文本或 base64）、`clipboard-set`（放数据：文本 / base64 / 指定 mime / 指定选区）、`clipboard-set-files`（`files` = 路径数组，发 uri-list + gnome-copied-files，见「文件复制」）、`clipboard-clear` |
@@ -5042,6 +5046,25 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
       - 另一个踩到的坑（不是 vidow 的）：`awww img` 默认带过渡动画，动画没跑完就进全景，抓到的
         底衬是**半透明混合**的（量到 (107,66,38)，金色和洋红混在一起）。验证 / 截图时加
         `--transition-type none`。
+
+226. **滚轮 + 修饰键那三组绑定**（用户：「还需要 alt + 滚轮切换工作区 alt+shift+滚轮切换窗口工作区
+     ctrl+alt+滚轮交换窗口位置」）
+
+     - `Alt+滚轮` → `workspace up` / `down`、`Alt+Shift+滚轮` → `move up` / `down`：这两组
+       都是现成动作，写进默认键位（`configs/14-keys.lua`）就行。修饰键是**精确匹配**
+       （`mods_match` 比的是整个「有意思的修饰键」掩码），所以 `Alt+滚轮` 不会顺带把
+       `Mod+滚轮` 那条也跑掉 —— 实测按住 Alt 滚一格只切工作区、焦点列一点没动。
+     - `Ctrl+Alt+滚轮` 要的新动作 **`swap-window left|right`**：以前没有「交换」这个动作
+       （只有 `move-column` 挪列、`move-window` 列内挪窗口）。语义 = 和相邻那列里的窗口
+       换个位置，两个窗口各自住进对方那一格、焦点跟着自己走；列里只有一个窗口时（常见的
+       那种）就是两条列的内容对调。和谁换：对方那列里**同一层**那个（层数不够取最后一个），
+       这样一列里叠了几个窗口时换完不会跳层；整列都最小化了的列跳过（它不占条带）。
+       浮窗 / 那个方向没有别的列 → 什么都不做，日志报人话。
+     - 拿真事件量过：注入 `send-key press alt` + `pointer-scroll`（走的就是真鼠标那条
+       `vidow_pointer_axis`），三组都按预期生效；`Ctrl+Alt+滚轮上` 在 `[a1] | [a2] | [a3]`
+       上把 a2 和 a1 对调、焦点跟着 a2 走，滚回来还原。
+     - 记一笔行为：`Alt+Shift+滚轮` 搬完**不跟过去**（焦点留在原工作区，落到剩下的窗口上），
+       这是 `move up/down` 本来的语义（和 `Mod+Shift+U/I` 一致）。
 
 225. **剪贴板加历史 + 一个 GUI**（用户：「内置的剪贴板同步需要一个 GUI」，以及「需要能从剪贴板
      历史里面复制内容，剪贴板历史里如果是文件路径（file 前缀）则复制文件」）

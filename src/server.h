@@ -2837,6 +2837,8 @@ void vidow_view_activate(struct vidow_view *view);
 void vidow_focus_column(struct vidow_server *server, int direction);
 void vidow_focus_window(struct vidow_server *server, int direction);
 void vidow_move_column(struct vidow_server *server, int direction);
+/* 和相邻列里同层的那个窗口换个位置（swap-window 动作）。 */
+bool vidow_swap_window(struct vidow_server *server, int direction);
 void vidow_move_window(struct vidow_server *server, int direction);
 /* 把一条窗口插进**另一条列**的第 index 位（niri 的 insert into column：一列里
  * 上下叠起来）。index 是「目标列现在这些窗口（不含自己）里的第几位」，越界就放

@@ -55,6 +55,14 @@ vidow.bind("Mod+mouse-left", "interactive-move")
 vidow.bind("Mod+mouse-right", "interactive-resize")
 vidow.bind("Mod+wheel-up", "focus-column left")
 vidow.bind("Mod+wheel-down", "focus-column right")
+-- Alt+滚轮 = 换工作区（往上 = 上一块），Alt+Shift+滚轮 = 把当前窗口搬到那块去
+vidow.bind("Alt+wheel-up", "workspace up")
+vidow.bind("Alt+wheel-down", "workspace down")
+vidow.bind("Alt+Shift+wheel-up", "move up")
+vidow.bind("Alt+Shift+wheel-down", "move down")
+-- Ctrl+Alt+滚轮 = 和左右相邻的窗口换位置（往上 = 和左边那个换）
+vidow.bind("Ctrl+Alt+wheel-up", "swap-window left")
+vidow.bind("Ctrl+Alt+wheel-down", "swap-window right")
 -- 单独一个修饰键：默认**松开才触发**（按下就触发的话 Super+Q 会顺带开全景）。
 -- 按下武装、期间按了别的键或鼠标键就作废，松开且其它修饰键都松了才跑。
 --     vidow.bind("Mod", "toggle-overview")        -- 按一下 Super 开全景

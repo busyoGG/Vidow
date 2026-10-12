@@ -895,6 +895,24 @@ bool vidow_action_run(struct vidow_server *server, const char *action) {
 		log_action(action, "把窗口从列里取出来");
 		return true;
 	}
+	/* 和相邻那列里的窗口换个位置（左右两个窗口对调；列里只有一个窗口时就是
+	 * 两条列的内容对调）。方向只认 left / right —— 上下是列内挪窗口
+	 * （move-window），不是这个动作。 */
+	if (strcmp(name, "swap-window") == 0 ||
+			strcmp(name, "swap") == 0) {
+		int dir = 0;
+		if (!parse_direction(arg, &dir) || dir == 0) {
+			wlr_log(WLR_ERROR, "%s 要一个方向（left / right）", name);
+			return false;
+		}
+		if (!vidow_swap_window(server, dir)) {
+			wlr_log(WLR_INFO, "换不了：没焦点窗口、是浮窗、"
+				"或者那个方向没有别的列");
+			return false;
+		}
+		log_action(action, "和相邻列里的窗口换位置");
+		return true;
+	}
 	/* 鼠标拖拽：原来写死在 input.c 的指针手势，现在是一条动作 + 一条绑定：
 	 *     vidow.bind("Mod+mouse-left",  "interactive-move")
 	 *     vidow.bind("Mod+mouse-right", "interactive-resize")

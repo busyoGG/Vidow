@@ -3332,6 +3332,93 @@ bool vidow_view_expel_from_column(struct vidow_view *view, int direction) {
 		direction > 0 ? "右边" : "左边") != NULL;
 }
 
+/* 第 index 个「还占着位置」的窗口（0 起数，越界返回 NULL）。 */
+static struct vidow_view *column_shown_view_at(struct vidow_column *col,
+		int index) {
+	if (index < 0) {
+		return NULL;
+	}
+	struct vidow_view *view;
+	wl_list_for_each(view, &col->views, column_link) {
+		if (view_shows(view) && index-- == 0) {
+			return view;
+		}
+	}
+	return NULL;
+}
+
+/* `view` 在它那条列里排第几（按「还占着位置」的数；它自己最小化时 -1）。 */
+static int column_shown_index(struct vidow_view *view) {
+	if (view == NULL || view->column == NULL || !view_shows(view)) {
+		return -1;
+	}
+	int index = 0;
+	struct vidow_view *it;
+	wl_list_for_each(it, &view->column->views, column_link) {
+		if (it == view) {
+			return index;
+		}
+		if (view_shows(it)) {
+			index++;
+		}
+	}
+	return -1;
+}
+
+/* 和相邻那列里的窗口**换个位置**（niri 那种 swap）：两个窗口各自住进对方那一格，
+ * 焦点跟着自己走 —— 列里只有一个窗口时（常见情况）就是两条列的内容对调。
+ *
+ * 跟谁换：目标列里「纵向同一层」那个（层数不够就取最后一个）。一列里叠了好几个
+ * 窗口时，这样换完两个窗口都还在原来那一层，不会跳层。整列都最小化了的列跳过
+ * （它不占条带，换过去等于凭空挪一屏）。 */
+bool vidow_swap_window(struct vidow_server *server, int direction) {
+	struct vidow_view *view = server->focused;
+	if (view == NULL || view->column == NULL ||
+			view->float_mode != VIDOW_FLOAT_NONE ||
+			!view_shows(view)) {
+		return false;
+	}
+	struct vidow_column *col = view->column;
+	if (col->ws == NULL || direction == 0) {
+		return false;
+	}
+	int index = column_shown_index(view);
+
+	struct wl_list *node = direction > 0 ? col->link.next : col->link.prev;
+	while (node != &col->ws->columns) {
+		struct vidow_column *other = wl_container_of(node, other, link);
+		struct vidow_view *mate =
+			column_shown_view_at(other, index);
+		if (mate == NULL && column_has_shown_views(other)) {
+			/* 对方那列层数不够：换成它最后一个（最靠下的那个）。 */
+			struct vidow_view *last = NULL;
+			struct vidow_view *it;
+			wl_list_for_each(it, &other->views, column_link) {
+				if (view_shows(it)) {
+					last = it;
+				}
+			}
+			mate = last;
+		}
+		if (mate == NULL || mate == view) {
+			node = direction > 0 ? node->next : node->prev;
+			continue;
+		}
+		/* 两格的前驱都得先记下来：wl_list_remove 会把节点的 prev/next 清掉。 */
+		struct wl_list *a_prev = view->column_link.prev;
+		struct wl_list *b_prev = mate->column_link.prev;
+		wl_list_remove(&view->column_link);
+		wl_list_remove(&mate->column_link);
+		wl_list_insert(b_prev, &view->column_link);
+		wl_list_insert(a_prev, &mate->column_link);
+		view->column = other;
+		mate->column = col;
+		vidow_arrange(server);
+		return true;
+	}
+	return false;
+}
+
 void vidow_move_window(struct vidow_server *server, int direction) {
 	struct vidow_view *view = server->focused;
 	if (view == NULL || view->column == NULL) {
