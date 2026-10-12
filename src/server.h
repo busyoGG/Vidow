@@ -289,6 +289,10 @@ struct vidow_config {
 	float mru_hover_color[4];
 	int mru_highlight_border;
 	float mru_highlight_color[4];
+
+	/* 全景（overview，见 src/overview.c）：压在壁纸之上、窗口之下的那层遮罩。
+	 * 颜色带 alpha（RRGGBBAA），alpha 就是「压多暗」，0 = 不压暗。 */
+	float overview_dim_color[4];
 };
 
 /* gap 的唯一算法：单独设了就用它，没设（-1）跟随统一值 gaps；其余负值当 0
@@ -446,6 +450,7 @@ struct vidow_blur_set {
 struct vidow_overview {
 	bool on;                 /* 目标状态（动画朝它走） */
 	double t;                /* 0..1，当前进度 */
+	double anim_from;        /* 这次动画的起点 t（中途反向就从这儿接着走） */
 	double scale;            /* 由 t 算出的缩放 */
 	double cam_x, cam_y;     /* 由 t 算出的相机中心（世界坐标） */
 	double pan;              /* 滚轮平移（世界坐标），换列时清零 */

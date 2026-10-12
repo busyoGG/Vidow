@@ -119,7 +119,8 @@ static void overview_apply(struct vidow_server *server) {
 	ov->out_cx = id_cx;
 	ov->out_cy = id_cy;
 
-	/* 遮罩：压暗壁纸，让缩小的窗口浮在上面。盖住那块屏（用它的整个布局框） */
+	/* 遮罩：压暗壁纸，让缩小的窗口浮在上面。盖住那块屏（用它的整个布局框）。
+	 * 颜色和浓度都是配置给的（overview_dim_color，见 17-overview.lua）。 */
 	if (ov->dim != NULL) {
 		struct wlr_box box = {0};
 		wlr_output_layout_get_box(server->output_layout, output, &box);
@@ -127,14 +128,15 @@ static void overview_apply(struct vidow_server *server) {
 			box = (struct wlr_box){ .x = work.x, .y = work.y,
 				.width = work.width, .height = work.height };
 		}
-		float dim[4] = { 0.02f, 0.02f, 0.03f, (float)(0.60 * t) };
+		const float *c = server->config.overview_dim_color;
+		float dim[4] = { c[0], c[1], c[2], (float)(c[3] * t) };
 		wlr_scene_rect_set_color(ov->dim, dim);
 		wlr_scene_rect_set_size(ov->dim, box.width, box.height);
 		wlr_scene_node_set_position(&ov->dim->node, box.x, box.y);
-		bool want = t > 0.002;
+		bool want = t > 0.002 && c[3] > 0.0f;
 		if (ov->dim->node.enabled != want) {
 			wlr_log(WLR_DEBUG, "overview: 遮罩 %s（t=%.3f，alpha=%.2f）",
-				want ? "开" : "关", t, 0.60 * t);
+				want ? "开" : "关", t, c[3] * t);
 		}
 		wlr_scene_node_set_enabled(&ov->dim->node, want);
 	}
@@ -163,22 +165,33 @@ static void overview_apply(struct vidow_server *server) {
 
 /* ------------------------------------------------------------- 进出 */
 
+/* 动画引擎给的 t 永远是 0 → 1（见 anim.c）：方向由 on 决定，起点是「这次动画
+ * 开始时 t 是多少」（ov->anim_from）。**不能**把 t 直接当进度用 —— 那样退出会
+ * 把「进入」重放一遍再瞬间跳回原位（用户报的「点选之后闪弹一下」：先弹回原样、
+ * 又缩下来、最后啪一下再弹回去）。中途反向（进到一半再按一次）也从当前进度接着
+ * 走，不跳。 */
 static void overview_update(void *data, double t, double linear) {
 	(void)linear;
 	struct vidow_server *server = data;
-	server->overview.t = t;
+	struct vidow_overview *ov = &server->overview;
+	double from = ov->anim_from;
+	ov->t = ov->on ? from + (1.0 - from) * t : from * (1.0 - t);
 	overview_apply(server);
 }
 
 static void overview_done(void *data, bool cancelled) {
-	(void)cancelled;
 	struct vidow_server *server = data;
-	server->overview.anim = NULL;
-	server->overview.t = server->overview.on ? 1.0 : 0.0;
+	struct vidow_overview *ov = &server->overview;
+	ov->anim = NULL;
+	if (cancelled) {
+		/* 被紧接着的新动画接管了：t / output 归新的那次管，别在这儿拍端点。 */
+		return;
+	}
+	ov->t = ov->on ? 1.0 : 0.0;
 	overview_apply(server);
-	if (!server->overview.on) {
-		server->overview.output = NULL;
-		server->overview.pan = 0.0;
+	if (!ov->on) {
+		ov->output = NULL;
+		ov->pan = 0.0;
 	}
 	/* 进 / 出都重判一次「谁该出现在场景里」：overview 里**所有**窗口都要画
 	 * （缩到画面里），所以滚出视口被剔除的那些得先放回来；退出之后又要按框剔除
@@ -188,7 +201,13 @@ static void overview_done(void *data, bool cancelled) {
 
 static void overview_start(struct vidow_server *server) {
 	struct vidow_overview *ov = &server->overview;
+	/* 起点先记下来：cancel 会回调 overview_done，把 t 拍成端点值。没在动画里
+	 * 就是干净的两端 —— 进从 0 起，退从 1 起。 */
+	double from = ov->anim != NULL ? ov->t : (ov->on ? 0.0 : 1.0);
 	vidow_anim_cancel(ov->anim);
+	ov->anim = NULL;
+	ov->anim_from = from;
+	ov->t = from;
 	ov->anim = vidow_anim_start(server, "overview", server->config.window_move_ms,
 		server->config.easing, overview_update, overview_done, server);
 	if (ov->anim == NULL) {

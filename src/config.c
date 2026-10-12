@@ -89,6 +89,11 @@ static const struct section sections[] = {
 	/* 会话环境同样是往后加（16-…）：前面那些文件名早就写进用户的 config.lua 了。 */
 	{ "会话环境 / 自启动 / 事件钩子", "16-env.lua",
 		"和 systemd 用户管理器对账（吸 / 推）、exec_once 自启动、vidow.on() 事件钩子" },
+	/* 全景（overview）也只能往后加（17-…）。壁纸本身**不**在这里：那是
+	 * layer-shell 的 background 层，谁画都行（swaybg / swww / shell），
+	 * 见 README「背景（壁纸）」一节。这里配的是它上面那层遮罩。 */
+	{ "全景（overview）", "17-overview.lua",
+		"Mod+O 把整条列带缩到一屏里看全景；配的是壁纸之上、窗口之下那层遮罩" },
 };
 #define N_SECTIONS ((int)(sizeof(sections) / sizeof(sections[0])))
 /* 「键位 / 工作区 / 规则」那一节：它不是配置键，entries[] 里没有它，打印也
@@ -343,6 +348,12 @@ static const struct entry entries[] = {
 	{ "mru_highlight_color", K_COLOR, OFF(mru_highlight_color),
 		SZ(mru_highlight_color), 14,
 		"强调色：选中那张卡片的描边、以及它的底色（底 = 卡片底混 12% 这个色）" },
+
+	{ "overview_dim_color", K_COLOR, OFF(overview_dim_color),
+		SZ(overview_dim_color), 16,
+		"全景里压在壁纸上的那层遮罩的颜色（RRGGBB 或 RRGGBBAA）：alpha 就是"
+		"压多暗，默认 #05050899（60%）；0 = 不压暗，壁纸原样，缩小的窗口直接"
+		"浮在上面" },
 };
 
 /* ------------------------------------------------------------ 配置组
@@ -815,6 +826,13 @@ static void defaults(struct vidow_config *cfg) {
 	cfg->mru_highlight_color[1] = 0xae / 255.0f;
 	cfg->mru_highlight_color[2] = 0xe9 / 255.0f;
 	cfg->mru_highlight_color[3] = 1.0f;
+
+	/* 全景：壁纸压暗一层（alpha 0.6），缩小的窗口浮在上面。颜色几乎就是黑，
+	 * 偏一点点蓝 —— 纯黑会让壁纸显得"断电"了。 */
+	cfg->overview_dim_color[0] = 0x05 / 255.0f;
+	cfg->overview_dim_color[1] = 0x05 / 255.0f;
+	cfg->overview_dim_color[2] = 0x08 / 255.0f;
+	cfg->overview_dim_color[3] = 0.6f;
 
 	cfg->cursor_shake = true;
 	cfg->cursor_shake_scale = 2.0;

@@ -12,6 +12,10 @@
 #   5) Esc 退出：日志 `overview: 退出`，画面**逐像素**回到进 overview 之前那张
 #   6) 点选：点某个窗口 → `overview: 选中 X` + 退出 + 焦点换成它（那一列被滚进视野）
 #   7) 两块屏时只看当前那块：另一块屏上的窗口淡出（那片区域不是 pattern 的颜色）
+#   8) 退出不反弹：Esc 之后 t 单调从 1 降到 0（动画引擎的 t 永远 0→1，方向得由
+#      on 决定；以前直接把 t 当进度用，退出会把「进入」重放一遍再瞬间跳回去）
+#   9) 遮罩颜色可配（overview_dim_color）：默认压暗、alpha 0 = 不压暗、换色就染色，
+#      三种配色下窗口本身都不暗
 set -u
 cd "$(dirname "$0")"
 
@@ -155,6 +159,57 @@ wtype -M logo -k o >/dev/null 2>&1
 sleep 0.9
 grim "$RUNDIR/two-overview.png"
 cp "$LOG" "$RUNDIR/log-two.txt"
+stop_clients
+kill -TERM -- "-$VIDOW_PGID" 2>/dev/null
+sleep 0.6
+
+# ---------------------------------------------------------------- 退出不反弹 + 遮罩配色
+mark "退出动画不反弹 + 遮罩颜色可配（overview_dim_color）"
+start_vidow 1
+python3 tools/wall.py >/dev/null 2>&1 &
+sleep 1.0
+grim "$RUNDIR/wall-only.png"     # 只有壁纸：金色方块的基准
+# 列窄一点（0.25），overview 缩下去之后两边留得出壁纸，好采样
+./build/vidowmsg set-config window_move_ms 150 >/dev/null 2>&1
+for n in p-a p-b p-c; do
+	python3 tools/pattern.py "$n" >/dev/null 2>&1 &
+	sleep 0.8
+done
+sleep 1.2
+
+# 退出：把动画拉长到 600ms，Esc 之后每 50ms 采一次 t —— 必须是单调往下走。
+# （以前这里是「重放一遍进入动画」：t 从 0 重新涨到 1，看起来就是闪弹一下。）
+./build/vidowmsg set-config window_move_ms 600 >/dev/null 2>&1
+wtype -M logo -k o >/dev/null 2>&1
+sleep 1.0
+: > "$RUNDIR/exit-t.txt"
+wtype -k Escape >/dev/null 2>&1
+for _ in $(seq 1 14); do
+	./build/vidowmsg overview 2>/dev/null |
+		python3 -c "import json,sys; print('%.3f' % json.load(sys.stdin)['t'])" \
+		>> "$RUNDIR/exit-t.txt"
+	sleep 0.05
+done
+sleep 0.7
+./build/vidowmsg set-config window_move_ms 150 >/dev/null 2>&1
+
+dim_shot() { # dim_shot <名字> [颜色]
+	if [ -n "${2:-}" ]; then
+		./build/vidowmsg set-config overview_dim_color "$2" >/dev/null 2>&1
+		sleep 0.3
+	fi
+	wtype -M logo -k o >/dev/null 2>&1
+	sleep 0.9
+	grim "$RUNDIR/$1.png"
+	wtype -k Escape >/dev/null 2>&1
+	sleep 0.9
+}
+dim_shot dim-default
+dim_shot dim-off "#00000000"
+dim_shot dim-red "#ff000099"
+./build/vidowmsg get-config overview_dim_color > "$RUNDIR/dim-cfg.json" 2>&1
+./build/vidowmsg set-config overview_dim_color "紫色" > "$RUNDIR/dim-bad.txt" 2>&1
+cp "$LOG" "$RUNDIR/log-dim.txt"
 stop_clients
 kill -TERM -- "-$VIDOW_PGID" 2>/dev/null
 sleep 0.6
@@ -318,6 +373,104 @@ right_before = find_pattern(im_two_norm, 1300, 2560)
 right_after = find_pattern(im_two, 1300, 2560)
 check(right_before is not None, "另一块屏上本来有窗口（%s）" % (right_before,))
 check(right_after is None, "overview 里另一块屏上的窗口淡出了（现在只剩壁纸）")
+
+print()
+print("== 退出不反弹 ==")
+# 动画引擎的 t 永远 0 → 1，方向得由 on 决定（见 overview_update）。以前直接把
+# t 当进度用，退出 = 把「进入」重放一遍再瞬间跳回去 —— 就是用户报的「点选之后
+# 闪弹一下」。这里量退出过程中 t 的走向：必须从 1 单调降到 0。
+ts = [float(x) for x in
+      open("%s/exit-t.txt" % rundir, encoding="utf-8").read().split()]
+check(len(ts) >= 8, "退出过程中采到 %d 个 t" % len(ts))
+if len(ts) >= 8:
+    check(ts[0] > 0.9, "按下 Esc 的那一刻还是展开状态（t=%.3f）" % ts[0])
+    back = [i for i in range(1, len(ts)) if ts[i] > ts[i - 1] + 0.02]
+    check(not back,
+          "t 一路往下走，没有回头（%s）" % " ".join("%.2f" % v for v in ts))
+    check(ts[-1] < 0.05, "最后收干净了（t=%.3f）" % ts[-1])
+    mid = [v for v in ts if 0.2 < v < 0.8]
+    check(len(mid) >= 2, "中间真的在动，不是一帧跳过去（%d 个中间态）" % len(mid))
+
+print()
+print("== 遮罩颜色可配（overview_dim_color）==")
+wall = image("wall-only")
+
+
+def is_gold(p):
+    r, g, b = p
+    return r > 170 and r - b > 110 and g - b > 80 and g > 120
+
+
+# 壁纸基准：只有壁纸那张里金色方块的均值
+base_pts = [(x, y) for y in range(2, 718, 2) for x in range(2, 1278, 2)
+            if is_gold(wall.getpixel((x, y)))]
+check(len(base_pts) > 500, "壁纸基准采样点 %d 个（金色方块）" % len(base_pts))
+
+
+def still_gold(p):  # 压暗之后的金色：还是 r > g > b，只是暗了
+    r, g, b = p
+    return r > 70 and r > g > b and r - b > 40 and g - b > 25
+
+
+def mean(im, pts):
+    s = [0, 0, 0]
+    for p in pts:
+        c = im.getpixel(p)
+        for i in range(3):
+            s[i] += c[i]
+    return tuple(round(v / len(pts)) for v in s)
+
+
+base = mean(wall, base_pts)
+check(abs(base[0] - 255) < 12 and base[1] > 190 and base[2] < 90,
+      "壁纸金色基准 %s" % (base,))
+
+dim = {}
+for name in ("dim-default", "dim-off", "dim-red"):
+    im = image(name)
+    pts = [p for p in base_pts if still_gold(im.getpixel(p))]
+    if len(pts) < 200:
+        check(False, "%s：采样点不够（%d）" % (name, len(pts)))
+        continue
+    dim[name] = (mean(im, pts), len(pts))
+
+if len(dim) == 3:
+    d, n = dim["dim-default"]
+    check(sum(d) < sum(base) * 0.6,
+          "默认压暗：壁纸 %s -> %s（%.0f%%，%d 个点）"
+          % (base, d, 100 * sum(d) / sum(base), n))
+    check(abs(d[0] - d[1]) < 40 and d[2] < 60,
+          "默认遮罩是近黑偏蓝，不是染了色（%s）" % (d,))
+
+    o, n = dim["dim-off"]
+    check(abs(o[0] - base[0]) <= 12 and abs(o[1] - base[1]) <= 12 and
+          abs(o[2] - base[2]) <= 12,
+          "overview_dim_color = #00000000（alpha 0）时壁纸原样：%s -> %s（%d 个点）"
+          % (base, o, n))
+
+    r_, n = dim["dim-red"]
+    check(r_[0] > 200 and r_[0] > r_[1] * 2 and r_[1] < base[1] - 40,
+          "#ff000099 时壁纸被染红：%s（红 %d 绿 %d 蓝 %d，%d 个点）"
+          % (r_, r_[0], r_[1], r_[2], n))
+
+    # 遮罩在窗口下面：三个配色下窗口都是原色
+    for name in ("dim-default", "dim-off", "dim-red"):
+        im = image(name)
+        px = [im.getpixel((x, y)) for y in range(300, 420, 20)
+              for x in range(40, 240, 20)]
+        check(any(p == (255, 0, 0) for p in px),
+              "%s：窗口本身没被压暗（采样里还有纯红 255,0,0）" % name)
+
+cfg = open("%s/dim-cfg.json" % rundir, encoding="utf-8", errors="replace").read()
+check("#ff000099" in cfg, "get-config 读回改过的值：%s" % " ".join(cfg.split()))
+bad = open("%s/dim-bad.txt" % rundir, encoding="utf-8", errors="replace").read()
+check("改不了" in bad or "不合法" in bad,
+      "非法颜色被拒（%s）" % bad.strip().splitlines()[0][:60])
+
+dim_log = open("%s/log-dim.txt" % rundir, encoding="utf-8",
+               errors="replace").read()
+check("Assertion" not in dim_log and "abort" not in dim_log.lower(),
+      "遮罩那一段日志里没有 assert / abort")
 
 check("Assertion" not in single and "abort" not in single.lower() and
       "Assertion" not in two and "abort" not in two.lower(),
