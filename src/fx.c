@@ -3183,6 +3183,80 @@ void vidow_fx_release(struct vidow_fx_target *fx) {
  *   - top / overlay 层反过来：窗口就在它底下，模糊里**得有窗口**。这时按它自己那
  *     一小块区域重抓一份：基座是从共享底衬上 1:1 拷过来的那块（壁纸 + background /
  *     bottom 层），窗口再画上去。代价跟这块区域的面积成正比，不是整屏。 */
+/* 在子树里找第一个挂着 wlr_scene_surface 的 buffer 节点。 */
+static struct wlr_scene_surface *find_scene_surface(struct wlr_scene_node *node) {
+	if (node->type == WLR_SCENE_NODE_BUFFER) {
+		return wlr_scene_surface_try_from_buffer(
+			wlr_scene_buffer_from_node(node));
+	}
+	if (node->type != WLR_SCENE_NODE_TREE) {
+		return NULL;
+	}
+	struct wlr_scene_tree *tree = wlr_scene_tree_from_node(node);
+	struct wlr_scene_node *child;
+	wl_list_for_each(child, &tree->children, link) {
+		struct wlr_scene_surface *ss = find_scene_surface(child);
+		if (ss != NULL) {
+			return ss;
+		}
+	}
+	return NULL;
+}
+
+/* 找这块 layer 的 wlr_scene_surface。wlr_scene_layer_surface_v1 只把 tree 暴露出来，
+ * 表面在那棵树**里面**（wlroots 0.20 给它套了一层 subsurface 树，不是直接子节点），
+ * 旁边还躺着我们自己垫的那张模糊节点的 buffer —— 所以要递归找、且要认得出哪个才是
+ * 客户端的表面（find_scene_surface 只认挂得起 scene_surface 的）。 */
+static struct wlr_scene_surface *layer_scene_surface(
+		struct vidow_layer_surface *ls) {
+	if (ls->scene == NULL || ls->scene->tree == NULL) {
+		return NULL;
+	}
+	struct wlr_scene_node *node;
+	wl_list_for_each(node, &ls->scene->tree->children, link) {
+		struct wlr_scene_surface *ss = find_scene_surface(node);
+		if (ss != NULL) {
+			return ss;
+		}
+	}
+	return NULL;
+}
+
+/* 这块 layer 的模糊看得见吗 —— 和窗口那条路同一个道理（见 view_blur_visible）：
+ * 内容整块不透明的状态栏 / 面板，底下垫一层模糊一个像素都透不出来（装饰着色器里
+ * 模糊被 content.a 乘成 0），那趟私有底衬抓取 + kawase 链条全是白算的。
+ *
+ * 判据保守：拿不准就当看得见。 */
+static bool layer_blur_visible(struct vidow_layer_surface *ls) {
+	/* 入场 / 退场动画期间内容在淡入淡出（layer.c 把 anim_alpha 乘在内容上）。 */
+	if (ls->anim != NULL || ls->anim_alpha < 1.0) {
+		return true;
+	}
+	/* 图层规则写了 opacity：内容被画淡，模糊从里面透出来。 */
+	if (vidow_rule_opacity(&ls->rule_eff) < 1.0) {
+		return true;
+	}
+	/* 抓图遮挡正盖着这一块（画出来的不是客户端的内容）。 */
+	if (ls->mask_opacity) {
+		return true;
+	}
+	struct wlr_scene_surface *ss = layer_scene_surface(ls);
+	if (ss == NULL || ss->buffer == NULL || ss->buffer->buffer == NULL) {
+		return true;
+	}
+	if (wlr_buffer_is_opaque(ss->buffer->buffer)) {
+		return false; /* 格式里没 alpha（XRGB / RGBX）：整块 alpha == 1 */
+	}
+	/* 客户端声明了盖住整块 layer 的 opaque region（坐标是表面局部，wlroots 按
+	 * 表面尺寸设的）。只声明了一部分的（圆角、留白）照旧算模糊。 */
+	pixman_box32_t want = {
+		.x1 = 0, .y1 = 0,
+		.x2 = ls->geom.width, .y2 = ls->geom.height,
+	};
+	return pixman_region32_contains_rectangle(&ss->buffer->opaque_region,
+		&want) != PIXMAN_REGION_IN;
+}
+
 static bool layer_blur_wanted(struct vidow_server *server,
 		struct vidow_layer_surface *ls) {
 	if (!server->shader_ok || !server->config.blur_enabled) {
@@ -3196,7 +3270,8 @@ static bool layer_blur_wanted(struct vidow_server *server,
 	if (ls->layer == ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND) {
 		return false;
 	}
-	return ls->geom.width > 0 && ls->geom.height > 0 && ls->scene != NULL;
+	return ls->geom.width > 0 && ls->geom.height > 0 && ls->scene != NULL &&
+		layer_blur_visible(ls);
 }
 
 /* 抓一块「这个 layer 盖住的东西」，含窗口。

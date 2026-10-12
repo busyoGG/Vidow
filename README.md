@@ -2737,6 +2737,22 @@ kawase + 重烘整块，而画出来的像素和没有模糊时一模一样（�
 「重烘 1.00 次/帧」= 只剩底下那个每帧在变的窗口自己在烘（那是该干的活）。半透明那两行
 是守门的：判据没把该模糊的一起砍掉。
 
+layer surface（状态栏 / 面板）走同一条判据，实现在 `layer_blur_visible`：整块不透明的
+状态栏底下垫的那层模糊也是一个像素都透不出来，于是它那块私有底衬的抓取、kawase 链条、
+重烘全省。实测（`./test-layerblur.sh` 最后一节：一个每帧换色的窗口压在状态栏那块区域里，
+headless 1280x720@60，`blur_levels = 3`，5s 稳定窗口）：
+
+| 状态栏 | layer region 重抓 | kawase 链条 |
+| --- | --- | --- |
+| 半透明（alpha 0.5） | 304 | 279 |
+| 整块不透明（alpha 1.0） | **0** | **0** |
+
+注意这条判据只能看**客户端自己声明的**不透明：GTK 拿 RGBA visual +
+`set_app_paintable(True)` 画出来的状态栏（`tools/bar.py` 的默认样子），哪怕内容一个像素
+都不透明，缓冲区格式照样带 alpha、也没声明 opaque region —— 这种 vidow 照旧给它算模糊
+（保守，宁可白算）。真客户端里不透明的状态栏该用不透明格式（不拿 RGBA visual），或者自己
+`wl_surface.set_opaque_region` 声明一块盖满的 opaque region。
+
 ### `blur_levels` 是降采样次数
 
 是。`blur_levels = n` 就是「降采样 n 次」：链上第 i 级的分辨率是 `输出 >> (i+1)`，
