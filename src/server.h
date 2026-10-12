@@ -484,6 +484,7 @@ struct vidow_mru {
 	int slot_n;
 	double scroll;                  /* strip 模式横向滚了多少 */
 	int total_w, total_h;           /* 整条清单占多大（日志 / 断言用） */
+	struct wlr_scene_tree *tree;    /* 浮层：压暗 + 卡片 + 缩略图，压在窗口之上 */
 	struct wlr_scene_rect *backdrop; /* 压暗背景 */
 	/* 每项背后那张卡片（超椭圆圆角的底 + 描边，见 mru.c）。节点按需建、建了留着
 	 * 复用；圆角是按覆盖率算出来的小图（wlr_scene_rect 画不出圆角），尺寸或样式
@@ -492,13 +493,6 @@ struct vidow_mru {
 	int card_n;
 	struct vidow_view *hover;       /* 鼠标底下的那一项（只影响样式，不改选中） */
 	bool swallow_release;           /* 点选那一下的松手也吃掉（别漏给客户端） */
-};
-
-/* 切换器里的窗口这一帧该怎么摆（view.c 的 view_anim_place 问它）。 */
-enum vidow_mru_place {
-	VIDOW_MRU_PLACE_NONE,    /* 不归切换器管：照常走布局 / overview */
-	VIDOW_MRU_PLACE_PREVIEW, /* 摆到预览的位置上（x/y/zoom 已填好） */
-	VIDOW_MRU_PLACE_HIDE,    /* 切换器开着、但它不在清单里：收起来 */
 };
 
 /* A window's content rendered through the decoration (and optionally an
@@ -2666,11 +2660,8 @@ size_t vidow_mru_collect(struct vidow_server *server, const char *app_id_filter,
 		struct vidow_view **out, size_t max);
 /* 选择阶段开着（按住修饰键期间）：键盘归它管，焦点先不动。 */
 bool vidow_mru_active(const struct vidow_server *server);
-/* 面板显形了（open_delay 到了）：窗口被摆进预览里，画面归它管。 */
+/* 面板显形了（open_delay 到了）：切换器那层浮在画面上（窗口本身一动没动）。 */
 bool vidow_mru_showing(const struct vidow_server *server);
-/* 这个窗口现在是不是切换器里的一个预览。 */
-bool vidow_mru_holds(const struct vidow_server *server,
-		const struct vidow_view *view);
 /* 打开（dir > 0 = 往后走，对应 Alt+Tab；< 0 = 往前，Alt+Shift+Tab）。
  * 已经开着的时候再调 = 走一格（按住连点 Tab 走的就是这条）。 */
 void vidow_mru_open(struct vidow_server *server, int dir, const char *app_id,
@@ -2688,9 +2679,6 @@ void vidow_mru_commit(struct vidow_server *server);
 void vidow_mru_cancel(struct vidow_server *server);
 /* 配置 / 屏幕变了：重排一遍（没显示就什么都不做）。 */
 void vidow_mru_update(struct vidow_server *server);
-/* 这一帧这个窗口该摆在哪、缩多少（view.c 的摆位 / 重烘都问它）。 */
-enum vidow_mru_place vidow_mru_place(const struct vidow_view *view, int *x,
-		int *y, double *zoom);
 
 /* ----------------------------------------------------------------- 热插拔 */
 

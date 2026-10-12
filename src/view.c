@@ -1084,9 +1084,6 @@ static bool view_clip_box(struct vidow_view *view, struct wlr_box *out) {
 	struct vidow_server *server = view->server;
 	if (!view->mapped || view->float_mode != VIDOW_FLOAT_NONE ||
 			view->dragging || vidow_overview_active(server) ||
-			/* Alt+Tab 的切换器把窗口摆到**它自己那块屏**上（可能不是窗口
-			 * 原来那块），按原屏框裁就等于把它切没了。 */
-			vidow_mru_holds(server, view) ||
 			view->output == NULL ||
 			view->geom.width <= 0 || view->geom.height <= 0) {
 		return false;
@@ -1457,11 +1454,6 @@ bool vidow_view_should_park(struct vidow_server *server,
 	if (view->popup || !view->mapped || view->scene_tree == NULL) {
 		return false; /* 弹出物 / 还没上屏的：各有各的路（见 workspace.c） */
 	}
-	/* Alt+Tab 的切换器开着的时候画面归它管：清单里的窗口按预览摆（可能摆到
-	 * 别的屏上、也可能来自别的工作区），清单外的收起来。 */
-	if (vidow_mru_showing(server)) {
-		return !vidow_mru_holds(server, view);
-	}
 	if (!vidow_workspace_view_visible(server, view)) {
 		return true; /* 最小化 / 工作区被藏起来：也不画 */
 	}
@@ -1523,19 +1515,15 @@ static void view_anim_place(struct vidow_view *view) {
 	struct vidow_server *server = view->server;
 	double ov = vidow_overview_scale(server);
 	double alpha = view->anim_alpha;
-	/* Alt+Tab 的切换器开着时，位置和缩放都归它（预览条 / 网格）：它给的 zoom
-	 * 直接顶替 overview 那个缩放。清单外的窗口由下面停车那条路收走。 */
 	int x = 0, y = 0;
-	if (vidow_mru_place(view, &x, &y, &ov) == VIDOW_MRU_PLACE_NONE) {
-		if (server->overview.t > 0.0 && server->overview.output != NULL &&
-				view->output != server->overview.output) {
-			alpha *= 1.0 - server->overview.t;
-		}
-		double sx_mapped = 0, sy_mapped = 0;
-		vidow_overview_map(server, wx, wy, &sx_mapped, &sy_mapped);
-		x = (int)lround(sx_mapped);
-		y = (int)lround(sy_mapped);
+	if (server->overview.t > 0.0 && server->overview.output != NULL &&
+			view->output != server->overview.output) {
+		alpha *= 1.0 - server->overview.t;
 	}
+	double sx_mapped = 0, sy_mapped = 0;
+	vidow_overview_map(server, wx, wy, &sx_mapped, &sy_mapped);
+	x = (int)lround(sx_mapped);
+	y = (int)lround(sy_mapped);
 
 	/* 停车：滚出自己那块屏 / 工作区藏起来的窗口不关节点，改成停到所有输出框外面
 	 * （见 server.h 的 scene_parked）。位置只有这一个出口 —— 藏不藏、摆哪儿都在
@@ -1595,16 +1583,14 @@ void vidow_view_anim_bake(struct vidow_view *view) {
 	int x = 0, y = 0;
 	/* 摆位那份（view_anim_place）怎么算的，这里就得怎么算：重烘的位置和缩放
 	 * 必须跟场景节点上那套一致，差一个像素就是糊 / 错位。 */
-	if (vidow_mru_place(view, &x, &y, &ov) == VIDOW_MRU_PLACE_NONE) {
-		if (server->overview.t > 0.0 && server->overview.output != NULL &&
-				view->output != server->overview.output) {
-			alpha *= 1.0 - server->overview.t;
-		}
-		double sx_mapped = 0, sy_mapped = 0;
-		vidow_overview_map(server, wx, wy, &sx_mapped, &sy_mapped);
-		x = (int)lround(sx_mapped);
-		y = (int)lround(sy_mapped);
+	if (server->overview.t > 0.0 && server->overview.output != NULL &&
+			view->output != server->overview.output) {
+		alpha *= 1.0 - server->overview.t;
 	}
+	double sx_mapped = 0, sy_mapped = 0;
+	vidow_overview_map(server, wx, wy, &sx_mapped, &sy_mapped);
+	x = (int)lround(sx_mapped);
+	y = (int)lround(sy_mapped);
 
 	if (!view->fx.active || view->scene_surface == NULL) {
 		return;

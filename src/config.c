@@ -777,7 +777,7 @@ static void defaults(struct vidow_config *cfg) {
 	cfg->mru_max_scale = 0.5;
 	cfg->mru_max_height = 480;
 	cfg->mru_min_scale = 0.05;
-	cfg->mru_backdrop_alpha = 0.8;
+	cfg->mru_backdrop_alpha = 0.6;   /* 半透明：桌面还看得见 */
 	/* 卡片样式照 portal 的选择器（深色那套调色板）：底 #2f3336 压一点透明度、
 	 * 描边 #3b4045；强调色默认取 KDE Breeze 蓝 #3daee9 —— 和 portal 用同一个
 	 * 强调色（portal 那边读 kdeglobals，这里没法读，就按默认值来）。 */

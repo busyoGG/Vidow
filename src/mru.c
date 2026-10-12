@@ -219,20 +219,6 @@ bool vidow_mru_showing(const struct vidow_server *server) {
 	return server->mru.shown;
 }
 
-/* 这个窗口现在是不是切换器里的一个预览（要在场、按预览的位置摆）。 */
-bool vidow_mru_holds(const struct vidow_server *server,
-		const struct vidow_view *view) {
-	if (!mru_showing(server)) {
-		return false;
-	}
-	for (int i = 0; i < server->mru.slot_n; i++) {
-		if (server->mru.slot[i].view == view) {
-			return true;
-		}
-	}
-	return false;
-}
-
 /* 预览的缩放：先按「不超过最大缩放」和「不超过最大高度」取小的那个，
  * 再兜一个下限（别缩成看不见的几个像素）。 */
 static double mru_slot_zoom(const struct vidow_config *cfg, int base_w,
@@ -505,8 +491,8 @@ static void mru_layout(struct vidow_server *server) {
 	}
 	mru->slot_n = n_used;
 	/* 滚出去 / 挤出去的那些预览不画：场景是全局坐标，摆在工作区外面的预览
-	 * 会落到隔壁那块屏上。置空 = 这一帧不归切换器管（vidow_mru_place 找不到它
-	 * → 按停车处理），选中的那个由上面的滚动保证在画面里。 */
+	 * 会落到隔壁那块屏上。置空 = 这一项不画（缩略图也不画），选中的那个由上面
+	 * 的滚动保证在画面里。 */
 	for (int i = 0; i < n_used; i++) {
 		struct vidow_mru_slot *slot = &mru->slot[i];
 		struct wlr_box at = { slot->x, slot->y, slot->w, slot->h };
@@ -544,6 +530,7 @@ struct vidow_mru_buf {
 };
 
 struct vidow_mru_card {
+	struct wlr_scene_buffer *thumb;     /* 窗口内容的缩略图（客户端那份 buffer） */
 	struct wlr_scene_buffer *fill_c[4]; /* 四个圆角（底） */
 	struct wlr_scene_rect *fill_e[3];   /* 中 / 左 / 右三条直边 */
 	struct wlr_scene_buffer *ring_c[4]; /* 四个圆角（描边） */
@@ -740,23 +727,25 @@ static struct vidow_mru_card *mru_card_get(struct vidow_server *server, int i) {
 	card->bw = -1;
 	bool ok = true;
 	for (int k = 0; k < 4; k++) {
-		card->fill_c[k] = wlr_scene_buffer_create(
-			server->layer_overview_dim, NULL);
+		card->fill_c[k] = wlr_scene_buffer_create(mru->tree, NULL);
 		ok = ok && card->fill_c[k] != NULL;
 	}
 	for (int k = 0; k < 3; k++) {
-		card->fill_e[k] = wlr_scene_rect_create(server->layer_overview_dim,
-			1, 1, (float[4]){ 0.0f, 0.0f, 0.0f, 0.0f });
+		card->fill_e[k] = wlr_scene_rect_create(mru->tree, 1, 1,
+			(float[4]){ 0.0f, 0.0f, 0.0f, 0.0f });
 		ok = ok && card->fill_e[k] != NULL;
 	}
+	/* 缩略图夹在「底」和「描边」之间：底中间那条大矩形铺满整张卡片，缩略图得
+	 * 压在它上面；描边在最外圈，压不压无所谓，但排最后总没错。 */
+	card->thumb = wlr_scene_buffer_create(mru->tree, NULL);
+	ok = ok && card->thumb != NULL;
 	for (int k = 0; k < 4; k++) {
-		card->ring_c[k] = wlr_scene_buffer_create(
-			server->layer_overview_dim, NULL);
+		card->ring_c[k] = wlr_scene_buffer_create(mru->tree, NULL);
 		ok = ok && card->ring_c[k] != NULL;
 	}
 	for (int k = 0; k < 4; k++) {
-		card->ring_e[k] = wlr_scene_rect_create(server->layer_overview_dim,
-			1, 1, (float[4]){ 0.0f, 0.0f, 0.0f, 0.0f });
+		card->ring_e[k] = wlr_scene_rect_create(mru->tree, 1, 1,
+			(float[4]){ 0.0f, 0.0f, 0.0f, 0.0f });
 		ok = ok && card->ring_e[k] != NULL;
 	}
 	if (!ok) {
@@ -897,11 +886,70 @@ static void mru_card_place(struct vidow_server *server,
 	}
 }
 
+/* 缩略图：把**客户端那份 buffer** 直接摆进预览框里 —— 场景会拿它的纹理画，
+ * 等于「把窗口内容缩小一份」，而窗口本身一动没动（这就是切换器要的效果：面板是
+ * 新内容，原来那块屏照旧）。宽高比按 buffer 自己的算：塞不下就等比缩到框里居中，
+ * 不拉伸（窗口逻辑尺寸和 buffer 尺寸偶尔对不上，别赌）。 */
+static void mru_card_thumb(struct vidow_mru_card *card,
+		const struct vidow_view *view, const struct wlr_box *box) {
+	if (card->thumb == NULL) {
+		return;
+	}
+	struct wlr_scene_buffer *src = view->scene_surface != NULL ?
+		view->scene_surface->buffer : NULL;
+	struct wlr_buffer *buf = src != NULL ? src->buffer : NULL;
+	if (buf == NULL || box->width <= 0 || box->height <= 0 ||
+			buf->width <= 0 || buf->height <= 0) {
+		/* 还没上屏 / 客户端刚把 buffer 收走：留着卡片底，这一帧不画缩略图。 */
+		wlr_scene_buffer_set_buffer(card->thumb, NULL);
+		wlr_scene_node_set_enabled(&card->thumb->node, false);
+		return;
+	}
+	/* 只取「可见窗口」那一块：自己画装饰的客户端（GTK）会把表面做大一圈画阴影，
+	 * 那圈留白不要 —— 取法跟装饰着色器一致（归一化坐标 × buffer 尺寸）。全 0 =
+	 * 没算（X11 整块就是内容），那就整块铺。 */
+	struct vidow_fx_geo geo = vidow_view_fx_geo(view);
+	struct wlr_fbox crop = {
+		.x = geo.tex_u0 * (double)buf->width,
+		.y = geo.tex_v0 * (double)buf->height,
+		.width = geo.tex_du * (double)buf->width,
+		.height = geo.tex_dv * (double)buf->height,
+	};
+	bool cropped = crop.width >= 1.0 && crop.height >= 1.0;
+	double ar = cropped ? crop.width / crop.height :
+		(double)buf->width / (double)buf->height;
+	int tw = box->width, th = (int)lround((double)box->width / ar);
+	if (th > box->height) {
+		th = box->height;
+		tw = (int)lround((double)box->height * ar);
+	}
+	if (tw < 1) {
+		tw = 1;
+	}
+	if (th < 1) {
+		th = 1;
+	}
+	/* buffer 一样就别再 set 一次（set 会把缓存的纹理丢掉重新来）。 */
+	if (card->thumb->buffer != buf) {
+		wlr_scene_buffer_set_buffer(card->thumb, buf);
+	}
+	/* 注意：别抄场景节点自己的 src_box —— 那里面还含着「窗口被裁到屏里」那块
+	 * （列排到屏外的窗口只剩一条），缩略图要的是整扇窗口。 */
+	wlr_scene_buffer_set_source_box(card->thumb, cropped ? &crop : NULL);
+	wlr_scene_buffer_set_dest_size(card->thumb, tw, th);
+	wlr_scene_node_set_position(&card->thumb->node, box->x + (box->width - tw) / 2,
+		box->y + (box->height - th) / 2);
+	wlr_scene_node_set_enabled(&card->thumb->node, true);
+}
+
 /* 收起一张卡片。free_buf = true 连圆角那张图一起放掉（面板关了就别占着内存，
  * 下次显形重画 —— 一次重画就是几张小图，量可以忽略）。 */
 static void mru_card_hide(struct vidow_mru_card *card, bool free_buf) {
 	if (card == NULL) {
 		return;
+	}
+	if (card->thumb != NULL) {
+		wlr_scene_node_set_enabled(&card->thumb->node, false);
 	}
 	for (int k = 0; k < 4; k++) {
 		if (card->fill_c[k] != NULL) {
@@ -923,6 +971,10 @@ static void mru_card_hide(struct vidow_mru_card *card, bool free_buf) {
 	}
 	if (!free_buf) {
 		return;
+	}
+	if (card->thumb != NULL) {
+		/* 缩略图那份 buffer 是客户端的，不是我们的：只是不再引用它。 */
+		wlr_scene_buffer_set_buffer(card->thumb, NULL);
 	}
 	for (int k = 0; k < 4; k++) {
 		if (card->fill_c[k] != NULL) {
@@ -1034,6 +1086,8 @@ static void mru_scene_apply(struct vidow_server *server) {
 		mru_card_style(server, slot->view, fill, ring, &bw);
 		struct wlr_box at = { slot->cx, slot->cy, slot->cw, slot->ch };
 		mru_card_place(server, card, &at, fill, ring, bw);
+		struct wlr_box thumb = { slot->x, slot->y, slot->w, slot->h };
+		mru_card_thumb(card, slot->view, &thumb);
 	}
 	/* 上一轮排了、这一轮没排到的（窗口少了 / 清单短了）也收起来。 */
 	for (int i = mru->slot_n; i < mru->card_n; i++) {
@@ -1043,17 +1097,14 @@ static void mru_scene_apply(struct vidow_server *server) {
 	}
 }
 
-/* 清单 / 选中项变了：重排 + 重画 + 把所有窗口按新位置摆一遍。 */
+/* 清单 / 选中项变了：重排 + 重画自己那一层（窗口不动，所以不用碰 view）。 */
 static void mru_refresh(struct vidow_server *server) {
 	struct vidow_mru *mru = &server->mru;
 	if (mru->n > 0) {
 		mru_layout(server);
 	}
 	mru_scene_apply(server);
-	struct vidow_view *view;
-	wl_list_for_each(view, &server->views, link) {
-		vidow_view_apply_anim(view);
-	}
+	/* 窗口一个都不动：切换器是浮层，只管自己那层（见 mru_scene_apply）。 */
 	vidow_backdrop_damage(server, false);
 }
 
@@ -1225,11 +1276,6 @@ static void mru_close(struct vidow_server *server, bool commit) {
 		wl_event_source_timer_update(mru->open_timer, 0);
 	}
 	mru_scene_apply(server);
-	struct vidow_view *view;
-	wl_list_for_each(view, &server->views, link) {
-		vidow_view_apply_anim(view);
-	}
-	vidow_workspace_apply_visibility(server);
 	vidow_backdrop_damage(server, false);
 	if (target != NULL && target->mapped && !target->minimized) {
 		/* 明确选中 = 明确使用：直接落账，不等 debounce。 */
@@ -1311,27 +1357,6 @@ bool vidow_mru_click(struct vidow_server *server, double sx, double sy) {
 	return true;
 }
 
-/* --------------------------------------------------------- 给渲染用 */
-
-enum vidow_mru_place vidow_mru_place(const struct vidow_view *view, int *x,
-		int *y, double *zoom) {
-	struct vidow_server *server = view->server;
-	if (!mru_showing(server)) {
-		return VIDOW_MRU_PLACE_NONE;
-	}
-	for (int i = 0; i < server->mru.slot_n; i++) {
-		const struct vidow_mru_slot *slot = &server->mru.slot[i];
-		if (slot->view != view) {
-			continue;
-		}
-		*x = slot->x;
-		*y = slot->y;
-		*zoom = slot->zoom;
-		return VIDOW_MRU_PLACE_PREVIEW;
-	}
-	return VIDOW_MRU_PLACE_HIDE;
-}
-
 /* 配置改了 / 屏幕变了：清单还在就重排一遍。 */
 void vidow_mru_update(struct vidow_server *server) {
 	struct vidow_mru *mru = &server->mru;
@@ -1370,10 +1395,14 @@ bool vidow_mru_init(struct vidow_server *server) {
 	if (mru->timer == NULL || mru->open_timer == NULL) {
 		return false;
 	}
-	/* 面板的东西跟 overview 的遮罩挤同一层（壁纸之上、窗口之下）：压暗背景和每项
-	 * 背后那张卡片都得在窗口**下面**才看得见（窗口压在卡片上，卡片只露出四周那
-	 * 圈内边距）。 */
-	mru->backdrop = wlr_scene_rect_create(server->layer_overview_dim, 1, 1,
+	/* 切换器是**浮层**：它不改窗口的排版、不搬窗口、不缩放窗口（niri 的窗口切换
+	 * 器也是这样 —— 面板是新内容，原来那块屏照旧）。所以面板得有自己的、压在窗口
+	 * 之上的一层：场景树按创建顺序叠（先建的在下），这里是最后建的，就在最上面。 */
+	mru->tree = wlr_scene_tree_create(&server->scene->tree);
+	if (mru->tree == NULL) {
+		return false;
+	}
+	mru->backdrop = wlr_scene_rect_create(mru->tree, 1, 1,
 		(float[4]){ 0.0f, 0.0f, 0.0f, 0.0f });
 	if (mru->backdrop == NULL) {
 		return false;

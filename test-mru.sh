@@ -18,6 +18,8 @@
 #  11) 鼠标悬停：点亮指针底下那一张，**选中项不动**；挪到空白处悬停清掉
 #  12) 鼠标点击：点哪张卡片就切到哪个窗口（不用等松修饰键），面板当场收起，
 #      松手被吃掉（没漏给客户端）
+#  13) 浮层：切换器**不动窗口** —— 面板开着期间每个窗口的位置/尺寸一字不变；
+#      卡片里画的是窗口内容（缩略图，全亮），桌面那层被压暗（面板浮在窗口之上）
 set -u
 cd "$(dirname "$0")"
 
@@ -113,6 +115,24 @@ print(b['x'], b['y'], b['width'], b['height'])
 # IPC 注入（鼠标那条路和真设备同一条：move-cursor / pointer-button）
 msg() { ./build/vidowmsg --raw "$@" >/dev/null 2>&1; }
 # 截图里 (x, y) 那一点的颜色，打 "R G B"
+win_geo() { ./build/vidowmsg --raw windows 2>/dev/null | python3 -c "
+import json,sys
+d=json.load(sys.stdin)['result']
+for w in d:
+    if w.get('popup'):
+        continue
+    g = w.get('geometry') or {}
+    print(w.get('title'), g.get('x'), g.get('y'), g.get('width'), g.get('height'))
+" 2>/dev/null; }
+# 截图里 (x, y) 那一点的亮度（三个通道之和）
+pix_sum() { # pix_sum <png> <x> <y>
+	python3 - "$1" "$2" "$3" <<'PY'
+import sys
+from PIL import Image
+im = Image.open(sys.argv[1]).convert("RGB")
+print(sum(im.getpixel((int(sys.argv[2]), int(sys.argv[3])))))
+PY
+}
 pix() { # pix <png> <x> <y>
 	python3 - "$1" "$2" "$3" <<'PY'
 import sys
@@ -164,6 +184,7 @@ recent=$(mq '" ".join(e["title"] for e in d["recent"])')
 mark "2) 按住 Alt + Tab：面板显形、焦点先不动"
 before_png="$RUNDIR/before.png"
 grim "$before_png" >/dev/null 2>&1
+before_geo=$(win_geo)
 hold_tabs 1 2500
 sleep 0.7
 showing=$(mq 'd["showing"]')
@@ -176,6 +197,14 @@ slots=$(mq 'd["slots"]')
 [ "$(focused_title)" = "p5" ] && pass "焦点还没动（还是 p5）" \
 	|| fail "焦点已经动了：$(focused_title)"
 grep -aq "mru: 面板显形" "$LOG" && pass "日志：面板显形" || fail "日志里没有「面板显形」"
+
+# 浮层：面板开着的时候窗口一个都没动（不搬、不缩、不藏）
+during_geo=$(win_geo)
+if [ -n "$before_geo" ] && [ "$before_geo" = "$during_geo" ]; then
+	pass "窗口一个都没动（浮层，不是把窗口摆进预览里）"
+else
+	fail "窗口被动了：$(diff <(echo "$before_geo") <(echo "$during_geo") | head -4)"
+fi
 
 # 选中的是「当前窗口的下一个」（p4）
 sel_title=$(mq 'next((e["title"] for e in d["entries"] if e["selected"]), "(无)")')
@@ -252,6 +281,29 @@ if [ $? -ne 0 ]; then
 	pass "角尖是切掉的（$sel_tip 既不是描边也不是底）"
 else
 	fail "角尖没切：$sel_tip 像描边或底，说明圆角是方的"
+fi
+
+# 缩略图：卡片里那块画的是**窗口内容**（面板自己画一份缩小版），而且没被压暗层盖
+# 住（压暗层在卡片下面）。取左上象限那一点：四象限窗口的左上是红的。
+read -r t1_x t1_y t1_w t1_h <<<"$(mj "next((e['x'], e['y'], e['w'], e['h']) for e in d['entries'] if e['selected'])")"
+t1_px=$(pix "$RUNDIR/during.png" $((t1_x + t1_w / 4)) $((t1_y + t1_h * 2 / 5)))
+read -r t1_r t1_g t1_b <<<"$t1_px"
+if [ "$t1_r" -ge 200 ] || [ "$t1_g" -ge 200 ] || [ "$t1_b" -ge 200 ]; then
+	pass "卡片里画的是窗口内容、而且是全亮的（$t1_px）"
+else
+	fail "卡片里没有缩略图 / 被压暗了（$t1_px，期望窗口那种纯色）"
+fi
+
+# 面板浮在窗口之上：卡片底下那些窗口被压暗层盖住了 —— 拿「窗口自己那块地儿、又在
+# 面板外面」的一点量（工作区底边那条：卡片是竖着居中的，底下留着空）。
+dim_x=$((wx + 30))
+dim_y=$((wy + wh - 8))
+b_sum=$(pix_sum "$before_png" "$dim_x" "$dim_y")
+d_sum=$(pix_sum "$RUNDIR/during.png" "$dim_x" "$dim_y")
+if [ "$b_sum" -gt 200 ] && [ "$d_sum" -lt $((b_sum * 7 / 10)) ]; then
+	pass "窗口那块被压暗了（$b_sum -> $d_sum，面板压在窗口之上）"
+else
+	fail "窗口没被压暗（$b_sum -> $d_sum，量的是 $dim_x,$dim_y）—— 面板可能跑到窗口下面去了"
 fi
 
 # ---------------------------------------------------------------- 松开提交

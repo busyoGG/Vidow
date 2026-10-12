@@ -1131,6 +1131,7 @@ void vidow_ipc_json_mru(struct jbuf *b, struct vidow_server *server) {
 		jb_kv_str(b, "app_id", vidow_view_app_id(slot->view));
 		jb_kv_bool(b, "selected", slot->view == mru->selected);
 		jb_kv_bool(b, "hover", slot->view == mru->hover);
+		/* 缩略图摆在哪（= 卡片里缩进内边距那块）。 */
 		jb_kv_int(b, "x", slot->x);
 		jb_kv_int(b, "y", slot->y);
 		jb_kv_int(b, "w", slot->w);
