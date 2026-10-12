@@ -11,7 +11,10 @@
 #   修之后：每帧 2 次重建 / 2 遍链条 / **贴图 +0 -0**（金字塔缓冲复用，贴图跟着复用）
 #
 # 判据（VIDOW_RENDER_STATS=1 打的那行「渲染统计」，只看拖拽期间那几行）：
-#   1) 拖拽期间真的在重建私有底衬（own ≥ 10）—— 不然说明没复现「重叠」这个前提
+#   1) 拖拽期间真的在重建私有底衬（own ≥ 10）—— 不然说明没复现「重叠」这个前提。
+#      两个窗口都得是半透明的：不透明的窗口现在不算模糊（content.a == 1 的地方模糊
+#      被乘成 0，看不出来），vidow 不再为它抓私有底衬 —— 实测同样这条拖拽，底下换回
+#      不透明的 pattern.py 之后 own 从 104 掉到 3（那次是真没活干，不是漏抓）。
 #   2) 拖拽期间贴图导入次数为 0 —— 这是这条测试要守的东西
 #   3) 重建次数 / 指针步数 < 1.5 —— 只有「它底下那个窗口」该重建；被拖的窗口自己
 #      每步都重抓就是白工（实测：修前 2.23 次/步，修后 0.52）。步长用 20ms 是为了让
@@ -116,7 +119,11 @@ print(next((w["floating"] for w in json.load(sys.stdin) if w["title"] == sys.arg
 	sleep 0.6
 }
 
-setsid nohup python3 ./tools/pattern.py wback > "$RUNDIR/pat.log" 2>&1 </dev/null &
+# 底下那个窗口必须是**半透明**的：不透明的窗口（pattern.py 那种）现在根本不算模糊
+# —— 装饰着色器里 content.a == 1 的地方模糊被乘成 0，一个像素都透不出来，vidow 直接
+# 跳过它那趟（见 fx.c 的 view_blur_visible）。拿它当「重叠」的靶子的话，这趟拖拽里
+# 一条私有底衬都不会重建，前提判据就废了。
+setsid nohup python3 ./tools/sheet.py wback 0.2 0.25 0.3 0.9 > "$RUNDIR/pat.log" 2>&1 </dev/null &
 CLIENTS="$CLIENTS $!"
 sleep 1.6
 float_at wback 200 150 600 500

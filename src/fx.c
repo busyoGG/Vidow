@@ -1621,6 +1621,31 @@ static bool backdrop_render(struct vidow_server *server,
 	return wlr_render_pass_submit(pass);
 }
 
+/* 窗口的内容是不是**整块不透明**。两种确定的情形：
+ *   1. 格式里没 alpha（XRGB / RGBX）：每个像素的 alpha 都是 1；
+ *   2. 客户端声明了盖住可见窗口那一块的 opaque region（GTK / Qt 那套）：opaque
+ *      region 就是「这里 alpha == 1」的承诺，坐标是表面局部（wlroots 在
+ *      types/scene/surface.c 里按表面尺寸设的），所以拿窗口在表面里的那块比。
+ * 两个地方要问这个：直通（vidow_view_scanout_ok —— 底下画什么一个像素都透不出来）
+ * 和模糊（view_blur_visible —— 模糊被 content.a 乘成 0）。 */
+static bool view_content_opaque(struct vidow_view *view,
+		const struct vidow_fx_geo *geo) {
+	struct wlr_scene_buffer *src = view->scene_surface != NULL ?
+		view->scene_surface->buffer : NULL;
+	if (src == NULL || src->buffer == NULL) {
+		return false;
+	}
+	if (wlr_buffer_is_opaque(src->buffer)) {
+		return true;
+	}
+	pixman_box32_t want = {
+		.x1 = geo->off_x, .y1 = geo->off_y,
+		.x2 = geo->off_x + geo->w, .y2 = geo->off_y + geo->h,
+	};
+	return pixman_region32_contains_rectangle(&src->opaque_region, &want) ==
+		PIXMAN_REGION_IN;
+}
+
 /* A window only needs blur when something can show through it. Floating
  * windows always can; tiled ones only when blur_all is set, because their
  * backdrop is the wallpaper and the layer surfaces. */
@@ -1649,10 +1674,55 @@ static bool view_wants_blur_ever(struct vidow_view *view) {
 	return view->fx.blur_region_on;
 }
 
+/* 这笔模糊看得见吗 —— 看不见就别算（整屏 Kawase 金字塔 + 私有底衬抓取 +
+ * 「底衬版本变了就重烘这个窗口」全是白花的钱）。
+ *
+ * 装饰着色器最后两句是 out_px = content + out_px * (1 - content.a)，而模糊那一项
+ * 还乘着 inside 和 step(u_mask_min, elem_a)：**内容不透明的地方（content.a == 1）
+ * 模糊被乘成 0，内容全透明的地方又被剔除**（模糊只画在元素真有内容的地方）。所以
+ * 模糊只在**内容半透明**的窗口上看得见 —— 终端背景 0.8、播放器控制条、半透明
+ * 圆角窗口那些才是真的要看模糊的。
+ *
+ * 判据保守：**拿不准就当看得见**（照旧算模糊，行为不变）。判成看不见的只有
+ * view_content_opaque() 那两种确定情形（XRGB/RGBX，或整块 opaque region）—— 它们
+ * 保证窗口里每个像素 alpha == 1。客户端只声明了部分 opaque region 的（圆角窗口
+ * 四个角、CSD 阴影留白）照旧算模糊：那几处其实也是全透明、模糊照样被剔掉，但不读
+ * 像素就没法确认，不值得为它冒险。 */
+static bool view_blur_visible(struct vidow_view *view) {
+	/* 形状被改过（果冻网格）/ 抓图正压着：看不清内容是不是不透明。 */
+	if (view->jelly != NULL || view->mask_opacity) {
+		return true;
+	}
+	/* 自定义 shader（开 / 关 / idle）可能把内容画淡，装饰也归它画。 */
+	if (view->fx.shader != NULL) {
+		return true;
+	}
+	/* 动画期间内容是快照 / 被缩放，alpha 也未必是 1。 */
+	if (view->anim_open != NULL || view->anim_move != NULL) {
+		return true;
+	}
+	if (view->anim_alpha < 1.0) {
+		return true;
+	}
+	struct vidow_look look;
+	vidow_view_look(&view->server->config, &view->rule_eff, view->fullscreen,
+		&look);
+	/* 整个窗口被画淡了（window_opacity）：模糊从里面透出来。 */
+	if (look.opacity < 1.0) {
+		return true;
+	}
+	if (view->scene_surface == NULL || view->scene_surface->buffer == NULL) {
+		return true;
+	}
+	struct vidow_fx_geo geo = vidow_view_fx_geo(view);
+	return !view_content_opaque(view, &geo);
+}
+
 /* 这个窗口现在要不要采样模糊底衬。上面那份不看 fx 开没开 —— 全屏直通的判据要在
  * 「fx 已经被收掉」的时候也能问出答案（见 vidow_view_scanout_ok），所以分开。 */
 static bool view_wants_blur(struct vidow_view *view) {
-	return view->fx.active && view_wants_blur_ever(view);
+	return view->fx.active && view_wants_blur_ever(view) &&
+		view_blur_visible(view);
 }
 
 /* VIDOW_NO_SCANOUT=1：一律走合成那条路（探针，见 vidow_view_scanout_ok）。 */
@@ -1762,14 +1832,7 @@ bool vidow_view_scanout_ok(struct vidow_view *view) {
 	 * 或者客户端自己声明了盖住整块表面的 opaque region（GTK 那套：格式带 alpha，
 	 * 但声明整块不透明）。后者 wlroots 判「这个节点盖住了下面的东西」用的也是它
 	 * （见 wlr_scene.c 的 scene_node_opaque_region）—— 它不认，直通也轮不到。 */
-	if (!wlr_buffer_is_opaque(src->buffer)) {
-		pixman_box32_t want = { .x1 = 0, .y1 = 0, .x2 = geo.w, .y2 = geo.h };
-		if (pixman_region32_contains_rectangle(&src->opaque_region,
-				&want) != PIXMAN_REGION_IN) {
-			return false;
-		}
-	}
-	return true;
+	return view_content_opaque(view, &geo);
 }
 
 /* Hide/show a toplevel for a backdrop capture. A decorated window is drawn
