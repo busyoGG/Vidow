@@ -1624,13 +1624,13 @@ static bool backdrop_render(struct vidow_server *server,
 /* A window only needs blur when something can show through it. Floating
  * windows always can; tiled ones only when blur_all is set, because their
  * backdrop is the wallpaper and the layer surfaces. */
-static bool view_wants_blur(struct vidow_view *view) {
+static bool view_wants_blur_ever(struct vidow_view *view) {
 	struct vidow_look look;
 	vidow_view_look(&view->server->config, &view->rule_eff, view->fullscreen,
 		&look);
 	/* blur 那条规则在这里生效：false = 这个窗口背后不模糊（视频、终端那种
 	 * 「糊了更难看」的），true = 平铺也模糊（等于给这一个窗口开 blur_all）。 */
-	if (!look.blur || !view->mapped || !view->fx.active) {
+	if (!look.blur || !view->mapped) {
 		return false;
 	}
 	/* overview 里不采样背景模糊：UV 是按窗口自己的位置算的，窗口缩小之后对不上。
@@ -1647,6 +1647,129 @@ static bool view_wants_blur(struct vidow_view *view) {
 	}
 	/* 客户端自己开口要的（ext-background-effect），blur_all 关着也得给 */
 	return view->fx.blur_region_on;
+}
+
+/* 这个窗口现在要不要采样模糊底衬。上面那份不看 fx 开没开 —— 全屏直通的判据要在
+ * 「fx 已经被收掉」的时候也能问出答案（见 vidow_view_scanout_ok），所以分开。 */
+static bool view_wants_blur(struct vidow_view *view) {
+	return view->fx.active && view_wants_blur_ever(view);
+}
+
+/* VIDOW_NO_SCANOUT=1：一律走合成那条路（探针，见 vidow_view_scanout_ok）。 */
+static bool scanout_off(void) {
+	static int off = -1;
+	if (off < 0) {
+		off = getenv("VIDOW_NO_SCANOUT") != NULL ? 1 : 0;
+	}
+	return off == 1;
+}
+
+/* 这个窗口这一帧能不能「直通」：屏幕上该显示的像素就是客户端缓冲自己 —— 全屏、
+ * 装饰参数全零、内容整块不透明、没有动画 / 果冻 / 遮罩、没有裁剪。满足的话 view.c 就
+ * 把装饰节点收起来（不烘那一趟离屏渲染），场景里只剩客户端表面这一个节点，
+ * wlroots 的 scene 就有机会把它的缓冲直接扫上屏（见 wlr_scene.c 的
+ * scene_entry_try_direct_scanout：要求这一帧的 render list 正好一项、且它是
+ * 盖住整块输出的 buffer）。
+ *
+ * **判据宁严不宽**：漏判只是没省下那两笔 GPU（每帧一次整屏离屏渲染 + 一次输出
+ * 合成），误判会让画面变样 —— 装饰、模糊、CSD 留白、半透明、动画里任何一项在
+ * 直通下都会露出来（合成那条路把它们画进了离屏缓冲，直通扫的是原始缓冲）。
+ *
+ * 切换本身是无感的：判据成立时「合成出来的像素」和「客户端缓冲本身」一样，
+ * 所以进出直通两个方向都看不出变化（细节见 view.c 的 view_scanout_switch）。 */
+bool vidow_view_scanout_ok(struct vidow_view *view) {
+	if (view == NULL || !view->mapped || view->popup) {
+		return false;
+	}
+	/* 关掉直通的开关（和 VIDOW_RENDER_STATS 一样的探针）：怀疑「全屏画面和
+	 * 以前不一样」时先拿它排除直通这条路 —— 两个方向应该一个像素都不差。 */
+	if (scanout_off()) {
+		return false;
+	}
+	/* 只做全屏：只有它铺满整块输出（wlroots 要求节点的框正好等于输出框）。 */
+	if (!view->fullscreen || view->scene_parked) {
+		return false;
+	}
+	/* 全景里窗口是被缩小的（ov 那个系数写在 view_anim_place 的缩放里，而那条路
+	 * 挂在 fx.active 上）—— 直通里没人给它缩放，全屏窗口会以原尺寸糊在全景上。 */
+	if (vidow_overview_active(view->server)) {
+		return false;
+	}
+	if (view->scene_tree == NULL || view->scene_surface == NULL) {
+		return false;
+	}
+	struct wlr_scene_buffer *src = view->scene_surface->buffer;
+	if (src == NULL || src->buffer == NULL) {
+		return false;
+	}
+	/* 动画 / 果冻 / 遮罩期间内容不是「缓冲自己」，得走合成那条路。 */
+	if (view->anim_open != NULL || view->anim_move != NULL ||
+			view->jelly != NULL || view->mask_opacity) {
+		return false;
+	}
+	if (view->anim_alpha < 1.0 || view->anim_scale != 1.0) {
+		return false;
+	}
+	if (view->fx.shader != NULL) {
+		return false;
+	}
+	/* 裁过（跨屏那一半 / overview 里缩放）：直通没法裁，画面会画到隔壁屏上。 */
+	if (view->fx.clip_on) {
+		return false;
+	}
+	struct vidow_look look;
+	vidow_view_look(&view->server->config, &view->rule_eff, view->fullscreen,
+		&look);
+	if (look.corner_radius > 0.0 || look.border_width > 0.0 ||
+			look.shadow_radius > 0.0 || look.noise > 0.0) {
+		return false;
+	}
+	if (look.opacity < 1.0) {
+		return false;
+	}
+	/* 客户端自己画装饰（GTK 那套 CSD 阴影）时表面比窗口大一圈：合成那条路按
+	 * 窗口几何裁掉留白，直通扫的是整块缓冲 —— 那圈留白会露出来。 */
+	struct vidow_fx_geo geo = vidow_view_fx_geo(view);
+	if (geo.off_x != 0 || geo.off_y != 0) {
+		return false;
+	}
+	if (geo.w != geo.src_w || geo.h != geo.src_h) {
+		return false;
+	}
+	/* 缓冲的设备像素得和这块输出对上（1:1 上屏）。客户端没吃下输出缩放（1x 的
+	 * 客户端放在 2x 屏上）时，合成那条路是**着色器**把 1x 贴图放大到 2x、直通
+	 * 那条路是**场景**自己放大 —— 两条路的采样未必一模一样，这一步不省。 */
+	struct wlr_output *out = view->output;
+	if (out == NULL) {
+		return false;
+	}
+	int ow = out->width, oh = out->height;
+	if (out->transform % 2 == 1) {
+		int t = ow;   /* 90 / 270：长宽对调 */
+		ow = oh;
+		oh = t;
+	}
+	if (src->buffer->width != ow || src->buffer->height != oh) {
+		return false;
+	}
+	/* 内容得**整块不透明**：全屏窗口盖住整块屏，只有内容真的不透明，底衬和模糊
+	 * 才一个像素都透不出来 —— 合成那条路也只是拿 content 盖住它（装饰着色器里
+	 * content.a == 1 时 blurred 那一项被乘成 0），所以直通少了模糊那一趟也看不
+	 * 出差别。默认配置 blur_all 开着（平铺窗口也糊壁纸），全屏窗口照样被算成
+	 * 「要模糊」，可那笔模糊一个像素都透不出来，为它留着合成不值。
+	 *
+	 * 两种「不透明」：格式里就没 alpha（XRGB / RGBX，播放器和游戏的常规选择），
+	 * 或者客户端自己声明了盖住整块表面的 opaque region（GTK 那套：格式带 alpha，
+	 * 但声明整块不透明）。后者 wlroots 判「这个节点盖住了下面的东西」用的也是它
+	 * （见 wlr_scene.c 的 scene_node_opaque_region）—— 它不认，直通也轮不到。 */
+	if (!wlr_buffer_is_opaque(src->buffer)) {
+		pixman_box32_t want = { .x1 = 0, .y1 = 0, .x2 = geo.w, .y2 = geo.h };
+		if (pixman_region32_contains_rectangle(&src->opaque_region,
+				&want) != PIXMAN_REGION_IN) {
+			return false;
+		}
+	}
+	return true;
 }
 
 /* Hide/show a toplevel for a backdrop capture. A decorated window is drawn

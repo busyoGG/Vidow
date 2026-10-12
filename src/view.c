@@ -1565,6 +1565,50 @@ void vidow_view_apply_anim_place(struct vidow_view *view) {
 	view_anim_place(view);
 }
 
+/* 全屏直通：这一帧这个窗口能不能整块交给场景直画（不烘装饰那趟离屏渲染），让
+ * wlroots 有机会把客户端的缓冲直接扫上屏（判据见 fx.c 的 vidow_view_scanout_ok，
+ * wlroots 那一侧的要求见 wlr_scene.c 的 scene_entry_try_direct_scanout）。
+ *
+ * 返回 true = 这一帧按直通处理，调用方什么都不用做了。
+ *
+ * 为什么来回切换看不出变化：判据成立的时候「合成出来的像素」就是「客户端缓冲
+ * 本身」（装饰参数全零、内容整块不透明、不裁），所以
+ *   * 进直通：先把真实表面露出来 —— 内容一样，装饰节点这一帧还盖在上面，看不出
+ *     变化；同一帧把装饰节点收掉。
+ *   * 退直通：先把装饰那条路接回来，下面照常烘一帧，**烘成了才**把表面藏起来
+ *     （见函数尾那句 set_opacity），中间没有任何一帧是空的。
+ * 两个方向都会让场景节点自己报损伤（改透明度 / 开关节点都算整块），全屏窗口那
+ * 一块就是整块输出 —— 屏幕上不会留下上一帧的残影（那是「跳一下」的来源）。 */
+static bool view_scanout_switch(struct vidow_view *view) {
+	bool ok = vidow_view_scanout_ok(view);
+	if (ok == view->fx.scanout) {
+		return ok;
+	}
+	view->fx.scanout = ok;
+	if (ok) {
+		if (view->scene_surface != NULL &&
+				view->scene_surface->buffer != NULL) {
+			wlr_scene_buffer_set_opacity(view->scene_surface->buffer, 1.0f);
+		}
+		vidow_fx_end(view->server, &view->fx);
+		wlr_log(WLR_INFO, "scanout: %s 交给场景直画（全屏 + 装饰全零）",
+			vidow_view_title(view) != NULL ? vidow_view_title(view) : "?");
+	} else {
+		/* 装饰那条路接回来：和 view_open_done / view_swap_decor 一个套路 ——
+		 * 装饰开着就重建 fx 节点（自定义的 idle shader 再挂上）。 */
+		struct vidow_config *cfg = &view->server->config;
+		if (vidow_fx_begin(view->server, &view->fx, view->scene_tree, NULL) &&
+				cfg->shader_idle[0] != '\0') {
+			vidow_fx_set_shader(view->server, &view->fx, cfg->shader_idle,
+				VIDOW_SHADER_IDLE);
+			view->fx.progress = 1.0;
+		}
+		wlr_log(WLR_INFO, "scanout: %s 回到合成（装饰 / 模糊 / 动画又要了）",
+			vidow_view_title(view) != NULL ? vidow_view_title(view) : "?");
+	}
+	return ok;
+}
+
 /* 重烘这个窗口的装饰图（含底衬采样）。贵，一帧一次。位置先用 view_anim_place
  * 摆好；这里把同一套位置参数再算一遍（几个整数，跟重烘比起来不算什么）。 */
 void vidow_view_anim_bake(struct vidow_view *view) {
@@ -1575,6 +1619,10 @@ void vidow_view_anim_bake(struct vidow_view *view) {
 	 * 把裁剪算进场景节点里，烘完再改就晚了一帧 —— 那一帧里越界的那一块照样
 	 * 画在隔壁屏上（而且静止下来之后再也没有下一帧来纠正）。 */
 	vidow_view_apply_clip(view);
+	/* 直通那一路：不烘，整块交给场景（见上）。 */
+	if (view_scanout_switch(view)) {
+		return;
+	}
 	int wx = view->geom.x + (int)lround(view->anim_off_x);
 	int wy = view->geom.y + (int)lround(view->anim_off_y);
 	struct vidow_server *server = view->server;

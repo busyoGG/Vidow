@@ -919,6 +919,7 @@ VIDOW_TEST_RENDERER=gles2 ./test-screencast.sh
 ./test-floatstack.sh                 # 层级：浮窗永远压平铺、点浮窗换层级（全 headless + grim 逐像素，12 项断言）
 ./test-fullscreen-scroll.sh          # 全屏占**整块屏**（不吃 gap）+ 参与滚动：滑出去 / 隔壁列并排 / 整块滚出屏藏起 / 退全屏列宽回来（全 headless + grim 逐像素，24 项断言）
 ./test-fullscreen-2out.sh            # 同上，但在**混合 DPI 两块屏**上：全屏占自己那块整屏（2 倍屏上就是整个 4K）、越界那半块不画到隔壁屏（全 headless + grim 逐像素，16 项断言）
+./test-scanout.sh                    # 全屏直通：默认配置下真的扫上屏 / 退全屏回到合成 / 切换全程窗口不消失 / 直通与合成两条路内圈逐像素一样（全 headless + grim 逐像素，11 项断言）
 ./test-mixdpi.sh                     # 跨屏拖窗口：拖着的那段就按对面那块屏的倍率烘（全 headless，7 项断言）
 ./test-vt.sh                         # tty 的 VT 切换（Ctrl+Alt+F1..F12 / switch-vt 动作）（全 headless，11 项断言）
 ./test-focus.sh                      # 焦点规则 + 激活请求（全 headless，60 项断言）
@@ -995,6 +996,7 @@ WLR_BACKENDS=headless WLR_HEADLESS_OUTPUTS=1 WLR_LIBINPUT_NO_DEVICES=1 ./build/v
 | 变量 | 作用 |
 | --- | --- |
 | `VIDOW_LOG` | `info`（默认）/ `debug` / `error` |
+| `VIDOW_NO_SCANOUT` | 关掉全屏直通（一律走合成那条路）。排查「全屏画面和以前不一样」时先拿它排除直通，见 `./test-scanout.sh` |
 | `VIDOW_TERMINAL` | `Super+Enter` 启动的命令，默认 `kitty` |
 | `VIDOW_BLUR_DUMP=N` | 前 N 份底衬 / 模糊图 / layer 区域抓取 dump 成 `/tmp/vidow-{bd,blur,lbd,lblur}-*`（裸 ARGB，测试用）。`bd`/`blur` 是**被抓的那块区域**那么大（重叠窗口抓的是「窗口 ± 模糊半径」那块，不是整屏；layer 那条路一直是区域大小），每份配一个同名 `.txt` 写宽高 |
 | `VIDOW_FX_DUMP=N` | 前 N 份装饰离屏缓冲 dump 成 `/tmp/vidow-fx-*` |
@@ -2556,6 +2558,48 @@ GTK 在我这儿走 shm，所以看不出问题 —— 用户报的正是「只�
 代价：GTK3 窗口连**标题栏一起**收回去，只剩 vidow 的边框（半屏 / 关闭走快捷键）。这个键
 只对**之后**才连上的客户端彻底生效 —— KDE 老协议的默认模式是客户端绑定的时候发一次的
 事件，已经在跑的窗口要重启客户端，和 niri 的 `prefer-no-csd` 一样。
+
+## 全屏直通（direct scanout）
+
+全屏窗口只要**不需要装饰**，vidow 就不烘那趟离屏渲染，把它整块交给场景 —— 场景里只剩
+客户端表面这一个节点，wlroots 才有机会把客户端的缓冲**直接扫上屏**（`wlr_scene.c` 的
+`scene_entry_try_direct_scanout` 要求这一帧的 render list 正好一项、且它是盖住整块输出的
+buffer）。省掉的是每帧「一次整屏离屏渲染 + 一次输出合成」：全屏看视频 / 打游戏是白拿的
+帧率，4K 全屏还少一趟 GPU 带宽。
+
+判据在 `src/fx.c` 的 `vidow_view_scanout_ok`，**宁严不宽** —— 漏判只是没省下那两笔，
+误判会让画面变样：
+
+| 条件 | 为什么 |
+| --- | --- |
+| 全屏、已 map、不是弹出物、没被 park、不在 overview 里 | 只有全屏铺满整块输出（wlroots 要求节点的框正好等于输出框）；overview 里窗口是缩小的，那笔缩放在合成那条路上 |
+| 表面节点有缓冲，且**整块不透明** | 全屏窗口盖住整块屏，只有内容真的不透明，底衬 / 模糊才一个像素都透不出来。两种「不透明」：格式里没 alpha（XRGB / RGBX，播放器和游戏的常规选择），或者客户端声明了盖住整块表面的 opaque region（GTK 那套）。后者 wlroots 判「这个节点盖住了下面的东西」用的也是它（`scene_node_opaque_region`）—— 它不认，直通也轮不到 |
+| 装饰参数全零、`opacity = 1` | 全屏窗口本来就不画 SSD（`vidow_view_look` 把边框 / 圆角 / 阴影 / 噪点归零），但规则里写了 opacity / 圆角就得走合成 |
+| 不在动画 / 果冻 / 遮罩里，`anim_alpha == 1`、`anim_scale == 1` | 那些帧画出来的不是「缓冲自己」 |
+| 没有自定义 shader、没有越界裁剪 | shader 会改像素；裁剪只做在合成那条路上（直通会把越界那半块画到隔壁屏上）|
+| CSD 留白 = 0（`off_x / off_y == 0`）、窗口框 == 表面框 | 客户端自己画的阴影留白在合成那条路上被裁掉，直通扫的是整块缓冲 |
+| 缓冲的设备像素 == 这块输出的设备像素 | 客户端没吃下输出缩放（1x 客户端放在 2x 屏上）时，合成那条路是**着色器**放大、直通那条路是**场景**自己放大，两条路的采样未必一样 |
+
+**切换看不出变化**（用户要求：「回退的时候屏幕不要黑一下」）。`view.c` 的
+`view_scanout_switch` 在重烘之前问一次判据，只在翻转那一帧做事：
+
+* 进直通：先把真实表面露出来（内容一样，装饰节点这一帧还盖在上面），同一帧把装饰节点收掉；
+* 退直通：先把装饰那条路接回来，下面照常烘一帧，**烘成了才**把表面藏起来（`view_anim_bake`
+  尾那句 `set_opacity`）。
+
+判据成立时「合成出来的像素」和「客户端缓冲本身」是同一个东西，所以两个方向都没有中间帧
+是空的。量过：`./test-scanout.sh` 拿同一个全屏窗口跑两遍（默认 / `VIDOW_NO_SCANOUT=1`），
+grim 两张图**内圈逐像素一样**；差的只有最外 1px（3996 个像素、最大 37/255）—— 装饰着色器
+的边缘抗锯齿（`radius = 0` 时 `smoothstep(-1, 1, d)` 让最外那圈落在 0.84 上），全屏窗口
+贴到屏幕边，这圈就落在屏幕最外沿。两个方向都是静态的 1px，不是闪一下。
+
+- 日志（`VIDOW_LOG=debug`）：`scanout: <窗口> 交给场景直画（全屏 + 装饰全零）` /
+  `scanout: <窗口> 回到合成（装饰 / 模糊 / 动画又要了）`，紧跟着 wlroots 自己那句
+  `Direct scan-out enabled` / `disabled`（`types/scene/wlr_scene.c`）。
+- `VIDOW_NO_SCANOUT=1`：一律走合成那条路（探针 / 排查用）。
+- 已知边界：**全屏窗口上面还有可见的东西**（状态栏那类 layer surface、通知）时 render list
+  就不止一项，wlroots 不直通 —— vidow 这边仍是「不烘装饰」的状态（画出来的像素和直通一样），
+  只是省不下那两笔。niri / Hyprland 同样如此（「全屏时自动藏状态栏」是个独立功能，vidow 没做）。
 
 ## Kawase 背景模糊
 

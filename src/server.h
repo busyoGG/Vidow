@@ -546,6 +546,13 @@ struct vidow_fx_target {
 	bool active;  /* decoration or shader is in use */
 	bool blur;    /* sample the blurred backdrop */
 
+	/* 全屏直通：这个窗口现在整块交给场景直画（不建 / 不画装饰节点），wlroots
+	 * 才有机会把客户端的缓冲直接扫上屏（判据见 fx.c 的
+	 * vidow_view_scanout_ok）。true = 上一次是按直通处理的 —— view.c 的
+	 * view_scanout_switch 用它判断状态翻转（翻转那一帧要把表面透明度接回去、
+	 * 把装饰节点收起来）。 */
+	bool scanout;
+
 	/* 越界裁剪（见 view.c 的 vidow_view_apply_clip）：这块窗口只画自己那块屏
 	 * 里的那部分。clip = 那块屏的框（布局逻辑坐标），clip_on 为 false 时整块
 	 * 都画。裁剪只作用在**显示**上：几何、客户端、录屏抓帧都不动。 */
@@ -2082,6 +2089,11 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 		const struct vidow_rule_eff *eff);
 void vidow_fx_end(struct vidow_server *server, struct vidow_fx_target *fx);
 void vidow_fx_release(struct vidow_fx_target *fx);
+/* 这个窗口这一帧能不能「直通」：装饰 / 模糊 / 动画 / 裁剪一个都不需要，屏幕上
+ * 该显示的像素就是客户端缓冲自己（全屏 + 装饰参数全零）。判据宁严不宽 —— 漏判
+ * 只是没省下那两笔 GPU，误判会让画面变样（CSD 留白、半透明、模糊底衬都会在直通
+ * 里露出来）。见 view.c 的 view_scanout_switch。 */
+bool vidow_view_scanout_ok(struct vidow_view *view);
 void vidow_fx_flush(struct vidow_server *server);
 bool vidow_fx_set_shader(struct vidow_server *server,
 		struct vidow_fx_target *fx, const char *name,
