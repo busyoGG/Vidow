@@ -5048,6 +5048,31 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
         底衬是**半透明混合**的（量到 (107,66,38)，金色和洋红混在一起）。验证 / 截图时加
         `--transition-type none`。
 
+231. **X11 客户端自己改 `_NET_WM_STATE` 要全屏，vidow 收不到**（用户：「proton 游戏启动的
+     时候会有半屏空位，然后窗口不是全画幅，而是半屏大小（带窗口装饰），然后会一直在屏幕的
+     右半屏」）
+
+     - 现场（用户的 `/tmp/vidow-run.log`，`崩坏：星穹铁道`）：窗口 951x1024（半屏一列的宽度
+       + 装饰）、x 在 2883 / 3840（右半屏、甚至半块屏外），日志里**一条 `全屏:` 都没有**
+       —— 也就是「客户端要全屏」这件事从头到尾没传到 vidow。
+     - 为什么：X11 的全屏请求有两条路。① 客户端发 `_NET_WM_STATE` 的 **ClientMessage** →
+       wlroots 发 `request_fullscreen` 信号 → 我们处理（这条一直好着）。② 客户端直接
+       **改属性**（`XChangeProperty`，wine / Proton 的游戏就是这条）→ wlroots 的
+       `read_surface_net_wm_state()` 只把 `xsurface->fullscreen = true` 赋值，
+       **一个字都不发**（`xwayland/xwm.c`）—— 信号没有，vidow 就永远不知道，游戏被当普通
+       平铺窗口摆成半屏一列。
+     - 修法：`view_sync_x11_fullscreen()`（`src/view.c`）在**交帧**和 **map** 两处把
+       `view->x11->fullscreen` 和 `view->fullscreen` 对一下（就是个指针比较），不一致就
+       走 `view_apply_fullscreen()`，日志写「X11 的 _NET_WM_STATE 属性变了」。
+     - 验证（临时 X11 客户端 `/tmp/zz-fswin.c`，三种时序，测完删掉）：
+       `prop`（map 之后改属性 = 游戏那条路）**旧代码：631x708 半屏一列、`全屏=False`；
+       新代码：0,0 1280x720、`全屏=True`**，日志有那一行；`late`（ClientMessage）没回归；
+       `early`（map 之前就把属性挂上）**仍然不认** —— 用 `xprop` 查出来原因是
+       wlroots 自己在焦点变化时会重写 `_NET_WM_STATE`（只剩 `_NET_WM_STATE_FOCUSED`），
+       客户端抢跑写进去的 FULLSCREEN 位被抹掉了，跟 vidow 无关；这条留在 README 里当已知
+       边界（真要治得在 wlroots 侧改，或者建窗前自己查一次属性）。
+     - `test-x11scale.sh` 全过。
+
 230. **切换器清单的预览画到隔壁显示器上**（用户：「开启大量窗口的时候，滚动列表，
      超出视口的窗口会在另一个显示器显示」）
 

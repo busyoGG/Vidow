@@ -489,6 +489,26 @@ static void view_apply_fullscreen(struct vidow_view *view, bool want,
 		want ? "开" : "关", why);
 }
 
+/* X11 的 _NET_WM_STATE_FULLSCREEN 有两条路：
+ *   ① 客户端发 ClientMessage → wlroots 发 request_fullscreen 信号 → 我们的
+ *      x11_request_fullscreen 处理（这条一直好着）；
+ *   ② 客户端直接改**属性**（wine / Proton 的游戏就是这条，XChangeProperty 或
+ *      map 之前就把状态挂上）→ wlroots 只把状态写进 xsurface->fullscreen，
+ *      **一个字都不发**（xwm.c 的 read_surface_net_wm_state 只赋字段）。
+ * ② 这条以前完全没人接：游戏被当普通平铺窗口摆成半屏一列（带装饰、停在半块屏
+ * 上）—— 用户报的「启动 proton 游戏时半屏空位、窗口不是全画幅而是半屏大小、
+ * 一直停在右半屏」就是这个。这里对一下两边（就是个指针比较），交帧和 map 的
+ * 时候各来一次：游戏一直在交帧，map 那次能赶上「状态比表面先到」的时序。 */
+static void view_sync_x11_fullscreen(struct vidow_view *view) {
+	if (view == NULL || view->kind != VIDOW_VIEW_X11 || view->x11 == NULL) {
+		return;
+	}
+	if (view->x11->fullscreen != view->fullscreen) {
+		view_apply_fullscreen(view, view->x11->fullscreen,
+			"X11 的 _NET_WM_STATE 属性变了");
+	}
+}
+
 /* 退出全屏。最小化 / 变浮窗这类「整屏状态跟它冲突」的操作要先走这一步：全屏那条
  * 分支在布局里不看占位、在层级里永远在最上面，留着它那些操作都白做。 */
 void vidow_view_unfullscreen(struct vidow_view *view, const char *why) {
@@ -3721,6 +3741,8 @@ static void view_map(struct wl_listener *listener, void *data) {
 	 * 下面「归哪块工作区、平铺还是浮动」的判据都要看它（app_id / 标题这时
 	 * 都齐了）。开窗只兑现一次的那几条在工作区落定之后（vidow_rule_placement）。 */
 	vidow_rule_apply(server, view);
+	/* X11 的窗口可能「状态比表面先到」：全屏那条属性在这儿先兑现一次。 */
+	view_sync_x11_fullscreen(view);
 	/* 落进现在显示着的那块工作区：新窗口跟着走，不偷偷开在藏起来的工作区里。
 	 * 列的窗口在 view_ensure_column 里落工作区；浮窗落在这里。 */
 	if (!view->popup) {
@@ -3951,6 +3973,10 @@ enum vidow_surface_damage vidow_view_surface_damage(struct vidow_view *view,
 static void view_commit(struct wl_listener *listener, void *data) {
 	(void)data;
 	struct vidow_view *view = wl_container_of(listener, view, commit);
+
+	/* 客户端交帧了 —— X11 那边顺手对一下 _NET_WM_STATE（属性那条路不发信号，
+	 * 见 view_sync_x11_fullscreen）。 */
+	view_sync_x11_fullscreen(view);
 
 	/* 客户端交帧了：它声明的有效源区域（wp_viewport 的 src 框）可能跟着变了，
 	 * 抄一份没裁过的那一版给装饰用（裁着的时候这个字段是被 set_clip 改过的，
