@@ -117,11 +117,55 @@ static int expand_group(lua_State *L, struct vidow_config *cfg,
 	return 0;
 }
 
+/* 一张 Lua 数组 → 逗号分隔的文本（`{ 0.25, 0.5 }` → `"0.25, 0.5"`）。配置里
+ * 那些「数表」键（K_LIST，现在是 preset_column_widths）走这条：vidow_config_set
+ * 收的是文本，解析 / 范围检查都在 config.c 的 parse_list() 里做一份。 */
+static int list_as_text(lua_State *L, int table_index, char *buf, size_t size) {
+	table_index = lua_absindex(L, table_index);
+	size_t n = lua_rawlen(L, table_index);
+	size_t used = 0;
+	for (size_t i = 1; i <= n; i++) {
+		lua_rawgeti(L, table_index, (int)i);
+		char item[64];
+		if (!value_as_text(L, -1, item, sizeof(item))) {
+			lua_pop(L, 1);
+			return luaL_error(L, "{…}: 表里第 %d 项是 %s，这里只能写数",
+				(int)i, lua_typename(L, lua_type(L, -1)));
+		}
+		lua_pop(L, 1);
+		int wrote = snprintf(buf + used, size - used, "%s%s",
+			i > 1 ? ", " : "", item);
+		if (wrote < 0 || (size_t)wrote >= size - used) {
+			return luaL_error(L, "{…}: 表太长了（最多 %d 项）",
+				VIDOW_MAX_COLUMN_WIDTH_PRESETS);
+		}
+		used += (size_t)wrote;
+	}
+	if (n == 0) {
+		return luaL_error(L, "{…}: 表不能是空的（至少写一档）");
+	}
+	return 0;
+}
+
 /* 一个配置键的赋值。值是标量就照平铺键存；是表就说明这个名字是一个「族」，
- * 表里每项展开成族里的平铺键（`border = { width = 0 }` → border_width = 0）。 */
+ * 表里每项展开成族里的平铺键（`border = { width = 0 }` → border_width = 0）。
+ * 数表键（preset_column_widths）是第三种：表本身就是一个值，转成逗号分隔的
+ * 文本存下去。 */
 static int assign_config(lua_State *L, struct vidow_config *cfg,
 		const char *key, int value_index) {
 	if (lua_type(L, value_index) == LUA_TTABLE) {
+		if (vidow_config_list_has(key)) {
+			char buf[256];
+			int err = list_as_text(L, value_index, buf, sizeof(buf));
+			if (err != 0) {
+				return err; /* luaL_error 已经抛了 */
+			}
+			if (!vidow_config_set(cfg, key, buf)) {
+				return luaL_error(L, "%s = '{ %s }' is not a valid value",
+					key, buf);
+			}
+			return 0;
+		}
 		if (!vidow_config_group_has(key)) {
 			return luaL_error(L, "%s = {…}: %s 不是一个「族」，这里不能写表",
 				key, key);

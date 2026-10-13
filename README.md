@@ -62,7 +62,8 @@
 
 - 新窗口在**焦点列的右侧**新开一列
 - 焦点移动时，视口按「最小滚动量」保证焦点列完整可见
-- 列宽默认占工作区 50%，可按列循环切换 1/3 → 1/2 → 2/3；比例分的是**连 gap 一起算**的
+- 列宽默认占工作区 50%，可按列循环切换 1/3 → 1/2 → 2/3（**默认那三档，可配**：
+  `preset_column_widths` / `default_column_width`，见编号 261）；比例分的是**连 gap 一起算**的
   那块区域（窗口 = 那块区域 − 一个 gap），所以几条列的比例加起来 = 1 时正好铺满可用区 ——
   两条 50% 不会被中间的 gap 挤出屏外（见「间距（gap）」一节）
 - 列可以**最大化**（`Mod+Shift+F`）：整列撑满工作区宽度，再按一次还原成**原来那个比例**
@@ -298,7 +299,7 @@ end
 | `close-window` | 关掉焦点窗口 |
 | `toggle-floating` | 焦点窗口 平铺 ⇄ 浮动 |
 | `toggle-fullscreen`（`fullscreen` 同义） | 焦点窗口全屏开关 |
-| `cycle-column-width` | 列宽 1/3 → 1/2 → 2/3 |
+| `cycle-column-width` | 列宽循环（默认 1/3 → 1/2 → 2/3，按 `preset_column_widths` 配的那几档，见编号 261） |
 | `maximize-column`（`toggle-maximize-column` 同义） | 整列最大化：撑满工作区宽度，再按一次还原成原来那个比例 |
 | `toggle-overview`（`overview` 同义） | niri 风格全景开关 |
 | `spawn <命令>`（`exec` 同义） | 撒手跑一条 shell 命令（双 fork、不等它、不阻塞渲染） |
@@ -1067,7 +1068,7 @@ vidow.bind("Mod+W", "close-window", { on = "release" })  -- 松开才触发
 | `Mod+V` / `Mod+Shift+Space` | 当前窗口 平铺 ⇄ 浮动（窗口正全屏时先把全屏退掉 —— 见 changelog 186） |
 | `Mod+左键拖动` | 拖窗口：浮动窗口跟着走（松手在哪块屏上就归那块屏的工作区）；平铺窗口按**落点**归位 —— 落点分两种（niri 的 NewColumn / InColumn）：落在**列带的缝上 / 空白处**（离列的左边缘近）= 把**这个窗口自己**取出来、在那儿新开一条列（它原来那条列连同别的窗口留在原处；列里就它一个时整条列搬过去），落在**窗口身上**（离那条列里的窗口缝近）= 插进那条列、一列里上下叠起来。拖的过程里落点画一块半透明预览（见「拖平铺窗口的落点」一节），拖到别的屏上 = 跨屏搬过去（那条路还是整条列） |
 | `Mod+右键拖动` | 浮动窗口：缩放它自己（从右下角开始）；平铺窗口：改这一列的宽度（列宽右边缘跟着光标走，两头夹在 5%…100%） |
-| `Mod+R` | 列宽循环 1/3 → 1/2 → 2/3 |
+| `Mod+R` | 列宽循环（默认 1/3 → 1/2 → 2/3，按 `preset_column_widths` 配的那几档） |
 | `Mod+F` | 当前窗口全屏切换 |
 | `Mod+Shift+F` | 当前列最大化 ⇄ 还原（见「列最大化」一节） |
 | `Mod+O` | niri 风格全景（overview）：整条列带缩小铺满这块屏，点谁去谁 |
@@ -5364,6 +5365,61 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
        `time(NULL) - server_start > 5` 才重启），那种情况下桥会一直摘着，直到配置 SIGHUP（`apply_config`
        会重新接管）或下一个 X 客户端把 Xwayland 再拉起来。
 
+261. **列宽预设 / 新列默认宽度 / 焦点列居中策略可配了（`configs/20-layout.lua`）**（用户：「照 niri 语义补 `center-focused-column` + 可配列宽预设」；2026-10-14）
+
+     - 改前：这三件事**全写死在 `src/view.c`** —— 列宽预设 `static const double presets[] = { 1.0/3.0, 0.5, 2.0/3.0 }`
+       （`vidow_cycle_column_width`）、新列宽度 `#define DEFAULT_COLUMN_WIDTH 0.5`（`view_ensure_column`）、
+       焦点列居中 `output_arrange` 的 Pass 2 只做「最小滚动」（焦点列贴视口左 / 右边缘）。README 第 13 条边界
+       （「列宽、按键、间隙仍是硬编码」）里那条，现在只剩按键。
+     - niri 那边的确切取值与出处（[Configuration: Layout](https://github.com/niri-wm/niri/wiki/Configuration:-Layout)，
+       以及仓库里的 `resources/default-config.kdl` 逐字核对）：
+       - `center-focused-column` 三个取值：`"never"`（**niri 的默认**，注释原文：「focusing an off-screen column will keep
+         at the left or right edge of the screen」）/ `"always"`（the focused column will always be centered）/
+         `"on-overflow"`（focusing a column will center it if it doesn't fit together with the previously focused column）。
+       - `preset-column-widths { proportion 0.33333 / proportion 0.5 / proportion 0.66667 }` —— 默认档位就是
+         「The default preset widths are 1/3, 1/2 and 2/3 of the output」；每项还能写 `fixed 1920`（固定逻辑像素）。
+       - `default-column-width { proportion 0.5; }`；**空括号 `{}` = 让窗口自己决定初始宽度**。
+     - vidow 侧三个新键（snake_case，取值 / 语义照 niri 抄）：
+       ```lua
+       center_focused_column = "never"                                  -- never / always / on-overflow
+       preset_column_widths  = { 0.3333333333, 0.5, 0.6666666667 }      -- cycle-column-width 循环的那几档
+       default_column_width  = 0.5                                      -- 新列多宽（窗口规则 column_width 优先）
+       ```
+       **默认值 = vidow 以前的行为，不配置零变化**：三个默认数就是原来写死的那三个。比例写成字面量
+       （`0.3333333333`）而不是 `1.0/3.0`，是为了「打出来的默认配置读回去还是同一个 double」。
+     - 三条写路径都吃（照「可配置缓动」508239e 那一套）：config.lua（`preset_column_widths` 写成 **Lua 数组**，
+       新增 `K_LIST` 类型 + script.c 的 `list_as_text()`）/ `VIDOW_CENTER_FOCUSED_COLUMN=always`、
+       `VIDOW_PRESET_COLUMN_WIDTHS=0.25,0.5,0.75`、`VIDOW_DEFAULT_COLUMN_WIDTH=0.6` / `vidowmsg set-config
+       preset_column_widths "0.25, 0.5"`；查询 `vidowmsg config <键>`（数表打回 `"0.3333333333, 0.5, 0.6666666667"`，
+       逗号分隔的那种文本，拷回配置文件 / 环境变量都能原样再读一遍）。写错当场 `WLR_ERROR` + 该行不生效
+       （`center_focused_column = "sometimes"`、`{ 0.25, 1.5 }` 越界、空表、超过 16 档都拒）。
+     - 居中策略落在 `output_arrange` 的 Pass 2，抽成 `focus_viewport_target()`（`src/view.c`）：
+       `always` 把焦点列中心对到视口中心；`on-overflow` 看「焦点列 + **上一个焦点列**」合起来的跨度
+       （`server->last_focused_col`，换焦点时更新、列被 free 时清空）能不能整个放进视口，放不下才居中；
+       `never` 就是原来的最小滚动。三种最后都夹到 `0..max_viewport`（条带两头滚不动，跟 niri 的夹取一样），
+       所以最左 / 最右那条列居中不了 —— 这是条带边界，不是特例分支。
+       `vidow_view_scroll_amount_to_activate()`（focus-follows-mouse 的 `max-scroll-amount` 拿它判阈值）改成调同一个
+       `focus_viewport_target()`：**预测和实际必须是同一件事**，否则居中一开那条判据全错。
+     - 列宽预设：`vidow_cycle_column_width()` 读 `server->config.preset_column_widths`（+ `_count`），
+       「现在是第几档」仍然按**目标** `width_fraction` 数（连按不因动画没跑完原地打转）；表为空兜一个 0.5。
+       `view_ensure_column()` 用 `config.default_column_width` 取代原来的 `DEFAULT_COLUMN_WIDTH` 宏。
+     - 验证（headless 1280x720 一块屏、`gaps = 10` → 工作区 1260 宽、视口中心 640；脚本
+       `/tmp/vidow-layout-verify.sh` + `/tmp/vidow-overflow-verify.sh`，数字是「焦点列中心 − 视口中心」）：
+       - 4 条列（0.5 = 625px，offset 0/635/1270/1905）：`never` 全程 ±317.5（贴边，改前就是这个数）；
+         `always` 第 2、3 列 **0.0**（正中），第 1、4 列 ∓317.5（条带两头夹住，滚不动）；
+         `on-overflow` 三条都是 ±317.5 —— 两条相邻 0.5 正好 1260 = 视口宽，**放得下**，不该居中（niri 的判据）。
+       - `on-overflow` 专项（3 条列、`default_column_width = 0.6` → 752px，两条相邻 = 1514 > 1260）：从最左跳到第 2 列
+         **中心差 0.0**（居中，视口 508）、第 3 列 +254（夹到 max_viewport 1016）、从第 3 列回第 2 列又 **0.0**；
+         同一个布局下 `never` 是 +254 / +254（不居中）。0.6 的 `never` 与 `on-overflow` 差异就是「溢出才居中」这一条。
+       - 预设：`preset_column_widths = { 0.25, 0.5, 0.75 }` → `cycle-column-width` 循环 0.75 → 0.25 → 0.5 → 0.75
+         （宽度 942 / 307 / 625 / 942）；默认配置下是 0.6667 → 0.3333 → 0.5 → 0.6667（836 / 413 / 625 / 836）——
+         和改前写死那三档一致。`default_column_width = 0.6` → 新列宽 752 = `0.6 × (1260+10) − 10`。
+       - 三个键 `vidowmsg config` 都查得回来（默认分别是 `never` / `0.3333333333, 0.5, 0.6666666667` / `0.5`）。
+     - 回归：`test-widthanim.sh` 全过（39 PASS，含「列还原停在 836 / `width_fraction` 0.666667」）、`test-workspace.sh` 全过、
+       `test-defaultconfig.sh` 全过（新增的 `20-layout.lua` 与 `--default-config` 逐字节一致，114 个平铺键都在）。
+     - 未做：niri 的 `fixed 1920`（固定像素档）、`preset-window-heights`、`default-column-width {}`（让客户端自己定宽）、
+       `always-center-single-column`；窗口规则级的 per-rule 预设覆盖。
+
 260. **libinput 设备配置族：触控板 / 鼠标那十一个设置终于能配了（`configs/19-input.lua`）**（用户：「照 niri 的 `input {}` 那套，给 vidow 加 libinput 设备配置族」；2026-10-14）
 
      - 改前：vidow **一个 libinput 设置都不能调**（全仓 grep `accel_profile` / `scroll_method` / `natural_scroll` / `tap_to_click` = 0 命中）——
@@ -9357,7 +9413,7 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
 10. 模糊只包含 background/bottom/toplevels 三层；top/overlay 层不参与背景
 11. 模糊用的是**上一帧**的场景快照（本帧开头采样），窗口快速移动时模糊内容有一帧延迟
 12. 装饰缓冲固定按 `shadow_radius + |shadow_offset|` 留边，改大阴影半径要重启
-13. 列宽、按键、间隙仍是硬编码（动画/装饰/模糊/shader 走配置文件）
+13. 按键仍是硬编码（动画/装饰/模糊/shader/列宽走配置文件 —— 列宽那三档见编号 261）
 14. 配置里的 shell 命令只在启动和 SIGHUP 时跑，没有定时轮询 / inotify 触发
 15. `vidow.exec` 成功时返回 stdout、失败时返回 `nil, 原因`（stderr 优先）；
     要退出码用 `vidow.exec_status`。stderr 单独抓，不混进返回值

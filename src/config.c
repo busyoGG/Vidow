@@ -44,6 +44,12 @@ enum kind {
 	 * vidow 以前的行为，所以这两个类型的默认值就是 auto。 */
 	K_TRISTATE,
 	K_OPT_DOUBLE,
+	/* 焦点列的居中策略（configs/20-layout.lua）：写字符串，存枚举。 */
+	K_CENTER_FOCUSED, /* "never" / "always" / "on-overflow" */
+	/* 一张「数表」：文本是逗号分隔的一串数（`"0.25, 0.5"`），存的是定长数组
+	 * + 个数（见 struct vidow_config 的 preset_column_widths）。config.lua
+	 * 那边写的是 Lua 数组（`{ 0.25, 0.5 }`），转文本的地方在 script.c。 */
+	K_LIST,
 };
 
 struct entry {
@@ -111,6 +117,10 @@ static const struct section sections[] = {
 	{ "输入设备（libinput）", "19-input.lua",
 		"触控板 / 鼠标这些设备自己的设置（照 niri 的 input {} 那一节）。默认全是 "
 		"\"auto\" = 不碰，用设备自己的默认；改了立刻套到已经连上的设备上，热插拔也照套" },
+	/* 布局（20-…）同样只能往后加。这一族是**列**自己的参数：焦点列怎么居中、
+	 * 列宽预设是哪几档、新列默认多宽 —— 默认值就是 vidow 原来写死的那套。 */
+	{ "布局（列宽 / 居中）", "20-layout.lua",
+		"列宽预设、新列默认宽度、焦点列的居中策略（照 niri 的 layout {} 那一节）" },
 };
 #define N_SECTIONS ((int)(sizeof(sections) / sizeof(sections[0])))
 /* 「键位 / 工作区 / 规则」那一节：它不是配置键，entries[] 里没有它，打印也
@@ -452,6 +462,23 @@ static const struct entry entries[] = {
 	{ "scroll_factor", K_DOUBLE, OFF(scroll_factor), SZ(scroll_factor), 18,
 		"滚动倍率（niri 的 scroll-factor）：0.5 = 半速，负数反向。libinput 没有"
 		"这个接口，是 vidow 自己在滚轮事件上乘的；1.0（默认）= 不缩放，跟以前一样" },
+
+	{ "center_focused_column", K_CENTER_FOCUSED, OFF(center_focused_column),
+		SZ(center_focused_column), 19,
+		"焦点列在视口里怎么居中：never（默认，也是 vidow 一直以来的行为 —— 换"
+		"焦点只滚「刚好让它整个露出来」的那点距离）/ always（永远摆到正中）/ "
+		"on-overflow（跟上一个焦点列能一起完整放下就不动，放不下才居中）"
+		"（niri 的 layout { center-focused-column }）" },
+	{ "preset_column_widths", K_LIST, OFF(preset_column_widths),
+		SZ(preset_column_widths), 19,
+		"列宽预设：cycle-column-width（Mod+R）在这几档之间循环，每个数是「可用"
+		"宽度的比例」（0.5 = 半宽）。默认 1/3、1/2、2/3 —— 原来写死在 view.c 的"
+		"那三档（niri 的 layout { preset-column-widths } 里的 proportion）" },
+	{ "default_column_width", K_DOUBLE, OFF(default_column_width),
+		SZ(default_column_width), 19,
+		"新列的默认宽度，比例（0.5 = 半宽）；窗口规则里写了 column_width 的窗口"
+		"按规则走。默认 0.5 —— 原来 view.c 里那个 DEFAULT_COLUMN_WIDTH"
+		"（niri 的 layout { default-column-width }）" },
 };
 
 /* ------------------------------------------------------------ 配置组
@@ -751,6 +778,91 @@ static bool parse_at_end(const char *p) {
 		p++;
 	}
 	return *p == '\0';
+}
+
+/* 一个「比例」数（列宽那三个键）：整串就是一个数，落在 min..max 里。
+ * allow_zero = false 时 0 也不算（0.0 的列宽没有意义）。 */
+static bool parse_fraction(const char *value, double min, double max,
+		bool allow_zero, double *out) {
+	const char *p = value;
+	double v = 0.0;
+	if (!parse_number(&p, &v) || !parse_at_end(p)) {
+		return false;
+	}
+	if (v < min || v > max || (!allow_zero && v <= 0.0)) {
+		return false;
+	}
+	*out = v;
+	return true;
+}
+
+/* 焦点列居中策略（niri 的 center-focused-column 取值）。 */
+static const char *center_focused_names[] = {
+	"never", "always", "on-overflow",
+};
+
+static bool parse_center_focused(const char *value,
+		enum vidow_center_focused_column *out) {
+	for (size_t i = 0; i < 3; i++) {
+		if (strcmp(value, center_focused_names[i]) == 0) {
+			*out = (enum vidow_center_focused_column)i;
+			return true;
+		}
+	}
+	return false;
+}
+
+/* 一张「数表」（K_LIST，现在只有 preset_column_widths）：
+ *
+ *     "0.25, 0.5, 0.75"        —— 逗号或空白分隔都认
+ *
+ * 每个数都要是 0 .. 1 的比例，至少得有一个。认不出来返回 false —— 和缓动
+ * 那条路一个规矩：**不静默退回默认表**（那样用户只会看到「配了没用」）。
+ * 目标数组的容量由 size 给（entries[] 里那个 SZ()）。
+ *
+ * 先解析到一张临时表、整串认下来了才写回 out：写错的配置（"0.5, 3" 这种，
+ * 第二个数越界）不该把原来那张表改掉一半。 */
+static bool parse_list(const char *value, double *out, size_t size,
+		int *count_out) {
+	size_t max = size / sizeof(double);
+	if (max > VIDOW_MAX_COLUMN_WIDTH_PRESETS) {
+		max = VIDOW_MAX_COLUMN_WIDTH_PRESETS; /* tmp 就那么大 */
+	}
+	double tmp[VIDOW_MAX_COLUMN_WIDTH_PRESETS];
+	int n = 0;
+	const char *p = value;
+	for (;;) {
+		while (isspace((unsigned char)*p) || *p == ',') {
+			p++;
+		}
+		if (*p == '\0') {
+			break;
+		}
+		if ((size_t)n >= max) {
+			wlr_log(WLR_ERROR, "config: 这张表最多 %zu 个数，多出来的没法"
+				"收（给的是 '%s'）", max, value);
+			return false;
+		}
+		double v = 0.0;
+		if (!parse_number(&p, &v)) {
+			wlr_log(WLR_ERROR, "config: 表里每一项都要是一个数（逗号或"
+				"空白分隔），'%s' 这一项不对", value);
+			return false;
+		}
+		if (v < 0.0 || v > 1.0) {
+			wlr_log(WLR_ERROR, "config: 表里的数都是 0 .. 1 的比例（0.5 = "
+				"半宽），'%.10g' 越界了", v);
+			return false;
+		}
+		tmp[n++] = v;
+	}
+	if (n == 0) {
+		wlr_log(WLR_ERROR, "config: 这张表不能是空的（至少写一档）");
+		return false;
+	}
+	memcpy(out, tmp, (size_t)n * sizeof(double));
+	*count_out = n;
+	return true;
 }
 
 /* 配置里怎么写一条缓动曲线（README 247）：
@@ -1059,13 +1171,25 @@ static bool apply_one(struct vidow_config *cfg, const char *key,
 				*(double *)field = v;
 				return true;
 			}
+			/* 列宽是比例：写错一位（0.5 敲成 5）会让窗口比屏幕还宽，
+			 * 所以和 scroll_factor 一样走严格解析。 */
+			if (strcmp(e->key, "default_column_width") == 0) {
+				double v = 0.0;
+				if (!parse_fraction(value, 0.0, 1.0, false, &v)) {
+					wlr_log(WLR_ERROR, "config: default_column_width 要是"
+						"一个 0 .. 1 的比例（0.5 = 半宽），给的是 '%s'",
+						value);
+					return false;
+				}
+				*(double *)field = v;
+				return true;
+			}
 			*(double *)field = atof(value);
 			/* 回弹幅度是派生的（见 sync_easings）：改了它，三条曲线
 			 * 得跟着重算一遍。 */
 			if (strcmp(e->key, "back_overshoot") == 0) {
 				sync_easings(cfg);
-			}
-			return true;
+			}			return true;
 		case K_BOOL:
 			*(bool *)field = strcmp(value, "0") != 0 &&
 				strcasecmp(value, "false") != 0 &&
@@ -1185,6 +1309,21 @@ static bool apply_one(struct vidow_config *cfg, const char *key,
 				return false;
 			}
 			return true;
+		case K_CENTER_FOCUSED:
+			if (!parse_center_focused(value,
+					(enum vidow_center_focused_column *)field)) {
+				wlr_log(WLR_ERROR, "config: center_focused_column 只能是 "
+					"never / always / on-overflow（niri 同名取值）；"
+					"给的是 '%s'", value);
+				return false;
+			}
+			return true;
+		case K_LIST: {
+			/* 表长在数组后面那个 int（约定见 server.h 的
+			 * preset_column_widths）。 */
+			int *count = (int *)((char *)field + e->size);
+			return parse_list(value, (double *)field, e->size, count);
+		}
 		}
 	}
 	return false;
@@ -1375,6 +1514,19 @@ static void defaults(struct vidow_config *cfg) {
 	cfg->window_close_ms = 140;
 	cfg->window_move_ms = 190;
 	cfg->column_width_ms = 200;
+	/* ---- 布局（configs/20-layout.lua）----
+	 * 默认值 = vidow 原来写死的那套，不配置零变化：
+	 *   center_focused_column  never  = 老的最小滚动（焦点列贴边）
+	 *   preset_column_widths   1/3 1/2 2/3 = view.c 里原来那个 presets[]
+	 *   default_column_width   0.5    = view.c 里原来的 DEFAULT_COLUMN_WIDTH
+	 * 三个比例写成字面量而不是 1.0/3.0：打印默认配置时 %.10g 打的是字面量
+	 * 的那一串（0.3333333333），这份打出来的配置读回去得是同一个数。 */
+	cfg->center_focused_column = VIDOW_CENTER_NEVER;
+	cfg->preset_column_widths[0] = 0.3333333333;
+	cfg->preset_column_widths[1] = 0.5;
+	cfg->preset_column_widths[2] = 0.6666666667;
+	cfg->preset_column_widths_count = 3;
+	cfg->default_column_width = 0.5;
 	cfg->workspace_switch_ms = 200;
 	cfg->layer_open_ms = 200;
 	cfg->layer_close_ms = 150;
@@ -1486,6 +1638,9 @@ void vidow_config_apply_env(struct vidow_config *cfg) {
 
 /* ------------------------------------------------------------ interface */
 
+/* 定义在下面（按 key 找 entries[] 里那一条）。 */
+static const struct entry *entry_for(const char *key);
+
 bool vidow_config_has(const char *key) {
 	for (size_t i = 0; i < sizeof(entries) / sizeof(entries[0]); i++) {
 		if (strcmp(entries[i].key, key) == 0) {
@@ -1493,6 +1648,12 @@ bool vidow_config_has(const char *key) {
 		}
 	}
 	return false;
+}
+
+/* 这个键的值是不是一张「数表」（K_LIST，比如 preset_column_widths）。 */
+bool vidow_config_list_has(const char *key) {
+	const struct entry *e = entry_for(key);
+	return e != NULL && e->kind == K_LIST;
 }
 
 bool vidow_config_set(struct vidow_config *cfg, const char *key,
@@ -1513,7 +1674,11 @@ static const struct entry *entry_for(const char *key) {
  * Four rotating buffers so one expression can read several keys. */
 const char *vidow_config_get(const struct vidow_config *cfg,
 		const char *key) {
-	static char slots[4][64];
+	/* 192 而不是 64：数表那个键（preset_column_widths）最多 16 档，每档
+	 * "%.10g" 最长 17 个字符（16 档 × 18 = 288 装不下，但 16 档全写满
+	 * 17 位数的配置不存在 —— 比例是 0..1，实际最长 12 位；这里给 192 是
+	 * 「够用且不会因为一行文本撑爆」。 */
+	static char slots[4][192];
 	static int next = 0;
 	char *buf = slots[next];
 	next = (next + 1) % 4;
@@ -1526,51 +1691,67 @@ const char *vidow_config_get(const struct vidow_config *cfg,
 	const void *field = (const char *)cfg + e->offset;
 	switch (e->kind) {
 	case K_INT:
-		snprintf(buf, 64, "%d", *(const int *)field);
+		snprintf(buf, 192, "%d", *(const int *)field);
 		break;
 	case K_DOUBLE:
-		snprintf(buf, 64, "%.10g", *(const double *)field);
+		snprintf(buf, 192, "%.10g", *(const double *)field);
 		break;
 	case K_BOOL:
-		snprintf(buf, 64, "%s", *(const bool *)field ? "true" : "false");
+		snprintf(buf, 192, "%s", *(const bool *)field ? "true" : "false");
 		break;
 	case K_EASING:
 		/* 打回配置里能写的样子：自定义曲线连参数一起（见 vidow_ease_text）。 */
-		vidow_ease_text((const struct vidow_ease *)field, buf, 64);
+		vidow_ease_text((const struct vidow_ease *)field, buf, 192);
 		break;
 	case K_MRU_SCOPE: {
 		int v = *(const enum vidow_mru_scope *)field;
-		snprintf(buf, 64, "%s", mru_scope_names[v >= 0 && v < 3 ? v : 0]);
+		snprintf(buf, 192, "%s", mru_scope_names[v >= 0 && v < 3 ? v : 0]);
 		break;
 	}
 	case K_MRU_LAYOUT: {
 		int v = *(const enum vidow_mru_layout *)field;
-		snprintf(buf, 64, "%s", mru_layout_names[v >= 0 && v < 2 ? v : 0]);
+		snprintf(buf, 192, "%s", mru_layout_names[v >= 0 && v < 2 ? v : 0]);
 		break;
 	}
 	case K_TRISTATE: {
 		int v = *(const enum vidow_tristate *)field;
-		snprintf(buf, 64, "%s", v == VIDOW_TRI_ON ? "true" :
+		snprintf(buf, 192, "%s", v == VIDOW_TRI_ON ? "true" :
 			v == VIDOW_TRI_OFF ? "false" : "auto");
 		break;
 	}
 	case K_OPT_DOUBLE: {
 		const struct vidow_opt_double *d = field;
 		if (!d->set) {
-			snprintf(buf, 64, "auto");
+			snprintf(buf, 192, "auto");
 		} else {
-			snprintf(buf, 64, "%.10g", d->value);
+			snprintf(buf, 192, "%.10g", d->value);
 		}
 		break;
 	}
 	case K_STRING:
-		snprintf(buf, 64, "%s", (const char *)field);
+		snprintf(buf, 192, "%s", (const char *)field);
 		break;
 	case K_COLOR: {
 		const float *c = field;
-		snprintf(buf, 64, "#%02x%02x%02x%02x",
+		snprintf(buf, 192, "#%02x%02x%02x%02x",
 			(int)(c[0] * 255.0f + 0.5f), (int)(c[1] * 255.0f + 0.5f),
 			(int)(c[2] * 255.0f + 0.5f), (int)(c[3] * 255.0f + 0.5f));
+		break;
+	}
+	case K_CENTER_FOCUSED: {
+		int v = *(const enum vidow_center_focused_column *)field;
+		snprintf(buf, 192, "%s",
+			center_focused_names[v >= 0 && v < 3 ? v : 0]);
+		break;
+	}
+	case K_LIST: {
+		const double *vals = field;
+		int n = *(const int *)((const char *)field + e->size);
+		size_t used = 0;
+		for (int i = 0; i < n && used < 192; i++) {
+			used += (size_t)snprintf(buf + used, 192 - used, "%s%.10g",
+				i > 0 ? ", " : "", vals[i]);
+		}
 		break;
 	}
 	}
@@ -1674,6 +1855,14 @@ void vidow_config_log(const struct vidow_config *cfg) {
 		cfg->shader_open[0] ? cfg->shader_open : "-",
 		cfg->shader_close[0] ? cfg->shader_close : "-",
 		cfg->shader_idle[0] ? cfg->shader_idle : "-");
+
+	/* 布局那一族（configs/20-layout.lua）：单独一条，数表用
+	 * vidow_config_get 打回「0.3333333333, 0.5, 0.6666666667」那种文本。 */
+	wlr_log(WLR_INFO, "config: layout center-focused-column=%s "
+		"preset-column-widths=[%s] default-column-width=%.10g",
+		vidow_config_get(cfg, "center_focused_column"),
+		vidow_config_get(cfg, "preset_column_widths"),
+		cfg->default_column_width);
 }
 
 /* 回到默认值，再压上环境变量。配置文件（Lua）跑之前、以及每次重载之前都调
@@ -1739,6 +1928,13 @@ static void print_lua_value(FILE *f, const struct vidow_config *cfg,
 	const char *v = vidow_config_get(cfg, key);
 	if (v == NULL) {
 		v = "";
+	}
+	if (kind == K_LIST) {
+		/* 数表在 Lua 里是一张数组：`{ 0.3333333333, 0.5, 0.6666666667 }`。
+		 * vidow_config_get 给的是逗号分隔的文本（IPC / 环境变量那条路），
+		 * 这里补上花括号 —— 打出来的这份能原样读回去。 */
+		fprintf(f, "{ %s }", v);
+		return;
 	}
 	if (kind != K_STRING && kind != K_COLOR && kind != K_EASING &&
 			kind != K_MRU_SCOPE && kind != K_MRU_LAYOUT &&

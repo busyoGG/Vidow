@@ -7,8 +7,6 @@
 #include <wlr/types/wlr_buffer.h>
 #include <wlr/util/log.h>
 
-#define DEFAULT_COLUMN_WIDTH 0.5
-
 /* gap 的算法都在 server.h 里（vidow_gap_side / vidow_gap_inner）：统一值 gaps
  * 管全部，单边设了就用单边的，-1 = 跟随。 */
 
@@ -764,6 +762,83 @@ static bool column_has_fullscreen(struct vidow_column *col) {
 	return false;
 }
 
+/* 聚焦的这条列「在条带上多宽」：全屏的那条算一整屏 —— 全屏窗口画出来就是整块
+ * 屏那么大，它在条带上占的位置自然也该是一整屏（不是给全屏开特例：列就是列，
+ * 只是它的宽度就是一屏）。滚动（Pass 2 / 预测）两处都用这一个。 */
+static int column_strip_width(struct vidow_column *col, int work_width) {
+	return column_has_fullscreen(col) ? work_width : col->width;
+}
+
+/* 「把焦点列摆到视口里，视口该在哪」—— niri 的 scroll_amount_to_activate 算的是
+ * 同一件事。三种策略（configs/20-layout.lua 的 center_focused_column）：
+ *
+ *   never（默认）  最小滚动：只滚「刚好让焦点列整个露出来」的那点距离，焦点列
+ *                  因此常常贴着视口左 / 右边缘 —— vidow 一直以来的行为。
+ *   always         焦点列永远摆到视口正中（条带两头夹住，见下面的 clamp）。
+ *   on-overflow    焦点列和**上一个焦点列**能一起完整放进视口就不动；放不下
+ *                  （= 溢出）才居中。niri 的同名取值。
+ *
+ * 只算「该在哪」，不真改视口 —— 调用方自己 clamp 到 0..max_viewport。 */
+static double focus_viewport_target(struct vidow_server *server,
+		struct vidow_output *output, double viewport, int work_width) {
+	if (work_width < 1) {
+		return viewport;
+	}
+	struct vidow_view *focus = server->focused;
+	if (focus != NULL && focus->float_mode == VIDOW_FLOAT_FOLLOW &&
+			focus->parent != NULL) {
+		/* scroll to where the dialog's parent lives */
+		focus = focus->parent;
+	}
+	struct vidow_column *focused_col = focus != NULL ? focus->column : NULL;
+	if (focused_col == NULL || focused_col->output != output->wlr_output) {
+		return viewport;
+	}
+
+	/* 这条列在条带上占多宽（全屏那条 = 一整屏）。 */
+	int cw = column_strip_width(focused_col, work_width);
+	/* 居中要用的宽度：列比视口还宽就没法居中（夹住，跟 niri 一样）。 */
+	int center_w = cw > work_width ? work_width : cw;
+
+	if (server->config.center_focused_column == VIDOW_CENTER_ALWAYS) {
+		return focused_col->offset - (work_width - center_w) / 2.0;
+	}
+
+	if (server->config.center_focused_column == VIDOW_CENTER_ON_OVERFLOW) {
+		/* 和上一个焦点列能不能一起完整放进视口。上一个没了 / 在别的屏上 /
+		 * 就在同一条列里 —— 都算「放得下」（不居中）。 */
+		struct vidow_column *prev = server->last_focused_col;
+		bool fits = true;
+		if (prev != NULL && prev != focused_col &&
+				prev->output == output->wlr_output &&
+				column_has_shown_views(prev)) {
+			int pw = column_strip_width(prev, work_width);
+			int lo = prev->offset < focused_col->offset ?
+				prev->offset : focused_col->offset;
+			int hi_a = prev->offset + pw;
+			int hi_b = focused_col->offset + cw;
+			int hi = hi_a > hi_b ? hi_a : hi_b;
+			fits = hi - lo <= work_width;
+		}
+		if (!fits) {
+			return focused_col->offset - (work_width - center_w) / 2.0;
+		}
+		/* 放得下：退回最小滚动（下面那段）。 */
+	}
+
+	/* 最小滚动：焦点列在视口右边外面就往左滚到贴右边缘，在左边外面就往右
+	 * 滚到贴左边缘；已经在里面就不动。 */
+	double target = viewport;
+	int right = focused_col->offset + cw;
+	if (right > target + work_width) {
+		target = right - work_width;
+	}
+	if (focused_col->offset < target) {
+		target = focused_col->offset;
+	}
+	return target;
+}
+
 /* 这块屏上现在该摆哪些列：有特殊工作区开着就摆它的（普通工作区让位），否则摆
  * 活动的那块普通工作区。空指针（还没建过工作区）返回空链表，arrange 就当没列。 */
 static struct wl_list *output_shown_columns(struct vidow_server *server,
@@ -794,10 +869,13 @@ static void view_ensure_column(struct vidow_server *server,
 	col->output = view->output;
 	col->home = view->home;
 	/* 列宽：窗口规则写了 column_width 就用它（这个窗口新开的列有多宽），
-	 * 没写用默认的一半。新列不做过渡（它是刚生出来的，宽度没有「变化」），
-	 * width_shown 跟逻辑值一起给上 —— arrange 画的是 width_shown。 */
+	 * 没写用配置里的 default_column_width（默认 0.5，就是原来写死的那个
+	 * DEFAULT_COLUMN_WIDTH —— 见 configs/20-layout.lua）。新列不做过渡
+	 * （它是刚生出来的，宽度没有「变化」），width_shown 跟逻辑值一起给上
+	 * —— arrange 画的是 width_shown。 */
 	col->width_fraction = view->rule_eff.set[VRA_COLUMN_WIDTH] ?
-		view->rule_eff.val[VRA_COLUMN_WIDTH].d : DEFAULT_COLUMN_WIDTH;
+		view->rule_eff.val[VRA_COLUMN_WIDTH].d :
+		server->config.default_column_width;
 	col->width_shown = col->width_fraction;
 	wl_list_init(&col->views);
 
@@ -860,6 +938,12 @@ void vidow_view_leave_column(struct vidow_view *view) {
 		 * 掉的内存（列没了但补间还在跑）。 */
 		vidow_anim_cancel(col->anim_width);
 		col->anim_width = NULL;
+		/* 「上一个焦点列」指着它的话先松手 —— 这条列马上就不是列了
+		 * （center_focused_column = "on-overflow" 要用，见
+		 * focus_viewport_target）。 */
+		if (view->server->last_focused_col == col) {
+			view->server->last_focused_col = NULL;
+		}
 		free(col);
 	}
 }
@@ -2386,29 +2470,7 @@ static void output_arrange(struct vidow_server *server,
 	if (output->gesture_drag) {
 		viewport = output->gesture_viewport;
 	} else {
-		struct vidow_view *focus = server->focused;
-		if (focus != NULL && focus->float_mode == VIDOW_FLOAT_FOLLOW &&
-				focus->parent != NULL) {
-			/* scroll to where the dialog's parent lives */
-			focus = focus->parent;
-		}
-		struct vidow_column *focused_col =
-			focus != NULL ? focus->column : NULL;
-		if (focused_col != NULL &&
-				focused_col->output == output->wlr_output) {
-			/* 聚焦的这条列「在条带上多宽」—— 全屏的那条算一整屏，所以聚焦
-			 * 它时视口正好落在它的 offset 上（= 全屏窗口左边缘贴着屏左边缘），
-			 * 聚焦它旁边那条时才把全屏整块推到屏外（并排露出来）。 */
-			int cw = column_has_fullscreen(focused_col) ? work.width :
-				focused_col->width;
-			int right = focused_col->offset + cw;
-			if (right > viewport + work.width) {
-				viewport = right - work.width;
-			}
-			if (focused_col->offset < viewport) {
-				viewport = focused_col->offset;
-			}
-		}
+		viewport = focus_viewport_target(server, output, viewport, work.width);
 	}
 	if (viewport < 0) {
 		viewport = 0;
@@ -2929,16 +2991,34 @@ double vidow_view_scroll_amount_to_activate(struct vidow_server *server,
 		return 0.0;
 	}
 	double viewport = output->viewport_x;
-	/* 全屏的那条列在条带上占一整屏 —— 和 Pass 2 同一个算法（不是给全屏开的
-	 * 特例：列就是列，只是它的宽度就是一屏）。 */
-	int cw = column_has_fullscreen(col) ? work.width : col->width;
-	double target = viewport;
-	double right = col->offset + cw;
-	if (right > viewport + work.width) {
-		target = right - work.width;
+	/* 和 Pass 2 同一个算法（focus_viewport_target）—— 「聚焦它会让视口滚到
+	 * 哪」和「聚焦之后视口真的在哪」必须是同一件事，不然居中策略一开，
+	 * focus-follows-mouse 的 max-scroll-amount 判的就全是错的。临时把焦点列
+	 * 换成它，算完还回去：这个函数只算不滚，不许改 server 的状态。 */
+	struct vidow_view *saved_focus = server->focused;
+	server->focused = view;
+	double target = focus_viewport_target(server, output, viewport, work.width);
+	server->focused = saved_focus;
+
+	/* 和 arrange 一样夹到 0..max_viewport：不夹的话「居中的列在条带最左 /
+	 * 最右」会报出一个实际滚不到的距离。 */
+	int max_viewport = 0;
+	struct vidow_column *c;
+	wl_list_for_each(c, output_shown_columns(server, output->wlr_output), link) {
+		if (!column_has_shown_views(c)) {
+			continue;
+		}
+		max_viewport = c->offset + column_strip_width(c, work.width);
 	}
-	if (col->offset < target) {
-		target = col->offset;
+	max_viewport -= work.width;
+	if (max_viewport < 0) {
+		max_viewport = 0;
+	}
+	if (target < 0.0) {
+		target = 0.0;
+	}
+	if (target > max_viewport) {
+		target = max_viewport;
 	}
 	return target > viewport ? target - viewport : viewport - target;
 }
@@ -2992,6 +3072,9 @@ void vidow_focus_view(struct vidow_view *view) {
 	struct vidow_view *previous = server->focused;
 	server->focused = view;
 	if (previous != view) {
+		/* center_focused_column = "on-overflow" 要知道「上一个焦点列」是谁
+		 * （见 focus_viewport_target）。换焦点时才动它。 */
+		server->last_focused_col = previous != NULL ? previous->column : NULL;
 		/* 「现在谁拿着键盘」是排查焦点问题（抢焦点 / 顶不上来）的第一现场，
 		 * 而且只在真的换人时才打一行。 */
 		wlr_log(WLR_INFO, "焦点: %s -> %s",
@@ -3765,8 +3848,16 @@ void vidow_cycle_column_width(struct vidow_server *server) {
 		return;
 	}
 
-	static const double presets[] = { 1.0 / 3.0, 0.5, 2.0 / 3.0 };
-	const size_t n = sizeof(presets) / sizeof(presets[0]);
+	/* 预设表来自配置（preset_column_widths，configs/20-layout.lua）：默认
+	 * 1/3、1/2、2/3，就是原来写死在这儿的那三个。表为空的话兜一个 0.5 ——
+	 * 配置解析保证至少一档，这里只是不给「空表除以零」的机会。 */
+	const double *presets = server->config.preset_column_widths;
+	size_t n = (size_t)server->config.preset_column_widths_count;
+	if (n == 0) {
+		static const double fallback[] = { 0.5 };
+		presets = fallback;
+		n = 1;
+	}
 	struct vidow_column *col = view->column;
 
 	/* 手动改宽度 = 退出「列最大化」这个状态：先把它按下来（宽度留在 1.0，

@@ -123,6 +123,24 @@ struct vidow_ease {
 enum vidow_mru_scope { VIDOW_MRU_ALL, VIDOW_MRU_WORKSPACE, VIDOW_MRU_OUTPUT };
 enum vidow_mru_layout { VIDOW_MRU_STRIP, VIDOW_MRU_GRID };
 
+/* 焦点列在视口里的居中策略（niri 的 `center-focused-column`，见
+ * configs/20-layout.lua 和 view.c 的 output_arrange Pass 2）。配置里写字符串，
+ * 落到这里就是整数。 */
+enum vidow_center_focused_column {
+	/* 默认，也是 vidow 一直以来的行为：换焦点只滚动「刚好让焦点列整个露出来」
+	 * 的那点距离，焦点列因此常常贴着视口左 / 右边缘。 */
+	VIDOW_CENTER_NEVER = 0,
+	/* 焦点列永远摆到视口正中（条带两头不够居中时夹到边界，见 view.c）。 */
+	VIDOW_CENTER_ALWAYS,
+	/* 焦点列和「上一个焦点列」能一起完整放进视口时不动；放不下（= 溢出）才
+	 * 居中。niri 的同名取值。 */
+	VIDOW_CENTER_ON_OVERFLOW,
+};
+
+/* 列宽预设表最多几档（niri 的 preset-column-widths 是个可长可短的表；vidow 的
+ * 配置值是一行文本，用一个定长数组收下）。 */
+#define VIDOW_MAX_COLUMN_WIDTH_PRESETS 16
+
 /* libinput 那些开 / 关设置的取值（configs/19-input.lua；套到设备上的地方在
  * input.c 的 vidow_input_apply_libinput）。
  *
@@ -177,6 +195,19 @@ struct vidow_config {
 	 * 拖动改宽（Mod+右键拖）不走它 —— 那个必须跟手。见 view.c 的
 	 * vidow_column_set_width。 */
 	int column_width_ms;
+	/* ---- 布局（configs/20-layout.lua）----
+	 * 焦点列在视口里的居中策略（niri 的 center-focused-column）。默认
+	 * VIDOW_CENTER_NEVER = vidow 一直以来的「最小滚动」行为，不配置零变化。
+	 * 见 view.c 的 output_arrange Pass 2。 */
+	enum vidow_center_focused_column center_focused_column;
+	/* 列宽预设表：cycle-column-width（Mod+R）在这几档之间循环，单位是「可用
+	 * 宽度的比例」（niri 的 preset-column-widths 里的 proportion）。默认
+	 * 1/3、1/2、2/3 —— 就是原来写死在 view.c 的那三个。 */
+	double preset_column_widths[VIDOW_MAX_COLUMN_WIDTH_PRESETS];
+	int preset_column_widths_count;
+	/* 新列（窗口规则没写 column_width 的）开出来多宽，比例。默认 0.5 —— 就是
+	 * 原来 view.c 里那个 DEFAULT_COLUMN_WIDTH。niri 的 default-column-width。 */
+	double default_column_width;
 	/* 切工作区的过渡时长（0 = 直接换，不动画）。旧的推开、新的从另一边进来，
 	 * 见 workspace.c 的 slide_start。 */
 	int workspace_switch_ms;
@@ -2000,6 +2031,11 @@ struct vidow_server {
 	uint64_t next_minimize_seq;
 
 	struct vidow_view *focused;
+	/* 上一次拿着焦点的**列**（center_focused_column = "on-overflow" 要用：
+	 * 「焦点列和上一个焦点列能不能一起完整放进视口」是居中与否的判据，见
+	 * view.c 的 focus_viewport_target）。列被销毁时（vidow_view_leave_column）
+	 * 会清掉，别拿着野指针。 */
+	struct vidow_column *last_focused_col;
 	struct vidow_layer_surface *keyboard_layer; /* exclusive layer grab */
 	struct wlr_output *focused_output;
 
@@ -2167,6 +2203,10 @@ bool vidow_config_parse_color(const char *value, float out[4]);
  * max-scroll-amount。 */
 bool vidow_config_parse_percent(const char *text, double *out);
 bool vidow_config_has(const char *key);
+/* 这个键的值是一张「数表」（`preset_column_widths = { 0.25, 0.5 }`）—— 文本形
+ * 式是逗号分隔的一串数（`"0.25, 0.5"`，`vidowmsg config` 读回来的也是它）。
+ * script.c 那边靠它把 Lua 数组转成这串文本，见 list_as_text()。 */
+bool vidow_config_list_has(const char *key);
 bool vidow_config_set(struct vidow_config *cfg, const char *key,
 		const char *value);
 const char *vidow_config_get(const struct vidow_config *cfg,
