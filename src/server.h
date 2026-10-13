@@ -91,6 +91,30 @@ enum vidow_easing {
 	VIDOW_EASE_OUT_BACK,
 	/* 阻尼振荡：冲过终点再回摆一下收住（见 anim.c）。窗口的「q 弹」就是它。 */
 	VIDOW_EASE_OUT_ELASTIC,
+	/* 配置里自己写的三次贝塞尔（`easing = "bezier 0.05 0.9 0.1 1.08"`）：形状和
+	 * 过冲幅度都从两个控制点来，见 anim.c 的 bezier_at()。追加在最后：前面那几个
+	 * 的值会经 IPC 露出去（vidowmsg anims 的 easing），别插在中间把老值挪了。 */
+	VIDOW_EASE_BEZIER,
+};
+
+/* 一条缓动曲线的完整描述：曲线名 + 它的参数。
+ *
+ * 为什么不再是一个裸枚举：曲线的参数（贝塞尔控制点、out_back 的回弹幅度）现在
+ * 是配置里写的，一个枚举装不下。曲线整份跟着动画走 —— anim.c 的 ease() 是纯函数，
+ * 不回头去读配置（配置随时可能重载，动画跑到一半换曲线会跳）。 */
+struct vidow_ease {
+	enum vidow_easing kind;
+	/* kind == VIDOW_EASE_BEZIER：两个控制点 (p1x,p1y) (p2x,p2y)。
+	 * x 必须落在 0..1（x(t) 要单调，否则「按 x 求 y」没有唯一解，见 config.c 的
+	 * parse_easing），y 随便 —— y > 1 的那部分就是过冲幅度。 */
+	double p1x, p1y, p2x, p2y;
+	/* kind == VIDOW_EASE_OUT_BACK：回弹幅度（0.10 = 冲过终点 10%）。
+	 * has_overshoot == false = 曲线里没写，跟着配置的全局 back_overshoot 走。 */
+	double overshoot;
+	bool has_overshoot;
+	/* 上面那个幅度反解出来的常数（见 vidow_ease_out_back_c1()）：配置解析时算
+	 * 一次放在这儿，ease() 每帧直接用 —— 每帧反解一次不值当。 */
+	double back_c1;
 };
 
 /* Alt+Tab 切换器（见 mru.c）的两个枚举：配置里写字符串
@@ -138,7 +162,7 @@ struct vidow_config {
 	int workspace_switch_ms;
 	int layer_open_ms;
 	int layer_close_ms;
-	enum vidow_easing easing;
+	struct vidow_ease easing;
 
 	double open_alpha_from; /* opacity at t=0 while opening */
 	int open_slide_px;      /* slide-in distance while opening */
@@ -148,8 +172,12 @@ struct vidow_config {
 	/* 每个阶段自己的缓动曲线：默认 out_elastic —— 入场和关闭会过冲一下再
 	 * 收住。上面那个 easing 只管位移补间、layer surface 和 overview：布局重排
 	 * 要的是「快而稳」，过冲反而晃眼。 */
-	enum vidow_easing open_easing;
-	enum vidow_easing close_easing;
+	struct vidow_ease open_easing;
+	struct vidow_ease close_easing;
+	/* 回弹幅度：out_back 冲过终点多少（0.10 = 10%）。三个曲线都能用 —— 曲线自己
+	 * 写了幅度（`easing = "out_back 0.2"`）的以曲线为准，这里管没写的那些。
+	 * 见 config.c 的 sync_easings()。 */
+	double back_overshoot;
 	/* 入场从多小弹出来 / 关闭缩到多小（1.0 = 不缩放）。 */
 	double open_scale_from;
 	double close_scale_to;
@@ -367,7 +395,7 @@ struct vidow_anim {
 	int64_t start_ns;
 	int64_t duration_ns;
 	const char *tag; /* for logs */
-	enum vidow_easing easing;
+	struct vidow_ease easing;
 	/* t = 曲线值（可能过冲，位移/缩放用它），linear = 线性进度（单调，透明度用它）*/
 	void (*update)(void *data, double t, double linear);
 	void (*done)(void *data, bool cancelled);
@@ -726,7 +754,7 @@ struct vidow_closing {
 	double off_y;
 	int slide_px;
 	double anim_scale_to;   /* 关闭动画结束时的缩放（1.0 = 不缩） */
-	enum vidow_easing easing;
+	struct vidow_ease easing;
 	int x, y, w, h;
 	struct vidow_fx_geo geo; /* 快照里哪一块是「可见窗口」（见上） */
 	double scale;
@@ -2044,6 +2072,10 @@ bool vidow_config_set(struct vidow_config *cfg, const char *key,
 		const char *value);
 const char *vidow_config_get(const struct vidow_config *cfg,
 		const char *key);
+/* 一条曲线打回配置里能写的那种文本（`vidowmsg config easing` 看到的就是它，
+ * 拷回 config.lua 能原样再读一遍）。buf 至少 64 字节。 */
+const char *vidow_ease_text(const struct vidow_ease *ease, char *buf,
+		size_t size);
 /* 配置「族」：一族的键既能一个值管全部，也能写成一张表只盖其中几项
  * （`gaps = { top = 30, inner = 20 }`、`border = { width = 0 }`）。
  * 解析表的地方在 script.c（Lua 那边），这里只回答「这个名字是不是族」、
@@ -2134,9 +2166,11 @@ void vidow_configwatch_add(struct vidow_server *server, const char *path);
 
 int64_t vidow_now_ns(void);
 struct vidow_anim *vidow_anim_start(struct vidow_server *server,
-		const char *tag, int duration_ms, enum vidow_easing easing,
+		const char *tag, int duration_ms, struct vidow_ease easing,
 		void (*update)(void *data, double t, double linear),
 		void (*done)(void *data, bool cancelled), void *data);
+/* 回弹幅度 → out_back 里那个常数（峰值 = 4c1³/(27(c1+1)²) 的反解）。见 anim.c。 */
+double vidow_ease_out_back_c1(double overshoot);
 void vidow_anim_cancel(struct vidow_anim *anim);
 void vidow_anim_tick(struct vidow_server *server);
 void vidow_output_render(struct vidow_output *output);
@@ -2698,7 +2732,7 @@ void vidow_closing_start(struct vidow_server *server,
 		struct wlr_scene_tree *parent, struct wlr_buffer *snapshot,
 		const struct vidow_fx_geo *geo, int x, int y, int w, int h,
 		int duration_ms, int slide_px, bool decorate, const char *shader_name,
-		double scale, enum vidow_easing easing, double anim_scale_to,
+		double scale, struct vidow_ease easing, double anim_scale_to,
 		const struct vidow_rule_eff *eff, bool fullscreen);
 
 /* ------------------------------------------------------------------ layout */

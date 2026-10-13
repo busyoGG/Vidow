@@ -3601,7 +3601,10 @@ $ wlrctl toplevel close title:zen-two   # request_close → 只剩 zen-one
 不写 shader 时的默认效果：淡入淡出 + 垂直滑动 + 缩放弹跳（`open_alpha_from` /
 `open_slide_px` / `open_scale_from` / `close_alpha_to` / `close_slide_px` /
 `close_scale_to`），缓动可选
-`linear` / `out_cubic` / `out_quint` / `in_out_cubic` / `out_back` / `out_elastic`。
+`linear` / `out_cubic` / `out_quint` / `in_out_cubic` / `out_back` / `out_elastic`，
+也可以自己写一条三次贝塞尔（`easing = "bezier 0.05 0.9 0.1 1.08"`，四个数是 x1 y1 x2 y2，
+y > 1 的部分就是过冲幅度）或者单独调回弹幅度（`easing = "out_back 0.25"`；全局
+`back_overshoot` 管所有没单独写幅度的 `out_back`，默认 0.10 = 冲过终点 10%）。
 
 **默认是「q 弹」的**：入场从 0.82 弹到 1.0（`open_easing = "out_elastic"`，冲到
 1.02 再收住），关闭缩到 0.82 之前先缩过头一点再涨回来。`out_elastic` 是阻尼余弦
@@ -5048,6 +5051,41 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
       - 另一个踩到的坑（不是 vidow 的）：`awww img` 默认带过渡动画，动画没跑完就进全景，抓到的
         底衬是**半透明混合**的（量到 (107,66,38)，金色和洋红混在一起）。验证 / 截图时加
         `--transition-type none`。
+
+247. **缓动曲线能自己写了：自定义三次贝塞尔 + 回弹幅度可调**（用户：「回弹幅度应该允许配置 回弹的时间也允许配置 类似 hyprland 那样」）
+
+     - 时间本来就能配（`window_move_ms` / `workspace_switch_ms` / `column_width_ms`），缺的是
+       **幅度**：`out_back` 的过冲常数写死在 `src/anim.c` 的 `ease()` 里（`c1 = 1.70158`），
+       用户改不了。现在曲线是配置里写的数据，不再是一个枚举。
+     - 三种写法，老那六个名字（`linear` / `out_cubic` / `out_quint` / `in_out_cubic` /
+       `out_back` / `out_elastic`）一个字没变，默认值也没变：
+
+       ```lua
+       easing = "out_back"                     -- 老写法：回弹幅度跟全局走（默认 0.10 = 10%）
+       easing = "out_back 0.25"                -- 这条曲线冲过终点 25%
+       easing = "bezier 0.05 0.9 0.1 1.08"    -- 自定义三次贝塞尔：x1 y1 x2 y2
+       back_overshoot = 0.10                   -- 全局回弹幅度：三条曲线里没单独写幅度的跟它
+       ```
+       `bezier` 的 x 必须在 0..1（x 管进度，要单调）、y 在 -1..3，**y > 1 的那部分就是过冲
+       幅度**（1.08 ≈ 冲过 1.7%，1.5 ≈ 冲过 18%）；`back_overshoot` 和曲线里的幅度取 0..1。
+       超出范围、少给参数、名字拼错都当场报错并说清楚错在哪，**不静默退回默认曲线**。
+     - 贝塞尔是**按 x 求 y**（先解 x(t) = x 再取 y(t)），不是拿进度当参数 t 直接取 y ——
+       后者等于「进度按 t 均匀」，曲线形状完全不对（该冲的地方不冲）。x(t) 单调，二分 32 次
+       就够（比要求的 1e-4 精度高几个数量级），不引牛顿迭代：x'(t) 在 x1 = 1 / x2 = 0 这类
+       边上会退化。`out_back` 的幅度按峰值 `s = 4c1³/(27(c1+1)²)` 反解 c1，配置解析时算一次
+       （默认 0.10 反解回 1.701540，和原来写死的 1.70158 差 4e-5 → 曲线差 ~4e-7，看不出来）。
+     - 量到的过冲（headless 1280x720，`column_width_ms = 600` 走 `cycle-column-width`，
+       每 4ms 采一次 `vidowmsg columns` 的 width）：`linear` 0.0%、`out_back`（默认 0.10）
+       10.0%、`out_back 0.30` 30.3%、`back_overshoot = 0.50` 50.2%、`bezier 0.05 0.9 0.1 1.08`
+       1.9%、`bezier 0.05 0.9 0.1 1.50` 18.5% —— 跟按曲线算出来的 1.71% / 18.12% 对得上
+       （差值来自 4ms 采样和像素取整）。
+     - `vidowmsg config easing` 打回来的就是能直接抄回配置的写法（`"bezier 0.05 0.9 0.1 1.08"`、
+       `"out_back 0.2"`），往返一致；`vidowmsg anims` 每条动画多一个 `curve` 字段（曲线名连参数）。
+     - 回归：`test-config.sh`（新增第 9 节：默认值不变 / 三种写法 / 8 种写错和越界都当场报错
+       且值不变）、`test-defaultconfig.sh`（config.example 逐字节一致、96 个键和内置默认值
+       一样）、`test-widthanim.sh` / `test-openanim.sh` / `test-ipc.sh` 全过。
+       `test-closeanim.sh` 有一项「位移补间 30% 处它还在路上」是**改之前就红**的（拿 HEAD
+       干净副本编出来跑，数值一模一样：754 vs 判据的 <500），跟这次改动无关。
 
 246. **预览（overview / MRU）里不叠那层模糊 —— 模糊只画在屏幕上那扇窗口上**（用户：「overview
       和 mru 的预览不应该导致窗口内容变模糊」；期望是「预览里画的是窗口的**真实缓冲**，

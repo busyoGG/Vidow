@@ -17,6 +17,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>
+#include <math.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -193,7 +194,8 @@ static const struct entry entries[] = {
 		"layer-shell 消失的动画时长" },
 	{ "easing",          K_EASING, OFF(easing),          SZ(easing), 3,
 		"缓动曲线：linear / out_cubic / out_quint / in_out_cubic / out_back / "
-		"out_elastic" },
+		"out_elastic，也可以自己给一条三次贝塞尔 \"bezier 0.05 0.9 0.1 1.08\""
+		"（x1 y1 x2 y2；x 在 0..1，y > 1 的那部分就是过冲幅度）" },
 	{ "open_alpha_from", K_DOUBLE, OFF(open_alpha_from), SZ(open_alpha_from), 3,
 		"打开动画的起始透明度" },
 	{ "open_slide_px",   K_INT,    OFF(open_slide_px),   SZ(open_slide_px), 3,
@@ -204,9 +206,13 @@ static const struct entry entries[] = {
 	{ "close_slide_px",  K_INT,    OFF(close_slide_px),  SZ(close_slide_px), 3,
 		"关闭动画的结束位移（像素）" },
 	{ "open_easing",     K_EASING, OFF(open_easing),     SZ(open_easing), 3,
-		"打开动画的缓动曲线（默认 out_elastic：过冲一下再收住）" },
+		"打开动画的缓动曲线（默认 out_elastic：过冲一下再收住；写法同 easing，"
+		"贝塞尔和 \"out_back 0.2\" 这种带幅度的也认）" },
 	{ "close_easing",    K_EASING, OFF(close_easing),    SZ(close_easing), 3,
 		"关闭动画的缓动曲线（管位移 / 缩放；透明度不受它影响）" },
+	{ "back_overshoot",  K_DOUBLE, OFF(back_overshoot),  SZ(back_overshoot), 3,
+		"回弹幅度：out_back 冲过终点多少（0.10 = 10%，0 = 不过冲）。三条曲线都能"
+		"用；曲线自己写了幅度的（easing = \"out_back 0.2\"）以曲线为准" },
 	{ "open_scale_from", K_DOUBLE, OFF(open_scale_from), SZ(open_scale_from), 3,
 		"打开动画的起始缩放（1.0 = 不缩；0.82 = 弹一下）" },
 	{ "close_scale_to",  K_DOUBLE, OFF(close_scale_to),  SZ(close_scale_to), 3,
@@ -605,6 +611,197 @@ static const char *easing_names[] = {
 	"out_elastic",
 };
 
+/* 一条「只有名字」的曲线（老那六个名字的写法）：参数清空，回弹幅度跟全局
+ * back_overshoot 走。 */
+static void ease_set(struct vidow_ease *ease, enum vidow_easing kind) {
+	memset(ease, 0, sizeof(*ease));
+	ease->kind = kind;
+}
+
+/* 曲线的取值范围。都是「写错一位」的兜底：0.9 敲成 9、1.08 敲成 108 要当场
+ * 报错，不能悄悄画出一条怪物曲线（动画直接飞出屏幕，用户还以为是自己配错了）。 */
+#define EASE_Y_MIN (-1.0)
+#define EASE_Y_MAX 3.0
+#define EASE_OVERSHOOT_MAX 1.0
+
+/* 从 *p 读一个数，读到了就把 *p 挪到数字后面。整串都得是数（"0.1abc" 不算），
+ * 还得好端端落在 double 里。数字之间的分隔符：空白或者逗号（从 CSS 那边抄
+ * 写法的人习惯写逗号）。 */
+static bool parse_number(const char **p, double *out) {
+	while (isspace((unsigned char)**p) || **p == ',') {
+		(*p)++;
+	}
+	char *end = NULL;
+	errno = 0;
+	double v = strtod(*p, &end);
+	if (end == *p || errno == ERANGE || !isfinite(v)) {
+		return false;
+	}
+	*p = end;
+	*out = v;
+	return true;
+}
+
+/* 后面还有没有别的东西（只允许空白 / 逗号）。 */
+static bool parse_at_end(const char *p) {
+	while (isspace((unsigned char)*p) || *p == ',') {
+		p++;
+	}
+	return *p == '\0';
+}
+
+/* 配置里怎么写一条缓动曲线（README 247）：
+ *
+ *     "out_cubic"                     —— 老那六个名字，一个字没变
+ *     "bezier 0.05 0.9 0.1 1.08"      —— 自定义三次贝塞尔：x1 y1 x2 y2
+ *     "out_back 0.15"                 —— out_back 的回弹幅度：冲过终点 15%
+ *                                        （不写就跟全局 back_overshoot 走）
+ *
+ * 认不出来就报一条能照着改的错，然后返回 false。**不静默退回默认曲线** ——
+ * 那样用户只会看到「配了没用」，还得自己猜哪儿写错了。 */
+static bool parse_easing(const char *value, struct vidow_ease *out) {
+	/* 先解析到一个临时变量，认下来了才写回 out —— 写错的配置不该把原来那条
+	 * 曲线改掉一半（"out_back 5" 这种：幅度越界了，可曲线名已经变成了
+	 * out_back）。 */
+	struct vidow_ease ease;
+
+	/* 整串就是一个名字（老写法）。 */
+	for (size_t i = 0; i < VIDOW_EASE_OUT_ELASTIC + 1; i++) {
+		if (strcmp(value, easing_names[i]) == 0) {
+			ease_set(out, (enum vidow_easing)i);
+			return true;
+		}
+	}
+
+	/* 带参数的写法：第一个词是名字，后面是它的数。 */
+	const char *p = value;
+	while (isspace((unsigned char)*p)) {
+		p++;
+	}
+	const char *head = p;
+	while (*p != '\0' && !isspace((unsigned char)*p)) {
+		p++;
+	}
+	size_t head_len = (size_t)(p - head);
+
+	if (head_len == 6 && strncmp(head, "bezier", 6) == 0) {
+		double v[4];
+		for (int i = 0; i < 4; i++) {
+			if (!parse_number(&p, &v[i])) {
+				wlr_log(WLR_ERROR, "config: easing '%s' 不对：bezier 要四个数"
+					"（x1 y1 x2 y2），比如 \"bezier 0.05 0.9 0.1 1.08\"",
+					value);
+				return false;
+			}
+		}
+		if (!parse_at_end(p)) {
+			wlr_log(WLR_ERROR, "config: easing '%s' 不对：bezier 只要四个数，"
+				"后面还有多的东西", value);
+			return false;
+		}
+		if (v[0] < 0.0 || v[0] > 1.0 || v[2] < 0.0 || v[2] > 1.0) {
+			wlr_log(WLR_ERROR, "config: easing '%s' 不对：两个 x 控制点要在 "
+				"0..1（x 管进度，得单调；过冲幅度靠 y，y > 1 就是冲过头）",
+				value);
+			return false;
+		}
+		if (v[1] < EASE_Y_MIN || v[1] > EASE_Y_MAX ||
+				v[3] < EASE_Y_MIN || v[3] > EASE_Y_MAX) {
+			wlr_log(WLR_ERROR, "config: easing '%s' 不对：两个 y 控制点要在 "
+				"%.0f..%.0f（1.08 = 冲过头 8%%，0.9 = 收着点）",
+				value, EASE_Y_MIN, EASE_Y_MAX);
+			return false;
+		}
+		ease_set(&ease, VIDOW_EASE_BEZIER);
+		ease.p1x = v[0];
+		ease.p1y = v[1];
+		ease.p2x = v[2];
+		ease.p2y = v[3];
+		*out = ease;
+		return true;
+	}
+
+	if (head_len == 8 && strncmp(head, "out_back", 8) == 0) {
+		ease_set(&ease, VIDOW_EASE_OUT_BACK);
+		if (parse_at_end(p)) {
+			/* 没写幅度：跟全局 back_overshoot 走。 */
+			*out = ease;
+			return true;
+		}
+		double s = 0.0;
+		if (!parse_number(&p, &s) || !parse_at_end(p)) {
+			wlr_log(WLR_ERROR, "config: easing '%s' 不对：out_back 后面只能跟"
+				"一个回弹幅度（0.15 = 冲过终点 15%%），比如 "
+				"\"out_back 0.15\"", value);
+			return false;
+		}
+		if (s < 0.0 || s > EASE_OVERSHOOT_MAX) {
+			wlr_log(WLR_ERROR, "config: easing '%s' 不对：回弹幅度要在 0..%.2f"
+				"（0.10 = 冲过终点 10%%，0 = 不过冲）", value,
+				EASE_OVERSHOOT_MAX);
+			return false;
+		}
+		ease.overshoot = s;
+		ease.has_overshoot = true;
+		*out = ease;
+		return true;
+	}
+
+	wlr_log(WLR_ERROR, "config: 没有 '%s' 这条缓动曲线（能写：%s / %s / %s / "
+		"%s / %s / %s，或者 \"bezier x1 y1 x2 y2\"、\"out_back 0.15\"）",
+		value, easing_names[0], easing_names[1], easing_names[2],
+		easing_names[3], easing_names[4], easing_names[5]);
+	return false;
+}
+
+/* 把回弹幅度落到曲线上。
+ *
+ * 幅度有两条路：曲线自己写（`easing = "out_back 0.2"`）或者走全局的
+ * back_overshoot。两条路在这里合流：曲线自己写了就用它的，没写就跟全局走；
+ * 顺手把幅度反解成 ease() 要用的常数（每帧反解一次太亏，见 anim.c）。
+ * 改完三个 easing 键、改完 back_overshoot 都要过一遍（见 apply()）。 */
+static void sync_easings(struct vidow_config *cfg) {
+	struct vidow_ease *all[3] = {
+		&cfg->easing, &cfg->open_easing, &cfg->close_easing,
+	};
+	for (int i = 0; i < 3; i++) {
+		struct vidow_ease *e = all[i];
+		if (e->kind != VIDOW_EASE_OUT_BACK) {
+			continue;
+		}
+		if (!e->has_overshoot) {
+			e->overshoot = cfg->back_overshoot;
+		}
+		e->back_c1 = vidow_ease_out_back_c1(e->overshoot);
+	}
+}
+
+/* 一条曲线打回配置里能写的那种文本：`vidowmsg config easing` 看到的就是它，
+ * 拷回 config.lua 能原样再读一遍（往返一致）。 */
+const char *vidow_ease_text(const struct vidow_ease *ease, char *buf,
+		size_t size) {
+	switch (ease->kind) {
+	case VIDOW_EASE_BEZIER:
+		snprintf(buf, size, "bezier %.10g %.10g %.10g %.10g",
+			ease->p1x, ease->p1y, ease->p2x, ease->p2y);
+		break;
+	case VIDOW_EASE_OUT_BACK:
+		if (ease->has_overshoot) {
+			snprintf(buf, size, "out_back %.10g", ease->overshoot);
+		} else {
+			snprintf(buf, size, "out_back");
+		}
+		break;
+	default:
+		snprintf(buf, size, "%s",
+			easing_names[ease->kind >= 0 &&
+				ease->kind <= VIDOW_EASE_OUT_ELASTIC
+				? ease->kind : VIDOW_EASE_LINEAR]);
+		break;
+	}
+	return buf;
+}
+
 static const char *mru_scope_names[] = { "all", "workspace", "output" };
 static const char *mru_layout_names[] = { "strip", "grid" };
 
@@ -622,16 +819,6 @@ static bool parse_mru_layout(const char *value, enum vidow_mru_layout *out) {
 	for (size_t i = 0; i < 2; i++) {
 		if (strcmp(value, mru_layout_names[i]) == 0) {
 			*out = (enum vidow_mru_layout)i;
-			return true;
-		}
-	}
-	return false;
-}
-
-static bool parse_easing(const char *value, enum vidow_easing *out) {
-	for (size_t i = 0; i < VIDOW_EASE_OUT_ELASTIC + 1; i++) {
-		if (strcmp(value, easing_names[i]) == 0) {
-			*out = (enum vidow_easing)i;
 			return true;
 		}
 	}
@@ -679,6 +866,11 @@ static bool apply(struct vidow_config *cfg, const char *key, const char *value) 
 			return true;
 		case K_DOUBLE:
 			*(double *)field = atof(value);
+			/* 回弹幅度是派生的（见 sync_easings）：改了它，三条曲线
+			 * 得跟着重算一遍。 */
+			if (strcmp(e->key, "back_overshoot") == 0) {
+				sync_easings(cfg);
+			}
 			return true;
 		case K_BOOL:
 			*(bool *)field = strcmp(value, "0") != 0 &&
@@ -687,10 +879,12 @@ static bool apply(struct vidow_config *cfg, const char *key, const char *value) 
 				strcasecmp(value, "off") != 0;
 			return true;
 		case K_EASING:
-			if (!parse_easing(value, (enum vidow_easing *)field)) {
-				wlr_log(WLR_ERROR, "config: unknown easing '%s'", value);
+			/* parse_easing 自己会报「错在哪」（见那边），这里只管收结果。 */
+			if (!parse_easing(value, (struct vidow_ease *)field)) {
 				return false;
 			}
+			/* 曲线里没写回弹幅度的，跟着全局 back_overshoot 走。 */
+			sync_easings(cfg);
 			return true;
 		case K_MRU_SCOPE:
 			if (!parse_mru_scope(value, (enum vidow_mru_scope *)field)) {
@@ -772,6 +966,7 @@ static void warn_legacy_flat(void) {
 
 static void defaults(struct vidow_config *cfg) {
 	memset(cfg, 0, sizeof(*cfg));
+
 	cfg->force_render_hz = 60; /* 视口外补帧：跟屏幕刷新率差不多就够 */
 	/* 激活令牌不过期：wlroots 默认 30 秒，而「弹通知」和「点通知」之间常常隔着
 	 * 几分钟 —— 令牌过期了 wlroots 直接把激活请求丢掉，我们连信号都收不到
@@ -884,7 +1079,10 @@ static void defaults(struct vidow_config *cfg) {
 	cfg->workspace_switch_ms = 200;
 	cfg->layer_open_ms = 200;
 	cfg->layer_close_ms = 150;
-	cfg->easing = VIDOW_EASE_OUT_CUBIC;
+	ease_set(&cfg->easing, VIDOW_EASE_OUT_CUBIC);
+	/* out_back 的回弹幅度：0.10 = 冲过终点 10%，就是原来写死那个常数的样子。
+	 * 曲线自己带幅度的（"out_back 0.2"）不看这个值（见 sync_easings）。 */
+	cfg->back_overshoot = 0.10;
 
 	cfg->open_alpha_from = 0.0;
 	cfg->open_slide_px = 22;
@@ -892,8 +1090,8 @@ static void defaults(struct vidow_config *cfg) {
 	cfg->close_slide_px = 14;
 	/* 入场/关闭默认回弹：从 0.82 弹到 1.0，冲到 1.5% 再收住。上面的 easing
 	 * 保持 out_cubic —— 布局重排不该过冲。 */
-	cfg->open_easing = VIDOW_EASE_OUT_ELASTIC;
-	cfg->close_easing = VIDOW_EASE_OUT_ELASTIC;
+	ease_set(&cfg->open_easing, VIDOW_EASE_OUT_ELASTIC);
+	ease_set(&cfg->close_easing, VIDOW_EASE_OUT_ELASTIC);
 	cfg->open_scale_from = 0.82;
 	cfg->close_scale_to = 0.82;
 
@@ -1038,8 +1236,8 @@ const char *vidow_config_get(const struct vidow_config *cfg,
 		snprintf(buf, 64, "%s", *(const bool *)field ? "true" : "false");
 		break;
 	case K_EASING:
-		snprintf(buf, 64, "%s",
-			easing_names[*(const enum vidow_easing *)field]);
+		/* 打回配置里能写的样子：自定义曲线连参数一起（见 vidow_ease_text）。 */
+		vidow_ease_text((const struct vidow_ease *)field, buf, 64);
 		break;
 	case K_MRU_SCOPE: {
 		int v = *(const enum vidow_mru_scope *)field;
@@ -1079,6 +1277,9 @@ void vidow_config_each(const struct vidow_config *cfg,
 }
 
 void vidow_config_log(const struct vidow_config *cfg) {
+	/* 曲线名要能连参数一起打（自定义贝塞尔），所以借几个栈上的缓冲 ——
+	 * 一次日志里三条曲线各要一个。 */
+	char ease_buf[3][64];
 	wlr_log(WLR_INFO,
 		"config: decor=%s prefer_no_csd=%s radius=%.1f border=%.1f "
 		"shadow=%.1f/%.1f,%d opacity=%.2f noise=%.2f blur=%s all=%s "
@@ -1123,13 +1324,16 @@ void vidow_config_log(const struct vidow_config *cfg) {
 		"config: open=%dms(%s %.2f) close=%dms(%s %.2f) move=%dms "
 		"column_width=%dms "
 		"layer=%d/%dms easing=%s shader=%s open=%s close=%s idle=%s",
-		cfg->window_open_ms, easing_names[cfg->open_easing],
+		cfg->window_open_ms,
+		vidow_ease_text(&cfg->open_easing, ease_buf[0], sizeof(ease_buf[0])),
 		cfg->open_scale_from,
-		cfg->window_close_ms, easing_names[cfg->close_easing],
+		cfg->window_close_ms,
+		vidow_ease_text(&cfg->close_easing, ease_buf[1], sizeof(ease_buf[1])),
 		cfg->close_scale_to,
 		cfg->window_move_ms,
 		cfg->column_width_ms,
-		cfg->layer_open_ms, cfg->layer_close_ms, easing_names[cfg->easing],
+		cfg->layer_open_ms, cfg->layer_close_ms,
+		vidow_ease_text(&cfg->easing, ease_buf[2], sizeof(ease_buf[2])),
 		cfg->shader_enabled ? "on" : "off",
 		cfg->shader_open[0] ? cfg->shader_open : "-",
 		cfg->shader_close[0] ? cfg->shader_close : "-",

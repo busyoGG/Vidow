@@ -19,7 +19,7 @@ workspace_switch_ms = 200
 layer_open_ms = 200
 -- layer-shell 消失的动画时长
 layer_close_ms = 150
--- 缓动曲线：linear / out_cubic / out_quint / in_out_cubic / out_back / out_elastic
+-- 缓动曲线：linear / out_cubic / out_quint / in_out_cubic / out_back / out_elastic，也可以自己给一条三次贝塞尔 "bezier 0.05 0.9 0.1 1.08"（x1 y1 x2 y2；x 在 0..1，y > 1 的那部分就是过冲幅度）
 easing = "out_cubic"
 -- 打开动画的起始透明度
 open_alpha_from = 0
@@ -29,10 +29,12 @@ open_slide_px = 22
 close_alpha_to = 0
 -- 关闭动画的结束位移（像素）
 close_slide_px = 14
--- 打开动画的缓动曲线（默认 out_elastic：过冲一下再收住）
+-- 打开动画的缓动曲线（默认 out_elastic：过冲一下再收住；写法同 easing，贝塞尔和 "out_back 0.2" 这种带幅度的也认）
 open_easing = "out_elastic"
 -- 关闭动画的缓动曲线（管位移 / 缩放；透明度不受它影响）
 close_easing = "out_elastic"
+-- 回弹幅度：out_back 冲过终点多少（0.10 = 10%，0 = 不过冲）。三条曲线都能用；曲线自己写了幅度的（easing = "out_back 0.2"）以曲线为准
+back_overshoot = 0.1
 -- 打开动画的起始缩放（1.0 = 不缩；0.82 = 弹一下）
 open_scale_from = 0.82
 -- 关闭动画的结束缩放（1.0 = 不缩）

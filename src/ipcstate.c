@@ -150,7 +150,11 @@ static void json_anim(struct jbuf *b, struct vidow_anim *anim) {
 	jb_kv_int(b, "duration_ms", (long long)(anim->duration_ns / 1000000));
 	jb_kv_int(b, "elapsed_ms",
 		(long long)((vidow_now_ns() - anim->start_ns) / 1000000));
-	jb_kv_int(b, "easing", anim->easing);
+	jb_kv_int(b, "easing", anim->easing.kind);
+	/* 曲线名连参数一起给：自定义贝塞尔光看一个数字看不出形状。 */
+	char curve[64];
+	jb_kv_str(b, "curve",
+		vidow_ease_text(&anim->easing, curve, sizeof(curve)));
 	jb_obj_end(b);
 }
 

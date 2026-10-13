@@ -3834,7 +3834,7 @@ void vidow_closing_start(struct vidow_server *server,
 		struct wlr_scene_tree *parent, struct wlr_buffer *snapshot,
 		const struct vidow_fx_geo *geo, int x, int y, int w, int h,
 		int duration_ms, int slide_px, bool decorate, const char *shader_name,
-		double scale, enum vidow_easing easing, double anim_scale_to,
+		double scale, struct vidow_ease easing, double anim_scale_to,
 		const struct vidow_rule_eff *eff, bool fullscreen) {
 	if (snapshot == NULL || duration_ms <= 0 || w <= 0 || h <= 0) {
 		return;

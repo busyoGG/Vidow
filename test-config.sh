@@ -11,6 +11,9 @@
 #   7) $VIDOW_CONFIG 能换配置文件位置
 #   8) vidow.exec 的选项：{ status = true } 拿退出码 / { wait = false } 撒手跑 /
 #      并掉的老名字（vidow.spawn、vidow.exec_status）给一句人话而不是 "nil value"
+#   9) 缓动曲线：老的六个名字一个字没变；能自己写三次贝塞尔（"bezier x1 y1 x2 y2"）
+#      和调回弹幅度（"out_back 0.2" / 全局 back_overshoot）；写错 / 越界当场报错，
+#      值不变（不静默退回默认）
 set -u
 cd "$(dirname "$0")"
 
@@ -71,6 +74,8 @@ stop_vidow() {
 	kill -KILL -- "-$VIDOW_PID" 2>/dev/null
 	VIDOW_PID=""
 }
+
+VM="./build/vidowmsg"
 
 getcfg() { # getcfg <键> —— 读不到就打空
 	./build/vidowmsg get-config "$1" 2>/dev/null |
@@ -192,6 +197,82 @@ grep -aq "OPT badopt .*不认识的选项 'nope'" "$LOG" &&
 grep -aq "OPT once_wait .*撒手跑的" "$LOG" &&
 	pass "exec_once 传 { wait = true } 报错（它等不了）" \
 	|| fail "exec_once 的 wait = true 没报错：$(grep -a 'OPT once_wait' "$LOG" | tail -1)"
+grep -aq "Assertion" "$LOG" && fail "退出时日志里有 assert" || pass "退出时没有 assert"
+stop_vidow
+
+# ------------------------------------------- 9) 缓动曲线的写法（README 247）
+mark "缓动曲线：老的六个名字不变，能自己写贝塞尔 / 调回弹幅度"
+write_cfg 'scale = "1"' 'xwayland = false'
+start_vidow
+# 什么都不配 = 老默认值，一个字没变
+[ "$(getcfg easing)" = "out_cubic" ] && pass "easing 默认还是 out_cubic" \
+	|| fail "easing 默认变了：$(getcfg easing)"
+[ "$(getcfg open_easing)" = "out_elastic" ] &&
+	pass "open_easing 默认还是 out_elastic" ||
+	fail "open_easing 默认变了：$(getcfg open_easing)"
+[ "$(getcfg close_easing)" = "out_elastic" ] &&
+	pass "close_easing 默认还是 out_elastic" ||
+	fail "close_easing 默认变了：$(getcfg close_easing)"
+[ "$(getcfg back_overshoot)" = "0.1" ] &&
+	pass "back_overshoot 默认 0.1（= 原来写死那个常数的过冲幅度）" ||
+	fail "back_overshoot 默认不对：$(getcfg back_overshoot)"
+
+# 自定义贝塞尔：四个数按原样读回来（往返一致 —— vidowmsg 打出来的能直接抄回配置）
+$VM set-config easing "bezier 0.05 0.9 0.1 1.08" >/dev/null 2>&1 &&
+	pass "set-config 收下了 \"bezier 0.05 0.9 0.1 1.08\"" ||
+	fail "贝塞尔曲线没被认下来"
+waitcfg easing "bezier 0.05 0.9 0.1 1.08" &&
+	pass "读回来一模一样（vidowmsg config easing 能原样抄回配置）" ||
+	fail "读回来是 $(getcfg easing)"
+# 老名字照旧能用
+$VM set-config close_easing "out_back" >/dev/null 2>&1
+waitcfg close_easing "out_back" && pass "老名字 out_back 照旧能用" ||
+	fail "out_back 不好使了：$(getcfg close_easing)"
+# 回弹幅度：曲线里写 / 全局键，两种都认
+$VM set-config open_easing "out_back 0.2" >/dev/null 2>&1
+waitcfg open_easing "out_back 0.2" &&
+	pass "曲线里带幅度：open_easing = \"out_back 0.2\"" ||
+	fail "带幅度的 out_back 没认：$(getcfg open_easing)"
+$VM set-config back_overshoot 0.25 >/dev/null 2>&1
+waitcfg back_overshoot "0.25" && pass "全局键 back_overshoot = 0.25 生效" ||
+	fail "back_overshoot 没生效：$(getcfg back_overshoot)"
+# 配置文件里写（走自动重载那条路，和 set-config 分开验）
+write_cfg 'scale = "1"' 'xwayland = false' \
+	'easing = "bezier 0.05 0.9 0.1 1.08"' 'back_overshoot = 0.3'
+waitcfg easing "bezier 0.05 0.9 0.1 1.08" &&
+	pass "配置文件里写自定义贝塞尔，自动重载后生效" ||
+	fail "配置文件里的贝塞尔没生效：$(getcfg easing)"
+waitcfg back_overshoot "0.3" && pass "配置文件里的 back_overshoot 也生效" ||
+	fail "配置文件里的 back_overshoot 没生效：$(getcfg back_overshoot)"
+grep -aq "easing=bezier 0.05 0.9 0.1 1.08" "$LOG" &&
+	pass "日志里的曲线名连参数一起打（看得见配的是哪条）" ||
+	fail "日志里的曲线名没有参数：$(grep -a 'easing=' "$LOG" | tail -1)"
+
+# 写错 / 越界：当场报错，而且**值不变**（不静默退回默认，也不改一半）
+bad_easing() { # bad_easing <值> <日志里该出现的话> <标签>
+	$VM set-config easing "$1" >/dev/null 2>&1 &&
+		{ fail "$3：'$1' 居然被收下了"; return; }
+	grep -aqF "$2" "$LOG" || { fail "$3：报错信息不对（想要：$2）"; return; }
+	[ "$(getcfg easing)" = "bezier 0.05 0.9 0.1 1.08" ] ||
+		{ fail "$3：值被改掉了（现在是 $(getcfg easing)）"; return; }
+	pass "$3：非 0 退出 + 日志说清楚了，值没被改掉"
+}
+bad_easing "bezier 0.05 0.9" "bezier 要四个数" "贝塞尔少给了参数"
+bad_easing "bezier 1.5 0.9 0.1 1.08" "两个 x 控制点要在 0..1" "贝塞尔 x 越界"
+bad_easing "bezier 0.05 9 0.1 1.08" "两个 y 控制点要在" "贝塞尔 y 越界（0.9 敲成 9）"
+bad_easing "bezier 0.05 0.9 0.1 1.08 3" "后面还有多的东西" "贝塞尔多给了个数"
+bad_easing "out_back 5" "回弹幅度要在 0..1.00" "回弹幅度越界"
+bad_easing "out_back x" "只能跟一个回弹幅度" "回弹幅度不是数"
+bad_easing "nope" "没有 'nope' 这条缓动曲线" "曲线名拼错"
+bad_easing "linear 0.2" "没有 'linear 0.2' 这条缓动曲线" "给不认参数的名字塞参数"
+# 配置文件里写错：报错 + 那一行不生效（重载 = 重新读一遍，回到默认值）
+write_cfg 'scale = "1"' 'xwayland = false' 'easing = "bezier 0.05 0.9"'
+waitcfg easing "out_cubic" &&
+	pass "配置文件里写错的曲线不生效（回到默认 out_cubic）" ||
+	fail "写错的曲线还是生效了：$(getcfg easing)"
+grep -aq "easing 'bezier 0.05 0.9' 不对" "$LOG" &&
+	pass "配置文件里写错也报同一条错" ||
+	fail "配置文件里写错没报清楚：$(grep -a 'bezier' "$LOG" | tail -1)"
 grep -aq "Assertion" "$LOG" && fail "退出时日志里有 assert" || pass "退出时没有 assert"
 stop_vidow
 
