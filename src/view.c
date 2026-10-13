@@ -19,8 +19,31 @@ void vidow_view_leave_column(struct vidow_view *view);
 /* X11：按窗口的绝对坐标把它归到某块输出上（弹出物可以开在另一块屏上）。 */
 static void x11_track_output(struct vidow_view *view);
 
+/* 把一个窗口放回平铺布局（浮动 → 平铺那次重判走这里，见 float.c 的
+ * vidow_float_set_mode）。
+ *
+ * **没上屏的窗口不给列**：列是条带上的一格，占着它就是占着屏上的宽度 ——
+ * 一个没 map 的窗口进了列，屏上什么都不画、那格却照占，就是用户报的「凭空
+ * 多出一列」。proton / Steam 那批辅助窗（现场 dump 里标题 `Input` 的窗口 50）
+ * 就是这么来的：X11 窗口**从来没 map 过**，可它的属性（WM_TRANSIENT_FOR /
+ * WM_NORMAL_HINTS / `_NET_WM_WINDOW_TYPE`）在运行中被改掉，vidow 于是把它从
+ * 浮动重判成平铺 —— 这一步以前不看它上没上屏，直接建了一条列（几何 2883,6
+ * 951x1068，正卡在 lutris 和游戏之间）。
+ *
+ * 延迟到首次 map：view_map() 里 mapped 先置 true，随后自己会走
+ * view_ensure_column() 补上这条列，所以上屏的窗口一个都不少。
+ *
+ * 注意别把这条判据搬到 view_ensure_column() 里：xdg 的初始 commit 那一趟
+ * （view_commit 的 initial_commit 分支）**故意**在 map 之前建列 —— 客户端要拿
+ * 着「平铺格的尺寸」这个 configure 才会上屏，拦掉它窗口就会先按自己的尺寸冒
+ * 出来再跳一下（而且抢跑的最大化请求也兑现在那儿）。 */
 void vidow_view_join_layout(struct vidow_server *server,
 		struct vidow_view *view) {
+	if (!view->mapped) {
+		wlr_log(WLR_DEBUG, "join layout: %s 还没上屏，先不给列（等 map）",
+			vidow_view_title(view) != NULL ? vidow_view_title(view) : "(无题)");
+		return;
+	}
 	view_ensure_column(server, view);
 }
 

@@ -981,6 +981,7 @@ VIDOW_TEST_RENDERER=gles2 ./test-screencast.sh
 ./test-popup2out.sh                  # 不在布局原点上的窗口，弹出物要摆在自己那块屏上（13 项断言）
 ./test-ws-dynamic.sh                 # 动态工作区：栈底空位 / 空了就收 / 序号夹住 / 具名永存（9 项）
 ./test-dpi.sh                        # 混合 DPI + XWayland：装饰缓冲按**窗口几何**算（见 SSD 那节）
+./test-emptycol-nomap.sh             # 「凭空多出一列」：从没 map 过的 X11 窗口不许占列（同一进程里再放一个上屏的当对照 + 延迟到首次 map 补列）（全 headless + Xwayland，14 项断言，见 249）
 ./build/jsontest                     # 只看 JSON 写出/读入（离线，30 项）
 ./build/scaletest                    # 只看缩放计算（31 项）
 ```
@@ -3933,6 +3934,9 @@ tools/vdrag.c  虚拟指针拖拽测试工具
 tools/xpopup.c 按绝对坐标造 X11 窗口（owner / or / tooltip / menu / combo / utility），
                可指定 WM_TRANSIENT_FOR、晚设窗口类型、自声明固定尺寸、延后自己挪位 ——
                弹出物分类与定位的测试客户端
+tools/xnomap.py 造两个 X11 窗口跑同一套属性动作（声明成对话框 → 删掉类型，逼 vidow
+               把「浮动 → 平铺」重判一遍）：A **一次都不 map**、B 正常上屏当对照 ——
+               盯「没上屏的窗口不许占列」（见 249 / `./test-emptycol-nomap.sh`）
 tools/scaletest.c  缩放计算的离线自检（解析 / ppi 推算 / 量化 / 优先级 / 物理尺寸差 /
                    X 屏幕对账）
 tools/hotplugtest.c 热插拔纯逻辑的离线自检（身份 / 记忆 / 挑接收的屏 / 稳定重排）
@@ -5067,6 +5071,41 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
       - 另一个踩到的坑（不是 vidow 的）：`awww img` 默认带过渡动画，动画没跑完就进全景，抓到的
         底衬是**半透明混合**的（量到 (107,66,38)，金色和洋红混在一起）。验证 / 截图时加
         `--transition-type none`。
+
+249. **「凭空多出一列」的第二个入口：从没 map 过的窗口也会被塞进一条列**（用户：「proton 游戏还是有一列空列」，2026-10-13 20:48 现场 dump）
+
+     - 现场（用户真机 `vidowmsg windows`，DP-2）：窗口 50、标题 `Input`、`mapped=false`、
+       `visible=false`、`float_mode=none`、`placed=true`，可 `column` 在、几何 `2883,6 951x1068`
+       —— 一条占满整列的空列，正卡在 lutris（1926–2877）和崩铁（3834–5754）中间。
+     - 跟 237 是同一种病、**不是同一个入口**：237 修的是 `view_unmap()`（映射过之后又消失），
+       这个窗口**从来没映射过**，`view_unmap()` 一次都没进过。X11 窗口的属性（WM_TRANSIENT_FOR /
+       WM_NORMAL_HINTS / `_NET_WM_WINDOW_TYPE`）在它没 map 的时候照样会变 —— proton / Steam
+       那批辅助窗就撞在这条路上。
+     - 建列的那一步：`src/float.c:85` 的「浮动 → 平铺」重判（`vidow_float_set_mode()` 的
+       `VIDOW_FLOAT_NONE` 分支）→ `vidow_view_join_layout()`（`src/view.c:44`）→
+       `view_ensure_column()`（`src/view.c:782`）。触发者是 X11 的属性回调（`x11_set_parent` /
+       `x11_set_hints` / `x11_set_window_type` / `x11_set_size_hints` → `vidow_float_update_mode()`），
+       这一串里没有一个看窗口上没上屏。（规则那条入口 `src/rule.c:1092` 的 `float false` 同样走
+       `vidow_float_set_mode()`，被同一道闸拦下。）
+     - 为什么占着列却画不出东西、宽度还照占：占用判据是 `view_shows()`（`src/view.c:731`）=
+       `!view->minimized` —— **只排掉最小化**，没排掉「没上屏」，于是这条列照算宽度、那个没上屏的
+       视图还被 arrange 摆了一遍（所以 `placed=true`、几何是整格）。
+     - 修法：`vidow_view_join_layout()` 里 `if (!view->mapped) return;` —— **没上屏的窗口不给列**，
+       延迟到 `view_map()`（`src/view.c:3906`）自己补回来。判据只能是「**现在**在不在屏上」，不能是
+       「以前上过屏没有」：窗口 unmap 之后再翻一次浮动 → 平铺，照样不该建列（否则空列又回来）。
+     - **别把这条判据搬进 `view_ensure_column()`**：xdg 的初始 commit（`src/view.c:4199`）是
+       **故意**在 map 之前建列的 —— 客户端要拿着「平铺格的尺寸」这个 configure 才上屏
+       （`arrange_columns` → `vidow_place_view` → `vidow_view_set_size`）。拦掉它，每个窗口都会先按
+       自己的尺寸冒出来再跳一下，抢跑的最大化请求也兑现在那儿。
+     - 验证：新加 `test-emptycol-nomap.sh` + `tools/xnomap.py`（X11 探针，同一进程里两个窗口跑同一
+       套属性动作：A **一次都不 map**、B 正常上屏当对照）。**修之前**：A 占着一条列（几何 631 宽）、
+       屏上两条列、对照组 B 被挤到 `x=643` —— 就是用户那条空列；**修之后**：A `column=null`、
+       `width=0`、屏上只剩一条列、B 还在第一格（6,6 631），A 后来自己 map 上来列又补回来了
+       （延迟，不是不给）。`test-fullscreen-scroll.sh` / `test-fullscreen-2out.sh` /
+       `test-workspace.sh` 跑前跑后都全过。
+     - 未覆盖：**只做初始 commit 却永远不 map 的 xdg 窗口**还是会留下一条空列 —— 那条路不敢拦
+       （理由见上一条）。用户现场那个窗口是 x11，不是这一条；另外真机那条空列宽 951（用户屏的
+       0.5 档），headless 复现出来是 631（1280x720），数值不同、形状一致。
 
 247. **缓动曲线能自己写了：自定义三次贝塞尔 + 回弹幅度可调**（用户：「回弹幅度应该允许配置 回弹的时间也允许配置 类似 hyprland 那样」）
 
