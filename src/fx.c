@@ -44,17 +44,29 @@ static void stat_tex_del(struct wlr_texture *t) {
 }
 /* ------------------------------------------------------------ scene alpha */
 
+/* 透明度一律夹在 [0,1]：wlroots 那边是 assert(opacity >= 0 && opacity <= 1)，
+ * 直接 abort。缓动曲线是**会过冲**的（easing = "out_back 0.18" 冲到 1.18，
+ * out_elastic 更夸张），把过冲的进度喂进透明度就当场炸 —— 2026-10-13 20:39 那次
+ * core dump 就是这条路：#6 alpha_iter ← #8 vidow_fx_set_alpha ← #9 layer_apply_anim
+ * （layer 的入场/消失动画把缓动进度当 alpha 用）。透明度本身不该过冲。 */
+static float clamp01(double v) {
+	if (v < 0.0) return 0.0f;
+	if (v > 1.0) return 1.0f;
+	return (float)v;
+}
+
 static void alpha_iter(struct wlr_scene_buffer *buffer, int sx, int sy,
 		void *data) {
 	(void)sx;
 	(void)sy;
-	double alpha = *(double *)data;
-	wlr_scene_buffer_set_opacity(buffer, (float)alpha);
+	wlr_scene_buffer_set_opacity(buffer, clamp01(*(double *)data));
 }
 
 /* Multiply every buffer of a subtree by `alpha`. Scene-graph opacity is a
  * compositor-side property, so this never disturbs what clients draw. */
 void vidow_fx_set_alpha(struct wlr_scene_node *node, double alpha) {
+	if (alpha < 0.0) alpha = 0.0;
+	if (alpha > 1.0) alpha = 1.0;
 	wlr_scene_node_for_each_buffer(node, alpha_iter, &alpha);
 }
 
@@ -3806,7 +3818,7 @@ static void closing_update(void *data, double t, double linear) {
 		 * 偏移不进位置，CSD 窗口的关闭动画就整个斜出那圈留白。 */
 		wlr_scene_node_set_position(&closing->node->node,
 			closing->x - closing->geo.off_x, y - closing->geo.off_y);
-		wlr_scene_buffer_set_opacity(closing->node, (float)closing->alpha);
+		wlr_scene_buffer_set_opacity(closing->node, clamp01(closing->alpha));
 	}
 }
 

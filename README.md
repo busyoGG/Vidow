@@ -1328,6 +1328,22 @@ X11 没有 per-window 的缓冲区缩放，所以：
    - 低 DPI 的屏（`s < S`）：落屏像素 = `逻辑 × s` < 缓冲区 → **缩小，不糊**
    - 两块屏上的物理尺寸一样（逻辑尺寸一样，而 scale ∝ ppi）
 4. 命中坐标按同一比例换回来：`局部 = (布局坐标 - 窗口原点) × S`，点哪儿就是哪儿。
+248. **过冲的缓动曲线把 vidow 打崩**（2026-10-13 20:39 core dump，noctalia 一打开就崩）
+
+     - 现象：`vidow: types/scene/wlr_scene.c:1133: wlr_scene_buffer_set_opacity: Assertion
+       'opacity >= 0 && opacity <= 1' failed.` → SIGABRT（coredump 5.3M）。
+     - 栈：`#6 alpha_iter` ← `#8 vidow_fx_set_alpha` ← `#9 layer_apply_anim` ← `layer_anim_update`
+       ← `vidow_anim_tick` ← `vidow_output_render`。
+     - 根因：layer 的入场/消失动画把**缓动后的进度**当 alpha 用；`out_cubic` 永远不超 1 所以
+       一直没事，配成会过冲的曲线（`out_back 0.18` 冲到 1.18，`out_elastic` 更夸张）就当场断言炸。
+     - 修法：`src/fx.c` 加 `clamp01()`，在 `alpha_iter()`（唯一的底层调用点，栈里那一帧）、
+       `vidow_fx_set_alpha()` 入口、关闭动画的 `closing->alpha` 三处夹到 [0,1]。透明度不该过冲。
+     - 验证：`easing = "out_back 0.6"` + `layer_open_ms/window_open_ms = 900` 起 headless，
+       开关窗跑一遍，无断言、无新 core dump（此前用户真机上同一条路 20:39 就炸了）。
+       结构性论据：所有经过 `vidow_fx_set_alpha` 的值现在都被夹住，越界值到不了 wlroots。
+     - 未覆盖：其余直接调 `wlr_scene_buffer_set_opacity` 的地方（fx.c 3124/3581/3699、
+       view.c 1749/4662、capturemask.c）没逐个查是否也会吃到缓动进度。
+
 5. **告诉 X 服务它该按设备像素报屏幕**：往 root window 写
    `_XWAYLAND_GLOBAL_OUTPUT_SCALE = S`（CARDINAL）。打过 HiDPI 补丁的 Xwayland
    （`xorg-xwayland-lily` / xorg 的 MR!733）收到之后才会把 X 屏幕和 RandR 模式也
