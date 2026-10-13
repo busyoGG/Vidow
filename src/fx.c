@@ -661,18 +661,40 @@ static void drop_targets(struct vidow_fx_target *fx) {
 	fx->scale = 0.0;
 }
 
+/* 渲染目标的设备像素数取成**输出缩放**的整数倍：节点尺寸是逻辑单位，而
+ * wlr_scene_buffer_set_dest_size() 只收整数 —— 只有 w / os 正好是整数时，
+ * 这张烘好的图才会 1:1 落到设备像素上。差 1 个设备像素（0.46 倍缩略图上
+ * 经常就差这一个），wlroots 就按 1.00x 之外的倍率再双线性采一次：内容看着
+ * 就是「糊」的，而且像素对不上（缩略图丢约 1/4 的梯度对比度，见 README 250）。
+ * os <= 0（拿不到输出缩放）时原样返回。 */
+static int snap_to_output_scale(int px, double os) {
+	if (!(os > 0.0)) {
+		return px;
+	}
+	for (int i = 0; i < 8; i++) {
+		double q = (double)(px + i) / os;
+		if (fabs(q - (double)llround(q)) < 1e-3) {
+			return px + i;
+		}
+	}
+	return px;
+}
+
 /* content_w/h 是逻辑单位；缓冲按 scale 倍分配，所以 HiDPI 屏上装饰和窗口内容
- * 都是按设备像素画的（不是先画小再放大）。pad 也要跟着乘，否则边框会内缩。 */
+ * 都是按设备像素画的（不是先画小再放大）。pad 也要跟着乘，否则边框会内缩。
+ * os 是**输出缩放**（设备像素 / 逻辑像素，= scale / ov）：见 snap_to_output_scale。 */
 static bool ensure_targets(struct vidow_server *server,
-		struct vidow_fx_target *fx, int content_w, int content_h, double scale) {
+		struct vidow_fx_target *fx, int content_w, int content_h, double scale,
+		double os) {
 	if (!(scale > 0.0)) {
 		scale = 1.0;
 	}
 	int pad = vidow_fx_pad(server);
-	int w = (int)lround((double)content_w * scale) +
-		2 * (int)lround((double)pad * scale);
-	int h = (int)lround((double)content_h * scale) +
-		2 * (int)lround((double)pad * scale);
+	int px_pad = (int)lround((double)pad * scale);
+	int w = snap_to_output_scale(
+		(int)lround((double)content_w * scale) + 2 * px_pad, os);
+	int h = snap_to_output_scale(
+		(int)lround((double)content_h * scale) + 2 * px_pad, os);
 	if (w < 1) {
 		w = 1;
 	}
@@ -694,9 +716,11 @@ static bool ensure_targets(struct vidow_server *server,
 	}
 	fx->w = w;
 	fx->h = h;
-	fx->content_w = (int)lround((double)content_w * scale);
-	fx->content_h = (int)lround((double)content_h * scale);
-	fx->px_pad = (int)lround((double)pad * scale);
+	/* 内容 = 目标减掉两边内边距。取差值而不是再算一次 lround：snap 补上的那
+	 * 一两个像素要算进内容里，否则着色器里内容右边会多出一条没画到的缝。 */
+	fx->content_w = w - 2 * px_pad;
+	fx->content_h = h - 2 * px_pad;
+	fx->px_pad = px_pad;
 	/* 场景节点尺寸用逻辑单位：渲染目标除以倍率，正好是 1:1 落到设备像素上。 */
 	fx->dst_w = (int)lround((double)w / scale);
 	fx->dst_h = (int)lround((double)h / scale);
@@ -2970,7 +2994,13 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 	if (px_w > MAX_TARGET_PX || px_h > MAX_TARGET_PX) {
 		return false;
 	}
-	if (!ensure_targets(server, fx, cw, ch, scale)) {
+	/* 输出缩放 = 设备像素 / 逻辑像素。scale 是烘图用的倍率（= 输出缩放 × ov），
+	 * ov <= 0 时按 1 算（调用方在这之前已经把 ov 归一到 > 0，这里只是兜底）。 */
+	double out_scale = ov > 0.0 ? scale / ov : scale;
+	if (!(out_scale > 0.0)) {
+		out_scale = 1.0;
+	}
+	if (!ensure_targets(server, fx, cw, ch, scale, out_scale)) {
 		return false;
 	}
 
@@ -3069,8 +3099,13 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 	 * 要挪回一半的差值，不然看着是从左上角往右下缩。静止时 anim_scale 恒为
 	 * 1，这两项正好是 0，一个像素都不动。 */
 	double as = fx->anim_scale > 0.0 ? fx->anim_scale : 1.0;
-	int dst_w0 = (int)lround((double)fx->dst_w * ov);
-	int dst_h0 = (int)lround((double)fx->dst_h * ov);
+	/* 节点尺寸 = 烘图那张缓冲的**设备像素数** ÷ 输出缩放，正好 1:1 落到设备
+	 * 像素上（ensure_targets 已经把缓冲取成输出缩放的整数倍，所以除得尽）。
+	 * 别再写回 lround(fx->dst_w * ov)：那中间隔着两次 lround，会漂一个逻辑
+	 * 像素 —— 差这一个像素，wlroots 就得把烘好的图按 1.00x 之外的倍率再双
+	 * 线性采一次，预览里那层糊就是这么来的（见 ensure_targets 上面的注释）。 */
+	int dst_w0 = (int)lround((double)fx->w / out_scale);
+	int dst_h0 = (int)lround((double)fx->h / out_scale);
 	int pad_ov = (int)lround((double)pad * ov * as);
 	int dst_w = (int)lround((double)dst_w0 * as);
 	int dst_h = (int)lround((double)dst_h0 * as);
