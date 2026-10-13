@@ -2587,6 +2587,14 @@ void vidow_blur_update(struct vidow_output *output) {
 		if (view_blur_owner(view) != output->wlr_output) {
 			continue;
 		}
+		/* 这张贴图代表的是**这块屏**的视野：尺寸和布局原点跟着贴图一起记在 fx
+		 * 上（见 server.h 那组 blur_out_*）。采样只认这一组，不现场读
+		 * server->output_*：重烘那趟会给别的屏上的窗口也烘一次，那一刻的
+		 * server->output_w 是那块屏的，按它算 UV 就是「只取中间一块铺满整窗」。 */
+		view->fx.blur_out_w = output->wlr_output->width;
+		view->fx.blur_out_h = output->wlr_output->height;
+		view->fx.blur_out_x = server->output_x;
+		view->fx.blur_out_y = server->output_y;
 		if (!view_wants_blur(view) || view->fx.node == NULL) {
 			if (view->fx.blur_own_tex != NULL) {
 				blur_own_drop(&view->fx);
@@ -2783,15 +2791,24 @@ static void decor_draw(struct vidow_server *server,
 	/* 窗口在输出上的位置（物理像素，输出原点已减掉）：散景贴图是按输出分辨
 	 * 率抓的，采样坐标必须落在这块屏自己的坐标系里。被模糊的 layer surface
 	 * 那张贴图只盖住它自己那一小块区域（fx->blur_tex_*），坐标就再减掉区域
-	 * 原点、除数也换成区域尺寸 —— 不减就是整块错位。 */
+	 * 原点、除数也换成区域尺寸 —— 不减就是整块错位。
+	 *
+	 * 那块屏是哪一块，认**跟着这张贴图一起记的** blur_out_*（见 server.h）：
+	 * 重烘会落在别的屏正在渲染的那一帧上（output.c 帧循环那趟不看归属），
+	 * 现场读 server->output_* 拿到的是那块屏的尺寸/原点 —— 整屏底衬只取中间
+	 * 一块铺满整窗，看着就是「静止时底衬啪一下换挡」（中心放大 + 变糊）。 */
+	int out_x = fx->blur_out_w > 0 ? fx->blur_out_x : server->output_x;
+	int out_y = fx->blur_out_h > 0 ? fx->blur_out_y : server->output_y;
+	int out_w = fx->blur_out_w > 0 ? fx->blur_out_w : server->output_w;
+	int out_h = fx->blur_out_h > 0 ? fx->blur_out_h : server->output_h;
 	glUniform2f(d->u_origin,
-		(float)((int)lround((double)ox * scale) - server->output_x -
+		(float)((int)lround((double)ox * scale) - out_x -
 			fx->blur_tex_x),
-		(float)((int)lround((double)oy * scale) - server->output_y -
+		(float)((int)lround((double)oy * scale) - out_y -
 			fx->blur_tex_y));
 	glUniform2f(d->u_output_size,
-		(float)(fx->blur_tex_w > 0 ? fx->blur_tex_w : server->output_w),
-		(float)(fx->blur_tex_w > 0 ? fx->blur_tex_h : server->output_h));
+		(float)(fx->blur_tex_w > 0 ? fx->blur_tex_w : out_w),
+		(float)(fx->blur_tex_w > 0 ? fx->blur_tex_h : out_h));
 	glUniform1f(d->u_flip_y, cfg->shader_flip_y ? 1.0f : 0.0f);
 	/* 模糊那层要不要叠：除了「有贴图」（fx->blur_tex）和全局开关（fx->blur），
 	 * 还得看**这一次渲染自己的 look** —— 预览（缩略图）那一趟在

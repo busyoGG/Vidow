@@ -626,6 +626,17 @@ struct vidow_fx_target {
 	 * **它自己那一小块区域**的抓取，采样坐标得减掉区域原点，否则整块错位。 */
 	int blur_tex_x, blur_tex_y, blur_tex_w, blur_tex_h;
 
+	/* 上面那张贴图代表的是**哪块屏**的视野：那块屏的设备像素尺寸 + 布局原点。
+	 * 跟贴图一起在 vidow_blur_update() 里记下（只有那一趟知道归属）。
+	 *
+	 * 为什么不能现场读 server->output_w/x：那对全局量说的是「**正在渲染**的那块
+	 * 屏」（output.c 的 vidow_output_render 开头才写）。而装饰重烘那趟（output.c
+	 * 帧循环里 blur_drawn != blur_ver 的那个循环）**不看归属**，会给别的屏上的
+	 * 窗口也重烘一次 —— 那一刻按 server->output_w 算采样 UV，就是拿整屏底衬只取
+	 * 中间一块铺满整窗：中心放大 + 变糊（用户报的「静止时底衬啪一下换挡」，见
+	 * README 253）。采样只认跟着贴图记的这一组。 */
+	int blur_out_w, blur_out_h, blur_out_x, blur_out_y;
+
 	/* 私有底衬**那一小块区域**的缓冲 + 包着它的贴图（只有重叠的窗口用；layer
 	 * 那一路把同样的东西挂在 struct vidow_layer_surface 上）。位置和尺寸就是
 	 * 上面那组 blur_tex_*。抓的时候只渲染这块区域：基座从共享底衬上 1:1 拷一块
