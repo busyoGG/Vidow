@@ -703,17 +703,22 @@ struct vidow_fx_target {
 
 /* overview 里的一行 = 这块屏上的一块工作区。行表按需分配、复用（见 rows）。
  *
- * 每行自己的三个数：
- *   band_w    —— 这块工作区的条带（工作区局部像素）有多宽；
- *   y         —— 这一行的区域在屏幕上的顶边；
+ * 每行自己的几个数：
+ *   band_w    —— 这块工作区的条带（工作区局部像素）有多宽（只喂日志）；
+ *   rect_w /
+ *   rect_x    —— 这一行的**矩形**（缩小版的屏：高 = row_h，宽 = 高 × 那块屏的长宽比，
+ *                横向居中）在屏幕上的位置和宽度；
+ *   y         —— 这一行的矩形在屏幕上的顶边；
  *   content_x —— 条带原点画在屏幕上的 x（已经含**行内横向滚动**：跟着这块工作区
  *                自己的视口走，见 overview.c）。
- * plate 是这一行的区域 / 背景板（和遮罩同一层，垫在窗口下面）—— 「上下排布」就是
- * 靠它 + 行间距看出来的。 */
+ * plate 是矩形的底板、bg 是矩形里的**背景图**（那块工作区所在屏的壁纸底衬）—— 两个
+ * 都跟遮罩同一层、垫在窗口下面。 */
 struct vidow_ov_row {
 	struct vidow_workspace *ws;
 	struct wlr_scene_rect *plate;
+	struct wlr_scene_buffer *bg;
 	int band_w;
+	int rect_w, rect_x;
 	int y;
 	double content_x;
 };

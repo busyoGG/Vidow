@@ -212,7 +212,8 @@ static double row_viewport(struct vidow_server *server,
 }
 
 /* 每行条带多宽（工作区局部像素）：按列宽比例现算 —— 藏起来的工作区从来没被 arrange
- * 过，col->offset / view->geom 都是老值，照着画会叠在一起。 */
+ * 过，col->offset / view->geom 都是老值，照着画会叠在一起。**现在只喂日志**：一行是
+ * 「一块缩小版的屏」，条带比屏宽的那些列在屏幕上本来就在屏外（见 row_rect_w）。 */
 static void rows_scale(struct vidow_server *server) {
 	struct vidow_overview *ov = &server->overview;
 	int work_w = ov->out_w, work_h = ov->out_h;
@@ -221,30 +222,49 @@ static void rows_scale(struct vidow_server *server) {
 		ov->row_h = 0.0;
 		return;
 	}
-	int max_band = 0;
 	for (int i = 0; i < ov->n_rows; i++) {
 		struct vidow_ov_row *row = &ov->rows[i];
 		row->band_w = vidow_workspace_preview_layout(server, row->ws,
 			work_w, work_h, NULL, NULL);
-		if (row->band_w > max_band) {
-			max_band = row->band_w;
-		}
 	}
 
-	/* 缩放：横向要让**最宽的那条带**铺得进这一行（留 4% 边）；纵向**行高固定**，
-	 * 不按行数平分 —— 早先是 0.92 / n_rows，工作区一多每行就被摊薄、越开越小
-	 * （用户：「overview 每个工作区的大小应该固定，现在开启多个工作区的时候一直
-	 * 缩小」）。行数超过一屏排不下就靠列表滚动看（list_scroll / rows_total）。
-	 * 只有两列时别放大（放大反而糊），所以封顶 1.0。 */
-	double fit_w = max_band > 0 ?
-		(double)work_w * 0.92 / (double)max_band : 1.0;
-	double fit_h = OV_ROW_FIXED_SCALE;
-	double scale = fit_w < fit_h ? fit_w : fit_h;
-	if (scale > 1.0) {
-		scale = 1.0;
+	/* 缩略比例**固定**（OV_ROW_FIXED_SCALE）：纵向不按行数平分 —— 早先是
+	 * 0.92 / n_rows，工作区一多每行就被摊薄、越开越小（用户：「overview 每个工作区
+	 * 的大小应该固定，现在开启多个工作区的时候一直缩小」）。横向也不再按「最宽的
+	 * 条带铺得进一行」算 fit_w：那个式子属于「整条带铺满一行」的旧模型，现在一行是
+	 * 一块缩小版的屏，条带比屏宽的部分本来就该落在矩形（= 屏）外面。行数超过一屏
+	 * 排不下就靠列表滚动看（list_scroll / rows_total）。 */
+	ov->scale = OV_ROW_FIXED_SCALE;
+	ov->row_h = (double)work_h * ov->scale;
+}
+
+/* 这块工作区现在住的那块输出。工作区是全局的一叠（屏拔了整块借住到别的屏上，见
+ * workspace.h），所以比例和背景图都得看它**此刻**住的那块屏。没归属（刚建出来还没
+ * 认领 / 屏刚拔）就退回 overview 锁的那块 —— 那正是进全景时聚焦的那块屏。 */
+static struct vidow_output *row_output(struct vidow_server *server,
+		const struct vidow_ov_row *row) {
+	struct wlr_output *output = row->ws->output != NULL ?
+		row->ws->output : server->overview.output;
+	return output != NULL ? vidow_output_lookup(server, output) : NULL;
+}
+
+/* 这一行那块「缩小版的屏」有多宽：高就是行高（固定比例），宽 = 高 × 那块输出的逻辑
+ * 长宽比 —— 用户要的就是「缩小版的屏幕矩形，而不是一整条横带」。 */
+static int row_rect_w(struct vidow_server *server,
+		const struct vidow_ov_row *row) {
+	struct vidow_overview *ov = &server->overview;
+	struct vidow_output *output = row_output(server, row);
+	struct wlr_box box = {0};
+	if (output != NULL) {
+		wlr_output_layout_get_box(server->output_layout,
+			output->wlr_output, &box);
 	}
-	ov->scale = scale;
-	ov->row_h = (double)work_h * scale;
+	if (box.width < 1 || box.height < 1) {
+		box.width = ov->out_w;
+		box.height = ov->out_h;
+	}
+	int w = (int)lround(ov->row_h * (double)box.width / (double)box.height);
+	return w > 0 ? w : 1;
 }
 
 static double rows_total(const struct vidow_overview *ov) {
@@ -252,8 +272,66 @@ static double rows_total(const struct vidow_overview *ov) {
 		+ (double)(ov->n_rows > 0 ? ov->n_rows - 1 : 0) * OV_ROW_GAP;
 }
 
-/* 这一行的区域 / 背景板：和遮罩同一层（窗口之下），铺满工作区那么宽 —— 「上下排布」
- * 就靠它 + 行间距看出来。浓度跟着遮罩的 alpha 走（见 OV_PLATE_ALPHA）。 */
+/* 背景图那块 scene buffer 不吃输入：它盖在窗口上面（同一层里后建的在上），默认会
+ * 把所有点击吃掉 —— 返回 false 让命中测试继续往下走，落到窗口 / 遮罩上。 */
+static bool ov_node_rejects_input(struct wlr_scene_buffer *buffer, double *sx,
+		double *sy) {
+	(void)buffer;
+	(void)sx;
+	(void)sy;
+	return false;
+}
+
+/* 这块工作区的背景图：一块 scene buffer，画在板子上面（都在遮罩上面 —— 矩形就是
+ * 「缩小版的屏」，它得跟屏幕上一样亮，不能再被压暗一次）。
+ *
+ * 图从哪来：vidow 不画壁纸（壁纸永远是 background 层客户端画的，见 README），合成器
+ * 手上没有单独的「壁纸贴图」。离它最近的就是 fx.c 抓的那张**底衬**
+ * （output->backdrop：把所有窗口藏起来渲染的一帧 = 壁纸 + background / bottom 层），
+ * 正好是「这块屏平时显示的样子」，缩进矩形里就是要的那张背景图。模糊那份
+ * （output->blur_tex）不能用：那是整屏垫在遮罩下面的糊壁纸。
+ *
+ * 底衬按设备像素抓，scene buffer 的 dest_size 一设就按逻辑尺寸缩放着画。拿不到
+ * （没开 blur_enabled 就没有这张底衬）就什么都不画，退回只有板子。 */
+static void row_bg_apply(struct vidow_server *server, struct vidow_ov_row *row) {
+	struct vidow_overview *ov = &server->overview;
+	bool on = ov->t > 0.002;
+	struct vidow_output *output = row_output(server, row);
+	struct wlr_buffer *buf = (on && output != NULL) ? output->backdrop : NULL;
+	if (row->bg == NULL) {
+		if (buf == NULL) {
+			return;
+		}
+		row->bg = wlr_scene_buffer_create(server->layer_overview_dim, NULL);
+		if (row->bg == NULL) {
+			return;
+		}
+		/* 跟 fx.c 那块装饰 buffer 一个道理：普通 buffer 默认吃输入，盖在窗口上面
+		 * 会把点击全吃掉 —— 返回 false 让命中测试继续往下走。 */
+		row->bg->point_accepts_input = ov_node_rejects_input;
+		/* 板子先建（plate_apply 在这一句之前），所以背景图盖在板子上面。 */
+	}
+	if (row->bg->buffer != buf) {
+		/* 换图 = 换底衬那一版（窗口动了 / 壁纸重抓都会换缓冲）。set_buffer 会锁住
+		 * 缓冲：退出时置 NULL（见 overview_done），不然那张整屏大的底衬会被一直
+		 * 锁着不放（4K 上 33MB）。 */
+		wlr_scene_buffer_set_buffer(row->bg, buf);
+	}
+	wlr_scene_node_set_enabled(&row->bg->node, buf != NULL);
+	if (buf == NULL) {
+		return;
+	}
+	wlr_scene_buffer_set_dest_size(row->bg, row->rect_w,
+		(int)lround(ov->row_h));
+	/* 跟窗口一样跟着 t 淡入淡出：不然进出全景的时候它会「啪」一下出现。 */
+	wlr_scene_buffer_set_opacity(row->bg, (float)ov->t);
+	wlr_scene_node_set_position(&row->bg->node, row->rect_x, row->y);
+}
+
+/* 这一行的区域 / 背景板：和遮罩同一层（窗口之下、背景图之下）。它现在是**矩形**
+ * （缩小版的屏），不再是铺满一行的一条横带；浓度跟着遮罩的 alpha 走
+ * （见 OV_PLATE_ALPHA）。背景图画不出来的地方（没开模糊 = 没底衬、壁纸留白）露的
+ * 就是它。 */
 static void plate_apply(struct vidow_server *server, struct vidow_ov_row *row) {
 	struct vidow_overview *ov = &server->overview;
 	if (row->plate == NULL) {
@@ -272,8 +350,8 @@ static void plate_apply(struct vidow_server *server, struct vidow_ov_row *row) {
 	float c[4] = { dim[0] * a, dim[1] * a, dim[2] * a, a };
 	int h = (int)lround(ov->row_h);
 	wlr_scene_rect_set_color(row->plate, c);
-	wlr_scene_rect_set_size(row->plate, ov->out_w, h > 0 ? h : 1);
-	wlr_scene_node_set_position(&row->plate->node, ov->out_x, row->y);
+	wlr_scene_rect_set_size(row->plate, row->rect_w, h > 0 ? h : 1);
+	wlr_scene_node_set_position(&row->plate->node, row->rect_x, row->y);
 	wlr_scene_node_set_enabled(&row->plate->node, ov->t > 0.002 && a > 0.0f);
 }
 
@@ -303,28 +381,27 @@ static void rows_place(struct vidow_server *server) {
 	for (int i = 0; i < ov->n_rows; i++) {
 		struct vidow_ov_row *row = &ov->rows[i];
 		row->y = (int)lround(top + (double)i * (ov->row_h + OV_ROW_GAP));
+		/* 矩形 = 这块屏缩小 0.46 摆在这儿（横向居中）：宽按屏幕长宽比算，不再是
+		 * 铺满一行的一条横带。 */
+		row->rect_w = row_rect_w(server, row);
+		row->rect_x = ov->out_x + (ov->out_w - row->rect_w) / 2;
 		/* 行内横向滚动：跟着这块工作区自己的视口（焦点在工作区里换窗口时它自己
-		 * 会动），但夹住 —— 全景是缩小看的，条带整体滑出这一行的区域就看不见了
-		 * （测试也按日志里的坐标采样像素）。视口 0 = 条带居中，视口越大越往左
-		 * 滑，最多滑到左边缘对齐。 */
-		double slack = (double)ov->out_w - (double)row->band_w * ov->scale;
-		if (slack < 0.0) {
-			slack = 0.0;
-		}
-		double want = row_viewport(server, row->ws) * ov->scale;
-		if (want > slack) {
-			want = slack;
-		}
-		if (want < 0.0) {
-			want = 0.0;
-		}
-		row->content_x = (double)ov->out_x + (slack - want) / 2.0;
+		 * 会动）。视口 0 = 条带左边缘贴着矩形左边（屏幕上第一列就在屏幕左边），
+		 * 视口越大条带越往左滑 —— 画出来的就是「这块屏上看到的那一屏」。条带比
+		 * 屏宽的那些列落在矩形外，跟屏幕上一样（屏幕上它们在屏幕外，这儿没法裁：
+		 * 场景没有裁剪节点）。 */
+		row->content_x = (double)row->rect_x -
+			row_viewport(server, row->ws) * ov->scale;
 		plate_apply(server, row);
+		row_bg_apply(server, row);
 	}
-	/* 上次进来时行更多：多出来的板子关掉（留着下次用）。 */
+	/* 上次进来时行更多：多出来的板子 / 背景图关掉（留着下次用）。 */
 	for (int i = ov->n_rows; i < ov->cap_rows; i++) {
 		if (ov->rows[i].plate != NULL) {
 			wlr_scene_node_set_enabled(&ov->rows[i].plate->node, false);
+		}
+		if (ov->rows[i].bg != NULL) {
+			wlr_scene_node_set_enabled(&ov->rows[i].bg->node, false);
 		}
 	}
 }
@@ -504,6 +581,14 @@ static void overview_done(void *data, bool cancelled) {
 		 * ——它挂在 layer_overview_dim 那棵树上，下次进来接着用。 */
 		vidow_fx_end(server, &ov->fx);
 		ov->fx_on = false;
+		/* 每行那块背景图也一样：**必须**把缓冲放掉（set_buffer 会锁住它），
+		 * 不然那张整屏大的底衬被我们锁着，fx.c 换了新的一代它也不释放。 */
+		for (int i = 0; i < ov->cap_rows; i++) {
+			if (ov->rows[i].bg != NULL) {
+				wlr_scene_node_set_enabled(&ov->rows[i].bg->node, false);
+				wlr_scene_buffer_set_buffer(ov->rows[i].bg, NULL);
+			}
+		}
 	}
 	/* 进 / 出都重判一次「谁该出现在场景里」：overview 里**这块屏上所有工作区**
 	 * 的窗口都要画（缩到画面里），所以平时按工作区藏起来的那些得先放回来；退出
@@ -572,6 +657,17 @@ void vidow_overview_toggle(struct vidow_server *server) {
 		wlr_log(WLR_INFO, "overview: 进入（%s 上 %d 个窗口，占 %dx%d 缩到 %.3f，"
 			"铺在工作区 %dx%d 里）", ov->output->name, n_win, max_band,
 			ov->n_rows * ov->out_h, ov->scale, ov->out_w, ov->out_h);
+		/* 每行的矩形（缩小版的屏）：宽按那块屏的长宽比算，行高固定 0.46 —— 日志
+		 * 里能看到它、也能看到背景图有没有拿到（拿不到 = 那张底衬还没抓出来）。 */
+		for (int i = 0; i < ov->n_rows; i++) {
+			struct vidow_ov_row *row = &ov->rows[i];
+			struct vidow_output *out = row_output(server, row);
+			wlr_log(WLR_INFO, "overview: 工作区 %s 的矩形 %d,%d %dx%d（%s 的屏，"
+				"背景图 %s）", row->ws->name[0] != '\0' ? row->ws->name : "(无名)",
+				row->rect_x, row->y, row->rect_w, (int)lround(ov->row_h),
+				out != NULL ? out->wlr_output->name : "?",
+				out != NULL && out->backdrop != NULL ? "有" : "无");
+		}
 		if (ov->n_skipped > 0) {
 			wlr_log(WLR_INFO, "overview: %d 块空工作区没摆行（没东西可看，"
 				"摆了白占地方）", ov->n_skipped);
