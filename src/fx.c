@@ -2757,7 +2757,10 @@ static void decor_draw(struct vidow_server *server,
 		(float)(fx->blur_tex_w > 0 ? fx->blur_tex_w : server->output_w),
 		(float)(fx->blur_tex_w > 0 ? fx->blur_tex_h : server->output_h));
 	glUniform1f(d->u_flip_y, cfg->shader_flip_y ? 1.0f : 0.0f);
-	float strength = fx->blur && fx->blur_tex != NULL ?
+	/* 模糊那层要不要叠：除了「有贴图」（fx->blur_tex）和全局开关（fx->blur），
+	 * 还得看**这一次渲染自己的 look** —— 预览（缩略图）那一趟在
+	 * vidow_fx_frame 里把 look.blur 关掉，于是预览里不叠模糊（见那里的注释）。 */
+	float strength = fx->blur && fx->blur_tex != NULL && look->blur ?
 		(float)cfg->blur_strength : 0.0f;
 	glUniform1f(d->u_blur_strength, strength);
 	/* 客户端用 ext-background-effect 指定了区域就只模糊那块 */
@@ -2902,6 +2905,25 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 	 * vidow_view_look / vidow_rule_look）。eff = NULL 就是纯全局。 */
 	struct vidow_look look;
 	vidow_view_look(&server->config, eff, fullscreen, &look);
+	/* 预览（缩略图：overview 的格子 / MRU 卡片）里**不叠那层模糊**。
+	 *
+	 * ov 就是「这块缩略图相对原尺寸的缩放」：overview 那一趟传的是格子缩放
+	 * （1 → 0.46 的动画值，见 view.c 的 vidow_view_anim_bake），MRU 卡片那一趟
+	 * 传的是卡片的 zoom（见 mru.c 的 mru_card_thumb），桌面那条路恒等于 1。
+	 * 缩略图里画的是窗口的**真实缓冲**（客户端自己那份，原样采过来），内容已经
+	 * 按 0.4x 缩过一道；再在它底下垫一层按**屏幕**坐标抓的模糊底衬，看着就是
+	 * 「预览里的窗口内容是糊的」（用户报的「overview 和 mru 的预览不应该导致
+	 * 窗口内容变模糊」）。模糊是给屏幕上的窗口用的，缩略图不该有。
+	 *
+	 * 只关**这一次渲染**的 look.blur（decor_draw 按它决定 u_blur_strength），
+	 * **别动 fx->blur** —— 那个标志是 vidow_fx_begin() 按配置设的、
+	 * vidow_blur_update() 也要读它，改了退出预览就再也恢复不了（README 1723）。
+	 *
+	 * 阈值取 0.98 而不是「< 1」：overview 进出场动画的头尾几帧 ov 是 0.999 /
+	 * 0.998 这种值，那几帧窗口还是原尺寸、模糊是对的，不该跳一下。 */
+	if (ov < 0.98) {
+		look.blur = false;
+	}
 	if (geo == NULL || geo->w <= 0 || geo->h <= 0) {
 		return false;
 	}
