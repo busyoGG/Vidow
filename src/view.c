@@ -3915,8 +3915,20 @@ static void view_unmap(struct wl_listener *listener, void *data) {
 	view->mapped = false;
 	vidow_portal_view_mapped(view, false);
 	if (!view->popup && view->float_mode != VIDOW_FLOAT_NONE) {
-		/* 浮窗离开工作区；列里的窗口跟着列，不用记账。 */
+		/* 浮窗离开工作区。 */
 		vidow_workspace_track(view->ws, view, false);
+	}
+	if (!view->popup && view->float_mode == VIDOW_FLOAT_NONE &&
+			view->column != NULL) {
+		/* 平铺窗口自己 unmap 了，得从列里摘出去 —— 不摘的话那条列一直占着
+		 * 一列宽，屏上却什么都没有。proton 游戏就会这样：它的 "Input" 输入法
+		 * 辅助窗口先被平铺进一条列，随后 unmap（连接不断、surface 还在）。
+		 * 用户报的正是这个：「lutris 和游戏窗口之间凭空出现了一列，什么窗口
+		 * 都没有但占据了一列的空间」—— 现场 dump 里 id 59 那个窗口就是
+		 * mapped=false、visible=false，可 column 还在、几何 2883,6 951x1068，
+		 * 正好夹在 lutris（1926）和游戏（3834）两条列中间。
+		 * 它回来时 view_map 会走 view_ensure_column 重新归位。 */
+		vidow_view_leave_layout(view);
 	}
 	if (view->dragging) {
 		/* 拖着的时候窗口没了：撤掉 grab，别让指针还挂在一个已经没了的窗口上。 */

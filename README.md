@@ -5048,6 +5048,25 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
         底衬是**半透明混合**的（量到 (107,66,38)，金色和洋红混在一起）。验证 / 截图时加
         `--transition-type none`。
 
+237. **平铺窗口 unmap 之后还占着一条列（「凭空出现一列」）**（用户：「lutris 和游戏窗口之间凭空出现了一列，什么窗口都没有但占据了一列的空间」）
+
+     - 现场（用户给的 `vidowmsg windows` dump）：id 59、标题 `Input`、`mapped=false`、`visible=false`、
+       `float_mode=none`（平铺），可 `column` 还在、几何 `2883,6 951x1068` —— 正好夹在 lutris（1926–2877）
+       和游戏（3834–5754）两条列中间。那就是"空列"：屏上什么都不画，列宽却照占。
+     - 机制：`view_unmap()` 只处理了浮窗（`vidow_workspace_track(..., false)`），注释还写着「列里的窗口
+       跟着列，不用记账」—— 但列是**按 `view_shows()`（只排除 minimized）**算宽的，一个 unmap 了的平铺
+       窗口照样算"还占着位置"，于是那条列一直留着一列宽。proton 游戏就会这样：它的 `Input` 输入法辅助
+       窗口先被平铺进一条列，随后 unmap（连接不断、surface 还在）。
+     - 修法：`view_unmap()` 里平铺（`float_mode == NONE`）且 `column != NULL` 的窗口走
+       `vidow_view_leave_layout()` 摘出列；它回来时 `view_map()` 会走 `view_ensure_column()` 重新归位。
+     - 验证：新 harness（`/tmp/zz-emptycol2.sh` + 一个 5 秒后自己 `hide()` 的 GTK 窗口）：藏之前
+       `vidowmsg windows` 2 条列（邻居 6,6 631x708 / 会藏的 643,6 631x708），藏之后 **1 条列**。
+       `test-fullscreen-scroll.sh` / `test-minimize.sh` / `test-scrollcull.sh` 全过。
+     - 排查过程（记一笔，别重复走）：先猜全屏抢焦点（就是 233，错）、再猜全屏列占整屏宽（错）、
+       再猜「X11 窗口 unmap 后 surface 被摘」（用自造客户端量到 surface 不摘，误判成"vidow 收不到
+       unmap"）—— 直到用户给了真实现场 dump 才看见 `mapped=false` + `column` 还在。**自造客户端
+       复现不出真实现的窗口行为，别拿它下结论。**
+
 235. **全景改成「所有工作区上下排」**（用户：「overview 应该显示所有工作区（上下排布）」「滚轮上下控制
       工作区列表的滚动预览」「移动窗口焦点的热键控制工作区内窗口的滚动预览」「overview 要绘制每个工作区的
       区域和背景」）
