@@ -110,6 +110,11 @@ struct vidow_cursor_fx {
 	struct wlr_surface *surface;
 	int32_t hx, hy;
 	struct wl_listener surface_destroy;
+
+	/* 光标藏起来了（hide_when_typing / hide_after_inactive_ms，见下面
+	 * vidow_cursor_fx_set_hidden）：藏的时候图在 wlroots 那边是 NULL，上面那
+	 * 三个字段留着「显示回来该给哪张」。 */
+	bool hidden;
 };
 
 /* 前置声明：定时器（动画的推手）在上面，重画光标图那两段在下面。 */
@@ -612,6 +617,52 @@ void vidow_cursor_fx_set_surface(struct vidow_server *server,
 		fx->surface_destroy.notify = surface_gone;
 		wl_signal_add(&surface->events.destroy, &fx->surface_destroy);
 	}
+	/* 光标藏着的时候只记账、不上图：不然客户端一 set_cursor 光标又冒出来了
+	 * （隐藏是「用户没在动」这件事，不该被客户端的一个请求打断）。 */
+	if (fx->hidden) {
+		wlr_cursor_set_surface(server->cursor, NULL, 0, 0);
+	}
+}
+
+/* 光标藏起来 / 显示回来（hide_when_typing / hide_after_inactive_ms，配置见
+ * configs/13-cursor.lua，调用点在 input.c）。
+ *
+ * 「藏」= 把 wlr_cursor 那张图设成 NULL（wlroots 那边就是不出图）；
+ * 「显示」= 把这期间该显示的那张重新设上 —— 客户端 set_cursor 给的那张
+ * （fx->surface）或者主题箭头。放大中（摇晃找光标）交给放大那条路自己重画，
+ * 这里别把放大图顶掉。 */
+void vidow_cursor_fx_set_hidden(struct vidow_server *server, bool hidden) {
+	struct vidow_cursor_fx *fx = server->cursor_fx;
+	if (fx == NULL) {
+		if (hidden) {
+			wlr_cursor_set_surface(server->cursor, NULL, 0, 0);
+		}
+		return;
+	}
+	if (fx->hidden == hidden) {
+		return;
+	}
+	fx->hidden = hidden;
+	wlr_log(WLR_DEBUG, "光标: %s", hidden ? "藏起来（没在动）" : "显示回来");
+	if (hidden) {
+		wlr_cursor_set_surface(server->cursor, NULL, 0, 0);
+		return;
+	}
+	if (fx->active) {
+		cursor_refresh(server);
+		return;
+	}
+	if (fx->surface != NULL) {
+		wlr_cursor_set_surface(server->cursor, fx->surface, fx->hx, fx->hy);
+	} else {
+		wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "left_ptr");
+	}
+}
+
+/* 光标现在藏着吗（input.c 的定时器 / 状态用）。 */
+bool vidow_cursor_fx_is_hidden(const struct vidow_server *server) {
+	struct vidow_cursor_fx *fx = server->cursor_fx;
+	return fx != NULL && fx->hidden;
 }
 
 /* 把放大图的**源**换成「光标图当前那张」，并照现在的倍数重画一遍。
@@ -677,6 +728,10 @@ void vidow_cursor_fx_default_cursor(struct vidow_server *server) {
 	if (fx != NULL) {
 		bool had_surface = fx->surface != NULL;
 		forget_surface(fx);
+		if (fx->hidden) {
+			/* 藏着：只记住「显示回来该给主题箭头」，别现在就把图上回去。 */
+			return;
+		}
 		if (fx->active) {
 			if (had_surface) {
 				wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr,

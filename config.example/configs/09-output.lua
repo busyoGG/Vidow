@@ -7,6 +7,10 @@
 -- ================== 缩放与输出
 -- 所有输出的默认缩放：auto = 按 EDID 的 ppi 推，也可以写死 "1" / "1.5"；单块屏点名用 vidow.output{ name = …, scale = … }
 scale = "auto"
+-- 指针一动就把「关着的屏」打开（Hyprland 的 misc { mouse_move_enables_dpms }）；默认 false = 不唤醒（以前的样子：关掉的屏只有再发一条 vidowmsg output-power 才回来）
+mouse_move_enables_dpms = false
+-- 按一下键就把「关着的屏」打开（Hyprland 的 misc { key_press_enables_dpms }）；默认 false = 不唤醒
+key_press_enables_dpms = false
 
 -- 显示器（输出）是另一类写法：**一块屏一组** —— 缩放、摆在哪儿（逻辑坐标）、
 -- 什么模式、开不开 VRR、几位色、方向、开不开，都是这块屏的事，写在一行里

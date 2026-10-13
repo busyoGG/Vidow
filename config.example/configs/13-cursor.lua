@@ -16,6 +16,10 @@ focus_follows_mouse_max_scroll_amount = ""
 warp_mouse_to_focus = false
 -- 光标挪到哪，照 niri 的 mode：留空 = X / Y 分别判断（只往需要的那个轴挪）；center-xy = 光标在窗口外就挪到窗口正中；center-xy-always = 永远挪到正中
 warp_mouse_to_focus_mode = ""
+-- 打字的时候把光标藏起来，指针一动就回来（niri 的 cursor { hide-when-typing }）；默认 false = 不藏，和以前一样
+hide_when_typing = false
+-- 指针静止这么多毫秒就把光标藏起来，一动就回来（niri 的 cursor { hide-after-inactive-ms }）；0（默认）= 不藏
+hide_after_inactive_ms = 0
 -- 这一族也能写成一张表，只写要改的项（focus_follows_mouse = { max_scroll_amount = "" }）
 --     不写表也行：focus_follows_mouse = false（一个值管全部）
 -- 这一族也能写成一张表，只写要改的项（warp_mouse_to_focus = { mode = "" }）

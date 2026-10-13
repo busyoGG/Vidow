@@ -121,6 +121,15 @@ static const struct section sections[] = {
 	 * 列宽预设是哪几档、新列默认多宽 —— 默认值就是 vidow 原来写死的那套。 */
 	{ "布局（列宽 / 居中）", "20-layout.lua",
 		"列宽预设、新列默认宽度、焦点列的居中策略（照 niri 的 layout {} 那一节）" },
+	/* 键盘（21-…）也只能往后加。和 19-input.lua 那族分开：那边是**设备属性**
+	 * （默认全不碰），这边是键盘自己的参数 —— 默认值就是 vidow 以前写死的
+	 * 25 / 600 和「不点亮 NumLock」。 */
+	{ "键盘（NumLock / 重复）", "21-keyboard.lua",
+		"键盘自己的参数：NumLock 起手点不点亮、按住键多久开始重复、每秒重复几次"
+		"（这两个数传给客户端，自动重复是客户端自己做的），以及键位里的 Mod 是哪个键" },
+	/* 工作区（22-…）。 */
+	{ "工作区", "22-workspace.lua",
+		"切工作区的规矩（照 niri 的 workspace-auto-back-and-forth）" },
 };
 #define N_SECTIONS ((int)(sizeof(sections) / sizeof(sections[0])))
 /* 「键位 / 工作区 / 规则」那一节：它不是配置键，entries[] 里没有它，打印也
@@ -479,6 +488,48 @@ static const struct entry entries[] = {
 		"新列的默认宽度，比例（0.5 = 半宽）；窗口规则里写了 column_width 的窗口"
 		"按规则走。默认 0.5 —— 原来 view.c 里那个 DEFAULT_COLUMN_WIDTH"
 		"（niri 的 layout { default-column-width }）" },
+
+	/* 光标隐藏（照 niri 的 cursor {} 那一节）。默认 = 改前行为：都不藏。 */
+	{ "hide_when_typing", K_BOOL, OFF(hide_when_typing),
+		SZ(hide_when_typing), 12,
+		"打字的时候把光标藏起来，指针一动就回来（niri 的 cursor { "
+		"hide-when-typing }）；默认 false = 不藏，和以前一样" },
+	{ "hide_after_inactive_ms", K_INT, OFF(hide_after_inactive_ms),
+		SZ(hide_after_inactive_ms), 12,
+		"指针静止这么多毫秒就把光标藏起来，一动就回来（niri 的 cursor { "
+		"hide-after-inactive-ms }）；0（默认）= 不藏" },
+
+	/* 输入唤醒关掉的屏（Hyprland 的 misc {} 那一节）。 */
+	{ "mouse_move_enables_dpms", K_BOOL, OFF(mouse_move_enables_dpms),
+		SZ(mouse_move_enables_dpms), 8,
+		"指针一动就把「关着的屏」打开（Hyprland 的 misc { "
+		"mouse_move_enables_dpms }）；默认 false = 不唤醒（以前的样子：关掉的屏"
+		"只有再发一条 vidowmsg output-power 才回来）" },
+	{ "key_press_enables_dpms", K_BOOL, OFF(key_press_enables_dpms),
+		SZ(key_press_enables_dpms), 8,
+		"按一下键就把「关着的屏」打开（Hyprland 的 misc { "
+		"key_press_enables_dpms }）；默认 false = 不唤醒" },
+
+	/* 键盘自己的参数（configs/21-keyboard.lua）。 */
+	{ "repeat_delay", K_INT, OFF(repeat_delay), SZ(repeat_delay), 20,
+		"按住键多久开始自动重复（毫秒）。默认 600 —— 改前 input.c 里写死的值。"
+		"这个数通过 wl_keyboard.repeat_info 报给客户端，**重复本身是客户端做的**"
+		"（wlroots 0.20 不在合成器里重复）" },
+	{ "repeat_rate", K_INT, OFF(repeat_rate), SZ(repeat_rate), 20,
+		"自动重复每秒几次（0 = 关掉重复）。默认 25 —— 改前 input.c 里写死的值" },
+	{ "numlock", K_BOOL, OFF(numlock), SZ(numlock), 20,
+		"启动时把 NumLock 点亮（niri 的 input { keyboard { numlock } }，niri 默认"
+		" true）；vidow 默认 false = 不碰键盘状态，和以前一样" },
+	{ "mod_key", K_STRING, OFF(mod_key), SZ(mod_key), 20,
+		"键位里写的 `Mod` 是哪个键：super（默认，= 改前行为）/ alt（niri 的 "
+		"mod-key）。niri 还有个 mod-key-nested（嵌套里的 Mod 换另一个键），没做" },
+
+	/* 工作区。 */
+	{ "workspace_auto_back_and_forth", K_BOOL,
+		OFF(workspace_auto_back_and_forth),
+		SZ(workspace_auto_back_and_forth), 21,
+		"切到「当前就在的」那块工作区时改成切回上一个（niri 的 "
+		"workspace-auto-back-and-forth）；默认 false = 什么都不做（以前的样子）" },
 };
 
 /* ------------------------------------------------------------ 配置组
@@ -1292,6 +1343,24 @@ static bool apply_one(struct vidow_config *cfg, const char *key,
 					"或者留空 = 不碰这台设备）；给的是 '%s'", value);
 				return false;
 			}
+			if (strcmp(e->key, "mod_key") == 0 && value[0] != '\0' &&
+					strcasecmp(value, "super") != 0 &&
+					strcasecmp(value, "logo") != 0 &&
+					strcasecmp(value, "win") != 0 &&
+					strcasecmp(value, "alt") != 0 &&
+					strcasecmp(value, "mod1") != 0) {
+				wlr_log(WLR_ERROR, "config: mod_key 只能是 super / alt"
+					"（niri 的 mod-key；给的是 '%s'）", value);
+				return false;
+			}
+			if (strcmp(e->key, "mod_key") == 0) {
+				/* 归一化成 super / alt 两个词 —— vidowmsg config 打回来的
+				 * 和写进去的是同一个词，键位那边只认这两个。 */
+				snprintf((char *)field, e->size, "%s",
+					strcasecmp(value, "alt") == 0 ||
+					strcasecmp(value, "mod1") == 0 ? "alt" : "super");
+				return true;
+			}
 			if (strcmp(e->key, "click_method") == 0 && value[0] != '\0' &&
 					strcmp(value, "button-areas") != 0 &&
 					strcmp(value, "clickfinger") != 0) {
@@ -1502,6 +1571,22 @@ static void defaults(struct vidow_config *cfg) {
 	 * 三态清成 VIDOW_TRI_AUTO、字符串清成空串、opt_double 清成没设）。
 	 * scroll_factor 是 vidow 自己在滚轮事件上乘的倍率，1.0 = 不缩放。 */
 	cfg->scroll_factor = 1.0;
+	/* 光标隐藏（configs/13-cursor.lua）：两个都关 —— 改前 vidow 不藏光标
+	 * （memset 已经给了 false / 0，这里写出来是为了让「默认 = 改前行为」这条
+	 * 一眼能看见）。 */
+	cfg->hide_when_typing = false;
+	cfg->hide_after_inactive_ms = 0;
+	/* 键盘（configs/21-keyboard.lua）：重复的两个数 = 改前 input.c 里写死的
+	 * 25 / 600；NumLock 不点亮（改前不碰键盘状态）；Mod 还是 Super。 */
+	cfg->repeat_rate = 25;
+	cfg->repeat_delay = 600;
+	cfg->numlock = false;
+	snprintf(cfg->mod_key, sizeof(cfg->mod_key), "super");
+	/* 输入唤醒关掉的屏：默认不唤醒（改前行为），见 server.h。 */
+	cfg->mouse_move_enables_dpms = false;
+	cfg->key_press_enables_dpms = false;
+	/* 切到当前工作区就什么都不做（改前行为）。 */
+	cfg->workspace_auto_back_and_forth = false;
 	/* 剪贴板默认接管：X11(Xwayland) 和 Wayland 两边共用一份内容，而且不看焦点
 	 * （wlroots 自带那套只在有 X11 窗口聚焦时才同步）。每个类型读进内存的上限
 	 * 32MiB —— 「源程序退出后还能粘」靠的就是这份副本。 */

@@ -778,6 +778,11 @@ static int l_bind(lua_State *L) {
 	/* { on = "release" } = 松开才触发（默认按下触发；单独一个修饰键的绑定默认
 	 * 就是松开触发，见 keybind.c）。 */
 	bool on_release = false;
+	/* { repeat = false } = 按住键的自动重复不再触发（niri 的 binds { repeat }，
+	 * 默认 true）；{ cooldown_ms = 200 } = 两次触发之间至少隔 200ms
+	 * （niri 的 binds { cooldown-ms }，默认 0 = 不限）。 */
+	bool repeat = true;
+	int cooldown_ms = 0;
 	if (lua_istable(L, 3)) {
 		lua_getfield(L, 3, "inhibited");
 		inhibited = lua_toboolean(L, -1) != 0;
@@ -798,10 +803,32 @@ static int l_bind(lua_State *L) {
 			}
 		}
 		lua_pop(L, 1);
+		lua_getfield(L, 3, "repeat");
+		if (lua_isboolean(L, -1)) {
+			repeat = lua_toboolean(L, -1) != 0;
+		} else if (!lua_isnil(L, -1)) {
+			lua_pop(L, 1);
+			return luaL_error(L, "vidow.bind 的 repeat 只能是 true / false");
+		}
+		lua_pop(L, 1);
+		lua_getfield(L, 3, "cooldown_ms");
+		if (lua_isnumber(L, -1)) {
+			cooldown_ms = (int)lua_tointeger(L, -1);
+			if (cooldown_ms < 0) {
+				lua_pop(L, 1);
+				return luaL_error(L, "vidow.bind 的 cooldown_ms 不能是"
+					"负数（0 = 不限，默认）");
+			}
+		} else if (!lua_isnil(L, -1)) {
+			lua_pop(L, 1);
+			return luaL_error(L, "vidow.bind 的 cooldown_ms 要是一个毫秒数"
+				"（0 = 不限，默认）");
+		}
+		lua_pop(L, 1);
 	}
 	char err[160];
 	if (vidow_keybind_add(s->server, trigger, action, inhibited, on_release,
-			err, sizeof(err)) == NULL) {
+			repeat, cooldown_ms, err, sizeof(err)) == NULL) {
 		return luaL_error(L, "%s", err);
 	}
 	lua_pushboolean(L, 1);

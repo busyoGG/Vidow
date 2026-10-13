@@ -195,7 +195,7 @@ static bool wheel_name(const char *token, enum wl_pointer_axis *axis, int *dir) 
  *   Mod+wheel-up              滚轮（纵向，往上）
  *   Mod                       单独一个修饰键（没有主键） */
 static bool parse_trigger(const char *trigger, struct trigger_parsed *out,
-		char *err, size_t errlen) {
+		uint32_t mod_mask, char *err, size_t errlen) {
 	char buf[sizeof(((struct vidow_keybind *)0)->trigger)];
 	snprintf(buf, sizeof(buf), "%s", trigger);
 
@@ -210,7 +210,11 @@ static bool parse_trigger(const char *trigger, struct trigger_parsed *out,
 		uint32_t btn = 0;
 		enum wl_pointer_axis axis;
 		int dir = 0;
-		if (strcasecmp(token, "mod") == 0 || strcasecmp(token, "super") == 0 ||
+		if (strcasecmp(token, "mod") == 0) {
+			/* `Mod` 是哪个键由配置决定（mod_key = super / alt，niri 的
+			 * mod-key）。`Super` / `Logo` / `Win` 是写死的 Super，不受它影响。 */
+			m |= mod_mask;
+		} else if (strcasecmp(token, "super") == 0 ||
 				strcasecmp(token, "logo") == 0 ||
 				strcasecmp(token, "win") == 0) {
 			m |= WLR_MODIFIER_LOGO;
@@ -283,7 +287,8 @@ bool vidow_keybind_init(struct vidow_server *server) {
 
 struct vidow_keybind *vidow_keybind_add(struct vidow_server *server,
 		const char *trigger, const char *action, bool inhibited,
-		bool on_release, char *err, size_t errlen) {
+		bool on_release, bool repeat, int cooldown_ms, char *err,
+		size_t errlen) {
 	if (err != NULL && errlen > 0) {
 		err[0] = '\0';
 	}
@@ -295,8 +300,12 @@ struct vidow_keybind *vidow_keybind_add(struct vidow_server *server,
 		return NULL;
 	}
 
+	/* `Mod` 是哪个键（mod_key = super / alt）。只影响 `Mod` 这个词：显式写
+	 * `Super+…` / `Alt+…` 的还是它们自己。 */
+	uint32_t mod_mask = strcasecmp(server->config.mod_key, "alt") == 0 ?
+		WLR_MODIFIER_ALT : WLR_MODIFIER_LOGO;
 	struct trigger_parsed t;
-	if (!parse_trigger(trigger, &t, err, errlen)) {
+	if (!parse_trigger(trigger, &t, mod_mask, err, errlen)) {
 		return NULL;
 	}
 
@@ -317,16 +326,19 @@ struct vidow_keybind *vidow_keybind_add(struct vidow_server *server,
 	bind->axis = t.axis;
 	bind->axis_dir = t.axis_dir;
 	bind->modifier_only = t.modifier_only;
+	bind->repeat = repeat;
+	bind->cooldown_ms = cooldown_ms > 0 ? cooldown_ms : 0;
 	/* 单独一个修饰键默认**松开才触发**：按下就触发的话 `Super+Q` 会顺带把
 	 * 全景也打开（那条绑定本来只想在「只按了 Super」时生效）。 */
 	bind->on = on_release || t.modifier_only ? VIDOW_BIND_RELEASE
 						 : VIDOW_BIND_PRESS;
 	wl_list_insert(server->keybinds.prev, &bind->link);
-	wlr_log(WLR_INFO, "keybind: %s -> %s%s%s%s", bind->trigger, bind->action,
+	wlr_log(WLR_INFO, "keybind: %s -> %s%s%s%s%s", bind->trigger, bind->action,
 		bind->src == VIDOW_SRC_MOUSE ? "（鼠标按键）" :
 			bind->src == VIDOW_SRC_WHEEL ? "（滚轮）" : "",
 		bind->on == VIDOW_BIND_RELEASE ? "（松开触发）" : "",
-		inhibited ? "（抑制期间也生效）" : "");
+		inhibited ? "（抑制期间也生效）" : "",
+		!bind->repeat || bind->cooldown_ms > 0 ? "（有重复限制）" : "");
 	return bind;
 }
 
@@ -410,7 +422,33 @@ static bool bind_hits(const struct vidow_keybind *bind, enum vidow_bind_src src,
 	return sym == bind->keysym || xkb_keysym_to_lower(sym) == bind->keysym;
 }
 
-static void bind_run(struct vidow_server *server, struct vidow_keybind *bind) {
+/* 这条绑定现在能不能跑：自动重复（repeat = false 的绑定只认第一次按下）和
+ * cooldown_ms（两次触发之间的最小间隔，0 = 不限）。返回 false = 这次跳过 ——
+ * 键照样算被我们吃了（调用者返回 true），只是动作不跑。 */
+static bool bind_allowed(struct vidow_keybind *bind, bool repeated) {
+	if (repeated && !bind->repeat) {
+		return false;
+	}
+	if (bind->cooldown_ms > 0) {
+		int64_t now = vidow_now_ns();
+		if (bind->last_run_ns != 0 &&
+				now - bind->last_run_ns <
+					(int64_t)bind->cooldown_ms * 1000000LL) {
+			return false;
+		}
+		bind->last_run_ns = now;
+	}
+	return true;
+}
+
+static void bind_run(struct vidow_server *server, struct vidow_keybind *bind,
+		bool repeated) {
+	if (!bind_allowed(bind, repeated)) {
+		wlr_log(WLR_DEBUG, "keybind: %s 这次跳过（repeat=%s cooldown=%dms）",
+			bind->trigger, bind->repeat ? "true" : "false",
+			bind->cooldown_ms);
+		return;
+	}
 	vidow_action_run(server, bind->action);
 	/* 事件（见 hooks.c）：谁按了什么键、跑了哪条动作 —— 脚本要「跟着按键
 	 * 做点别的」（录屏时打标记、状态栏闪一下）不用自己抢键。 */
@@ -507,7 +545,7 @@ static bool pending_release(struct vidow_server *server,
 		struct vidow_keybind *bind =
 			tap_lookup(server, tap_mods, sym, pinhibited);
 		if (bind != NULL) {
-			bind_run(server, bind);
+			bind_run(server, bind, false);
 			return true;
 		}
 		return swallow;
@@ -515,14 +553,41 @@ static bool pending_release(struct vidow_server *server,
 	struct vidow_keybind *bind = bind_lookup(server, src, VIDOW_BIND_RELEASE,
 		sym, button, pmods, pinhibited);
 	if (bind != NULL) {
-		bind_run(server, bind);
+		bind_run(server, bind, false);
 		return true;
 	}
 	return swallow;
 }
 
+/* 现在按着哪些键（只看 keysym）。用来认「这一下是自动重复」：同一个 keysym
+ * 还没松开又收到一次按下 = 重复。wlroots 0.20 自己不做重复（客户端做），所以
+ * 平时这里一直是空的 —— 留着是为了虚拟键盘 / 输入法回注 / 以后 wlroots 自己
+ * 重复时，repeat = false 的绑定不会连着跑。 */
+#define HELD_MAX 32
+static xkb_keysym_t held_syms[HELD_MAX];
+static int held_count;
+
+static bool held_note(xkb_keysym_t sym, bool pressed) {
+	for (int i = 0; i < held_count; i++) {
+		if (held_syms[i] != sym) {
+			continue;
+		}
+		if (pressed) {
+			return true; /* 已经按着 = 这次是重复 */
+		}
+		held_syms[i] = held_syms[held_count - 1];
+		held_count--;
+		return false;
+	}
+	if (pressed && held_count < HELD_MAX) {
+		held_syms[held_count++] = sym;
+	}
+	return false;
+}
+
 bool vidow_keybind_key(struct vidow_server *server, xkb_keysym_t sym,
 		bool pressed, uint32_t mods, bool inhibited) {
+	bool repeated = held_note(sym, pressed);
 	if (!pressed) {
 		return pending_release(server, VIDOW_SRC_KEY, sym, 0, mods);
 	}
@@ -555,7 +620,7 @@ bool vidow_keybind_key(struct vidow_server *server, xkb_keysym_t sym,
 	struct vidow_keybind *bind = bind_lookup(server, VIDOW_SRC_KEY,
 		VIDOW_BIND_PRESS, sym, 0, mods, inhibited);
 	if (bind != NULL) {
-		bind_run(server, bind);
+		bind_run(server, bind, repeated);
 		return true;
 	}
 	if (pending_record(server, VIDOW_SRC_KEY, sym, 0, mods, inhibited)) {
@@ -577,7 +642,7 @@ bool vidow_keybind_button(struct vidow_server *server, uint32_t button,
 	struct vidow_keybind *bind = bind_lookup(server, VIDOW_SRC_MOUSE,
 		VIDOW_BIND_PRESS, XKB_KEY_NoSymbol, button, mods, inhibited);
 	if (bind != NULL) {
-		bind_run(server, bind);
+		bind_run(server, bind, false);
 		return true;
 	}
 	if (pending_record(server, VIDOW_SRC_MOUSE, XKB_KEY_NoSymbol, button,
@@ -606,7 +671,7 @@ bool vidow_keybind_wheel(struct vidow_server *server,
 		if (!mods_match(mods, bind->mods)) {
 			continue;
 		}
-		bind_run(server, bind);
+		bind_run(server, bind, false);
 		return true;
 	}
 	return false;
@@ -654,6 +719,33 @@ static bool parse_direction(const char *arg, int *out) {
 	return true;
 }
 
+/* workspace_auto_back_and_forth（niri 的 workspace-auto-back-and-forth）：
+ * 要切过去的那块工作区**就是现在这块**时，改成切回上一次切过来的那块 ——
+ * 「Mod+1 按两下 = 回到刚才那块」。返回 true = 已经处理掉了（调用者别再切）。
+ *
+ * 记账只记键位动作切过去的那一次（last_workspace 在 keybind.c 这边更新）：
+ * IPC / 钩子切工作区不走这条路，也就不会污染「上一个」。默认关（改前行为：
+ * 切到当前工作区 = 什么都不做）。 */
+static bool workspace_back_and_forth(struct vidow_server *server,
+		struct vidow_workspace *target) {
+	if (target == NULL || !server->config.workspace_auto_back_and_forth) {
+		return false;
+	}
+	struct vidow_workspace *active = vidow_workspace_active(server);
+	if (active == NULL || target != active) {
+		server->last_workspace = active;
+		return false;
+	}
+	struct vidow_workspace *last = server->last_workspace;
+	if (last == NULL || last == target) {
+		return false; /* 没得回：还是老样子（什么都不做） */
+	}
+	wlr_log(WLR_INFO, "workspace: 就在这块上，回到上一块（%s）",
+		vidow_workspace_name(last) != NULL ? vidow_workspace_name(last) : "?");
+	server->last_workspace = active;
+	return vidow_workspace_activate(server, last);
+}
+
 /* `workspace <序号>` / `workspace <名字>` / `workspace up|down|previous`。
  *
  * 序号 = **这块屏上从上往下第几块**（niri：序号是位置，不是身份），越界夹到最后
@@ -675,6 +767,11 @@ static bool action_workspace_switch(struct vidow_server *server,
 		return vidow_workspace_focus_previous(server);
 	}
 	if (parse_number(arg, &n)) {
+		struct vidow_workspace *target = vidow_workspace_at(server,
+			server->focused_output, n);
+		if (workspace_back_and_forth(server, target)) {
+			return true;
+		}
 		return vidow_workspace_focus_index(server, server->focused_output,
 			n);
 	}
@@ -683,6 +780,9 @@ static bool action_workspace_switch(struct vidow_server *server,
 		wlr_log(WLR_ERROR, "workspace: 没有叫 %s 的工作区（具名工作区要先在"
 			"配置里 vidow.workspace_create() 建）", arg);
 		return false;
+	}
+	if (workspace_back_and_forth(server, ws)) {
+		return true;
 	}
 	return vidow_workspace_activate(server, ws);
 }
@@ -877,6 +977,16 @@ bool vidow_action_run(struct vidow_server *server, const char *action) {
 	if (strcmp(name, "special") == 0 || strcmp(name, "scratch") == 0) {
 		const char *want = arg != NULL && arg[0] != '\0' ? arg : "special";
 		return vidow_workspace_toggle_special(server, want);
+	}
+	if (strcmp(name, "toggle-touchpad") == 0 ||
+			strcmp(name, "toggle_touchpad") == 0) {
+		const char *why = NULL;
+		if (!vidow_input_toggle_touchpad(server, &why)) {
+			wlr_log(WLR_ERROR, "toggle-touchpad: %s",
+				why != NULL ? why : "没做成");
+			return false;
+		}
+		return true;
 	}
 	if (strcmp(name, "focus") == 0) {
 		int dir = 0;

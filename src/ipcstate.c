@@ -880,6 +880,11 @@ void vidow_ipc_json_keybinds(struct jbuf *b, struct vidow_server *server) {
 		jb_kv_str(b, "trigger", bind->trigger);
 		jb_kv_str(b, "action", bind->action);
 		jb_kv_uint(b, "mods", bind->mods);
+		/* 绑定上的重复限制（vidow.bind 第三个参数）：repeat 默认 true、
+		 * cooldown_ms 默认 0 —— 两个都报出来，脚本 / 状态栏能看出「这条为什么
+		 * 按住不连发」。 */
+		jb_kv_bool(b, "repeat", bind->repeat);
+		jb_kv_int(b, "cooldown_ms", bind->cooldown_ms);
 		jb_obj_end(b);
 	}
 	jb_arr_end(b);

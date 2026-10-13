@@ -60,6 +60,18 @@ static void keyboard_modifiers(struct wl_listener *listener, void *data) {
 	}
 }
 
+/* 有键按下了：打字就藏光标（hide_when_typing）+ 唤醒关掉的屏
+ * （key_press_enables_dpms）—— 两个开关默认都关。真键盘和注入的键都走这里：
+ * 「人按了键」这件事不分键盘从哪来（注入那条路平时不触发键位，但活动是活动）。 */
+static void input_note_key_press(struct vidow_server *server) {
+	if (server->config.hide_when_typing) {
+		vidow_cursor_fx_set_hidden(server, true);
+	}
+	if (server->config.key_press_enables_dpms) {
+		vidow_output_wake_disabled(server);
+	}
+}
+
 static void keyboard_key(struct wl_listener *listener, void *data) {
 	struct vidow_keyboard *kb = wl_container_of(listener, kb, key);
 	struct vidow_server *server = kb->server;
@@ -86,6 +98,9 @@ static void keyboard_key(struct wl_listener *listener, void *data) {
 	 * 就是这些键。绑定里写了 { inhibited = true } 的那几条是逃生口，照样生效
 	 * （不然抑制着的窗口能把用户锁死在里面，连关窗都关不了）。 */
 	bool inhibited = vidow_shortcuts_inhibited(server);
+	if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+		input_note_key_press(server);
+	}
 	/* config.lua 里 vidow.bind() 声明的键位（动作字符串见 README 的动作表）：
 	 * 工作区切换 / 窗口与列的方向移动 / 浮动 / 全屏 / 全景 / 起命令 / 切 tty …
 	 * 一个内置的都不预设，绑什么是什么；没命中的按键透传给客户端。 */
@@ -166,6 +181,44 @@ static void keyboard_destroy(struct wl_listener *listener, void *data) {
 	free(kb);
 }
 
+/* 键盘自己的参数（configs/21-keyboard.lua）：
+ *   repeat_rate / repeat_delay -> wl_keyboard.repeat_info（客户端自己重复）
+ *   numlock                    -> 起手把 NumLock 点亮
+ * 两者都是「设备上/客户端上」的状态，所以插键盘、配置改了都要重套一遍。 */
+static void keyboard_apply_config(struct vidow_server *server,
+		struct wlr_keyboard *kb) {
+	if (kb == NULL) {
+		return;
+	}
+	const struct vidow_config *cfg = &server->config;
+	wlr_keyboard_set_repeat_info(kb, cfg->repeat_rate, cfg->repeat_delay);
+
+	/* NumLock：xkb 的锁定修饰位（一般叫 Mod2）—— 点亮它 = 客户端看到
+	 * wl_keyboard.modifiers 里 NumLock 锁着、小键盘出数字。默认关（改前不碰）。 */
+	if (!cfg->numlock || kb->keymap == NULL || kb->xkb_state == NULL) {
+		return;
+	}
+	xkb_mod_index_t idx = xkb_keymap_mod_get_index(kb->keymap, XKB_MOD_NAME_NUM);
+	if (idx == XKB_MOD_INVALID) {
+		wlr_log(WLR_DEBUG, "numlock: 这份 keymap 里没有 Mod2，跳过");
+		return;
+	}
+	xkb_mod_mask_t mask = (xkb_mod_mask_t)1 << idx;
+	if ((kb->modifiers.locked & mask) != 0) {
+		return; /* 已经亮着（按过 NumLock 键了） */
+	}
+	xkb_state_update_mask(kb->xkb_state, kb->modifiers.depressed,
+		kb->modifiers.latched, kb->modifiers.locked | mask, 0, 0,
+		kb->modifiers.group);
+	kb->modifiers.locked |= mask;
+	/* 把新的修饰位发给客户端（wlroots 0.20 没有 keyboard 级的 notify，走 seat
+	 * 那一个）。不是 seat 正拿着的那把键盘就别发 —— 那会把别人的修饰状态带歪。 */
+	if (wlr_seat_get_keyboard(server->seat) == kb) {
+		wlr_seat_keyboard_notify_modifiers(server->seat, &kb->modifiers);
+	}
+	wlr_log(WLR_INFO, "键盘: numlock = true，NumLock 起手点亮");
+}
+
 static void server_add_keyboard(struct vidow_server *server,
 		struct wlr_keyboard *wlr_keyboard, struct wlr_input_device *device,
 		struct wlr_virtual_keyboard_v1 *virtual, bool inject) {
@@ -190,7 +243,8 @@ static void server_add_keyboard(struct vidow_server *server,
 		}
 		xkb_context_unref(context);
 	}
-	wlr_keyboard_set_repeat_info(wlr_keyboard, 25, 600);
+	/* 重复速率 / 延迟和 NumLock 都从配置来（默认 25 / 600 / 不点亮 = 改前行为）。 */
+	keyboard_apply_config(server, wlr_keyboard);
 
 	kb->modifiers.notify = keyboard_modifiers;
 	wl_signal_add(&wlr_keyboard->events.modifiers, &kb->modifiers);
@@ -483,6 +537,84 @@ void vidow_input_apply_libinput(const struct vidow_config *cfg,
 	}
 }
 
+/* toggle-touchpad 动作（configs/14-keys.lua 里绑一条）：把触控板整体关掉 / 打开。
+ * 只认 libinput 的**触控板**（有 tap 能力的设备）—— 鼠标不碰。全开着就全关，
+ * 全关着就全开（一个动作来回切）。关 = libinput 的 send-events 置 DISABLED，
+ * 设备本身还在，配置 / 热插拔照旧。 */
+bool vidow_input_toggle_touchpad(struct vidow_server *server, const char **why) {
+	int touchpads = 0, disabled = 0;
+	struct vidow_input_device *dev;
+	wl_list_for_each(dev, &server->input_devices, link) {
+		if (!wlr_input_device_is_libinput(dev->device)) {
+			continue;
+		}
+		struct libinput_device *d =
+			wlr_libinput_get_device_handle(dev->device);
+		if (d == NULL || libinput_device_config_tap_get_finger_count(d) <= 0) {
+			continue; /* 不是触控板 */
+		}
+		touchpads++;
+		if (libinput_device_config_send_events_get_mode(d) ==
+				LIBINPUT_CONFIG_SEND_EVENTS_DISABLED) {
+			disabled++;
+		}
+	}
+	if (touchpads == 0) {
+		if (why != NULL) {
+			*why = "没有触控板（libinput 的 tap 能力设备）";
+		}
+		return false;
+	}
+	bool enable = disabled == touchpads; /* 全关着 -> 全开；否则全关 */
+	enum libinput_config_send_events_mode mode = enable ?
+		LIBINPUT_CONFIG_SEND_EVENTS_ENABLED :
+		LIBINPUT_CONFIG_SEND_EVENTS_DISABLED;
+	int n = 0;
+	wl_list_for_each(dev, &server->input_devices, link) {
+		if (!wlr_input_device_is_libinput(dev->device)) {
+			continue;
+		}
+		struct libinput_device *d =
+			wlr_libinput_get_device_handle(dev->device);
+		if (d == NULL || libinput_device_config_tap_get_finger_count(d) <= 0) {
+			continue;
+		}
+		libinput_device_config_send_events_set_mode(d, mode);
+		n++;
+	}
+	wlr_log(WLR_INFO, "触控板: %s（%d 块）", enable ? "打开" : "关掉", n);
+	if (why != NULL) {
+		*why = enable ? "触控板已打开" : "触控板已关掉";
+	}
+	return true;
+}
+
+/* ------------------------------------------------------------ 光标隐藏
+ *
+ * hide_when_typing / hide_after_inactive_ms（configs/13-cursor.lua，照 niri 的
+ * cursor {} 那一节）。两个开关共用「藏」这一个状态，显示回来的那条路只有一条：
+ * 指针一动（vidow_pointer_motion）。 */
+static int cursor_hide_timeout(void *data) {
+	struct vidow_server *server = data;
+	vidow_cursor_fx_set_hidden(server, true);
+	return 0;
+}
+
+/* 重新计时：hide_after_inactive_ms <= 0 就把闹钟停掉。 */
+static void cursor_hide_arm(struct vidow_server *server) {
+	if (server->cursor_hide_timer == NULL) {
+		return;
+	}
+	int ms = server->config.hide_after_inactive_ms;
+	wl_event_source_timer_update(server->cursor_hide_timer, ms > 0 ? ms : 0);
+}
+
+/* 指针动了：光标回来 + 重新计时（藏 / 显示都走 cursorfx.c 那一处）。 */
+static void cursor_wake(struct vidow_server *server) {
+	vidow_cursor_fx_set_hidden(server, false);
+	cursor_hide_arm(server);
+}
+
 /* 一台 wlr 设备：是 libinput 的才往下走（虚拟设备会被 wlroots 那套 assert 掉）。 */
 static void input_apply_device(const struct vidow_config *cfg,
 		struct wlr_input_device *device) {
@@ -513,6 +645,19 @@ static const char *input_config_keys[] = {
 	"click_method",
 };
 
+/* 键盘自己的那几个键（configs/21-keyboard.lua）+ 光标隐藏那两个：改了要立刻
+ * 生效 —— 键盘参数是「设备上 / 客户端上」的状态，光标隐藏要重设闹钟。 */
+static const char *keyboard_config_keys[] = {
+	"repeat_delay", "repeat_rate", "numlock",
+};
+
+static void keyboard_apply_all(struct vidow_server *server) {
+	struct vidow_keyboard *kb;
+	wl_list_for_each(kb, &server->keyboards, link) {
+		keyboard_apply_config(server, kb->wlr_keyboard);
+	}
+}
+
 static void input_config_changed(struct vidow_config *cfg, const char *key,
 		void *data) {
 	(void)cfg; /* 和 server->config 是同一份 */
@@ -528,6 +673,29 @@ static void input_config_changed(struct vidow_config *cfg, const char *key,
 			}
 		}
 		if (!ours) {
+			bool keyboard = false;
+			for (size_t i = 0;
+					i < sizeof(keyboard_config_keys) /
+						sizeof(keyboard_config_keys[0]); i++) {
+				if (strcmp(key, keyboard_config_keys[i]) == 0) {
+					keyboard = true;
+					break;
+				}
+			}
+			if (keyboard) {
+				keyboard_apply_all(server);
+				return;
+			}
+			if (strcmp(key, "hide_when_typing") == 0 ||
+					strcmp(key, "hide_after_inactive_ms") == 0) {
+				if (server->config.hide_after_inactive_ms <= 0) {
+					/* 关掉了：把藏起来的光标放回来。 */
+					cursor_wake(server);
+				} else {
+					cursor_hide_arm(server);
+				}
+				return;
+			}
 			return;
 		}
 	}
@@ -627,6 +795,15 @@ void vidow_pointer_motion(struct vidow_server *server, uint32_t time_msec) {
 	 * 移动指针时尤其明显）。放在最前面：拖着东西 / 摇晃那些分支提前 return 也
 	 * 一样要推（拖拽时光标也在动）。 */
 	vidow_screencast_cursor_moved(server);
+
+	/* 光标隐藏（hide_when_typing / hide_after_inactive_ms）：指针一动就把光标
+	 * 显示回来并重新计时。放在最前面 —— 拖着东西 / 摇晃那些分支提前 return 也
+	 * 一样算「人动了」。 */
+	cursor_wake(server);
+	/* 输入唤醒关掉的屏（默认关，见 server.h 的 mouse_move_enables_dpms）。 */
+	if (server->config.mouse_move_enables_dpms) {
+		vidow_output_wake_disabled(server);
+	}
 
 	/* 指针约束（游戏锁鼠标 / 夹光标）：先把这一步的位移发出去（relative_pointer），
 	 * 锁定的把光标钉回去、夹住的夹进围栏。必须在命中测试**之前** —— 位置定下来
@@ -1115,6 +1292,11 @@ bool vidow_input_init(struct vidow_server *server) {
 	 * 注册放在 wl_list_init 之后 —— 在那之前 server->input_devices 还不是个
 	 * 链表，回调里遍历会踩空。 */
 	vidow_config_observe(input_config_changed, server);
+	/* 光标隐藏的闹钟（hide_after_inactive_ms；两个开关都关着时闹钟一直停着）。 */
+	server->cursor_hide_timer = wl_event_loop_add_timer(
+		wl_display_get_event_loop(server->display), cursor_hide_timeout,
+		server);
+	cursor_hide_arm(server);
 	server->new_input.notify = server_new_input;
 	wl_signal_add(&server->backend->events.new_input, &server->new_input);
 
@@ -1261,6 +1443,12 @@ static void inject_key(struct vidow_server *server, uint32_t keycode,
 		kb->modifiers.group = xkb_state_serialize_layout(kb->xkb_state,
 			XKB_STATE_LAYOUT_EFFECTIVE);
 		wlr_seat_keyboard_notify_modifiers(server->seat, &kb->modifiers);
+	}
+
+	/* 注入的键也算「人按了键」：打字藏光标 / 唤醒关掉的屏两个开关都认它
+	 * （headless 里没有真键盘，这两个开关只有注入这条路能验）。 */
+	if (pressed) {
+		input_note_key_press(server);
 	}
 
 	/* 注入的键也走「X11 抓着键盘就给它」那条规矩（不然测试里没法验证抓取：

@@ -5420,6 +5420,64 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
      - 未做：niri 的 `fixed 1920`（固定像素档）、`preset-window-heights`、`default-column-width {}`（让客户端自己定宽）、
        `always-center-single-column`；窗口规则级的 per-rule 预设覆盖。
 
+262. **光标隐藏 / 键盘参数 / 输入唤醒 / 键位限制这一批小开关（`configs/21-keyboard.lua`、`22-workspace.lua`）**（用户：「把调研第 5 节剩下的 S 成本项打包做完」；2026-10-14）
+
+     - 新增 9 个配置键 + 2 个键位选项 + 1 个动作，**默认值全部 = vidow 改前的行为**（不配置零变化）：
+       ```lua
+       hide_when_typing = false                  -- 打字时藏光标（niri 的 cursor { hide-when-typing }）
+       hide_after_inactive_ms = 0                -- 指针静止多久藏（0 = 不藏；niri 的 hide-after-inactive-ms）
+       repeat_delay = 600                        -- 改前 input.c 里写死的 600
+       repeat_rate  = 25                         -- 改前 input.c 里写死的 25
+       numlock = false                           -- 起手点亮 NumLock（niri 默认 true，vidow 改前不碰）
+       mod_key = "super"                         -- 键位里的 `Mod` 是哪个键（niri 的 mod-key）：super / alt
+       mouse_move_enables_dpms = false           -- 指针一动唤醒关掉的屏（Hyprland 的 misc{}）
+       key_press_enables_dpms  = false           -- 按一下键唤醒关掉的屏
+       workspace_auto_back_and_forth = false     -- 切到「当前就在的」工作区改成切回上一个（niri 同名键）
+       vidow.bind("Mod+Q", "close-window", { ["repeat"] = false, cooldown_ms = 200 })
+       vidow.bind("Mod+R", "toggle-touchpad")    -- 动作：触控板整体关 / 开
+       ```
+     - 三条写路径都吃（照「可配置缓动」508239e）：config.lua / `VIDOW_NUMLOCK=true`、`VIDOW_MOD_KEY=alt`、
+       `VIDOW_HIDE_AFTER_INACTIVE_MS=1200` / `vidowmsg set-config <键> <值>`；查询 `vidowmsg config <键>`。
+       写错当场 `WLR_ERROR` + 该行不生效（`mod_key = "ctrl"` 拒，旧值不动）；`mod_key` 归一化成 `super` / `alt` 两个词。
+     - 光标隐藏（`cursorfx.c` 的 `vidow_cursor_fx_set_hidden()`，调用点在 `input.c`）：藏 = 把 wlr_cursor 的图设成 NULL；
+       显示 = 把「这期间该显示的那张」重新设上（客户端 `set_cursor` 给的那张，或者主题箭头）—— 客户端在藏着的时候
+       `set_cursor` 只记账不上图。指针一动就显示回来并重新计时；`hide_after_inactive_ms` 用 `wl_event_loop` 定时器。
+       **这条改动了 `src/cursorfx.c`（不在原定可碰清单里）**：只有它知道「当前该显示哪张光标图」。
+     - 键盘：`repeat_delay` / `repeat_rate` 走 `wlr_keyboard_set_repeat_info()`（就是原来那两个写死的数，现在能配），
+       插键盘和配置改了都重套；`numlock` 用 xkb 的 `XKB_MOD_NAME_NUM` 锁定位 + `wlr_seat_keyboard_notify_modifiers()`
+       （wlroots 0.20 没有 keyboard 级的 notify），只对 seat 正拿着的那把键盘发。**注意：自动重复是客户端自己做的**
+       （wlroots 0.20 不在合成器里重复，`repeat_info` 只是把速率报给客户端），所以 `repeat = false` / `cooldown_ms`
+       这两个绑定选项今天基本看不到效果 —— 它们按「同一个 keysym 没松开又来一次按下 = 重复」实现（`held_syms[]`），
+       留着给虚拟键盘 / 输入法回注 / 以后 wlroots 自己重复。绑定选项写在 `vidow.bind()` 第三个参数里，
+       **`repeat` 是 Lua 保留字，必须写成 `["repeat"] = false`**；`vidowmsg keybinds` 两个字段都报出来。
+     - 输入唤醒关掉的屏（`output.c` 的 `vidow_output_wake_disabled()`）：vidow 没有单独的 DPMS 状态，
+       「关掉的输出」本身就是那个状态，所以唤醒 = 把所有关着的输出打开（笔记本合盖 / `output-power off` 都算）。
+       `input.c` 里指针一动 / 按键一下各看一眼开关；注入的键也算「人按了键」（headless 只有这条路能验）。
+     - `workspace_auto_back_and_forth` 落在 `keybind.c` 的动作那条路（`workspace <序号>` / `workspace <名字>`）：
+       要切过去的就是现在这块 → 改成切回 `server->last_workspace`；记账只记**动作切过去的**那一次（IPC / 钩子切工作区
+       不污染「上一个」）。`toggle-touchpad` 动作只认 libinput 的触控板（有 tap 能力的设备），全开着就全关、全关着就全开。
+     - 验证（headless 1280x720 一块屏，脚本 `/tmp/vidow-check262b.sh`、`/tmp/t4.sh`、`/tmp/t5.sh`、`/tmp/t6.sh`）：
+       - 9 个键不配置时 `vidowmsg config` 全是上面那组默认值；配置里写了就原样查得回来；`VIDOW_*` / `set-config` 同样。
+       - 光标：`hide_after_inactive_ms = 400` 静止 0.9s → 日志 `光标: 藏起来`；`move-cursor` → `光标: 显示回来`；
+         `hide_when_typing = true` + 注入一个按键 → `光标: 藏起来`。
+       - DPMS：`output-power headless-1 off` + `move-cursor` → `输入唤醒: 打开 1 块关着的屏`；再关屏 + 按键 → 第二次唤醒；
+         两个开关 `set-config` 成 false 后同样操作**一次都不唤醒**，`state` 里那块屏仍是 `enabled: false`。
+       - `mod_key = "alt"` → `vidowmsg keybinds` 里 `Mod+Q` 的 `mods` 从 64（LOGO）变成 8（ALT）；`repeat=false` /
+         `cooldown_ms=250` 两个字段也报出来。
+       - 工作区往返（两块具名工作区 chat / mail）：`workspace mail` → mail；再按一次 → 日志
+         `workspace: 就在这块上，回到上一块（chat）` 且真的回到 chat；`workspace chat` 再按一次同样回到 mail。
+       - `toggle-touchpad`：headless 没有触控板 → `动作 'toggle-touchpad' 没做成` + 日志说清原因，**不崩**（真机上的
+         「关掉 / 打开」这条路没验，如实说）。
+     - 回归：`test-config.sh` 全过、`test-defaultconfig.sh` 全过（123 个平铺键都在，`21-keyboard.lua` /
+       `22-workspace.lua` 与 `--default-config` 逐字节一致）。
+     - 未做：**每屏 `focus_at_startup`**（要动 `outputconf.c` 的每屏配置 + 输出创建时的聚焦顺序，时间盒到点了，
+       连配置面都没铺）；niri 的 `mod-key-nested`（嵌套里换另一个 Mod）；真机上的触控板开关 / NumLock LED。
+     - 改了：`src/config.c`（2 个分节 + 9 个键 + 校验）、`src/server.h`（字段 + 声明）、`src/input.c`（键盘参数 /
+       numlock / 光标隐藏定时器 / DPMS 唤醒 / toggle-touchpad）、`src/output.c`（`vidow_output_wake_disabled`）、
+       `src/keybind.c` + `src/keybind.h`（repeat / cooldown_ms / mod_key / 两个动作）、`src/script.c`（绑定选项解析）、
+       `src/ipcstate.c`（keybinds 报 repeat / cooldown_ms）、`src/cursorfx.c`（藏 / 显示）、
+       `config.example/`（重新生成，新增两份分类文件）。
+
 260. **libinput 设备配置族：触控板 / 鼠标那十一个设置终于能配了（`configs/19-input.lua`）**（用户：「照 niri 的 `input {}` 那套，给 vidow 加 libinput 设备配置族」；2026-10-14）
 
      - 改前：vidow **一个 libinput 设置都不能调**（全仓 grep `accel_profile` / `scroll_method` / `natural_scroll` / `tap_to_click` = 0 命中）——

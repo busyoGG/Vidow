@@ -607,6 +607,29 @@ static double output_pick_scale(struct vidow_server *server,
 	return scale;
 }
 
+/* 把「关着的」屏全打开（mouse_move_enables_dpms / key_press_enables_dpms，
+ * 见 server.h）。返回打开了几个 —— 0 = 当时没有关着的屏，调用者别打日志。
+ *
+ * 语义照 Hyprland 那两个开关：屏是「被关掉省电 / 被 output-power off 关掉」的，
+ * 有人动了（指针 / 按键）就亮回来。vidow 这边没有单独的 DPMS 状态，
+ * 「关掉的输出」本身就是那个状态，所以唤醒 = 把所有关着的输出打开。 */
+int vidow_output_wake_disabled(struct vidow_server *server) {
+	int n = 0;
+	struct vidow_output *output;
+	wl_list_for_each(output, &server->outputs, link) {
+		if (output->wlr_output->enabled) {
+			continue;
+		}
+		if (vidow_output_set_enabled(server, output->wlr_output, true)) {
+			n++;
+		}
+	}
+	if (n > 0) {
+		wlr_log(WLR_INFO, "输入唤醒: 打开 %d 块关着的屏（dpms）", n);
+	}
+	return n;
+}
+
 /* 这块屏上现在挂着几个窗口（关屏的日志用：说清楚「东西还在，只是不画了」）。 */
 static int count_output_views(struct vidow_server *server,
 		struct wlr_output *output) {

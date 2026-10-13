@@ -353,6 +353,46 @@ struct vidow_config {
 	char click_method[24];                /* "" = 不设；button-areas / clickfinger */
 	double scroll_factor;                 /* 滚动倍率，1.0 = 不缩放 */
 
+	/* 光标隐藏（configs/13-cursor.lua，照 niri 的 cursor {} 那一节）。
+	 *
+	 * 默认值 = **vidow 以前的行为**：两个都不藏（光标一直在，跟以前一样）。
+	 * hide_when_typing = niri 的 cursor { hide-when-typing }：一打字就把光标
+	 * 藏起来（指针一动就回来）。hide_after_inactive_ms = 那个节点的
+	 * hide-after-inactive-ms：指针静止这么久（毫秒）就藏，0 = 不藏。
+	 * 实现见 cursorfx.c 的 vidow_cursor_fx_set_hidden + input.c 的定时器。 */
+	bool hide_when_typing;
+	int hide_after_inactive_ms;
+
+	/* 键盘自己的参数（configs/21-keyboard.lua）。
+	 *
+	 * repeat_delay / repeat_rate 就是改前 input.c 里写死的 600 / 25（毫秒 /
+	 * 每秒几次），只是现在能配了 —— 它们通过 wl_keyboard.repeat_info 传给
+	 * 客户端，**自动重复是客户端自己做的**（wlroots 0.20 不在合成器里重复，
+	 * 只把这两个数报给客户端），所以 vidow 自己的键位看不到重复事件。
+	 * numlock = niri 的 input { keyboard { numlock } }：起手把 NumLock 点亮。
+	 * niri 默认 true，vidow 默认 false —— 改前 vidow 一个键盘状态都不碰。
+	 * mod_key = niri 的 mod-key：键位里写的 `Mod` 到底是哪个键（super / alt）。
+	 * niri 还有个 mod-key-nested（嵌套里的 Mod 换成另一个键），**没做**。 */
+	int repeat_delay;
+	int repeat_rate;
+	bool numlock;
+	char mod_key[16];
+
+	/* 输入唤醒关掉的屏（Hyprland 的 misc { mouse_move_enables_dpms /
+	 * key_press_enables_dpms }）：指针一动 / 按键一下就把「关着的屏」打开。
+	 *
+	 * 默认都是 false = **vidow 以前的行为**：屏一旦用 `vidowmsg output-power
+	 * ... off`（或者后端因为合盖 / 省电）关掉，只有再发一条 IPC 才会回来，
+	 * 输入不会唤醒它。设 true 才有「一动就亮」。见 input.c 的
+	 * vidow_output_wake_disabled。 */
+	bool mouse_move_enables_dpms;
+	bool key_press_enables_dpms;
+
+	/* 切到「当前就在的」那块工作区时，改成切回**上一个**工作区
+	 * （niri 的 workspace-auto-back-and-forth）。默认 false = 改前行为：
+	 * 切到当前工作区 = 什么都不做。记账在 keybind.c 的动作那条路上。 */
+	bool workspace_auto_back_and_forth;
+
 	/* 剪贴板（见 clipboard.c）：X11(Xwayland) 与 Wayland 两边共用一份内容。
 	 * clipboard = false 就不接管，退回 wlroots 自带那套（只在有 X11 窗口聚焦
 	 * 时才同步）；clipboard_primary 决定选区（PRIMARY）要不要一起同步；
@@ -1929,6 +1969,11 @@ struct vidow_server {
 
 	struct wl_listener cursor_motion;
 	struct wl_listener cursor_motion_absolute;
+	/* 光标隐藏（hide_when_typing / hide_after_inactive_ms，见 input.c 的
+	 * 「光标隐藏」段）：指针静止到这个闹钟响就把光标藏起来；hidden 记着当前
+	 * 藏没藏（指针一动 / 按键来的时候要显示回来）。 */
+	struct wl_event_source *cursor_hide_timer;
+	bool cursor_hidden;
 	struct wl_listener cursor_button;
 	struct wl_listener cursor_axis;
 	struct wl_listener cursor_frame;
@@ -2038,6 +2083,9 @@ struct vidow_server {
 	struct vidow_column *last_focused_col;
 	struct vidow_layer_surface *keyboard_layer; /* exclusive layer grab */
 	struct wlr_output *focused_output;
+	/* 上一次切过去的那块工作区（workspace_auto_back_and_forth 要用）：只记
+	 * 「键位动作切过去的」那一次，见 keybind.c 的 action_workspace_switch。 */
+	struct vidow_workspace *last_workspace;
 
 	/* Fallback clock: advances animations when the backend stops delivering
 	 * frame events (a nested Wayland output stalls while the host is idle). */
@@ -2125,6 +2173,17 @@ void vidow_input_apply_libinput(const struct vidow_config *cfg,
 /* 上面那个套到当前所有设备上：设备插入时（热插拔也走这条路）和配置改了时各调
  * 一次（后者由 config.c 的观察者触发，见 vidow_input_init）。 */
 void vidow_input_apply_all(struct vidow_server *server);
+/* 光标隐藏 / 显示（hide_when_typing / hide_after_inactive_ms）。实现在
+ * cursorfx.c（它记着「当前该显示哪张光标图」），调用点在 input.c。 */
+void vidow_cursor_fx_set_hidden(struct vidow_server *server, bool hidden);
+/* 把「关着的」输出全打开（mouse_move_enables_dpms / key_press_enables_dpms）。
+ * 返回打开了几个（0 = 当时没有关着的屏，调用者就别打日志）。 */
+int vidow_output_wake_disabled(struct vidow_server *server);
+/* toggle-touchpad 动作：把触控板整体关掉 / 打开（见 input.c）。why 收一句人话
+ * （成功 / 失败的原因），给 IPC 和日志用。 */
+bool vidow_input_toggle_touchpad(struct vidow_server *server, const char **why);
+/* 光标现在藏着吗（cursorfx.c）。 */
+bool vidow_cursor_fx_is_hidden(const struct vidow_server *server);
 bool vidow_view_init(struct vidow_server *server);
 /* xdg_popup 的 unconstrain 只能在 popup 自己第一次 commit 之后做（wlroots 里
  * schedule_configure 有 assert(surface->initialized)），见 view.c 的注释。 */
