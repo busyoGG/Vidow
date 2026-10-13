@@ -2010,24 +2010,17 @@ void vidow_place_view(struct vidow_view *view, int x, int y, int w, int h) {
 	 * 得到的是新位置减新位置 = 0，动画照跑 190ms / 30 帧但一格都不动。 */
 	int drawn_x = view->geom.x + (int)lround(view->anim_off_x);
 	int drawn_y = view->geom.y + (int)lround(view->anim_off_y);
-	/* 上一帧它其实没画在屏上（被 park 了：滑出去、或者本来在别的工作区）时，
-	 * 上面这个值不是"它刚才在哪"，而是 park 之前那一次的 geom。列里每个窗口
-	 * 都会这样，可全屏视图的 geom.x 恒等于输出框左边（0），补间起点于是变成
-	 * "屏幕最左边" —— 每次滚出去再滚回来，它都从左边飞进来（用户报的 proton
-	 * 全屏游戏窗口）。
-	 * 判据是"这个起点落在输出框里面"：真滑到屏外的窗口起点本来就在框外，
-	 * 不动它；落在框内的说明上一帧它并不在屏上，那它到底从哪一侧进来，只能
-	 * 看新位置相对旧值往哪边走 —— 往右走就是从左边进，反之亦然。
-	 * 列就是列，跟全不全屏无关，所以这里不按 fullscreen 分支。 */
-	if (view->output != NULL) {
-		struct wlr_box box = {0};
-		wlr_output_layout_get_box(view->server->output_layout,
-			view->output, &box);
-		if (box.width > 0 && drawn_x >= box.x &&
-				drawn_x < box.x + box.width) {
-			drawn_x = x > drawn_x ? box.x - w : box.x + box.width;
-		}
-	}
+	/* 补间起点就是这个值，**被 park 的视图也不例外**：park 只把节点摆到屏外
+	 * 的停放位、不动 geom/anim_off（见 view_anim_place），而 park 的判据恰恰是
+	 * "画出来的盒子跟自己的输出框一点都不沾"（vidow_view_should_park）—— 所以
+	 * 滑出去时这个值必然是屏外**它进来的那一侧**上的一点，起点本来就对：滚回来
+	 * 它跟条带一起平移，位移跟别的列一模一样，不会单独飞。
+	 * 别按"起点落在输出框里就把它推到屏幕边上"去改（ee769a7 干过）：那个判据在
+	 * **正常**情况 —— 它明明画在屏上、只是被布局挪了一格 —— 也成立，于是每滚一列
+	 * 窗口都被瞬移到屏幕边再滑回来：往左滚时起点算成输出框右缘（看着"一直占着
+	 * 右边那一列、像跟别的窗口换了位置"），往右滚时起点算成 框.x - 窗口宽，而全屏
+	 * 视图的宽 == 整屏宽，那个值正好是屏幕最左边（用户报的"从最左边移入"）。
+	 * 列就是列，这里不按 fullscreen 分支。 */
 	struct wlr_box before = {
 		.x = drawn_x, .y = drawn_y,
 		.width = view->geom.width, .height = view->geom.height,
