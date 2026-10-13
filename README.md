@@ -5364,6 +5364,53 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
        `time(NULL) - server_start > 5` 才重启），那种情况下桥会一直摘着，直到配置 SIGHUP（`apply_config`
        会重新接管）或下一个 X 客户端把 Xwayland 再拉起来。
 
+258. **kitty + 虚拟键盘下 IM 层自激：10 秒刷 106 万行日志（`text input enabled/disabled` + wlroots 的 `Text input commit received without focus`）**（剪贴板测试顺带撞到，与剪贴板无关；2026-10-14；复现脚本 `/tmp/imfix-final.sh`，触发窗用 `geowin trigger 1 1 1 1 --linger=0.2`）
+
+     - 现象：headless vidow + kitty，只要有**另一扇窗 map 完立刻消失**（哪怕 1x1、200ms 就没），
+       日志当场进死循环：10 秒窗口 **1,061,522 行** —— `im.c:151 text input enabled`、
+       `im.c:163 text input disabled`、`im.c:440 im focus ->`、wlroots `types/wlr_text_input_v3.c:190
+       Text input commit received without focus` 各 **266,468** 次（4 行一轮，约 10.6 万轮/秒，CPU 空转）。
+     - 链路（日志 + wlroots 源码坐实的，不是猜）：
+       ① 焦点变化（触发窗 map / 关）让 `vidow_im_focus()` 给 kitty 发 `leave`、紧接着又发 `enter`
+          （`src/view.c:2983` → `src/im.c:439`）；
+       ② kitty 对 `leave` 回 `disable()` + `commit()`、对 `enter` 回 `enable()` + `commit()`
+          （`WAYLAND_DEBUG=1` 实录：`<- leave` / `-> disable()` / `-> commit()` 一路交替）；
+       ③ wlroots 的 commit 处理（`types/wlr_text_input_v3.c:174-196`）拿这次 `pending_enabled` 和
+          上一次 `current_enabled` 比跳变：客户端的 enable/disable 是**交替**的，于是**每一次 commit
+          都算一次跳变**，wlroots 就发 `events.enable` / `events.disable`；
+       ④ vidow 的 `text_input_enable_event` / `text_input_disable_event` 接住 → `text_input_enable()`
+          （`src/im.c:143`）里补的那次 `vidow_im_focus()` 又给客户端发 `enter`、
+          `text_input_disable()`（`src/im.c:154`）里给客户端发 `leave`；
+       ⑤ 回到 ②：客户端又回 enable/disable + commit …… ②③④ 互为因果，转起来就停不下。
+     - 根因：**`enter`/`leave` 是「表面的文本输入焦点」事件，只能跟着 seat 的键盘焦点走；
+       客户端自己说 `enable`/`disable` 并不代表它的表面丢了焦点。** `text_input_disable()` 里发
+       `leave` 违反了这条：客户端收到 `leave` 必然回 `disable` + `commit`，那个 commit 又被 wlroots
+       当成一次跳变 → 我们又 `disable` → 又发 `leave`。`text_input_enable()` 里补的那次
+       `vidow_im_focus()` 本身没错（「客户端在窗口已经有焦点之后才 enable」这条得靠它补 `enter`），
+       但上面那次 `leave` 把 `focused_surface` 清成了 NULL，于是它每次都真的再发一次 `enter`，
+       正好把环闭上。
+     - 修法（`src/im.c` 的 `text_input_disable()`，**删掉发 leave 那三行**）：`enter`/`leave` 只由
+       `vidow_im_focus()`（seat 焦点变化那几条路）发，`disable` 只改自己的 `ti->enabled` /
+       `im_set_active`。`focused_surface` 于是只被真正的焦点变化清掉，`text_input_enable()` 里那次
+       `vidow_im_focus()` 变成幂等（同一个 surface 直接 `continue`），环断开。没碰 `src/view.c` 的
+       焦点逻辑：`2178894`（全屏窗口状态变化不许抢焦点）和 `e6e2ea5`（焦点跟随光标）原样，
+       也没加任何 fullscreen 特例（列就是列）。
+     - 量到的（同一条复现，10 秒窗口，`VIDOW_LOG=debug`）：
+
+       | | vidow 日志行数 | enabled | disabled | without focus | im focus | kitty 侧 enable/disable/commit |
+       |---|---|---|---|---|---|---|
+       | 改前 | **1,061,522** | 266,468 | 266,468 | 266,468 | 266,468 | 286,869 / 291,827 / 593,919 |
+       | 改后 | **1** | 0 | 0 | 0 | 0 | 3 / 3 / 7 |
+
+       改后 kitty 那 3 次 enable 就是三次真实焦点变化（kitty 上屏、触发窗 map、触发窗消失）；
+       vidow 那 1 行是无关的渲染日志。
+     - 功能没修死：同一个 headless 里 `vidowmsg focus-column left` 把焦点落回 kitty（`vidowmsg focused`
+       报 `"title": "wlterm"`），`wtype "hello"` + `wtype -k Return` 敲进去，kitty 里跑的
+       `cat > typed.txt` 收到 `hello`（改后 OK）。
+     - 回归：`test-focus.sh` / `test-input-inject.sh` / `test-ipc.sh` 改前改后各一次，全绿。
+     - 未覆盖：只有「客户端收到 enter/leave 会回 enable/disable + commit」这一类客户端（kitty、GTK 系）
+       才会自激；协议上不这么回的客户端本来就不触发，改法对它们零影响。
+
 
 247. **缓动曲线能自己写了：自定义三次贝塞尔 + 回弹幅度可调**（用户：「回弹幅度应该允许配置 回弹的时间也允许配置 类似 hyprland 那样」）
 

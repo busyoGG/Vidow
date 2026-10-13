@@ -154,9 +154,11 @@ static void text_input_enable(struct vidow_text_input *ti) {
 static void text_input_disable(struct vidow_text_input *ti) {
 	ti->enabled = false;
 	ti->input->current_enabled = false;
-	if (ti->input->focused_surface != NULL) {
-		wlr_text_input_v3_send_leave(ti->input);
-	}
+	/* 这里**不发 leave**：enter/leave 只跟 seat 的键盘焦点走（vidow_im_focus
+	 * 那边管）。客户端自己说 disable 不代表它的表面丢了焦点；反过来说，
+	 * 客户端收到 leave 就会回 disable + commit —— 我们发 leave、它回 disable、
+	 * 我们 disable 又发 leave …… 和 wlroots 的 commit 事件凑成一个自激环
+	 * （见 README 258）。 */
 	if (active_text_input(ti->server) == NULL) {
 		im_set_active(ti->server, false);
 	}
