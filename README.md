@@ -961,6 +961,7 @@ VIDOW_TEST_RENDERER=gles2 ./test-screencast.sh
 ./test-layerwin.sh                   # top 层模糊里含窗口（纯蓝窗口 + 压在它上面的面板，4 项断言）
 ./test-layermask.sh                  # 按元素自己的 alpha 剔除（透明内边距里的亮点不糊，3 项断言）
 ./test-layerdestroy.sh               # layer 没了要收干净它的模糊节点（反复重建不崩不漏，9 项断言）
+./test-layerstorm.sh                 # 一批 layer 面一起上屏：动画每帧不许重跑布局灌 configure（两块屏，6 项断言）
 ./test-openanim.sh                   # 开窗动画画的是装饰后的窗口本身（不是一块更大的矩形，4 项断言）
 ./test-bounce.sh                     # 入场过冲 / 关闭回弹（q 弹曲线真的落到屏幕上了，5 项断言）
 ./test-closeanim.sh                  # 关闭动画：默认曲线下还看得见 + 不带窗口装饰 + 隔壁那块的位移补间中段还在路上（17 项断言）
@@ -5047,6 +5048,42 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
       - 另一个踩到的坑（不是 vidow 的）：`awww img` 默认带过渡动画，动画没跑完就进全景，抓到的
         底衬是**半透明混合**的（量到 (107,66,38)，金色和洋红混在一起）。验证 / 截图时加
         `--transition-type none`。
+
+241. **layer 面的入场动画每帧重跑布局 → configure 洪水把客户端灌断**（用户：noctalia 日志「Wayland display closed during failed to read Wayland events; shutting down (display_error=32 (断开的管道))」）
+
+     - 现场（用户机器：两块屏，1 倍 + 2 倍；noctalia 每块屏摆壁纸 / 状态栏 / 停靠栏 / 四个角，共 14 块
+       layer 面，一起上屏）。vidow 日志在客户端断开那一刻是：
+          00:00:07.693 [INFO] [wayland] Data too big for buffer (4092 + 12 > 4096).
+          00:00:07.713 [INFO] [wayland] error in client communication (pid 3178905)
+       `4092 + 12 > 4096` 是 libwayland 服务端的**出口缓冲**（`WL_BUFFER_DEFAULT_MAX_SIZE` = 4096）：
+       里面已经攒了 4092 字节没送出去，下一条事件（12 字节 —— 一个只有头的 configure 正好 12 字节）
+       放不下 → `wl_connection_queue()` 置 `client->error` → `destroy_client_with_error()`，
+       **整个客户端被销毁**；客户端那边看到的就是 EPIPE —— noctalia 那句 `display_error=32（断开的管道）`。
+       注意这条和 240 不是一回事：240 是 vidow 自己崩了（所有客户端一起 EPIPE），这里 vidow 活着
+       （日志在断连之后还接着写了十几万字节），只掐了这一个客户端。
+     - 机制：`layer_anim_update()`（layer 入场动画的每帧回调）每帧调一次 `vidow_arrange_layers()`，
+       而那是**布局**：它给每一块 layer 面都发一次 `wlr_layer_surface_v1_configure()`（wlroots 的
+       `wlr_scene_layer_surface_v1_configure()` 无条件发包）。动画是「每块正在动的面各跑一趟」，
+       于是每帧 configure = 正在动的面数 × 面数 = 面数²：14 块面一起上屏就是每帧 196 条。
+       实测（两块 headless 屏 + `tools/layerstorm.py` 摆 14 块面，在布局完全静止的 0.5 秒里量）：
+       **9408 条 configure**（≈450 KB/s），而客户端 socket 的上限是 213504 字节 —— 客户端启动那几秒
+       读不过来（或者像测试里那样被冻住），socket 灌满 → 上面那条 E2BIG → 客户端被掐。
+       单屏不炸是量正好减半（7 块面 = 每帧 49 条），差一点没灌满，所以「只有两块屏才复现」。
+     - 修法：动画只动**自己这一块** —— 新增 `layer_apply_anim()`（位置 = 布局定下的 `ls->base_x/base_y`
+       + 动画偏移，再写 alpha 和 fx 透明度），`layer_anim_update()` / `layer_anim_done()` /
+       `layer_open_anim()` 的「瞬间到位」那一支都改调它，不再整趟重排。布局该跑的地方照旧跑
+       （map / unmap / 初始 commit / 输出变化），语义和以前一模一样，只是不再每帧重发 configure。
+     - 验证：新增 `test-layerstorm.sh`（两块屏 1 倍 + 2 倍，`tools/layerstorm.py` 每屏 7 块面、
+       `layer_open_ms = 3000`，客户端冻住 2 秒）。修前 FAIL：
+       `布局静止的 0.5 秒里 configure = 9408 次（面数 14，判据上限 14）`、
+       `客户端被 vidow 断开了（进程没了）`、`Data too big for buffer (4096 + 20 > 4096)` +
+       `error in client communication (pid …)`，exit 1；修后全 PASS（同样的 0.5 秒里 configure = 0），exit 0。
+       要求的三个套件改前 / 改后都全过：`test-layerblur.sh` / `test-blur2out.sh` / `test-popup2out.sh`；
+       另外顺带跑了 `test-layerdestroy.sh` / `test-layerghost.sh`（改的就是动画那条路），也全过。
+     - 还没做：`vidow_arrange_layers()` 每次重排仍然给**每一块** layer 面发 configure（哪怕尺寸没变）——
+       一次 map 是 4 趟重排 × 面数条。量不大（14 块面 ≈ 800 条、19 KB，灌不满 socket），这次没动；
+       真要收干净得自己算一遍 wlroots 那套摆位（full_area / usable_area + 锚点 + 边距），
+       或者只对「状态真的变了」的面发。
 
 240. **窗口在动画没跑完时被销毁 → 动画回调拿着已释放的 view（防御性修复，未复现）**
 

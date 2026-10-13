@@ -1160,6 +1160,10 @@ struct vidow_layer_surface {
 	struct vidow_anim *anim;
 	double anim_off_x, anim_off_y;
 	double anim_alpha;
+	/* 布局（vidow_arrange_layers）定下来的位置，**不含**动画偏移。动画每帧
+	 * 只按 base + anim_off 挪这一块自己，不整趟重排 —— 重排会给每块 layer
+	 * 面重发一次 configure，见 layer.c 的 layer_apply_anim。 */
+	int base_x, base_y;
 	struct wlr_box geom; /* last configured box, layout coords */
 	double anim_from_x, anim_from_y; /* open tween start offsets */
 	struct wlr_buffer *last_buffer; /* locked, feeds the close animation */

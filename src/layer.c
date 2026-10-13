@@ -64,14 +64,48 @@ static void background_changed(struct vidow_layer_surface *ls) {
 	vidow_ipc_emit_background(ls->server, "background-changed");
 }
 
+/* 把这一块 layer 面自己的动画状态（偏移 + 透明度）写到场景节点上：
+ * 位置 = 布局定下的 base + 动画偏移。
+ *
+ * 为什么单独拎出来、而不是让动画每帧再跑一趟 vidow_arrange_layers：那一趟是
+ * **布局**（谁排哪、usable area 多少），它每碰到一块 layer 面就调一次 wlroots 的
+ * configure，而 configure 是无条件发包的。动画每帧、每块正在动的面各跑一趟 =
+ * 面数² 条 configure：14 块面一起上屏时每帧 196 条、一秒上万条（实测 300ms 里
+ * 8000 条 / 190KB）。客户端一时读不过来（启动那几秒正是它最忙的时候），socket
+ * 灌满之后 libwayland 的 4KB 出口缓冲放不下下一条事件，直接判 E2BIG 把整个
+ * 客户端踢掉 —— 日志里就是 "Data too big for buffer (4092 + 12 > 4096)." 紧跟
+ * "error in client communication"。动画只动这一块，不需要重排布局。 */
+static void layer_apply_anim(struct vidow_layer_surface *ls) {
+	wlr_scene_node_set_position(&ls->scene->tree->node,
+		ls->base_x + (int)lround(ls->anim_off_x),
+		ls->base_y + (int)lround(ls->anim_off_y));
+	/* 入场 / 退场动画的 alpha 乘上规则给的 opacity（图层规则写了 opacity 才有
+	 * 这一项）：面板半透明 = 它自己的内容淡下去，背后的东西透出来。 */
+	vidow_fx_set_alpha(&ls->scene->tree->node,
+		ls->anim_alpha * vidow_rule_opacity(&ls->rule_eff));
+	/* 垫在下面的模糊底衬不跟着淡：opacity 说的是「这块面板多透」，透出来的
+	 * 应该是糊过的背景（和窗口那条路一致 —— 装饰着色器里 u_opacity 也只乘内容
+	 * 和边框）。fx 节点是这块场景树的子节点，上面那一趟会连它一起乘，这里按它
+	 * 自己的状态放回去（masked 是抓帧遮挡，见 fx.c）。 */
+	if (ls->fx.node != NULL) {
+		wlr_scene_buffer_set_opacity(ls->fx.node,
+			ls->fx.masked ? 0.0f : 1.0f);
+	}
+}
+
 /* Position every layer surface and recompute each output's usable area.
  * Called whenever the set of layer surfaces changes.
  *
- * 注意这里**不**打 backdrop 标记：这个函数在 layer 开关动画里是每帧调的
- * （layer_anim_update），而每打一次标记，所有窗口的模糊金字塔就要重建一遍
- * —— 重新抓一屏、重跑 4 级 kawase、再重新分配 7 个 GBM 缓冲。实测那样一帧
- * 一次（143 次/秒），动画直接不丝滑。真正改变底衬的地方自己打标记：layer
- * 出现 / 消失 / 换屏 / 内容重画 / 动画落定。 */
+ * 注意这里**不**打 backdrop 标记：这个函数被好几条路径调（面出现 / 消失 / 换屏 /
+ * 规则重算），而每打一次标记，所有窗口的模糊金字塔就要重建一遍 —— 重新抓一屏、
+ * 重跑 4 级 kawase、再重新分配 7 个 GBM 缓冲。以前 layer 开关动画每帧也走这里
+ * （量到 143 次/秒），动画直接不丝滑。真正改变底衬的地方自己打标记：layer
+ * 出现 / 消失 / 换屏 / 内容重画 / 动画落定。
+ *
+ * 反过来：**动画每帧不该调这里**（noctalia 被灌断的那条路就是这么来的）。这里每
+ * 碰到一块 layer 面就发一次 configure，而动画是「每块正在动的面各调一次」——
+ * 上屏那一下就是面数² 条 configure，能把客户端的 socket 灌爆（见
+ * layer_apply_anim）。 */
 void vidow_arrange_layers(struct vidow_server *server) {
 	struct vidow_output *output;
 	wl_list_for_each(output, &server->outputs, link) {
@@ -115,23 +149,11 @@ void vidow_arrange_layers(struct vidow_server *server) {
 					ls->geom = box;
 					vidow_layer_blur_invalidate(ls);
 				}
-				wlr_scene_node_set_position(&ls->scene->tree->node,
-					lx + (int)lround(ls->anim_off_x),
-					ly + (int)lround(ls->anim_off_y));
-				/* 入场 / 退场动画的 alpha 乘上规则给的 opacity（图层规则写
-				 * 了 opacity 才有这一项）：面板半透明 = 它自己的内容淡下去，
-				 * 背后的东西透出来。 */
-				vidow_fx_set_alpha(&ls->scene->tree->node,
-					ls->anim_alpha * vidow_rule_opacity(&ls->rule_eff));
-				/* 垫在下面的模糊底衬不跟着淡：opacity 说的是「这块面板多
-				 * 透」，透出来的应该是糊过的背景（和窗口那条路一致 ——
-				 * 装饰着色器里 u_opacity 也只乘内容和边框）。fx 节点是这块
-				 * 场景树的子节点，上面那一趟会连它一起乘，这里按它自己的
-				 * 状态放回去（masked 是抓帧遮挡，见 fx.c）。 */
-				if (ls->fx.node != NULL) {
-					wlr_scene_buffer_set_opacity(ls->fx.node,
-						ls->fx.masked ? 0.0f : 1.0f);
-				}
+				/* 布局位置存下来：动画（layer_apply_anim）按 base + 偏移
+				 * 挪，不必再跑这一趟布局。 */
+				ls->base_x = lx;
+				ls->base_y = ly;
+				layer_apply_anim(ls);
 			}
 		}
 
@@ -228,8 +250,10 @@ static void layer_anim_update(void *data, double t, double linear) {
 	ls->anim_off_x = ls->anim_from_x * k;
 	ls->anim_off_y = ls->anim_from_y * k;
 	ls->anim_alpha = cfg->open_alpha_from + (1.0 - cfg->open_alpha_from) * t;
-	/* 动画中间不重做模糊底衬（一帧一次太贵），落定时在 layer_anim_done 补一次 */
-	vidow_arrange_layers(ls->server);
+	/* 只挪 / 只淡这一块自己。这里以前调的是 vidow_arrange_layers()，等于每帧
+	 * 给每一块 layer 面重发一次 configure —— 上屏那 200ms 里上万条，客户端的
+	 * socket 就是被这个灌满的（见 layer_apply_anim 的注释）。 */
+	layer_apply_anim(ls);
 }
 
 static void layer_anim_done(void *data, bool cancelled) {
@@ -242,7 +266,7 @@ static void layer_anim_done(void *data, bool cancelled) {
 	}
 	/* 动画停在最终位置上了，现在重做一次模糊，把这一帧的底衬固化下来 */
 	vidow_backdrop_damage(ls->server, true);
-	vidow_arrange_layers(ls->server);
+	layer_apply_anim(ls);
 }
 
 static void layer_open_anim(struct vidow_layer_surface *ls) {
@@ -257,7 +281,9 @@ static void layer_open_anim(struct vidow_layer_surface *ls) {
 		ls->anim_off_x = 0.0;
 		ls->anim_off_y = 0.0;
 		ls->anim_alpha = 1.0;
-		vidow_arrange_layers(ls->server);
+		/* 布局刚在上面那趟 arrange 里定过（base_x/base_y），这里只要把
+		 * 动画状态摆平 —— 不用再整趟重排、不用再发 configure。 */
+		layer_apply_anim(ls);
 		return;
 	}
 	int dx = 0, dy = 0;
