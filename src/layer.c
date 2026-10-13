@@ -459,25 +459,43 @@ static void layer_surface_destroy(struct wl_listener *listener, void *data) {
 	}
 }
 
+/* 「根表面是这块 layer surface」时，unconstrain 要的可用区：输出盒（布局坐标）
+ * 平移到这块 layer 表面自己的坐标系里。
+ *
+ * 同一个坑（见 view.c 的 vidow_popup_box_to_toplevel_space）：unconstrain 要的是
+ * **根表面自己的坐标系**里的可用区，而 wlr_output_layout_get_box() 给的是布局坐标
+ * —— 状态栏在屏幕顶端时 y 要减掉它的高度，不然菜单会被摆到屏幕上方外面去。
+ *
+ * 两个调用点：一级弹出物（layer.c 的 layer_surface_new_popup，父面就是这块 layer
+ * 表面）和挂在 layer 表面上的**二级**弹出物（view.c 的 server_new_popup —— 父面是
+ * 一级弹出物时 wlroots 只发 xdg_shell 那条 new_popup，见那边的
+ * popup_root_layer_surface）。 */
+void vidow_popup_box_to_layer_space(struct vidow_server *server,
+		const struct vidow_layer_surface *ls, struct wlr_box *box) {
+	if (ls == NULL || ls->output == NULL || box == NULL) {
+		return;
+	}
+	wlr_output_layout_get_box(server->output_layout, ls->output->wlr_output,
+		box);
+	int sx = 0, sy = 0;
+	wlr_scene_node_coords(&ls->scene->tree->node, &sx, &sy);
+	box->x -= sx;
+	box->y -= sy;
+}
+
 static void layer_surface_new_popup(struct wl_listener *listener, void *data) {
 	struct vidow_layer_surface *ls = wl_container_of(listener, ls, new_popup);
 	struct vidow_server *server = ls->server;
 	struct wlr_xdg_popup *popup = data;
 
-	wlr_scene_xdg_surface_create(ls->scene->tree, popup->base);
+	/* 挂在**这块 layer 表面**的树里（弹出物得跟着状态栏一起动），但父面本身是
+	 * 弹出物时（二级菜单）得挂到**父弹出物**的树上 —— 挑父树这件事在
+	 * vidow_popup_scene_create 里，跟窗口那条路共用（漏了这里就是子菜单错位，
+	 * 见 server.h 的说明）。 */
+	vidow_popup_scene_create(server, ls->scene->tree, popup);
 
 	struct wlr_box box = {0};
-	if (ls->output != NULL) {
-		wlr_output_layout_get_box(server->output_layout,
-			ls->output->wlr_output, &box);
-		/* 同一个坑（见 view.c 的 vidow_popup_box_to_toplevel_space）：输出盒
-		 * 是布局坐标，unconstrain 要的是这块 layer 表面自己的坐标系 —— 状态栏
-		 * 在屏幕顶端时 y 要减掉它的高度，不然菜单会被摆到屏幕上方外面去。 */
-		int sx = 0, sy = 0;
-		wlr_scene_node_coords(&ls->scene->tree->node, &sx, &sy);
-		box.x -= sx;
-		box.y -= sy;
-	}
+	vidow_popup_box_to_layer_space(server, ls, &box);
 	/* 跟 view.c 一样：unconstrain 要等 popup 自己第一次 commit（wlroots 里
 	 * schedule_configure 有 assert(surface->initialized)） */
 	vidow_popup_unconstrain_on_commit(server, popup, &box);

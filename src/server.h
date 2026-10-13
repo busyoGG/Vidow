@@ -1975,6 +1975,17 @@ void vidow_popup_unconstrain_on_commit(struct vidow_server *server,
  * 少这一步窗口不在布局原点时菜单会被摆到屏外（见 view.c 的注释）。 */
 void vidow_popup_box_to_toplevel_space(const struct vidow_view *view,
 	struct wlr_box *box);
+/* 建弹出物的场景树：父面本身是弹出物（二级菜单）就挂到父弹出物的树上，否则挂
+ * fallback（窗口的树 / layer 表面的树）。**两个调用点都得用它**：窗口的弹出物
+ * （view.c）和 layer surface 的弹出物（layer.c）—— 挑错父树的话子菜单会平移
+ * 一段「父菜单相对 fallback 原点」的距离（见 view.c 的注释）。 */
+struct wlr_scene_tree *vidow_popup_scene_create(struct vidow_server *server,
+	struct wlr_scene_tree *fallback, struct wlr_xdg_popup *popup);
+/* 「根是这块 layer 表面」时 unconstrain 要的可用区（输出盒平移到这块 layer 表面
+ * 自己的坐标系）。一级弹出物（layer.c）和挂在 layer 表面上的二级弹出物（view.c）
+ * 都走它 —— 少这一步 box 会是 0x0，客户端把菜单摆到屏幕左上角（见 layer.c）。 */
+void vidow_popup_box_to_layer_space(struct vidow_server *server,
+	const struct vidow_layer_surface *ls, struct wlr_box *box);
 bool vidow_workspace_init(struct vidow_server *server);
 bool vidow_keybind_init(struct vidow_server *server);
 bool vidow_rule_init(struct vidow_server *server);

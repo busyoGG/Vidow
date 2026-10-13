@@ -5424,6 +5424,92 @@ static void popup_scene_register(struct vidow_server *server,
 	wl_list_insert(&server->popup_scenes, &ps->link);
 }
 
+/* 建一个弹出物的场景树：父面本身是弹出物（二级菜单）就挂到**父弹出物**的树上，
+ * 否则挂 fallback（顶层窗口的树 / layer 表面的树）。
+ *
+ * 为什么要挑父树：wlroots 把弹出物节点的坐标（popup->current.geometry）当成
+ * 「相对**父表面**」的偏移（types/scene/xdg_shell.c 的
+ * scene_xdg_surface_update_position）。一级弹出物的父表面是窗口 / layer 表面，
+ * 挂 fallback 就对；二级弹出物的父表面是**一级弹出物**，挂 fallback 等于把
+ * 「一级菜单在窗口 / 状态栏里的位置」整段丢掉 —— 子菜单整体平移
+ * (父菜单.x − 窗口.x, 父菜单.y − 窗口.y)，看着就是错位。查不到父树（父弹出物
+ * 不是我们建的 / 登记时没内存）就退回 fallback。
+ *
+ * **两条路都得走这里**：窗口的弹出物（server_new_popup）和 layer surface 的
+ * 弹出物（layer.c 的 layer_surface_new_popup）。7768fe7 只在窗口那条路上挑了
+ * 父树，layer 那条路（状态栏菜单）漏了，子菜单于是还是老样子 —— 一条规则两个
+ * 调用点，漏一个就是这次。 */
+struct wlr_scene_tree *vidow_popup_scene_create(struct vidow_server *server,
+		struct wlr_scene_tree *fallback, struct wlr_xdg_popup *popup) {
+	struct wlr_scene_tree *parent = fallback;
+	if (popup->parent != NULL) {
+		struct wlr_scene_tree *pt =
+			popup_scene_tree_for(server, popup->parent);
+		if (pt != NULL) {
+			parent = pt;
+		}
+	}
+
+	struct wlr_scene_tree *tree = wlr_scene_xdg_surface_create(parent,
+		popup->base);
+	if (tree == NULL) {
+		return NULL;
+	}
+	/* 登记自己：下一级菜单要按 surface 找到这棵树（一级的登记也没白记 ——
+	 * 客户端可以再弹一个 popup，链就是这么接下去的）。 */
+	popup_scene_register(server, popup->base->surface, tree);
+	/* 每个弹出物挂一条「它自己 commit 了什么」的日志（一行一条，弹出物本来
+	 * 就不常 commit）。「弹窗不显示」这类问题全卡在这一步上，光看场景树看不
+	 * 出是客户端没交帧还是我们没画：
+	 *   没有这一行           = 客户端在等 configure，压根没交缓冲
+	 *   有行但节点关着/在屏外 = 我们这边的问题（节点没使能 / 位置算错）
+	 *   有行、节点开着在屏内 = 画了但被别的节点压住（层级问题） */
+	struct vidow_popup_trace *t = calloc(1, sizeof(*t));
+	if (t != NULL) {
+		t->popup = popup;
+		t->tree = tree;
+		t->commit.notify = popup_trace_commit;
+		wl_signal_add(&popup->base->surface->events.commit, &t->commit);
+		t->destroy.notify = popup_trace_destroy;
+		wl_signal_add(&popup->events.destroy, &t->destroy);
+	}
+	return tree;
+}
+
+/* 弹出物的「根」是不是一块 layer surface（状态栏），是就把它找出来。
+ *
+ * 为什么二级弹出物要走这里：wlroots 的 wlr_layer_shell_v1.c 里，挂在 layer 表面上
+ * 的弹出物是**两步**建的 —— 客户端先 xdg_wm_base.get_xdg_popup(parent=NULL)，这时
+ * 只发 xdg_shell 那条 new_popup（父面还是 NULL），随后 zwlr_layer_surface_v1.get_popup
+ * 才把父面设成 layer 表面并只发 layer 那条 new_popup。所以：一级弹出物归 layer.c 的
+ * layer_surface_new_popup 管，**二级弹出物（父面是一级弹出物）只有 xdg_shell 那条信号**
+ * —— 它的根还是那块 layer 表面，但 layer.c 永远看不到它，可用区得在这里自己算。 */
+static struct vidow_layer_surface *popup_root_layer_surface(
+		struct vidow_server *server, const struct wlr_xdg_popup *popup) {
+	struct wlr_surface *s = popup->parent;
+	while (s != NULL) {
+		struct wlr_layer_surface_v1 *lsls =
+			wlr_layer_surface_v1_try_from_wlr_surface(s);
+		if (lsls != NULL) {
+			struct vidow_layer_surface *ls;
+			wl_list_for_each(ls, &server->layers, link) {
+				if (ls->layer_surface == lsls) {
+					return ls;
+				}
+			}
+			return NULL;
+		}
+		struct wlr_xdg_surface *xs =
+			wlr_xdg_surface_try_from_wlr_surface(s);
+		if (xs == NULL || xs->role != WLR_XDG_SURFACE_ROLE_POPUP ||
+				xs->popup == NULL) {
+			return NULL;
+		}
+		s = xs->popup->parent;
+	}
+	return NULL;
+}
+
 static void server_new_popup(struct wl_listener *listener, void *data) {
 	struct vidow_server *server = wl_container_of(listener, server, new_popup);
 	struct wlr_xdg_popup *popup = data;
@@ -5438,42 +5524,10 @@ static void server_new_popup(struct wl_listener *listener, void *data) {
 	}
 
 	struct vidow_view *view = view_from_surface(server, popup->parent);
-	struct wlr_scene_tree *parent = view != NULL ? view->scene_tree :
-		server->layer_toplevels;
-	/* 父面是弹出物（二级菜单）：挂到父弹出物的树上，它的坐标才是相对谁算的
-	 * （见 popup_scene_tree_for）。 */
-	if (popup->parent != NULL) {
-		struct wlr_scene_tree *pt =
-			popup_scene_tree_for(server, popup->parent);
-		if (pt != NULL) {
-			parent = pt;
-		}
-	}
-
-	struct wlr_scene_tree *tree = wlr_scene_xdg_surface_create(parent,
-		popup->base);
-	/* 登记自己：下一级菜单要按 surface 找到这棵树（一级的登记也没白记 ——
-	 * 客户端可以再弹一个 popup，链就是这么接下去的）。 */
-	if (tree != NULL) {
-		popup_scene_register(server, popup->base->surface, tree);
-	}
-	/* 每个弹出物挂一条「它自己 commit 了什么」的日志（一行一条，弹出物本来
-	 * 就不常 commit）。「弹窗不显示」这类问题全卡在这一步上，光看场景树看不
-	 * 出是客户端没交帧还是我们没画：
-	 *   没有这一行           = 客户端在等 configure，压根没交缓冲
-	 *   有行但节点关着/在屏外 = 我们这边的问题（节点没使能 / 位置算错）
-	 *   有行、节点开着在屏内 = 画了但被别的节点压住（层级问题） */
-	if (tree != NULL) {
-		struct vidow_popup_trace *t = calloc(1, sizeof(*t));
-		if (t != NULL) {
-			t->popup = popup;
-			t->tree = tree;
-			t->commit.notify = popup_trace_commit;
-			wl_signal_add(&popup->base->surface->events.commit, &t->commit);
-			t->destroy.notify = popup_trace_destroy;
-			wl_signal_add(&popup->events.destroy, &t->destroy);
-		}
-	}
+	/* 父面本身是弹出物时（二级菜单）按登记表找父树 —— 见
+	 * vidow_popup_scene_create。 */
+	vidow_popup_scene_create(server,
+		view != NULL ? view->scene_tree : server->layer_toplevels, popup);
 
 	/* wlroots 0.20 不保证 popup->parent 非空（父面已经销毁、或者父面不是
 	 * xdg surface 时它就是 NULL），而 unconstrain 要沿 parent 链往上算
@@ -5505,6 +5559,15 @@ static void server_new_popup(struct wl_listener *listener, void *data) {
 			wlr_output_layout_get_box(server->output_layout, out, &box);
 			vidow_popup_box_to_toplevel_space(view, &box);
 		}
+	} else {
+		/* 根不是窗口：挂在 layer surface 上（状态栏的菜单）。一级弹出物由
+		 * layer.c 算这个盒子，二级弹出物只到这里（见
+		 * popup_root_layer_surface）—— 不补这一手 box 就是 {0,0,0,0}，客户端
+		 * 拿到「可用区是个 0x0 的盒子」，把子菜单摆到那个点上去：看着就是
+		 * 「二级菜单跑到屏幕左上角」。 */
+		struct vidow_layer_surface *root =
+			popup_root_layer_surface(server, popup);
+		vidow_popup_box_to_layer_space(server, root, &box);
 	}
 	vidow_popup_unconstrain_on_commit(server, popup, &box);
 }

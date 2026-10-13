@@ -5049,6 +5049,48 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
         底衬是**半透明混合**的（量到 (107,66,38)，金色和洋红混在一起）。验证 / 截图时加
         `--transition-type none`。
 
+244. **挂在 layer surface 上的弹出物再弹二级（状态栏菜单的子菜单）摆到屏幕左上角**（用户报的这条；README 238 当时记的「还没修」）
+
+     - 现场（headless 1920x1080，新靶子 `tools/menuprobe-layer.py`：gtk-layer-shell 的状态栏
+       + 8 项一级菜单 + 第一项带 2 项子菜单）：一级菜单 275x268 在 **301,17**（对），二级
+       114x82 在 **0,0**（屏幕左上角）—— 正确位置是 562,17（= 一级菜单右边缘 576 减 GTK 子菜单
+       跟父菜单的 14px 重叠），错 (562, 17) px。
+     - 根因**两条**，都在「wlroots 怎么把 layer 弹出物交给我们」这件事上（`types/xdg_shell/
+       wlr_xdg_popup.c` + `types/wlr_layer_shell_v1.c`）：
+       1. **layer 弹出物是两步建的**：客户端先 `xdg_wm_base.get_xdg_popup(parent=NULL)` —— 这时
+          wlroots 只发 `xdg_shell` 那条 `new_popup`，**`popup->parent` 还是 NULL**；随后
+          `zwlr_layer_surface_v1.get_popup` 才把父面设成那块 layer 表面，并且**只**发 layer 那条
+          `new_popup`。所以一级弹出物归 `layer.c` 的 `layer_surface_new_popup()` 管，而**二级弹出
+          物（父面是一级弹出物）只有 `xdg_shell` 那条信号** → 归 `view.c` 的 `server_new_popup()`
+          管。238 猜的「`layer_surface_new_popup()` 没进登记表」方向对了一半：**它根本收不到二级
+          弹出物的信号**，二级的节点被 `server_new_popup()` 挂在 fallback `server->layer_toplevels`
+          上（`view_from_surface()` 找不到窗口），于是「相对一级弹出物」的坐标被当成「相对屏幕
+          原点」，整段丢掉一级菜单的位置。
+       2. **可用区（unconstrain）算成 0x0**：`server_new_popup()` 只在「父面是窗口」时算可用区盒，
+          二级弹出物 `view == NULL` → box 是 `{0,0,0,0}`。wlroots 的
+          `wlr_xdg_popup_unconstrain_from_box()` 会把它沿父链换算成「相对父弹出物」的约束盒
+          （`0−301, 0−17, 0x0`），positioner 于是把子菜单摆到那个点上 —— 节点最终落在 0,0，
+          就是「子菜单跑到左上角」。**这条是量出来的**：修了第 1 条、没修第 2 条时子菜单仍在 0,0。
+     - 修法（两处，都不推翻 7768fe7 的思路）：
+       - 建树的规则收进一个函数 `vidow_popup_scene_create(server, fallback, popup)`：父面是弹出物
+         就按 `popup_scenes` 登记表挂到**父弹出物**的树上，否则挂 `fallback`；`view.c`（窗口的弹出
+         物，fallback = 窗口的树）和 `layer.c`（layer 的弹出物，fallback = 那块 layer 的树）都调
+         它 —— 一条规则两个调用点，7768fe7 只改了窗口那个，layer 那个漏了。
+       - 可用区：把 `layer.c` 里「输出盒平移到这块 layer 表面自己的坐标系」抽成
+         `vidow_popup_box_to_layer_space()`，`view.c` 在 `view == NULL` 时先沿父面链爬到根 layer
+         表面（`popup_root_layer_surface()`）再调它。
+     - 验证：新 `test-popup-layer.sh`（`tools/menuprobe-layer.py` 当靶子；判据 = 两个弹出物在场景里
+       **相邻**、纵向相交、都在屏里、真的画出来；两轮 scale 1 / 2）。修前 `FAIL scale1/scale2:
+       二级弹出物没贴着父弹出物：0,0 114x82 与 301,17 275x268（边缘差 187 / 576 px）`、exit 1；
+       修后全 PASS（边缘差 14px，就是那 14px 重叠）、exit 0。相关套件改前 / 改后都是全过：
+       `test-popup-nested.sh` / `test-popup2out.sh` / `test-layerblur.sh`。
+     - 顺带量到、**这次没动**（另案）：一级弹出物的场景树被建了**两份** —— `xdg_shell` 那条
+       `new_popup` 到达时 `popup->parent` 还是 NULL，`server_new_popup()` 开头那句
+       `wlr_layer_surface_v1_try_from_wlr_surface(popup->parent) != NULL` 的守卫**判断不出来**
+       （注释里想防的「同一个 surface 两个场景节点」没防住），`layer_toplevels` 上于是也挂了一份。
+       单屏 + layer 表面在布局原点时两份重合、看不出来；两块屏（layer 表面不在原点）时那份会画在
+       错的位置上。
+
 243. **「2 倍屏上窗口里的模糊底衬被放大了一倍」—— 量下来没有这个 bug**（用户：「同一坐标上，壁纸里的 16px 随机块在底衬里明显更大」，并明确要求别再拿互相关 / FFT 量位移：那种细节壁纸上峰值只有 0.07~0.19，上一轮就是被它误导成「模糊正常」的）
 
      - 靶子：`tools/cells.py`（新增）—— 16 **逻辑**像素的非周期随机灰块 + 三条彩色横带（逻辑
@@ -5182,9 +5224,10 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
        二级弹出物没贴着父弹出物：271,10 114x82 与 71,71 275x268（边缘差 314 / 75 px）`、exit 1；
        修后全 PASS（边缘差 14px，就是那 14px 重叠）、exit 0。相关套件改前 / 改后都是全过：
        `test-popup2out.sh` / `test-xwayland-popup.sh` / `test-layerwin.sh`。
-     - 还没修：挂在 layer surface 上的弹出物再弹二级（状态栏菜单的子菜单）还是老样子 ——
-       `layer.c` 的 `layer_surface_new_popup()` 也把弹出物挂在 layer 那棵树上（`ls->scene->tree`），
-       同一类问题，这次没动（不在用户报的这条路上）。
+     - 当时没修、**已由 244 修掉**：挂在 layer surface 上的弹出物再弹二级（状态栏菜单的子菜单）
+       当时还是老样子。那条路不止「`layer.c` 的 `layer_surface_new_popup()` 也把弹出物挂在 layer
+       那棵树上」这一个坑：二级弹出物的信号根本不到 `layer_surface_new_popup()`（wlroots 只发
+       `xdg_shell` 那条），可用区还会算成 0x0 —— 详见 **244**。
 
 237. **平铺窗口 unmap 之后还占着一条列（「凭空出现一列」）**（用户：「lutris 和游戏窗口之间凭空出现了一列，什么窗口都没有但占据了一列的空间」）
 
