@@ -1553,6 +1553,20 @@ struct vidow_hook_event {
 	char *json;
 };
 
+/* 弹出物的场景树登记表的一条：surface → 它的场景树。
+ *
+ * 为什么要记：wlroots 把弹出物场景节点的坐标直接当成「相对**父表面**」的偏移
+ * （wlr_scene_xdg_surface_create() 里 set_position(popup->current.geometry)，
+ * 见 types/scene/xdg_shell.c），所以嵌套弹出物（二级菜单）的节点必须挂在**父
+ * 弹出物**的场景树上 —— 而 wlroots 没有 surface → 场景节点的反查接口，只能自
+ * 己记一份。一级弹出物不用它（挂在顶层窗口的树上就是对的）。 */
+struct vidow_popup_scene {
+	struct wl_list link;         /* vidow_server.popup_scenes */
+	struct wlr_surface *surface; /* 弹出物自己的表面（查找时拿它比） */
+	struct wlr_scene_tree *tree; /* 它的场景树，子弹出物挂在这上面 */
+	struct wl_listener destroy;  /* 表面没了就摘掉这条 */
+};
+
 struct vidow_server {
 	struct wl_display *display;
 	struct wlr_backend *backend;
@@ -1731,6 +1745,9 @@ struct vidow_server {
 
 	struct wl_list outputs;   /* vidow_output.link */
 	struct wl_list views;     /* vidow_view.link */
+	/* 活着的 Wayland 弹出物的场景树（vidow_popup_scene.link）：嵌套弹出物要
+	 * 靠它找到父弹出物的树，见 view.c 的 server_new_popup。 */
+	struct wl_list popup_scenes;
 	struct wl_list keyboards; /* vidow_keyboard.link */
 	/* 注入用的键盘（IPC 的 send-key / type-text）。wlroots 没有公开的「造一个
 	 * 键盘」接口，键盘组能给出一个干净的 wlr_keyboard（自带 keymap 和

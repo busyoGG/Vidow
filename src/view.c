@@ -5339,6 +5339,47 @@ static void popup_trace_destroy(struct wl_listener *listener, void *data) {
 	free(t);
 }
 
+/* 弹出物的场景树登记 / 查找（见 server.h 里 vidow_popup_scene 的说明）。
+ *
+ * 只有「父面是弹出物」时查找才用得着：一级弹出物挂在顶层窗口的树上是**对的**
+ * （wlroots 给的坐标就是相对顶层表面的），二级弹出物的父面是**一级弹出物**，
+ * 它的坐标相对一级弹出物算 —— 挂到顶层窗口的树上等于把一级弹出物在窗口里的
+ * 偏移整个丢掉，二级菜单于是平移一段「一级菜单相对窗口」的距离，看着就是错位。
+ * 查不到（父弹出物不是我们建的 / 登记时没内存）就退回原来的挂法。 */
+static struct wlr_scene_tree *popup_scene_tree_for(
+		struct vidow_server *server, struct wlr_surface *surface) {
+	struct vidow_popup_scene *ps;
+	wl_list_for_each(ps, &server->popup_scenes, link) {
+		if (ps->surface == surface) {
+			return ps->tree;
+		}
+	}
+	return NULL;
+}
+
+static void popup_scene_destroy(struct wl_listener *listener, void *data) {
+	(void)data;
+	struct vidow_popup_scene *ps = wl_container_of(listener, ps, destroy);
+	/* 场景树由 wlroots 自己跟着 xdg_surface 销毁（见 types/scene/xdg_shell.c），
+	 * 这里只把登记项摘掉 —— 留着的话下一个 surface 可能拿到同一个地址。 */
+	wl_list_remove(&ps->destroy.link);
+	wl_list_remove(&ps->link);
+	free(ps);
+}
+
+static void popup_scene_register(struct vidow_server *server,
+		struct wlr_surface *surface, struct wlr_scene_tree *tree) {
+	struct vidow_popup_scene *ps = calloc(1, sizeof(*ps));
+	if (ps == NULL) {
+		return;
+	}
+	ps->surface = surface;
+	ps->tree = tree;
+	ps->destroy.notify = popup_scene_destroy;
+	wl_signal_add(&surface->events.destroy, &ps->destroy);
+	wl_list_insert(&server->popup_scenes, &ps->link);
+}
+
 static void server_new_popup(struct wl_listener *listener, void *data) {
 	struct vidow_server *server = wl_container_of(listener, server, new_popup);
 	struct wlr_xdg_popup *popup = data;
@@ -5355,9 +5396,23 @@ static void server_new_popup(struct wl_listener *listener, void *data) {
 	struct vidow_view *view = view_from_surface(server, popup->parent);
 	struct wlr_scene_tree *parent = view != NULL ? view->scene_tree :
 		server->layer_toplevels;
+	/* 父面是弹出物（二级菜单）：挂到父弹出物的树上，它的坐标才是相对谁算的
+	 * （见 popup_scene_tree_for）。 */
+	if (popup->parent != NULL) {
+		struct wlr_scene_tree *pt =
+			popup_scene_tree_for(server, popup->parent);
+		if (pt != NULL) {
+			parent = pt;
+		}
+	}
 
 	struct wlr_scene_tree *tree = wlr_scene_xdg_surface_create(parent,
 		popup->base);
+	/* 登记自己：下一级菜单要按 surface 找到这棵树（一级的登记也没白记 ——
+	 * 客户端可以再弹一个 popup，链就是这么接下去的）。 */
+	if (tree != NULL) {
+		popup_scene_register(server, popup->base->surface, tree);
+	}
 	/* 每个弹出物挂一条「它自己 commit 了什么」的日志（一行一条，弹出物本来
 	 * 就不常 commit）。「弹窗不显示」这类问题全卡在这一步上，光看场景树看不
 	 * 出是客户端没交帧还是我们没画：

@@ -232,6 +232,7 @@ int main(int argc, char *argv[]) {
 	struct vidow_server server = {0};
 	wl_list_init(&server.outputs);
 	wl_list_init(&server.views);
+	wl_list_init(&server.popup_scenes);
 	wl_list_init(&server.keyboards);
 	wl_list_init(&server.layers);
 	wl_list_init(&server.columns);

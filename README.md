@@ -5048,6 +5048,34 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
         底衬是**半透明混合**的（量到 (107,66,38)，金色和洋红混在一起）。验证 / 截图时加
         `--transition-type none`。
 
+238. **二级（嵌套）弹出物错位：子菜单按顶层窗口摆，丢掉了父菜单的偏移**（用户：「我发现 popup 的二级菜单会错位」）
+
+     - 现场（headless 1920x1080，GTK3 菜单：一级 8 项、第一项带子菜单，`tools/menuprobe2.py`）：
+       窗口 300,200、点 360,260 → 一级菜单 275x268 摆在 **773,731**（对），二级菜单 114x82 被摆到
+       **561,200**（窗口左上角，= 窗口原点 + 二级相对一级的偏移 261,0），正确位置是 1034,731
+       （一级菜单右边缘 1048 减 GTK 子菜单跟父菜单的 14px 重叠）—— 错 (473, 531) px。
+     - 机制：`server_new_popup()`（`src/view.c`）用 `view_from_surface(server, popup->parent)` 找
+       「父面所属的**顶层窗口**」，把每个弹出物的场景树都挂在**顶层窗口**的树上。而 wlroots 给的节点
+       坐标（`popup->current.geometry`，见 `types/scene/xdg_shell.c` 的
+       `scene_xdg_surface_update_position`）是相对**父表面**算的：一级弹出物的父表面就是顶层窗口，
+       所以对；二级弹出物的父表面是**一级弹出物**，挂到顶层窗口的树上等于把「一级菜单在窗口里的
+       位置」整段丢掉 —— 二级菜单平移 (父菜单.x − 窗口.x, 父菜单.y − 窗口.y)。X11 那条路
+       （override-redirect 菜单走 X 的绝对坐标，`vidow_view_x11_popup_box`）本来就没这问题，所以
+       只有 Wayland 客户端（GTK / Qt / kitty）的二级菜单错，一级看着一直正常。
+     - 修法：新增 `struct vidow_popup_scene` + 一张登记表（`vidow_server.popup_scenes`）：建弹出物
+       场景树时按「surface → 树」登记（`popup_scene_register()`，表面销毁时摘掉），开新弹出物时
+       父面要是弹出物就按 surface 查出父树、挂上去（`popup_scene_tree_for()`）；查不到就退回原来的
+       挂法。wlroots 没有 surface → 场景节点的反查接口，只能自己记一份（sway 是给每个弹出物挂一个
+       父表面的 `new_popup` 监听器；vidow 收的是 shell 的全局信号，加登记表这条改动最小）。
+     - 验证：新 `test-popup-nested.sh`（`tools/menuprobe2.py` 当靶子；判据 = 两个弹出物在场景里
+       **相邻**、纵向相交、都在屏里、真的画出来；两轮 scale 1 / 2）。修前 `FAIL scale1/scale2:
+       二级弹出物没贴着父弹出物：271,10 114x82 与 71,71 275x268（边缘差 314 / 75 px）`、exit 1；
+       修后全 PASS（边缘差 14px，就是那 14px 重叠）、exit 0。相关套件改前 / 改后都是全过：
+       `test-popup2out.sh` / `test-xwayland-popup.sh` / `test-layerwin.sh`。
+     - 还没修：挂在 layer surface 上的弹出物再弹二级（状态栏菜单的子菜单）还是老样子 ——
+       `layer.c` 的 `layer_surface_new_popup()` 也把弹出物挂在 layer 那棵树上（`ls->scene->tree`），
+       同一类问题，这次没动（不在用户报的这条路上）。
+
 237. **平铺窗口 unmap 之后还占着一条列（「凭空出现一列」）**（用户：「lutris 和游戏窗口之间凭空出现了一列，什么窗口都没有但占据了一列的空间」）
 
      - 现场（用户给的 `vidowmsg windows` dump）：id 59、标题 `Input`、`mapped=false`、`visible=false`、
