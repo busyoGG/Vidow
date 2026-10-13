@@ -424,6 +424,15 @@ static void xwayland_ready(struct wl_listener *listener, void *data) {
 	(void)data;
 	struct vidow_server *server = wl_container_of(listener, server, xwayland_ready);
 
+	/* 把 seat 再交给 X 服务一次。Xwayland 退出时 wlroots 的 xwm_destroy 会
+	 * wlr_xwayland_set_seat(xwayland, NULL)（顺带把 seat 上那份 X 来的选区撤
+	 * 掉），而懒启动模式下重启用的是同一个 wlr_xwayland 对象 —— 只在建的时候
+	 * 设过一次的话，重启后 xwayland->seat 一直是 NULL：xwm 拒掉所有选区事件
+	 * （日志刷 "not handling selection events: no seat assigned to xwayland"），
+	 * Wayland 复制的东西 X 侧永远拿不到（README 257）。
+	 * wlr_xwayland_set_seat 会先摘旧监听，重入安全。 */
+	wlr_xwayland_set_seat(server->xwayland, server->seat);
+
 	/* 新起来的 Xwayland 还不认识我们，重新判一次它认不认那个属性（换过
 	 * Xwayland 二进制 / 重启过 X 服务的话，上一次的结论就不算数了）。 */
 	server->xwayland_scale_ok = true;
@@ -501,6 +510,9 @@ static void xwayland_destroy(struct wl_listener *listener, void *data) {
 	(void)data;
 	struct vidow_server *server = wl_container_of(listener, server, xwayland_destroy);
 	xwayland_probe_stop(server);
+	/* X 服务要拆了：剪贴板桥手上那条连接马上就不算数了（wlroots 紧接着
+	 * xwm_destroy → xcb_disconnect），先摘掉，别留野指针。 */
+	vidow_clipboard_x11_detach(server);
 	wl_list_remove(&server->xwayland_ready.link);
 	wl_list_remove(&server->xwayland_destroy.link);
 	wl_list_remove(&server->new_xwayland_surface.link);

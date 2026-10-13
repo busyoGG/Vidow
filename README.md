@@ -5311,6 +5311,60 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
        `--default-config 13-cursor.lua` 重新生成、并给 `section_groups[]` 补上这两族的表写法提示之后全过。
 
 
+257. **Xwayland 退出重启后剪贴板桥全废：X 侧一复制就 SIGSEGV（`clip->conn` 是野指针）+ Wayland→X 彻底不通（`xwayland->seat` 被 xwm 清空）**（用户报「Xwayland 重启后 X 那边复制就崩、Wayland 复制的 X 客户端拿不到」；2026-10-14；复现脚本 `/tmp/clipsync/restart.sh`）
+
+     - 背景：wlroots 给 Xwayland 传的是 `-terminate`，**最后一个 X 客户端一走它就退出**；懒启动模式下
+       wlroots 复用的是同一个 `wlr_xwayland_server` 对象，下一个 X 客户端连上来时再 fork 一个新的 Xwayland
+       （日志 `[xwayland/server.c:215] Restarting Xwayland (lazy)`）。剪贴板双向同步本身没问题
+       （X11→Wayland / Wayland→Xwayland 逐字节一致、不循环），坏的是「重启」这一下。
+     - 现象 ①：重启后**下一次 X 侧 owner 变化就段错误**。core 栈：`xcb_convert_selection` ← `fetch_start`
+       （改前 `src/clipboard.c:909`）← `x11_event`（改前 `src/clipboard.c:1454`）。
+     - 现象 ②：重启后 `wl-copy` 复制，`xclip -o` 是空的；日志持续刷
+       `not handling selection events: no seat assigned to xwayland`。
+     - 根因 ①：`clip->conn` 指着 xwm 那条 xcb 连接，Xwayland 退出时 wlroots 在 `xwm_destroy()` 里
+       `xcb_disconnect()` 掉它 —— `clip->conn` 当场成了野指针；而 `x11_attach()`（改前 `src/clipboard.c:1581`）
+       第一行的 `if (clip->conn != NULL ...) return;` 让重启后再也不接管（日志里「接管 X11…」全程只出现 **1 次**），
+       可事件钩子 `user_event_handler` 还挂着：新 xwm 的事件一进来就拿着旧连接发请求。
+       **关键事实：懒启动模式下 wlroots 不为「Xwayland 进程退出」发任何信号** ——
+       `wlr_xwayland_server::events.destroy` 和 `wlr_xwayland::events.destroy` 都只在 `wlr_xwayland_destroy` /
+       display destroy 时发（上面那条日志是 `handle_client_destroy()` 里重启懒启动打的，跟 destroy 无关）。
+       所以「什么时候摘桥」只能在**使用点对账**，不能靠信号。
+     - 根因 ②：wlroots 的 `xwm_destroy()` 会 `wlr_xwayland_set_seat(xwayland, NULL)` 清空 `xwayland->seat`
+       （顺带把 seat 上那份 X 来的选区撤掉），而 vidow 只在 `vidow_xwayland_apply_config()` 建的时候设过一次 ——
+       重启后 `xwayland->seat` 一直是 NULL，xwm 于是拒掉所有选区事件。
+     - 修法 ①（`src/clipboard.c`）：
+       - 把 `vidow_clipboard_finish()` 里那段拆解抽成 `vidow_clipboard_x11_detach()`（`src/clipboard.c:1612`）：
+         放掉 `clip->conn`、摘 `user_event_handler`、把 X 侧还等着的 `out` 全收掉（`waiting=false`，`out_destroy`
+         就不会去碰死连接）、`fetch_reset()` + `x_owner = NONE`（老 X 服务上的窗口号留着会误判）。
+         **只有「当前 xwm 用的就是这条连接」时才对它发 `xcb_destroy_window`** —— 否则碰它就是 UAF。
+         不动 `clip->active`：那是「配置里开着桥」的账，跟 X 侧连接的死活无关。
+       - 新增 `x11_conn(clip)`（`src/clipboard.c:1655`）：`clip->conn` 和当前
+         `wlr_xwayland_get_xwm_connection()` 对不上就当场摘桥并返回 NULL。所有会碰 X 侧的路都先过它：
+         `x11_event`（事件入口，段错误那一处）、`sel_flush_outs` / `sel_tick`（Wayland 复制和定时器也会往 X
+         回数据，`out_send` 里要 `intern_atom`）、`vidow_clipboard_apply_config`。
+       - `x11_attach()` 改成「连接不一样就先摘掉再接管」；`xwayland_destroy()`（`src/xwayland.c:515`，X 服务真被
+         拆掉时）也调一次摘桥。
+     - 修法 ②（`src/xwayland.c:434` 的 `xwayland_ready()` 里一行）：重启后补一次
+       `wlr_xwayland_set_seat(server->xwayland, server->seat)`。wlroots 的 `wlr_xwayland_set_seat` 会先
+       `wl_list_remove` 旧监听，重入安全；此时 `xwayland->seat` 已是 NULL，不会重复挂 listener。
+     - 复现与验证（`/tmp/clipsync/restart.sh`：headless（`WLR_BACKENDS=headless`、独立 `XDG_RUNTIME_DIR`、
+       等日志 "vidow ready"），三阶段 = 有 X 客户端时双向 → 杀掉所有 X 客户端等 14s（Xwayland `-terminate`
+       自己退）→ 重启后再测；每阶段 `wl-paste` / `xclip -o` 各读一次）：
+       - 改前：阶段 1 双向正常（`WL-BEFORE` / `X11-BEFORE`）；阶段 3 `wl-copy` 后 `X=[]`（不通），
+         接着 `xclip -i` 直接 SEGV（`coredumpctl list` 里两条 `/home/busyo/Dev/Vidow/build/vidow` 的 SIGSEGV，
+         00:43:34 / 00:47:01），日志刷 `no seat assigned to xwayland`。
+       - 改后：三阶段全通 —— 阶段 1 `WL=[WL-BEFORE] X=[WL-BEFORE]`，再 X11 复制
+         `WL=[X11-BEFORE] X=[X11-BEFORE]`；阶段 2 `vidow 活? yes`；阶段 3 `WL=[WL-AFTER] X=[WL-AFTER]`，
+         再 X11 复制 `WL=[X11-AFTER] X=[X11-AFTER]`，`vidow 活? yes`。日志里
+         `no seat assigned to xwayland` **0 行**，「接管 X11…」出现**第 2 次**（`00:00:22.764`），
+         摘桥那行 `剪贴板: X 侧连接已摘（等 Xwayland 起来再接管）` 在 `00:00:22.673`（新 Xwayland 刚起来、
+         第一个事件进来时）；`coredumpctl list` 没有新增 core。
+     - 回归：`./test-clipboard.sh` 改前 111 PASS / 0 FAIL（EXIT=0）→ 改后 111 PASS / 0 FAIL（EXIT=0）。
+     - 未覆盖：Xwayland **起来不到 5 秒就死**的话 wlroots 不安排懒重启（`handle_client_destroy()` 里
+       `time(NULL) - server_start > 5` 才重启），那种情况下桥会一直摘着，直到配置 SIGHUP（`apply_config`
+       会重新接管）或下一个 X 客户端把 Xwayland 再拉起来。
+
+
 247. **缓动曲线能自己写了：自定义三次贝塞尔 + 回弹幅度可调**（用户：「回弹幅度应该允许配置 回弹的时间也允许配置 类似 hyprland 那样」）
 
      - 时间本来就能配（`window_move_ms` / `workspace_switch_ms` / `column_width_ms`），缺的是

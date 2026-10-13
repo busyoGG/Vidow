@@ -289,6 +289,9 @@ static void sel_unpublish(struct vidow_clip_selection *sel);
 static void fetch_reset(struct vidow_clip_selection *sel);
 static void pull_destroy(struct vidow_clip_pull *pull);
 static void out_send(struct vidow_clip_out *out);
+/* X 侧连接对账：还活着就返回它，死了（Xwayland 退出后重启前）当场摘桥并返回
+ * NULL —— 定义在 x11_attach() 前面，见那里的注释。 */
+static xcb_connection_t *x11_conn(struct vidow_clipboard *clip);
 
 /* 内容/归属变了：推一条事件出去（没人订阅就什么都不做）。 */
 static void sel_emit(struct vidow_clip_selection *sel, const char *what) {
@@ -800,31 +803,36 @@ static int sel_tick(void *data) {
 		}
 	}
 
+	/* X 请求的超时账（下面那段 out_send / out_destroy 是往 X 侧发请求的）：
+	 * 先对账 —— Xwayland 退出后连接没了，摘桥会把 out 全清掉。 */
+	xcb_connection_t *conn = x11_conn(sel->clip);
 	struct vidow_clip_out *out, *otmp;
-	wl_list_for_each_safe(out, otmp, &sel->out, link) {
-		if (now > out->deadline_ms) {
-			if (out->waiting) {
-				/* 它要的那个类型一直没拿到：如果手里有别的文本类型，
-				 * 拿那份顶上（老 X11 程序要 STRING / COMPOUND_TEXT 是常事） */
-				struct vidow_clip_mime *fb = sel_pick(sel, NULL);
-				if (fb != NULL && mime_is_text(fb->mime)) {
-					free(out->mime);
-					out->mime = strdup(fb->mime);
-					out->waiting = false;
-					wlr_log(WLR_DEBUG, "剪贴板: %s 要的类型没拿到，"
-						"拿 %s 顶上", sel->name, out->mime);
-					out_send(out);
-					continue;
+	if (conn != NULL) {
+		wl_list_for_each_safe(out, otmp, &sel->out, link) {
+			if (now > out->deadline_ms) {
+				if (out->waiting) {
+					/* 它要的那个类型一直没拿到：如果手里有别的文本类型，
+					 * 拿那份顶上（老 X11 程序要 STRING / COMPOUND_TEXT 是常事） */
+					struct vidow_clip_mime *fb = sel_pick(sel, NULL);
+					if (fb != NULL && mime_is_text(fb->mime)) {
+						free(out->mime);
+						out->mime = strdup(fb->mime);
+						out->waiting = false;
+						wlr_log(WLR_DEBUG, "剪贴板: %s 要的类型没拿到，"
+							"拿 %s 顶上", sel->name, out->mime);
+						out_send(out);
+						continue;
+					}
+					wlr_log(WLR_DEBUG, "剪贴板: %s 一直没取到，先跟对面说没有",
+						sel->name);
+				} else {
+					wlr_log(WLR_DEBUG, "剪贴板: %s 的 INCR 对面一直不取，收摊",
+						sel->name);
 				}
-				wlr_log(WLR_DEBUG, "剪贴板: %s 一直没取到，先跟对面说没有",
-					sel->name);
+				out_destroy(out);
 			} else {
-				wlr_log(WLR_DEBUG, "剪贴板: %s 的 INCR 对面一直不取，收摊",
-					sel->name);
+				busy = true;
 			}
-			out_destroy(out);
-		} else {
-			busy = true;
 		}
 	}
 
@@ -1140,6 +1148,12 @@ static void out_next_chunk(struct vidow_clip_out *out) {
 }
 
 static void sel_flush_outs(struct vidow_clip_selection *sel) {
+	/* Wayland 侧复制时也会走到这里（sel_publish）。Xwayland 已经退出的话
+	 * out_send 会去 intern_atom / xcb_change_property —— 那是条死连接，
+	 * 先对账摘掉（摘桥会把 sel->out 清空，见 vidow_clipboard_x11_detach）。 */
+	if (x11_conn(sel->clip) == NULL) {
+		return;
+	}
 	struct vidow_clip_out *out, *tmp;
 	wl_list_for_each_safe(out, tmp, &sel->out, link) {
 		if (out->waiting) {
@@ -1356,7 +1370,10 @@ static bool x11_event(struct wlr_xwayland *xwayland, xcb_generic_event_t *event)
 		return false;
 	}
 	struct vidow_clipboard *clip = &server->clipboard;
-	if (!clip->active || clip->conn == NULL) {
+	/* x11_conn()：Xwayland 重启过的话这条事件来自新 xwm 的连接，手上那条已经
+	 * 死了 —— 当场摘桥（绝不去碰它），这一条交给 wlroots 默认处理，100ms 后
+	 * x11_attach() 会用新连接重新接管（README 257）。 */
+	if (!clip->active || x11_conn(clip) == NULL) {
 		return false;
 	}
 
@@ -1575,15 +1592,96 @@ static void sel_init(struct vidow_clipboard *clip,
 		wl_display_get_event_loop(clip->server->display), sel_tick, sel);
 }
 
+/* ------------------------------------------------------ 摘桥 / 连接对账 */
+
+/* 放掉 X 侧：clip->conn 这条「xwm 的连接」不再归我们。
+ *
+ * 为什么必须单独有这一步（README 257）：wlroots 给 Xwayland 传的是 -terminate，
+ * 最后一个 X 客户端一走它就退出，而退出时 wlroots 会把 xwm 的 xcb 连接
+ * xcb_disconnect 掉（xwm_destroy）—— clip->conn 当场变成野指针，下一次
+ * xcb_convert_selection 就是段错误。
+ *
+ * 而且懒启动模式下 wlroots 复用的是同一个 wlr_xwayland_server 对象，Xwayland
+ * 进程退出**不发任何信号**（日志里只有 "Restarting Xwayland (lazy)"；
+ * server->events.destroy 只在 wlr_xwayland_destroy / display destroy 时发，
+ * xwayland->events.destroy 也一样）。所以「什么时候摘」只能在使用点对账：
+ * 见 x11_conn()。
+ *
+ * 不动 clip->active：那是「配置里开着剪贴板桥」的账，跟 X 侧连接的死活无关 ——
+ * 摘掉之后 x11_attach() 会用新连接重新接管。 */
+void vidow_clipboard_x11_detach(struct vidow_server *server) {
+	struct vidow_clipboard *clip = &server->clipboard;
+	if (clip->conn == NULL) {
+		return;
+	}
+
+	/* X 侧还等着的请求（INCR 大块传输中途 Xwayland 就退了）：连接已经没了，
+	 * 通知发不出去，直接收摊 —— waiting=false 让 out_destroy 不去碰 conn
+	 * （跟 sel_shutdown_selection 一个道理）。 */
+	struct vidow_clip_selection *list[2] = {&clip->clip, &clip->primary};
+	for (int i = 0; i < 2; ++i) {
+		struct vidow_clip_out *out, *otmp;
+		wl_list_for_each_safe(out, otmp, &list[i]->out, link) {
+			out->waiting = false;
+			out_destroy(out);
+		}
+		fetch_reset(list[i]);
+		/* 老 X 服务上的窗口号，重启后是别人的号，留着会误判 */
+		list[i]->x_owner = XCB_WINDOW_NONE;
+	}
+
+	struct wlr_xwayland *xwayland = server->xwayland;
+	if (xwayland != NULL) {
+		if (xwayland->user_event_handler == x11_event) {
+			xwayland->user_event_handler = NULL;
+		}
+		/* 只有「当前 xwm 用的就是这条连接」时才敢对它发请求：Xwayland 已经
+		 * 退出过的话它早被释放了，碰它就是 UAF。 */
+		if (wlr_xwayland_get_xwm_connection(xwayland) == clip->conn) {
+			xcb_destroy_window(clip->conn, clip->window);
+			xcb_flush(clip->conn);
+		}
+	}
+	clip->conn = NULL;
+	wlr_log(WLR_DEBUG, "剪贴板: X 侧连接已摘（等 Xwayland 起来再接管）");
+}
+
+/* 手上这条 X 连接还活着吗？Xwayland 退出后（重启前）它已经没了 —— 一发现就当场
+ * 摘桥并返回 NULL，绝不让调用方拿着野指针去发 xcb 请求。
+ *
+ * 为什么不用信号：见 vidow_clipboard_x11_detach() 的注释（懒启动模式下
+ * Xwayland 退出不发信号）。所有会碰 X 侧的地方都先过这里对账：x11_event（事件
+ * 入口）、sel_flush_outs / sel_tick（Wayland 复制时往 X 回数据）、apply_config。 */
+static xcb_connection_t *x11_conn(struct vidow_clipboard *clip) {
+	if (clip->conn == NULL) {
+		return NULL;
+	}
+	struct vidow_server *server = clip->server;
+	if (server->xwayland == NULL ||
+			wlr_xwayland_get_xwm_connection(server->xwayland) != clip->conn) {
+		vidow_clipboard_x11_detach(server);
+		return NULL;
+	}
+	return clip->conn;
+}
+
 /* 接上 X 侧：拿 xwm 的连接、开自己的窗口、注册 XFixes、装上事件钩子。 */
 static void x11_attach(struct vidow_server *server) {
 	struct vidow_clipboard *clip = &server->clipboard;
-	if (clip->conn != NULL || server->xwayland == NULL) {
+	if (server->xwayland == NULL) {
 		return;
 	}
 	xcb_connection_t *conn = wlr_xwayland_get_xwm_connection(server->xwayland);
 	if (conn == NULL) {
 		return; /* Xwayland 还没起来 */
+	}
+	if (clip->conn == conn) {
+		return; /* 已经接管这条连接了 */
+	}
+	if (clip->conn != NULL) {
+		/* Xwayland 重启过：手上这条连接已经死了（xwm_destroy 里
+		 * xcb_disconnect 掉了），先摘掉再用新连接接管。 */
+		vidow_clipboard_x11_detach(server);
 	}
 
 	const xcb_query_extension_reply_t *xfixes =
@@ -1784,7 +1882,9 @@ void vidow_clipboard_apply_config(struct vidow_server *server) {
 		clip->active = true;
 		wlr_log(WLR_INFO, "剪贴板: 开了，接管 X11 <-> Wayland 剪贴板");
 	}
-	if (clip->conn == NULL) {
+	/* 手上这条连接死了（Xwayland 退出后重启前）也算「没接上」：x11_conn 会把它
+	 * 摘掉，下面 x11_attach 再用新连接接管。 */
+	if (x11_conn(clip) == NULL) {
 		x11_attach(server);
 	}
 	if (clip->conn != NULL) {
@@ -1875,14 +1975,8 @@ void vidow_clipboard_finish(struct vidow_server *server) {
 		staging_reset(sel);
 	}
 
-	if (server->xwayland != NULL && clip->conn != NULL) {
-		if (server->xwayland->user_event_handler == x11_event) {
-			server->xwayland->user_event_handler = NULL;
-		}
-		xcb_destroy_window(clip->conn, clip->window);
-		xcb_flush(clip->conn);
-	}
-	clip->conn = NULL;
+	/* X 侧那条连接（自己的窗口、事件钩子）一起放掉，见 x11_detach。 */
+	vidow_clipboard_x11_detach(server);
 	clip->active = false;
 }
 

@@ -8,6 +8,7 @@
  *   vidow_clipboard_init()         —— 启动时（Wayland 侧：seat 监听 + 缓存）
  *   vidow_clipboard_x11_ready()    —— Xwayland 就绪后（X 侧：XFixes + 事件钩子）
  *   vidow_clipboard_apply_config() —— 配置变了（SIGHUP / IPC set-config）
+ *   vidow_clipboard_x11_detach()   —— X 侧连接没了（Xwayland 退出 / X 服务被拆）
  *   vidow_clipboard_finish()       —— 退出前
  */
 #ifndef VIDOW_CLIPBOARD_H
@@ -25,6 +26,10 @@ struct vidow_server;
 bool vidow_clipboard_init(struct vidow_server *server);
 void vidow_clipboard_x11_ready(struct vidow_server *server);
 void vidow_clipboard_apply_config(struct vidow_server *server);
+/* 放掉 X 侧那条连接（clip->conn）：Xwayland 退出 / X 服务被拆 / 退出前都要做，
+ * 否则 clip->conn 是野指针（wlroots 在 xwm_destroy 里 xcb_disconnect 了它）。
+ * 幂等；不动 clip->active —— 重启后 x11_attach() 会用新连接重新接管。 */
+void vidow_clipboard_x11_detach(struct vidow_server *server);
 void vidow_clipboard_finish(struct vidow_server *server);
 
 /* IPC 用：取一份内容（挑最合适的类型，除非指定 mime）、塞一份内容、清空。
