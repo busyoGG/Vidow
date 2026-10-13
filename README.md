@@ -5048,6 +5048,24 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
         底衬是**半透明混合**的（量到 (107,66,38)，金色和洋红混在一起）。验证 / 截图时加
         `--transition-type none`。
 
+240. **窗口在动画没跑完时被销毁 → 动画回调拿着已释放的 view（防御性修复，未复现）**
+
+     - 现场：用户机器上 `coredumpctl list vidow` 有 5 个 SIGSEGV 核心转储（2026-10-12 23:20–23:47，
+       几分钟一次）。栈：`#0 野地址 0x29b000004ec <- #1 vidow_output_render <- #2 output_frame <- 帧回调`；
+       偏移对应源码是 `src/output.c:130/132`（那圈 blur 装饰循环 + 紧跟的 `vidow_anim_tick`）。
+       vidow 一崩，所有客户端收到 `display_error=32（断开的管道）` —— 用户报的「noctalia 爆这个错误」
+       就是这么来的（noctalia 日志 00:00:07.7，vidow 侧同一时刻只有一行 `error in client communication`）。
+     - 机制（代码阅读定位）：动画回调的 `data` 就是 view 本身（`view_move_update` / `view_move_done`），
+       而**两条销毁路径**（`view_destroy()` / X11 那条）都没取消动画 —— 其它所有路径都规规矩矩
+       `vidow_anim_cancel(view->anim_move)`。窗口在动画中途没了 → 下一次 tick 拿已释放的 view
+       写内存并调 `vidow_view_apply_anim()` → 野地址跳转。
+     - 修法：两条销毁路径在 `wl_list_remove(&view->link)` 前补上 `anim_move` / `anim_open` 的取消。
+     - **诚实说明**：harness 没能复现触发条件（入场动画 3 秒、map 后 0.6 秒杀窗口、12 次循环，
+       修前修后都活），所以这条是**防御性修复**：它消除的是一个确实存在的生命周期漏洞，
+       但"就是那 5 个核心转储的根因"尚未证实。要证实需要用户在真实负载下（Proton/X11 窗口 +
+       切工作区）再跑，下次崩溃 `run.sh` 会打印栈的前几帧（见 `run.sh` 注释第 24 条），
+       `/tmp/vidow-run.log` 也会留着。
+
 238. **二级（嵌套）弹出物错位：子菜单按顶层窗口摆，丢掉了父菜单的偏移**（用户：「我发现 popup 的二级菜单会错位」）
 
      - 现场（headless 1920x1080，GTK3 菜单：一级 8 项、第一项带子菜单，`tools/menuprobe2.py`）：

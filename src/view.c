@@ -4274,6 +4274,19 @@ static void view_destroy(struct wl_listener *listener, void *data) {
 	view_capture_holds_clear(view);
 	vidow_portal_view_free(view);
 	vidow_mru_forget(server, view);
+	/* 动画回调的 data 就是这个 view（view_move_update / view_move_done）：
+	 * 窗口在动画没跑完时没了，必须先把动画取消掉，否则下一次 anim tick
+	 * 会拿着已释放的 view 调 vidow_view_apply_anim() —— 那就是 2026-10-12
+	 * 23:20–23:47 那 5 个 SIGSEGV 核心转储（栈：#0 野地址 <- #1
+	 * vidow_output_render <- output_frame <- 帧回调）。 */
+	if (view->anim_move != NULL) {
+		vidow_anim_cancel(view->anim_move);
+		view->anim_move = NULL;
+	}
+	if (view->anim_open != NULL) {
+		vidow_anim_cancel(view->anim_open);
+		view->anim_open = NULL;
+	}
 	wl_list_remove(&view->link);
 	/* 果冻那个场景节点比 view 活得久，结构里又攥着 view 指针：先收掉。 */
 	vidow_jelly_view_gone(view);
@@ -5019,6 +5032,19 @@ static void x11_destroy_view(struct wl_listener *listener, void *data) {
 	view_popup_release_keyboard(view);
 	vidow_portal_view_free(view);
 	vidow_mru_forget(server, view);
+	/* 动画回调的 data 就是这个 view（view_move_update / view_move_done）：
+	 * 窗口在动画没跑完时没了，必须先把动画取消掉，否则下一次 anim tick
+	 * 会拿着已释放的 view 调 vidow_view_apply_anim() —— 那就是 2026-10-12
+	 * 23:20–23:47 那 5 个 SIGSEGV 核心转储（栈：#0 野地址 <- #1
+	 * vidow_output_render <- output_frame <- 帧回调）。 */
+	if (view->anim_move != NULL) {
+		vidow_anim_cancel(view->anim_move);
+		view->anim_move = NULL;
+	}
+	if (view->anim_open != NULL) {
+		vidow_anim_cancel(view->anim_open);
+		view->anim_open = NULL;
+	}
 	wl_list_remove(&view->link);
 	/* 同上：果冻先收掉，别留一个攥着野指针的场景节点。 */
 	vidow_jelly_view_gone(view);
