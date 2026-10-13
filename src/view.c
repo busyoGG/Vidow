@@ -1987,6 +1987,24 @@ void vidow_place_view(struct vidow_view *view, int x, int y, int w, int h) {
 	 * 得到的是新位置减新位置 = 0，动画照跑 190ms / 30 帧但一格都不动。 */
 	int drawn_x = view->geom.x + (int)lround(view->anim_off_x);
 	int drawn_y = view->geom.y + (int)lround(view->anim_off_y);
+	/* 上一帧它其实没画在屏上（被 park 了：滑出去、或者本来在别的工作区）时，
+	 * 上面这个值不是"它刚才在哪"，而是 park 之前那一次的 geom。列里每个窗口
+	 * 都会这样，可全屏视图的 geom.x 恒等于输出框左边（0），补间起点于是变成
+	 * "屏幕最左边" —— 每次滚出去再滚回来，它都从左边飞进来（用户报的 proton
+	 * 全屏游戏窗口）。
+	 * 判据是"这个起点落在输出框里面"：真滑到屏外的窗口起点本来就在框外，
+	 * 不动它；落在框内的说明上一帧它并不在屏上，那它到底从哪一侧进来，只能
+	 * 看新位置相对旧值往哪边走 —— 往右走就是从左边进，反之亦然。
+	 * 列就是列，跟全不全屏无关，所以这里不按 fullscreen 分支。 */
+	if (view->output != NULL) {
+		struct wlr_box box = {0};
+		wlr_output_layout_get_box(view->server->output_layout,
+			view->output, &box);
+		if (box.width > 0 && drawn_x >= box.x &&
+				drawn_x < box.x + box.width) {
+			drawn_x = x > drawn_x ? box.x - w : box.x + box.width;
+		}
+	}
 	struct wlr_box before = {
 		.x = drawn_x, .y = drawn_y,
 		.width = view->geom.width, .height = view->geom.height,

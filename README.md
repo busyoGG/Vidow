@@ -5049,6 +5049,22 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
         底衬是**半透明混合**的（量到 (107,66,38)，金色和洋红混在一起）。验证 / 截图时加
         `--transition-type none`。
 
+242. **滚出去的列滚回来时，窗口从屏幕最左边飞进来**（用户：「proton 游戏窗口滚动的时候从最左边移入」）
+
+     - 现场：窗口早就落位了，**每次滚出去再滚回来**都从屏幕最左边滑入。用户还纠正了我一次方向：
+       「列就是列，和全不全屏有什么关系，统一视为列」—— 对，修法不许按 fullscreen 分支。
+     - 机制：滑入起点取的是「它现在画在哪」= `view->geom.x + anim_off_x`（`vidow_place_view()`，
+       `src/view.c`）。但**被 park 的窗口上一帧根本没画在屏上**，这个值只是 park 之前那一次的 geom
+       —— 列里每个窗口都这样，而全屏视图的 `geom.x` 恒等于输出框左边（0，见
+       `arrange_columns(..., full_box, ...)`），于是起点成了「屏幕最左边」。普通列没露出来，只是
+       因为它们 park 前的 `geom.x` 本来就在屏外、看着像"从正确的一侧进来"。
+     - 修法：判据 = 这个起点**落在输出框里面**（说明上一帧它并不在屏上）→ 按新位置相对旧值往哪边
+       走，把它推到那一侧的框外（往右走 = 从左边进 → `box.x - w`；反之 `box.x + box.width`）。
+       真滑到屏外的窗口起点本来就在框外，不动它。**不按 fullscreen 分支**。
+     - 验证：`test-fullscreen-scroll.sh`（24 条，README 191「全屏参与滚动」）+
+       `test-fullscreen-2out.sh`（16 条）全过。**未做视觉复现**（`zz-fswin` 全屏 X11 窗口来回滚、
+       截动画中间帧那条没跑），需要在真机上确认一次。
+
 241. **layer 面的入场动画每帧重跑布局 → configure 洪水把客户端灌断**（用户：noctalia 日志「Wayland display closed during failed to read Wayland events; shutting down (display_error=32 (断开的管道))」）
 
      - 现场（用户机器：两块屏，1 倍 + 2 倍；noctalia 每块屏摆壁纸 / 状态栏 / 停靠栏 / 四个角，共 14 块
