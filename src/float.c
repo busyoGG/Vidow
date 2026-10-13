@@ -151,6 +151,31 @@ void vidow_float_set_mode(struct vidow_view *view,
 }
 
 void vidow_float_update_mode(struct vidow_view *view) {
+	/* 全屏的窗口**不接受自动识别**（规则和 Mod+V 那两条显式的路照旧）。
+	 *
+	 * 为什么非要有这条：自动识别看的是客户端声明的 min/max 尺寸提示
+	 * （detect_mode → vidow_x11_detect_mode 的 x11_has_fixed_size），而**全屏的
+	 * 尺寸是我们定的**（整块输出）。proton 游戏进全屏时正好把提示钉成
+	 * min == max（等于它全屏的尺寸），离开全屏又松开 —— 而 view.c 里那串
+	 * x11_set_* 回调（WM_HINTS / WM_NORMAL_HINTS / _NET_WM_STATE）每次属性变动
+	 * 都重判一遍模式，于是同一个全屏游戏在「平铺 <-> 浮动」之间来回翻
+	 * （用户日志里翻了 175 次）。
+	 *
+	 * 翻成浮动的代价是两样一起丢：
+	 *   ① 它那条列（vidow_view_leave_layout）→ 条带塌一格，整屏跟着跳；
+	 *   ② 「停到屏外 / 裁到自己那块屏」两道闸（vidow_view_should_park 与
+	 *      view_clip_box 对浮动窗口一律放行，因为浮窗本来就允许跨屏）——
+	 *      它以条带上的坐标整块画出来。1920 宽的全屏窗口在 1920 那块屏上滚出
+	 *      视口时，x 正好落在 0 / 963 这种跨两块屏的位置上，于是「突然从左边
+	 *      平移到右边，且跨显示器了」。
+	 * 列就是列：全屏窗口照旧在条带里跟着滚、滚出去就停到屏外。
+	 *
+	 * 这里**保持现状**（不硬掰成平铺）：显式浮动起来的窗口（Mod+V / 规则）再
+	 * 全屏还得是浮动的 —— test-fullscreen-scroll.sh 里那条「浮动的全屏窗口也
+	 * 盖住整块屏」就是它。 */
+	if (view->fullscreen && !view->rule_eff.set[VRA_FLOAT]) {
+		return;
+	}
 	/* 窗口规则说了算（float = true / false）：自动识别让位。尺寸提示晚到
 	 * （dialogs 在第一次 configure 之后才发 min/max）的时候也不能把它推翻。 */
 	if (view->rule_eff.set[VRA_FLOAT]) {

@@ -5213,6 +5213,38 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
        注意这几个脚本里 `window_move_ms = 0`（不起补间），所以它们**量不到**这条 bug ——
        上面的数字全靠那个 headless 复现（`move tween` 那行日志 + `grim` 连拍）。
 
+254. **全屏游戏滚出视口时「突然从左边平移到右边，且跨显示器了」：属性一抖它就被判成浮动，浮动窗口既不裁也不停**（用户：「proton 游戏移出视口的时候会突然从左边平移到右边（且跨显示器了）」，2026-10-13；现场日志 `/tmp/vidow-run.log`）
+
+     - 机制（哪一行）：proton 游戏**进全屏时把 `WM_NORMAL_HINTS` 钉成 `min == max`（等于它全屏的尺寸）**，离开全屏又松开。
+       `src/view.c` 里那串属性回调（`x11_set_hints` / `x11_set_size_hints` / `x11_set_window_type` / `x11_request_configure`，
+       加上 `view_map` 和 xdg 的初次 commit）每次变动都调 `vidow_float_update_mode()` →
+       `vidow_x11_detect_mode()` 的 `x11_has_fixed_size()`（`src/view.c:4550`）见 min==max 就返回 `VIDOW_FLOAT_FIXED`
+       —— **不看全屏状态**（全屏的尺寸是我们定的，客户端那套提示在这时候不代表「它是个对话框」）。
+       全屏窗口一变成浮动，两样东西一起丢：
+       ① 它那条列（`vidow_float_set_mode()` → `vidow_view_leave_layout()`）→ 条带塌一格，整屏跟着跳；
+       ② 「停到屏外 / 裁到自己那块屏」两道闸 —— `vidow_view_should_park()`（`src/view.c:1524`）和
+          `view_clip_box()`（`src/view.c:1141`）对 `float_mode != NONE` 一律放行（浮窗本来就允许跨屏，
+          见 `README` 的浮动窗口那节）。于是它**按条带上的坐标整块画出来**：1920 宽的全屏窗口在 1920 那块屏上
+          滚出视口时，x 正好落在 `0` / `6` / `963` 这种跨两块屏的位置上（`963 = 1920 - 957`，957 = 951 + gaps 6）。
+     - 现场：`/tmp/vidow-run.log` 里同一个全屏游戏 `float mode 崩坏：星穹铁道: 0 -> 1` / `1 -> 0` **翻了 175 次**，
+       每次都在滚动前后。例：`00:03:12.213` 判成浮动 → `12.214 clip: 崩坏：星穹铁道 不裁（屏框 0,0 0x0，窗口 963,0 1920x1080）`
+       → `12.214 全屏: 关` → `12.219 float mode: 1 -> 0`（又回平铺）。窗口盒 `963,0 1920x1080` 正好压在左边那块屏上。
+     - 先量后改（headless 双屏 `HEADLESS-1 1920x1080@1 x=0` + `HEADLESS-2 3840x2160@2 x=1920`，`gaps 6`、
+       `easing = "out_back 0.18"`、`window_move_ms = 320`，仿 proton 的 X11 客户端：固定尺寸提示 + `_NET_WM_STATE_FULLSCREEN`
+       + 一直交帧 + 每 0.4s 重设一次属性）：滚 2 格把游戏滚出视口，`grim` 连拍两块屏各 40 帧，
+       数**左边那块屏**上有没有游戏的红 ——
+       - 改前：**11/40 帧拍到**（帧 3 红 `x=1782..1919`、149040 像素；帧 9 / 14 / 19 / 20 / 24 / 25 / 30 / 35 / 40 同）
+       - 改后：**0/40 帧**（日志里 `float mode game` 一行都没有，几何照旧跟着条带 `963 → 6 → -951 → 1920` 走）
+     - 修法（`src/float.c` 的 `vidow_float_update_mode()` 开头一条）：**全屏的窗口不接受自动识别**（规则里的
+       `float` 和 Mod+V 那两条显式的路照旧，所以条件里带 `!view->rule_eff.set[VRA_FLOAT]`）。
+       这里**保持现状**、不硬掰成平铺：显式浮动起来的窗口全屏之后还得是浮动的（`test-fullscreen-scroll.sh` 那条
+       「浮动的全屏窗口也盖住整块屏」就是它）。列就是列：全屏窗口照旧在条带里跟着滚、滚出去照旧停到屏外。
+     - 回归：`test-fullscreen-scroll.sh` / `test-fullscreen-2out.sh` / `test-scrollcull.sh` / `test-workspace.sh`
+       改前（`/tmp/vidow-park-bug/vidow-before`）改后各跑一次，全过。注意这四个脚本 `window_move_ms = 0`，
+       量不到这条（症状不是补间起点，是「该藏起来的窗口没藏」），数字全靠上面那个 headless 复现 + `grim` 连拍。
+     - 未覆盖：**非全屏**的真·钉死尺寸的 X11 窗口照旧判浮动（那是它本来的语义）—— 那种窗口不在条带里、不参与滚动，
+       位置是它自己的浮动位置，不会跟着视口跨屏。
+
 247. **缓动曲线能自己写了：自定义三次贝塞尔 + 回弹幅度可调**（用户：「回弹幅度应该允许配置 回弹的时间也允许配置 类似 hyprland 那样」）
 
      - 时间本来就能配（`window_move_ms` / `workspace_switch_ms` / `column_width_ms`），缺的是
