@@ -34,3 +34,4 @@ vidow.include("configs/15-mru.lua")        -- 最近窗口（Alt+Tab）
 vidow.include("configs/16-env.lua")        -- 会话环境 / 自启动 / 事件钩子
 vidow.include("configs/17-overview.lua")   -- 全景（overview）
 vidow.include("configs/18-background.lua") -- 桌面背景
+vidow.include("configs/19-input.lua")      -- 输入设备（libinput）

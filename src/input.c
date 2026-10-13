@@ -10,7 +10,10 @@
 
 #include <linux/input-event-codes.h>
 #include <wayland-server-protocol.h>
+#include <wlr/backend/libinput.h>
 #include <wlr/util/log.h>
+
+#include <libinput.h>
 
 /* 指针手势（Mod+左键拖窗口 / Mod+右键缩放 / Mod+滚轮切列）要求的修饰键。这是
  * 指针手势，不是键位 —— 键位一个内置的都没有，全在 config.lua 里绑。 */
@@ -281,6 +284,7 @@ static void input_device_note(struct vidow_server *server,
 		return;
 	}
 	dev->server = server;
+	dev->device = device;
 	snprintf(dev->name, sizeof(dev->name), "%s",
 		device->name != NULL ? device->name : "(无名)");
 	snprintf(dev->type, sizeof(dev->type), "%s",
@@ -304,6 +308,230 @@ void vidow_input_finish(struct vidow_server *server) {
 		wl_list_remove(&dev->link);
 		free(dev);
 	}
+	/* 账本没了，配置改了就别再往里套设置了（配置重载理论上还能跑到这儿）。 */
+	vidow_config_observe(NULL, NULL);
+}
+
+/* ------------------------------------------------- libinput 设备配置 */
+
+/* 配置里那一族 libinput 设置（configs/19-input.lua，照 niri 的 input {} 那一节）
+ * 套到设备上。两个时机：
+ *
+ *   1. 设备插上来 —— server_new_input 那条路，热插拔也是它；
+ *   2. 配置改了 —— config.c 的观察者（见 vidow_input_init）。设置是**存在设备
+ *      上**的，配置重载 / `vidowmsg set-config` 不会自动跟过去，得重套一遍。
+ *
+ * 只认 libinput 的设备：虚拟键盘 / 虚拟指针（wtype、vidowmsg send-key 那些）不是
+ * libinput 的，wlr_libinput_get_device_handle() 对它们会 assert 掉。
+ *
+ * 没配的项一概不碰（三态 AUTO / 空串 / accel_speed 没设）：这是「不配置时零
+ * 变化」的落点 —— vidow 以前一个 libinput 设置都不碰，而 libinput 的默认值随
+ * 设备和 udev 规则走，替用户写死一个常数就等于改了他没配的东西。 */
+
+/* 三态 → 日志里的一个词。AUTO 不会走到这儿（没配就不打）。 */
+static const char *tri_text(enum vidow_tristate v) {
+	return v == VIDOW_TRI_ON ? "on" : "off";
+}
+
+/* 往「这台设备上真设了什么」那行里追加一项。默认全是「不碰」，所以打一串
+ * auto / - 没意义，只记真的动过的。 */
+static void applied_add(char *buf, size_t size, const char *what,
+		const char *value) {
+	snprintf(buf + strlen(buf), size - strlen(buf), "%s%s=%s",
+		buf[0] != '\0' ? " " : "", what, value);
+}
+
+void vidow_input_apply_libinput(const struct vidow_config *cfg,
+		struct libinput_device *dev, const char *name) {
+	if (cfg == NULL || dev == NULL) {
+		return;
+	}
+	char done[256] = "";
+	char num[32];
+
+	/* 点按 = 左键。finger count == 0 就是这台设备不支持点按（鼠标 / 老触控板）。 */
+	if (cfg->tap != VIDOW_TRI_AUTO &&
+			libinput_device_config_tap_get_finger_count(dev) > 0) {
+		libinput_device_config_tap_set_enabled(dev,
+			cfg->tap == VIDOW_TRI_ON ? LIBINPUT_CONFIG_TAP_ENABLED :
+			LIBINPUT_CONFIG_TAP_DISABLED);
+		applied_add(done, sizeof(done), "tap", tri_text(cfg->tap));
+	}
+	/* 打字时关触控板（disable-while-typing）。 */
+	if (cfg->dwt != VIDOW_TRI_AUTO &&
+			libinput_device_config_dwt_is_available(dev)) {
+		libinput_device_config_dwt_set_enabled(dev,
+			cfg->dwt == VIDOW_TRI_ON);
+		applied_add(done, sizeof(done), "dwt", tri_text(cfg->dwt));
+	}
+	/* 点按拖拽时松手不立刻放手。跟 tap 一样要求设备支持点按。 */
+	if (cfg->drag_lock != VIDOW_TRI_AUTO &&
+			libinput_device_config_tap_get_finger_count(dev) > 0) {
+		libinput_device_config_tap_set_drag_lock_enabled(dev,
+			cfg->drag_lock == VIDOW_TRI_ON ?
+			LIBINPUT_CONFIG_DRAG_LOCK_ENABLED :
+			LIBINPUT_CONFIG_DRAG_LOCK_DISABLED);
+		applied_add(done, sizeof(done), "drag_lock",
+			tri_text(cfg->drag_lock));
+	}
+	/* 反向滚动。 */
+	if (cfg->natural_scroll != VIDOW_TRI_AUTO &&
+			libinput_device_config_scroll_has_natural_scroll(dev)) {
+		libinput_device_config_scroll_set_natural_scroll_enabled(dev,
+			cfg->natural_scroll == VIDOW_TRI_ON);
+		applied_add(done, sizeof(done), "natural_scroll",
+			tri_text(cfg->natural_scroll));
+	}
+	/* 左右键对调。 */
+	if (cfg->left_handed != VIDOW_TRI_AUTO &&
+			libinput_device_config_left_handed_is_available(dev)) {
+		libinput_device_config_left_handed_set(dev,
+			cfg->left_handed == VIDOW_TRI_ON);
+		applied_add(done, sizeof(done), "left_handed",
+			tri_text(cfg->left_handed));
+	}
+	/* 左右键同时按 = 中键。 */
+	if (cfg->middle_emulation != VIDOW_TRI_AUTO &&
+			libinput_device_config_middle_emulation_is_available(dev)) {
+		libinput_device_config_middle_emulation_set_enabled(dev,
+			cfg->middle_emulation == VIDOW_TRI_ON);
+		applied_add(done, sizeof(done), "middle_emulation",
+			tri_text(cfg->middle_emulation));
+	}
+	/* 加速曲线 / 加速强度（两个都要求这台设备支持加速）。 */
+	if (libinput_device_config_accel_is_available(dev)) {
+		if (cfg->accel_profile[0] != '\0') {
+			enum libinput_config_accel_profile profile =
+				strcmp(cfg->accel_profile, "flat") == 0 ?
+				LIBINPUT_CONFIG_ACCEL_PROFILE_FLAT :
+				LIBINPUT_CONFIG_ACCEL_PROFILE_ADAPTIVE;
+			libinput_device_config_accel_set_profile(dev, profile);
+			applied_add(done, sizeof(done), "accel_profile",
+				cfg->accel_profile);
+		}
+		if (cfg->accel_speed.set) {
+			libinput_device_config_accel_set_speed(dev,
+				cfg->accel_speed.value);
+			snprintf(num, sizeof(num), "%.3f",
+				cfg->accel_speed.value);
+			applied_add(done, sizeof(done), "accel_speed", num);
+		}
+	}
+	/* 什么时候把指针移动当滚动。设备支持的方法是个位掩码，写了个它不支持的
+	 * 就跳过并在日志里说清楚（不然用户只会看到「配了没反应」）。 */
+	if (cfg->scroll_method[0] != '\0') {
+		enum libinput_config_scroll_method method;
+		uint32_t supported = libinput_device_config_scroll_get_methods(dev);
+		bool known = true;
+		if (strcmp(cfg->scroll_method, "no-scroll") == 0) {
+			method = LIBINPUT_CONFIG_SCROLL_NO_SCROLL;
+		} else if (strcmp(cfg->scroll_method, "two-finger") == 0) {
+			method = LIBINPUT_CONFIG_SCROLL_2FG;
+		} else if (strcmp(cfg->scroll_method, "edge") == 0) {
+			method = LIBINPUT_CONFIG_SCROLL_EDGE;
+		} else if (strcmp(cfg->scroll_method, "on-button-down") == 0) {
+			method = LIBINPUT_CONFIG_SCROLL_ON_BUTTON_DOWN;
+		} else {
+			known = false;
+			method = LIBINPUT_CONFIG_SCROLL_NO_SCROLL;
+		}
+		if (!known) {
+			wlr_log(WLR_ERROR, "input: %s：scroll_method '%s' 不认识"
+				"（只能是 no-scroll / two-finger / edge / "
+				"on-button-down），这台设备上不生效", name,
+				cfg->scroll_method);
+		} else if ((supported & (uint32_t)method) == 0) {
+			wlr_log(WLR_INFO, "input: %s：这台设备不支持 scroll_method "
+				"%s，跳过", name, cfg->scroll_method);
+		} else {
+			libinput_device_config_scroll_set_method(dev, method);
+			applied_add(done, sizeof(done), "scroll_method",
+				cfg->scroll_method);
+		}
+	}
+	/* 触控板的按键怎么划分（整块按下去 / 几根手指 = 哪个键）。 */
+	if (cfg->click_method[0] != '\0') {
+		enum libinput_config_click_method method;
+		uint32_t supported = libinput_device_config_click_get_methods(dev);
+		bool known = true;
+		if (strcmp(cfg->click_method, "button-areas") == 0) {
+			method = LIBINPUT_CONFIG_CLICK_METHOD_BUTTON_AREAS;
+		} else if (strcmp(cfg->click_method, "clickfinger") == 0) {
+			method = LIBINPUT_CONFIG_CLICK_METHOD_CLICKFINGER;
+		} else {
+			known = false;
+			method = LIBINPUT_CONFIG_CLICK_METHOD_NONE;
+		}
+		if (!known) {
+			wlr_log(WLR_ERROR, "input: %s：click_method '%s' 不认识"
+				"（只能是 button-areas / clickfinger），这台设备上"
+				"不生效", name, cfg->click_method);
+		} else if ((supported & (uint32_t)method) == 0) {
+			wlr_log(WLR_INFO, "input: %s：这台设备不支持 click_method "
+				"%s，跳过", name, cfg->click_method);
+		} else {
+			libinput_device_config_click_set_method(dev, method);
+			applied_add(done, sizeof(done), "click_method",
+				cfg->click_method);
+		}
+	}
+
+	/* 一行一台设备，只在真设了什么的时候打。scroll_factor 不在这儿 —— 它不是
+	 * 设备属性，是 vidow 自己在滚轮事件上乘的（见 vidow_pointer_axis）。 */
+	if (done[0] != '\0') {
+		wlr_log(WLR_INFO, "input: %s：%s", name, done);
+	}
+}
+
+/* 一台 wlr 设备：是 libinput 的才往下走（虚拟设备会被 wlroots 那套 assert 掉）。 */
+static void input_apply_device(const struct vidow_config *cfg,
+		struct wlr_input_device *device) {
+	if (device == NULL || !wlr_input_device_is_libinput(device)) {
+		return;
+	}
+	struct libinput_device *dev = wlr_libinput_get_device_handle(device);
+	if (dev == NULL) {
+		return;
+	}
+	vidow_input_apply_libinput(cfg, dev,
+		device->name != NULL ? device->name : "(无名)");
+}
+
+void vidow_input_apply_all(struct vidow_server *server) {
+	struct vidow_input_device *dev;
+	wl_list_for_each(dev, &server->input_devices, link) {
+		input_apply_device(&server->config, dev->device);
+	}
+}
+
+/* 配置改了（三条写路径最后都落到 config.c 的 apply()）：只有这一族的键变了才
+ * 重套，别的键（gap、动画…）改一次重套一遍所有设备是白费。key == NULL =
+ * 整份配置都可能变了（配置重载先恢复默认值，那一步不走单个键）。 */
+static const char *input_config_keys[] = {
+	"tap", "dwt", "natural_scroll", "left_handed", "middle_emulation",
+	"drag_lock", "accel_profile", "accel_speed", "scroll_method",
+	"click_method",
+};
+
+static void input_config_changed(struct vidow_config *cfg, const char *key,
+		void *data) {
+	(void)cfg; /* 和 server->config 是同一份 */
+	struct vidow_server *server = data;
+	if (key != NULL) {
+		bool ours = false;
+		for (size_t i = 0;
+				i < sizeof(input_config_keys) / sizeof(input_config_keys[0]);
+				i++) {
+			if (strcmp(key, input_config_keys[i]) == 0) {
+				ours = true;
+				break;
+			}
+		}
+		if (!ours) {
+			return;
+		}
+	}
+	vidow_input_apply_all(server);
 }
 
 static void server_new_input(struct wl_listener *listener, void *data) {
@@ -311,6 +539,9 @@ static void server_new_input(struct wl_listener *listener, void *data) {
 	struct wlr_input_device *device = data;
 
 	input_device_note(server, device);
+	/* 设备属性是存在设备上的：插上来就得套一遍（热插拔也走这儿，所以不只是
+	 * 启动时那一次）。虚拟设备在里面被滤掉。 */
+	input_apply_device(&server->config, device);
 	switch (device->type) {
 	case WLR_INPUT_DEVICE_KEYBOARD:
 		server_new_keyboard(server, device);
@@ -769,6 +1000,26 @@ static void server_cursor_axis(struct wl_listener *listener, void *data) {
 void vidow_pointer_axis(struct vidow_server *server,
 		enum wl_pointer_axis orientation, double delta, int32_t delta_discrete,
 		enum wl_pointer_axis_source source, uint32_t time_msec) {
+	/* 滚动倍率（niri 的 scroll-factor，见 configs/19-input.lua）。libinput 没
+	 * 这个接口，是 vidow 自己在滚轮事件上乘的。1.0（默认）= 不缩放，跟以前
+	 * 一模一样。乘在**入口**而不是只乘发给客户端那一份：真设备和 IPC 注入本来
+	 * 就走这一条路，倍率在这儿才一处管全。 */
+	double factor = server->config.scroll_factor;
+	if (factor != 1.0) {
+		delta *= factor;
+		if (delta_discrete != 0) {
+			/* 离散值（老鼠标一格一格那种）跟着缩，不然只吃离散值的客户端
+			 * 感觉不到倍率；缩到 0 那一格就白滚了，所以至少留一格（方向
+			 * 不变）。 */
+			double d = delta_discrete * factor;
+			int32_t r = (int32_t)(d >= 0 ? floor(d + 0.5) : ceil(d - 0.5));
+			if (r == 0) {
+				r = delta_discrete > 0 ? 1 : -1;
+			}
+			delta_discrete = r;
+		}
+	}
+
 	/* 有些设备只发离散值（老鼠标），所以两个都看 */
 	double amount = delta != 0 ? delta : delta_discrete;
 
@@ -858,6 +1109,12 @@ static void server_new_virtual_pointer(struct wl_listener *listener, void *data)
 
 bool vidow_input_init(struct vidow_server *server) {
 	wl_list_init(&server->input_devices);
+	/* 配置改了要重套 libinput 设置（设置存在设备上，重载 / set-config 不会自己
+	 * 跟过去）。挂在配置那条路上而不是某个调用点：config.lua / VIDOW_* / IPC
+	 * set-config 三条写路径都从 config.c 的 apply() 过，一处盖全。
+	 * 注册放在 wl_list_init 之后 —— 在那之前 server->input_devices 还不是个
+	 * 链表，回调里遍历会踩空。 */
+	vidow_config_observe(input_config_changed, server);
 	server->new_input.notify = server_new_input;
 	wl_signal_add(&server->backend->events.new_input, &server->new_input);
 

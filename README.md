@@ -5364,6 +5364,46 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
        `time(NULL) - server_start > 5` 才重启），那种情况下桥会一直摘着，直到配置 SIGHUP（`apply_config`
        会重新接管）或下一个 X 客户端把 Xwayland 再拉起来。
 
+260. **libinput 设备配置族：触控板 / 鼠标那十一个设置终于能配了（`configs/19-input.lua`）**（用户：「照 niri 的 `input {}` 那套，给 vidow 加 libinput 设备配置族」；2026-10-14）
+
+     - 改前：vidow **一个 libinput 设置都不能调**（全仓 grep `accel_profile` / `scroll_method` / `natural_scroll` / `tap_to_click` = 0 命中）——
+       笔记本用户第一件事（开点按、打字时关触控板、反向滚动）在 vidow 上无解。
+     - 新增 11 个键（键名照 niri 的 `input { touchpad { … } }`，转成 vidow 的 snake_case）：`tap` / `dwt` /
+       `natural_scroll` / `left_handed` / `middle_emulation` / `drag_lock` / `accel_profile` / `accel_speed` /
+       `scroll_method` / `click_method` / `scroll_factor`。
+     - **默认值 = vidow 以前的行为**：前十个默认是 `"auto"` / 空串 = **一个 libinput 设置都不碰**，用设备自己的默认 ——
+       libinput 的默认值按设备 / udev 规则走（同一台机器上触控板和鼠标的 tap 默认就不是一回事），照抄一个常数等于替用户
+       改了他没配的东西，所以「零变化」只能靠「不设置」本身（`enum vidow_tristate` + `struct vidow_opt_double`，
+       config.c 新增 `K_TRISTATE` / `K_OPT_DOUBLE` 两种类型）。`scroll_factor` 是 vidow 自己乘的倍率
+       （libinput 没有这个接口），默认 1.0 = 不缩放。
+     - 三条写路径都吃：config.lua（`touchpad = { tap = true, … }`，新增的族 —— vidow 的族只有一层，所以省掉 niri 外面的
+       `input`）/ `VIDOW_TAP` 这类环境变量 / `vidowmsg set-config tap true`；查询 `vidowmsg config tap`
+       （打出来能原样抄回配置）。写错当场报错、该键不生效（`tap = "maybe"`、`accel_speed = 5`、
+       `scroll_method = "two-fingered"` 都拒，旧值不被改坏）。
+     - **设备插入时也套**（不只是启动时）：`input.c` 的 `server_new_input`（热插拔走同一条路）调
+       `vidow_input_apply_libinput()`；设备手柄走 wlroots 0.20 的 `wlr_input_device_is_libinput()` +
+       `wlr_libinput_get_device_handle()`（`<wlr/backend/libinput.h>`），虚拟键盘 / 虚拟指针不是 libinput 的，先滤掉
+       （wlroots 那个取手柄的函数对它们会 assert）。设备不支持某一项就跳过并在日志里说清楚（比如 `scroll_method` 要过
+       设备支持的方法位掩码）。
+     - 配置改了要重套（设置是存在**设备**上的，重载不会自己跟过去）：config.c 新增 `vidow_config_observe()`，挂在
+       `apply()` 上 —— 三条写路径最后都过那儿，一处盖全；`key == NULL` = 配置重载先恢复默认值那一步（不走单个键），
+       所以配置里**删掉**一行也能回到默认。
+     - `scroll_factor` 乘在 `vidow_pointer_axis()` 的入口（真设备和 IPC 注入本来就走这一条路，倍率在这儿一处管全）；
+       离散值（老鼠标一格一格那种）一起缩，缩到 0 至少留一格。
+     - 日志：配置那一行 `config: 输入设备 tap=auto … scroll_factor=1.00（auto / 空 = 不碰设备…）`；真设了东西的设备打一行
+       `input: <设备名>：tap=on …`（默认全是「不碰」，所以不打一串 auto）。
+     - 验证（headless，脚本 `/tmp/vidow-input-verify.sh`）：11 个键的默认值逐个查回 = 现状（`auto` / 空 / `1`）；三条写路径
+       各验一遍（配置文件 + 表写法 + 自动重载、`VIDOW_TAP=true`、`set-config tap true`）；四种写错的取值都被拒且旧值没被
+       改坏；配置里删掉那一行回到 `auto`。`./test-config.sh` 与 `./test-defaultconfig.sh` 改后全过（后者含 config.example
+       与 `--default-config` 逐字节一致，新增的 `19-input.lua` 也在内）。
+       **headless 下没有真 libinput 设备**（`WLR_LIBINPUT_NO_DEVICES=1`，headless 后端本来也不建 libinput），所以
+       「把设置套到真设备上」那一段只有读代码 + 日志行做论证，**没有端到端实测**（真机插拔 + `libinput debug-events`
+       看 tap 是否真生效是没做的那一步）。
+     - 未做：niri 同一节里剩下的 `dwtp`（disable-while-trackpointing）、`scroll_button` / `scroll-button-lock`、
+       `tap-button-map`、`pinch-sensitivity`、`disabled-on-external-mouse`、`off`（整台设备不发事件）；每台设备单独配
+       （niri 也没有）；`tablet` / `touch` 那两节；`scroll-factor` 的横向 / 纵向分开给（niri 25.08 才有）。
+     - 依赖：`meson.build` 加了一份 `libinput_dep`（wlroots 把它放在 `Requires.private` 里，链接时不会自动带过来）。
+
 259. **overview 每个工作区画成「缩小版的屏」：矩形按屏幕长宽比 + 里面画该工作区实际的背景图**（用户：「overview 工作区矩形应该是缩小版的屏幕矩形而不是一整条，工作区矩形填充的是实际的工作区背景图」；2026-10-14）
 
      - 机制（改前）：一行就是**铺满工作区宽的一条横带** —— `plate_apply()` 把板子铺成 `out_w` 宽、`row_h` 高，里面只有一块压暗的板子，没有背景图；缩略比例横向还按「最宽的条带铺得进一行」算

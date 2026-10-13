@@ -23,6 +23,10 @@ drm_dep = dependency('libdrm')
 pipewire_dep = dependency('libpipewire-0.3', version: '>=0.3.60')
 # 剪贴板桥（clipboard.c）靠 XFixes 监听 X 侧的 owner 变化。
 xcb_xfixes_dep = dependency('xcb-xfixes')
+# libinput 设备配置（input.c 的 vidow_input_apply_libinput）：点按 / 反向滚动 /
+# 加速曲线那些设备属性直接调 libinput。wlroots 把 libinput 放在 Requires.private
+# 里，链接时不会自动带过来，所以自己声明一份（版本跟着 wlroots 0.20 的要求）。
+libinput_dep = dependency('libinput', version: '>=1.19.0')
 # 配置语言：Lua 5.4（Arch 的 lua54 包）。没有就退回系统默认 lua。
 lua_dep = dependency('lua5.4', required: false)
 if not lua_dep.found()
@@ -477,7 +481,7 @@ executable('vidow',
              etl_code, zkde_server_code, xkg_server_code],
   dependencies: [wlroots_dep, xkbcommon_dep, wayland_server_dep, math_dep,
                  egl_dep, gles2_dep, pixman_dep, lua_dep, xcb_dep,
-                 xcb_xfixes_dep, drm_dep, pipewire_dep],
+                 xcb_xfixes_dep, drm_dep, pipewire_dep, libinput_dep],
   include_directories: include_directories('.'),
   install: false)
 

@@ -38,6 +38,12 @@ enum kind {
 	/* Alt+Tab 切换器的两个枚举（写字符串，存整数；见 mru.c） */
 	K_MRU_SCOPE,  /* "all" / "workspace" / "output" */
 	K_MRU_LAYOUT, /* "strip" / "grid" */
+	/* libinput 那两个「可以不设」的类型（见 server.h 的 enum vidow_tristate /
+	 * struct vidow_opt_double）：文本是 "auto" / "true" / "false"，或者
+	 * "auto" / 一个数。auto = 不碰这台设备、用 libinput 自己的默认 —— 那正是
+	 * vidow 以前的行为，所以这两个类型的默认值就是 auto。 */
+	K_TRISTATE,
+	K_OPT_DOUBLE,
 };
 
 struct entry {
@@ -100,6 +106,11 @@ static const struct section sections[] = {
 	{ "桌面背景", "18-background.lua",
 		"壁纸由 layer-shell 的 background 层客户端画（swaybg / swww / quickshell 都行，"
 		"见 README「背景（壁纸）归谁画」）；这里只有没有壁纸客户端时垫在最底下的颜色" },
+	/* 输入设备（19-…）同样只能往后加。这一族是**设备属性**，不是布局参数：
+	 * 默认全是「不设」（"auto"）= vidow 以前一个 libinput 设置都不碰。 */
+	{ "输入设备（libinput）", "19-input.lua",
+		"触控板 / 鼠标这些设备自己的设置（照 niri 的 input {} 那一节）。默认全是 "
+		"\"auto\" = 不碰，用设备自己的默认；改了立刻套到已经连上的设备上，热插拔也照套" },
 };
 #define N_SECTIONS ((int)(sizeof(sections) / sizeof(sections[0])))
 /* 「键位 / 工作区 / 规则」那一节：它不是配置键，entries[] 里没有它，打印也
@@ -109,6 +120,8 @@ static const struct section sections[] = {
 #define SECTION_OUTPUT 8
 /* 16-env.lua 多一段 vidow.* 的写法（会话环境 / 自启动 / 事件钩子，不是配置键）。 */
 #define SECTION_ENV 15
+/* 输入设备那一节（19-input.lua）多一段 niri 那种表写法的提示。 */
+#define SECTION_INPUT 18
 
 #define OFF(field) offsetof(struct vidow_config, field)
 #define SZ(field) sizeof(((struct vidow_config *)0)->field)
@@ -403,6 +416,42 @@ static const struct entry entries[] = {
 		SZ(background_color), 17,
 		"桌面底色：没有任何壁纸客户端（layer-shell 的 background 层 —— "
 		"swaybg / swww / shell 都算）时垫在最底下的颜色，有壁纸就看不见它" },
+
+	/* libinput 设备配置（照 niri 的 input {} 那一节，键名转成 vidow 的
+	 * snake_case）。默认值全是「不设」：vidow 以前一个 libinput 设置都不碰，
+	 * 而 libinput 的默认值随设备和 udev 规则走 —— 要「不配置时零变化」，就
+	 * 不能替用户写死一个常数（见 server.h 的 enum vidow_tristate）。
+	 * 表写法见 groups[] 里的 touchpad。 */
+	{ "tap", K_TRISTATE, OFF(tap), SZ(tap), 18,
+		"点按触控板 = 左键（niri 的 input { touchpad { tap } }）；\"auto\"（默认）= "
+		"不碰，用设备自己的默认" },
+	{ "dwt", K_TRISTATE, OFF(dwt), SZ(dwt), 18,
+		"打字的时候临时关掉触控板（disable-while-typing）；\"auto\"（默认）= 不碰" },
+	{ "natural_scroll", K_TRISTATE, OFF(natural_scroll), SZ(natural_scroll), 18,
+		"反向滚动（手指往下滑、内容往上走）；\"auto\"（默认）= 不碰" },
+	{ "left_handed", K_TRISTATE, OFF(left_handed), SZ(left_handed), 18,
+		"左手模式：左右键对调；\"auto\"（默认）= 不碰" },
+	{ "middle_emulation", K_TRISTATE, OFF(middle_emulation),
+		SZ(middle_emulation), 18,
+		"左右键同时按 = 中键；\"auto\"（默认）= 不碰" },
+	{ "drag_lock", K_TRISTATE, OFF(drag_lock), SZ(drag_lock), 18,
+		"点按拖拽时松开手指不立刻放手（libinput 的 tap drag lock）；\"auto\""
+		"（默认）= 不碰" },
+	{ "accel_profile", K_STRING, OFF(accel_profile), SZ(accel_profile), 18,
+		"指针加速曲线：adaptive（自适应）/ flat（不加速）；留空（默认）= 不碰，"
+		"用设备自己的默认" },
+	{ "accel_speed", K_OPT_DOUBLE, OFF(accel_speed), SZ(accel_speed), 18,
+		"指针加速强度，-1.0 .. 1.0（niri 的 accel-speed，0.0 = 不加速也不减速）；"
+		"\"auto\"（默认）= 不碰" },
+	{ "scroll_method", K_STRING, OFF(scroll_method), SZ(scroll_method), 18,
+		"什么时候把指针移动当滚动：no-scroll / two-finger / edge / on-button-down"
+		"（niri 同名的四个值）；留空（默认）= 不碰，用设备自己的默认" },
+	{ "click_method", K_STRING, OFF(click_method), SZ(click_method), 18,
+		"触控板的按键怎么划分：button-areas（整块按下去）/ clickfinger（几根手指 "
+		"= 哪个键）；留空（默认）= 不碰" },
+	{ "scroll_factor", K_DOUBLE, OFF(scroll_factor), SZ(scroll_factor), 18,
+		"滚动倍率（niri 的 scroll-factor）：0.5 = 半速，负数反向。libinput 没有"
+		"这个接口，是 vidow 自己在滚轮事件上乘的；1.0（默认）= 不缩放，跟以前一样" },
 };
 
 /* ------------------------------------------------------------ 配置组
@@ -543,6 +592,23 @@ static const struct group_field focus_follows_mouse_fields[] = {
 static const struct group_field warp_mouse_to_focus_fields[] = {
 	{ "mode", "warp_mouse_to_focus_mode" },
 };
+/* niri 的 input { touchpad { … } } 那个节点（vidow 的族只有一层，所以省掉外面的
+ * input）。项名就是平铺键名，一个不多一个不少 —— 这些设置会套到**每一台**支持
+ * 它的设备上（accel_profile 对鼠标同样生效，niri 里也是这么分的）。
+ * 表写法不会顺手把开关打开（vidow 的族都这样：border = { width = 0 } 也不开边框）。 */
+static const struct group_field touchpad_fields[] = {
+	{ "tap",              "tap" },
+	{ "dwt",              "dwt" },
+	{ "natural_scroll",   "natural_scroll" },
+	{ "left_handed",      "left_handed" },
+	{ "middle_emulation", "middle_emulation" },
+	{ "drag_lock",        "drag_lock" },
+	{ "accel_profile",    "accel_profile" },
+	{ "accel_speed",      "accel_speed" },
+	{ "scroll_method",    "scroll_method" },
+	{ "click_method",     "click_method" },
+	{ "scroll_factor",    "scroll_factor" },
+};
 
 #define GROUP(name, scalar, fields) \
 	{ name, scalar, fields, sizeof(fields) / sizeof(fields[0]) }
@@ -564,6 +630,7 @@ static const struct group groups[] = {
 		focus_follows_mouse_fields),
 	GROUP("warp_mouse_to_focus", "warp_mouse_to_focus",
 		warp_mouse_to_focus_fields),
+	GROUP("touchpad", NULL, touchpad_fields),
 };
 
 static const struct group *group_named(const char *name) {
@@ -861,6 +928,30 @@ static bool parse_mru_layout(const char *value, enum vidow_mru_layout *out) {
 	return false;
 }
 
+/* libinput 那些开关的取值（见 server.h 的 enum vidow_tristate）：
+ *     "auto" / ""     —— 不碰这台设备（默认）
+ *     "true" / "on" / "yes" / "1"
+ *     "false" / "off" / "no" / "0"
+ * 认不出来返回 false，由调用方报错 —— 不静默退回 auto（那样用户只会看到
+ * 「配了没用」，还得自己猜哪儿写错了，和缓动那条路一个规矩）。 */
+static bool parse_tristate(const char *value, enum vidow_tristate *out) {
+	if (strcmp(value, "auto") == 0 || value[0] == '\0') {
+		*out = VIDOW_TRI_AUTO;
+		return true;
+	}
+	if (strcmp(value, "true") == 0 || strcasecmp(value, "on") == 0 ||
+			strcasecmp(value, "yes") == 0 || strcmp(value, "1") == 0) {
+		*out = VIDOW_TRI_ON;
+		return true;
+	}
+	if (strcmp(value, "false") == 0 || strcasecmp(value, "off") == 0 ||
+			strcasecmp(value, "no") == 0 || strcmp(value, "0") == 0) {
+		*out = VIDOW_TRI_OFF;
+		return true;
+	}
+	return false;
+}
+
 /* niri 那种百分比写法："10%" → 10.0。规矩和 niri 的 Percent 解析一样：结尾必须
  * 就是 '%'，后面不许再有东西，前面得是个数（niri 源码 niri-config/src/utils.rs
  * 的 impl FromStr for Percent）。focus-follows-mouse 的 max-scroll-amount 用它。 */
@@ -917,8 +1008,30 @@ bool vidow_config_parse_color(const char *value, float out[4]) {
 	return true;
 }
 
+/* 配置真的改了之后通知谁（见 server.h 的 vidow_config_observe）。
+ *
+ * 为什么是文件级静态变量、而不是 struct vidow_config 里的一个字段：defaults()
+ * 会 memset 整个结构（配置重载先恢复默认值再跑脚本），字段会被抹掉。 */
+static void (*config_observer)(struct vidow_config *cfg, const char *key,
+		void *data);
+static void *config_observer_data;
+
+void vidow_config_observe(void (*cb)(struct vidow_config *cfg, const char *key,
+		void *data), void *data) {
+	config_observer = cb;
+	config_observer_data = data;
+}
+
+/* 通知一轮。key == NULL = 整份配置都可能变了。 */
+static void config_notify(struct vidow_config *cfg, const char *key) {
+	if (config_observer != NULL) {
+		config_observer(cfg, key, config_observer_data);
+	}
+}
+
 /* Returns false if the key is unknown or the value cannot be parsed. */
-static bool apply(struct vidow_config *cfg, const char *key, const char *value) {
+static bool apply_one(struct vidow_config *cfg, const char *key,
+		const char *value) {
 	for (size_t i = 0; i < sizeof(entries) / sizeof(entries[0]); i++) {
 		const struct entry *e = &entries[i];
 		if (strcmp(e->key, key) != 0) {
@@ -930,6 +1043,22 @@ static bool apply(struct vidow_config *cfg, const char *key, const char *value) 
 			*(int *)field = atoi(value);
 			return true;
 		case K_DOUBLE:
+			/* scroll_factor 是「乘在滚轮上的倍率」：写错一位（0.5 敲成 5）不
+			 * 报错的话，用户只会觉得「滚动变得好怪」。所以它走严格解析，
+			 * 别的键照旧 atof。 */
+			if (strcmp(e->key, "scroll_factor") == 0) {
+				const char *p = value;
+				double v = 0.0;
+				if (!parse_number(&p, &v) || !parse_at_end(p) ||
+						v < -100.0 || v > 100.0) {
+					wlr_log(WLR_ERROR, "config: scroll_factor 要是一个数"
+						"（1.0 = 不缩放、0.5 = 半速、负数反向；-100 .. 100），"
+						"给的是 '%s'", value);
+					return false;
+				}
+				*(double *)field = v;
+				return true;
+			}
 			*(double *)field = atof(value);
 			/* 回弹幅度是派生的（见 sync_easings）：改了它，三条曲线
 			 * 得跟着重算一遍。 */
@@ -943,6 +1072,39 @@ static bool apply(struct vidow_config *cfg, const char *key, const char *value) 
 				strcasecmp(value, "no") != 0 &&
 				strcasecmp(value, "off") != 0;
 			return true;
+		case K_TRISTATE:
+			if (!parse_tristate(value, (enum vidow_tristate *)field)) {
+				wlr_log(WLR_ERROR, "config: %s 只能是 auto / true / false"
+					"（auto = 不碰这台设备，用 libinput 自己的默认；"
+					"给的是 '%s'）", e->key, value);
+				return false;
+			}
+			return true;
+		case K_OPT_DOUBLE: {
+			struct vidow_opt_double *d = field;
+			if (strcmp(value, "auto") == 0 || value[0] == '\0') {
+				d->set = false;
+				d->value = 0.0;
+				return true;
+			}
+			const char *p = value;
+			double v = 0.0;
+			if (!parse_number(&p, &v) || !parse_at_end(p)) {
+				wlr_log(WLR_ERROR, "config: %s 要是一个数，或者 \"auto\""
+					"（= 不碰这台设备）；给的是 '%s'", e->key, value);
+				return false;
+			}
+			if (strcmp(e->key, "accel_speed") == 0 &&
+					(v < -1.0 || v > 1.0)) {
+				wlr_log(WLR_ERROR, "config: accel_speed 要在 -1.0 .. 1.0"
+					"（0.0 = 不加速也不减速，\"auto\" = 不碰；给的是 '%s'）",
+					value);
+				return false;
+			}
+			d->value = v;
+			d->set = true;
+			return true;
+		}
 		case K_EASING:
 			/* parse_easing 自己会报「错在哪」（见那边），这里只管收结果。 */
 			if (!parse_easing(value, (struct vidow_ease *)field)) {
@@ -986,6 +1148,34 @@ static bool apply(struct vidow_config *cfg, const char *key, const char *value) 
 					"niri 的默认）；给的是 '%s'", e->key, value);
 				return false;
 			}
+			/* libinput 那两个枚举：取值就那几样，写错一位（two-finger 敲成
+			 * two-fingered）当场报错，别等到设备上才发现没生效。 */
+			if (strcmp(e->key, "accel_profile") == 0 && value[0] != '\0' &&
+					strcmp(value, "adaptive") != 0 &&
+					strcmp(value, "flat") != 0) {
+				wlr_log(WLR_ERROR, "config: accel_profile 只能是 adaptive / "
+					"flat（或者留空 = 不碰这台设备）；给的是 '%s'",
+					value);
+				return false;
+			}
+			if (strcmp(e->key, "scroll_method") == 0 && value[0] != '\0' &&
+					strcmp(value, "no-scroll") != 0 &&
+					strcmp(value, "two-finger") != 0 &&
+					strcmp(value, "edge") != 0 &&
+					strcmp(value, "on-button-down") != 0) {
+				wlr_log(WLR_ERROR, "config: scroll_method 只能是 no-scroll / "
+					"two-finger / edge / on-button-down（niri 同名的四个值；"
+					"或者留空 = 不碰这台设备）；给的是 '%s'", value);
+				return false;
+			}
+			if (strcmp(e->key, "click_method") == 0 && value[0] != '\0' &&
+					strcmp(value, "button-areas") != 0 &&
+					strcmp(value, "clickfinger") != 0) {
+				wlr_log(WLR_ERROR, "config: click_method 只能是 button-areas / "
+					"clickfinger（或者留空 = 不碰这台设备）；给的是 '%s'",
+					value);
+				return false;
+			}
 			snprintf((char *)field, e->size, "%s", value);
 			return true;
 		case K_COLOR:
@@ -998,6 +1188,17 @@ static bool apply(struct vidow_config *cfg, const char *key, const char *value) 
 		}
 	}
 	return false;
+}
+
+/* 一个键的赋值。三条写路径（config.lua / VIDOW_<键> / IPC set-config）最后都落
+ * 到这儿，所以「改完通知谁」挂在这一层，一处盖全（见 vidow_config_observe）。
+ * 值不合法（返回 false）就不通知 —— 那种情况配置其实没变。 */
+static bool apply(struct vidow_config *cfg, const char *key, const char *value) {
+	bool ok = apply_one(cfg, key, value);
+	if (ok) {
+		config_notify(cfg, key);
+	}
+	return ok;
 }
 
 /* ------------------------------------------------------------ 文件位置 */
@@ -1155,6 +1356,13 @@ static void defaults(struct vidow_config *cfg) {
 	 * = 不限滚动量，mode 留空 = X / Y 分别判断。 */
 	cfg->focus_follows_mouse = false;
 	cfg->warp_mouse_to_focus = false;
+	/* libinput 设备配置（configs/19-input.lua）：**一个都不设**（三态 = AUTO、
+	 * accel_profile / scroll_method / click_method 留空、accel_speed 没设）——
+	 * vidow 以前一个 libinput 设置都不碰，libinput 的默认值又随设备和 udev
+	 * 规则走，所以「不配置时零变化」只能靠「不设置」本身（上面 memset 已经把
+	 * 三态清成 VIDOW_TRI_AUTO、字符串清成空串、opt_double 清成没设）。
+	 * scroll_factor 是 vidow 自己在滚轮事件上乘的倍率，1.0 = 不缩放。 */
+	cfg->scroll_factor = 1.0;
 	/* 剪贴板默认接管：X11(Xwayland) 和 Wayland 两边共用一份内容，而且不看焦点
 	 * （wlroots 自带那套只在有 X11 窗口聚焦时才同步）。每个类型读进内存的上限
 	 * 32MiB —— 「源程序退出后还能粘」靠的就是这份副本。 */
@@ -1340,6 +1548,21 @@ const char *vidow_config_get(const struct vidow_config *cfg,
 		snprintf(buf, 64, "%s", mru_layout_names[v >= 0 && v < 2 ? v : 0]);
 		break;
 	}
+	case K_TRISTATE: {
+		int v = *(const enum vidow_tristate *)field;
+		snprintf(buf, 64, "%s", v == VIDOW_TRI_ON ? "true" :
+			v == VIDOW_TRI_OFF ? "false" : "auto");
+		break;
+	}
+	case K_OPT_DOUBLE: {
+		const struct vidow_opt_double *d = field;
+		if (!d->set) {
+			snprintf(buf, 64, "auto");
+		} else {
+			snprintf(buf, 64, "%.10g", d->value);
+		}
+		break;
+	}
 	case K_STRING:
 		snprintf(buf, 64, "%s", (const char *)field);
 		break;
@@ -1401,6 +1624,28 @@ void vidow_config_log(const struct vidow_config *cfg) {
 		cfg->input_injection ? "on" : "off");
 	wlr_log(WLR_INFO, "config: cursor_shake=%s scale=%.2f（摇晃指针就放大，好找）",
 		cfg->cursor_shake ? "on" : "off", cfg->cursor_shake_scale);
+	/* 输入设备那一族：默认全是「不碰」，所以打成一行 key=值 —— 一眼看得出
+	 * 用户到底配了什么（auto / 空 = 没配，设备用自己的默认）。一次一个缓冲：
+	 * vidow_config_get 的缓冲是轮转的，同一个 printf 里连取几个会互相盖掉。 */
+	{
+		static const char *input_keys[] = {
+			"tap", "dwt", "natural_scroll", "left_handed",
+			"middle_emulation", "drag_lock", "accel_profile",
+			"accel_speed", "scroll_method", "click_method",
+		};
+		char line[256] = "";
+		for (size_t i = 0;
+				i < sizeof(input_keys) / sizeof(input_keys[0]); i++) {
+			char value[32];
+			snprintf(value, sizeof(value), "%s",
+				vidow_config_get(cfg, input_keys[i]));
+			snprintf(line + strlen(line), sizeof(line) - strlen(line),
+				"%s%s=%s", i > 0 ? " " : "", input_keys[i], value);
+		}
+		wlr_log(WLR_INFO, "config: 输入设备 %s scroll_factor=%.2f"
+			"（auto / 空 = 不碰设备，用 libinput 自己的默认）",
+			line, cfg->scroll_factor);
+	}
 	wlr_log(WLR_INFO, "config: clipboard=%s primary=%s max=%d 字节"
 		" history=%d 条/%d 字节",
 		cfg->clipboard ? "on" : "off",
@@ -1438,6 +1683,10 @@ void vidow_config_reset(struct vidow_config *cfg) {
 	vidow_config_apply_env(cfg);
 	warn_legacy_flat();
 	vidow_config_log(cfg);
+	/* 恢复默认值这一步不走单个键（defaults 直接填结构体），所以这里补一次
+	 * 「整份都变了」的通知：配置里**删掉**一行时，设备上那份设置也得跟着回到
+	 * 默认（重载是先 reset 再跑脚本，脚本没写那个键就没人通知了）。 */
+	config_notify(cfg, NULL);
 }
 
 /* ------------------------------------------------- 完整的默认配置（打印） */
@@ -1458,6 +1707,7 @@ static const struct {
 	{ 11, "portal" },
 	{ 12, "focus_follows_mouse" }, { 12, "warp_mouse_to_focus" },
 	{ 14, "mru" },
+	{ 18, "touchpad" },
 };
 
 /* 少数默认值是「跟着本机配置目录走」的（现在是 shader_dir）：照绝对路径打出来，
@@ -1491,7 +1741,8 @@ static void print_lua_value(FILE *f, const struct vidow_config *cfg,
 		v = "";
 	}
 	if (kind != K_STRING && kind != K_COLOR && kind != K_EASING &&
-			kind != K_MRU_SCOPE && kind != K_MRU_LAYOUT) {
+			kind != K_MRU_SCOPE && kind != K_MRU_LAYOUT &&
+			kind != K_TRISTATE && kind != K_OPT_DOUBLE) {
 		fputs(v, f);
 		return;
 	}

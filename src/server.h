@@ -123,6 +123,26 @@ struct vidow_ease {
 enum vidow_mru_scope { VIDOW_MRU_ALL, VIDOW_MRU_WORKSPACE, VIDOW_MRU_OUTPUT };
 enum vidow_mru_layout { VIDOW_MRU_STRIP, VIDOW_MRU_GRID };
 
+/* libinput 那些开 / 关设置的取值（configs/19-input.lua；套到设备上的地方在
+ * input.c 的 vidow_input_apply_libinput）。
+ *
+ * 为什么不是一个 bool：vidow 以前**一个 libinput 设置都不碰**，而 libinput 的
+ * 默认值是按设备 / udev 规则来的（同一台机器上，触控板的 tap 默认和鼠标的不是
+ * 一回事），照抄一个常数就等于替用户改了他没配的东西 —— 「不配置时零变化」这条
+ * 要求只能靠「不设置」本身来满足。 */
+enum vidow_tristate {
+	VIDOW_TRI_AUTO = 0, /* 没配：不动这台设备，用 libinput 自己的默认 */
+	VIDOW_TRI_ON,
+	VIDOW_TRI_OFF,
+};
+
+/* 一个「可以不设」的数（accel_speed）：同上，libinput 的默认值随设备走，而且
+ * 0.0 和「没配」不是一个意思。set == false = 不动。 */
+struct vidow_opt_double {
+	double value;
+	bool set;
+};
+
 struct vidow_config {
 	/* ---- gap ----
 	 * 一个统一值管全部：`gaps = 10` → 屏幕边 10px、窗口之间也是 10px。
@@ -279,6 +299,28 @@ struct vidow_config {
 	char focus_follows_mouse_max_scroll_amount[16];
 	bool warp_mouse_to_focus;
 	char warp_mouse_to_focus_mode[24];
+
+	/* ---- libinput 设备配置（configs/19-input.lua，套上去的地方在 input.c）----
+	 * 照 niri 的 input {} 那一节，键名转成 vidow 的 snake_case。
+	 *
+	 * 默认值 = **vidow 以前的行为**：一个 libinput 设置都不碰（三态是 AUTO、
+	 * accel_profile / scroll_method 是空串、accel_speed 没设），所以不配置时
+	 * 与以前逐字节一致。scroll_factor 是 vidow 自己乘的倍率（libinput 没这个
+	 * 接口），1.0 = 不缩放，也是以前的行为。
+	 *
+	 * 这些是**设备属性**，不是布局参数：套一次就存在设备上，所以设备热插拔、
+	 * 配置重载都要重套（见 vidow_input_apply_all 和 config.c 的观察者）。 */
+	enum vidow_tristate tap;              /* 点按 = 左键 */
+	enum vidow_tristate dwt;              /* 打字时关掉触控板 */
+	enum vidow_tristate natural_scroll;   /* 反向滚动 */
+	enum vidow_tristate left_handed;      /* 左右键对调 */
+	enum vidow_tristate middle_emulation; /* 左右键同按 = 中键 */
+	enum vidow_tristate drag_lock;        /* 点按拖拽：松手不立刻放手 */
+	char accel_profile[16];               /* "" = 不设；adaptive / flat */
+	struct vidow_opt_double accel_speed;  /* -1.0 .. 1.0；没设 = 不动 */
+	char scroll_method[24];               /* "" = 不设；no-scroll / two-finger / edge / on-button-down */
+	char click_method[24];                /* "" = 不设；button-areas / clickfinger */
+	double scroll_factor;                 /* 滚动倍率，1.0 = 不缩放 */
 
 	/* 剪贴板（见 clipboard.c）：X11(Xwayland) 与 Wayland 两边共用一份内容。
 	 * clipboard = false 就不接管，退回 wlroots 自带那套（只在有 X11 窗口聚焦
@@ -1576,6 +1618,10 @@ struct vidow_input_device {
 	struct wl_list link;      /* vidow_server.input_devices */
 	struct wl_listener destroy;
 	struct vidow_server *server;
+	/* 设备本身。拔掉时 destroy 回调会把这个条目摘掉（见 input.c 的
+	 * input_device_gone），所以只要条目还在，这个指针就是活的 —— 配置改了要
+	 * 重套 libinput 设置，靠它找回设备。 */
+	struct wlr_input_device *device;
 	char name[128];
 	char type[16];
 };
@@ -2031,6 +2077,18 @@ bool vidow_output_set_position(struct vidow_server *server,
 bool vidow_input_init(struct vidow_server *server);
 /* 退出：把输入设备的账本收掉（见 input.c）。 */
 void vidow_input_finish(struct vidow_server *server);
+/* libinput 的手柄：只在 input.c 里用（<libinput.h> 只在那儿包含，免得整个头文件
+ * 把 libinput 拖进来）。 */
+struct libinput_device;
+/* 把配置里那一族 libinput 设置（configs/19-input.lua）套到一台 libinput 设备上。
+ * 不是 libinput 的设备（虚拟键盘 / 虚拟指针）直接跳过 —— wlroots 的
+ * wlr_libinput_get_device_handle() 对它们会 assert 掉。设了才动，没设的项一概
+ * 不碰（默认值 = vidow 以前的行为）。 */
+void vidow_input_apply_libinput(const struct vidow_config *cfg,
+		struct libinput_device *dev, const char *name);
+/* 上面那个套到当前所有设备上：设备插入时（热插拔也走这条路）和配置改了时各调
+ * 一次（后者由 config.c 的观察者触发，见 vidow_input_init）。 */
+void vidow_input_apply_all(struct vidow_server *server);
 bool vidow_view_init(struct vidow_server *server);
 /* xdg_popup 的 unconstrain 只能在 popup 自己第一次 commit 之后做（wlroots 里
  * schedule_configure 有 assert(surface->initialized)），见 view.c 的注释。 */
@@ -2113,6 +2171,14 @@ bool vidow_config_set(struct vidow_config *cfg, const char *key,
 		const char *value);
 const char *vidow_config_get(const struct vidow_config *cfg,
 		const char *key);
+/* 配置真的改到了之后通知谁。三条写路径（config.lua / VIDOW_* / IPC set-config）
+ * 最后都落到 config.c 的 apply()，通知就挂在那儿，一处盖全。
+ *
+ * 现在只有 input.c 用：libinput 的设置是存在**设备**上的，配置重载 / set-config
+ * 不会自动跟过去，得重套一遍。key == NULL = 整份配置都可能变了（配置重载先把
+ * 默认值恢复一遍，那一步不走单个键）。回调里别再改配置（会递归）。 */
+void vidow_config_observe(void (*cb)(struct vidow_config *cfg, const char *key,
+		void *data), void *data);
 /* 一条曲线打回配置里能写的那种文本（`vidowmsg config easing` 看到的就是它，
  * 拷回 config.lua 能原样再读一遍）。buf 至少 64 字节。 */
 const char *vidow_ease_text(const struct vidow_ease *ease, char *buf,
