@@ -28,6 +28,8 @@
 /* 一行的最小屏幕高（占工作区的比例）。工作区多到纵向排不下时行不再继续缩，列表就
  * 比屏高 —— 滚轮才有得滚（见 vidow_overview_scroll）。 */
 #define OV_ROW_MIN_SCALE 0.25
+/* 固定行高（占可用高度的比例）：不按行数平分，见下面那段注释。 */
+#define OV_ROW_FIXED_SCALE 0.46
 /* 背景板的浓度：遮罩 alpha 的多少倍（写死，不另加配置项）。**必须跟着遮罩走**：
  * overview_dim_color 的 alpha = 0（不压暗壁纸）时它得跟着一起没有，壁纸像素原样
  * （test-overview.sh 拿壁纸像素断言这条）。 */
@@ -229,15 +231,14 @@ static void rows_scale(struct vidow_server *server) {
 		}
 	}
 
-	/* 缩放：横向要让**最宽的那条带**铺得进这一行（留 4% 边），纵向要让所有行排得
-	 * 下。行多到纵向排不下就按最小行高兜底 —— 列表比屏高，滚轮才有得滚。只有两
-	 * 列时别放大（放大反而糊），所以封顶 1.0。 */
+	/* 缩放：横向要让**最宽的那条带**铺得进这一行（留 4% 边）；纵向**行高固定**，
+	 * 不按行数平分 —— 早先是 0.92 / n_rows，工作区一多每行就被摊薄、越开越小
+	 * （用户：「overview 每个工作区的大小应该固定，现在开启多个工作区的时候一直
+	 * 缩小」）。行数超过一屏排不下就靠列表滚动看（list_scroll / rows_total）。
+	 * 只有两列时别放大（放大反而糊），所以封顶 1.0。 */
 	double fit_w = max_band > 0 ?
 		(double)work_w * 0.92 / (double)max_band : 1.0;
-	double fit_h = 0.92 / (double)ov->n_rows;
-	if (fit_h < OV_ROW_MIN_SCALE) {
-		fit_h = OV_ROW_MIN_SCALE;
-	}
+	double fit_h = OV_ROW_FIXED_SCALE;
 	double scale = fit_w < fit_h ? fit_w : fit_h;
 	if (scale > 1.0) {
 		scale = 1.0;
