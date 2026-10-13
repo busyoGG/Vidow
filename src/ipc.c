@@ -771,6 +771,9 @@ static bool cmd_focus_column(struct vidow_server *server, struct jval *req,
 		return false;
 	}
 	vidow_focus_column(server, direction);
+	/* 和 keybind.c 的 focus-column 动作一样：键盘换焦点之后把光标带过去
+	 * （warp-mouse-to-focus，默认关，没开就什么都不做）。 */
+	vidow_warp_cursor_to_focus(server);
 	jb_obj(out);
 	jb_kv_int(out, "direction", direction);
 	jb_key(out, "focused");
@@ -786,6 +789,8 @@ static bool cmd_focus_window_direction(struct vidow_server *server,
 		return false;
 	}
 	vidow_focus_window(server, direction);
+	/* 同上：也是键盘换焦点。 */
+	vidow_warp_cursor_to_focus(server);
 	jb_obj(out);
 	jb_kv_int(out, "direction", direction);
 	jb_key(out, "focused");

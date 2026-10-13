@@ -307,6 +307,28 @@ static const struct entry entries[] = {
 		"每一圈加多少倍：2 = 第一圈就到大一倍，之后每圈再 +1（2x → 3x → 4x …，"
 		"线性加不是乘）。放大走硬件光标那条路（放得下就不进截图），放不下会被降级"
 		"成软光标，所以实际倍数会先按硬件光标尺寸上限夹住" },
+	/* 焦点跟随光标 / 键盘换焦点时把光标带过去：键名 / 取值 / 默认值全照 niri 的
+	 * input 那一节（niri 的 input { focus-follows-mouse max-scroll-amount="10%" }
+	 * 和 input { warp-mouse-to-focus mode="center-xy" }）。表写法见 groups[] 里的
+	 * focus_follows_mouse / warp_mouse_to_focus。 */
+	{ "focus_follows_mouse", K_BOOL, OFF(focus_follows_mouse),
+		SZ(focus_follows_mouse), 12,
+		"指针悬停到哪个窗口就聚焦哪个（niri 的 input { focus-follows-mouse }）；"
+		"默认 false = 不跟，和以前一样" },
+	{ "focus_follows_mouse_max_scroll_amount", K_STRING,
+		OFF(focus_follows_mouse_max_scroll_amount),
+		SZ(focus_follows_mouse_max_scroll_amount), 12,
+		"悬停聚焦允许带出多少滚动：工作区宽度的百分比，照 niri 的 max-scroll-amount"
+		"（\"10%\"）；\"0%\" = 只有已经整个在屏上的窗口才跟；留空 = 不限（niri 不写"
+		"子项就是这个意思）" },
+	{ "warp_mouse_to_focus", K_BOOL, OFF(warp_mouse_to_focus),
+		SZ(warp_mouse_to_focus), 12,
+		"键盘换焦点时把光标挪到新窗口上（niri 的 input { warp-mouse-to-focus }）；"
+		"鼠标悬停聚焦不挪（光标本来就在那儿）。默认 false" },
+	{ "warp_mouse_to_focus_mode", K_STRING, OFF(warp_mouse_to_focus_mode),
+		SZ(warp_mouse_to_focus_mode), 12,
+		"光标挪到哪，照 niri 的 mode：留空 = X / Y 分别判断（只往需要的那个轴挪）；"
+		"center-xy = 光标在窗口外就挪到窗口正中；center-xy-always = 永远挪到正中" },
 
 	{ "mru_enabled",     K_BOOL,   OFF(mru_enabled),     SZ(mru_enabled), 14,
 		"Alt+Tab 的窗口切换器（niri 的 recent windows，见 src/mru.c）：关掉就不"
@@ -511,6 +533,16 @@ static const struct group_field portal_fields[] = {
 	{ "desktop",   "portal_desktop" },
 	{ "capture",   "portal_capture" },
 };
+/* niri 那两个节点的子项：niri 的 input { focus-follows-mouse max-scroll-amount=… }
+ * / input { warp-mouse-to-focus mode=… }。注意表写法**不会**顺手把开关打开
+ * （vidow 的族都这样：border = { width = 0 } 也不会开边框）—— 要开就再写一行
+ * 标量：focus_follows_mouse = true。 */
+static const struct group_field focus_follows_mouse_fields[] = {
+	{ "max_scroll_amount", "focus_follows_mouse_max_scroll_amount" },
+};
+static const struct group_field warp_mouse_to_focus_fields[] = {
+	{ "mode", "warp_mouse_to_focus_mode" },
+};
 
 #define GROUP(name, scalar, fields) \
 	{ name, scalar, fields, sizeof(fields) / sizeof(fields[0]) }
@@ -528,6 +560,10 @@ static const struct group groups[] = {
 	GROUP("xwayland",  "xwayland",       xwayland_fields),
 	GROUP("portal",    NULL,             portal_fields),
 	GROUP("mru",       "mru_enabled",    mru_fields),
+	GROUP("focus_follows_mouse", "focus_follows_mouse",
+		focus_follows_mouse_fields),
+	GROUP("warp_mouse_to_focus", "warp_mouse_to_focus",
+		warp_mouse_to_focus_fields),
 };
 
 static const struct group *group_named(const char *name) {
@@ -825,6 +861,35 @@ static bool parse_mru_layout(const char *value, enum vidow_mru_layout *out) {
 	return false;
 }
 
+/* niri 那种百分比写法："10%" → 10.0。规矩和 niri 的 Percent 解析一样：结尾必须
+ * 就是 '%'，后面不许再有东西，前面得是个数（niri 源码 niri-config/src/utils.rs
+ * 的 impl FromStr for Percent）。focus-follows-mouse 的 max-scroll-amount 用它。 */
+bool vidow_config_parse_percent(const char *text, double *out) {
+	if (text == NULL || text[0] == '\0') {
+		return false;
+	}
+	const char *pct = strchr(text, '%');
+	if (pct == NULL || pct[1] != '\0' || pct == text) {
+		return false;
+	}
+	char num[32];
+	size_t n = (size_t)(pct - text);
+	if (n >= sizeof(num)) {
+		return false;
+	}
+	memcpy(num, text, n);
+	num[n] = '\0';
+	char *end = NULL;
+	double v = strtod(num, &end);
+	if (end == NULL || *end != '\0' || v < 0.0) {
+		return false;
+	}
+	if (out != NULL) {
+		*out = v;
+	}
+	return true;
+}
+
 /* "RRGGBB" / "RRGGBBAA"（# 可有可无）→ 四个 0..1 的分量，直通 alpha（非预乘）。
  * 配置键（K_COLOR）和窗口规则的颜色作用共用这一份。 */
 bool vidow_config_parse_color(const char *value, float out[4]) {
@@ -901,6 +966,26 @@ static bool apply(struct vidow_config *cfg, const char *key, const char *value) 
 			}
 			return true;
 		case K_STRING:
+			/* 这两个键的取值是 niri 定的，写错了当场报错、该行不生效
+			 * （值保持不变，不静默退回默认 —— 和缓动那条路一个规矩）。 */
+			if (strcmp(e->key,
+					"focus_follows_mouse_max_scroll_amount") == 0 &&
+					value[0] != '\0' &&
+					!vidow_config_parse_percent(value, NULL)) {
+				wlr_log(WLR_ERROR, "config: %s 要写成百分比（照 niri 的 "
+					"max-scroll-amount，比如 \"10%%\" / \"0%%\"），"
+					"留空 = 不限；给的是 '%s'", e->key, value);
+				return false;
+			}
+			if (strcmp(e->key, "warp_mouse_to_focus_mode") == 0 &&
+					value[0] != '\0' &&
+					strcmp(value, "center-xy") != 0 &&
+					strcmp(value, "center-xy-always") != 0) {
+				wlr_log(WLR_ERROR, "config: %s 只能是 center-xy / "
+					"center-xy-always（或者留空 = X / Y 分别判断，"
+					"niri 的默认）；给的是 '%s'", e->key, value);
+				return false;
+			}
 			snprintf((char *)field, e->size, "%s", value);
 			return true;
 		case K_COLOR:
@@ -1064,6 +1149,12 @@ static void defaults(struct vidow_config *cfg) {
 
 	cfg->cursor_shake = true;
 	cfg->cursor_shake_scale = 2.0;
+	/* 焦点跟随光标 / 键盘换焦点带光标：默认**都不开**（上面 memset 已经给
+	 * false + 空串），这就是 niri 的默认行为 —— niri 的默认配置里这两个节点
+	 * 也是注释着的。空串的含义照 niri 的「不写子项」：max-scroll-amount 留空
+	 * = 不限滚动量，mode 留空 = X / Y 分别判断。 */
+	cfg->focus_follows_mouse = false;
+	cfg->warp_mouse_to_focus = false;
 	/* 剪贴板默认接管：X11(Xwayland) 和 Wayland 两边共用一份内容，而且不看焦点
 	 * （wlroots 自带那套只在有 X11 窗口聚焦时才同步）。每个类型读进内存的上限
 	 * 32MiB —— 「源程序退出后还能粘」靠的就是这份副本。 */
@@ -1365,6 +1456,7 @@ static const struct {
 	{ 7, "ipc" },
 	{ 9, "xwayland" },
 	{ 11, "portal" },
+	{ 12, "focus_follows_mouse" }, { 12, "warp_mouse_to_focus" },
 	{ 14, "mru" },
 };
 

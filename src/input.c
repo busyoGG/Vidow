@@ -340,6 +340,56 @@ static void pointer_grab_update(struct vidow_server *server) {
 	vidow_float_grab_update(server, server->cursor->x, server->cursor->y);
 }
 
+/* 焦点跟随光标（niri 的 input { focus-follows-mouse }）：指针压到哪个窗口，
+ * 哪个窗口就接键盘。**鼠标悬停是用户的显式动作**，所以全屏窗口也照跟 —— 不给
+ * 全屏开特例（那条「状态变化不许抢焦点」的规矩管的是窗口自己变全屏时的那次
+ * 状态变更，不是这里）。
+ *
+ * max-scroll-amount 那个子项照 niri 的算法：先算「聚焦它条带要滚多少」，超过
+ * 「工作区宽度的百分之几」就不聚焦（"0%" = 只有已经整个在屏上的窗口才跟）。
+ * 不写 = 不限。 */
+/* 「这一趟指针位移是键盘换焦点顺手带过去的」——vidow_warp_cursor_to_focus 用，
+ * 免得刚聚焦的窗口又被自己带过去的那一下悬停聚焦抢给浮窗。 */
+static bool warp_in_progress = false;
+
+static void focus_follows_mouse(struct vidow_server *server,
+		struct vidow_view *hit) {
+	if (warp_in_progress) {
+		/* 这一趟指针位移是「键盘换焦点顺手把光标带过去」造成的（见
+		 * vidow_warp_cursor_to_focus），不是用户在挪鼠标。 */
+		return;
+	}
+	if (!server->config.focus_follows_mouse || hit == NULL ||
+			hit == server->focused) {
+		return;
+	}
+	const char *limit = server->config.focus_follows_mouse_max_scroll_amount;
+	if (limit[0] != '\0') {
+		double pct = 0.0;
+		if (vidow_config_parse_percent(limit, &pct)) {
+			struct vidow_output *output = hit->column != NULL &&
+				hit->column->output != NULL ?
+				vidow_output_lookup(server, hit->column->output) : NULL;
+			if (output != NULL) {
+				struct wlr_box work = vidow_work_area(server,
+					output->wlr_output);
+				double allowed = work.width * pct / 100.0;
+				double amount =
+					vidow_view_scroll_amount_to_activate(server, hit);
+				if (amount > allowed) {
+					wlr_log(WLR_DEBUG, "悬停聚焦: %s 要滚 %.0fpx"
+						"（限 %s），这次不跟",
+						vidow_view_title(hit) != NULL ?
+							vidow_view_title(hit) : "(无题)",
+						amount, limit);
+					return;
+				}
+			}
+		}
+	}
+	vidow_focus_view(hit);
+}
+
 void vidow_pointer_motion(struct vidow_server *server, uint32_t time_msec) {
 	/* 有人在录「光标不进画面」的流（metadata / embedded）：光标的位置就是那一帧
 	 * 的内容，指针一动就得推一帧（否则录进去的光标停在上一帧 —— 静止的窗口上
@@ -391,6 +441,12 @@ void vidow_pointer_motion(struct vidow_server *server, uint32_t time_msec) {
 	/* 约束跟着指针焦点走：指针底下的表面 == 约束那个表面才生效，移开就解除。 */
 	vidow_pointer_constraint_focus(server, surface);
 
+	/* 焦点跟随光标（默认关）：压在哪个窗口上就聚焦哪个。放在命中测试之后、
+	 * 指针焦点通知之前 —— 悬停聚焦只动键盘焦点，指针焦点还是按老样子发给
+	 * 客户端。拖着东西的时候上面早就 return 了（拖拽中不换焦点，和 niri 的
+	 * 「指针被抓着就不跟」一个意思）。 */
+	focus_follows_mouse(server, hit);
+
 	if (hit != NULL && hit->kind == VIDOW_VIEW_X11) {
 		wlr_log(WLR_DEBUG, "x11: 指针 %.0f,%.0f -> %s 局部 %.0f,%.0f",
 			server->cursor->x, server->cursor->y,
@@ -406,6 +462,67 @@ void vidow_pointer_motion(struct vidow_server *server, uint32_t time_msec) {
 		vidow_cursor_fx_default_cursor(server);
 		wlr_seat_pointer_notify_clear_focus(server->seat);
 	}
+}
+
+/* 键盘换焦点之后把光标挪到新窗口上（niri 的 input { warp-mouse-to-focus }）。
+ * 只在**键盘 / IPC 动作**那条路调（见 keybind.c）—— 鼠标悬停聚焦不调：光标
+ * 本来就在窗口里，niri 也是这么分的。
+ *
+ * 三种落点照 niri 的 mode 同名同义：
+ *   留空              X / Y 分别判断：哪个轴在窗口外就挪哪个轴，另一个轴不动
+ *   center-xy         光标整个在窗口外才挪，挪就挪到窗口正中
+ *   center-xy-always  永远挪到窗口正中
+ *
+ * wlr_cursor_warp 只挪位置、不发事件（wlroots 的 cursor_warp_unchecked），所以
+ * 和注入那条路一样显式再走一遍 vidow_pointer_motion（指针焦点 / enter / motion
+ * 全在里面），最后自己补一个 wl_pointer.frame —— 为什么要补见
+ * vidow_inject_pointer_move 那段注释。 */
+void vidow_warp_cursor_to_focus(struct vidow_server *server) {
+	if (!server->config.warp_mouse_to_focus || server->focused == NULL ||
+			server->cursor == NULL) {
+		return;
+	}
+	struct wlr_box g = server->focused->geom;
+	if (g.width < 1 || g.height < 1) {
+		return;
+	}
+	const char *mode = server->config.warp_mouse_to_focus_mode;
+	double cx = g.x + g.width / 2.0;
+	double cy = g.y + g.height / 2.0;
+	double x = server->cursor->x;
+	double y = server->cursor->y;
+	bool inside_x = x >= g.x && x < g.x + g.width;
+	bool inside_y = y >= g.y && y < g.y + g.height;
+	if (mode[0] == '\0') {
+		if (!inside_x) {
+			x = cx;
+		}
+		if (!inside_y) {
+			y = cy;
+		}
+	} else if (strcmp(mode, "center-xy") == 0) {
+		if (!inside_x || !inside_y) {
+			x = cx;
+			y = cy;
+		}
+	} else { /* center-xy-always */
+		x = cx;
+		y = cy;
+	}
+	if (x == server->cursor->x && y == server->cursor->y) {
+		return;
+	}
+	if (!wlr_cursor_warp(server->cursor, NULL, x, y)) {
+		return;
+	}
+	/* 挪光标这一下自己会经过 vidow_pointer_motion，而那里会跑焦点跟随光标 ——
+	 * 光标底下要是压着一个浮窗（焦点窗口被它盖住一角），那一下就会把焦点从
+	 * 刚聚焦的窗口抢到浮窗上。这里明确：这一趟是「带光标过去」，不是「用户
+	 * 把鼠标挪过去」，别让悬停聚焦插手。 */
+	warp_in_progress = true;
+	vidow_pointer_motion(server, (uint32_t)(vidow_now_ns() / 1000000LL));
+	warp_in_progress = false;
+	wlr_seat_pointer_notify_frame(server->seat);
 }
 
 static void server_cursor_motion(struct wl_listener *listener, void *data) {

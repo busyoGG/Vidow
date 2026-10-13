@@ -882,6 +882,8 @@ bool vidow_action_run(struct vidow_server *server, const char *action) {
 		int dir = 0;
 		if (parse_direction(arg, &dir)) {
 			vidow_focus_column(server, dir);
+			/* 键盘换焦点之后把光标带过去（warp-mouse-to-focus，默认关）。 */
+			vidow_warp_cursor_to_focus(server);
 			return true;
 		}
 		wlr_log(WLR_ERROR, "focus 的参数是列方向（focus -1 / focus 1 / "
@@ -909,6 +911,9 @@ bool vidow_action_run(struct vidow_server *server, const char *action) {
 		} else {
 			vidow_move_window(server, dir);
 		}
+		/* move-* 不换焦点，所以这一下在它们身上是空转；focus-* 才真的挪光标
+		 * （warp-mouse-to-focus，默认关）。 */
+		vidow_warp_cursor_to_focus(server);
 		log_action(action, "焦点 / 窗口挪一格");
 		return true;
 	}

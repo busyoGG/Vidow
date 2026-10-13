@@ -259,6 +259,27 @@ struct vidow_config {
 	bool cursor_shake;
 	double cursor_shake_scale;
 
+	/* 焦点跟随光标 / 键盘换焦点时把光标带过去（照 niri 的 input 那一节，
+	 * 键名 / 取值 / 默认值都照它）。
+	 *
+	 * focus_follows_mouse = niri 的 input { focus-follows-mouse }：指针压到
+	 * 哪个窗口，哪个窗口就接键盘。默认 false（niri 不写这个节点就是不跟）。
+	 * focus_follows_mouse_max_scroll_amount = 那个节点的 max-scroll-amount
+	 * 子项：聚焦会让条带滚动多少才算「能跟」。写 "10%" 这种百分比（工作区
+	 * 宽度的百分之几），"0%" = 只有已经整个在屏上的窗口才跟，留空 = 不限
+	 * （niri 不写子项就是这个意思）。值按原样存着，`vidowmsg config` 打出来
+	 * 能原样抄回配置。
+	 *
+	 * warp_mouse_to_focus = niri 的 input { warp-mouse-to-focus }：**键盘**
+	 * 换焦点时把光标挪到新窗口上（鼠标悬停聚焦不挪 —— 光标本来就在那儿）。
+	 * 默认 false。warp_mouse_to_focus_mode 是它的 mode 子项：留空 = niri 的
+	 * 默认「X / Y 分别判断」（只往需要的那个轴挪），"center-xy" /
+	 * "center-xy-always" 和 niri 同名同义。 */
+	bool focus_follows_mouse;
+	char focus_follows_mouse_max_scroll_amount[16];
+	bool warp_mouse_to_focus;
+	char warp_mouse_to_focus_mode[24];
+
 	/* 剪贴板（见 clipboard.c）：X11(Xwayland) 与 Wayland 两边共用一份内容。
 	 * clipboard = false 就不接管，退回 wlroots 自带那套（只在有 X11 窗口聚焦
 	 * 时才同步）；clipboard_primary 决定选区（PRIMARY）要不要一起同步；
@@ -2078,6 +2099,10 @@ void vidow_config_log(const struct vidow_config *cfg);
 /* "RRGGBB" / "RRGGBBAA"（# 可有可无）→ 四个 0..1 分量。配置键和窗口规则的颜色
  * 作用共用这一份。 */
 bool vidow_config_parse_color(const char *value, float out[4]);
+/* niri 那种百分比写法："10%" → 10.0（要求结尾就是 '%'，后面不许再有东西 ——
+ * 和 niri 的 Percent 解析同一套规矩）。用于 focus-follows-mouse 的
+ * max-scroll-amount。 */
+bool vidow_config_parse_percent(const char *text, double *out);
 bool vidow_config_has(const char *key);
 bool vidow_config_set(struct vidow_config *cfg, const char *key,
 		const char *value);
@@ -2337,6 +2362,9 @@ void vidow_pointer_button(struct vidow_server *server, uint32_t button,
 		bool pressed, uint32_t time_msec, bool force_mod);
 /* 指针移动（测试注入也走这里）。 */
 void vidow_pointer_motion(struct vidow_server *server, uint32_t time_msec);
+/* 键盘换焦点之后把光标挪到焦点窗口上（niri 的 warp-mouse-to-focus）。没开这个
+ * 开关就什么都不做；光标本来就在窗口里就也不动（center-xy-always 除外）。 */
+void vidow_warp_cursor_to_focus(struct vidow_server *server);
 /* 滚轮。真实滚轮和 IPC 注入走同一条路（overview 平移 / Mod+滚轮换列 / 转发给
  * 客户端），所以直接收一个 wlr_pointer_axis_event 的字段而不是拆开的 dx/dy。 */
 void vidow_pointer_axis(struct vidow_server *server,
@@ -2955,6 +2983,11 @@ struct vidow_view *vidow_view_at(struct vidow_server *server,
 		double lx, double ly, struct wlr_surface **surface,
 		double *sx, double *sy);
 void vidow_focus_view(struct vidow_view *view);
+/* 「聚焦这个窗口会让条带滚多少像素」—— 和 arrange 的 Pass 2（把焦点列滚回可见
+ * 区）算的是同一件事。focus-follows-mouse 的 max-scroll-amount 拿它跟阈值比
+ * （见 input.c 的 focus_follows_mouse）。 */
+double vidow_view_scroll_amount_to_activate(struct vidow_server *server,
+		struct vidow_view *view);
 /* 层级收口：平铺 < 浮动 < 全屏（浮动永远压在平铺之上，浮窗之间靠点击换层级）。
  * top 非空 = 「这一个刚被抬起来」，它落在自己那一组的最上面；没人站错队时一个
  * 节点都不碰（见 src/view.c）。 */

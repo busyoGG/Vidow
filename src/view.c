@@ -2901,6 +2901,48 @@ void vidow_restack(struct vidow_server *server, struct vidow_view *top) {
 
 /* --------------------------------------------------------------- focus */
 
+/* 「聚焦这个窗口会让条带滚多少像素」—— niri 的 scroll_amount_to_activate。
+ * 算的是和 arrange 的 Pass 2（把焦点列滚回可见区）**同一件事**：现在视口在哪、
+ * 聚焦它以后视口该在哪，两者差多少就滚多少。只是这里不真滚，只把数报出去 ——
+ * focus-follows-mouse 的 max-scroll-amount 拿它跟阈值比（见 input.c）。
+ *
+ * 浮窗的「跟随式」子窗（FLOAT_FOLLOW）和 Pass 2 一样跟着父窗口算：光标停在
+ * 对话框上时，滚动的是它爹那条列。 */
+double vidow_view_scroll_amount_to_activate(struct vidow_server *server,
+		struct vidow_view *view) {
+	if (view == NULL) {
+		return 0.0;
+	}
+	if (view->float_mode == VIDOW_FLOAT_FOLLOW && view->parent != NULL) {
+		view = view->parent;
+	}
+	struct vidow_column *col = view->column;
+	if (col == NULL || col->output == NULL) {
+		return 0.0;
+	}
+	struct vidow_output *output = vidow_output_lookup(server, col->output);
+	if (output == NULL) {
+		return 0.0;
+	}
+	struct wlr_box work = vidow_work_area(server, output->wlr_output);
+	if (work.width < 1) {
+		return 0.0;
+	}
+	double viewport = output->viewport_x;
+	/* 全屏的那条列在条带上占一整屏 —— 和 Pass 2 同一个算法（不是给全屏开的
+	 * 特例：列就是列，只是它的宽度就是一屏）。 */
+	int cw = column_has_fullscreen(col) ? work.width : col->width;
+	double target = viewport;
+	double right = col->offset + cw;
+	if (right > viewport + work.width) {
+		target = right - work.width;
+	}
+	if (col->offset < target) {
+		target = col->offset;
+	}
+	return target > viewport ? target - viewport : viewport - target;
+}
+
 void vidow_focus_view(struct vidow_view *view) {
 	struct vidow_server *server = view->server;
 	struct wlr_seat *seat = server->seat;

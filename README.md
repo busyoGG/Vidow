@@ -5263,6 +5263,54 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
      - 未覆盖：`vidow_view_join_layout()` 重新入列时**落在条带末尾**这条语义本身没动（它只在这条路上被误触发）——
        如果以后有别的路把窗口摘出布局再放回来，还是会落在末尾。要改的话是另一个决定（入列位置记在哪儿）。
 
+256. **焦点跟随光标 + 键盘换焦点把光标带过去（niri 的 `focus-follows-mouse` / `warp-mouse-to-focus`）**（用户要求照 niri 补这两个开关；键名 / 取值 / 默认值都照 niri 的 `input` 那一节抄）
+
+     - niri 那边是 `input { focus-follows-mouse }`（布尔，也可以写成带 `max-scroll-amount` 子项的表）和
+       `input { warp-mouse-to-focus }`（布尔，也可以写成带 `mode` 子项的表）—— 出处是 niri 配置文档的 `input` 一节
+       （`niri-config` 的 `Input`：`focus-follows-mouse` / `max-scroll-amount` / `warp-mouse-to-focus` / `mode`）。
+     - vidow 里一一对应，**默认都不开**（`false` / 空串）—— 也就是现有行为一个字没变（niri 的默认配置里这两个节点
+       也是注释着的）：
+
+       ```lua
+       focus_follows_mouse = true                       -- 指针悬停到哪个窗口就聚焦哪个（默认 false = 不跟）
+       focus_follows_mouse_max_scroll_amount = "10%"    -- 悬停聚焦允许带出多少滚动（默认 "" = 不限）
+       warp_mouse_to_focus = true                       -- 键盘换焦点时把光标挪到新窗口上（默认 false）
+       warp_mouse_to_focus_mode = "center-xy"           -- 光标挪到哪（默认 "" = X / Y 分别判断）
+       ```
+       族写法（照 niri 的节点样子，都能当平铺键的另一种写法）：`focus_follows_mouse = { max_scroll_amount = "10%" }`、
+       `warp_mouse_to_focus = { mode = "center-xy" }`。和 vidow 别的族一个规矩，**表写法不会顺手把开关打开**
+       （`border = { width = 0 }` 也不开边框），要开就再写一行标量。
+     - 取值就是 niri 那套：`max_scroll_amount` 只认百分比写法（结尾必须就是 `%`，`"10%"` = 工作区宽度的 10%），
+       `"0%"` = 只有已经整个在屏上的窗口才跟，留空 = 不限；`mode` 只认 `center-xy` / `center-xy-always`，
+       留空 = X / Y 分别判断（只往需要的那个轴挪，光标本来就在窗口里就整个不动）。写错当场 WLR_ERROR +
+       该行不生效（值保持不变，不静默退回默认）。两个值 `vidowmsg config <键>` 都能原样读回来。
+     - 鼠标悬停聚焦**不给全屏窗口开特例**：全屏也是窗口，指针压上去照跟（「状态变化不许抢焦点」那条规矩管的是
+       窗口自己变全屏时的那次状态变更，不是这里）。键盘换焦点带光标只走**键盘 / 动作**那条路（keybind.c 的动作 +
+       MRU 切换器 + IPC 的 `focus-column` / `focus-window-direction`）；悬停聚焦不带光标 —— 光标本来就在窗口里。
+     - 验证（headless 1280x720 一块屏，两扇窗 A=`6,6,631,708` / B=`643,6,631,708`，开窗后焦点在 B；用 `wev`
+       当窗口是因为它的 surface 填满窗口，命中测试才覆盖整扇窗 —— `build/frames` 的 surface 只有 320x200 被拉满，
+       只有左上角那块能点中）：
+       - `focus_follows_mouse = true`：`move-cursor 321 360`（A 中心）→ `vidowmsg focused` = A；再 `move-cursor
+         958 360`（B 中心）→ 焦点回 B。跟了。
+       - 默认（不开）：光标初始 `100,100` 就压在 A 上，焦点仍是 B；悬停 A 中心、再悬停 B 中心，焦点一直是 B。
+         没变。
+       - `warp_mouse_to_focus = true`：光标先放 B 中心 `958.5,360`，`focus-column left` → 焦点 A、`vidowmsg cursor`
+         = `321.5,360`（= A 的窗口中心）；`focus-column right` → 焦点 B、光标 = `958.5,360`（= B 的中心）。
+         `action "focus-column left"`（键位走的那条路）给的是同一个值。
+       - `warp_mouse_to_focus_mode = "center-xy-always"`：光标放在 A 里的 `26,26`，再 `focus-column left`
+         （A 已经最左、焦点没变）→ 光标照样挪到 A 中心 `321.5,360`；默认模式（留空）这一下光标停在 `26,26` 不动。
+       - 全屏：B `toggle-fullscreen` 后 `0,0,1280,720`，`focus-column left` 聚焦 A（B 滚到 `637,0`，右半屏还在屏上），
+         悬停 `1037,360`（在 B 的可见区、A 之外）→ 焦点回到 B。全屏照跟，没特例。
+     - 顺手补的一处：`vidowmsg focus-column` / `focus-window-direction` 这两条 IPC 命令原来直接调
+       `vidow_focus_column()` / `vidow_focus_window()`，没经过 keybind.c 那条动作路，所以「键盘换焦点带光标」在
+       IPC 这个入口上不生效（`vidowmsg action "focus-column left"` 生效、`vidowmsg focus-column left` 不生效）。
+       在 ipc.c 那两个命令里各补一行 `vidow_warp_cursor_to_focus()`，两个入口就一致了 —— 开关没开时它第一行就
+       return，零行为变化。
+     - 回归：`test-config.sh` / `test-ipc.sh` 改前改后都全过；`test-defaultconfig.sh` 补文档**之前是红的**
+       （4 个平铺键 + 族项 `max_scroll_amount` 没写进 config.example），把 `13-cursor.lua` 按
+       `--default-config 13-cursor.lua` 重新生成、并给 `section_groups[]` 补上这两族的表写法提示之后全过。
+
+
 247. **缓动曲线能自己写了：自定义三次贝塞尔 + 回弹幅度可调**（用户：「回弹幅度应该允许配置 回弹的时间也允许配置 类似 hyprland 那样」）
 
      - 时间本来就能配（`window_move_ms` / `workspace_switch_ms` / `column_width_ms`），缺的是
