@@ -259,6 +259,21 @@ else:
     print(int(xs.max() - xs.min() + 1), int(ys.max() - ys.min() + 1))
 PY
 }
+# 这块图里有多少「非底色」像素（底色 = 该区域出现最多的那个颜色）：
+# 量工具条按钮上有没有**字形**（纯色按钮 = 0），以及整条有没有内容。
+inkpix() {
+	python3 - "$1" <<'PY'
+import sys
+from collections import Counter
+from PIL import Image
+import numpy as np
+a = np.asarray(Image.open(sys.argv[1]).convert('RGB'), dtype=np.int16)
+c = Counter(map(tuple, a.reshape(-1, 3)))
+base = np.array(c.most_common(1)[0][0], dtype=np.int16)
+d = (np.abs(a - base).sum(axis=2) > 24)
+print("%d/%d" % (int(d.sum()), a.shape[0] * a.shape[1]))
+PY
+}
 shot() {  # $1 输出文件，$2..$5 = x y w h（grim 的几何是 "x,y WxH"！）
 	local sz
 	if [ "${4:-0}" -le 0 ] || [ "${5:-0}" -le 0 ]; then
@@ -666,6 +681,35 @@ TL=$(since "$MARK" | grep -a 'mini toolbar: w1 露出' | tail -1)
 echo "  ${TL:-(工具条没露出)}"
 if [ -n "$TL" ]; then
 	pass "悬停迷你小窗 → 工具条露出"
+	# ---- 工具条**有内容**（每个按钮上真画了字形）且**横向跟小窗居中对齐** ----
+	# 用户报的「没有内容只有四个格子且位置偏左」：以前四个按钮就是四个纯色
+	# wlr_scene_rect（实测每个按钮 0/884 个非底色像素 = 空方框），整条 x = 窗口
+	# 左边（迷你盒 353 宽 / 工具条 151 宽 → 比窗口中心偏左 101px）。
+	TBX=$(echo "$TL" | sed -n 's/.*整块 \([0-9]*\),\([0-9]*\) \([0-9]*\)x\([0-9]*\).*/\1/p')
+	TBW=$(echo "$TL" | sed -n 's/.*整块 \([0-9]*\),\([0-9]*\) \([0-9]*\)x\([0-9]*\).*/\3/p')
+	if [ -n "$TBX" ] && [ -n "$TBW" ]; then
+		DX=$((TBX + TBW / 2 - (IX + IW / 2)))
+		echo "  工具条 $TBX + $TBW/2 中心 $((TBX + TBW / 2))，窗口中心 $((IX + IW / 2))，差 $DX px"
+		[ "${DX#-}" -le 2 ] &&
+			pass "工具条横向跟小窗居中（差 $DX px ≤ 2）" ||
+			fail "工具条没跟小窗居中：偏 $DX px（窗口 $IX,$IY ${IW}x${IH}）"
+		BAD=0
+		GBOX=""
+		for grp in "放大" "收图标" "还原成列" "关闭"; do
+			BX=$(echo "$TL" | sed -n "s/.*$grp \([0-9]*\),\([0-9]*\).*/\1/p")
+			BY=$(echo "$TL" | sed -n "s/.*$grp \([0-9]*\),\([0-9]*\).*/\2/p")
+			[ -z "$BX" ] && continue
+			if shot "$RUNDIR/tb-$grp.ppm" "$BX" "$BY" 34 26; then
+				N=$(inkpix "$RUNDIR/tb-$grp.ppm")
+				GBOX="$GBOX $grp=$N"
+				[ "${N%%/*}" -ge 40 ] || BAD=$((BAD + 1))
+			fi
+		done
+		echo "  四个按钮上的字形像素（非底色/整块）$GBOX"
+		[ "$BAD" = "0" ] &&
+			pass "四个按钮上都有字形（每个 ≥ 40 个字形像素 —— 不是四个空格子）" ||
+			fail "有 $BAD 个按钮是空的（没有字形）"
+	fi
 	# 日志里四个按钮的左上角：放大 / 收图标 / 还原成列 / 关闭（每个 34x26）
 	BX=$(echo "$TL" | sed -n 's/.*还原成列 \([0-9]*\),\([0-9]*\).*/\1/p')
 	BY=$(echo "$TL" | sed -n 's/.*还原成列 \([0-9]*\),\([0-9]*\).*/\2/p')
@@ -682,6 +726,74 @@ if [ -n "$TL" ]; then
 else
 	fail "工具条没露出来"
 fi
+
+# ================================================================ S4：自由小窗拖拽
+mark "S4 自由小窗拖拽：Mod+左键 interactive-move（跟手 + 尺寸不许跳回原生）"
+# 用户原话：「自由小窗的时候没有拖拽的方式……我试图用 win+鼠标 拖拽自由小窗，
+# 此时小窗的大小会变成原始大小且拖不动」。两个现象、两个根因：
+#   ① 拖不动：float.c 的 vidow_float_grab_update() 只写 float_geom.x/y，而小窗的
+#      位置语义是比例锚点（vidow_mini_resolve_geom 是唯一换算点）—— 下一次 arrange
+#      按锚点把位置算回来，整段拖拽盒子的 x/y 逐字段不变（实测 1668,203 → 1668,203，
+#      期望 1868,343）；
+#   ② 尺寸跳回原生：拖动会起果冻（jelly），而 jelly 的落点换算 `dst = buf/fx->scale`
+#      里 fx->scale 已经含了 contain 系数（view_anim_bake 传的是 view_scale*fx_ov），
+#      被除了第二遍 —— 内容的屏幕脚印从 272x304 涨到 641x507（≈ 原生 665x740）。
+unmini; sleep 0.7
+# 挪到有壁纸的那块屏（wall.py 只盖它所在那块屏，非背景像素的判据要它当底）。
+./build/vidowmsg move-window-to-output HEADLESS-2 --id "$ID" >/dev/null 2>&1
+sleep 0.6
+[ "$(winf w1 float)" != "True" ] &&
+	{ ./build/vidowmsg toggle-floating --id "$ID" >/dev/null; sleep 0.6; }
+set_state free; sleep 1.2
+read -r X Y W H <<< "$(echo "$(geom)" | tr 'x,' ' ')"
+SW=$(winf w1 sw); SH=$(winf w1 sh)
+echo "  自由小窗 $X,$Y ${W}x${H}（原生 ${SW}x${SH}，屏 $(winf w1 out)）；Mod+左键往左下拖 -60,+40"
+FB="0 0"
+shot "$RUNDIR/free-before.ppm" "$X" "$Y" "$W" "$H" &&
+	FB=$(nonbgbox "$RUNDIR/free-before.ppm")
+echo "  拖前盒内内容脚印：$FB"
+CX=$((X + W / 2)); CY=$((Y + H / 2))
+MARK=$(logmark)
+act "pointer-motion $CX $CY" 0.25
+act "pointer-button left press mod" 0.25
+act "pointer-motion $((CX - 30)) $((CY + 20))" 0.3
+act "pointer-motion $((CX - 60)) $((CY + 40))" 0.3
+read -r MX MY MW MH <<< "$(echo "$(geom)" | tr 'x,' ' ')"
+echo "  拖到一半：盒 = $MX,$MY ${MW}x${MH}（期望 ≈ $((X - 60)),$((Y + 40))）"
+# 拖拽中：盒里的内容尺寸**不许变**（果冻那条路会把内容放大回原生大小）
+if shot "$RUNDIR/free-mid.ppm" "$MX" "$MY" "$MW" "$MH"; then
+	FM=$(nonbgbox "$RUNDIR/free-mid.ppm")
+	echo "  拖拽中盒内内容脚印：$FM（拖前 $FB）"
+	python3 - "$FB" "$FM" <<'PY'
+import sys
+f = [int(v) for v in sys.argv[1].split()]
+m = [int(v) for v in sys.argv[2].split()]
+d = max(abs(m[0] - f[0]), abs(m[1] - f[1]))
+print("  PASS  拖拽中内容尺寸不变（%dx%d → %dx%d，差 %d px ≤ 10）" %
+      (f[0], f[1], m[0], m[1], d) if d <= 10 else
+      "  FAIL  一拖内容就变大了：%dx%d → %dx%d（差 %d px）" %
+      (f[0], f[1], m[0], m[1], d))
+sys.exit(0 if d <= 10 else 1)
+PY
+	[ $? -eq 0 ] || FAILED=1
+else
+	fail "拖拽中盒内截图失败"
+fi
+act "pointer-button left release mod" 1.2
+read -r X2 Y2 W2 H2 <<< "$(echo "$(geom)" | tr 'x,' ' ')"
+echo "  松手后：盒 = $X2,$Y2 ${W2}x${H2}"
+DX=$((X2 - X + 60)); DY=$((Y2 - Y - 40))
+[ "${DX#-}" -le 4 ] && [ "${DY#-}" -le 4 ] &&
+	pass "盒子跟着光标走了（$X,$Y → $X2,$Y2 = 位移 +$((X2 - X)),+$((Y2 - Y))）" ||
+	fail "拖了没动 / 动得不对：$X,$Y → $X2,$Y2（期望 +(-60),+(40)，差 $DX,$DY）"
+[ "$W2" = "$W" ] && [ "$H2" = "$H" ] &&
+	pass "拖完盒子尺寸没变（${W2}x${H2} = 拖前的 ${W}x${H}）" ||
+	fail "拖完尺寸变了：${W}x${H} → ${W2}x${H2}"
+[ "$(winf w1 mini)" = "free" ] && pass "拖完形态仍是 free" ||
+	fail "拖完形态变了：$(winf w1 mini)"
+# 收尾：挪回屏 1（下面 S5 甩出那条判据的前提是「左边外侧没有相邻输出」= 屏 1）。
+./build/vidowmsg move-window-to-output HEADLESS-1 --id "$ID" >/dev/null 2>&1
+sleep 0.6
 
 # ================================================================ S5：出帧分叉
 mark "S5 force_render 关：图标与预览都静止、客户端 0 新帧"
@@ -851,6 +963,62 @@ echo "  $LAST"
 echo "$LAST" | grep -qE "偏移 0\.0,-?0\.0" && pass "转换结束偏移归零（画在 geom 上）" ||
 	fail "最后偏移没归零"
 echo "$LAST" | grep -q "缩放 1.000" && pass "转换结束缩放归 1" || fail "最后缩放不是 1"
+
+# ---- 退出小窗那一瞬间：起点必须是「上一帧画在哪」，不许闪原生尺寸 ----
+# 用户原话：「退出小窗（还原成列 / 关闭）的一瞬间显示原始大小」。根因：起点是从
+# **盒面积**推的 sqrt(area_from/area_to)，只在内容正好填满盒子时才等于屏上真正画的
+# contain 系数。判据两条（都只读日志 + geometry，不依赖时序）：
+#   ① 起点缩放 ≈ min(盒宽/原生宽, 盒高/原生高)（自由小窗那趟推出来是 0.602、
+#      真值是 0.426，差 41%；图标那趟 0.097 vs 0.087）；
+#   ② 起点位置是**内容**原点（盒原点 + contain 居中偏移），不是盒原点。
+# ②的容差给 ±16：实现里的居中用的是「可见窗口」几何，测试只能从 surface 尺寸算
+# （GTK CSD 那圈留白差 ~9px）。
+check_exit_from() {  # $1 = 退出前的形态
+	local st="$1" bx by bw bh sw sh ms cx line sc sx0
+	set_state "$st"; sleep 1.3
+	read -r bx by bw bh <<< "$(echo "$(geom)" | tr 'x,' ' ')"
+	sw=$(winf w1 sw); sh=$(winf w1 sh)
+	read -r ms cx < <(python3 - "$bw" "$bh" "$sw" "$sh" <<'PY'
+import sys
+bw, bh, sw, sh = (float(v) for v in sys.argv[1:5])
+ms = min(bw / sw, bh / sh)
+print("%.4f %d" % (ms, round((bw - sw * ms) / 2.0)))
+PY
+)
+	MARK=$(logmark)
+	unmini; sleep 1.3
+	line=$(since "$MARK" | grep -a 'mini: 过渡动画' | tail -1)
+	sc=$(echo "$line" | sed -n 's/.*缩放 \([0-9.]*\) → 1.*/\1/p')
+	sx0=$(echo "$line" | sed -n 's/.*起点 \([0-9-]*\),\([0-9-]*\).*/\1/p')
+	echo "  $st→none：盒 $bx,$by ${bw}x${bh} / 原生 ${sw}x${sh}"
+	echo "    期望起点缩放 $ms（contain）、起点 x ≈ $((bx + cx))（内容原点）；日志：$line"
+	python3 - "$st" "$sc" "$ms" "$sx0" "$bx" "$cx" <<'PY'
+import sys
+st, sc, ms, sx0, bx, cx = sys.argv[1], sys.argv[2], float(sys.argv[3]), \
+    sys.argv[4], int(sys.argv[5]), int(sys.argv[6])
+try:
+    scf = float(sc)
+except ValueError:
+    print("  FAIL  %s→none：日志里没有「缩放 X → 1」（%s）" % (st, sys.argv[4])); sys.exit(1)
+d = abs(scf - ms)
+print("  PASS  %s→none：起点缩放 %.4f = 上一帧的 contain 系数（差 %.4f ≤ 0.005）"
+      % (st, scf, d) if d <= 0.005 else
+      "  FAIL  %s→none：起点缩放 %.4f ≠ 上一帧的 %.4f（差 %.4f）" % (st, scf, ms, d))
+try:
+    sx = int(sx0)
+except ValueError:
+    print("  FAIL  %s→none：日志里没有起点坐标" % st); sys.exit(1)
+d2 = abs(sx - (bx + cx))
+print("  PASS  %s→none：起点在内容原点（x=%d，期望 %d，差 %d ≤ 16）"
+      % (st, sx, bx + cx, d2) if d2 <= 16 else
+      "  FAIL  %s→none：起点在盒原点不是内容原点（x=%d，期望 %d，差 %d）"
+      % (st, sx, bx + cx, d2))
+sys.exit(0 if (d <= 0.005 and d2 <= 16) else 1)
+PY
+	[ $? -eq 0 ] || FAILED=1
+}
+check_exit_from free
+check_exit_from icon
 
 # ================================================================ S5：甩出
 mark "S5 惯性甩出：速度阈值 / 不过冲 / <4px 快甩的逃生口"
@@ -1253,6 +1421,57 @@ print("  PASS  scale 2 下盒心坐标换算正确（客户端收到 = 原生对
 sys.exit(0 if ok else 1)
 PY
 [ $? -eq 0 ] || FAILED=1
+
+# ================================================================ 关闭小窗
+mark "S5 关闭小窗：关闭动画不许闪原生尺寸"
+# 用户原话：「关闭小窗的时候也会显示原始大小」。根因：view_snapshot_close() 不管
+# view->mini —— 快照是原生缓冲，画布 / 快照节点的尺寸也照原生算（实测关一个
+# 504x315 的自由小窗：画布 649x724 = 原生 625x700 + 装饰留白），于是关闭动画第一帧
+# 直接按原生大小铺开（内容脚印 637x521，静止时只有 272x304）。修后画布 290x322、
+# 内容脚印 280x311。**另起一个客户端**跑这一节（w1 后面 S7 还要用），跑完让它走。
+python3 "$RUNDIR/probe.py" closewin > "$RUNDIR/close.log" 2>&1 &
+CLIENT_PIDS="$CLIENT_PIDS $!"
+sleep 2.0
+CID=$(winf closewin id)
+if [ -z "$CID" ]; then
+	fail "另起的客户端 closewin 没起来"
+else
+	echo "  closewin id = $CID"
+	./build/vidowmsg move-window-to-output HEADLESS-2 --id "$CID" >/dev/null 2>&1
+	sleep 0.6
+	./build/vidowmsg set-mini-state --id "$CID" --state free >/dev/null 2>&1
+	sleep 1.3
+	read -r BX BY BW BH <<< "$(echo "$(winf closewin x),$(winf closewin y) $(winf closewin w)x$(winf closewin h)" | tr 'x,' ' ')"
+	echo "  自由小窗 $BX,$BY ${BW}x${BH}"
+	# 静止时盒里的内容脚印（后面每一帧都不许比它大太多）
+	RFW=0; RFH=0
+	if shot "$RUNDIR/close-rest.ppm" "$BX" "$BY" "$BW" "$BH"; then
+		read -r RFW RFH <<< "$(nonbgbox "$RUNDIR/close-rest.ppm")"
+		echo "  静止时盒内内容脚印 ${RFW}x${RFH}"
+		[ "$RFW" -gt 50 ] &&
+			pass "关闭前盒里有内容（${RFW}x${RFH}，判据才有意义）" ||
+			fail "关闭前盒里就没什么内容（${RFW}x${RFH}），后面会假通过"
+	fi
+	# 关闭动画期间连拍：内容外接框不许超过静止那一份的 1.5 倍
+	./build/vidowmsg close-window --id "$CID" >/dev/null 2>&1
+	MXW=0
+	# 只量**盒子那块**：往外扩会框进同一块屏上列里的别的窗口（实测扩 80px 时
+	# 外接框 515 = 自己的快照和隔壁列连成一片），那不是「小窗闪了原生尺寸」。
+	for i in 1 2 3 4; do
+		if shot "$RUNDIR/close-$i.ppm" "$BX" "$BY" "$BW" "$BH"; then
+			W=$(nonbgbox "$RUNDIR/close-$i.ppm" | cut -d' ' -f1)
+			echo "  关闭第 $i 帧：内容外接框宽 ${W}px（静止 ${RFW}px）"
+			[ "${W:-0}" -gt "$MXW" ] && MXW=$W
+		fi
+	done
+	[ "$RFW" -le 0 ] && RFW=1
+	if [ "$MXW" -le $((RFW * 3 / 2)) ]; then
+		pass "关闭动画全程没有原生尺寸那一帧（最大外接框 ${MXW} ≤ 静止 ${RFW} × 1.5）"
+	else
+		fail "关闭动画闪了原生尺寸：某帧外接框 ${MXW} > 静止 ${RFW} × 1.5"
+	fi
+	kill "$(pgrep -f 'probe.py closewin' | head -1)" 2>/dev/null
+fi
 
 # ================================================================
 exec 9>&-

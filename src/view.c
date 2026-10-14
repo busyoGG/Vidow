@@ -1974,6 +1974,51 @@ static double view_mini_scale(const struct vidow_view *view) {
 	return s > 0.0 ? s : 1.0;
 }
 
+/* 给小窗的过渡动画用（float.c 的 mini_transition_start / vidow_mini_set_state）：
+ * 这一帧内容画出来的缩放、以及内容原点相对盒子原点的居中偏移。必须和
+ * view_anim_place 里那两处（view_mini_scale 与 mini_cx/mini_cy）同源 —— 补间
+ * 的起点是「上一帧画在哪」，拿别的量推出来就会在转换的第一帧跳一下（用户报的
+ * 「退出小窗的一瞬间显示原始大小」就是这个跳）。 */
+double vidow_view_mini_scale_export(const struct vidow_view *view) {
+	return view_mini_scale(view);
+}
+
+void vidow_view_mini_content_offset(const struct vidow_view *view, int *dx,
+		int *dy) {
+	if (dx != NULL) {
+		*dx = 0;
+	}
+	if (dy != NULL) {
+		*dy = 0;
+	}
+	if (view == NULL) {
+		return;
+	}
+	double ms = view_mini_scale(view);
+	if (ms == 1.0 || view->float_geom.width <= 0 ||
+			view->float_geom.height <= 0) {
+		return;
+	}
+	/* 几何取**可见窗口**（和 view_anim_bake 的 mini_cx/mini_cy 同一个来源）：
+	 * 装饰那一条路画的就是它。 */
+	struct vidow_fx_geo geo = vidow_view_fx_geo(view);
+	int cw = geo.w, ch = geo.h;
+	if (cw <= 0 || ch <= 0) {
+		view_mini_native(view, &cw, &ch);
+	}
+	if (cw <= 0 || ch <= 0) {
+		return;
+	}
+	if (dx != NULL) {
+		*dx = (int)lround(((double)view->float_geom.width -
+			(double)cw * ms) / 2.0);
+	}
+	if (dy != NULL) {
+		*dy = (int)lround(((double)view->float_geom.height -
+			(double)ch * ms) / 2.0);
+	}
+}
+
 /* 「摆在哪」落到场景节点上：位置 / 透明度 / overview 的显示尺寸 / 装饰的采样
  * 偏移和 ext-background-effect 的区域。**便宜**，拖动跟手时每个指针事件都走这条。
  * 装饰图的重烘（贵：整块窗口那么大的离屏渲染）在 vidow_view_anim_bake 里，一帧
@@ -2475,9 +2520,57 @@ static void view_snapshot_close(struct vidow_view *view) {
 		geo.h = geo.src_h;
 	}
 	int w = geo.src_w, h = geo.src_h;
+	int cx = 0, cy = 0;
+	/* 小窗（mini）：关闭动画画的是**上一帧那个小窗**，不是它原生的样子。
+	 *
+	 * 快照是整块源缓冲（原生尺寸），而小窗台上画着的那份是「原生 × contain 系数」
+	 * 居中摆在盒子里（S3 的 view_mini_scale + S3b 的居中）。以前这条路上一个
+	 * 小窗系数都没有：关掉一个 504x315 的自由小窗时，关闭动画第一帧直接按原生
+	 * 649x724（含装饰留白）铺开 —— 用户报的「关闭小窗的时候也会显示原始大小」。
+	 * 修法：画布 / 快照节点的尺寸都乘上 ms，位置挪到**内容**原点（盒子原点 +
+	 * 居中偏移）—— 和 S5 的过渡动画取同一个「上一帧画在哪」。
+	 *
+	 * 纹理映射得显式写成「整块缓冲里可见窗口那一块」：原来的兜底公式拿 geo 的
+	 * 偏移量当 uv 起点，而这里要把那个偏移按 ms 缩（留给**没装饰那条路**摆快照
+	 * 节点用），不显式写就会把缩过的 geo 当成裁切。 */
+	double mini_ms = view_mini_scale(view);
+	if (mini_ms != 1.0 && mini_ms > 0.0 &&
+			view->float_geom.width > 0 && view->float_geom.height > 0) {
+		int off_x = geo.off_x, off_y = geo.off_y;
+		if (geo.tex_du <= 0.0f || geo.tex_dv <= 0.0f) {
+			geo.tex_u0 = geo.src_w > 0 ?
+				(float)off_x / (float)geo.src_w : 0.0f;
+			geo.tex_v0 = geo.src_h > 0 ?
+				(float)off_y / (float)geo.src_h : 0.0f;
+			geo.tex_du = geo.src_w > 0 ?
+				(float)geo.w / (float)geo.src_w : 1.0f;
+			geo.tex_dv = geo.src_h > 0 ?
+				(float)geo.h / (float)geo.src_h : 1.0f;
+		}
+		cx = (int)lround(((double)view->float_geom.width -
+			(double)geo.w * mini_ms) / 2.0);
+		cy = (int)lround(((double)view->float_geom.height -
+			(double)geo.h * mini_ms) / 2.0);
+		geo.off_x = (int)lround((double)off_x * mini_ms);
+		geo.off_y = (int)lround((double)off_y * mini_ms);
+		geo.w = (int)lround((double)geo.w * mini_ms);
+		geo.h = (int)lround((double)geo.h * mini_ms);
+		if (geo.w < 1) {
+			geo.w = 1;
+		}
+		if (geo.h < 1) {
+			geo.h = 1;
+		}
+		w = (int)lround((double)w * mini_ms);
+		h = (int)lround((double)h * mini_ms);
+		/* 烘图倍率**不乘** ms：geo.w/h 已经是逻辑尺寸了，fx.c 那边
+		 * 节点尺寸 = 画布像素 ÷ out_scale = geo.w + 2*pad，乘两遍就小一圈。
+		 * 代价只有一个：装饰留白（pad）还是原生那点逻辑像素，140ms 的关闭
+		 * 动画里那圈边框看着比静止时厚一点点。 */
+	}
 	vidow_closing_start(server, server->layer_toplevels, view->last_buffer,
-		&geo, view->geom.x + (int)lround(view->anim_off_x),
-		view->geom.y + (int)lround(view->anim_off_y), w, h,
+		&geo, view->geom.x + (int)lround(view->anim_off_x) + cx,
+		view->geom.y + (int)lround(view->anim_off_y) + cy, w, h,
 		anim.close_ms, server->config.close_slide_px,
 		true, server->config.shader_close, view_scale(view),
 		server->config.close_easing, server->config.close_scale_to,

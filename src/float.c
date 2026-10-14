@@ -547,8 +547,17 @@ void vidow_float_begin_grab(struct vidow_server *server,
 	/* 客户端自己发起的那次（见 server.h 里 grab_client_press 的说明）：按下
 	 * 已经转给它了，松手也要转给它，状态才对称。 */
 	server->grab_client_press = from_client;
-	/* 拖动有果冻，改大小没有：改大小每帧换源缓冲尺寸，网格对不上（见 jelly.c）。 */
-	if (!resize) {
+	/* 拖动有果冻，改大小没有：改大小每帧换源缓冲尺寸，网格对不上（见 jelly.c）。
+	 *
+	 * 小窗（mini）**不做果冻**：jelly 的落点换算（jelly.c 的
+	 * `dst = buf / fx->scale`）假设 fx->scale 就是「设备像素 / 逻辑像素」，
+	 * 而小窗那条路上烘图倍率里**已经乘过 contain 系数**（view.c 的
+	 * view_anim_bake 传 `view_scale(view) * fx_ov`，fx_ov 含小窗系数），
+	 * 于是那一份被除第二遍：内容被放大 1/ms 倍（实测 FREE 盒 504x315、
+	 * contain 0.43 → 拖起来内容的屏幕脚印从 272x304 变成 641x507 ≈ 原生大小，
+	 * 正是用户报的「一拖就变回原始大小」）。要修得动 jelly.c 的换算（不在
+	 * 本次范围），先按「缩放态不做果冻」处理：拖拽的手感和尺寸都不会错。 */
+	if (!resize && vidow_view_mini_scale_export(view) == 1.0) {
 		vidow_jelly_begin(view);
 	}
 	server->grab_x = server->cursor->x;
@@ -598,6 +607,27 @@ void vidow_float_grab_update(struct vidow_server *server, double lx,
 
 		view->float_geom.x = x;
 		view->float_geom.y = y;
+		/* 小窗（mini）：位置语义是**比例锚点**（唯一的换算点是
+		 * vidow_mini_resolve_geom），只写 float_geom.x/y 没有用 —— 下一次
+		 * arrange 走到 float_place_recursive() 的小窗分支会按锚点把位置算回来。
+		 * 实测就是用户报的那条：「按住 Mod+左键拖自由小窗，拖不动」（整段拖拽
+		 * 里盒子的 x/y 逐字段不变）。和 input.c 的 mini_grab_update()（拖迷你 /
+		 * 图标）以及下面 resize 分支回写 mini_wf/hf 是同一规矩：**拖出来的东西
+		 * 必须回写锚点**。放在夹取之后：夹出来的位置才是真正要落地的那个。 */
+		if (view->mini != VIDOW_MINI_NONE) {
+			struct wlr_box work = vidow_work_area(server, view->output);
+			double span_x = (double)(work.width - view->float_geom.width);
+			double span_y = (double)(work.height - view->float_geom.height);
+			/* 锚点 0 = 贴工作区左 / 上边、1 = 贴右 / 下边（夹取规则见
+			 * vidow_mini_resolve_geom，图标允许超出一点）。 */
+			view->mini_ax = span_x > 1.0 ?
+				((double)x - work.x) / span_x : 0.5;
+			view->mini_ay = span_y > 1.0 ?
+				((double)y - work.y) / span_y : 0.5;
+			vidow_mini_resolve_geom(view);
+			x = view->float_geom.x;
+			y = view->float_geom.y;
+		}
 		/* 位置是「相对自己那块屏」记的（见本文件顶上那段注释）：只改绝对盒、
 		 * 不刷新 home_dx/home_dy，下一次 arrange 的 float_place_recursive()
 		 * 会按旧偏移把它摆回去 —— 拖了等于没拖。 */
@@ -1582,9 +1612,13 @@ static void mini_anim_done(void *data, bool cancelled) {
 }
 
 /* 形态转换的收口（set_state 的最后一步）：起点 `from` 是**改几何之前**取的
- * 「上一帧画在哪」，view->geom 这时已经是这一趟 arrange 摆出来的目标盒。 */
+ * 「上一帧画在哪」，view->geom 这时已经是这一趟 arrange 摆出来的目标盒。
+ *
+ * `from_scale` 是同一时刻的「上一帧内容的缩放」（set_state 里在改之前问
+ * vidow_view_mini_scale），**不是**从盒子面积推出来的那个 —— 见下面 scale_from
+ * 的注释：推出来的那一个只在「内容正好填满盒子」时才等于屏上真正画的那个。 */
 static void mini_transition_start(struct vidow_view *view,
-		const struct wlr_box *from) {
+		const struct wlr_box *from, double from_scale) {
 	struct vidow_server *server = view->server;
 	/* 上一趟还在飞就被打断了：先掐掉（cancelled 那条不清偏移 —— 新的这条
 	 * 紧接着会把偏移重写成新起点，中途不清才不会闪）。 */
@@ -1604,10 +1638,21 @@ static void mini_transition_start(struct vidow_view *view,
 	}
 	double dx = (double)(from->x - view->geom.x);
 	double dy = (double)(from->y - view->geom.y);
+	/* 起点缩放：view_anim_place 每帧画出来的是 **ms(新状态) × anim_scale**，
+	 * 所以 anim_scale 的起点要取「上一帧的内容缩放 ÷ 新状态的 contain 系数」——
+	 * 这样 t = 0 那一帧画出来的内容尺寸和上一帧**逐像素一样**（daeba31 那条
+	 * 教训：补间起点必须是「上一帧画在哪」，不能是推出来的量）。
+	 *
+	 * 以前这里取 sqrt(盒面积比)：只在「内容正好填满盒子」时才等于屏上真正画的
+	 * 那个（`sqrt` 是面积比的几何平均，撑不起 contain 的 min）。实测的偏差：
+	 * 自由小窗（盒 504x315、内容 625x700 原生、contain 0.4257）还原成列
+	 * （目标 625x700）时起点取到 0.602 → 退出动画第一帧的内容比上一帧大
+	 * **41%**（用户报的「退出小窗的一瞬间显示原始大小」）；图标态那趟同理
+	 * （0.097 vs 真正的 0.0865）。 */
+	double to_scale = vidow_view_mini_scale_export(view);
+	double scale_from = to_scale > 0.0 ? from_scale / to_scale : 1.0;
 	double area_from = (double)from->width * (double)from->height;
 	double area_to = (double)view->geom.width * (double)view->geom.height;
-	double scale_from = (area_from > 0.0 && area_to > 0.0) ?
-		sqrt(area_from / area_to) : 1.0;
 	if (ms <= 0 || (dx == 0.0 && dy == 0.0 &&
 			fabs(scale_from - 1.0) < 0.01)) {
 		view->anim_off_x = 0.0;
@@ -1664,10 +1709,17 @@ void vidow_mini_set_state(struct vidow_view *view, enum vidow_mini_state state) 
 	if (old == state) {
 		return;
 	}
-	/* 过渡动画的起点：**改几何之前**的「上一帧画在哪」（§1.4 第 1 条）。 */
+	/* 过渡动画的起点：**改几何之前**的「上一帧画在哪」（§1.4 第 1 条）。
+	 * 对小窗态来说「画在哪」是**内容**的原点，不是盒子的原点 —— 内容在盒子里
+	 * 是 contain 居中摆的（S3b，见 view.c 的 mini_cx/mini_cy），盒子原点到
+	 * 内容原点还差一个居中偏移。不把它算进来的话，退出小窗的第一帧会横着跳
+	 * 一下（实测自由小窗那趟差 119px，比动画本身一步的位移还大）。 */
+	int content_dx = 0, content_dy = 0;
+	vidow_view_mini_content_offset(view, &content_dx, &content_dy);
+	double from_scale = vidow_view_mini_scale_export(view);
 	struct wlr_box from = {
-		.x = view->geom.x + (int)lround(view->anim_off_x),
-		.y = view->geom.y + (int)lround(view->anim_off_y),
+		.x = view->geom.x + (int)lround(view->anim_off_x) + content_dx,
+		.y = view->geom.y + (int)lround(view->anim_off_y) + content_dy,
 		.width = view->geom.width,
 		.height = view->geom.height,
 	};
@@ -1707,7 +1759,7 @@ void vidow_mini_set_state(struct vidow_view *view, enum vidow_mini_state state) 
 		vidow_float_set_mode(view, VIDOW_FLOAT_NONE);
 		/* S5：接回条带也走过渡动画（目标盒是 join_layout 算出来的条带位置，
 		 * 上面那次 arrange 已经把它摆进 geom 了）。 */
-		mini_transition_start(view, &from);
+		mini_transition_start(view, &from, from_scale);
 		wlr_log(WLR_INFO, "mini: %s 还原成列（从 %s）",
 			vidow_view_title(view) != NULL ? vidow_view_title(view) : "?",
 			vidow_mini_state_name(old));
@@ -1803,7 +1855,7 @@ void vidow_mini_set_state(struct vidow_view *view, enum vidow_mini_state state) 
 	}
 	/* S5：进小窗 / 三态互切 —— 上面那次 arrange 已经把目标盒摆进 geom 了，
 	 * 这里起过渡动画（起点是进函数时取的「上一帧画在哪」）。 */
-	mini_transition_start(view, &from);
+	mini_transition_start(view, &from, from_scale);
 	/* 形态刚定下来：出帧策略（快照 / 活）与快照节点跟着走一趟。 */
 	vidow_mini_frames_sync(view);
 	vidow_ipc_emit_window(server, "window-mini-changed", view);

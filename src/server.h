@@ -2012,6 +2012,10 @@ struct vidow_popup_scene {
 	struct wl_listener destroy;  /* 表面没了就摘掉这条 */
 };
 
+/* 每个按钮上的字形最多几个亮点（5x5 字模，最满的那个「三根竖条」是 15 ——
+ * 留点余量给以后换字模）。建节点时超了会当场报错，不悄悄少画。 */
+#define VIDOW_MINI_TOOLBAR_GLYPH_MAX 20
+
 struct vidow_server {
 	struct wl_display *display;
 	struct wlr_backend *backend;
@@ -2375,6 +2379,12 @@ struct vidow_server {
 	uint64_t mini_last_id;
 	struct wlr_box mini_toolbar_box;          /* 工具条整块（布局坐标） */
 	struct wlr_box mini_toolbar_btn_box[4];   /* 四个按钮（布局坐标） */
+	/* 按钮上的字形（**不是**表面，也不是字库：每个亮点一个 3x3 的小方块，
+	 * 字模在 drag.c）：以前四个按钮就是四个空方块 —— 用户报的「没有内容只有
+	 * 四个格子」。顺序 = 字模行优先，节点在 vidow_mini_ui_init 里一次建好。
+	 * 第一个下标 = enum vidow_mini_toolbar_btn（4 个）。 */
+	struct wlr_scene_rect
+		*mini_toolbar_glyph[4][VIDOW_MINI_TOOLBAR_GLYPH_MAX];
 	/* 浮动窗口拖拽同理：每帧最多重排一次（见 vidow_float_grab_update）。 */
 	bool arrange_dirty;
 	/* 正在跑的列宽过渡有几条。过渡期间**位置跟着变的那几列不做位移补间**：
@@ -3638,6 +3648,12 @@ void vidow_mini_set_state(struct vidow_view *view, enum vidow_mini_state state);
 void vidow_view_yield_focus_for_mini(struct vidow_view *view);
 /* 按比例锚点算出 float_geom（幂等，不 configure 客户端）。摆放前调。 */
 void vidow_mini_resolve_geom(struct vidow_view *view);
+/* S5（修「退出小窗那一瞬间显示原始大小」）：这一帧内容画出来的缩放 / 内容原点
+ * 相对盒子原点的居中偏移。补间的起点必须取这两个量（「上一帧画在哪」），
+ * 不能从盒子面积推（见 float.c 的 mini_transition_start）。 */
+double vidow_view_mini_scale_export(const struct vidow_view *view);
+void vidow_view_mini_content_offset(const struct vidow_view *view, int *dx,
+		int *dy);
 /* S3：这个窗口现在要不要**保留客户端原生分辨率**（小窗态不 configure 客户端、
  * 由合成器把场景节点缩到小窗盒显示）。规则写了就按规则的，没写按全局键。 */
 bool vidow_mini_preserve_buffer(const struct vidow_view *view);

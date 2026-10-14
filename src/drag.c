@@ -472,10 +472,30 @@ static const float MINI_DROP_PREVIEW_COLOR[4] = { 0.09f, 0.42f, 0.32f, 0.45f };
 /* 工具条：深底 + 四个按钮（按钮稍微亮一点，点得中看得见）。 */
 static const float MINI_TOOLBAR_BG_COLOR[4] = { 0.04f, 0.04f, 0.05f, 0.55f };
 static const float MINI_TOOLBAR_BTN_COLOR[4] = { 0.16f, 0.16f, 0.20f, 0.75f };
+/* 按钮上的字形颜色（预乘，同上）。 */
+static const float MINI_TOOLBAR_GLYPH_COLOR[4] = { 0.78f, 0.80f, 0.84f, 0.85f };
 
 #define MINI_TOOLBAR_BTN_W 34
 #define MINI_TOOLBAR_BTN_H 26
 #define MINI_TOOLBAR_PAD 3
+#define MINI_TOOLBAR_GLYPH_N 5    /* 字模 5x5 */
+#define MINI_TOOLBAR_GLYPH_PX 3   /* 每个亮点 3x3 逻辑像素 → 字形 15x15 */
+
+/* 四个按钮的**字形**（5x5 像素字模，'#' = 亮）。
+ *
+ * 用户报的「小窗的工具栏没有内容只有四个格子」：这四个按钮以前就是四个纯色
+ * 的 wlr_scene_rect，一个字形都没有（实测每个按钮 0/884 个非底色像素）。
+ * 合成器自绘的东西没有字体 / 位图可借，就用最笨也最稳的办法：每个亮点一个
+ * 小方块（wlr_scene_rect），颜色统一 —— 34x26 的按钮里放 15x15 的字形，够认。
+ *   [0] 放大   = 向上箭头      [1] 收成图标 = 小方块
+ *   [2] 还原成列 = 三根竖条    [3] 关闭     = 叉                          */
+static const char *const MINI_TOOLBAR_GLYPH[VIDOW_MINI_BTN_COUNT]
+		[MINI_TOOLBAR_GLYPH_N] = {
+	{ "..#..", ".###.", "#.#.#", "..#..", "..#.." },
+	{ ".....", ".###.", ".###.", ".###.", "....." },
+	{ ".#.#.", ".#.#.", ".#.#.", ".#.#.", ".#.#." },
+	{ "#...#", ".#.#.", "..#..", ".#.#.", "#...#" },
+};
 
 /* 配置里的百分比键（"15%"）-> 比例。读不出来就用兜底值（写配置那一刻已经校验
  * 过，见 config.c 的 K_STRING 分支）。float.c 里有一份同样用途的 mini_frac()，
@@ -646,7 +666,9 @@ static struct wlr_box mini_toolbar_layout(struct vidow_server *server,
 	int w = MINI_TOOLBAR_BTN_W * (int)VIDOW_MINI_BTN_COUNT +
 		MINI_TOOLBAR_PAD * ((int)VIDOW_MINI_BTN_COUNT + 1);
 	int h = MINI_TOOLBAR_BTN_H + MINI_TOOLBAR_PAD * 2;
-	int x = g.x;
+	/* 横向**跟小窗居中对齐**（不是左对齐）：以前 x = g.x，迷你盒 353 宽、
+	 * 工具条 151 宽时整条比窗口中心偏左 101px（用户报的「位置偏左」）。 */
+	int x = g.x + (g.width - w) / 2;
 	int y = g.y - h - 4;
 	if (work.height > 0 && y < work.y) {
 		y = g.y + g.height + 4; /* 上面放不下 → 摆到下面 */
@@ -666,6 +688,39 @@ static struct wlr_box mini_toolbar_layout(struct vidow_server *server,
 		}
 	}
 	return (struct wlr_box){ .x = x, .y = y, .width = w, .height = h };
+}
+
+/* 把四个字形摆到按钮正中（每个亮点一个方块）。节点是 init 时照字模建好的
+ * （见 vidow_mini_ui_init），顺序和这里遍历字模的顺序**必须**一致：两边都从
+ * 0 数起、都是行优先，所以不需要额外存坐标表。 */
+static void mini_toolbar_glyph_place(struct vidow_server *server) {
+	int size = MINI_TOOLBAR_GLYPH_N * MINI_TOOLBAR_GLYPH_PX;
+	for (int i = 0; i < (int)VIDOW_MINI_BTN_COUNT; i++) {
+		const struct wlr_box *b = &server->mini_toolbar_btn_box[i];
+		int ox = b->x + (b->width - size) / 2;
+		int oy = b->y + (b->height - size) / 2;
+		int g = 0;
+		for (int r = 0; r < MINI_TOOLBAR_GLYPH_N; r++) {
+			for (int c = 0; c < MINI_TOOLBAR_GLYPH_N; c++) {
+				if (MINI_TOOLBAR_GLYPH[i][r][c] != '#') {
+					continue;
+				}
+				if (g >= VIDOW_MINI_TOOLBAR_GLYPH_MAX) {
+					continue;
+				}
+				struct wlr_scene_rect *node =
+					server->mini_toolbar_glyph[i][g++];
+				if (node == NULL) {
+					continue;
+				}
+				wlr_scene_node_set_position(&node->node,
+					ox + c * MINI_TOOLBAR_GLYPH_PX,
+					oy + r * MINI_TOOLBAR_GLYPH_PX);
+				wlr_scene_node_set_enabled(&node->node, true);
+				raise_node(&node->node);
+			}
+		}
+	}
 }
 
 void vidow_mini_toolbar_show(struct vidow_server *server,
@@ -703,6 +758,7 @@ void vidow_mini_toolbar_show(struct vidow_server *server,
 		wlr_scene_node_set_enabled(&btn->node, true);
 		raise_node(&btn->node);
 	}
+	mini_toolbar_glyph_place(server);
 	raise_node(&server->mini_toolbar_bg->node);
 	/* 日志里把四个按钮的矩形说清楚（测试靠它注入点击；用户报「点不中」时也能
 	 * 一眼看出工具条摆在哪儿）。 */
@@ -728,6 +784,12 @@ void vidow_mini_toolbar_hide(struct vidow_server *server) {
 		if (server->mini_toolbar_btn[i] != NULL) {
 			wlr_scene_node_set_enabled(
 				&server->mini_toolbar_btn[i]->node, false);
+		}
+		for (int g = 0; g < VIDOW_MINI_TOOLBAR_GLYPH_MAX; g++) {
+			if (server->mini_toolbar_glyph[i][g] != NULL) {
+				wlr_scene_node_set_enabled(
+					&server->mini_toolbar_glyph[i][g]->node, false);
+			}
 		}
 	}
 }
@@ -773,6 +835,38 @@ bool vidow_mini_ui_init(struct vidow_server *server) {
 		if (server->mini_toolbar_btn[i] == NULL) {
 			wlr_log(WLR_ERROR, "mini: 工具条按钮建不出来");
 			return false;
+		}
+		/* 按钮上的字形：照字模每个亮点建一个小方块（见上面那段说明）。
+		 * 亮点数超过 VIDOW_MINI_TOOLBAR_GLYPH_MAX 就是字模画得太满 ——
+		 * 当场报错，别悄悄少画几笔。 */
+		int g = 0;
+		for (int r = 0; r < MINI_TOOLBAR_GLYPH_N; r++) {
+			for (int c = 0; c < MINI_TOOLBAR_GLYPH_N; c++) {
+				if (MINI_TOOLBAR_GLYPH[i][r][c] != '#') {
+					continue;
+				}
+				if (g >= VIDOW_MINI_TOOLBAR_GLYPH_MAX) {
+					wlr_log(WLR_ERROR, "mini: 工具条字形 %d 的亮点超过 "
+						"%d 个（改字模或加大 VIDOW_MINI_TOOLBAR_"
+						"GLYPH_MAX）", i,
+						VIDOW_MINI_TOOLBAR_GLYPH_MAX);
+					return false;
+				}
+				struct wlr_scene_rect *node = wlr_scene_rect_create(
+					server->layer_toplevels,
+					MINI_TOOLBAR_GLYPH_PX,
+					MINI_TOOLBAR_GLYPH_PX, (float[4]){
+						MINI_TOOLBAR_GLYPH_COLOR[0],
+						MINI_TOOLBAR_GLYPH_COLOR[1],
+						MINI_TOOLBAR_GLYPH_COLOR[2],
+						MINI_TOOLBAR_GLYPH_COLOR[3] });
+				if (node == NULL) {
+					wlr_log(WLR_ERROR, "mini: 工具条字形建不出来");
+					return false;
+				}
+				wlr_scene_node_set_enabled(&node->node, false);
+				server->mini_toolbar_glyph[i][g++] = node;
+			}
 		}
 	}
 	vidow_mini_drop_zone_hide(server);

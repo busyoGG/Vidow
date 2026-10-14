@@ -5459,6 +5459,32 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
      - 未做：niri 的 `fixed 1920`（固定像素档）、`preset-window-heights`、`default-column-width {}`（让客户端自己定宽）、
        `always-center-single-column`；窗口规则级的 per-rule 预设覆盖。
 
+284. **小窗模式三个真机 bug：自由小窗拖不动/一拖变原生、退出与关闭闪原生、工具条四个空格子且偏左**（用户：「自由小窗的时候没有拖拽的方式……一拖大小会变成原始大小且拖不动 / 关闭小窗的时候也会显示原始大小 / 工具条没有内容只有四个格子且位置偏左」；2026-10-14）
+     - **A 自由小窗拖不动 + 一拖变回原始大小**（两个独立根因）
+       - 拖不动：`src/float.c` 的 `vidow_float_grab_update()` MOVE 分支只写 `float_geom.x/y`，而**小窗的位置语义是比例锚点**（`mini_ax/mini_ay`）——
+         下一次 arrange 走 `float_place_recursive()` 的小窗分支会把位置按锚点算回来，等于丢掉。实测：FREE 盒 `1668,203 504x315`，注入 `Mod+左键` 拖 +200,+140 → 盒逐字段不变。
+         修法：MOVE 分支加小窗支路，把拖出来的位置回写锚点再 `vidow_mini_resolve_geom()`（和 `input.c` 的 `mini_grab_update()`、以及同函数 resize 分支回写 `mini_wf/hf` 同一规矩：**拖出来的东西必须回写锚点**，而且放在夹取之后）。改后盒 `1868,343` = 注入的 +200,+140。
+       - 一拖变大：拖动会起果冻（jelly），而 `jelly.c` 的落点换算 `dst = buf / fx->scale` 里 `fx->scale` **已经含 contain 系数**
+         （`view.c` 烘图传 `view_scale * fx_ov`），被除第二遍 → 内容放大 `1/ms` 倍。实测拖拽中内容屏幕脚印 `641x507`（≈ 原生 665x740）→ 修后 `272x304`（= 静止那一份）。
+         真正通用的修法在 `jelly.c`（本次不动），改法：**缩放态不起果冻**（contain 系数 = 1.0 才起），注释里写清为什么。
+     - **B 退出 / 关闭小窗那一瞬间显示原始大小**（两个根因，同一个「补间起点不能是推出来的量」）
+       - `mini_transition_start()` 的起点缩放原来取 `sqrt(盒面积比)` —— 只在「内容正好填满盒子」时才等于屏上真正画的 contain 系数，也漏了内容在盒子里的居中偏移。
+         实测自由小窗还原成列那趟：起点算出 `0.602`，真值 `0.4257` → **第一帧大 41%**；图标态 `0.097` vs `0.0865`。修法：`view.c` 导出 `vidow_view_mini_scale_export()` /
+         `vidow_view_mini_content_offset()`（与 `view_anim_place` 的 `view_mini_scale`、`mini_cx/cy` 同源），起点取「上一帧内容缩放 ÷ 新状态 contain」+ 内容居中偏移。改后 `0.4570`（差 0.0001）、起点坐标 `1787,212`（+119,+9 = 内容原点）。
+       - `view_snapshot_close()` 完全不管 `view->mini`：关闭一个 `504x315` 的自由小窗时按原生 `649x724` 铺开。修法：画布 / 节点尺寸乘 `ms`、位置挪到内容原点、显式写纹理映射。改后画布 `290x322`、第一帧脚印 `280x311`（静止 `272x304`）。
+         （遗留：装饰留白 pad 仍按原生逻辑像素画，140ms 关闭动画里边框比静止略厚 —— 要修得动 `fx.c` 的 pad 语义。）
+     - **C 工具条没有内容、只有四个格子、位置偏左**：`src/drag.c` 的 `mini_toolbar_layout()` 横向 `x = g.x` 左对齐（迷你盒 353 宽、条 151 宽 → 偏 **-101px**）；
+       `vidow_mini_ui_init()` 只建了 4 个纯色 `wlr_scene_rect`，**一个字形节点都没有**（实测每按钮 `0/884` 非底色像素）。
+       修法：横向改 `x = g.x + (g.width - w)/2`（保留「优先上方 → 放不下摆下方 → 夹进工作区」）；加 5x5 像素字模（放大=上箭头 / 收图标=小方块 / 还原成列=三竖条 / 关闭=叉），
+       每个亮点一个 3x3 scene rect（15x15 居中放在 34x26 里），节点在 init 建好、show 时摆位、hide 时全关（数量上限 `VIDOW_MINI_TOOLBAR_GLYPH_MAX`，字模画满会当场报错而不是悄悄少画）。改后偏移 `0px`、字形像素 `81/81/90/81`。
+     - **icon 态：「显示的是应用的图标」这条不是 bug**：全仓库没有任何 icon-theme / app-icon 查询（`grep app_icon|icon_theme|xdg_icon` 为空），
+       画的就是**这个窗口自己最后一帧的缩略图**（`view.c` 的 `mini_snapshot_place()` 把 `view->last_buffer` 塞进快照节点）。64x64 实测：78% 是客户端自己的底色 `#F6F5F4` + 它自己的标题栏，
+       58x64 按 contain 进 64x64、比例没拉伸 —— 用户看到的是「缩小后的窗口画面」，尺寸印象像图标。
+     - **判据**：新增 8 条（工具条偏 -101 → 0 / 四个按钮空 → 有字形 / 拖拽中内容 `292x326→296x439` / 拖了没动 / `free→none` 起点缩放 `0.6240≠0.4571` / `icon→none` `0.0970≠0.0865` /
+       关闭动画某帧外接框 `496 > 258×1.5`）；**用改前二进制跑同一份脚本 = 125 PASS / 7 FAIL**，逐条对应上面各根因。
+       `test-mini.sh` **120 → 132 PASS / 0 FAIL**；`test-overview.sh` 66 PASS / 0 FAIL 不变（共享裁剪路径）。
+     - **遗留**（都不在本次范围）：`jelly.c` 的双计数通用修法；关闭动画的装饰留白不随 `ms` 缩；icon 态点击命中区没走 `hit_scale`（test-mini.sh 里已文档化的既有问题）。
+
 283. **还债：生成的配置里字符串型枚举漏了引号（`20-layout.lua` 打出 `center_focused_column = never`）**（用户「新增的配置应该给我本地的配置加上」时顺手撞出来的；2026-10-14）
      - **怎么撞上的**：把用户本地 `~/.config/vidow`（旧快照，缺 7 个分类文件）和仓库当前默认对齐、headless 起来验一遍 —— 日志里一行
        `[ERROR] … config.lua: …/20-layout.lua:9: center_focused_column: cannot use a nil as a config value`。
