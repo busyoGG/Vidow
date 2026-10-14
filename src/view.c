@@ -3056,6 +3056,16 @@ void vidow_focus_view(struct vidow_view *view) {
 	if (view->minimized) {
 		return;
 	}
+	/* 小窗（mini window，S2）：**迷你 / 图标态不拿键盘焦点**。和上面那条同形状、
+	 * 同一个思想 —— 调用方漏了跳过；放大那条路（T3/T4）会先把形态改成 FREE
+	 * 再进来。不变量：server->focused 永远不指向 MINI / ICON 的窗口。
+	 *
+	 * ⚠️ 和锁屏（S3）那套**方向相反**：锁屏是「谁都不许进」（连命中测试都短路），
+	 * 这里是「只有焦点不许进，命中必须进」—— vidow_view_at() 必须能命中迷你态
+	 * （单击要能放大），所以那边一个字都不动。 */
+	if (view->mini == VIDOW_MINI_MINI || view->mini == VIDOW_MINI_ICON) {
+		return;
+	}
 
 	if (prev != surface) {
 		if (prev != NULL) {
@@ -3315,6 +3325,52 @@ static struct vidow_view *focus_after_close(struct vidow_server *server,
 	/* 这块工作区上没有别的列了：可能还剩浮窗 —— 它们照样该接住键盘（niri 的
 	 * 「平铺关完落到浮窗上」）。挑不到就返回 NULL，调用方走兜底。 */
 	return focus_nearest_by_x(server, view, output);
+}
+
+/* -------------------------------------------------------- 小窗（S2）焦点交出 */
+
+/* 一个窗口要进 MINI / ICON 了：它**不接键盘**，所以焦点得先交出去。规矩照抄
+ * vidow_view_set_minimized() 里那条（已测过的路）—— 「位置不动，谁滑到空出来的
+ * 位置上就是谁」，不另发明一套。
+ *
+ * 两件事，必须**在摘列 / 摘工作区之前**做（vidow_mini_set_state 的调用点在最前面）：
+ *   1) 键盘焦点换人：focus_after_close() 要靠窗口还挂在列里才找得到邻居；
+ *   2) 指针焦点清掉：光标本来压在这个窗口上，形态一变它就不该再收 enter / motion
+ *      （不然进迷你态的第一下移动还会转给客户端，见 input.c 的小窗分流）。
+ *
+ * 为什么放在 view.c：focus_after_close / focus_nearest_column / focus_nearest_by_x
+ * 都是这儿的静态函数，搬出去要暴露三个。 */
+void vidow_view_yield_focus_for_mini(struct vidow_view *view) {
+	if (view == NULL || view->popup) {
+		return;
+	}
+	struct vidow_server *server = view->server;
+	struct wlr_output *output = view->output;
+
+	/* 指针焦点：光标底下就是它（或者它的子表面）才清 —— 清别人的会打断正在
+	 * 操作的窗口。 */
+	struct wlr_surface *pfocus = server->seat->pointer_state.focused_surface;
+	if (pfocus != NULL && vidow_view_from_surface(server,
+			wlr_surface_get_root_surface(pfocus)) == view) {
+		wlr_seat_pointer_notify_clear_focus(server->seat);
+	}
+
+	/* 形态上它也不再是「活动窗口」了：边框 / 任务栏（foreign toplevel）跟着走。 */
+	vidow_view_set_activated(view, false);
+	vidow_portal_view_activated(view, false);
+
+	if (server->focused != view) {
+		return;
+	}
+	struct vidow_view *next = focus_after_close(server, view, output);
+	server->focused = NULL;
+	if (next != NULL) {
+		vidow_focus_view(next);
+	} else {
+		focus_nearest_column(server, output);
+	}
+	wlr_log(WLR_INFO, "mini: 焦点交出 %s（迷你 / 图标不接键盘）",
+		vidow_view_title(view) != NULL ? vidow_view_title(view) : "(无题)");
 }
 
 /* ------------------------------------------------------------------ 最小化 */
@@ -4136,6 +4192,13 @@ static void view_unmap(struct wl_listener *listener, void *data) {
 	wlr_scene_node_set_enabled(&view->scene_tree->node, false);
 	vidow_backdrop_damage_view(view);
 
+	if (server->mini_grab_view == view) {
+		/* 小窗形态拖拽中窗口没了（客户端崩 / 被关）：撤掉，别让指针还挂在一个
+		 * 已经没了的窗口上（见 input.c 的 mini_pointer_*）。 */
+		server->mini_grab_view = NULL;
+		server->mini_grab_dragging = false;
+	}
+
 	if (server->grab_view == view) {
 		vidow_float_end_grab(server);
 	}
@@ -4486,6 +4549,12 @@ static void view_destroy(struct wl_listener *listener, void *data) {
 	 * tag so hit-testing cannot reach the freed struct. */
 	if (view->scene_tree != NULL) {
 		view->scene_tree->node.data = NULL;
+	}
+	if (server->mini_grab_view == view) {
+		/* 小窗形态拖拽中窗口被销毁了（客户端崩 / 直接被关，没走 unmap）：
+		 * 和 view_unmap 里那处一样，撤掉指针上的挂账。 */
+		server->mini_grab_view = NULL;
+		server->mini_grab_dragging = false;
 	}
 	if (server->grab_view == view) {
 		vidow_float_end_grab(server);

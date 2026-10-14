@@ -728,6 +728,18 @@ bool vidow_workspace_view_visible(struct vidow_server *server,
 	if (view->minimized) {
 		return false;
 	}
+	/* 小窗（mini window，S2）**跟屏不跟工作区**（像安卓 PiP）：切工作区它不消失。
+	 * 和 overview 那条旁路（view.c 的 vidow_view_should_park）同一个位置、同一个
+	 * 思想：可见性只有这一个判据口，所以旁路也只开在这儿。进小窗态时 view->ws
+	 * 已经摘成 NULL（float.c 的 vidow_mini_set_state），下面那句
+	 * `view->ws == active` 必然为假 —— 必须在这儿提前放行。
+	 *
+	 * 这一处改完，三处自动跟着对：vidow_view_should_park()（它调这个函数）、
+	 * view_on_screen()（view.c）、vidow_workspace_apply_visibility()（走 should_park）。
+	 * 判据只看「它有没有屏」—— 小窗是屏级对象。 */
+	if (view->mini != VIDOW_MINI_NONE) {
+		return view->output != NULL;
+	}
 	struct wlr_output *output = view->output;
 	if (output == NULL) {
 		return false;

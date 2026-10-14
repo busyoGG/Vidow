@@ -2251,6 +2251,17 @@ struct vidow_server {
 	 * 界面、移出去再移回来再点一次就好了」）。Mod+拖拽那条路按下是吃掉的，
 	 * 松手也一起吃掉，客户端两边都没见过，状态是对称的。 */
 	bool grab_client_press;
+	/* 小窗（S2）形态拖拽：迷你 / 图标态客户端收不到任何指针事件，所以同一个
+	 * 左键按下要同时承载「单击 = 放大」和「拖拽 = 移动」两个语义 —— 按累计位移
+	 * 和 mini_drag_threshold_px 区分（见 input.c 的 mini_pointer_*）。
+	 * 单向不回退：一旦判成拖拽就锁到松手（慢速拖出去再拖回来不该变成单击）。
+	 * 和上面的 grab_mode 是两套东西：那个是给平铺 / 浮窗的（会转事件给客户端），
+	 * 这个全程吞事件。 */
+	struct vidow_view *mini_grab_view;
+	double mini_grab_press_x, mini_grab_press_y; /* 按下点（布局坐标） */
+	double mini_grab_dx, mini_grab_dy;           /* 按下点 - 窗口左上角 */
+	bool mini_grab_dragging;                     /* 已经越过阈值（单向） */
+	uint32_t mini_grab_button;
 	/* 拖动时指针比刷新快：一帧里会来好几个移动事件，中间那些位置屏幕上从来没
 	 * 出现过。重画装饰（整块窗口那么大的离屏渲染）+ 记损伤推迟到出帧之前做一次
 	 * （见 vidow_tile_grab_update / output.c 的帧回调）—— 实测每个事件 66µs
@@ -3428,6 +3439,9 @@ void vidow_float_on_commit(struct vidow_view *view);
  * 只动数据模型与几何（比例锚点 -> float_geom），不碰可见性 / 焦点 / 输入 /
  * 渲染 / 动画 —— 那些是 S2–S5。 */
 void vidow_mini_set_state(struct vidow_view *view, enum vidow_mini_state state);
+/* S2：这个窗口要进 MINI / ICON 了 —— 把键盘 / 指针焦点交出去（迷你 / 图标不接
+ * 键盘）。必须在摘列 / 摘工作区**之前**调（要还在列里才找得到焦点邻居）。 */
+void vidow_view_yield_focus_for_mini(struct vidow_view *view);
 /* 按比例锚点算出 float_geom（幂等，不 configure 客户端）。摆放前调。 */
 void vidow_mini_resolve_geom(struct vidow_view *view);
 /* "none" / "free" / "mini" / "icon" <- 文本（IPC / 日志）。返回 NULL = 不认识。 */

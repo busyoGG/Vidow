@@ -914,6 +914,14 @@ void vidow_mini_set_state(struct vidow_view *view, enum vidow_mini_state state) 
 		return;
 	}
 
+	/* S2：迷你 / 图标**不接键盘**，所以进这两个态之前先把焦点交出去（规矩照抄
+	 * 最小化那条：位置不动，谁滑到空出来的位置就是谁）。必须在下面
+	 * vidow_float_set_mode() 摘列**之前** —— focus_after_close() 要靠窗口还挂在
+	 * 列里才找得到邻居。FREE 照常拿焦点，不用交。 */
+	if (state == VIDOW_MINI_MINI || state == VIDOW_MINI_ICON) {
+		vidow_view_yield_focus_for_mini(view);
+	}
+
 	if (state == VIDOW_MINI_NONE) {
 		view->mini = VIDOW_MINI_NONE;
 		view->mini_edge = VIDOW_MINI_EDGE_NONE;
