@@ -5420,6 +5420,29 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
      - 未做：niri 的 `fixed 1920`（固定像素档）、`preset-window-heights`、`default-column-width {}`（让客户端自己定宽）、
        `always-center-single-column`；窗口规则级的 per-rule 预设覆盖。
 
+274. **小窗模式 S3b：`mini_aspect` 三值生效（键位 > 规则 > 全局键）+ X11 `PAspect` 真的读了 + 拖拽锁比例 + contain 居中 —— 设了 `PAspect` 的游戏不再「关不掉锁」**（用户：「做方案 §11.3 + §7 S3 的宽高比那半」；方案 `/tmp/vidow-miniwin-plan.md` §11.3 + §8 判据 35–38b/43；2026-10-14）
+
+     - **`mini_aspect` 是「有效值」算出来的，不是散在各处判的**：`vidow_mini_aspect_effective()`（`src/float.c:824`）—— 键位（运行时 `view->mini_aspect_runtime`）> 窗口规则（`mini_aspect_rule`）> 全局键（`config.mini_aspect`），**三级都是显式选择**（`auto` 也是「我选择按自动信号走」）。
+       自动信号只在 `auto` 那一级看：X11 `PAspect` 优先，其次 `min == max` 的尺寸提示（`vidow_view_fixed_size_hint()`，Wayland 也认）；都没命中 → 不锁（Wayland 协议没有比例提示，所以那边 `auto` 等同 `free`）。
+       `lock` / `free` 是**强制**：全局写 `free` 时，一个设了 `PAspect = 16/9` 的 X11 窗口**不再**自动锁（这正是用户报过的反直觉行为）。判「锁不锁 + 锁的比值」只有一个出口：`vidow_mini_aspect_lock()`（`src/float.c:840`），比值取内容比例（`base_dst`，没有才退回表面逻辑尺寸 —— 不混 X11 的缩放桥）。
+     - **X11 `PAspect` 以前一条都没读**（`grep -rn aspect src/` 是空的）：新增 `vidow_view_aspect_hint()`（`src/view.c:4985`，紧挨 `vidow_view_fixed_size_hint()`）—— `XCB_ICCCM_SIZE_HINT_P_ASPECT` 且 min/max 两边都设了且**交叉相乘相等**才算「一个确定的比值」（只设一边是区间，不是锁定）。
+       重判点用现成的 `x11_set_size_hints` 监听器（`src/view.c` 的 `x11_set_size_hints()` 里调 `vidow_mini_aspect_changed()`，`src/float.c:884`）：客户端常常**映射之后**才设它（游戏进全屏那一刻），那时进 FREE 态的盒子还是配置的初始比例 —— 这个函数当场按宽度重排出锁定比例，并在日志里说清「有效值来自哪一级、PAspect 有没有读到」。
+     - **拖拽锁比例**：`vidow_float_grab_update()` 的 resize 分支（`src/float.c:626`）**宽度驱动**（`h = round(w / ratio)`，和 `vidow_tile_resize_*` 的手感一致，「拖右边」和「拖右下角」结果相同）。另加一条**必须**的回写：FREE 的盒子每次 arrange 都会被 `vidow_mini_resolve_geom()` 按 `mini_wf/mini_hf` 重算，拖出来的尺寸不回写锚点就是「拖了等于没拖」（实测确认）。
+     - **contain 居中（修 S3a 报的偏差）**：以前内容左上对齐贴盒，信件箱全堆在右下。两条渲染路都要改，只改一条等于没改：
+       ① 表面节点（`src/view.c:1867-1889`）—— 记下内容节点原来的位置（xdg 的窗口几何留白可能挂在父节点上），居中偏移减掉父节点那层，每帧重设（wlroots 每次 commit 会按自己的规则重算节点位置）；
+       ② **装饰节点**（`src/view.c:2049-2056` 把 `mini_cx/mini_cy` 传给 `vidow_fx_frame()` 的 `x/y`）—— 默认开着装饰时屏幕上画的是它，表面节点那份是藏起来的（只留给命中测试）。S3a 那条「信件箱点不着」就是这里。
+     - **迷你 / 图标态不受 `mini_aspect` 影响**：`vidow_mini_aspect_lock()` 第一句就是 `view->mini != VIDOW_MINI_FREE → false`；那两个形态永远按内容比例 `contain`（识别度问题，不给逃生口）。
+     - **逃生口（顺手做了 S4 的一半）**：`toggle-mini-aspect`（`src/keybind.c:1294`，键位或 `vidowmsg action toggle-mini-aspect`）把当前自由小窗翻成 `lock` / `free`，**只作用于运行时、不写回配置**（`vidowmsg config mini_aspect` 照旧）；还原成列（`mini = NONE`）时忘掉这次翻转。
+     - **实测**（headless 双屏 1280x720 @1x，`HOME`/`XDG_RUNTIME_DIR` 指临时目录；X11 客户端 `/tmp/xsolid`（纯色 + 可选 `PAspect`），Wayland 用 `tools/geowin`）：
+       - **居中**：X11 625×700 内容进 FREE 盒 `388,203 504x315` → grim 逐像素量内容包围盒 `500,204 279x313`，**留白左 112 / 右 113**（旧行为是左 0 / 右 225），上 1 / 下 1；盒中心 `pick-window` 命中该窗口；内容比例 0.8922 → 0.8914（没拉伸）。
+       - **规则 `lock`**：拖右下角 +120,+60 → `504x315`（比 1.6000）→ **`624x699`（比 0.8927，锁的就是内容比例 0.8929，偏差 0.02%）**；再横向拖 −60 → `564x632`（比 0.8924，偏差 0.03%）。
+       - **规则 `free`**：同一拖法 → `664x335`（比 1.9821，比例变了 **23.9%**）。
+       - **判据 38b**（全局 `free` + 不带规则 + X11 `PAspect = 16/9`）：拖 +150,+30 → `504x315` → `654x345`（比 1.8957，**变了 18.5%** = 全局 `free` 压过自动信号）；`vidowmsg set-config mini_aspect auto` 之后同一窗口再拖 → `774x435`（比 **1.7793**，16:9 = 1.7778，偏差 0.08% = 自动锁上了）。日志两行分别是「全局 free → 不锁」「全局 auto + PAspect 有 → 锁（比值 1.7778）」。
+       - **Wayland**：`geowin` 400×300 在全局 `auto` 下拖 → 比例变了 16.7%（协议没有比例提示 → 等同 `free`）。
+       - **迷你态**：`mini cw mini` → 盒 `464,262 353x196`，内容包围盒 `554,263 173x194`（比例 0.8918 ≈ 原生 0.8922），留白 **左 90 / 右 90**。
+     - **改动面**：`src/float.c`（`vidow_mini_aspect_effective/lock/changed` + resize 锁比例 + 锚点回写 + 进 FREE 时那行日志）、`src/view.c`（`vidow_view_aspect_hint()`、`x11_set_size_hints` 重判、表面节点与装饰节点两处居中）、`src/server.h`（`mini_aspect_runtime` / `mini_base_dx,dy` 两个字段 + 四个声明）、`src/keybind.c`（`toggle-mini-aspect`）。`src/input.c` / `workspace.c` / `overview.c` / `config.c` 一行没改，**没有全屏特例**。
+     - **没做**：`mini_icon_pause_render` 快照方案、悬停预览 / 工具条（S5）；「盒子本身按内容比例收」（MINI / ICON 的盒子仍是配置的 `mini_w x mini_h`，内容是 `contain` 居中，两条都满足「按内容比例显示」，但盒子没有跟着变形状）。
+
 273. **小窗模式 S3a：原生分辨率保留（合成器缩放显示）+ 图标贴边裁剪 + 指针坐标换算 + 直通 / 基线两个守卫 —— 小窗化**不**重配客户端**（用户：「做方案 §7 的 S3 里『正确性』那半，宽高比留给 S3b」；方案 `/tmp/vidow-miniwin-plan.md` §7 S3 + §11.1/§11.2/§11.7；2026-10-14）
 
      - **原则**：小窗化只改**呈现**，不改客户端 —— 不 configure、不重建 swapchain、不触发客户端的 resize 路径（有的游戏一 resize 就重置成窗口模式）。

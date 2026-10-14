@@ -619,8 +619,30 @@ void vidow_float_grab_update(struct vidow_server *server, double lx,
 		if (h < FLOAT_MIN_SIZE) {
 			h = FLOAT_MIN_SIZE;
 		}
+		/* 小窗（S3b）：锁比例时**宽度驱动**（h = w / ratio）。理由：vidow 的
+		 * 平铺改宽本来就是横向驱动，手感一致；宽度驱动还保证「拖右边」和
+		 * 「拖右下角」得到同一个结果，不会因为光标 y 抖一下就跳。 */
+		double ratio = 0.0;
+		if (vidow_mini_aspect_lock(view, &ratio) && ratio > 0.0) {
+			h = (int)lround((double)w / ratio);
+			if (h < FLOAT_MIN_SIZE) {
+				h = FLOAT_MIN_SIZE;
+			}
+		}
 		view->float_geom.width = w;
 		view->float_geom.height = h;
+		/* 小窗（S3b）：FREE 的盒子是**比例锚点**算出来的 —— 每次 arrange 都会
+		 * 走 vidow_mini_resolve_geom()，按 mini_wf/mini_hf 重算 float_geom。
+		 * 拖出来的尺寸不回写锚点，下一次 arrange 就把它抹掉（拖了等于没拖，
+		 * 实测就是这样）。和 input.c 里拖小窗位置时回写 mini_ax/ay 同一条规矩。 */
+		if (view->mini == VIDOW_MINI_FREE) {
+			struct wlr_box work = vidow_work_area(server, view->output);
+			if (work.width > 0 && work.height > 0) {
+				view->mini_wf = (double)w / (double)work.width;
+				view->mini_hf = (double)h / (double)work.height;
+				view->mini_size_known = true;
+			}
+		}
 	}
 
 	/* 重排推迟到这一帧要出帧之前（见 output.c 里那段）：指针比刷新快的时候
@@ -774,6 +796,127 @@ bool vidow_mini_parse_aspect(const char *text, enum vidow_mini_aspect *out) {
 		return false;
 	}
 	return true;
+}
+
+/* ------------------------------------------- 宽高比（mini window，S3b，§11.3）
+ *
+ * 三级显式优先级：键位（运行时）> 窗口规则 > 全局键。**三个取值都是显式选择**
+ * —— `free` 就是真的不锁（压过客户端的 PAspect），`auto` 才是「我选择按自动
+ * 信号走」。判策略只有下面这一个出口，别在拖拽 / 摆放 / IPC 里各判一份。 */
+
+/* 内容比例（w/h）。优先场景里的 1:1 尺寸（base_dst_*，X11 那条已经除过
+ * x11_scale），没有就取表面自己的逻辑尺寸 —— 两者是同一个比例。**不要**直接
+ * 拿 surface->current.width 混 X11 的缩放桥（计划 §11.3 那条）。 */
+static bool mini_native_ratio(const struct vidow_view *view, double *ratio) {
+	int nw = view->base_dst_w, nh = view->base_dst_h;
+	if (nw <= 0 || nh <= 0) {
+		struct wlr_surface *surface = vidow_view_surface(view);
+		nw = surface != NULL ? surface->current.width : 0;
+		nh = surface != NULL ? surface->current.height : 0;
+	}
+	if (nw <= 0 || nh <= 0) {
+		return false;
+	}
+	*ratio = (double)nw / (double)nh;
+	return true;
+}
+
+enum vidow_mini_aspect vidow_mini_aspect_effective(const struct vidow_view *view) {
+	if (view == NULL) {
+		return VIDOW_MINI_ASPECT_AUTO;
+	}
+	if (view->mini_aspect_runtime != VIDOW_MINI_ASPECT_UNSET) {
+		return view->mini_aspect_runtime;
+	}
+	if (view->mini_aspect_rule != VIDOW_MINI_ASPECT_UNSET) {
+		return view->mini_aspect_rule;
+	}
+	/* 全局键：配置面已经校验过取值，读不出来就当 auto（不静默退回别的值）。 */
+	enum vidow_mini_aspect global = VIDOW_MINI_ASPECT_AUTO;
+	vidow_mini_parse_aspect(view->server->config.mini_aspect, &global);
+	return global;
+}
+
+bool vidow_mini_aspect_lock(const struct vidow_view *view, double *ratio) {
+	/* 迷你 / 图标态永远按内容比例显示（contain），这条不受 mini_aspect 影响
+	 * —— 那是「预览能不能被认出来」的呈现职责，不是用户偏好。 */
+	if (view == NULL || view->mini != VIDOW_MINI_FREE) {
+		return false;
+	}
+	switch (vidow_mini_aspect_effective(view)) {
+	case VIDOW_MINI_ASPECT_FREE:
+		return false;
+	case VIDOW_MINI_ASPECT_LOCK: {
+		/* 强制锁：没有 PAspect 也锁，比值取内容自己的比例。 */
+		double r = 0.0;
+		if (!mini_native_ratio(view, &r)) {
+			return false;
+		}
+		if (ratio != NULL) {
+			*ratio = r;
+		}
+		return true;
+	}
+	case VIDOW_MINI_ASPECT_AUTO:
+	case VIDOW_MINI_ASPECT_UNSET:
+		break;
+	}
+	/* auto：让自动信号决定。X11 的 PAspect 最权威（客户端自己声明的），其次
+	 * min==max 的尺寸提示（固定尺寸窗口拖不动，锁比例是它的自然语义）。
+	 * Wayland 协议没有比例提示 → 两条都不命中 → free。 */
+	int num = 0, den = 0;
+	if (vidow_view_aspect_hint(view, &num, &den) && num > 0 && den > 0) {
+		if (ratio != NULL) {
+			*ratio = (double)num / (double)den;
+		}
+		return true;
+	}
+	int fw = 0, fh = 0;
+	if (vidow_view_fixed_size_hint(view, &fw, &fh) && fw > 0 && fh > 0) {
+		if (ratio != NULL) {
+			*ratio = (double)fw / (double)fh;
+		}
+		return true;
+	}
+	return false;
+}
+
+void vidow_mini_aspect_changed(struct vidow_view *view) {
+	if (view == NULL) {
+		return;
+	}
+	/* 只有自由小窗在乎：迷你 / 图标态的比例跟这个键无关。 */
+	if (view->mini != VIDOW_MINI_FREE) {
+		return;
+	}
+	double ratio = 0.0;
+	bool lock = vidow_mini_aspect_lock(view, &ratio);
+	int num = 0, den = 0;
+	bool hinted = vidow_view_aspect_hint(view, &num, &den);
+	wlr_log(WLR_INFO, "mini: %s 比例信号变了（PAspect %s，有效值 %s → %s）",
+		vidow_view_title(view) != NULL ? vidow_view_title(view) : "?",
+		hinted ? "有" : "没有",
+		vidow_mini_aspect_name(vidow_mini_aspect_effective(view)),
+		lock ? "锁" : "不锁");
+	if (!lock || ratio <= 0.0 || view->float_geom.width <= 0 ||
+			view->float_geom.height <= 0) {
+		return;
+	}
+	/* 锁着但盒子还不是那个比例（客户端**映射之后**才设 PAspect 的常见情况：
+	 * 进小窗那一刻还没有信号，盒子是配置的初始比例）→ 按宽度重排盒子，让它
+	 * 当场变成锁定的形状。宽度驱动，和拖拽那条一致。 */
+	double want = (double)view->float_geom.width / ratio;
+	if (fabs(want - (double)view->float_geom.height) < 1.0) {
+		return;
+	}
+	if (want < FLOAT_MIN_SIZE) {
+		want = FLOAT_MIN_SIZE;
+	}
+	view->float_geom.height = (int)lround(want);
+	view->mini_hf = view->float_geom.height /
+		(double)vidow_work_area(view->server, view->output).height;
+	vidow_float_set_size(view, view->float_geom.width, view->float_geom.height);
+	vidow_arrange(view->server);
 }
 
 /* 配置里的百分比键（"28%"）-> 比例（0.28）。读不出来就用兜底值 ——
@@ -948,6 +1091,9 @@ void vidow_mini_set_state(struct vidow_view *view, enum vidow_mini_state state) 
 	if (state == VIDOW_MINI_NONE) {
 		view->mini = VIDOW_MINI_NONE;
 		view->mini_edge = VIDOW_MINI_EDGE_NONE;
+		/* S3b：键位翻转是「这一次小窗」的运行时选择，还原成列就忘掉 —— 下次
+		 * 进小窗重新按 规则 > 全局键 判。 */
+		view->mini_aspect_runtime = VIDOW_MINI_ASPECT_UNSET;
 		/* 还原成列。小窗本来不属于任何工作区，先认领回自己那块屏显示着的
 		 * 工作区（屏没了就留 NULL，view_ensure_column 会安置到一块无屏的
 		 * 工作区上，屏回来时跟着认领回来）。浮窗记账不减 —— 窗口这就回列了，
@@ -1021,5 +1167,24 @@ void vidow_mini_set_state(struct vidow_view *view, enum vidow_mini_state state) 
 		view->float_geom.x, view->float_geom.y,
 		view->mini_ax, view->mini_ay,
 		view->output != NULL ? view->output->name : "-");
+	if (state == VIDOW_MINI_FREE) {
+		/* S3b：把「这一级算出来的宽高比策略」说清楚 —— 用户报「设了 PAspect 的
+		 * 游戏还是锁着 / 没锁」时，这一行能直接看出是哪一级（键位 / 规则 /
+		 * 全局键）说了算、自动信号有没有被读到。 */
+		int anum = 0, aden = 0;
+		double aratio = 0.0;
+		bool alock = vidow_mini_aspect_lock(view, &aratio);
+		bool ahint = vidow_view_aspect_hint(view, &anum, &aden);
+		wlr_log(WLR_INFO, "mini: %s 宽高比 有效值=%s（键位 %s / 规则 %s / 全局 %s），"
+			"PAspect=%s，min==max=%s → %s（比值 %.4f）",
+			vidow_view_title(view) != NULL ? vidow_view_title(view) : "?",
+			vidow_mini_aspect_name(vidow_mini_aspect_effective(view)),
+			vidow_mini_aspect_name(view->mini_aspect_runtime),
+			vidow_mini_aspect_name(view->mini_aspect_rule),
+			server->config.mini_aspect,
+			ahint ? "有" : "没有",
+			vidow_view_fixed_size_hint(view, &anum, &aden) ? "有" : "没有",
+			alock ? "锁" : "不锁", aratio);
+	}
 	vidow_ipc_emit_window(server, "window-mini-changed", view);
 }

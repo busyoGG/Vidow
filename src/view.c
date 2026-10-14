@@ -1854,8 +1854,39 @@ static void view_anim_place(struct vidow_view *view) {
 			view_mini_native(view, &nw, &nh);
 			int dw = (int)lround((double)nw * ms);
 			int dh = (int)lround((double)nh * ms);
-			wlr_scene_buffer_set_dest_size(mini_src, dw > 0 ? dw : 1,
-				dh > 0 ? dh : 1);
+			if (dw < 1) {
+				dw = 1;
+			}
+			if (dh < 1) {
+				dh = 1;
+			}
+			if (!view->mini_scaled) {
+				/* 记下「还没居中之前内容节点在它父节点里的位置」：xdg 的窗口
+				 * 几何留白（CSD 阴影那圈）有可能是 wlroots 设在这一层的，退出
+				 * 缩放态时要还原成它。 */
+				view->mini_base_dx = mini_src->node.x;
+				view->mini_base_dy = mini_src->node.y;
+			}
+			wlr_scene_buffer_set_dest_size(mini_src, dw, dh);
+			/* S3b：内容在盒子里**居中** —— contain 留出来的信件箱两边平分。
+			 * 以前是左上对齐（内容贴着盒子左上角，留白全堆在右下），FREE 盒
+			 * 里「看着是内容中间」的那一点其实落在留白上，点不着。
+			 *
+			 * 相对的是 scene_tree（盒子原点），所以要把父节点那一层的偏移
+			 * （xdg 的窗口几何）减掉：两种留白挂在哪一层都算得对。
+			 *
+			 * 每帧重设（跟 dst 一样）：wlroots 每次 commit 会把节点位置按自己
+			 * 的规则重算一遍，我们排在它的监听器后面，重设才留得住。 */
+			int vx = 0, vy = 0, px = 0, py = 0;
+			wlr_scene_node_coords(&view->scene_tree->node, &vx, &vy);
+			if (mini_src->node.parent != NULL) {
+				wlr_scene_node_coords(&mini_src->node.parent->node, &px, &py);
+			}
+			int off_x = view->mini_base_dx +
+				(view->float_geom.width - dw) / 2 - (px - vx);
+			int off_y = view->mini_base_dy +
+				(view->float_geom.height - dh) / 2 - (py - vy);
+			wlr_scene_node_set_position(&mini_src->node, off_x, off_y);
 			view->mini_scaled = true;
 		} else if (view->mini_scaled) {
 			/* 退出小窗（或者关掉了保留）：把节点还原成原生尺寸，并重记一次
@@ -1863,6 +1894,9 @@ static void view_anim_place(struct vidow_view *view) {
 			 * base_dst_* 会一直停在进小窗之前那一版（X11 那边下一步就
 			 * commit 重记了，这里补的是「不 commit 也要对」）。 */
 			view->mini_scaled = false;
+			/* 居中偏移一起撤掉（位置还原成进缩放态之前那一版）。 */
+			wlr_scene_node_set_position(&mini_src->node, view->mini_base_dx,
+				view->mini_base_dy);
 			if (view->kind == VIDOW_VIEW_X11) {
 				vidow_view_x11_scale(view);
 			} else {
@@ -2006,10 +2040,23 @@ void vidow_view_anim_bake(struct vidow_view *view) {
 	 * 副作用只有一个：ov < 0.98 会关掉这一次渲染的底衬模糊 —— 缩到几十像素的
 	 * 小窗本来也不该叠一层按原尺寸算的模糊（overview / MRU 缩略图同理）。 */
 	double fx_ov = ov * view_mini_scale(view);
+	/* 小窗（S3b）：装饰那条路也要**居中**。装饰节点画的是「内容」这一块
+	 * （节点原点 = 内容左上角，见 fx.c 的 node_x = x - pad_ov），x/y 传的就是
+	 * 内容相对窗口树原点的偏移 —— 留白两边平分才和表面那条路一致（不传的话
+	 * 装饰会把内容画在盒子左上角，表面节点缩在中间也看不见）。
+	 *
+	 * 只在保留原生分辨率（mini_scaled）时有非零值：那正是盒子比内容大的时候。 */
+	int mini_cx = 0, mini_cy = 0;
+	if (view->mini_scaled) {
+		mini_cx = (int)lround(((double)view->float_geom.width -
+			(double)geo.w * fx_ov) / 2.0);
+		mini_cy = (int)lround(((double)view->float_geom.height -
+			(double)geo.h * fx_ov) / 2.0);
+	}
 	int64_t bake_t0 = vidow_now_ns();
-	bool fx_drawn = vidow_fx_frame(view->server, &view->fx, src, &geo, 0, 0,
-		x, y, alpha, view->server->focused == view, view->fullscreen,
-		view_scale(view) * fx_ov, fx_ov, &view->rule_eff);
+	bool fx_drawn = vidow_fx_frame(view->server, &view->fx, src, &geo,
+		mini_cx, mini_cy, x, y, alpha, view->server->focused == view,
+		view->fullscreen, view_scale(view) * fx_ov, fx_ov, &view->rule_eff);
 	/* 探针：整块窗口那么大的离屏渲染一共多少钱（见统计行的「重烘」；次数由
 	 * vidow_fx_frame 的 vidow_stats.bakes 记）。拖动 / 滚动动画里每个在动的
 	 * 窗口每帧都要烘一次，所以这项随窗口数线性涨。 */
@@ -4927,6 +4974,37 @@ static bool x11_has_fixed_size(const struct wlr_xwayland_surface *x) {
 		hints->min_height == hints->max_height;
 }
 
+/* X11 客户端声明的宽高比（WM_NORMAL_HINTS 的 PAspect）。num/den 就是 w/h。
+ *
+ * min_aspect 与 max_aspect 都设了、且相等，才算「一个确定的比值」—— 只设一边
+ * 是「不小于 / 不大于」的区间，那不是锁定（ICCCM 的语义）。**vidow 以前完全没
+ * 读这个字段**，S3b 才加上（见计划 §11.3）。
+ *
+ * Wayland 协议里没有对应物（xdg-shell 只有 min/max 尺寸，没有比例提示），所以
+ * 非 X11 恒返回 false —— 那边的 auto 等同 free。 */
+bool vidow_view_aspect_hint(const struct vidow_view *view, int *num, int *den) {
+	if (view == NULL || view->kind != VIDOW_VIEW_X11 || view->x11 == NULL) {
+		return false;
+	}
+	const xcb_size_hints_t *hints = view->x11->size_hints;
+	if (hints == NULL ||
+			(hints->flags & XCB_ICCCM_SIZE_HINT_P_ASPECT) == 0) {
+		return false;
+	}
+	if (hints->min_aspect_num <= 0 || hints->min_aspect_den <= 0 ||
+			hints->max_aspect_num <= 0 || hints->max_aspect_den <= 0) {
+		return false;
+	}
+	/* 交叉相乘比：整数除法会把 16/9 和 16/10 判成同一个。 */
+	if ((long)hints->min_aspect_num * hints->max_aspect_den !=
+			(long)hints->max_aspect_num * hints->min_aspect_den) {
+		return false;
+	}
+	*num = hints->min_aspect_num;
+	*den = hints->min_aspect_den;
+	return true;
+}
+
 /* 客户端声明的固定尺寸，逻辑单位。 */
 bool vidow_view_fixed_size_hint(const struct vidow_view *view, int *w, int *h) {
 	if (view->kind == VIDOW_VIEW_X11) {
@@ -5254,6 +5332,10 @@ static void x11_set_size_hints(struct wl_listener *listener, void *data) {
 	struct vidow_view *view =
 		wl_container_of(listener, view, x11_set_size_hints);
 	vidow_float_update_mode(view);
+	/* S3b：这条信号不只带 min/max 尺寸，也带 PAspect（宽高比）—— 客户端常常
+	 * **映射之后**才设它（游戏进全屏那一刻），所以锁比例必须在这儿重判一次，
+	 * 而不是只在建 view 时读一遍。 */
+	vidow_mini_aspect_changed(view);
 }
 
 static void x11_request_configure(struct wl_listener *listener, void *data) {

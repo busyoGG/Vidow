@@ -1291,6 +1291,28 @@ bool vidow_action_run(struct vidow_server *server, const char *action) {
 		}
 		return vidow_view_toggle_minimized(server->focused);
 	}
+	if (strcmp(name, "toggle-mini-aspect") == 0) {
+		/* 小窗（S3b，计划 §11.3 的「逃生口」）：把当前自由小窗的锁 / 不锁翻过来，
+		 * **只作用于运行时**，不写回配置（vidowmsg config mini_aspect 照旧）。
+		 * 优先级最高的一级：键位 > 窗口规则 > 全局键 —— 自动判错时一键纠正。
+		 *
+		 * 也走 IPC（vidowmsg action toggle-mini-aspect），测试用得上。 */
+		struct vidow_view *view = server->focused;
+		if (view == NULL || view->mini != VIDOW_MINI_FREE) {
+			wlr_log(WLR_ERROR, "toggle-mini-aspect: 当前没有自由小窗"
+				"（迷你 / 图标态永远按内容比例，不受这个键影响）");
+			return false;
+		}
+		double ratio = 0.0;
+		bool locked = vidow_mini_aspect_lock(view, &ratio);
+		view->mini_aspect_runtime = locked ? VIDOW_MINI_ASPECT_FREE :
+			VIDOW_MINI_ASPECT_LOCK;
+		wlr_log(WLR_INFO, "mini: %s 键位翻转宽高比 → %s（不写回配置）",
+			vidow_view_title(view) != NULL ? vidow_view_title(view) : "?",
+			vidow_mini_aspect_name(view->mini_aspect_runtime));
+		vidow_ipc_emit_window(server, "window-mini-changed", view);
+		return true;
+	}
 	if (strcmp(name, "mousemove") == 0) {
 		/* 光标走到哪儿，哪块屏就是「聚焦的屏」—— 特殊工作区跟随激活的屏就靠它。 */
 		struct wlr_output *output = wlr_output_layout_output_at(

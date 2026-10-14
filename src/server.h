@@ -1425,6 +1425,13 @@ struct vidow_view {
 	 * view_mini_scale / view_anim_place）。退出小窗 / 关掉保留之后要还原成原生
 	 * 尺寸，这个标志就是「该不该还原」。 */
 	bool mini_scaled;
+	/* 小窗（S3b）：内容居中用的原始偏移 —— 进缩放态那一刻记下内容节点在它父节点
+	 * 里的位置（xdg 的窗口几何留白有可能是 wlroots 设在这一层的），居中偏移加在
+	 * 它上面、退出缩放态时还原成它。见 view.c 的 view_anim_place。 */
+	int mini_base_dx, mini_base_dy;
+	/* 小窗（S3b）：运行时键位覆盖（toggle-mini-aspect）。UNSET = 没按过。
+	 * 有效值 = 键位 > 窗口规则 > 全局键，见 vidow_mini_aspect_effective()。 */
+	enum vidow_mini_aspect mini_aspect_runtime;
 	/* 上次记「缓冲区多大 / 几倍」日志时的值：每个 commit 都刷一行没意义。 */
 	int logged_scale;
 	int logged_buf_w;
@@ -3457,6 +3464,17 @@ const char *vidow_mini_state_name(enum vidow_mini_state state);
 /* "auto" / "lock" / "free" <- 文本。返回 NULL = 不认识。 */
 const char *vidow_mini_aspect_name(enum vidow_mini_aspect aspect);
 bool vidow_mini_parse_aspect(const char *text, enum vidow_mini_aspect *out);
+/* S3b：宽高比的**有效值** —— 键位（运行时）> 窗口规则 > 全局键，三级都是显式
+ * 选择（auto 也是「我选择按自动信号走」）。判策略只有这一个出口，别散在各处。 */
+enum vidow_mini_aspect vidow_mini_aspect_effective(const struct vidow_view *view);
+/* S3b：这个窗口现在锁不锁宽高比；锁的话把比值（w/h）写到 *ratio。只有自由小窗
+ * （FREE）看它 —— 迷你 / 图标态永远按内容比例显示（contain），不给逃生口。 */
+bool vidow_mini_aspect_lock(const struct vidow_view *view, double *ratio);
+/* S3b：客户端的比例信号变了（X11 后来才设 PAspect）时的重判点。 */
+void vidow_mini_aspect_changed(struct vidow_view *view);
+/* S3b：X11 客户端声明的宽高比（WM_NORMAL_HINTS 的 PAspect，num/den = w/h）。
+ * 只设了一边（区间）不算。Wayland 协议没有对应物 —— 那边恒返回 false。 */
+bool vidow_view_aspect_hint(const struct vidow_view *view, int *num, int *den);
 void vidow_float_detach_children(struct vidow_server *server,
 		struct vidow_view *dying);
 /* from_client = 客户端自己发起的（CSD 标题栏拖拽 / _NET_WM_MOVERESIZE）：它的
