@@ -699,6 +699,17 @@ void vidow_float_end_grab(struct vidow_server *server) {
 		return;
 	}
 
+	/* 小窗（S5）甩出：自由小窗（也是小窗三态里唯一走浮窗拖拽那条路的）被
+	 * **甩**出去 → 按速度方向收成图标 / 换屏。放在落点判定之前：甩出去的那
+	 * 一下速度就是意图，不该再拿「光标现在停在哪」去判。 */
+	if (view->mini != VIDOW_MINI_NONE) {
+		double vx = 0.0, vy = 0.0;
+		if (vidow_mini_fling_velocity(server, &vx, &vy) &&
+				vidow_mini_fling(server, view, vx, vy)) {
+			return;
+		}
+	}
+
 	/* 小窗（S4）：迷你 / 图标的形态拖拽（input.c 的 mini_grab_*）和浮窗拖拽
 	 * 共用同一套落点判据 —— 内边缘收图标、跨屏边换屏保持形态。普通浮窗
 	 * （mini == NONE）走这儿什么都没发生。 */
@@ -912,6 +923,176 @@ bool vidow_mini_drag_finish(struct vidow_server *server,
 		vidow_view_title(view) != NULL ? vidow_view_title(view) : "?",
 		edge == VIDOW_MINI_EDGE_LEFT ? "左" : edge == VIDOW_MINI_EDGE_RIGHT ?
 			"右" : edge == VIDOW_MINI_EDGE_TOP ? "上" : "下");
+	vidow_mini_set_state(view, VIDOW_MINI_ICON);
+	return true;
+}
+
+/* -------------------------------------------------- 甩出（mini fling，S5）
+ *
+ * 用户要的「像安卓那样惯性甩出」：把迷你小窗快速甩向边缘 → 飞过去收成图标，
+ * 不用慢慢拖到底。三条设计决定：
+ *
+ *  1) **速度按最近 ~100ms 的采样算**（8 格采样环，vidow_pointer_motion 每帧推
+ *     一格），不是单帧增量 —— 单帧增量在高刷新率下小得量不出意图、在低刷新率
+ *     下抖得离谱。至少 3 个点、且最后一点离松手不超过 80ms 才算数（指针停住
+ *     一会儿再松手不是甩）。
+ *  2) **方向取最近的那条边**（±45° 容差：横向速度占优就取左 / 右边）。落点
+ *     判据沿用已定的那条：那条边外侧有相邻输出 → 换屏保持形态；没有 → 收成
+ *     图标贴那条边。
+ *  3) **不做真物理**：时长由速度推（越快越短，夹在 110ms..mini_transition_ms），
+ *     位置曲线照旧 out_cubic（单调、**不过冲**）—— 边缘是吸附目标，不是自由
+ *     物体的落点，越界再弹回来是错的。
+ */
+void vidow_mini_fling_sample(struct vidow_server *server, double x, double y) {
+	if (server == NULL) {
+		return;
+	}
+	for (int i = 1; i < 8; i++) {
+		server->mini_fling_pts[i - 1] = server->mini_fling_pts[i];
+	}
+	server->mini_fling_pts[7].x = x;
+	server->mini_fling_pts[7].y = y;
+	server->mini_fling_pts[7].ns = vidow_now_ns();
+	if (server->mini_fling_n < 8) {
+		server->mini_fling_n++;
+	}
+}
+
+bool vidow_mini_fling_velocity(struct vidow_server *server, double *vx,
+		double *vy) {
+	if (server == NULL || server->mini_fling_n < 3) {
+		return false;
+	}
+	int n = server->mini_fling_n;
+	/* 采样环永远是「最新的那一格在 [7]、往前依次更早」：有效的是
+	 * [8-n .. 7]，别拿 n-1 当末尾（那是「环形缓冲从头读」的写法，这里不是）。 */
+	int last = 7;
+	int oldest = 8 - n;
+	if (vidow_now_ns() - server->mini_fling_pts[last].ns > 80000000LL) {
+		return false;
+	}
+	int first = last;
+	for (int i = last; i >= oldest; i--) {
+		if (server->mini_fling_pts[last].ns -
+				server->mini_fling_pts[i].ns > 100000000LL) {
+			break;
+		}
+		first = i;
+	}
+	int64_t dt = server->mini_fling_pts[last].ns -
+		server->mini_fling_pts[first].ns;
+	if (dt < 20000000LL) {
+		return false;
+	}
+	double secs = (double)dt / 1e9;
+	*vx = (server->mini_fling_pts[last].x -
+		server->mini_fling_pts[first].x) / secs;
+	*vy = (server->mini_fling_pts[last].y -
+		server->mini_fling_pts[first].y) / secs;
+	return true;
+}
+
+/* 速度方向最近的那条边（±45° 容差）。 */
+static enum vidow_mini_edge fling_edge(double vx, double vy) {
+	double ax = fabs(vx), ay = fabs(vy);
+	if (ax == 0.0 && ay == 0.0) {
+		return VIDOW_MINI_EDGE_NONE;
+	}
+	if (ax >= ay) {
+		return vx > 0.0 ? VIDOW_MINI_EDGE_RIGHT : VIDOW_MINI_EDGE_LEFT;
+	}
+	return vy > 0.0 ? VIDOW_MINI_EDGE_BOTTOM : VIDOW_MINI_EDGE_TOP;
+}
+
+bool vidow_mini_fling(struct vidow_server *server, struct vidow_view *view,
+		double vx, double vy) {
+	if (server == NULL || view == NULL || view->popup ||
+			view->mini == VIDOW_MINI_NONE) {
+		return false;
+	}
+	int threshold = server->config.mini_fling_speed;
+	if (threshold <= 0) {
+		return false;
+	}
+	double speed = hypot(vx, vy);
+	if (speed < (double)threshold) {
+		return false;
+	}
+	enum vidow_mini_edge edge = fling_edge(vx, vy);
+	if (edge == VIDOW_MINI_EDGE_NONE) {
+		return false;
+	}
+	/* 时长：越快越短。180000/speed 在 800px/s（阈值）时是 225ms、1600px/s 时
+	 * 是 112ms；夹在 [110, mini_transition_ms] —— 再快也得看得见那一下，
+	 * 再慢也不比普通转换更久（它是「甩」，不是「慢慢飞」）。 */
+	int ms = (int)lround(180000.0 / speed);
+	int cap = server->config.mini_transition_ms;
+	if (cap <= 0) {
+		cap = 260;
+	}
+	if (ms > cap) {
+		ms = cap;
+	}
+	if (ms < 110) {
+		ms = 110;
+	}
+
+	struct wlr_output *across =
+		vidow_mini_output_across(server, view->output, edge);
+	if (across != NULL) {
+		/* 跨屏边：换屏、保持形态（锚点是比例，位置天然对得上）。 */
+		wlr_log(WLR_INFO, "mini fling: %s 以 %.0f px/s 甩向 %s 边（外侧是 %s）"
+			"→ 换屏保持 %s，%dms",
+			vidow_view_title(view) != NULL ? vidow_view_title(view) : "?",
+			speed,
+			edge == VIDOW_MINI_EDGE_LEFT ? "左" :
+				edge == VIDOW_MINI_EDGE_RIGHT ? "右" :
+				edge == VIDOW_MINI_EDGE_TOP ? "上" : "下",
+			across->name, vidow_mini_state_name(view->mini), ms);
+		server->mini_transition_override_ms = ms;
+		vidow_mini_move_to_output(server, view, across);
+		return true;
+	}
+
+	/* 内边缘：收成图标，贴这条边 —— 沿边的那一轴按窗口**现在**的位置记锚点
+	 * （甩出去的那一下不该把图标挪到屏幕另一头）。 */
+	struct wlr_box work = vidow_work_area(server, view->output);
+	if (work.width > 0 && work.height > 0) {
+		int iw = server->config.mini_icon_size;
+		double span_x = (double)(work.width - iw);
+		double span_y = (double)(work.height - iw);
+		double cx = view->float_geom.x + view->float_geom.width / 2.0;
+		double cy = view->float_geom.y + view->float_geom.height / 2.0;
+		if (edge == VIDOW_MINI_EDGE_LEFT || edge == VIDOW_MINI_EDGE_RIGHT) {
+			view->mini_ax = edge == VIDOW_MINI_EDGE_LEFT ? 0.0 : 1.0;
+			view->mini_ay = span_y > 1.0 ?
+				(cy - iw / 2.0 - (double)work.y) / span_y : 0.0;
+		} else {
+			view->mini_ay = edge == VIDOW_MINI_EDGE_TOP ? 0.0 : 1.0;
+			view->mini_ax = span_x > 1.0 ?
+				(cx - iw / 2.0 - (double)work.x) / span_x : 0.0;
+		}
+		if (view->mini_ax < 0.0) {
+			view->mini_ax = 0.0;
+		} else if (view->mini_ax > 1.0) {
+			view->mini_ax = 1.0;
+		}
+		if (view->mini_ay < 0.0) {
+			view->mini_ay = 0.0;
+		} else if (view->mini_ay > 1.0) {
+			view->mini_ay = 1.0;
+		}
+	}
+	view->mini_edge = edge;
+	wlr_log(WLR_INFO, "mini fling: %s 以 %.0f px/s 甩向 %s 边（内边缘）→ 收成"
+		"图标，%dms",
+		vidow_view_title(view) != NULL ? vidow_view_title(view) : "?",
+		speed,
+		edge == VIDOW_MINI_EDGE_LEFT ? "左" :
+			edge == VIDOW_MINI_EDGE_RIGHT ? "右" :
+			edge == VIDOW_MINI_EDGE_TOP ? "上" : "下",
+		ms);
+	server->mini_transition_override_ms = ms;
 	vidow_mini_set_state(view, VIDOW_MINI_ICON);
 	return true;
 }
@@ -1342,6 +1523,138 @@ void vidow_mini_resolve_geom(struct vidow_view *view) {
 	view->float_geom.height = h;
 }
 
+/* ------------------------------------------ 形态转换的过渡动画（S5，§1.4）
+ *
+ * 两条硬规矩，写在这儿当注释钉住：
+ *
+ *  1) **起点严格取「上一帧画在哪」**：`geom + anim_off`，和 view.c 的
+ *     `vidow_place_view()` 里算 drawn_x/drawn_y 的那两行**完全同源**，而且
+ *     必须在**改几何之前**取（下面 set_state 第一行就是它）。起点存成
+ *     「起点 − 目标」的常量差值，update() 里**绝不重读 view->geom** ——
+ *     转换中途夹着 arrange，geom 会被改写，重读 = 起点漂移。
+ *     `daeba31` 的教训（计划 §1.4 引了原文）：那次用「起点落在输出框里就推到
+ *     框的一侧」这种推断，正常滚动时也命中 → 每滚一列窗口都从屏幕外飞入。
+ *     这里**不做任何推断**：起点是什么就是什么，哪怕它在屏外。
+ *
+ *  2) **位置曲线一律单调**（out_cubic），`out_back` 只用在**缩放**上 ——
+ *     「中间帧位置单调」因此是构造性保证，测试不用给过冲开例外。
+ *
+ * 位置 / 缩放都走现成的 anim_off_x/anim_off_y 与 anim_scale（view_anim_place
+ * 每帧读它们，fx.c 按窗口中心缩放），不新造第二条摆放管线。
+ */
+static const struct vidow_ease MINI_POS_EASE = {
+	.kind = VIDOW_EASE_OUT_CUBIC,
+};
+
+static void mini_anim_apply(struct vidow_view *view, double t, double ts) {
+	/* t = 位置进度（单调曲线），ts = 缩放进度（可能过冲）。 */
+	view->anim_off_x = view->mini_from_dx * (1.0 - t);
+	view->anim_off_y = view->mini_from_dy * (1.0 - t);
+	double s = 1.0 + (view->mini_scale_from - 1.0) * (1.0 - ts);
+	if (s < 0.01) {
+		s = 0.01;
+	}
+	view->anim_scale = s;
+	vidow_view_apply_anim(view);
+	wlr_log(WLR_DEBUG, "mini anim: %s t=%.3f 画在 %d,%d（偏移 %.1f,%.1f）缩放 %.3f",
+		vidow_view_title(view) != NULL ? vidow_view_title(view) : "?",
+		t, view->geom.x + (int)lround(view->anim_off_x),
+		view->geom.y + (int)lround(view->anim_off_y),
+		view->anim_off_x, view->anim_off_y, view->anim_scale);
+}
+
+static void mini_anim_update(void *data, double t, double linear) {
+	struct vidow_view *view = data;
+	mini_anim_apply(view, t,
+		vidow_ease_value(&view->mini_scale_ease, linear));
+}
+
+static void mini_anim_done(void *data, bool cancelled) {
+	struct vidow_view *view = data;
+	view->mini_anim = NULL;
+	if (!cancelled) {
+		/* 收尾：偏移归零、缩放归 1 —— 不归零的话窗口会永远画在差一点的地方。 */
+		view->anim_off_x = 0.0;
+		view->anim_off_y = 0.0;
+		view->anim_scale = 1.0;
+	}
+	vidow_view_apply_anim(view);
+}
+
+/* 形态转换的收口（set_state 的最后一步）：起点 `from` 是**改几何之前**取的
+ * 「上一帧画在哪」，view->geom 这时已经是这一趟 arrange 摆出来的目标盒。 */
+static void mini_transition_start(struct vidow_view *view,
+		const struct wlr_box *from) {
+	struct vidow_server *server = view->server;
+	/* 上一趟还在飞就被打断了：先掐掉（cancelled 那条不清偏移 —— 新的这条
+	 * 紧接着会把偏移重写成新起点，中途不清才不会闪）。 */
+	vidow_anim_cancel(view->mini_anim);
+	view->mini_anim = NULL;
+	/* arrange 里 vidow_place_view 起的那条普通位移补间让位（它用的是
+	 * window_move_ms 和全局曲线，也不动缩放）。 */
+	vidow_anim_cancel(view->anim_move);
+	view->anim_move = NULL;
+
+	int ms = server->config.mini_transition_ms;
+	/* 甩出：时长由速度推出来（越快越短），一次性的覆盖，读完就清 —— 不覆盖
+	 * 配置键，也不留在下一次转换上。 */
+	if (server->mini_transition_override_ms > 0) {
+		ms = server->mini_transition_override_ms;
+		server->mini_transition_override_ms = 0;
+	}
+	double dx = (double)(from->x - view->geom.x);
+	double dy = (double)(from->y - view->geom.y);
+	double area_from = (double)from->width * (double)from->height;
+	double area_to = (double)view->geom.width * (double)view->geom.height;
+	double scale_from = (area_from > 0.0 && area_to > 0.0) ?
+		sqrt(area_from / area_to) : 1.0;
+	if (ms <= 0 || (dx == 0.0 && dy == 0.0 &&
+			fabs(scale_from - 1.0) < 0.01)) {
+		view->anim_off_x = 0.0;
+		view->anim_off_y = 0.0;
+		view->anim_scale = 1.0;
+		vidow_view_apply_anim(view);
+		return;
+	}
+
+	view->mini_from_dx = dx;
+	view->mini_from_dy = dy;
+	view->mini_scale_from = scale_from;
+	/* 缩放曲线：**变大**（展开）给一点回弹（out_back，幅度取全局
+	 * back_overshoot 反解出来的常数）；变小用 out_cubic 收住。位置永远是
+	 * out_cubic —— 见本节顶上第 2 条。 */
+	bool expanding = area_from < area_to;
+	if (expanding) {
+		double c1 = vidow_ease_out_back_c1(server->config.back_overshoot);
+		view->mini_scale_ease = (struct vidow_ease){
+			.kind = VIDOW_EASE_OUT_BACK, .back_c1 = c1,
+		};
+	} else {
+		view->mini_scale_ease = (struct vidow_ease){
+			.kind = VIDOW_EASE_OUT_CUBIC,
+		};
+	}
+
+	/* 先把 t = 0 那一帧摆出来（第一帧就必须画在起点，不能等下一次 tick ——
+	 * 判据 19 查的就是这个）。 */
+	mini_anim_apply(view, 0.0, 0.0);
+	view->mini_anim = vidow_anim_start(server, "mini-transition", ms,
+		MINI_POS_EASE, mini_anim_update, mini_anim_done, view);
+	if (view->mini_anim == NULL) {
+		view->anim_off_x = 0.0;
+		view->anim_off_y = 0.0;
+		view->anim_scale = 1.0;
+		vidow_view_apply_anim(view);
+		return;
+	}
+	wlr_log(WLR_INFO, "mini: 过渡动画 %s → 起点 %d,%d（%.1f,%.1f 偏移）→ "
+		"目标 %d,%d %dx%d，缩放 %.3f → 1，%dms",
+		vidow_view_title(view) != NULL ? vidow_view_title(view) : "?",
+		from->x, from->y, dx, dy,
+		view->geom.x, view->geom.y, view->geom.width, view->geom.height,
+		scale_from, ms);
+}
+
 void vidow_mini_set_state(struct vidow_view *view, enum vidow_mini_state state) {
 	if (view == NULL || view->popup) {
 		return;
@@ -1351,6 +1664,13 @@ void vidow_mini_set_state(struct vidow_view *view, enum vidow_mini_state state) 
 	if (old == state) {
 		return;
 	}
+	/* 过渡动画的起点：**改几何之前**的「上一帧画在哪」（§1.4 第 1 条）。 */
+	struct wlr_box from = {
+		.x = view->geom.x + (int)lround(view->anim_off_x),
+		.y = view->geom.y + (int)lround(view->anim_off_y),
+		.width = view->geom.width,
+		.height = view->geom.height,
+	};
 
 	/* S2：迷你 / 图标**不接键盘**，所以进这两个态之前先把焦点交出去（规矩照抄
 	 * 最小化那条：位置不动，谁滑到空出来的位置就是谁）。必须在下面
@@ -1363,6 +1683,9 @@ void vidow_mini_set_state(struct vidow_view *view, enum vidow_mini_state state) 
 	 * 盒子算的，留着会画在一个已经不在那儿的窗口旁边）。下一次指针动会重新
 	 * 露出来。 */
 	vidow_mini_toolbar_hide(server);
+	/* 小窗（S5）：形态一变，悬停预览也收掉（预览画的是**上一个**形态旁边的
+	 * 那块，留着会停在已经不在那儿的图标旁边）。 */
+	vidow_mini_preview_hide(server);
 	/* 键位动作用的指认（迷你 / 图标态不拿键盘焦点，server->focused 指不到）。 */
 	if (state != VIDOW_MINI_NONE) {
 		server->mini_last_id = view->id;
@@ -1382,6 +1705,9 @@ void vidow_mini_set_state(struct vidow_view *view, enum vidow_mini_state state) 
 			view->ws = vidow_workspace_shown_for(server, view->output);
 		}
 		vidow_float_set_mode(view, VIDOW_FLOAT_NONE);
+		/* S5：接回条带也走过渡动画（目标盒是 join_layout 算出来的条带位置，
+		 * 上面那次 arrange 已经把它摆进 geom 了）。 */
+		mini_transition_start(view, &from);
 		wlr_log(WLR_INFO, "mini: %s 还原成列（从 %s）",
 			vidow_view_title(view) != NULL ? vidow_view_title(view) : "?",
 			vidow_mini_state_name(old));
@@ -1466,5 +1792,8 @@ void vidow_mini_set_state(struct vidow_view *view, enum vidow_mini_state state) 
 			vidow_view_fixed_size_hint(view, &anum, &aden) ? "有" : "没有",
 			alock ? "锁" : "不锁", aratio);
 	}
+	/* S5：进小窗 / 三态互切 —— 上面那次 arrange 已经把目标盒摆进 geom 了，
+	 * 这里起过渡动画（起点是进函数时取的「上一帧画在哪」）。 */
+	mini_transition_start(view, &from);
 	vidow_ipc_emit_window(server, "window-mini-changed", view);
 }

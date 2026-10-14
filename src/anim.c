@@ -116,6 +116,12 @@ static double ease(const struct vidow_ease *ease, double t) {
 	return t;
 }
 
+/* 一条 anim 里要用第二条曲线（小窗转换：位置单调、缩放可过冲）时用这个取，
+ * 别为第二条曲线再起一条 anim —— 两条 anim 会多出两个生命周期要收。 */
+double vidow_ease_value(const struct vidow_ease *curve, double t) {
+	return ease(curve, t);
+}
+
 struct vidow_anim *vidow_anim_start(struct vidow_server *server,
 		const char *tag, int duration_ms, struct vidow_ease easing,
 		void (*update)(void *data, double t, double linear),

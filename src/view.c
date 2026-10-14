@@ -2371,6 +2371,17 @@ void vidow_place_view(struct vidow_view *view, int x, int y, int w, int h) {
 		return;
 	}
 
+	/* 小窗（mini window，S5）形态转换正跑着：位置 / 缩放归那条补间管 ——
+	 * 它的起点是「上一帧画在哪」（float.c 的 mini_transition_start），这里只
+	 * 更新 geom 并把节点摆出去。**绝不能把 anim_off 清零 / 起位移补间**：
+	 * 清零等于中间帧瞬移到终点（判据 18 量的是这个）。 */
+	if (view->mini_anim != NULL) {
+		vidow_anim_cancel(view->anim_move);
+		view->anim_move = NULL;
+		vidow_view_apply_anim(view);
+		return;
+	}
+
 	if (!view->placed) {
 		view->placed = true;
 		view->anim_off_x = 0.0;
@@ -3577,6 +3588,362 @@ void vidow_view_yield_focus_for_mini(struct vidow_view *view) {
 		vidow_view_title(view) != NULL ? vidow_view_title(view) : "(无题)");
 }
 
+/* ================================== 小窗（mini window，S5）：图标悬停预览
+ *
+ * 悬停图标 mini_icon_hover_ms 之后，在**朝屏内**那一侧展开一块迷你尺寸 ×0.8 的
+ * **实时预览**（图标本身贴边、有一部分在屏外，朝屏外展开会被裁掉一半）。
+ *
+ * 三条规矩：
+ *  1) **只读**：不抢 pointer focus、不进 MRU、不拿键盘焦点、不参与
+ *     vidow_view_at 命中 —— 它是**信息**不是窗口（指针扫过屏幕边缘就把键盘焦点
+ *     从正在打字的窗口上拽走是不能接受的）。命中和焦点这两条是**构造性**的：
+ *     预览挂在 layer_toplevels 里、节点没有 view tag，vidow_view_at 走的是
+ *     「节点 → view」那条映射，认不出它。
+ *  2) **但吞点击**：指针底下有一块「像窗口的东西」，点下去却激活**背后的**窗口
+ *     是明显的错。吞掉最省事，也不引入「预览能不能操作」这个新问题。
+ *  3) **渲染用同一张表面的第二份**（wlr_scene_subsurface_tree_create，先例
+ *     wincapture.c:676）—— 不另造一套抓帧 / 上屏管线，客户端出一帧预览就跟着动。
+ *
+ * 时间轴（用 vidow_anim_start 当定时器，不新开 timer —— 它自己会 kick watchdog
+ * 保证「就算后端不给帧事件帧也照出」）：延迟 hover_ms → 出；不在图标也不在预览
+ * → 离开 leave_ms → 收；**指针进到预览矩形里就把计时清掉**（这就是宽限期：
+ * 从图标移到预览要跨那 8px 空隙，不给宽限会闪一下再回来）。
+ */
+
+/* 镜面树里那层内容节点（wlr_scene_subsurface_tree_create 建的第一层就是它；
+ * 子表面另外挂。和 capturemask.c 的写法一致）。 */
+static struct wlr_scene_surface *preview_find_surface(
+		struct wlr_scene_tree *tree) {
+	if (tree == NULL) {
+		return NULL;
+	}
+	struct wlr_scene_node *node;
+	wl_list_for_each(node, &tree->children, link) {
+		if (node->type != WLR_SCENE_NODE_BUFFER) {
+			continue;
+		}
+		struct wlr_scene_surface *ss = wlr_scene_surface_try_from_buffer(
+			wlr_scene_buffer_from_node(node));
+		if (ss != NULL) {
+			return ss;
+		}
+	}
+	return NULL;
+}
+
+/* 预览那块矩形：迷你态尺寸 × 0.8，摆在图标的**朝屏内**那一侧（间距
+ * mini_edge_margin），再夹进工作区。 */
+static bool preview_box_for(struct vidow_server *server,
+		struct vidow_view *view, struct wlr_box *out) {
+	struct wlr_box work = vidow_work_area(server, view->output);
+	if (work.width < 1 || work.height < 1) {
+		return false;
+	}
+	double wpct = 28.0, hpct = 28.0;
+	const char *tw = vidow_config_get(&server->config, "mini_w");
+	const char *th = vidow_config_get(&server->config, "mini_h");
+	if (tw != NULL) {
+		vidow_config_parse_percent(tw, &wpct);
+	}
+	if (th != NULL) {
+		vidow_config_parse_percent(th, &hpct);
+	}
+	int pw = (int)lround(wpct / 100.0 * 0.8 * (double)work.width);
+	int ph = (int)lround(hpct / 100.0 * 0.8 * (double)work.height);
+	if (pw < 1) {
+		pw = 1;
+	}
+	if (ph < 1) {
+		ph = 1;
+	}
+	/* 图标「画在哪」= geom + anim_off（和 vidow_place_view 同源）。 */
+	int ix = view->geom.x + (int)lround(view->anim_off_x);
+	int iy = view->geom.y + (int)lround(view->anim_off_y);
+	int iw = view->geom.width, ih = view->geom.height;
+	int margin = server->config.mini_edge_margin;
+	if (margin < 0) {
+		margin = 0;
+	}
+	int x = 0, y = 0;
+	switch (view->mini_edge) {
+	case VIDOW_MINI_EDGE_LEFT:
+		x = ix + iw + margin;
+		y = iy + (ih - ph) / 2;
+		break;
+	case VIDOW_MINI_EDGE_RIGHT:
+		x = ix - margin - pw;
+		y = iy + (ih - ph) / 2;
+		break;
+	case VIDOW_MINI_EDGE_TOP:
+		x = ix + (iw - pw) / 2;
+		y = iy + ih + margin;
+		break;
+	case VIDOW_MINI_EDGE_BOTTOM:
+		x = ix + (iw - pw) / 2;
+		y = iy - margin - ph;
+		break;
+	case VIDOW_MINI_EDGE_NONE:
+		x = ix + iw + margin;
+		y = iy;
+		break;
+	}
+	if (x < work.x) {
+		x = work.x;
+	}
+	if (y < work.y) {
+		y = work.y;
+	}
+	if (x + pw > work.x + work.width) {
+		x = work.x + work.width - pw;
+	}
+	if (y + ph > work.y + work.height) {
+		y = work.y + work.height - ph;
+	}
+	*out = (struct wlr_box){ .x = x, .y = y, .width = pw, .height = ph };
+	return true;
+}
+
+bool vidow_mini_preview_hit(struct vidow_server *server, double lx, double ly) {
+	if (server == NULL || server->mini_preview_view == NULL ||
+			!server->mini_preview_shown) {
+		return false;
+	}
+	const struct wlr_box *b = &server->mini_preview_box;
+	return lx >= b->x && lx < b->x + b->width &&
+		ly >= b->y && ly < b->y + b->height;
+}
+
+static void preview_apply_alpha(struct vidow_server *server, double a) {
+	if (a < 0.0) {
+		a = 0.0;
+	} else if (a > 1.0) {
+		a = 1.0;
+	}
+	server->mini_preview_alpha = a;
+	if (server->mini_preview_surface != NULL) {
+		wlr_scene_buffer_set_opacity(server->mini_preview_surface->buffer,
+			(float)a);
+	}
+}
+
+static void preview_fade_update(void *data, double t, double linear) {
+	(void)linear;
+	struct vidow_server *server = data;
+	preview_apply_alpha(server, server->mini_preview_alpha_from +
+		(server->mini_preview_alpha_to - server->mini_preview_alpha_from) * t);
+}
+
+static void preview_fade_done(void *data, bool cancelled) {
+	struct vidow_server *server = data;
+	server->mini_preview_fade = NULL;
+	if (cancelled) {
+		return;
+	}
+	if (server->mini_preview_alpha_to <= 0.0) {
+		/* 淡出完：收节点、忘掉 view（节点留着复用，下次换个表面就重建）。 */
+		if (server->mini_preview != NULL) {
+			wlr_scene_node_set_enabled(&server->mini_preview->node, false);
+		}
+		server->mini_preview_view = NULL;
+		server->mini_preview_shown = false;
+		server->mini_preview_box = (struct wlr_box){0};
+	}
+}
+
+static void preview_fade_to(struct vidow_server *server, double to, int ms) {
+	vidow_anim_cancel(server->mini_preview_fade);
+	server->mini_preview_fade = NULL;
+	server->mini_preview_alpha_from = server->mini_preview_alpha;
+	server->mini_preview_alpha_to = to;
+	if (ms <= 0) {
+		preview_apply_alpha(server, to);
+		preview_fade_done(server, false);
+		return;
+	}
+	struct vidow_ease linear = { .kind = VIDOW_EASE_LINEAR };
+	server->mini_preview_fade = vidow_anim_start(server, "mini-preview-fade",
+		ms, linear, preview_fade_update, preview_fade_done, server);
+	if (server->mini_preview_fade == NULL) {
+		preview_apply_alpha(server, to);
+		preview_fade_done(server, false);
+	}
+}
+
+void vidow_mini_preview_hide(struct vidow_server *server) {
+	if (server == NULL) {
+		return;
+	}
+	vidow_anim_cancel(server->mini_hover_timer);
+	server->mini_hover_timer = NULL;
+	server->mini_hover_view = NULL;
+	server->mini_preview_pressed = false;
+	if (!server->mini_preview_shown || server->mini_preview == NULL) {
+		server->mini_preview_view = NULL;
+		server->mini_preview_shown = false;
+		server->mini_preview_box = (struct wlr_box){0};
+		return;
+	}
+	wlr_log(WLR_DEBUG, "mini preview: 收起来（%dx%d @ %d,%d）",
+		server->mini_preview_box.width, server->mini_preview_box.height,
+		server->mini_preview_box.x, server->mini_preview_box.y);
+	preview_fade_to(server, 0.0, server->config.mini_hover_fade_out_ms);
+}
+
+static void preview_show(struct vidow_server *server, struct vidow_view *view) {
+	if (server == NULL || view == NULL || server->locked ||
+			view->mini != VIDOW_MINI_ICON) {
+		return;
+	}
+	struct wlr_surface *surface = vidow_view_surface(view);
+	if (surface == NULL) {
+		return;
+	}
+	struct wlr_box box = {0};
+	if (!preview_box_for(server, view, &box)) {
+		return;
+	}
+	/* 换了窗口（或者第一次）：重建镜面 —— 同一张表面挂第二棵树是允许的
+	 * （见 wincapture.c 那段注释）。 */
+	if (server->mini_preview == NULL || server->mini_preview_view != view) {
+		if (server->mini_preview != NULL) {
+			wlr_scene_node_destroy(&server->mini_preview->node);
+			server->mini_preview = NULL;
+			server->mini_preview_surface = NULL;
+		}
+		/* 挂 layer_top（不是 layer_toplevels）：它在窗口之上、会话锁和 overview
+		 * 都会把它整棵关掉（sessionlock.c / overview.c 那两个数组），而且
+		 * **不在模糊底衬抓取 / 裁剪检查的遍历范围里**（fx.c 那两处走的是
+		 * layer_toplevels）—— 挂错地方的话，悬停预览那块镜面会被当成一个窗口
+		 * 抓进底衬里，留下一块鬼影。 */
+		server->mini_preview = wlr_scene_subsurface_tree_create(
+			server->layer_top, surface);
+		if (server->mini_preview == NULL) {
+			return;
+		}
+		server->mini_preview_surface = preview_find_surface(server->mini_preview);
+	}
+	if (server->mini_preview_surface == NULL) {
+		return;
+	}
+	/* 尺寸：contain 塞进预览盒（和 S3 的 view_mini_scale 同一条算法 —— 不拉伸、
+	 * 按内容自己的比例），居中摆。 */
+	int nw = view->base_dst_w > 0 ? view->base_dst_w : surface->current.width;
+	int nh = view->base_dst_h > 0 ? view->base_dst_h : surface->current.height;
+	int dw = box.width, dh = box.height;
+	if (nw > 0 && nh > 0) {
+		double s = (double)box.width / (double)nw;
+		double sy = (double)box.height / (double)nh;
+		if (sy < s) {
+			s = sy;
+		}
+		dw = (int)lround((double)nw * s);
+		dh = (int)lround((double)nh * s);
+		if (dw < 1) {
+			dw = 1;
+		}
+		if (dh < 1) {
+			dh = 1;
+		}
+	}
+	wlr_scene_buffer_set_dest_size(server->mini_preview_surface->buffer,
+		dw, dh);
+	wlr_scene_node_set_position(&server->mini_preview->node,
+		box.x + (box.width - dw) / 2, box.y + (box.height - dh) / 2);
+	wlr_scene_node_set_enabled(&server->mini_preview->node, true);
+	/* 压在别的窗口之上：它可能比这些窗口后建出来（新开的窗口挂在后面）。 */
+	wlr_scene_node_raise_to_top(&server->mini_preview->node);
+	server->mini_preview_view = view;
+	server->mini_preview_box = box;
+	server->mini_preview_shown = true;
+	preview_apply_alpha(server, 0.0);
+	preview_fade_to(server, 1.0, server->config.mini_hover_fade_in_ms);
+	wlr_log(WLR_INFO, "mini preview: %s 的预览在 %d,%d %dx%d（图标 %d,%d %dx%d，"
+		"贴 %s 边 → 朝屏内展开）",
+		vidow_view_title(view) != NULL ? vidow_view_title(view) : "(无题)",
+		box.x, box.y, box.width, box.height,
+		view->geom.x, view->geom.y, view->geom.width, view->geom.height,
+		view->mini_edge == VIDOW_MINI_EDGE_LEFT ? "左" :
+			view->mini_edge == VIDOW_MINI_EDGE_RIGHT ? "右" :
+			view->mini_edge == VIDOW_MINI_EDGE_TOP ? "上" :
+			view->mini_edge == VIDOW_MINI_EDGE_BOTTOM ? "下" : "（无）");
+}
+
+static void hover_timer_done(void *data, bool cancelled) {
+	struct vidow_server *server = data;
+	bool leaving = server->mini_hover_leaving;
+	struct vidow_view *view = server->mini_hover_view;
+	server->mini_hover_timer = NULL;
+	server->mini_hover_view = NULL;
+	if (cancelled) {
+		return;
+	}
+	if (leaving) {
+		vidow_mini_preview_hide(server);
+	} else {
+		preview_show(server, view);
+	}
+}
+
+static void hover_timer_start(struct vidow_server *server, int ms,
+		bool leaving, struct vidow_view *view) {
+	vidow_anim_cancel(server->mini_hover_timer);
+	server->mini_hover_timer = NULL;
+	if (ms <= 0) {
+		ms = 1;
+	}
+	server->mini_hover_leaving = leaving;
+	server->mini_hover_view = view;
+	struct vidow_ease linear = { .kind = VIDOW_EASE_LINEAR };
+	server->mini_hover_timer = vidow_anim_start(server, "mini-hover", ms,
+		linear, NULL, hover_timer_done, server);
+}
+
+void vidow_mini_preview_motion(struct vidow_server *server,
+		struct vidow_view *hit) {
+	if (server == NULL || server->cursor == NULL) {
+		return;
+	}
+	if (!server->config.mini_enabled || !server->config.mini_icon_preview) {
+		vidow_mini_preview_hide(server);
+		return;
+	}
+	struct vidow_view *icon = (hit != NULL && hit->mini == VIDOW_MINI_ICON) ?
+		hit : NULL;
+	if (icon == NULL) {
+		/* 指针在预览上（只读，但算「还在看它」）→ 清掉离开计时 = 宽限期。 */
+		if (vidow_mini_preview_hit(server, server->cursor->x,
+				server->cursor->y)) {
+			vidow_anim_cancel(server->mini_hover_timer);
+			server->mini_hover_timer = NULL;
+			server->mini_hover_view = NULL;
+			return;
+		}
+		/* 既不在图标也不在预览：起 / 保持离开计时（已经起着就不重起，
+		 * 免得每动一下都把 300ms 推倒重来 —— 那样永远收不掉）。 */
+		if ((server->mini_preview_shown ||
+				server->mini_hover_timer != NULL) &&
+				(server->mini_hover_timer == NULL ||
+					!server->mini_hover_leaving)) {
+			hover_timer_start(server,
+				server->config.mini_icon_hover_leave_ms, true, NULL);
+		}
+		return;
+	}
+	/* 在图标上：离开计时作废。 */
+	if (server->mini_hover_timer != NULL && server->mini_hover_leaving) {
+		vidow_anim_cancel(server->mini_hover_timer);
+		server->mini_hover_timer = NULL;
+	}
+	if (server->mini_preview_shown && server->mini_preview_view == icon) {
+		return; /* 已经露着 */
+	}
+	if (server->mini_hover_timer != NULL &&
+			server->mini_hover_view == icon) {
+		return; /* 延迟计时正跑着 */
+	}
+	hover_timer_start(server, server->config.mini_icon_hover_ms, false, icon);
+}
+
 /* ------------------------------------------------------------------ 最小化 */
 
 /* 最小化 / 放回。窗口**留在原来的列里**（列宽、上下顺序、滚动位置、归属工作区和
@@ -4778,6 +5145,14 @@ static void view_destroy(struct wl_listener *listener, void *data) {
 	view->anim_move = NULL;
 	vidow_anim_cancel(view->anim_open);
 	view->anim_open = NULL;
+	/* 小窗形态转换的补间（S5）data 也是这个 view。 */
+	vidow_anim_cancel(view->mini_anim);
+	view->mini_anim = NULL;
+	/* 悬停预览（S5）挂在 server 上、指着的却是这个 view：先收掉，别留一个
+	 * 攥着已释放窗口的镜面节点。 */
+	if (server->mini_preview_view == view) {
+		vidow_mini_preview_hide(server);
+	}
 
 	bool was_focused = server->focused == view;
 	/* 邻居要在摘列（和 free(view)）之前找（见 focus_after_close）。 */
@@ -5566,6 +5941,14 @@ static void x11_destroy_view(struct wl_listener *listener, void *data) {
 	view->anim_move = NULL;
 	vidow_anim_cancel(view->anim_open);
 	view->anim_open = NULL;
+	/* 小窗形态转换的补间（S5）data 也是这个 view。 */
+	vidow_anim_cancel(view->mini_anim);
+	view->mini_anim = NULL;
+	/* 悬停预览（S5）挂在 server 上、指着的却是这个 view：先收掉，别留一个
+	 * 攥着已释放窗口的镜面节点。 */
+	if (server->mini_preview_view == view) {
+		vidow_mini_preview_hide(server);
+	}
 
 	bool was_focused = server->focused == view;
 	/* 邻居要在摘列（和 free(view)）之前找（见 focus_after_close）。 */

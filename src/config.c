@@ -605,6 +605,11 @@ static const struct entry entries[] = {
 	{ "mini_edge_snap_px", K_INT, OFF(mini_edge_snap_px),
 		SZ(mini_edge_snap_px), 23,
 		"拖到屏边多少像素内算「贴边」（松手 = 收成图标）" },
+	{ "mini_fling_speed", K_INT, OFF(mini_fling_speed),
+		SZ(mini_fling_speed), 23,
+		"甩出速度阈值（逻辑像素 / 秒）：松手时指针速度超过它 = 甩出"
+		"（朝速度最近的那条边飞过去：那条边外侧有相邻输出就换屏保持形态，"
+		"没有就收成图标）。0 = 关掉甩出" },
 	{ "mini_transition_ms", K_INT, OFF(mini_transition_ms),
 		SZ(mini_transition_ms), 23,
 		"形态转换时长（毫秒，0 = 不做动画）" },
@@ -2189,6 +2194,10 @@ static void defaults(struct vidow_config *cfg) {
 	cfg->mini_icon_preview = true;
 	cfg->mini_toolbar = true;
 	cfg->mini_edge_snap_px = 24;
+	/* 甩出阈值 800 px/s：有意定位的慢拖通常 < 300 px/s，随手一甩 > 1500 px/s，
+	 * 800 落在中间偏保守的一侧（宁可把「有点快的拖」当拖，不要把它当甩 ——
+	 * 甩错了会收成图标，代价比「甩了没反应、得再拖一下」大）。 */
+	cfg->mini_fling_speed = 800;
 	cfg->mini_transition_ms = 260;
 	cfg->mini_hover_fade_in_ms = 120;
 	cfg->mini_hover_fade_out_ms = 150;

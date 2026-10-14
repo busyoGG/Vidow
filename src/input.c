@@ -1001,6 +1001,14 @@ static bool mini_pointer_release(struct vidow_server *server, uint32_t button) {
 		return true; /* 别的键的松手：照吞，不结束这次判定 */
 	}
 	if (!dragging) {
+		/* 小窗（S5）甩出**逃生口**：位移没到 mini_drag_threshold_px 但松手速度
+		 * 够快 —— 一次很快的小幅甩动（< 4px）本来会被判成「单击 = 放大」，
+		 * 那和甩出直接冲突。速度优先：够快就算甩出，不是单击。 */
+		double vx = 0.0, vy = 0.0;
+		if (vidow_mini_fling_velocity(server, &vx, &vy) &&
+				vidow_mini_fling(server, view, vx, vy)) {
+			return true;
+		}
 		/* 单击 = 放大：图标 -> 迷你，迷你 -> 自由小窗（计划 T3 / T4）。
 		 * 自由小窗可交互，所以放大之后把焦点给它（vidow_mini_set_state 里
 		 * 对 MINI / ICON 会先交出焦点，FREE 不会 —— 这里是反向那一步）。 */
@@ -1014,8 +1022,19 @@ static bool mini_pointer_release(struct vidow_server *server, uint32_t button) {
 		/* 小窗（S4）：拖拽松手 = 落点判定（用户点名的那条）——
 		 *   内边缘（外侧没有相邻输出）→ 收成图标；
 		 *   跨屏边（外侧有相邻输出）→ 移到那块屏、保持形态。
-		 * 和浮窗拖拽共用同一份（vidow_mini_drag_finish）。 */
+		 * 和浮窗拖拽共用同一份（vidow_mini_drag_finish）。
+		 *
+		 * 小窗（S5）：**甩出去**的（松手速度 ≥ mini_fling_speed）优先 ——
+		 * 它按速度方向取最近的那条边，不管光标停在哪。 */
 		vidow_mini_drop_zone_hide(server);
+		double vx = 0.0, vy = 0.0;
+		bool have_v = vidow_mini_fling_velocity(server, &vx, &vy);
+		wlr_log(WLR_DEBUG, "mini fling: 松手速度 %s（%.0f,%.0f px/s，采样 %d 点）",
+			have_v ? "有" : "没有", have_v ? vx : 0.0, have_v ? vy : 0.0,
+			server->mini_fling_n);
+		if (have_v && vidow_mini_fling(server, view, vx, vy)) {
+			return true;
+		}
 		vidow_mini_drag_finish(server, view);
 	}
 	return true;
@@ -1057,6 +1076,11 @@ void vidow_pointer_motion(struct vidow_server *server, uint32_t time_msec) {
 	 * 移动指针时尤其明显）。放在最前面：拖着东西 / 摇晃那些分支提前 return 也
 	 * 一样要推（拖拽时光标也在动）。 */
 	vidow_screencast_cursor_moved(server);
+
+	/* 小窗（S5）甩出：每一次指针移动都往采样环里推一格（松手时按最近 ~100ms
+	 * 那一段算速度，见 float.c 的 vidow_mini_fling_velocity）。放在最前面 ——
+	 * 下面拖着东西的分支会提前 return，那正是最需要采样的时候。 */
+	vidow_mini_fling_sample(server, server->cursor->x, server->cursor->y);
 
 	/* 光标隐藏（hide_when_typing / hide_after_inactive_ms）：指针一动就把光标
 	 * 显示回来并重新计时。放在最前面 —— 拖着东西 / 摇晃那些分支提前 return 也
@@ -1129,6 +1153,10 @@ void vidow_pointer_motion(struct vidow_server *server, uint32_t time_msec) {
 		mini_pointer_clear_client_focus(server);
 		return;
 	}
+
+	/* 小窗（S5）悬停预览：指针一动就过一次状态机（延迟 / 离开 / 宽限）。
+	 * 放在命中测试之后 —— 它要按「光标底下是不是图标」分流。 */
+	vidow_mini_preview_motion(server, hit);
 
 	/* 小窗（S2）：压在迷你 / 图标上 —— 客户端收不到 enter / motion，悬停聚焦也
 	 * 跳过（focus_follows_mouse 里另有一道）。命中测试上面已经跑过了（必须能
@@ -1264,6 +1292,28 @@ void vidow_pointer_button(struct vidow_server *server, uint32_t button,
 	if (server->locked) {
 		lock_pointer_route(server, time_msec, button, pressed, true);
 		return;
+	}
+	/* 小窗（S5）悬停预览：它是**只读**的（不抢焦点 / 不进 MRU / 不参与命中），
+	 * 但**吞点击** —— 指针底下有一块「像窗口的东西」，点下去却激活了背后的
+	 * 窗口是明显的错。按下 / 松手成对吞掉（客户端两边都没见过，状态对称）。
+	 * 放在最前面：预览可能压在别的窗口上，压着的时候不该把事件给背后那个。 */
+	if (server->mini_preview_view != NULL) {
+		bool on_preview = vidow_mini_preview_hit(server, server->cursor->x,
+			server->cursor->y);
+		if (pressed && on_preview) {
+			server->mini_preview_pressed = true;
+			wlr_log(WLR_INFO, "mini preview: 吞掉点击（%.0f,%.0f，预览 "
+				"%dx%d @ %d,%d）—— 只读，不激活背后的窗口",
+				server->cursor->x, server->cursor->y,
+				server->mini_preview_box.width,
+				server->mini_preview_box.height,
+				server->mini_preview_box.x, server->mini_preview_box.y);
+			return;
+		}
+		if (!pressed && server->mini_preview_pressed) {
+			server->mini_preview_pressed = false;
+			return;
+		}
 	}
 	/* 小窗（S4）悬停工具条：它不是表面（合成器自绘的矩形），命中得单独判一次
 	 * —— 按在按钮上就整个吃掉（不转给客户端、也不起拖拽），松手那次也成对吃掉
