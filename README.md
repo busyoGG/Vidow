@@ -5420,6 +5420,29 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
      - 未做：niri 的 `fixed 1920`（固定像素档）、`preset-window-heights`、`default-column-width {}`（让客户端自己定宽）、
        `always-center-single-column`；窗口规则级的 per-rule 预设覆盖。
 
+270. **窗口抓帧录出来就是「这个窗口在屏上的样子」：背后的模糊底衬 + 那圈画框（默认开，一个开关能关掉）**（用户：「能否混合背景（包括模糊）和 ssd」→ 澄清为「我是说窗口录制的时候」；2026-10-14）
+
+     - **改前**：窗口抓帧（`src/wincapture.c` 的私有镜面场景 + 假输出，渲染在 `vidow_win_grab_render()`）画的是**客户端表面本身** —— 没有装饰、模糊、圆角、阴影（照 Hyprland 的窗口导出那个口径）。屏幕上的画框 / 底衬是 `src/fx.c` 的 `decor_pass()`（圆角 + 边框 + 投影 + 模糊底衬 + 颗粒，一个着色器一遍画完）画的，画在**正常场景**的装饰节点上，镜面场景里没有 —— 所以录不到。vidow 不画真标题栏（`src/decoration.c` 只做 CSD 协商），所以「录进去的 SSD」就是这圈画框。
+     - **接法（两趟离屏 + 一趟场景，`src/wincapture.c` 的 `vidow_win_grab_render()`）**：
+       ① 背后的模糊底衬（`vidow_fx_capture_decor(edge = false)`）烘成一张取景框那么大的图，挂在**镜像下面**的场景节点 `grab->decor_blur` 上；
+       ② 圆角 / 边框 / 投影 / 颗粒（`edge = true`）烘成另一张，挂在**镜像上面**的 `grab->decor_edge` 上。
+       两张图都走**屏幕上那同一个 `decor_pass()`**（`src/fx.c:2745`），差别只有几何：渲染目标是取景框、底衬采样按取景框的缩放换算（`k = frame_scale / 底衬那块屏的缩放`，见 `vidow_fx_capture_decor`）。中间夹着窗口内容那个镜像节点 —— 屏上的叠放次序就是「底衬 < 内容 < 画框」，一张图做不到（画框要压在内容上、模糊要垫在下面）。
+     - **内容**由镜像节点自己画，所以**子表面（chromium 放视频那种）照旧在**；装饰图里只把内容贴图当「透明度剔除」的依据（着色器新加的 `u_content_alpha`：内容那一项乘 0 = 不画进这张图，但剔除仍按内容自己的 alpha 走）—— 半透明窗口该透出底衬的地方跟屏上逐像素一致。
+     - **画框贴的是可见窗口**，不是整块表面：客户端自己画装饰时（CSD）表面比窗口大一圈透明留白，贴到表面边上录出来的框会比屏上那圈大一圈。用的是屏幕上同一份 `vidow_view_fx_geo()`（`tex_u0/v0/du/dv` 就是 `u_tex_map`）。
+     - **底衬采样不许读全局量**：认**跟着贴图一起记的** `blur_out_*`（`server.h`），跨屏时拿窗口自己那块屏的缩放去算就是错位（提交 `f022b9e` 修过那个坑）；`k` 只有「取景框缩放 ≠ 那块屏缩放」时才不是 1。
+     - **开关**：`wincapture_decor`（默认 `true`）。三条写路径都吃（config.lua / `VIDOW_WINCAPTURE_DECOR` / `vidowmsg set-config wincapture_decor false`），`vidowmsg config wincapture_decor` 查得回来，`config.example/configs/23-wincapture.lua` 是新的默认值示例（`--default-config` 与仓库里那一套逐字节一致）。关掉 = 改前那个样子（只有客户端表面本身，给 OBS 窗口源这类自己再加边框的用家）。
+     - **锁定期间照旧不泄漏**：`server->locked` 时**两趟装饰都不跑**、镜像也关这一趟，回黑帧（提交 `078e9e2` 补的洞）。
+     - **实测**（headless 双屏 + 软件渲染；`tools/wall.py "#00ff00"` 纯绿壁纸（background 层）+ 一个 50% 不透明的蓝窗（466×404）；`tools/capture.c` 抓窗口，`VIDOW_CAPTURE_DUMP` 出 PPM，472×409 = 193048 像素）：
+
+       | | 窗口内容（蓝） | 底衬（绿透出来） | 边框（焦点色） | 黑（圆角外 / CSD 留白） |
+       |---|---|---|---|---|
+       | 改后（默认开） | 159073（82.40%） | **141190（73.14%）** | **3118（1.62%）** | 32110（16.63%） |
+       | 关掉开关（= 改前） | 159119（82.42%） | 0（0.00%） | 0（0.00%） | 33640（17.43%） |
+
+       逐像素对照**屏幕**（`grim` 同一时刻那一帧）：窗口那块屏上是 `(0,127,128)`（50% 蓝窗 + 绿壁纸的模糊）**140120 px**，抓帧里 `(0,127,128)` **141190 px** —— 底衬的颜色和位置跟屏上一致。两张图：`/tmp/wincapture-decor-on.png`、`/tmp/wincapture-decor-off.png`。
+     - **回归**：`./test-wincapture-lock.sh` OK（8 PASS / 0 FAIL：锁前能抓 / 锁定期间 0 像素且 0 failed / 解锁后回来）；`./test-sessionlock.sh` **47 PASS / 0 FAIL**；`./test-defaultconfig.sh` OK（126 个键、新增的 `23-wincapture.lua` 与 `--default-config` 逐字节一致）。
+     - **取舍**：取景框就是窗口那块（`vidow_win_grab_frame_box` 那套没动），所以投影落在框外那部分照旧被裁掉（屏上看得见、录进去看不见）；圆角外那四个角是透明的（PPM 里是黑），屏幕上那里是壁纸。**没有全屏特例**（全屏窗口的 look 本来就全是 0，和屏上一致）。
+
 269. **空闲通知 + 空闲抑制两个 global（`ext-idle-notify-v1` / `zwp-idle-inhibit-v1`）：swayidle / hypridle 这类自动锁屏能接上了、播视频的客户端也能「别锁屏」（实测抑制真的生效）**（用户：「给 vidow 建这两个 global（各一行 create 的量级）；先核实 API 与版本；如果 wlroots 侧要求额外接线，照它的要求做」；方案 `/tmp/vidow-sessionlock-plan.md` §4 末尾 + §5 S5（独立可选步）；2026-10-14）
 
      - **API 照头文件核过（本机 wlroots 0.20.2）**：`/usr/include/wlroots-0.20/wlr/types/wlr_idle_notify_v1.h` →

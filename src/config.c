@@ -131,6 +131,9 @@ static const struct section sections[] = {
 	/* 工作区（22-…）。 */
 	{ "工作区", "22-workspace.lua",
 		"切工作区的规矩（照 niri 的 workspace-auto-back-and-forth）" },
+	/* 窗口抓帧（23-…）同样只能往后加。 */
+	{ "窗口抓帧", "23-wincapture.lua",
+		"按窗口录屏 / 窗口截图源抓出来的那一帧长什么样" },
 };
 #define N_SECTIONS ((int)(sizeof(sections) / sizeof(sections[0])))
 /* 「键位 / 工作区 / 规则」那一节：它不是配置键，entries[] 里没有它，打印也
@@ -542,6 +545,13 @@ static const struct entry entries[] = {
 		SZ(workspace_auto_back_and_forth), 21,
 		"切到「当前就在的」那块工作区时改成切回上一个（niri 的 "
 		"workspace-auto-back-and-forth）；默认 false = 什么都不做（以前的样子）" },
+
+	/* 窗口抓帧（按窗口录屏 / 窗口截图源）。 */
+	{ "wincapture_decor", K_BOOL, OFF(wincapture_decor),
+		SZ(wincapture_decor), 22,
+		"窗口抓帧带不带「屏上那圈画框 + 背后的模糊底衬」：默认 true = 录出来跟"
+		"屏幕上看到的一样；关掉 = 只有客户端表面本身（给只想要裸窗口内容的用家，"
+		"比如 OBS 的窗口源自己再加边框）" },
 };
 
 /* ------------------------------------------------------------ 配置组
@@ -2047,6 +2057,9 @@ static void defaults(struct vidow_config *cfg) {
 	cfg->shadow_offset_y = 2;
 	cfg->window_opacity = 1.0;
 	cfg->noise = 0.0;
+
+	/* 默认开：录出来就该跟屏幕上看到的一样（关掉只有裸窗口内容，见 server.h） */
+	cfg->wincapture_decor = true;
 
 	cfg->blur_enabled = true;
 	cfg->blur_all = true; /* tiled windows blur the wallpaper too */

@@ -38,3 +38,4 @@ vidow.include("configs/19-input.lua")      -- 输入设备（libinput）
 vidow.include("configs/20-layout.lua")     -- 布局（列宽 / 居中）
 vidow.include("configs/21-keyboard.lua")   -- 键盘（NumLock / 重复）
 vidow.include("configs/22-workspace.lua")  -- 工作区
+vidow.include("configs/23-wincapture.lua") -- 窗口抓帧

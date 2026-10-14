@@ -304,6 +304,12 @@ struct vidow_config {
 	double window_opacity;
 	double noise;
 
+	/* 窗口抓帧（按窗口录屏 / 窗口截图源）里带不带「屏上那圈画框 + 背后的模糊
+	 * 底衬」。默认开：录出来就跟屏幕上看到的一样。关掉 = 只有客户端表面本身
+	 * （Hyprland 的窗口导出那种口径，给只想要裸窗口内容的用家，比如 OBS 的
+	 * 窗口源自己再加边框）。见 wincapture.c。 */
+	bool wincapture_decor;
+
 	/* kawase blur behind windows */
 	bool blur_enabled;
 	bool blur_all;        /* also blur behind tiled windows */
@@ -661,7 +667,7 @@ struct vidow_mesh_prog {
  * blurred backdrop and grain. */
 struct vidow_decor_prog {
 	unsigned int program;
-	int u_texture, u_blur, u_size, u_target_size, u_pad;
+	int u_texture, u_blur, u_size, u_target_size, u_content_off, u_content_alpha;
 	int u_radius, u_border_width, u_border_color, u_shadow_color;
 	int u_shadow_offset, u_shadow_radius, u_opacity, u_noise, u_alpha;
 	int u_origin, u_output_size, u_flip_y;
@@ -2571,6 +2577,48 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 		int x, int y, int ox, int oy,
 		double alpha, bool focused, bool fullscreen, double scale, double ov,
 		const struct vidow_rule_eff *eff);
+/* 窗口抓帧那条路的装饰输入（wincapture.c 填，见 fx.c 的 vidow_fx_capture_decor）。
+ * 全部是「这一帧的取景框」口径：渲染目标 = 取景框，内容是已经渲染好的那张窗口
+ * 贴图摆在框里的某个位置。 */
+struct vidow_capture_decor {
+	/* 渲染目标 = 这一帧的取景框 */
+	struct wlr_buffer *dst;
+	int dst_w, dst_h;
+	/* 可见窗口（= 画框贴着的那块）在取景框里的位置 / 尺寸，目标像素 */
+	int content_x, content_y, content_w, content_h;
+	/* 客户端内容贴图：**不画进这张图**（内容由场景里那个镜像节点画，见
+	 * wincapture.c），只用来决定「背后的模糊画在哪儿」（装饰着色器的透明度
+	 * 剔除按元素自己的 alpha 走）。tex_* 是它在装饰矩形里的采样映射，跟屏幕上
+	 * 那条路的 u_tex_map 同一套（CSD 留白靠它偏掉）。 */
+	struct wlr_texture *content;
+	float tex_u0, tex_v0, tex_du, tex_dv;
+	/* 可见窗口左上角的**布局逻辑坐标** —— 底衬采样靠它换算到那块屏的设备像素 */
+	int content_layout_x, content_layout_y;
+	/* 取景框的缩放：布局逻辑 → 目标像素 */
+	double frame_scale;
+	/* 模糊底衬：贴图 + 它盖住输出的哪一块（设备像素，w <= 0 = 整屏），以及它
+	 * 代表的那块屏（设备像素尺寸 + 布局原点 + 缩放）。blur 为 NULL = 没底衬
+	 * （模糊关着），这一趟就只画边框 / 圆角（跟屏上一样）。 */
+	struct wlr_texture *blur;
+	int blur_x, blur_y, blur_w, blur_h;
+	int out_x, out_y, out_w, out_h;
+	double out_scale;
+	/* 这一趟画哪一层（见 wincapture.c：模糊在内容**下面**、画框在内容**上面**，
+	 * 中间夹着窗口内容那个场景节点）：
+	 *   edge = false：背后的模糊底衬。调用方给的 look 已经把边框 / 阴影 / 噪点
+	 *                归零（重复画一遍阴影会变浓）。
+	 *   edge = true ：圆角 / 边框 / 投影 / 颗粒，不采样模糊。 */
+	bool edge;
+	/* 画框参数（跟屏上同一份）与边框颜色（直通 alpha，焦点 / 非焦点由调用方选） */
+	const struct vidow_look *look;
+	const float *border;
+};
+bool vidow_fx_capture_decor(struct vidow_server *server,
+		const struct vidow_capture_decor *c);
+/* 客户端缓冲 → 贴图（窗口抓帧那条路要拿它当元素内容贴图；owned 非空时告诉
+ * 调用方要不要自己销毁）。 */
+struct wlr_texture *vidow_fx_client_texture(struct vidow_server *server,
+		struct wlr_buffer *buffer, bool *owned);
 void vidow_fx_end(struct vidow_server *server, struct vidow_fx_target *fx);
 void vidow_fx_release(struct vidow_fx_target *fx);
 /* 这个窗口这一帧能不能「直通」：装饰 / 模糊 / 动画 / 裁剪一个都不需要，屏幕上

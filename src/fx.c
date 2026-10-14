@@ -185,7 +185,7 @@ static const char *decor_fragment_src =
 	"uniform sampler2D u_blur;\n"    /* blurred backdrop, half resolution */
 	"uniform vec2 u_size;\n"         /* content size */
 	"uniform vec2 u_target_size;\n"  /* padded size */
-	"uniform float u_pad;\n"
+	"uniform vec2 u_content_off;\n" /* 内容左上角在目标里的位置（目标像素） */
 	"uniform float u_radius;\n"
 	"uniform float u_border_width;\n"
 	"uniform vec4 u_border_color;\n" /* premultiplied */
@@ -193,6 +193,10 @@ static const char *decor_fragment_src =
 	"uniform vec2 u_shadow_offset;\n"
 	"uniform float u_shadow_radius;\n"
 	"uniform float u_opacity;\n"
+	/* 内容那一项的额外乘子：窗口抓帧那条路把它设成 0 —— 内容由场景里那个
+	 * 镜像节点画，这张图里只要底衬 / 画框，但**透明度剔除还得按内容自己的
+	 * alpha** 走（u_texture 照样得采）。 */
+	"uniform float u_content_alpha;\n"
 	"uniform float u_noise;\n"
 	"uniform float u_alpha;\n"
 	"uniform float u_time;\n"
@@ -223,7 +227,7 @@ static const char *decor_fragment_src =
 	"\n"
 	"void main() {\n"
 	"	vec2 p = v_uv * u_target_size;\n"
-	"	vec2 wp = p - u_pad;\n"
+	"	vec2 wp = p - u_content_off;\n"
 	"	vec2 half_size = u_size * 0.5;\n"
 	"	float r = min(u_radius, min(half_size.x, half_size.y));\n"
 	"	float d = sd_round_box(wp - half_size, half_size, r);\n"
@@ -231,7 +235,7 @@ static const char *decor_fragment_src =
 	"\n"
 	"	vec2 cuv = clamp(wp / u_size, 0.0, 1.0);\n"
 	"	vec2 uv = clamp(u_tex_map.xy + cuv * u_tex_map.zw, 0.0, 1.0);\n"
-	"	vec4 content = texture2D(u_texture, uv) * u_opacity * inside;\n"
+	"	vec4 content = texture2D(u_texture, uv) * u_opacity * u_content_alpha * inside;\n"
 	"\n"
 	"	float bw = min(u_border_width, min(half_size.x, half_size.y));\n"
 	"	float ring = inside - (1.0 - smoothstep(-1.0, 1.0, d + bw));\n"
@@ -243,7 +247,7 @@ static const char *decor_fragment_src =
 	 * translucent window instead of staying behind it. */
 	"	vec4 shadow = u_shadow_color * sa * (1.0 - inside);\n"
 	"\n"
-	"	vec2 o = (u_origin - u_pad + p) / u_output_size;\n"
+	"	vec2 o = (u_origin - u_content_off + p) / u_output_size;\n"
 	"	vec4 blurred = texture2D(u_blur, clamp(o, 0.0, 1.0));\n"
 	/* 元素自己的 alpha（「透明度剔除」）：模糊只画在元素真的有内容的地方 —— 透明
 	 * 内边距、圆角外面、弹窗自带的半透明阴影边都不再透出一圈模糊。窗口 / 弹窗那条
@@ -427,7 +431,7 @@ static void load_decor_program(struct vidow_server *server) {
 	LOC(u_blur, "u_blur");
 	LOC(u_size, "u_size");
 	LOC(u_target_size, "u_target_size");
-	LOC(u_pad, "u_pad");
+	LOC(u_content_off, "u_content_off");
 	LOC(u_radius, "u_radius");
 	LOC(u_border_width, "u_border_width");
 	LOC(u_border_color, "u_border_color");
@@ -435,6 +439,7 @@ static void load_decor_program(struct vidow_server *server) {
 	LOC(u_shadow_offset, "u_shadow_offset");
 	LOC(u_shadow_radius, "u_shadow_radius");
 	LOC(u_opacity, "u_opacity");
+	LOC(u_content_alpha, "u_content_alpha");
 	LOC(u_noise, "u_noise");
 	LOC(u_alpha, "u_alpha");
 	LOC(u_origin, "u_origin");
@@ -2714,11 +2719,35 @@ void vidow_blur_update(struct vidow_output *output) {
 
 /* ------------------------------------------------------------------- draw */
 
-static void decor_draw(struct vidow_server *server,
+/* 装饰那一趟的几何（全部是**渲染目标像素**口径）。屏幕那条路（decor_draw）和
+ * 窗口抓帧那条路（vidow_fx_capture_decor）只有这一份不一样，uniform 那几十行
+ * 共用同一段代码 —— 两处各写一遍必然走散，某处忘了乘 scale 就是「录出来跟屏上
+ * 长得不一样」。
+ *
+ * off_x/off_y：内容（窗口可见区）左上角在渲染目标里的位置。屏幕那条路是内边距
+ * px_pad（内容居中），窗口抓帧那条路是窗口在取景框里的位置（抓帧框常常就是窗口
+ * 本身，于是是 0）。
+ * origin_x / origin_y 与 out_size_x / out_size_y：内容左上角在**底衬贴图**里的
+ * 像素坐标，以及那张贴图的尺寸。
+ * 装饰着色器按它算模糊采样的 UV（见 decor_fragment_src 的 u_origin /
+ * u_output_size）。 */
+struct decor_geo {
+	int dst_w, dst_h;
+	int content_w, content_h;
+	float off_x, off_y;
+	float origin_x, origin_y;
+	float out_size_x, out_size_y;
+	/* 内容那一项的乘子：屏幕那条路是 1，窗口抓帧那条路是 0（内容由场景节点
+	 * 画，这张图里只要底衬 / 画框，但剔除仍按内容 alpha 走）。 */
+	float content_alpha;
+};
+
+static void decor_pass(struct vidow_server *server,
 		struct vidow_fx_target *fx, struct wlr_buffer *dst,
+		const struct decor_geo *g,
 		struct wlr_texture *src, struct wlr_texture *mask,
-		const float border[4], int ox, int oy,
-		double alpha, double scale, const struct vidow_look *look) {
+		const float border[4], double alpha, double scale,
+		const struct vidow_look *look) {
 	struct vidow_decor_prog *d = &server->decor;
 	struct vidow_config *cfg = &server->config;
 
@@ -2726,7 +2755,7 @@ static void decor_draw(struct vidow_server *server,
 	wlr_gles2_texture_get_attribs(src, &sa);
 
 	struct wlr_egl *egl = NULL;
-	if (begin_pass(server, dst, fx->w, fx->h, &egl) == 0) {
+	if (begin_pass(server, dst, g->dst_w, g->dst_h, &egl) == 0) {
 		return;
 	}
 
@@ -2765,9 +2794,9 @@ static void decor_draw(struct vidow_server *server,
 
 	/* 着色器全程在「渲染目标的物理像素」里算：配置里的圆角、边框、阴影都是
 	 * 逻辑单位，乘上倍率才是像素。 */
-	glUniform2f(d->u_size, (float)fx->content_w, (float)fx->content_h);
-	glUniform2f(d->u_target_size, (float)fx->w, (float)fx->h);
-	glUniform1f(d->u_pad, (float)fx->px_pad);
+	glUniform2f(d->u_size, (float)g->content_w, (float)g->content_h);
+	glUniform2f(d->u_target_size, (float)g->dst_w, (float)g->dst_h);
+	glUniform2f(d->u_content_off, g->off_x, g->off_y);
 	glUniform1f(d->u_radius, (float)(look->corner_radius * scale));
 	glUniform1f(d->u_border_width, (float)(look->border_width * scale));
 	/* The decoration shader works in premultiplied alpha; the config keeps
@@ -2784,6 +2813,7 @@ static void decor_draw(struct vidow_server *server,
 		(float)(look->shadow_offset_y * scale));
 	glUniform1f(d->u_shadow_radius, (float)(look->shadow_radius * scale));
 	glUniform1f(d->u_opacity, (float)look->opacity);
+	glUniform1f(d->u_content_alpha, g->content_alpha);
 	glUniform1f(d->u_noise, (float)look->noise);
 	glUniform1f(d->u_alpha, (float)alpha);
 	glUniform1f(glGetUniformLocation(d->program, "u_time"),
@@ -2797,18 +2827,11 @@ static void decor_draw(struct vidow_server *server,
 	 * 重烘会落在别的屏正在渲染的那一帧上（output.c 帧循环那趟不看归属），
 	 * 现场读 server->output_* 拿到的是那块屏的尺寸/原点 —— 整屏底衬只取中间
 	 * 一块铺满整窗，看着就是「静止时底衬啪一下换挡」（中心放大 + 变糊）。 */
-	int out_x = fx->blur_out_w > 0 ? fx->blur_out_x : server->output_x;
-	int out_y = fx->blur_out_h > 0 ? fx->blur_out_y : server->output_y;
-	int out_w = fx->blur_out_w > 0 ? fx->blur_out_w : server->output_w;
-	int out_h = fx->blur_out_h > 0 ? fx->blur_out_h : server->output_h;
-	glUniform2f(d->u_origin,
-		(float)((int)lround((double)ox * scale) - out_x -
-			fx->blur_tex_x),
-		(float)((int)lround((double)oy * scale) - out_y -
-			fx->blur_tex_y));
-	glUniform2f(d->u_output_size,
-		(float)(fx->blur_tex_w > 0 ? fx->blur_tex_w : out_w),
-		(float)(fx->blur_tex_w > 0 ? fx->blur_tex_h : out_h));
+	/* 底衬采样的映射：全部由调用方算好（屏幕那条路按窗口在输出上的位置算，
+	 * 窗口抓帧那条路按取景框算）—— 两边共用这一份 uniform，别在这儿现场读
+	 * 全局量（跨屏底衬采样的坑，见 server.h 的 blur_out_*）。 */
+	glUniform2f(d->u_origin, g->origin_x, g->origin_y);
+	glUniform2f(d->u_output_size, g->out_size_x, g->out_size_y);
 	glUniform1f(d->u_flip_y, cfg->shader_flip_y ? 1.0f : 0.0f);
 	/* 模糊那层要不要叠：除了「有贴图」（fx->blur_tex）和全局开关（fx->blur），
 	 * 还得看**这一次渲染自己的 look** —— 预览（缩略图）那一趟在
@@ -2841,6 +2864,119 @@ static void decor_draw(struct vidow_server *server,
 	draw_quad(d->program);
 	glUseProgram(0);
 	end_pass(egl);
+}
+
+/* 屏幕那条路：几何从 fx（离屏缓冲 + 窗口在输出上的位置）来。 */
+static void decor_draw(struct vidow_server *server,
+		struct vidow_fx_target *fx, struct wlr_buffer *dst,
+		struct wlr_texture *src, struct wlr_texture *mask,
+		const float border[4], int ox, int oy,
+		double alpha, double scale, const struct vidow_look *look) {
+	/* 窗口在输出上的位置（物理像素，输出原点已减掉）：散景贴图是按输出分辨
+	 * 率抓的，采样坐标必须落在这块屏自己的坐标系里。被模糊的 layer surface
+	 * 那张贴图只盖住它自己那一小块区域（fx->blur_tex_*），坐标就再减掉区域
+	 * 原点、除数也换成区域尺寸 —— 不减就是整块错位。
+	 *
+	 * 那块屏是哪一块，认**跟着这张贴图一起记的** blur_out_*（见 server.h）：
+	 * 重烘会落在别的屏正在渲染的那一帧上（output.c 帧循环那趟不看归属），
+	 * 现场读 server->output_* 拿到的是那块屏的尺寸/原点 —— 整屏底衬只取中间
+	 * 一块铺满整窗，看着就是「静止时底衬啪一下换挡」（中心放大 + 变糊）。 */
+	int out_x = fx->blur_out_w > 0 ? fx->blur_out_x : server->output_x;
+	int out_y = fx->blur_out_h > 0 ? fx->blur_out_y : server->output_y;
+	int out_w = fx->blur_out_w > 0 ? fx->blur_out_w : server->output_w;
+	int out_h = fx->blur_out_h > 0 ? fx->blur_out_h : server->output_h;
+	struct decor_geo g = {
+		.dst_w = fx->w, .dst_h = fx->h,
+		.content_w = fx->content_w, .content_h = fx->content_h,
+		.off_x = (float)fx->px_pad, .off_y = (float)fx->px_pad,
+		.origin_x = (float)((int)lround((double)ox * scale) - out_x -
+			fx->blur_tex_x),
+		.origin_y = (float)((int)lround((double)oy * scale) - out_y -
+			fx->blur_tex_y),
+		.out_size_x = (float)(fx->blur_tex_w > 0 ? fx->blur_tex_w : out_w),
+		.out_size_y = (float)(fx->blur_tex_w > 0 ? fx->blur_tex_h : out_h),
+		.content_alpha = 1.0f,
+	};
+	decor_pass(server, fx, dst, &g, src, mask, border, alpha, scale, look);
+}
+
+/* 窗口抓帧那条路（wincapture.c）：把「窗口内容」按屏上的样子合成出来 —— 模糊底衬
+ * + 圆角 + 边框 + 投影 + 颗粒，和屏幕上**同一个着色器、同一遍**（不是另写一套）。
+ *
+ * 和屏幕那条路的差别只有几何：
+ *   - 渲染目标是**取景框**（这一帧的流），不是窗口的离屏缓冲，内容摆在哪由调用方
+ *     给（content_x/y）；
+ *   - 底衬采样按「内容左上角的布局坐标 × 取景框缩放」算：取景框的缩放常常和那块
+ *     屏的缩放不是一回事（窗口等比缩进流里），所以先按布局坐标换算到那块屏的设备
+ *     像素，再乘目标像素/底衬像素那个比值（k）。取景框就是窗口本身时 k = 1，
+ *     公式跟屏幕那条路逐项一致。
+ *
+ * 取景框比窗口大（窗口缩进流、四周留黑）时，装饰只画在窗口那块；外面的留黑由
+ * 调用方保证（这一趟不动那儿的像素）。 */
+/* 客户端缓冲 → 贴图（借来那张或自己建一张）。窗口抓帧那条路要拿它当「元素
+ * 内容」贴图（采样映射 + 透明度剔除），和屏幕上那条路共用这一份。owned 非空时
+ * 告诉调用方要不要自己销毁。 */
+struct wlr_texture *vidow_fx_client_texture(struct vidow_server *server,
+		struct wlr_buffer *buffer, bool *owned) {
+	if (server == NULL || buffer == NULL) {
+		return NULL;
+	}
+	bool own = true;
+	struct wlr_texture *tex = client_texture(server->renderer, buffer, &own);
+	if (owned != NULL) {
+		*owned = own;
+	}
+	return tex;
+}
+
+bool vidow_fx_capture_decor(struct vidow_server *server,
+		const struct vidow_capture_decor *c) {
+	if (server == NULL || c == NULL || c->dst == NULL || c->look == NULL ||
+			c->dst_w <= 0 || c->dst_h <= 0 || server->decor.program == 0) {
+		return false;
+	}
+	double frame_scale = c->frame_scale > 0.0 ? c->frame_scale : 1.0;
+	double out_scale = c->out_scale > 0.0 ? c->out_scale : frame_scale;
+	/* 目标像素 / 底衬像素。两者一样时（窗口源那条路就是这样：出图尺寸 =
+	 * 窗口逻辑尺寸 × 那块屏的缩放）下面这两行就是屏幕那条路的公式。 */
+	double k = frame_scale / out_scale;
+	int bw = c->blur_w > 0 ? c->blur_w : c->out_w;
+	int bh = c->blur_h > 0 ? c->blur_h : c->out_h;
+	if (bw <= 0 || bh <= 0) {
+		bw = 1;
+		bh = 1;
+	}
+
+	/* fx 只用来告诉 decor_pass「底衬是哪张、内容贴图怎么采」：几何全在 g 里。
+	 * 模糊只有「底衬那一趟」画（edge 那趟画的是画框，叠在内容上面，再糊一次
+	 * 就是错的）。 */
+	struct vidow_fx_target fx = {0};
+	fx.blur_tex = c->blur;
+	fx.blur = !c->edge && c->blur != NULL;
+	fx.tex_off_x = c->tex_u0;
+	fx.tex_off_y = c->tex_v0;
+	fx.tex_scale_x = c->tex_du;
+	fx.tex_scale_y = c->tex_dv;
+
+	struct decor_geo g = {
+		.dst_w = c->dst_w, .dst_h = c->dst_h,
+		.content_w = c->content_w, .content_h = c->content_h,
+		.off_x = (float)c->content_x, .off_y = (float)c->content_y,
+		.origin_x = (float)(((double)c->content_layout_x - (double)c->out_x) *
+			frame_scale - (double)c->blur_x * k),
+		.origin_y = (float)(((double)c->content_layout_y - (double)c->out_y) *
+			frame_scale - (double)c->blur_y * k),
+		.out_size_x = (float)((double)bw * k),
+		.out_size_y = (float)((double)bh * k),
+		/* 内容不画进这张图（由场景里那个镜像节点画），但 u_texture 照样得
+		 * 采 —— 透明度剔除按它的 alpha 走（和屏上同一条判据）。 */
+		.content_alpha = 0.0f,
+	};
+
+	decor_pass(server, &fx, c->dst, &g,
+		c->content != NULL ? c->content : server->empty_tex, NULL,
+		c->border, 1.0, frame_scale, c->look);
+	return true;
 }
 
 static bool anim_draw(struct vidow_server *server,
