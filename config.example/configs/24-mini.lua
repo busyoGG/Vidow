@@ -37,6 +37,8 @@ mini_icon_preview = true
 mini_toolbar = true
 -- 拖到屏边多少像素内算「贴边」（松手 = 收成图标）
 mini_edge_snap_px = 24
+-- 甩出速度阈值（逻辑像素 / 秒）：松手时指针速度超过它 = 甩出（朝速度最近的那条边飞过去：那条边外侧有相邻输出就换屏保持形态，没有就收成图标）。0 = 关掉甩出
+mini_fling_speed = 800
 -- 形态转换时长（毫秒，0 = 不做动画）
 mini_transition_ms = 260
 -- 悬停预览淡入时长（毫秒）
