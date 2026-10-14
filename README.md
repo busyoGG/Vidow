@@ -3266,6 +3266,43 @@ portal_capture = "wlr"   -- 借 xdg-desktop-portal-wlr：没有选择器，直�
 portal_capture = "none"  -- ScreenCast / Screenshot 两行都不写
 ```
 
+**会话持久化（`persist_mode` / `restore_data`，impl 接口 v4）**：以前每录一次都要重新弹选择器 ——
+后端只声明到 v2，前端根本不会把持久化那两项给它（用户：「录屏 portal 需要持久化」）。现在
+`SC_VERSION = 4`（**只到 4**：v5 的 `mapping_id`、v6 的 `pipewire-serial` 是流属性，我们不在
+`Start` 的 streams 里给，报了就是给消费者制造期待）：
+
+- `SelectSources` 里解析 `persist_mode`（0/1/2）和 `restore_data`（`(suv)` 三元组：vendor /
+  私有版本号 / 私有数据）；`Start` 的 results 里回 `restore_data` + `persist_mode`（原样回，
+  没做「降级」那套 UI）；
+- 持久化数据**存在前端**（权限库，按 app_id 存），后端只做两件事：生成一份**能自证**的、收到时
+  认得出来就**跳过选择器**直接建流。vendor 用 `vidow`（和 KDE / GNOME 一个做法），私有版本号从
+  1 起，私有数据是个**自描述字符串**（不用指针 / 时间戳这种没法复现的东西）：
+
+  ```
+  kind|标识符|cursor_mode[;kind|标识符|cursor_mode]…
+  kind：monitor（标识符 = 输出名）/ window（= ext-foreign-toplevel 的 identifier）/ virtual（= WxH）
+  例：monitor|HEADLESS-1|1        ← 一块叫 HEADLESS-1 的屏、隐藏光标
+      window|ad28e827…524|4       ← 某个窗口、光标走 metadata
+  ```
+  （区域那条路是当场框出来的、没有稳定标识符，不进 `restore_data` —— 全是区域的会话就不回它，
+  等于这次没持久化，日志里会说。）
+- **不可信输入**：`restore_data` 是前端原样转回来的 ——格式不合法（vendor 不是 vidow / 版本号对不上 /
+  私有数据不是字符串 / 解析不出来）就**忽略 + 照常弹选择器**；合法但**源不在了**（窗口关了 / 输出
+  的名字对不上 / types 这次没要这种源）也**回退弹选择器**（不是报错），半路建起来的流全收掉；「源没了」有两条路都能走到、日志会说清是哪条：
+  还没建流就发现窗口不在了（`ext_foreign_toplevel` 的 `closed`），或者建流被**合成器**拒掉
+  （`vidow: 没有这个窗口（它可能已经关了）`）—— 后者才是权威信号，因为那个列表里可能还挂着已经关掉的窗口；
+  光标模式按存下来的那份恢复（这次请求带的另一份不覆盖它，两份不一样会记一行日志）。
+- 日志一眼能当判据：`restore_data：收到 …` / `判定合法（N 个源，光标 …）` / `判定非法（原因），
+  忽略，照常弹选择器` / `恢复成 N 路流，跳过选择器` / `输出 … 不在了，回退弹选择器` /
+  `合成器不认这些源（…），回退弹选择器` / `Start：回 restore_data（…）`。
+- 前端那层是**翻译**：它把后端的 `(suv)` 换成自己的 `restore_token`（字符串）发给客户端
+  （`Replacing restore data received from portal impl with a token`），客户端下次把 token 带回来
+  时再翻译回 `restore_data` 喂给后端 —— 所以「客户端看到的 token」和「后端看到的私有数据」不是
+  一回事，`./test-portal-own.sh` 的 6f 一节两层都验（客户端带 token → 后端收到 restore_data）。
+- 一个已知边界：**输出被拔掉**这条路后端看不出来（`outputs` 列表只加不删，
+  `registry_global_remove` 是空的）—— 窗口没了有确切信号（`ext_foreign_toplevel` 的 `closed`），
+  持久化恢复里已经按它判「源还在不在」；输出列表的增删是另一件事，这次没动。
+
 **选择器分三个 tab：屏幕 / 窗口 / 区域**（用户：「屏幕/窗口/区域 共享分为三个tab」）。顶上一条
 分段控件（`GtkStackSwitcher`，选中那段填强调色），下面一页一个网格；**只列应用真的在要的那几种
 来源**，只剩一个 tab 时那条控件收起来。虚拟屏幕并进「屏幕」页（它本来就是「再来一块屏」）。
@@ -3351,7 +3388,7 @@ xdg-desktop-portal-wlr 那边这笔拷贝在 **portal 进程**里做、合成器
 交换链都建不出来的会话（`WLR_RENDERER=pixman`，缓冲是 shm）就完全退回老路（消费者分配 memfd
 + 回读）。`VIDOW_SC_NO_DMABUF=1` 强制走回读那条路（A/B 用）。
 
-实测（`./test-portal-own.sh`，53 项）：私有 dbus + headless vidow → `vidow.portal` 落地、
+实测（`./test-portal-own.sh`，92 项：64 项老判据 + 6f 的 27 项持久化 + 1 项已知偶发）：私有 dbus + headless vidow → `vidow.portal` 落地、
 `vidow-portal` 占住总线名 → 前端把 ScreenCast / Screenshot 指到它 → 选择器画在 vidow 上
 （标题「共享屏幕」，第一行默认选中）→ 回车确认 → `Start` 返回 `node` / `size`：
 整屏（1280x720）、**窗口**（`source_type=2`，尺寸报窗口的）、**虚拟输出**（合成器里真多出
@@ -5420,6 +5457,21 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
        `test-defaultconfig.sh` 全过（新增的 `20-layout.lua` 与 `--default-config` 逐字节一致，114 个平铺键都在）。
      - 未做：niri 的 `fixed 1920`（固定像素档）、`preset-window-heights`、`default-column-width {}`（让客户端自己定宽）、
        `always-center-single-column`；窗口规则级的 per-rule 预设覆盖。
+
+279. **录屏 portal 会话持久化：impl ScreenCast 接口 2 → 4（`persist_mode` / `restore_data`）—— 选过一次的屏 / 窗口，以后不再弹选择器**（用户：「仓库 /home/busyo/Dev/Vidow（C，wlroots 0.20 的 niri 风格滚动平铺合成器 vidow）。用户要求：**录屏 portal 需要持久化**」；2026-10-14）
+
+     - **现象**：Chromium / OBS / Firefox 每次录屏都要重新弹选择器，`persist_mode=2` 的授权存不下来。根因在 `tools/vidowportal.c`：`SC_VERSION` 是 2（只有 `cursor_mode`），`SelectSources` 不读 `persist_mode` / `restore_data`、`Start` 也不回 —— 而前端（xdg-desktop-portal 1.20.4）**只在后端版本 ≥ 4 时**才把持久化那两项转下来，所以「授权」这一步压根没发生过。
+     - **改了什么**（`tools/vidowportal.c`，接口版本只声明到 4 —— v5 的 `mapping_id`、v6 的 `pipewire-serial` 是流属性，我们不在 `Start` 的 streams 里给，报了就是给消费者制造期待）：
+       - `SC_VERSION = 4`（`tools/vidowportal.c:157`）；`SelectSources` 解析 `persist_mode`(`u`) 和 `restore_data`(`(suv)`)；`Start` 的 results 回 `restore_data` + `persist_mode`（原样回，没做「降级」那套 UI）。
+       - 持久化数据存在**前端**（权限库、按 app_id 存），后端只做两件事：生成一份**能自证**的、和「收到时认得出来就跳过选择器」。vendor `"vidow"`、私有版本 `1`、私有数据是**自描述字符串**（不用指针 / 时间戳这种没法复现的东西）：`kind|标识符|cursor_mode[;kind|标识符|cursor_mode]…`，`kind` = `monitor`（标识符 = 输出名）/ `window`（= ext-foreign-toplevel 的 identifier）/ `virtual`（= `WxH`）。区域那种当场框出来的源没有稳定标识符，不进 `restore_data`（全是区域的会话就不回，等于这次没持久化，日志里会说）。
+       - **回退的两条路**：① 建流之前就发现源不在（窗口的 `ext_foreign_toplevel` `handle` 空了 / 输出名对不上 / 这次 types 没要这种源）；② 建了流但**被合成器拒掉**（`没有这个窗口（它可能已经关了）`）—— 后者才是权威信号（列表里可能还挂着已经关掉的窗口）。两条路都是「把半路建起来的流收掉 → 丢掉这份 restore_data → 弹选择器」，不是回失败（`req->restoring` 那个标记就是干这个的）。
+       - **不可信输入**：`restore_data` 是前端原样转回来的 —— 格式非法（vendor / 版本 / `v` 里不是字符串 / 解析不出来）**忽略 + 照常弹选择器**；合法但源不在了（窗口关了 / 输出名对不上 / 这次 types 没要这种源）**回退弹选择器**（不是报错），半路建起来的流全收掉。光标模式按**存下来的那份**恢复，这次请求带的另一份不覆盖它（不一样会记一行）。
+       - 建流那段抽成 `stream_add_output / window / region / virtual`：对话框点「共享」和 restore 恢复走**同一份**代码（`src_ kind` / `src_id` 记在 struct stream 上，Start 成功后按它拼新的 restore_data）。
+       - 日志每步一行（测试直接拿它们当判据）：`restore_data：收到 …` / `判定合法（N 个源，光标 …）` / `判定非法（原因），忽略，照常弹选择器` / `恢复成 N 路流，跳过选择器` / `输出 … 不在了，回退弹选择器` / `Start：回 restore_data（persist_mode=… vendor=… 版本=… 数据=…）`。
+     - **实测的前端行为（写下来免得下次又猜）**：前端是两层数据之间的**翻译层** —— 后端的 `(suv)` 被它换成自己的 **`restore_token`（字符串）** 发给客户端（前端日志 `Replacing restore data received from portal impl with a token`），客户端下次把 token 带回来时才翻译回 `restore_data` 喂给后端；客户端自己往 `SelectSources` 里塞 `restore_data` 是无效的（它会丢掉，那不是客户端的字段）。所以判据得这么写：判据 1 看**后端日志**里那份三元组，判据 2/3 走真链路（客户端带 `restore_token`），判据 4 的类型级垃圾只能**直接问后端**（前端按自己的协议先挡一遍）。
+     - **测试**（`./test-portal-own.sh` 新增 6f 一节，27 项；客户端探针**写进脚本里**（`$R/persistprobe.py`，不新增 tools 文件），和 `tools/screencastprobe.py` 同一条路：同一套 handle_token + Response 订阅）：判据 1 `persist_mode=2` → results 里回 `(suv)`（vendor=vidow / 版本 1 / 数据 `monitor|HEADLESS-2|1`）、前端把它换成 token 发给客户端；判据 2 同一个 app_id 第二次带 token 请求 → **没弹选择器窗口**、日志 `判定合法 → 恢复成 1 路流，跳过选择器`、size/position 和第一轮逐字相同（2560,1440 @ 1280,0）；判据 3 录一个窗口 → 把那个窗口关掉 → 再带 token 请求 → **回退弹选择器**（实测走的是「建流被合成器拒掉」那条路，日志 `restore_data：合成器不认这些源（…），回退弹选择器`；回退之后照常出流、不崩）；判据 4 五种字符串级垃圾（错 vendor / 错版本 / 空数据 / 结构不对 / 光标模式不认识）各自给了原因并被忽略、五种**类型级**垃圾（`'junk'` / `(suu)` / `v` 里是 uint32 / 前两段类型不对 / 少一段）没把后端打崩、以及一条完整的「CreateSession → SelectSources（垃圾）→ Start = 照常弹选择器」。基线（改前）`./test-portal-own.sh` 64 PASS / 1 FAIL → 改后 91 PASS / 1 FAIL（那 1 条是**改前就有**的偶发：6b2 窗口流的光标位置判据 `pos=630,708` vs 流中心 `671,748`，差 41 超了 ±40 的容差；改前基线同一位置、同一个数，跟这次改动无关）。
+     - **顺手加固**（`test-portal-own.sh` 的 `cleanup()`）：以前是 `pgrep -x vidow` **全杀** —— 在用户真跑着 vidow 的机器上跑这个测试会把人会话干掉。现在只收「自己的」vidow（临时 HOME 或 `WLR_BACKENDS=headless` 那两个判据），桌面上的那个一个都不碰。
+     - **没做到 / 边界**：**输出被拔掉**这条路后端看不出来（`outputs` 列表只加不删，`registry_global_remove` 是空的），所以「拔了屏 → 回退」只在窗口那条路上验了（窗口没了有确切信号：`ext_foreign_toplevel` 的 `closed`）。输出列表的增删是另一件事（要小心处理行 / 缩略图里的悬垂指针），这次没动。
 
 278. **小窗 HiDPI 修一条真 bug：运行时把输出调到 scale 2 之后重进小窗，盒里的客户端内容只有该有的一半大**（用户：「仓库 /home/busyo/Dev/Vidow …… 先定性，再决定改不改」；2026-10-14）
 

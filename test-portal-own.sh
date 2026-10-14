@@ -46,7 +46,15 @@ fail() { echo "  FAIL  $1"; FAILED=1; }
 mark() { echo; echo "== $1 =="; }
 
 cleanup() {
-	for p in $(pgrep -x vidow 2>/dev/null); do kill "$p" 2>/dev/null; done
+	# 只收**自己起的** vidow：临时 HOME（$RUNDIR/home）或者 headless 后端那两种。
+	# 桌面上那个真 vidow（用户自己的 HOME、真后端）一个都不许碰 —— 以前这里是无脑
+	# `pgrep -x vidow` 全杀，别人正跑着 vidow 的机器上跑这个测试会把人会话干掉。
+	for p in $(pgrep -x vidow 2>/dev/null); do
+		e=$(tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null)
+		case "$e" in
+		*"HOME=$RUNDIR/home"*|*"WLR_BACKENDS=headless"*) kill "$p" 2>/dev/null ;;
+		esac
+	done
 	# vidow-portal 挂在私有总线上（dbus-run-session 结束不一定带走），按总线地址认。
 	for p in $(pgrep -x vidow-portal 2>/dev/null); do
 		a=$(tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null |
@@ -1064,6 +1072,525 @@ if [ -n "${NODE5:-}" ]; then
 else
 	fail "反证那轮没拿到 node"
 fi
+
+
+# --- 6f 会话持久化（persist_mode / restore_data，impl ScreenCast v4） --------
+#
+# 规范（flatpak.github.io/xdg-desktop-portal/docs 的 impl ScreenCast，当前 v6）：
+#   SelectSources 的 options 里可能带 persist_mode（0/1/2）和 restore_data（(suv)）；
+#   Start 的 results 里回 restore_data + persist_mode（有效 persist_mode = 2 时**前端**
+#   把它存进权限库、按 app_id 存，下次作为 SelectSources 的 options 再喂给后端）。
+# 两边责任分得清楚：**数据存在前端**（我们看不到权限库），后端只做「生成一份能自证的」
+# 和「收到时认得出来就跳过选择器」。所以这一节能验的是：
+#   1) persist_mode=2 → Start 的 results 里回了 restore_data（(suv) 三元组：vendor=vidow
+#      / 私有版本 / 非空数据，数据形如 monitor|HEADLESS-2|1）；
+#   2) 同一个 app_id 再请求一次（**客户端什么都不用带**）→ 前端把它喂回来 → 后端
+#      **不弹选择器**、直接恢复成同一块源；
+#   3) 那块源没了（关掉窗口）→ **回退弹选择器**，不崩；
+#   4) 垃圾 restore_data（错 vendor / 错版本 / 空数据 / 结构不对 / D-Bus 类型不对）→
+#      忽略 + 弹选择器，一个都不能崩。
+#
+# 实测到的前端行为（xdp 1.20.4，写下来免得下次又猜）：前端是**两层数据之间的翻译层** ——
+# 后端给它 `restore_data`（(suv) 三元组），它换成自己的 **`restore_token`（字符串）** 发给
+# 客户端（前端日志：`Replacing restore data received from portal impl with a token`），
+# 下次客户端把 token 带回来（SelectSources 的 `restore_token`），它再翻译回 `restore_data`
+# 喂给后端。所以：
+#   * 判据 1 看的是**后端日志**里那份「回 restore_data」（客户端侧看到的是 token）；
+#   * 判据 2/3 走**真链路**：客户端第二次请求把上一轮拿到的 `restore_token` 带回去；
+#   * 判据 4 的类型级垃圾只能**直接问后端**（前端按自己的协议先挡一遍，而且客户端塞的
+#     `restore_data` 选项它会丢掉 —— 那是后端和前端之间的字段，客户端不该碰）。
+
+cat >"$R/persistprobe.py" <<'PYP'
+#!/usr/bin/env python3
+"""带持久化的 ScreenCast 请求：SelectSources 里能带 persist_mode / restore_data，
+Start 的 results 里把 restore_data / persist_mode 打出来。"""
+import argparse, os, sys
+import gi
+gi.require_version("Gio", "2.0")
+from gi.repository import Gio, GLib
+
+DEST = "org.freedesktop.portal.Desktop"
+OBJ = "/org/freedesktop/portal/desktop"
+SC = "org.freedesktop.portal.ScreenCast"
+REQ = "org.freedesktop.portal.Request"
+
+ap = argparse.ArgumentParser()
+ap.add_argument("--types", type=int, default=1)
+ap.add_argument("--cursor-mode", type=int, default=1)
+ap.add_argument("--persist", type=int, default=0)
+ap.add_argument("--restore-data", default=None,
+                help="私有数据字符串；给了就在 SelectSources 里带 restore_data=(suv)")
+ap.add_argument("--restore-token", default=None,
+                help="前端在 Start 的 results 里给的那个 token（下一次请求带回来）")
+ap.add_argument("--restore-vendor", default="vidow")
+ap.add_argument("--restore-version", type=int, default=1)
+ap.add_argument("--timeout", type=float, default=20.0)
+args = ap.parse_args()
+
+conn = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+sender = conn.get_unique_name()[1:].replace(".", "_")
+pid = os.getpid()
+seq = [0]
+loop = GLib.MainLoop()
+seen = {}
+
+def req_path(t):
+    return "%s/request/%s/%s" % (OBJ, sender, t)
+
+def sess_path(t):
+    return "%s/session/%s/%s" % (OBJ, sender, t)
+
+def on_resp(_c, _s, path, _i, _sig, params_, *rest):
+    seen[path] = params_.unpack()
+    loop.quit()
+
+conn.signal_subscribe(DEST, REQ, "Response", None, None, 0, on_resp)
+conn.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus",
+               "org.freedesktop.DBus", "GetId", None, None,
+               Gio.DBusCallFlags.NONE, -1, None)
+
+def call(method, params, handle):
+    seen.clear()
+    box = {}
+
+    def on_timeout():
+        box["timeout"] = True
+        loop.quit()
+        return False
+
+    tid = GLib.timeout_add(int(args.timeout * 1000), on_timeout)
+    ret = conn.call_sync(DEST, OBJ, SC, method, params, None,
+                         Gio.DBusCallFlags.NONE, -1, None)
+    actual = ret.unpack()[0] if ret is not None else "(无)"
+    loop.run()
+    if not box.get("timeout"):
+        GLib.source_remove(tid)
+    if box.get("timeout"):
+        print("  %s: 超时（%gs 没有 Response）—— 对话框没人点？" % (method, args.timeout),
+              flush=True)
+        return None
+    code, results = seen.get(actual, seen.get(handle, (None, None)))
+    if code != 0:
+        print("  %s: Response code=%s" % (method, code), flush=True)
+        return None
+    print("  %s: code=0" % method, flush=True)
+    return results or {}
+
+seq[0] += 1
+token = "vpp%da%d" % (pid, seq[0])
+params = GLib.Variant("(a{sv})", ({
+    "handle_token": GLib.Variant("s", token),
+    "session_handle_token": GLib.Variant("s", "vpps%d" % pid),
+},))
+res = call("CreateSession", params, req_path(token))
+if res is None:
+    sys.exit(1)
+session = res.get("session_handle") or sess_path("vpps%d" % pid)
+
+seq[0] += 1
+token = "vpp%db%d" % (pid, seq[0])
+opts = {
+    "handle_token": GLib.Variant("s", token),
+    "types": GLib.Variant("u", args.types),
+    "cursor_mode": GLib.Variant("u", args.cursor_mode),
+}
+if args.persist:
+    opts["persist_mode"] = GLib.Variant("u", args.persist)
+if args.restore_token is not None:
+    opts["restore_token"] = GLib.Variant("s", args.restore_token)
+    print("  发送 restore_token=%s" % args.restore_token, flush=True)
+if args.restore_data is not None:
+    opts["restore_data"] = GLib.Variant("(suv)", (
+        args.restore_vendor, args.restore_version,
+        GLib.Variant("s", args.restore_data)))
+    print("  发送 restore_data=(%s, %d, %r)" % (args.restore_vendor,
+                                               args.restore_version,
+                                               args.restore_data), flush=True)
+print("SelectSources:", flush=True)
+if call("SelectSources", GLib.Variant("(oa{sv})", (session, opts)),
+        req_path(token)) is None:
+    sys.exit(1)
+
+seq[0] += 1
+token = "vpp%dc%d" % (pid, seq[0])
+print("Start:", flush=True)
+res = call("Start", GLib.Variant("(osa{sv})", (
+    session, "", {"handle_token": GLib.Variant("s", token)})), req_path(token))
+if res is None:
+    sys.exit(1)
+streams = res.get("streams") or []
+print("    streams=%d" % len(streams), flush=True)
+for node, props in streams:
+    print("      node=%s props=%s" % (node, props), flush=True)
+rd = res.get("restore_data")
+if rd is None:
+    print("    没有 restore_data", flush=True)
+else:
+    vendor, version, data = rd
+    print("    restore_data: vendor=%s version=%d data=%s" % (vendor, version, data),
+          flush=True)
+tok = res.get("restore_token")
+if tok is not None:
+    print("    restore_token=%s" % tok, flush=True)
+pm = res.get("persist_mode")
+print("    persist_mode=%s" % ("（没回）" if pm is None else pm), flush=True)
+try:
+    conn.call_sync(DEST, session, "org.freedesktop.portal.Session", "Close", None, None,
+                   Gio.DBusCallFlags.NONE, -1, None)
+except Exception as exc:  # noqa: BLE001
+    print("关会话失败（不影响前面拿到的流）：%s" % exc, flush=True)
+if not streams:
+    print("    （没有流）", flush=True)
+    sys.exit(1)
+print("OK", flush=True)
+sys.exit(0)
+PYP
+
+
+picker_lines() { grep -ac "Start，弹选择器" "$R/helper.log" 2>/dev/null; }
+# 后端回的那份 restore_data（日志里的三元组）→ shell 变量：RDV / RDEV / RDD / RDCNT。
+rd_fields() {
+	local line
+	line=$(grep -a "Start：回 restore_data" "$R/helper.log" 2>/dev/null | tail -1)
+	RDLINE=$line
+	RDV=$(echo "$line" | sed -n 's/.*vendor=\([^ ]*\) 版本=.*/\1/p')
+	RDEV=$(echo "$line" | sed -n 's/.*版本=\([0-9]*\) 数据=.*/\1/p')
+	RDD=$(echo "$line" | sed -n 's/.*数据=\(.*\)）.*/\1/p')
+	RDCNT=$(grep -ac "Start：回 restore_data" "$R/helper.log" 2>/dev/null)
+}
+probe_size() { grep -ao "size': ([0-9-]*, [0-9-]*)" "$1" 2>/dev/null | head -1 | grep -o "[0-9-]*, [0-9-]*"; }
+probe_pos() { grep -ao "position': ([0-9-]*, [0-9-]*)" "$1" 2>/dev/null | head -1 | grep -o "[0-9-]*, [0-9-]*"; }
+last_source() { grep -a "要一路流" "$R/helper.log" 2>/dev/null | tail -1 | sed 's/^vidow-portal: //; s/: 要一路流.*//'; }
+
+echo; echo "== 6f. 会话持久化（restore_data / persist_mode，接口 v4） =="
+
+# 接口版本必须是 4：**只声明 4，不虚报 5/6**（v5 的 mapping_id、v6 的 pipewire-serial
+# 是流属性，我们不在 Start 的 streams 里给，报了就是给消费者制造期待）。前端也是按这个
+# 属性决定要不要把 persist_mode / restore_data 转给后端的。
+VER=$(gdbus call --session --dest org.freedesktop.impl.portal.desktop.vidow \
+	--object-path /org/freedesktop/portal/desktop \
+	--method org.freedesktop.DBus.Properties.Get \
+	org.freedesktop.impl.portal.ScreenCast version 2>/dev/null)
+if echo "${VER:-}" | grep -q "uint32 4"; then
+	pass "后端的 ScreenCast version = 4（v4 才有 persist_mode / restore_data）"
+else
+	fail "ScreenCast version 不是 4：${VER:-读不出来}"
+fi
+
+# --- 6f1 persist_mode=2 → Start 的 results 里要回一份 restore_data ----------
+PICK0=$(picker_lines)
+RDC0=$(grep -ac "Start：回 restore_data" "$R/helper.log" 2>/dev/null)
+# 6f2 要比的是「6f1 弹完之后」的基线（6f1 自己就弹了一次）。
+
+timeout 150 python3 "$R/persistprobe.py" --types 1 --persist 2 --timeout 60 \
+	>"$R/p1.txt" 2>&1 &
+if wait_and_share; then
+	pass "6f1 带 persist_mode=2 的第一次请求，选择器弹出来了"
+else
+	fail "6f1 第一次没等到选择器：$(tail -3 "$R/p1.txt" | tr '\n' ' ')"
+fi
+NODE1=$(wait_node "$R/p1.txt")
+if [ -n "${NODE1:-}" ]; then
+	pass "6f1 第一次拿到了流（node=$NODE1）"
+else
+	fail "6f1 第一次没拿到流：$(tail -3 "$R/p1.txt" | tr '\n' ' ')"
+fi
+rd_fields
+if [ "${RDV:-}" = "vidow" ] && [ "${RDEV:-}" = "1" ] && [ -n "${RDD:-}" ]; then
+	pass "6f1 Start 的 results 里回了 restore_data（vendor=vidow 版本=1 数据=$RDD）"
+else
+	fail "6f1 Start 的 results 里没有合法的 restore_data：${RDLINE:-（没有那一行日志）}"
+fi
+if [ "${RDCNT:-0}" -gt "${RDC0:-0}" ]; then
+	pass "6f1 日志里多了「Start：回 restore_data」这一行（就是判据 1 的证据）"
+else
+	fail "6f1 日志里没有「Start：回 restore_data」"
+fi
+case "${RDD:-}" in
+monitor\|*\|1|monitor\|*\|2|monitor\|*\|4)
+	pass "6f1 数据的形状是自描述字符串（$RDD = 源类型|标识符|光标模式）" ;;
+*)
+	fail "6f1 restore_data 的私有数据形状不对：${RDD:-空}" ;;
+esac
+SIZE1=$(probe_size "$R/p1.txt")
+POS1=$(probe_pos "$R/p1.txt")
+SRC1=$(last_source)
+TOK1=$(grep -ao "restore_token=.*" "$R/p1.txt" 2>/dev/null | head -1 | cut -d= -f2-)
+if [ -n "${TOK1:-}" ]; then
+	pass "6f1 前端把那份 restore_data 换成了 restore_token 发给客户端（$TOK1）"
+else
+	fail "6f1 客户端没拿到 restore_token（前端没认我们回的 restore_data？）"
+fi
+PICK1=$(picker_lines)
+echo "      （第一次：源=$SRC1 size=$SIZE1 pos=$POS1，数据=$RDD，token=$TOK1）"
+
+# --- 6f2 同一个 app_id 再请求一次（客户端不带任何东西）→ 不弹选择器 --------
+# 这一条是**真链路**的判据：客户端这次没有 restore_data 可带（前端也不让它带），
+# 前端手里那份就是我们上一轮给的 —— 后端能跳过选择器，只可能是前端把它喂回来了。
+if [ -n "${RDD:-}" ]; then
+	timeout 120 python3 "$R/persistprobe.py" --types 1 --persist 2 \
+		--restore-token "$TOK1" --timeout 30 >"$R/p2.txt" 2>&1 &
+	PP=$!
+	DLGSEEN=0
+	for i in $(seq 1 60); do
+		if $VM --socket "$IPC" windows 2>/dev/null | grep -aq "共享屏幕"; then
+			DLGSEEN=1
+			break
+		fi
+		kill -0 "$PP" 2>/dev/null || break
+		sleep 0.2
+	done
+	wait "$PP"
+	PICK2=$(picker_lines)
+	if [ "$DLGSEEN" = 0 ]; then
+		pass "6f2 第二次请求**没有**弹选择器窗口（前端把上一轮的 restore_data 喂回来了）"
+	else
+		fail "6f2 第二次请求还是弹了选择器"
+	fi
+	if [ "${PICK2:-0}" = "${PICK1:-0}" ]; then
+		pass "6f2 后端日志里没有新的「Start，弹选择器」（$PICK1 → $PICK2）"
+	else
+		fail "6f2 后端又弹了一次选择器（「Start，弹选择器」$PICK1 → $PICK2）"
+	fi
+	if grep -aq "restore_data：判定合法" "$R/helper.log" &&
+			grep -aq "restore_data：恢复成" "$R/helper.log"; then
+		pass "6f2 日志：收到 → 判定合法 → 直接恢复（$(grep -a 'restore_data：恢复成' "$R/helper.log" | tail -1 | sed 's/^vidow-portal: //')）"
+	else
+		fail "6f2 日志里没有「判定合法 / 恢复成」：$(grep -a 'restore_data' "$R/helper.log" | tail -3 | tr '\n' ' ')"
+	fi
+	NODE2=$(wait_node "$R/p2.txt")
+	if [ -n "${NODE2:-}" ]; then
+		pass "6f2 恢复出来的流拿到了 node（node=$NODE2）"
+	else
+		fail "6f2 恢复出来的流没拿到 node：$(tail -3 "$R/p2.txt" | tr '\n' ' ')"
+	fi
+	SIZE2=$(probe_size "$R/p2.txt")
+	POS2=$(probe_pos "$R/p2.txt")
+	SRC2=$(last_source)
+	if [ -n "${SIZE2:-}" ] && [ "${SIZE2:-}" = "${SIZE1:-}" ] && [ "${POS2:-}" = "${POS1:-}" ]; then
+		pass "6f2 恢复的流指的还是同一块源（size=$SIZE2 pos=$POS2，第一次 $SIZE1/$POS1）"
+	else
+		fail "6f2 恢复的流不是同一块源：size/pos = ${SIZE2:-空}/${POS2:-空}，第一次是 ${SIZE1:-空}/${POS1:-空}"
+	fi
+	if [ -n "${SRC2:-}" ] && [ "${SRC2}" = "${SRC1:-}" ]; then
+		pass "6f2 恢复的流是同一块输出（$SRC2 = $SRC1）"
+	else
+		fail "6f2 恢复的流换了一块输出：${SRC2:-空} vs ${SRC1:-空}"
+	fi
+	rd_fields
+	if [ -n "${RDD:-}" ] && [ -n "${RDV:-}" ]; then
+		pass "6f2 恢复之后又回了一份新的 restore_data（$RDD，前端会再换成新 token）"
+	else
+		fail "6f2 恢复之后没回新的 restore_data"
+	fi
+else
+	fail "6f1 没拿到 restore_data，6f2 测不了"
+fi
+
+# --- 6f3 源没了：关掉那个窗口 → 回退弹选择器（不是报错、不崩） -------------
+echo "      （6f3：窗口那条路 —— 录一个窗口，把它关掉，再让前端拿存下来的数据喂回来）"
+python3 /home/busyo/Dev/Vidow/tools/pattern.py >"$R/pd1.log" 2>&1 &
+WP1=$!
+python3 /home/busyo/Dev/Vidow/tools/pattern.py >"$R/pd2.log" 2>&1 &
+WP2=$!
+for i in $(seq 1 20); do
+	[ "$($VM --socket "$IPC" windows 2>/dev/null | grep -ac '"pattern"')" -ge 2 ] && break
+	sleep 0.5
+done
+timeout 150 python3 "$R/persistprobe.py" --types 2 --persist 2 --timeout 60 \
+	>"$R/p3.txt" 2>&1 &
+if wait_and_share; then
+	pass "6f3 窗口那轮（persist_mode=2）的选择器弹出来了"
+else
+	fail "6f3 窗口那轮没等到选择器"
+fi
+NODE3=$(wait_node "$R/p3.txt")
+if [ -n "${NODE3:-}" ]; then
+	pass "6f3 窗口那轮拿到了流（node=$NODE3）"
+else
+	fail "6f3 窗口那轮没拿到流：$(tail -3 "$R/p3.txt" | tr '\n' ' ')"
+fi
+rd_fields
+RDW=${RDD:-}
+TOK3=$(grep -ao "restore_token=.*" "$R/p3.txt" 2>/dev/null | head -1 | cut -d= -f2-)
+case "${RDW:-}" in
+window\|*\|1|window\|*\|2|window\|*\|4)
+	pass "6f3 录了一个窗口，存的 restore_data 是它的 identifier（$RDW）" ;;
+*)
+	fail "6f3 没拿到窗口的 restore_data：${RDW:-空}" ;;
+esac
+# 关掉两个探针窗口，再开一个新的：新窗口的 identifier 和存下来的那个不一样 ——
+# 这就是「拔了源」那条路（ext_foreign_toplevel 的 closed 是后端能看到的信号）。
+kill $WP1 $WP2 2>/dev/null
+for i in $(seq 1 30); do
+	[ "$($VM --socket "$IPC" windows 2>/dev/null | grep -ac '"pattern"')" -eq 0 ] && break
+	sleep 0.5
+done
+python3 /home/busyo/Dev/Vidow/tools/pattern.py >"$R/pd3.log" 2>&1 &
+WP3=$!
+for i in $(seq 1 20); do
+	[ "$($VM --socket "$IPC" windows 2>/dev/null | grep -ac '"pattern"')" -ge 1 ] && break
+	sleep 0.5
+done
+if [ -n "${RDW:-}" ] && [ -n "${TOK3:-}" ]; then
+	PICK3=$(picker_lines)
+	timeout 150 python3 "$R/persistprobe.py" --types 2 --persist 2 \
+		--restore-token "$TOK3" --timeout 60 >"$R/p4.txt" 2>&1 &
+	sleep 3
+	DLG3=$(wait_dialog)
+	if [ -n "${DLG3:-}" ]; then
+		pass "6f3 源没了（那个窗口关了）→ 回退弹了选择器（对话框 $DLG3）"
+	else
+		fail "6f3 源没了却没弹选择器：$(tail -3 "$R/p4.txt" | tr '\n' ' ')"
+	fi
+	# 回退的原因有两条路都可能走到（都对，日志里会说清是哪条）：
+	#   ① 后端手里那份窗口列表已经把那个窗口标成没了（ext_foreign_toplevel 的 closed，
+	#      选择器也是按它过滤的）→ 还没建流就回退；
+	#   ② 列表里那个窗口还挂着（合成器发 closed 的时机 / 顺序不一定）→ 建流被合成器
+	#      拒掉（`没有这个窗口（它可能已经关了）`）→ 照样回退，不是回失败。
+	if grep -aq "restore_data：窗口 .* 不在了，回退弹选择器" "$R/helper.log" 2>/dev/null ||
+			grep -aq "restore_data：合成器不认这些源" "$R/helper.log" 2>/dev/null; then
+		pass "6f3 日志说清了为什么回退（$(grep -a '回退弹选择器' "$R/helper.log" | tail -1 | sed 's/^vidow-portal: //')）"
+	else
+		fail "6f3 日志里没有「窗口 … 不在了 / 合成器不认这些源 → 回退」"
+	fi
+	if [ "${PICK3:-0}" -gt "${PICK2:-0}" ]; then
+		pass "6f3 日志里「Start，弹选择器」多了一行（$PICK3 > $PICK2）"
+	else
+		fail "6f3 日志里没看到新的「Start，弹选择器」（$PICK2 → $PICK3）"
+	fi
+	# 把回退出来的选择器答掉（回车 = 共享第一行，这会儿列表里是新开的那个窗口）
+	if [ -n "${DLG3:-}" ]; then
+		sleep 1
+		for i in $(seq 1 20); do
+			$VM --socket "$IPC" send-key tap Return >/dev/null 2>&1
+			sleep 0.5
+			$VM --socket "$IPC" windows 2>/dev/null | grep -aq "共享屏幕" || break
+		done
+	fi
+	for i in $(seq 1 30); do
+		grep -aq "node=" "$R/p4.txt" 2>/dev/null && break
+		sleep 1
+	done
+	NODE4=$(grep -ao "node=[0-9]*" "$R/p4.txt" 2>/dev/null | head -1 | cut -d= -f2)
+	if [ -n "${NODE4:-}" ]; then
+		pass "6f3 回退之后照常走完（新选择器选的那个窗口出流 node=$NODE4）"
+	else
+		fail "6f3 回退之后没出流：$(tail -3 "$R/p4.txt" | tr '\n' ' ')"
+	fi
+else
+	fail "6f3 没拿到窗口的 restore_data，测不了"
+fi
+kill $WP3 2>/dev/null
+
+# --- 6f4 垃圾 restore_data：忽略 + 弹选择器，不崩在 D-Bus 类型上 ----------
+#   (a) 字符串级垃圾（错 vendor / 错版本 / 空数据 / 结构不对）：直接问后端，
+#       每条都要**忽略 + 记原因**；
+#   (b) 类型级垃圾（整条换成字符串 / (suu) / v 里是 uint32 / 前两段类型不对）：
+#       前端会先把不对的类型挡掉，所以只能直接问后端 —— 「不崩在 D-Bus 类型上」
+#       正是要验后端自己扛得住；
+#   (c) 走一遍完整回退：CreateSession → SelectSources（垃圾）→ Start，垃圾必须被
+#       忽略、**照常弹选择器**（不是报错）。
+GARBAGE=0
+garbage_case() { # <说明> <vendor> <版本> <数据>
+	local vendor=$2 ver=$3 data=$4
+	gdbus call --session --dest org.freedesktop.impl.portal.desktop.vidow \
+		--object-path /org/freedesktop/portal/desktop \
+		--method org.freedesktop.impl.portal.ScreenCast.SelectSources \
+		"/org/freedesktop/portal/desktop/request/garbage$$" \
+		"/org/freedesktop/portal/desktop/session/garbage$$" "garbage-app" \
+		"{'types': <uint32 1>, 'persist_mode': <uint32 2>, 'restore_data': <('$vendor', uint32 $ver, <'$data'>)>}" \
+		>/dev/null 2>&1 || GARBAGE=$((GARBAGE + 1))
+}
+BAD0=$(grep -ac "restore_data：判定非法" "$R/helper.log" 2>/dev/null)
+garbage_case "乱写的 vendor" kde 1 "monitor|HEADLESS-1|1"
+garbage_case "错版本号" vidow 2 "monitor|HEADLESS-1|1"
+garbage_case "空数据" vidow 1 ""
+garbage_case "结构不对（少一段）" vidow 1 "monitor|HEADLESS-1"
+garbage_case "光标模式不认识" vidow 1 "monitor|HEADLESS-1|7"
+BAD1=$(grep -ac "restore_data：判定非法" "$R/helper.log" 2>/dev/null)
+if [ "$GARBAGE" = 0 ] && [ "${BAD1:-0}" -ge $(( ${BAD0:-0} + 5 )) ]; then
+	pass "6f4 (a) 五种字符串级垃圾全被判非法忽略（「判定非法」$BAD0 → $BAD1）"
+else
+	fail "6f4 (a) 字符串级垃圾没处理干净（失败 $GARBAGE 次，「判定非法」$BAD0 → $BAD1）"
+fi
+if grep -aq "vendor 不是 vidow" "$R/helper.log" &&
+		grep -aq "私有版本号不是 1" "$R/helper.log" &&
+		grep -aq "数据是空的" "$R/helper.log" &&
+		grep -aq "不是 kind|标识符|cursor_mode 三段" "$R/helper.log" &&
+		grep -aq "光标模式不是 1/2/4" "$R/helper.log"; then
+	pass "6f4 (a) 五种垃圾各自给了原因（错 vendor / 错版本 / 空 / 结构 / 光标模式）"
+else
+	fail "6f4 (a) 垃圾的原因没记全：$(grep -a '判定非法' "$R/helper.log" | tail -5 | tr '\n' ' ')"
+fi
+# (b) 类型级
+TYPEBAD=0
+type_garbage() { # <restore_data 的 GVariant 文本>
+	gdbus call --session --dest org.freedesktop.impl.portal.desktop.vidow \
+		--object-path /org/freedesktop/portal/desktop \
+		--method org.freedesktop.impl.portal.ScreenCast.SelectSources \
+		"/org/freedesktop/portal/desktop/request/tb$$" \
+		"/org/freedesktop/portal/desktop/session/tb$$" "garbage-app" \
+		"{'types': <uint32 1>, 'restore_data': $1}" >/dev/null 2>&1 || TYPEBAD=$((TYPEBAD + 1))
+}
+type_garbage "<'junk'>"
+type_garbage "<('vidow', uint32 1, uint32 5)>"
+type_garbage "<('vidow', uint32 1, <uint32 5>)>"
+type_garbage "<(uint32 3, uint32 1, <'x'>)>"
+type_garbage "<('vidow', uint32 1)>"
+if [ "$TYPEBAD" = 0 ] && pgrep -x vidow-portal >/dev/null; then
+	pass "6f4 (b) 五种类型级垃圾（字符串 / (suu) / v 里是 uint32 / 前两段类型不对 / 少一段）都没把后端打崩"
+else
+	fail "6f4 (b) 类型级垃圾把后端弄出问题了（失败 $TYPEBAD 次，进程 $(pgrep -x vidow-portal >/dev/null && echo 在 || echo 不在)）"
+fi
+if grep -aq "restore_data：收到 vendor=vidow 版本=1 数据=(v 里不是字符串)" "$R/helper.log"; then
+	pass "6f4 (b) v 里不是字符串时安全拒掉（记了原因，没去解那个 variant）"
+else
+	fail "6f4 (b) v 里是 uint32 那条没记原因：$(grep -a 'restore_data：收到' "$R/helper.log" | tail -2 | tr '\n' ' ')"
+fi
+# (c) 完整的「垃圾 → 忽略 → 照常弹选择器」（直接问后端，走真的 CreateSession/Start）
+GSESS=/org/freedesktop/portal/desktop/session/garbage$$/s1
+GREQ=/org/freedesktop/portal/desktop/request/garbage$$/r1
+gdbus call --session --dest org.freedesktop.impl.portal.desktop.vidow \
+	--object-path /org/freedesktop/portal/desktop \
+	--method org.freedesktop.impl.portal.ScreenCast.CreateSession \
+	"$GREQ" "$GSESS" "garbage-app" "{'handle_token': <'r1'>}" \
+	>/dev/null 2>&1
+gdbus call --session --dest org.freedesktop.impl.portal.desktop.vidow \
+	--object-path /org/freedesktop/portal/desktop \
+	--method org.freedesktop.impl.portal.ScreenCast.SelectSources \
+	"$GREQ" "$GSESS" "garbage-app" \
+	"{'types': <uint32 1>, 'persist_mode': <uint32 2>, 'restore_data': <('vidow', uint32 1, <'monitor|HEADLESS-1'>)>}" \
+	>/dev/null 2>&1
+timeout 60 gdbus call --session --dest org.freedesktop.impl.portal.desktop.vidow \
+	--object-path /org/freedesktop/portal/desktop \
+	--method org.freedesktop.impl.portal.ScreenCast.Start \
+	"$GREQ" "$GSESS" "garbage-app" "" "{'handle_token': <'r2'>}" \
+	>"$R/g4.txt" 2>&1 &
+SLEEP_DLG=$(wait_dialog)
+if [ -n "${SLEEP_DLG:-}" ]; then
+	pass "6f4 (c) 垃圾 restore_data 被忽略、**照常弹选择器**（对话框 $SLEEP_DLG）"
+	$VM --socket "$IPC" send-key tap Escape >/dev/null 2>&1
+else
+	fail "6f4 (c) 垃圾 restore_data 之后没弹选择器：$(tail -2 "$R/g4.txt" 2>/dev/null | tr '\n' ' ')"
+fi
+sleep 1
+if pgrep -x vidow-portal >/dev/null && ! grep -aqiE "Assertion|Aborted|core dump" "$R/vidow.log"; then
+	pass "6f4 垃圾 restore_data 全流程走完，vidow-portal 活着、vidow 没崩"
+else
+	fail "6f4 垃圾 restore_data 这条路上出了崩 / 断言"
+fi
+
+# 这一节的边界（写清楚，别让人以为验了没验的）：
+#   * 客户端看不到 restore_data / persist_mode（前端把它们吃了，只存权限库）—— 判据 1
+#     的证据是**后端日志**里那份三元组；判据 2/3 是真链路（客户端第二次什么都没带）。
+#   * app_id：这个 harness 里前端算出来的是**空串**（客户端是个普通 python 脚本，不在
+#     systemd 的 app-*.scope 里），两次请求一样 —— 权限库按它存 / 取，所以能来回；
+#     真机上 app_id 是应用自己的（firefox / OBS 那些）。
+#   * **输出被拔掉**（wl_output 的 global 没了）那条路没测：后端现在只往 outputs 列表里
+#     加、从没删过（registry_global_remove 是空的），所以「输出没了」它看不出来 —— 这是
+#     这次没动的边界。窗口那条路有确切信号（ext_foreign_toplevel 的 closed），6f3 验的
+#     就是它。
 
 # --- 9 KDE 后端在这条私有总线上根本没被拉起来 ------------------------------
 # 怎么证明「这次录屏不是 KDE 后端干的」：

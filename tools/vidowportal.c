@@ -94,7 +94,10 @@
 #define THUMB_RADIUS 10.0
 /* 圆角用**超椭圆**（squircle）：|x/a|^n + |y/b|^n = 1，n=2 是普通的圆角圆弧，
  * n 越大越「方中带圆」（KDE Plasma 6 / macOS 那种）。GTK 的 border-radius 只会画
- * 圆弧，所以卡片 / 按钮 / tab 的底都是我们自己用 cairo 画的（CSS 里设成透明）。 */
+ * 圆弧，所以卡片 / 按钮 / tab 的底都是我们自己用 cairo 画的（CSS 里设成透明）。
+ *
+ * 4.0 是**三处同值**：窗口装饰（src/fx.c 的 sd_round_box，配置键 corner_n 默认
+ * 也是 4.0）和 Alt+Tab 的 MRU 卡片（src/mru.c 的 MRU_SQUIRCLE_N）—— 改要一起改。 */
 #define SQUIRCLE_N 4.0
 #define CARD_RADIUS 16.0
 #define BUTTON_RADIUS 16.0
@@ -148,8 +151,23 @@ static const char *cursor_mode_name(uint32_t cursor_mode) {
 	}
 }
 
-/* impl ScreenCast 的接口版本：2 = 有 cursor_mode，没有 restore_data / persist_mode。 */
-#define SC_VERSION 2u
+/* impl ScreenCast 的接口版本：4 = 有 cursor_mode（2）、source_type（3）、
+ * restore_data / persist_mode（4，会话持久化，见下面的「恢复」一节）。
+ * **不报 5 / 6**：v5 的 mapping_id、v6 的 pipewire-serial 是流属性，报了却不在
+ * Start 的 streams 里给，等于给消费者制造期待 —— 声明到哪儿就得做到哪儿。 */
+#define SC_VERSION 4u
+
+/* 持久化的三件事（impl ScreenCast v4）：
+ *   SelectSources 里可能带 persist_mode（0/1/2）和 restore_data（(suv) 三元组）；
+ *   Start 成功时回 restore_data（persist_mode != 0 时）+ persist_mode。
+ * 数据**存在前端**（权限库，按 app_id 存），我们只做「生成一份能自证的」和
+ * 「认得出来就跳过选择器」两件事。vendor 用 "vidow"（和 KDE / GNOME 一个做法），
+ * 私有版本号从 1 起，私有数据是个自描述字符串（**不能用指针 / 时间戳这种没法
+ * 复现的东西**）：kind|标识符|cursor_mode[;kind|标识符|cursor_mode]… */
+#define RESTORE_VENDOR "vidow"
+#define RESTORE_VERSION 1u
+/* 一次 Start 最多认几个源（对话框里同时选多块屏时按这个上限截断）。 */
+#define RESTORE_MAX_SRC 8
 
 /* 一行（对话框里一个可选项）。 */
 enum row_kind {
@@ -157,6 +175,14 @@ enum row_kind {
 	ROW_WINDOW,
 	ROW_VIRTUAL,
 	ROW_REGION,
+};
+
+/* restore_data 里的一条（私有数据字符串解出来的）：哪种源 + 它在合成器上的标识符
+ * + 当初授权时的光标模式。解析 / 使用都见「会话恢复」那一节。 */
+struct restore_src {
+	enum row_kind kind;   /* ROW_OUTPUT / ROW_WINDOW / ROW_VIRTUAL */
+	char id[96];
+	uint32_t cursor;
 };
 
 struct row {
@@ -216,6 +242,11 @@ struct stream {
 	uint32_t node;
 	bool created;
 	bool failed;
+	/* restore_data 要用：这一路录的是哪种源 + 它在合成器上的标识符（输出名 /
+	 * 窗口 identifier / 虚拟尺寸 WxH）。区域是当场框出来的、没法持久化，
+	 * src_kind = NULL（这种会话就不回 restore_data）。 */
+	const char *src_kind;
+	char src_id[96];
 };
 
 /* 一个窗口（ext-foreign-toplevel-list-v1 报的）。identifier 是录屏时回给合成器的
@@ -267,6 +298,10 @@ struct session {
 	uint32_t types;
 	bool multiple;
 	uint32_t cursor_mode;
+	/* impl v4 的持久化：persist_mode（SelectSources 收到，Start 原样回）+
+	 * restore_data 里那份私有数据（收到时就验过格式，Start 时再查源还在不在）。 */
+	uint32_t persist_mode;
+	char *restore_data;
 	GPtrArray *streams; /* struct stream * */
 	bool started;
 	bool closed;
@@ -284,6 +319,9 @@ struct request {
 	 * 那时候 streams 是空的，「全都settled」会真空成立，直接把 Start 回成失败
 	 * （踩过：对话框刚弹出来就被自己回掉了）。 */
 	bool starting;
+	/* 这次 Start 是**恢复**（带 restore_data 跳过选择器）来的：合成器要是把这些源
+	 * 全拒了（窗口刚关 / 输出没了），要回退去弹选择器，而不是回失败。 */
+	bool restoring;
 };
 
 /* ------------------------------------------------------------ 全局 */
@@ -1928,6 +1966,12 @@ static void request_finish(struct request *req, uint32_t response, GVariant *res
 static void session_close(struct session *s, const char *why);
 static void dialog_show(struct request *req);
 static void start_show_next(void);
+/* 会话恢复（restore_data）：实现在对话框那一节 —— 恢复和「点共享」用的是同一份
+ * 建流代码。start_show_next 也要试恢复，所以先声明在这儿。 */
+struct restore_src;
+static const char *restore_parse(const char *data, struct restore_src *out, int max,
+	int *n_out);
+static bool start_restored(struct request *req, const struct restore_src *rs, int n);
 /* 框选浮层（定义在后面）：对话框被关掉 / 换掉的时候要顺手收掉它；卡片点一下也开它。 */
 static void region_pick_close(bool restore_dialog);
 static void region_pick_start(void);
@@ -1953,6 +1997,16 @@ static void start_show_next(void) {
 		pending = req;
 		log_info("%s: 轮到排队里的 Start，弹选择器", req->session != NULL &&
 			req->session->app_id != NULL ? req->session->app_id : "?");
+		/* 排队里这个要是也带 restore_data，一样先试恢复（跳过选择器）。 */
+		if (req->session != NULL && req->session->restore_data != NULL && zkde != NULL) {
+			struct restore_src rs[RESTORE_MAX_SRC];
+			int rn = 0;
+			if (restore_parse(req->session->restore_data, rs, RESTORE_MAX_SRC,
+					&rn) == NULL && start_restored(req, rs, rn)) {
+				continue; /* 恢复成功：这一个不受理对话框了，接着排下一个 */
+			}
+			log_info("（排队里那个）恢复不了，照常弹选择器");
+		}
 		if (g_list_length(outputs) == 0) {
 			log_info("一块输出都没有，没法选");
 			request_finish(req, RESPONSE_OTHER, NULL);
@@ -2037,6 +2091,7 @@ static void session_free(struct session *s) {
 	}
 	free(s->path);
 	free(s->app_id);
+	free(s->restore_data);
 	free(s);
 }
 
@@ -2069,10 +2124,53 @@ static GVariant *streams_variant(struct session *s) {
 	return g_variant_builder_end(&arr);
 }
 
+/* Start 成功时回给前端的 restore_data 的**私有数据**：把这次真建起来的流写下来
+ * （kind|标识符|cursor_mode，多条用 ';' 串起来）。区域那种当场框出来的源没有稳定
+ * 标识符，不进这里面 —— 全是区域就返回 NULL（这次不给 restore_data，等于没持久化，
+ * 日志里会说一句）。 */
+static char *session_restore_string(struct session *s) {
+	GString *g = g_string_new(NULL);
+	for (guint i = 0; i < s->streams->len; i++) {
+		struct stream *st = g_ptr_array_index(s->streams, i);
+		if (!st->created || st->src_kind == NULL) {
+			continue;
+		}
+		if (g->len > 0) {
+			g_string_append_c(g, ';');
+		}
+		g_string_append_printf(g, "%s|%s|%u", st->src_kind, st->src_id,
+			s->cursor_mode);
+	}
+	if (g->len == 0) {
+		g_string_free(g, TRUE);
+		return NULL;
+	}
+	return g_string_free(g, FALSE);
+}
+
 static GVariant *start_results(struct session *s) {
 	GVariantBuilder rb;
 	g_variant_builder_init(&rb, G_VARIANT_TYPE("a{sv}"));
 	g_variant_builder_add(&rb, "{sv}", "streams", streams_variant(s));
+	/* 持久化那两项（接口 v4）：persist_mode 原样回（没做「降级」那套 UI），
+	 * restore_data 只在 persist_mode != 0 时给（有效 persist_mode = 2 时前端会把它
+	 * 存进权限库，以后作为 SelectSources 的 options 再传回来）。 */
+	if (s->persist_mode != 0) {
+		g_variant_builder_add(&rb, "{sv}", "persist_mode",
+			g_variant_new_uint32(s->persist_mode));
+		char *data = session_restore_string(s);
+		if (data != NULL) {
+			g_variant_builder_add(&rb, "{sv}", "restore_data",
+				g_variant_new("(suv)", RESTORE_VENDOR, RESTORE_VERSION,
+					g_variant_new_string(data)));
+			log_info("Start：回 restore_data（persist_mode=%u，vendor=%s 版本=%u 数据=%s）",
+				s->persist_mode, RESTORE_VENDOR, RESTORE_VERSION, data);
+			free(data);
+		} else {
+			log_info("Start：这一路没有能持久化的源（区域不算），不回 restore_data"
+				"（persist_mode=%u 这次等于没持久化）", s->persist_mode);
+		}
+	}
 	return g_variant_builder_end(&rb);
 }
 
@@ -2177,6 +2275,31 @@ static void start_maybe_finish(void) {
 		}
 	}
 	if (!any) {
+		if (req->restoring) {
+			/* 恢复的路上合成器把这些源全拒了（窗口刚关 / 输出没了）——**回退去弹
+			 * 选择器**，不是报错。这份 restore_data 也丢掉：别再拿它试第二次
+			 * （这一轮的窗口列表已经变了，重试只会再失败一遍）。 */
+			req->restoring = false;
+			req->starting = false;
+			log_info("restore_data：合成器不认这些源（%s），回退弹选择器",
+				req->session != NULL && req->session->app_id != NULL ?
+				req->session->app_id : "?");
+			session_streams_destroy(s);
+			free(s->restore_data);
+			s->restore_data = NULL;
+			if (stream_timer != 0) {
+				g_source_remove(stream_timer);
+				stream_timer = 0;
+			}
+			if (g_list_length(outputs) == 0) {
+				log_info("一块输出都没有，没法选");
+				request_finish(req, RESPONSE_OTHER, NULL);
+			} else {
+				log_info("Start，弹选择器（恢复失败回退）");
+				dialog_show(req);
+			}
+			return;
+		}
 		log_info("没有一路流建成功，回失败");
 		request_finish(req, RESPONSE_OTHER, NULL);
 		return;
@@ -2194,6 +2317,319 @@ static gboolean stream_timeout(gpointer data) {
 		request_finish(pending, RESPONSE_OTHER, NULL);
 	}
 	return G_SOURCE_REMOVE;
+}
+
+/* ------------------------------------------------------------ 建流（一个源一路）
+ *
+ * 对话框点「共享」和 restore_data 恢复走的是**同一套**建流代码：按来源调合成器的
+ * zkde_screencast，记下 position / size / source_type，等 created(node) 回来。
+ * 每个函数都往 s->streams 里加；要不了这个源（协议对象建不出来）就返回 NULL。
+ */
+
+/* 收尾：交给合成器 + 记账 + 日志。失败（obj 没建出来）就把这次分配收干净。 */
+static struct stream *stream_done(struct session *s, struct stream *st) {
+	if (st == NULL) {
+		return NULL;
+	}
+	if (st->obj == NULL) {
+		free(st);
+		return NULL;
+	}
+	zkde_screencast_stream_unstable_v1_add_listener(st->obj, &stream_listener, st);
+	g_ptr_array_add(s->streams, st);
+	log_info("%s: 要一路流（cursor=%s）", st->label,
+		cursor_mode_name(s->cursor_mode));
+	return st;
+}
+
+static struct stream *stream_add_output(struct session *s, struct output *out) {
+	struct stream *st = calloc(1, sizeof(*st));
+	if (st == NULL) {
+		return NULL;
+	}
+	st->obj = zkde_screencast_unstable_v1_stream_output(zkde, out->wl,
+		cursor_mode_to_pointer(s->cursor_mode));
+	st->x = out->x;
+	st->y = out->y;
+	/* **报像素尺寸，不是逻辑尺寸**：合成器那边这一路流就是
+	 * output->width/height（模式像素），PipeWire 缓冲也是这个大小。
+	 * 前端 / 应用拿 size 当元数据，跟真实缓冲**对不上**的时候消费者会
+	 * 按比值换算光标位置（或干脆判越界不画）—— 缩放 2 的那块屏上就是
+	 * 「录屏里看不到光标」，2 倍屏的第一次录还可能是黑的（消费者按
+	 * size 协商缓冲，跟合成器报的格式撞上就整路不出图）。
+	 * 位置（x/y）仍然是**布局逻辑坐标**，那是前端要的口径。 */
+	st->w = out->px_w;
+	st->h = out->px_h;
+	st->source_type = SOURCE_TYPE_MONITOR;
+	st->src_kind = "monitor";
+	snprintf(st->src_id, sizeof(st->src_id), "%s", out->name);
+	snprintf(st->label, sizeof(st->label), "%s", out->name);
+	return stream_done(s, st);
+}
+
+static struct stream *stream_add_window(struct session *s, struct toplevel *tl) {
+	if (tl->identifier == NULL || tl->identifier[0] == '\0') {
+		log_info("窗口「%s」还没有 identifier，先跳过", tl->title);
+		return NULL;
+	}
+	struct stream *st = calloc(1, sizeof(*st));
+	if (st == NULL) {
+		return NULL;
+	}
+	/* window_uuid = ext-foreign-toplevel-list 的 identifier：
+	 * 合成器拿它反查自己的 view（screencast.c）。 */
+	st->obj = zkde_screencast_unstable_v1_stream_window(zkde, tl->identifier,
+		cursor_mode_to_pointer(s->cursor_mode));
+	/* 尺寸报最近一张缩略图的大小（窗口列表协议里没有几何，只有
+	 * 抓帧会话知道）；位置不知道就报 0。前端拿这两个数当元数据，
+	 * 真正的大小看 PipeWire 协商出来的格式。 */
+	st->w = tl->w;
+	st->h = tl->h;
+	st->source_type = SOURCE_TYPE_WINDOW;
+	st->src_kind = "window";
+	snprintf(st->src_id, sizeof(st->src_id), "%s", tl->identifier);
+	snprintf(st->label, sizeof(st->label), "窗口「%s」",
+		tl->title != NULL && tl->title[0] != '\0' ? tl->title : "(没标题)");
+	log_info("录窗口：identifier=%s（%s）", tl->identifier,
+		tl->app_id != NULL ? tl->app_id : "");
+	return stream_done(s, st);
+}
+
+static struct stream *stream_add_region(struct session *s, struct region_row *reg) {
+	if (reg == NULL || reg->host == NULL || reg->w < 2 || reg->h < 2) {
+		return NULL;
+	}
+	struct stream *st = calloc(1, sizeof(*st));
+	if (st == NULL) {
+		return NULL;
+	}
+	/* 协议要的是**布局逻辑坐标**（x/y 是整块工作区里的位置，不是相对
+	 * 这块屏的），尺寸也是逻辑的；scale 一起给过去，合成器按它乘出像素。
+	 * 报给前端的 size 用像素尺寸 —— 和 output 那一路一个口径。 */
+	st->obj = zkde_screencast_unstable_v1_stream_region(zkde,
+		reg->host->x + reg->x, reg->host->y + reg->y, (uint32_t)reg->w,
+		(uint32_t)reg->h, wl_fixed_from_int(reg->scale),
+		cursor_mode_to_pointer(s->cursor_mode));
+	st->x = reg->host->x + reg->x;
+	st->y = reg->host->y + reg->y;
+	st->w = reg->w * reg->scale;
+	st->h = reg->h * reg->scale;
+	st->source_type = SOURCE_TYPE_MONITOR;
+	/* 区域是当场框出来的，没有稳定的标识符 —— 不进 restore_data。 */
+	st->src_kind = NULL;
+	snprintf(st->label, sizeof(st->label), "区域 %dx%d @ %d,%d（%s）",
+		reg->w, reg->h, reg->host->x + reg->x, reg->host->y + reg->y,
+		reg->host->name);
+	return stream_done(s, st);
+}
+
+static struct stream *stream_add_virtual(struct session *s, int vw, int vh) {
+	char name[64];
+	snprintf(name, sizeof(name), "vidow-virtual-%d", vw);
+	struct stream *st = calloc(1, sizeof(*st));
+	if (st == NULL) {
+		return NULL;
+	}
+	st->obj = zkde_screencast_unstable_v1_stream_virtual_output(zkde, name, vw, vh,
+		wl_fixed_from_int(1), cursor_mode_to_pointer(s->cursor_mode));
+	st->w = vw;
+	st->h = vh;
+	st->source_type = SOURCE_TYPE_VIRTUAL;
+	st->src_kind = "virtual";
+	snprintf(st->src_id, sizeof(st->src_id), "%dx%d", vw, vh);
+	snprintf(st->label, sizeof(st->label), "虚拟屏幕 %dx%d", vw, vh);
+	return stream_done(s, st);
+}
+
+/* ------------------------------------------------------------ 会话恢复（restore_data）
+ *
+ * 持久化数据由**前端**保管（权限库，按 app_id 存）：Start 里那份 restore_data 只在
+ * persist_mode 有效为 2 时存下来，下次作为 SelectSources 的 options 再传回来。
+ * 我们这边只做两件事 —— 生成一份**能自证**的（vendor / 私有版本 / 私有数据），以及
+ * 收到时认得出来就**跳过选择器**直接恢复。规范明确要求：格式不合法、或者来源已经
+ * 不存在（换过后端实现 / 拔了屏 / 窗口关了）就**忽略它、照常弹选择器** —— 这份数据
+ * 是前端原样转回来的**不可信输入**，一个字节都不能当指针或者假设它包对。
+ *
+ * 私有数据是自描述字符串（**不能用指针 / 时间戳这种没法复现的东西**）：
+ *     kind|标识符|cursor_mode[;kind|标识符|cursor_mode]…
+ *     kind：monitor（标识符 = 输出名）/ window（= identifier）/ virtual（= WxH）
+ * 例：monitor|HEADLESS-1|1（一块叫 HEADLESS-1 的屏、隐藏光标）
+ * 每条的结构见前面 struct restore_src 的定义。
+ */
+
+static const char *restore_kind_name(enum row_kind kind) {
+	switch (kind) {
+	case ROW_OUTPUT:
+		return "monitor";
+	case ROW_WINDOW:
+		return "window";
+	case ROW_VIRTUAL:
+		return "virtual";
+	default:
+		return "?";
+	}
+}
+
+/* 私有数据 → 条目数组。返回 NULL = 合法；否则返回一句给日志看的原因。 */
+static const char *restore_parse(const char *data, struct restore_src *out, int max,
+		int *n_out) {
+	*n_out = 0;
+	if (data == NULL || data[0] == '\0') {
+		return "数据是空的";
+	}
+	const char *p = data;
+	while (*p != '\0') {
+		const char *end = strchr(p, ';');
+		size_t len = end != NULL ? (size_t)(end - p) : strlen(p);
+		char buf[sizeof(out[0].id) * 3];
+		if (len == 0 || len >= sizeof(buf)) {
+			return "条目长度不对";
+		}
+		if (*n_out >= max) {
+			return "源太多了";
+		}
+		memcpy(buf, p, len);
+		buf[len] = '\0';
+		/* 三段：kind|标识符|cursor_mode。标识符里不许再有分隔符 —— 我们不生成，
+		 * 也不接受（免得把一个奇怪的输出名当成两条）。 */
+		char *f1 = strchr(buf, '|');
+		char *f2 = f1 != NULL ? strchr(f1 + 1, '|') : NULL;
+		if (f1 == NULL || f2 == NULL || f1[1] == '\0' || strchr(f2 + 1, '|') != NULL) {
+			return "不是 kind|标识符|cursor_mode 三段";
+		}
+		*f1 = '\0';
+		*f2 = '\0';
+		struct restore_src *rs = &out[*n_out];
+		if (strcmp(buf, "monitor") == 0) {
+			rs->kind = ROW_OUTPUT;
+		} else if (strcmp(buf, "window") == 0) {
+			rs->kind = ROW_WINDOW;
+		} else if (strcmp(buf, "virtual") == 0) {
+			rs->kind = ROW_VIRTUAL;
+		} else {
+			return "源类型不认识";
+		}
+		snprintf(rs->id, sizeof(rs->id), "%s", f1 + 1);
+		char *endp = NULL;
+		unsigned long cur = strtoul(f2 + 1, &endp, 10);
+		if (endp == f2 + 1 || *endp != '\0' ||
+				(cur != 1 && cur != 2 && cur != 4)) {
+			return "光标模式不是 1/2/4";
+		}
+		rs->cursor = (uint32_t)cur;
+		(*n_out)++;
+		if (end == NULL) {
+			break;
+		}
+		p = end + 1;
+	}
+	if (*n_out == 0) {
+		return "一条源都没有";
+	}
+	return NULL;
+}
+
+/* 源还在不在：输出按名字（wl_output 的 name），窗口按 identifier（和录屏时交给
+ * 合成器的 window_uuid 同一个东西），虚拟屏幕没有实体（按存的尺寸现建一块）。
+ * 拔了屏 / 换了名字 / 窗口关了 → 这里就是 NULL。 */
+static struct output *output_by_name(const char *name) {
+	for (GList *it = outputs; it != NULL; it = it->next) {
+		struct output *out = it->data;
+		if (strcmp(out->name, name) == 0) {
+			return out;
+		}
+	}
+	return NULL;
+}
+
+static struct toplevel *toplevel_by_id(const char *id) {
+	for (GList *it = toplevels; it != NULL; it = it->next) {
+		struct toplevel *tl = it->data;
+		if (tl->identifier != NULL && strcmp(tl->identifier, id) == 0) {
+			return tl;
+		}
+	}
+	return NULL;
+}
+
+/* restore_data 合法、且源都还在 → 跳过选择器直接建流。返回 false = 有源没了
+ * （调用方照常弹选择器；已经建起来的流由这里收干净）。 */
+static bool start_restored(struct request *req, const struct restore_src *rs, int n) {
+	struct session *s = req->session;
+	/* 光标模式用**存下来的那份**（当初用户授权的就是它），这次请求里带的另一份
+	 * 不覆盖它 —— 两份不一样时说一声，别悄悄换掉用户的授权。 */
+	if (rs[0].cursor != s->cursor_mode) {
+		log_info("restore_data：光标用存下来的 %s（这次请求要的是 %s）",
+			cursor_mode_name(rs[0].cursor), cursor_mode_name(s->cursor_mode));
+	}
+	s->cursor_mode = rs[0].cursor;
+
+	for (int i = 0; i < n; i++) {
+		const struct restore_src *r = &rs[i];
+		struct stream *st = NULL;
+		/* 存的是「上次录了什么」，这一轮应用要的 types 里得包含它 —— 应用这轮
+		 * 只要窗口、存下来的却是屏幕，就该照常弹选择器（别硬塞一路屏流）。 */
+		uint32_t need = r->kind == ROW_OUTPUT ? SOURCE_TYPE_MONITOR
+			: r->kind == ROW_WINDOW ? SOURCE_TYPE_WINDOW
+			: r->kind == ROW_VIRTUAL ? SOURCE_TYPE_VIRTUAL : 0;
+		if (need == 0 || (s->types & need) == 0) {
+			log_info("restore_data：%s 这种源这次没要（types=0x%x），回退弹选择器",
+				restore_kind_name(r->kind), s->types);
+			goto rollback;
+		}
+		switch (r->kind) {
+		case ROW_OUTPUT: {
+			struct output *out = output_by_name(r->id);
+			if (out == NULL) {
+				log_info("restore_data：输出 %s 不在了，回退弹选择器", r->id);
+				goto rollback;
+			}
+			st = stream_add_output(s, out);
+			break;
+		}
+		case ROW_WINDOW: {
+			struct toplevel *tl = toplevel_by_id(r->id);
+			if (tl == NULL) {
+				log_info("restore_data：窗口 %s 不在了，回退弹选择器", r->id);
+				goto rollback;
+			}
+			st = stream_add_window(s, tl);
+			break;
+		}
+		case ROW_VIRTUAL: {
+			int vw = 0, vh = 0;
+			if (sscanf(r->id, "%dx%d", &vw, &vh) != 2 || vw < 2 || vh < 2) {
+				log_info("restore_data：虚拟屏幕尺寸「%s」不合法，回退弹选择器",
+					r->id);
+				goto rollback;
+			}
+			st = stream_add_virtual(s, vw, vh);
+			break;
+		}
+		default:
+			goto rollback;
+		}
+		if (st == NULL) {
+			log_info("restore_data：%s %s 这次要不来流（合成器不给），回退弹选择器",
+				restore_kind_name(r->kind), r->id);
+			goto rollback;
+		}
+	}
+	wl_display_flush(wl);
+	if (s->streams->len == 0) {
+		return false;
+	}
+	log_info("restore_data：恢复成 %u 路流，跳过选择器", s->streams->len);
+	req->starting = true;
+	req->restoring = true;
+	stream_timer = g_timeout_add(STREAM_TIMEOUT_MS, stream_timeout, NULL);
+	start_maybe_finish();
+	return true;
+
+rollback:
+	/* 有源没了：**回退到弹选择器**（不是报错），这条会话上已经建的流全收掉。 */
+	session_streams_destroy(s);
+	return false;
 }
 
 /* 用户点了「共享」：给每个选中的输出要一路流。 */
@@ -2230,106 +2666,29 @@ static void dialog_accept(void) {
 	gtk_widget_hide(dialog);
 	preview_stop();
 
-	uint32_t pointer = cursor_mode_to_pointer(s->cursor_mode);
+	/* 每一路都走上面的 stream_add_*：光标模式那些统一在 s->cursor_mode 里。 */
 	for (GList *it = rows; it != NULL; it = it->next) {
 		struct row *row = it->data;
 		if (row->toggle == NULL ||
 				!gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(row->toggle))) {
 			continue;
 		}
-		struct stream *st = calloc(1, sizeof(*st));
-		if (st == NULL) {
-			continue;
-		}
 		switch (row->kind) {
-		case ROW_OUTPUT: {
-			struct output *out = row->ptr;
-			st->obj = zkde_screencast_unstable_v1_stream_output(zkde, out->wl,
-				pointer);
-			st->x = out->x;
-			st->y = out->y;
-			/* **报像素尺寸，不是逻辑尺寸**：合成器那边这一路流就是
-			 * output->width/height（模式像素），PipeWire 缓冲也是这个大小。
-			 * 前端 / 应用拿 size 当元数据，跟真实缓冲**对不上**的时候消费者会
-			 * 按比值换算光标位置（或干脆判越界不画）—— 缩放 2 的那块屏上就是
-			 * 「录屏里看不到光标」，2 倍屏的第一次录还可能是黑的（消费者按
-			 * size 协商缓冲，跟合成器报的格式撞上就整路不出图）。
-			 * 位置（x/y）仍然是**布局逻辑坐标**，那是前端要的口径。 */
-			st->w = out->px_w;
-			st->h = out->px_h;
-			st->source_type = SOURCE_TYPE_MONITOR;
-			snprintf(st->label, sizeof(st->label), "%s", out->name);
+		case ROW_OUTPUT:
+			stream_add_output(s, row->ptr);
 			break;
-		}
-		case ROW_WINDOW: {
-			struct toplevel *tl = row->ptr;
-			if (tl->identifier == NULL || tl->identifier[0] == '\0') {
-				log_info("窗口「%s」还没有 identifier，先跳过", tl->title);
-				free(st);
-				continue;
-			}
-			/* window_uuid = ext-foreign-toplevel-list 的 identifier：
-			 * 合成器拿它反查自己的 view（screencast.c）。 */
-			st->obj = zkde_screencast_unstable_v1_stream_window(zkde,
-				tl->identifier, pointer);
-			/* 尺寸报最近一张缩略图的大小（窗口列表协议里没有几何，只有
-			 * 抓帧会话知道）；位置不知道就报 0。前端拿这两个数当元数据，
-			 * 真正的大小看 PipeWire 协商出来的格式。 */
-			st->w = tl->w;
-			st->h = tl->h;
-			st->source_type = SOURCE_TYPE_WINDOW;
-			snprintf(st->label, sizeof(st->label), "窗口「%s」",
-				tl->title != NULL && tl->title[0] != '\0' ? tl->title : "(没标题)");
-			log_info("录窗口：identifier=%s（%s）", tl->identifier,
-				tl->app_id != NULL ? tl->app_id : "");
+		case ROW_WINDOW:
+			stream_add_window(s, row->ptr);
 			break;
-		}
-		case ROW_REGION: {
-			struct region_row *reg = row->ptr;
-			if (reg == NULL || reg->host == NULL || reg->w < 2 || reg->h < 2) {
-				free(st);
-				continue;
-			}
-			/* 协议要的是**布局逻辑坐标**（x/y 是整块工作区里的位置，不是相对
-			 * 这块屏的），尺寸也是逻辑的；scale 一起给过去，合成器按它乘出像素。
-			 * 报给前端的 size 用像素尺寸 —— 和 output 那一路一个口径。 */
-			st->obj = zkde_screencast_unstable_v1_stream_region(zkde,
-				reg->host->x + reg->x, reg->host->y + reg->y, (uint32_t)reg->w,
-				(uint32_t)reg->h, wl_fixed_from_int(reg->scale), pointer);
-			st->x = reg->host->x + reg->x;
-			st->y = reg->host->y + reg->y;
-			st->w = reg->w * reg->scale;
-			st->h = reg->h * reg->scale;
-			st->source_type = SOURCE_TYPE_MONITOR;
-			snprintf(st->label, sizeof(st->label), "区域 %dx%d @ %d,%d（%s）",
-				reg->w, reg->h, reg->host->x + reg->x, reg->host->y + reg->y,
-				reg->host->name);
+		case ROW_REGION:
+			stream_add_region(s, row->ptr);
 			break;
-		}
-		case ROW_VIRTUAL: {
-			char name[64];
-			snprintf(name, sizeof(name), "vidow-virtual-%d", row->vw);
-			st->obj = zkde_screencast_unstable_v1_stream_virtual_output(zkde,
-				name, row->vw, row->vh, wl_fixed_from_int(1), pointer);
-			st->w = row->vw;
-			st->h = row->vh;
-			st->source_type = SOURCE_TYPE_VIRTUAL;
-			snprintf(st->label, sizeof(st->label), "虚拟屏幕 %dx%d", row->vw,
-				row->vh);
+		case ROW_VIRTUAL:
+			stream_add_virtual(s, row->vw, row->vh);
 			break;
-		}
 		default:
-			free(st);
-			continue;
+			break;
 		}
-		if (st->obj == NULL) {
-			free(st);
-			continue;
-		}
-		zkde_screencast_stream_unstable_v1_add_listener(st->obj, &stream_listener, st);
-		g_ptr_array_add(s->streams, st);
-		log_info("%s: 要一路流（cursor=%s）", st->label,
-			cursor_mode_name(s->cursor_mode));
 	}
 	wl_display_flush(wl);
 
@@ -3278,9 +3637,16 @@ static void on_select_sources(GDBusConnection *conn, const gchar *sender,
 	g_variant_get(parameters, "(&o&o&s@a{sv})", &handle, &session_path, &app_id, &options);
 
 	struct session *s = g_hash_table_lookup(sessions, session_path);
+	/* 一次 SelectSources 就是这条会话最新的一次选择：上一轮留下的 restore_data
+	 * 先丢掉，只有这一轮真给了合法的才留下（否则会拿旧数据去恢复）。 */
+	if (s != NULL) {
+		free(s->restore_data);
+		s->restore_data = NULL;
+	}
 	uint32_t types = SOURCE_TYPE_MONITOR;
 	bool multiple = false;
 	uint32_t cursor = 1;
+	uint32_t persist = 0;
 	if (options != NULL) {
 		GVariant *v = g_variant_lookup_value(options, "types", G_VARIANT_TYPE_UINT32);
 		if (v != NULL) {
@@ -3297,12 +3663,66 @@ static void on_select_sources(GDBusConnection *conn, const gchar *sender,
 			cursor = g_variant_get_uint32(v);
 			g_variant_unref(v);
 		}
+		v = g_variant_lookup_value(options, "persist_mode", G_VARIANT_TYPE_UINT32);
+		if (v != NULL) {
+			persist = g_variant_get_uint32(v);
+			g_variant_unref(v);
+		}
+		/* restore_data 是 (suv)：类型对不上（(suv) 以外的东西，甚至压根不是元组）
+		 * lookup_value 直接给 NULL，**不会**碰数据 —— 前端原样转回来的东西是不可信
+		 * 输入，这里只按 (suv) 收，其它一律当「没给」。 */
+		v = g_variant_lookup_value(options, "restore_data", G_VARIANT_TYPE("(suv)"));
+		if (v != NULL) {
+			const char *vendor = NULL;
+			uint32_t ver = 0;
+			GVariant *boxed = NULL;
+			g_variant_get(v, "(&su@v)", &vendor, &ver, &boxed);
+			/* v 里面是另一种类型（u / 数组 / 嵌套）时 get_variant 照样拿得回来，
+			 * 但**不是字符串**就不能当数据用 —— 不认就忽略，别去解它。 */
+			GVariant *inner = g_variant_get_variant(boxed);
+			const char *data = g_variant_is_of_type(inner, G_VARIANT_TYPE_STRING)
+				? g_variant_get_string(inner, NULL) : NULL;
+			log_info("restore_data：收到 vendor=%s 版本=%u 数据=%s（persist_mode=%u）",
+				vendor, ver,
+				data != NULL ? data : "(v 里不是字符串)",
+				persist);
+			const char *why = NULL;
+			struct restore_src rs[RESTORE_MAX_SRC];
+			int rn = 0;
+			if (g_strcmp0(vendor, RESTORE_VENDOR) != 0) {
+				why = "vendor 不是 vidow（别的后端留下的）";
+			} else if (ver != RESTORE_VERSION) {
+				why = "私有版本号不是 1（别的版本留下的）";
+			} else if (data == NULL) {
+				why = "私有数据不是字符串";
+			} else {
+				why = restore_parse(data, rs, RESTORE_MAX_SRC, &rn);
+			}
+			/* 判定 / 日志跟「这条会话是不是我们的」无关：收到什么样的
+			 * restore_data、为什么不用它，一条都要记清楚（测试就靠这几行）。 */
+			if (why != NULL) {
+				log_info("restore_data：判定非法（%s），忽略，照常弹选择器", why);
+			} else {
+				log_info("restore_data：判定合法（%d 个源，光标 %s）", rn,
+					cursor_mode_name(rs[0].cursor));
+				if (s != NULL) {
+					s->restore_data = g_strdup(data);
+				}
+			}
+			g_variant_unref(inner);
+			g_variant_unref(boxed);
+			g_variant_unref(v);
+		}
 		g_variant_unref(options);
 	}
 	if (s != NULL) {
 		s->types = types;
 		s->multiple = multiple;
 		s->cursor_mode = cursor;
+		/* 没带 persist_mode 就是 0（不持久）。restore_data 是**另一回事**：它是
+		 * 前端把上一轮的授权转回来（按 app_id 从权限库取的），给了一份合法的就
+		 * 留着，Start 时去查源还在不在。 */
+		s->persist_mode = persist;
 	}
 	log_info("%s: SelectSources types=0x%x multiple=%d cursor=%u（%s）",
 		app_id, types, multiple ? 1 : 0, cursor, cursor_mode_name(cursor));
@@ -3363,11 +3783,37 @@ static void on_start(GDBusConnection *conn, const gchar *sender,
 
 	if (pending != NULL && !pending->done) {
 		/* 一次只弹一个对话框，但**不能拒**（见 start_show_next 上面那段）：
-		 * 排队，当前这个选完 / 关掉之后接着弹。 */
+		 * 排队，当前这个选完 / 关掉之后接着弹。带 restore_data 的也一起排队
+		 * （排到自己的时候再看能不能跳过选择器）。 */
 		g_queue_push_tail(&queued_starts, req);
 		log_info("%s: 已经有一个对话框开着，排队等（队里 %u 个）", app_id,
 			g_queue_get_length(&queued_starts));
 		return;
+	}
+
+	/* 上一轮授权过、这次带回来一份 restore_data → **先试恢复**（跳过选择器）。
+	 * 格式（vendor / 版本 / 私有数据）在 SelectSources 那步已经验过了，这里查
+	 * 「源还在不在」：在就直接建流，不在就回退到弹选择器（不是报错）。 */
+	if (s->restore_data != NULL) {
+		struct restore_src rs[RESTORE_MAX_SRC];
+		int rn = 0;
+		const char *why = restore_parse(s->restore_data, rs, RESTORE_MAX_SRC, &rn);
+		if (why != NULL) {
+			/* 理论上到不了这儿（SelectSources 已经验过），真到了就当没有。 */
+			log_info("restore_data：这会儿又非法了（%s），回退弹选择器", why);
+		} else if (zkde == NULL) {
+			log_info("restore_data：合成器没有 zkde_screencast_unstable_v1，回退弹选择器");
+		} else {
+			pending = req;
+			log_info("%s: Start，带 restore_data，试恢复（parent=%s）", app_id,
+				req->parent_window[0] != '\0' ? req->parent_window : "无");
+			if (start_restored(req, rs, rn)) {
+				return;
+			}
+			/* 回退：pending 还是它，往下照常弹选择器（start_restored 已经把
+			 * 半路建起来的流收干净了）。 */
+			log_info("%s: 恢复不了，照常弹选择器", app_id);
+		}
 	}
 
 	pending = req;
