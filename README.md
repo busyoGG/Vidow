@@ -5438,7 +5438,8 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
        - 工具条：悬停露出（日志给了整块 `1298,58 151x32` 和四个按钮坐标），注入点 `1348,71` 按「收成图标」→ `mini → icon`。
        - 键位：`vidowmsg action cycle-mini-state` 连按四次 → `none → mini → icon → free → mini`；`mini-collapse` 两次 → `icon`、`icon`（到底停住），`mini-expand` → `mini`；`unmini-window` → `none`（还原成列）。
      - **改动面**：`src/server.h`（落点区 / 工具条的场景节点与命中状态 + `mini_last_id` + 声明）、`src/drag.c`（落点区 + 工具条 + 拖拽更新 / 松手挂点）、`src/float.c`（`vidow_mini_output_across` / `vidow_mini_edge_under_cursor` / `vidow_mini_drag_finish` / `vidow_mini_move_to_output` / `vidow_mini_toolbar_press`）、`src/input.c`（工具条命中与悬停、滚轮档位、拖拽松手判定）、`src/keybind.c`（四个动作 + `mini_action_view`）。`workspace.c` / `overview.c` / `im.c` / `gesture.c` / `main.c` / `config.c` 一行没改，**没有全屏特例**。
-     - **没做 / 请示**：`config.example/configs/14-keys.lua` 里**没加**那四行键位示例 —— 那套分类文件的逐字副本在 `src/config.c` 的 `print_keys_lua()` 里（`test-defaultconfig.sh` 判据 3 逐字比对），而 `src/config.c` 在本次的「别碰」清单里。要落这一行必须同时改 `src/config.c`（约 6 行 C 字符串），一句话就能补。S5 的过渡动画 / 悬停预览 / 图标出帧策略仍未做（S4 里形态切换是瞬时的）。
+     - **键位示例落地了**：`config.example/configs/14-keys.lua` 与内嵌默认配置（`src/config.c` 的 `print_keys_lua()`）同时加上了那四行 —— `Mod+Shift+W` → `cycle-mini-state`、`Mod+Shift+Up` → `mini-expand`、`Mod+Shift+Down` → `mini-collapse`、`Mod+Shift+Return` → `unmini-window`，外加鼠标那条入口的说明（落点区 / 内边缘 / 跨屏边）。两份必须逐字一致（`test-defaultconfig.sh` 判据 3），只改一份就是漂移。
+     - **没做**：S5 的过渡动画 / 悬停预览 / 图标出帧策略仍未做（S4 里形态切换是瞬时的）；落点区只在**光标底下那块屏**亮（要「每屏同时亮」得每屏一对矩形）。
 
 274. **小窗模式 S3b：`mini_aspect` 三值生效（键位 > 规则 > 全局键）+ X11 `PAspect` 真的读了 + 拖拽锁比例 + contain 居中 —— 设了 `PAspect` 的游戏不再「关不掉锁」**（用户：「做方案 §11.3 + §7 S3 的宽高比那半」；方案 `/tmp/vidow-miniwin-plan.md` §11.3 + §8 判据 35–38b/43；2026-10-14）
 

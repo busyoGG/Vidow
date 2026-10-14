@@ -33,6 +33,18 @@ vidow.bind("Mod+R", "cycle-column-width")
 vidow.bind("Mod+M", "minimize-window")
 vidow.bind("Mod+Shift+M", "restore-window")
 vidow.bind("Mod+O", "toggle-overview")
+-- 小窗（mini window，见 configs/24-mini.lua）：形态的键盘通路。
+--   cycle-mini-state  三态循环：不在小窗态 / 自由 → 迷你 → 图标 → 自由 → 迷你 …
+--   mini-expand       单步放大：图标 → 迷你 → 自由（不在小窗态时 = 进迷你）
+--   mini-collapse     单步收拢：自由 → 迷你 → 图标
+--   unmini-window     还原成列（接回条带）—— 唯一的出口，循环里不出现
+-- 鼠标那条：拖窗口时每块屏右上角亮出**落点区**，松手 = 迷你小窗；把迷你小窗拖到
+-- 屏幕**内边缘**（外侧没有相邻输出的那条边）松手 = 收成图标；拖到**跨屏边**松手
+-- = 移到那块屏、保持形态。悬停迷你 / 图标会露出小工具条。
+vidow.bind("Mod+Shift+W", "cycle-mini-state")
+vidow.bind("Mod+Shift+Up", "mini-expand")
+vidow.bind("Mod+Shift+Down", "mini-collapse")
+vidow.bind("Mod+Shift+Return", "unmini-window")
 -- Alt+Tab：按住修饰键列出最近用过的窗口（一行预览），连点 Tab 换一个，松开就把
 -- 焦点给选中的那个；Esc 取消。样式 / 排版见 configs/15-mru.lua。
 vidow.bind("Alt+Tab", "next-window")
