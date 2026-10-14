@@ -55,6 +55,40 @@ static int alloc_w, alloc_h;
 
 static int captures;
 static int interval_us = 33333; /* 30fps */
+
+/* VIDOW_CAPTURE_DUMP=<路径>：每抓到一帧就把**最新一帧**写成二进制 PPM（P6）——
+ * 测试脚本要按像素统计「这一帧里有没有窗口内容」（test-sessionlock.sh 的抓帧
+ * 审计 ③）。不设这个变量就一个字节都不多写，别的测试不受影响。 */
+static const char *dump_path;
+
+static void dump_frame(void) {
+	if (dump_path == NULL || pixels == NULL) {
+		return;
+	}
+	FILE *f = fopen(dump_path, "wb");
+	if (f == NULL) {
+		return;
+	}
+	fprintf(f, "P6\n%d %d\n255\n", buf_w, buf_h);
+	const uint32_t *px = pixels;
+	/* 通道顺序按合成器给的 shm 格式（见 session_shm_format）：
+	 * XRGB8888 内存里是 B,G,R,X（uint32 = 0x00RRGGBB）；XBGR8888 是 R,G,B,X
+	 * （uint32 = 0x00BBGGRR）—— 实测抓窗口源时收到的是后者，按前者读会把
+	 * 蓝窗读成红（测试的「窗口内容」判据就永远数不到）。 */
+	bool bgrx = shm_format != WL_SHM_FORMAT_XBGR8888;
+	for (int y = 0; y < buf_h; y++) {
+		for (int x = 0; x < buf_w; x++) {
+			uint32_t p = px[y * buf_w + x];
+			unsigned char rgb[3] = {
+				(unsigned char)(bgrx ? ((p >> 16) & 0xff) : (p & 0xff)),
+				(unsigned char)((p >> 8) & 0xff),
+				(unsigned char)(bgrx ? (p & 0xff) : ((p >> 16) & 0xff)),
+			};
+			fwrite(rgb, 1, sizeof(rgb), f);
+		}
+	}
+	fclose(f);
+}
 static struct timespec start;
 static bool running = true;
 
@@ -121,6 +155,7 @@ static void frame_ready(void *data, struct ext_image_copy_capture_frame_v1 *f) {
 	}
 	printf("capture %d %d %08x\n", captures, ms_since_start(), sum);
 	fflush(stdout);
+	dump_frame();
 	ext_image_copy_capture_frame_v1_destroy(f);
 	frame = NULL;
 	if (interval_us > 0) {
@@ -430,6 +465,7 @@ int main(int argc, char *argv[]) {
 		interval_us = fps > 0 ? 1000000 / fps : 0;
 	}
 	clock_gettime(CLOCK_MONOTONIC, &start);
+	dump_path = getenv("VIDOW_CAPTURE_DUMP");
 	signal(SIGTERM, on_signal);
 	signal(SIGINT, on_signal);
 

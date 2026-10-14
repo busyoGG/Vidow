@@ -5456,6 +5456,14 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
        `vidow_pointer_motion()`，把那两条接上就全覆盖（一行调用的事）。触屏没接（vidow 本来就没接 touch）。
        没有全屏特例。
 
+268. **会话锁补漏：锁定期间窗口抓帧不再泄漏被藏窗口的内容（镜面场景只关这一趟、回黑帧而不是 failed）**（用户：「锁定期间窗口抓帧不能泄漏被藏窗口内容」；2026-10-14）
+
+     - **洞在哪**：窗口抓帧走的是私有镜面场景 `grab->scene`（`wlr_scene_subsurface_tree_create`，`src/wincapture.c:398`）+ 自己的假输出 `grab->scene_output`（`:304`/`:344`），跟锁屏时被 `set_enabled(false)` 的那棵正常树**没有任何关系** —— 输出抓帧（`src/capture.c`/`screencopy.c`/`screencast.c` 输出源）已实测不泄，只有窗口这条路照样把被藏窗口画出来。入口：`tools/capture.c`（ext-image-copy-capture + ext-foreign-toplevel-list 的窗口源，和 xdg-desktop-portal 选择器 / OBS 窗口源同一条路）→ `src/portal.c:113` 的 `capture_request` → `vidow_win_capture_source_create()`（`src/wincapture.c:728`）→ `source_request_frame()`（`:616`）→ `source_render()`（`:571`）→ **`vidow_win_grab_render()`（`src/wincapture.c:264`）**。
+     - **方案（最小，7 行）**：渲染前判 `grab->server->locked`，是就把镜像节点 `wlr_scene_node_set_enabled(&grab->mirror->node, false)` 关一趟、`build_state` 之后立刻开回来。这一帧就是空场景 → 纯黑（wlroots 按 damage 铺黑底，`types/scene/wlr_scene.c:2574`）。判据**每帧现读**，不存状态、不挂锁定/解锁信号，解锁后下一次调用自动照旧。
+     - **为什么不直接拒绝、不 `return NULL`**：回 NULL 等于回 failed，客户端得反复换缓冲重试（`source_copy_frame()` → `..._fail`），录屏的窗口流（`src/screencast.c:1063` 是同一个 `vidow_win_grab_render`）也会卡住。黑帧是协议允许的「这一帧没内容」，客户端不用换缓冲。**没有全屏特例。**
+     - **实测**（headless 双屏 + 软件渲染，`tools/locktest.c` 上锁；客户端抓 `tools/bluewin.py` 的纯蓝窗，671×748，29 帧/3 秒）：锁前蓝窗 **423401 px（84.36%）**；锁定期间 **改前 423401 px（与锁前逐像素相同 —— 洞）→ 改后 0 px（0.00%）、非黑 0 px**，29 帧 0 failed；解锁后 **423401 px** 回来。（改前数据是临时把 `hide_mirror` 改成 `false &&` 重编译实测的，已还原并重编译。）
+     - **顺带修的测试工具 bug**：`tools/capture.c` 的 PPM dump 原来写死按 XRGB8888 读，而合成器给窗口源报的 shm 格式是 **XBGR8888**（`shm_format 0x34324258`）—— 蓝窗读出来是红的、脚本的「窗口内容」判据永远数不到（基线先 FAIL）。现按 `session_shm_format` 分流。
+     - **回归**：`./test-wincapture-lock.sh` OK（锁前能抓 / 锁定期间 0 像素且 0 failed / 解锁后回来 / 没崩没 assert）；`./test-sessionlock.sh` **47 PASS / 0 FAIL**。唯一取舍：锁定期间被藏窗口仍会收到帧回调、还会继续画（内容到不了抓帧客户端），要一并省掉是另一处改动。
 267. **会话锁 S4：能解锁了（桌面恢复 + 焦点还给窗口）、客户端崩溃保持锁定、锁定期间抓帧不泄桌面（实测）**（用户：「接着 S3 做方案 §5 的 S4，先做解锁（最缺的）再做抓帧审计；别做多余的无用测试」；方案 `/tmp/vidow-sessionlock-plan.md` §2 环节 6 + §3 F/H + §4 风险 3 + §5 S4；2026-10-14）
 
      - **解锁**（S3 遗留的最大缺口：以前锁上只能杀客户端或切 VT）：`src/sessionlock.c` 新增 `lock_restore_desktop()`，在 `lock_handle_unlock()`（`lock->events.unlock`，

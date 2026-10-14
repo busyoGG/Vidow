@@ -317,6 +317,19 @@ struct wlr_buffer *vidow_win_grab_render(struct vidow_win_grab *grab,
 	}
 	struct wlr_scene_output_state_options opts = { .swapchain = sc };
 
+	/* 锁定期间**不画镜面**：这棵私有场景跟锁屏时被关掉的那棵正常树没关系
+	 * （见 sessionlock.c），不挡的话锁定期间照样能把被藏窗口的画面抓出来
+	 * （实测：锁定期抓帧跟锁前逐像素相同）。只把镜像节点关这一趟，这一帧就是
+	 * 「空场景」→ 纯黑；判据每帧现读 server->locked，解锁后下一次调用自动照旧，
+	 * 所以不用挂锁定 / 解锁的信号、也不存状态。
+	 *
+	 * **不 return NULL**：回 NULL 客户端收到的是 failed，得反复换缓冲重试，录屏
+	 * 的窗口流也会卡住 —— 回一张黑帧客户端照常往下走（协议上这就是「这一帧没内容」）。 */
+	bool hide_mirror = grab->server->locked && grab->mirror != NULL;
+	if (hide_mirror) {
+		wlr_scene_node_set_enabled(&grab->mirror->node, false);
+	}
+
 	struct wlr_buffer *buffer = NULL;
 	if (wlr_scene_output_build_state(grab->scene_output, &state,
 			sc != NULL ? &opts : NULL)) {
@@ -324,6 +337,9 @@ struct wlr_buffer *vidow_win_grab_render(struct vidow_win_grab *grab,
 		if (buffer != NULL) {
 			wlr_buffer_lock(buffer);
 		}
+	}
+	if (hide_mirror) {
+		wlr_scene_node_set_enabled(&grab->mirror->node, true);
 	}
 	wlr_output_state_finish(&state);
 
