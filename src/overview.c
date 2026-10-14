@@ -613,6 +613,11 @@ static void overview_start(struct vidow_server *server) {
 }
 
 void vidow_overview_toggle(struct vidow_server *server) {
+	/* 会话锁（S3）：锁定期间不开概览 / 不响应概览上的点击和滚轮 —— 概览里
+	 * 全是窗口预览，锁上以后它既不该出现也不该被操作（方案 §2 环节 3）。 */
+	if (server->locked) {
+		return;
+	}
 	struct vidow_overview *ov = &server->overview;
 	if (ov->on) {
 		vidow_overview_exit(server);
@@ -757,6 +762,10 @@ double vidow_overview_scale(const struct vidow_server *server) {
 /* 点一下：命中的那个窗口就选中（焦点给它，然后退出 overview 缩回去）。
  * 点在空白处 = 什么都不选，直接退出。返回 true 表示这次点击被吃掉了。 */
 bool vidow_overview_click(struct vidow_server *server, double sx, double sy) {
+	/* 会话锁（S3）：锁定期间概览上的点击一律不认（同上）。 */
+	if (server->locked) {
+		return false;
+	}
 	struct vidow_overview *ov = &server->overview;
 	if (!vidow_overview_active(server)) {
 		return false;
@@ -788,6 +797,11 @@ bool vidow_overview_click(struct vidow_server *server, double sx, double sy) {
  * 「滚轮一直滚会左右滚动窗口，会跨屏」）。行内横向预览现在跟**那块工作区自己的
  * 视口**走 —— 也就是「移动窗口焦点」那些键，滚轮不再碰它。 */
 void vidow_overview_scroll(struct vidow_server *server, double dy) {
+	/* 会话锁（S3）：锁定期间不开概览 / 不响应概览上的点击和滚轮 —— 概览里
+	 * 全是窗口预览，锁上以后它既不该出现也不该被操作（方案 §2 环节 3）。 */
+	if (server->locked) {
+		return;
+	}
 	struct vidow_overview *ov = &server->overview;
 	if (!vidow_overview_active(server)) {
 		return;

@@ -440,6 +440,12 @@ bool vidow_drag_init(struct vidow_server *server) {
 
 void vidow_tile_grab_begin(struct vidow_server *server,
 		struct vidow_view *view) {
+	/* 会话锁（S3）：锁定期间不进拖拽 —— 拖的是被藏起来的窗口，而且拖拽
+	 * grab 会把指针事件全吃掉（方案 §2 环节 3）。锁定瞬间已经在拖的由
+	 * sessionlock.c 的 lock_cancel_input_gestures 收掉。 */
+	if (server->locked) {
+		return;
+	}
 	if (server == NULL || view == NULL || view->column == NULL ||
 			view->ws == NULL || view->popup) {
 		return;
@@ -480,6 +486,12 @@ void vidow_tile_grab_begin(struct vidow_server *server,
 }
 
 void vidow_tile_grab_update(struct vidow_server *server, double lx, double ly) {
+	/* 会话锁（S3）：锁定期间不进拖拽 —— 拖的是被藏起来的窗口，而且拖拽
+	 * grab 会把指针事件全吃掉（方案 §2 环节 3）。锁定瞬间已经在拖的由
+	 * sessionlock.c 的 lock_cancel_input_gestures 收掉。 */
+	if (server->locked) {
+		return;
+	}
 	struct vidow_view *view = server->grab_view;
 	if (view == NULL || view->scene_tree == NULL) {
 		return;
@@ -657,6 +669,12 @@ void vidow_tile_grab_end(struct vidow_server *server) {
 
 void vidow_tile_resize_begin(struct vidow_server *server,
 		struct vidow_view *view) {
+	/* 会话锁（S3）：锁定期间不进拖拽 —— 拖的是被藏起来的窗口，而且拖拽
+	 * grab 会把指针事件全吃掉（方案 §2 环节 3）。锁定瞬间已经在拖的由
+	 * sessionlock.c 的 lock_cancel_input_gestures 收掉。 */
+	if (server->locked) {
+		return;
+	}
 	if (server == NULL || view == NULL || view->column == NULL ||
 			view->popup || view->float_mode != VIDOW_FLOAT_NONE) {
 		return;
@@ -684,6 +702,12 @@ void vidow_tile_resize_begin(struct vidow_server *server,
 }
 
 void vidow_tile_resize_update(struct vidow_server *server, double lx, double ly) {
+	/* 会话锁（S3）：锁定期间不进拖拽 —— 拖的是被藏起来的窗口，而且拖拽
+	 * grab 会把指针事件全吃掉（方案 §2 环节 3）。锁定瞬间已经在拖的由
+	 * sessionlock.c 的 lock_cancel_input_gestures 收掉。 */
+	if (server->locked) {
+		return;
+	}
 	(void)ly;
 	struct vidow_view *view = server->grab_view;
 	struct vidow_column *col = view != NULL ? view->column : NULL;

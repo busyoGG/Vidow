@@ -585,8 +585,58 @@ static bool held_note(xkb_keysym_t sym, bool pressed) {
 	return false;
 }
 
+/* ------------------------------------------------- 会话锁期间的键位白名单 */
+
+/* 锁定期间放行的动作（方案 §2 环节 3）：只有 VT 切换这类逃生口 —— 客户端在锁定期
+ * 死掉时合成器不许解锁（协议 XML:111），用户的逃生口就只剩切 tty 了（方案 §4
+ * 风险 5）。加新动作进来之前先想清楚：它能不能碰到被藏起来的桌面。 */
+static bool bind_locked_allowed(const struct vidow_keybind *bind) {
+	return strncmp(bind->action, "switch-vt", 9) == 0 &&
+		(bind->action[9] == '\0' || bind->action[9] == ' ');
+}
+
+/* 锁定期间的一个按键：在绑定表里只找白名单动作（真键盘和注入共用这一条）。
+ * 返回是否吃掉 —— 调用方（input.c 的 lock_key_route）锁定期间无论如何都不把
+ * 按键透传给客户端，返回值只是给日志 / 以后的策略用。 */
+static bool keybind_locked_key(struct vidow_server *server, xkb_keysym_t sym,
+		bool pressed, uint32_t mods) {
+	if (!pressed) {
+		return false; /* 白名单动作都是按下触发，松开不用管 */
+	}
+	struct vidow_keybind *bind;
+	wl_list_for_each(bind, &server->keybinds, link) {
+		if (bind->on != VIDOW_BIND_PRESS || bind->modifier_only) {
+			continue;
+		}
+		/* 命中判定和平时同一条（bind_hits 管大小写 keysym 和修饰键匹配），
+		 * 只是不认 inhibited —— 锁屏时不该有客户端的抑制生效。 */
+		if (!bind_hits(bind, VIDOW_SRC_KEY, sym, 0, mods)) {
+			continue;
+		}
+		if (!bind_locked_allowed(bind)) {
+			/* 命中了但不放行：这是「锁定期间绑定被白名单挡住」的直接证据
+			 * （test-sessionlock.sh 的 D 就断言这一行 —— 光看「工作区没变」
+			 * 不够，注入那条路平时本来就不触发键位）。 */
+			wlr_log(WLR_INFO, "sessionlock: 绑定 %s（%s）锁定期间不生效 —— "
+				"白名单只有 VT 切换", bind->trigger, bind->action);
+			return true;
+		}
+		bind_run(server, bind, false);
+		return true;
+	}
+	return false;
+}
+
+/* ------------------------------------------------- 会话锁期间的键位白名单 结束 */
+
 bool vidow_keybind_key(struct vidow_server *server, xkb_keysym_t sym,
 		bool pressed, uint32_t mods, bool inhibited) {
+	/* 会话锁（S3）：锁定期间只认白名单（VT 切换），其余绑定一律不跑 —— 否则
+	 * 锁屏界面上按 Super+J 就把工作区换了，锁形同虚设（方案 §2 环节 3 /
+	 * §4 风险 5）。inhibited 不看：锁屏时不该有客户端的抑制生效。 */
+	if (server->locked) {
+		return keybind_locked_key(server, sym, pressed, mods);
+	}
 	bool repeated = held_note(sym, pressed);
 	if (!pressed) {
 		return pending_release(server, VIDOW_SRC_KEY, sym, 0, mods);
@@ -631,6 +681,11 @@ bool vidow_keybind_key(struct vidow_server *server, xkb_keysym_t sym,
 
 bool vidow_keybind_button(struct vidow_server *server, uint32_t button,
 		bool pressed, uint32_t mods, bool inhibited) {
+	/* 会话锁：锁定期间的鼠标键一个绑定都不跑（input.c 的指针入口会先短路，
+	 * 这里是第二道闸 —— 万一以后有人加了新调用点，也漏不出去）。 */
+	if (server->locked) {
+		return true;
+	}
 	if (pressed) {
 		/* 点了鼠标就不算「只按了一下修饰键」。 */
 		pending_disarm_taps();
@@ -655,6 +710,10 @@ bool vidow_keybind_button(struct vidow_server *server, uint32_t button,
 bool vidow_keybind_wheel(struct vidow_server *server,
 		enum wl_pointer_axis axis, double amount, uint32_t mods,
 		bool inhibited) {
+	/* 会话锁：锁定期间的滚轮绑定也不跑（同上，第二道闸）。 */
+	if (server->locked) {
+		return true;
+	}
 	if (amount == 0) {
 		return false;
 	}
@@ -817,6 +876,11 @@ static bool action_move_step(struct vidow_server *server, int direction,
 
 /* 光标底下那个窗口（指针手势动作用的：按下那一刻谁在光标下面，就拖谁）。 */
 static struct vidow_view *view_under_cursor(struct vidow_server *server) {
+	/* 会话锁：锁定期间不许做命中测试 —— 窗口全被藏起来了，命中结果没有任何
+	 * 意义（方案 §2 环节 3 点名要短路 vidow_view_at）。 */
+	if (server->locked) {
+		return NULL;
+	}
 	double sx, sy;
 	struct wlr_surface *surface = NULL;
 	return vidow_view_at(server, server->cursor->x, server->cursor->y, &surface,

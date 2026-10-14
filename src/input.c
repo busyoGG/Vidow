@@ -1,6 +1,7 @@
 #include "gesture.h"
 #include "ipc.h"
 #include "server.h"
+#include "sessionlock.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -28,12 +29,87 @@
  * 动作字符串（spawn / close-window / focus-column / toggle-floating / toggle-overview
  * / toggle-fullscreen / switch-vt …），用户绑哪个键都行，也能一个都不绑。 */
 
+/* =========================================================== 会话锁（S3）
+ *
+ * 锁上以后输入**只**给 lock surface（ext-session-lock-v1 XML:77-82 / 246-250）。
+ * 这一节是那条路唯一的一套函数：每个输入入口（keyboard_key / modifiers、指针
+ * motion / button / axis）第一行就问 server->locked，是就整条走这里、立刻 return
+ * —— 命中测试（vidow_view_at）、悬停聚焦、拖拽 / 手势 / 概览 / MRU / 输入法一个
+ * 都不跑（方案 §2 环节 3 的「单一 choke point」）。
+ *
+ * 为什么非得放每个入口的第一行：vidow 的输入入口太多（见方案 §4 风险 1），漏一条
+ * 按键 / 指针就漏给被藏起来的客户端，锁就白上了。 */
+
+/* 锁定期间键盘焦点给「光标所在那块屏」的 lock surface（方案 §2 环节 3）。 */
+static void lock_focus_keyboard(struct vidow_server *server) {
+	vidow_sessionlock_focus(server);
+}
+
+/* 锁定期间的一个键盘事件：白名单键位（vidow_keybind_key 里判，只放行 VT 切换）→
+ * lock surface。真键盘和注入共用这一条（注入在 headless 里是唯一能造键盘事件的
+ * 路，两边必须同一条，否则测出来的不是真路径）。 */
+static void lock_key_route(struct vidow_server *server, struct wlr_keyboard *kb,
+		uint32_t time_msec, uint32_t keycode, uint32_t state) {
+	const xkb_keysym_t *syms = NULL;
+	int nsyms = kb->xkb_state != NULL
+		? xkb_state_key_get_syms(kb->xkb_state, keycode + 8, &syms)
+		: 0;
+	bool pressed = state == WL_KEYBOARD_KEY_STATE_PRESSED;
+	uint32_t mods = wlr_keyboard_get_modifiers(kb);
+	/* 白名单（方案 §2 环节 3：只有 VT 切换这类逃生口）—— vidow_keybind_key 在
+	 * locked 状态下自己只认白名单里的动作，其余绑定一律不跑。 */
+	for (int i = 0; i < nsyms; i++) {
+		vidow_keybind_key(server, syms[i], pressed, mods, false);
+	}
+	wlr_seat_set_keyboard(server->seat, kb);
+	lock_focus_keyboard(server);
+	wlr_seat_keyboard_notify_key(server->seat, time_msec, keycode, state);
+}
+
+/* 锁定期间的一个指针事件：焦点只给 lock surface，绝不落到被藏起来的窗口上。
+ * 返回 false = 一块 lock surface 都还没有（调用方自己决定吞掉）。 */
+static bool lock_pointer_route(struct vidow_server *server, uint32_t time_msec,
+		uint32_t button, bool pressed, bool have_button) {
+	double sx = 0, sy = 0;
+	struct wlr_surface *surface =
+		vidow_sessionlock_pointer_surface(server, &sx, &sy);
+	/* 键盘焦点跟着光标所在屏走（多屏时指针挪到哪块屏，哪块屏的锁屏界面收键盘）。 */
+	lock_focus_keyboard(server);
+	if (surface == NULL) {
+		/* 客户端还没建 lock surface：指针焦点清掉，别留给被藏起来的窗口。 */
+		vidow_cursor_fx_default_cursor(server);
+		wlr_seat_pointer_notify_clear_focus(server->seat);
+		return false;
+	}
+	wlr_seat_pointer_notify_enter(server->seat, surface, sx, sy);
+	if (have_button) {
+		wlr_seat_pointer_notify_button(server->seat, time_msec, button,
+			pressed ? WL_POINTER_BUTTON_STATE_PRESSED
+				: WL_POINTER_BUTTON_STATE_RELEASED);
+	} else {
+		wlr_seat_pointer_notify_motion(server->seat, time_msec, sx, sy);
+	}
+	return true;
+}
+
+/* ======================================================= 会话锁（S3）结束 */
+
 static void keyboard_modifiers(struct wl_listener *listener, void *data) {
 	(void)data;
 	struct vidow_keyboard *kb = wl_container_of(listener, kb, modifiers);
 
 	/* 正在拆（wl_display_run 已经返回）：seat 可能已经没了，别再往里塞东西。 */
 	if (kb->server->shutting_down) {
+		return;
+	}
+
+	/* 会话锁：修饰键也只给 lock surface。放在输入法判断**之前** —— 锁上的
+	 * 时候输入法不许再抢键盘（见 im.c 里的守卫）。 */
+	if (kb->server->locked) {
+		wlr_seat_set_keyboard(kb->server->seat, kb->wlr_keyboard);
+		lock_focus_keyboard(kb->server);
+		wlr_seat_keyboard_notify_modifiers(kb->server->seat,
+			&kb->wlr_keyboard->modifiers);
 		return;
 	}
 
@@ -100,6 +176,14 @@ static void keyboard_key(struct wl_listener *listener, void *data) {
 	bool inhibited = vidow_shortcuts_inhibited(server);
 	if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
 		input_note_key_press(server);
+	}
+	/* 会话锁：锁定期间键盘只给 lock surface（白名单里的 VT 切换除外，见
+	 * lock_key_route）。放在 input_note_key_press 之后 —— key_press_enables_dpms
+	 * 锁定期间照样要生效，屏关着的时候得能按键唤醒（方案 §4 风险 2）。 */
+	if (server->locked) {
+		lock_key_route(server, kb->wlr_keyboard, event->time_msec,
+			event->keycode, event->state);
+		return;
 	}
 	/* config.lua 里 vidow.bind() 声明的键位（动作字符串见 README 的动作表）：
 	 * 工作区切换 / 窗口与列的方向移动 / 浮动 / 全屏 / 全景 / 起命令 / 切 tty …
@@ -753,6 +837,12 @@ static bool warp_in_progress = false;
 
 static void focus_follows_mouse(struct vidow_server *server,
 		struct vidow_view *hit) {
+	/* 会话锁（S3）：锁定期间**必须不生效** —— 被藏起来的窗口一个都不该因为
+	 * 鼠标经过而拿到键盘焦点（方案 §4 风险 2：这条不能靠默认值碰运气，
+	 * 用户把 focus_follows_mouse 配成 true 也照样不许跟）。 */
+	if (server->locked) {
+		return;
+	}
 	if (warp_in_progress) {
 		/* 这一趟指针位移是「键盘换焦点顺手把光标带过去」造成的（见
 		 * vidow_warp_cursor_to_focus），不是用户在挪鼠标。 */
@@ -803,6 +893,16 @@ void vidow_pointer_motion(struct vidow_server *server, uint32_t time_msec) {
 	/* 输入唤醒关掉的屏（默认关，见 server.h 的 mouse_move_enables_dpms）。 */
 	if (server->config.mouse_move_enables_dpms) {
 		vidow_output_wake_disabled(server);
+	}
+
+	/* 会话锁：锁定期间指针只属于 lock surface —— 命中测试（vidow_view_at）、
+	 * 指针约束、悬停聚焦、拖拽 / 概览 / MRU 一概不跑（方案 §2 环节 3）。
+	 * 放在 DPMS 唤醒之后：屏关着的时候指针一动也得能把屏唤醒，否则没法输密码
+	 * （方案 §4 风险 2 —— 安全性靠「唤醒后画的是黑 rect / lock surface」保证，
+	 * 不靠不唤醒）。 */
+	if (server->locked) {
+		lock_pointer_route(server, time_msec, 0, false, false);
+		return;
 	}
 
 	/* 指针约束（游戏锁鼠标 / 夹光标）：先把这一步的位移发出去（relative_pointer），
@@ -968,6 +1068,12 @@ static void server_cursor_button(struct wl_listener *listener, void *data) {
  * 和真实鼠标完全同一条路。 */
 void vidow_pointer_button(struct vidow_server *server, uint32_t button,
 		bool pressed, uint32_t time_msec, bool force_mod) {
+	/* 会话锁：锁定期间指针按键只给 lock surface —— 不进拖拽 grab、不过绑定表、
+	 * 不给被藏起来的窗口（方案 §2 环节 3）。 */
+	if (server->locked) {
+		lock_pointer_route(server, time_msec, button, pressed, true);
+		return;
+	}
 	if (server->grab_mode != VIDOW_GRAB_NONE) {
 		/* the grab owns the pointer: swallow everything until release */
 		if (!pressed) {
@@ -1177,6 +1283,21 @@ static void server_cursor_axis(struct wl_listener *listener, void *data) {
 void vidow_pointer_axis(struct vidow_server *server,
 		enum wl_pointer_axis orientation, double delta, int32_t delta_discrete,
 		enum wl_pointer_axis_source source, uint32_t time_msec) {
+	/* 会话锁：锁定期间滚轮也只给 lock surface（概览平移 / Mod+滚轮换列都不跑，
+	 * 方案 §2 环节 3）。滚轮倍率（scroll_factor）是 vidow 自己的偏好，锁屏界面
+	 * 拿原始值 —— 它不该受桌面配置影响。 */
+	if (server->locked) {
+		double sx = 0, sy = 0;
+		struct wlr_surface *surface =
+			vidow_sessionlock_pointer_surface(server, &sx, &sy);
+		if (surface != NULL) {
+			wlr_seat_pointer_notify_enter(server->seat, surface, sx, sy);
+			wlr_seat_pointer_notify_axis(server->seat, time_msec, orientation,
+				delta, delta_discrete, source,
+				WL_POINTER_AXIS_RELATIVE_DIRECTION_IDENTICAL);
+		}
+		return;
+	}
 	/* 滚动倍率（niri 的 scroll-factor，见 configs/19-input.lua）。libinput 没
 	 * 这个接口，是 vidow 自己在滚轮事件上乘的。1.0（默认）= 不缩放，跟以前
 	 * 一模一样。乘在**入口**而不是只乘发给客户端那一份：真设备和 IPC 注入本来
@@ -1442,13 +1563,33 @@ static void inject_key(struct vidow_server *server, uint32_t keycode,
 			XKB_STATE_MODS_LOCKED);
 		kb->modifiers.group = xkb_state_serialize_layout(kb->xkb_state,
 			XKB_STATE_LAYOUT_EFFECTIVE);
-		wlr_seat_keyboard_notify_modifiers(server->seat, &kb->modifiers);
 	}
 
 	/* 注入的键也算「人按了键」：打字藏光标 / 唤醒关掉的屏两个开关都认它
 	 * （headless 里没有真键盘，这两个开关只有注入这条路能验）。 */
 	if (pressed) {
 		input_note_key_press(server);
+	}
+
+	/* 会话锁：锁定期间注入的键走**真键盘那条路**（lock_key_route：白名单 +
+	 * lock surface）。注入平时不触发键位表（下面那条注释），锁上以后要是还
+	 * 直接往 seat 里塞，测试就量不到白名单 —— 「注入一个已绑定的键，工作区
+	 * 变不变」正是这么量的。注入本来就是测试 / 调试入口，锁上以后和真按键
+	 * 同一条路才说得通。
+	 * 修饰键也放在焦点切过去**之后**发：不然它会先落到被藏起来的那个窗口上。 */
+	if (server->locked) {
+		lock_focus_keyboard(server);
+		if (kb->xkb_state != NULL) {
+			wlr_seat_keyboard_notify_modifiers(server->seat, &kb->modifiers);
+		}
+		lock_key_route(server, kb, inject_now_ms(), keycode,
+			pressed ? WL_KEYBOARD_KEY_STATE_PRESSED
+				: WL_KEYBOARD_KEY_STATE_RELEASED);
+		return;
+	}
+
+	if (kb->xkb_state != NULL) {
+		wlr_seat_keyboard_notify_modifiers(server->seat, &kb->modifiers);
 	}
 
 	/* 注入的键也走「X11 抓着键盘就给它」那条规矩（不然测试里没法验证抓取：

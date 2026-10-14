@@ -10,16 +10,20 @@
  *   3. 等每块屏各呈现一帧后发 locked（XML:87-107）。某块屏一直不出帧就超时兜底
  *      （XML:96-98 的 "reasonable time limit"），不能无限等。
  *
- * 本文件到 S2 为止：能锁、能黑屏、能握手，lock surface 生命周期（建 / 输出尺寸变化
- * 重新 configure / 输出拔掉清账）和输出热插拔（新屏立刻补黑幕、进握手账）都做了。
- * 解锁 / 客户端崩溃恢复（S4）、输入路由（S3）不在这里。 */
+ * 本文件到 S3 为止：能锁、能黑屏、能握手，lock surface 生命周期（建 / 输出尺寸变化
+ * 重新 configure / 输出拔掉清账）和输出热插拔（新屏立刻补黑幕、进握手账）都做了，
+ * 输入路由（键盘 / 指针只给 lock surface，见本文件末尾）也做了。解锁 / 客户端崩溃
+ * 恢复（S4）不在这里。 */
 
 #include "server.h"
 #include "sessionlock.h"
 
 #include <stdlib.h>
 
+#include <wlr/types/wlr_keyboard.h>
+#include <wlr/types/wlr_output_layout.h>
 #include <wlr/types/wlr_scene.h>
+#include <wlr/types/wlr_seat.h>
 #include <wlr/types/wlr_session_lock_v1.h>
 #include <wlr/util/log.h>
 
@@ -214,8 +218,100 @@ void vidow_sessionlock_output_removed(struct vidow_output *output) {
 	}
 }
 
-/* ---------------------------------------------------------- lock surface */
+/* --------------------------------------------------------------- 输入路由
+ *
+ * 锁定期间键盘和指针**只能**给 lock surface（协议 XML:77-82 / 246-250，方案 §2
+ * 环节 3）。策略取「光标所在那块屏的 lock surface」：光标不在任何屏上、或那块屏
+ * 还没有 lock surface 时退回到第一块有 lock surface 的屏 —— 一块都不剩就返回
+ * NULL，调用方（input.c）把事件吞掉，绝不漏给被藏起来的窗口。
+ *
+ * 这里只算「给谁、局部坐标多少」，seat 的 notify_* 由 input.c 发。 */
 
+/* 锁定期间光标所在那块屏的 lock surface；顺便把这块屏的布局框带回 *box。 */
+static struct vidow_lock_surface *lock_surface_at_cursor(
+		struct vidow_server *server, struct wlr_box *box) {
+	struct wlr_output *under = NULL;
+	if (server->cursor != NULL && server->output_layout != NULL) {
+		under = wlr_output_layout_output_at(server->output_layout,
+			server->cursor->x, server->cursor->y);
+	}
+	struct vidow_lock_surface *ls, *fallback = NULL;
+	wl_list_for_each(ls, &server->lock_surfaces, link) {
+		if (fallback == NULL) {
+			fallback = ls;
+		}
+		if (under != NULL && ls->output != NULL &&
+				ls->output->wlr_output == under) {
+			fallback = ls;
+			break;
+		}
+	}
+	if (fallback == NULL || fallback->output == NULL) {
+		return NULL;
+	}
+	if (box != NULL) {
+		box->x = box->y = 0;
+		box->width = box->height = 0;
+		wlr_output_layout_get_box(server->output_layout,
+			fallback->output->wlr_output, box);
+	}
+	return fallback;
+}
+
+struct wlr_surface *vidow_sessionlock_keyboard_surface(
+		struct vidow_server *server) {
+	struct vidow_lock_surface *ls = lock_surface_at_cursor(server, NULL);
+	return ls != NULL ? ls->lock_surface->surface : NULL;
+}
+
+struct wlr_surface *vidow_sessionlock_pointer_surface(
+		struct vidow_server *server, double *sx, double *sy) {
+	struct wlr_box box = {0};
+	struct vidow_lock_surface *ls = lock_surface_at_cursor(server, &box);
+	if (ls == NULL) {
+		return NULL;
+	}
+	if (sx != NULL) {
+		*sx = server->cursor->x - box.x;
+	}
+	if (sy != NULL) {
+		*sy = server->cursor->y - box.y;
+	}
+	return ls->lock_surface->surface;
+}
+
+void vidow_sessionlock_focus(struct vidow_server *server) {
+	struct wlr_surface *target = vidow_sessionlock_keyboard_surface(server);
+	if (target == NULL ||
+			server->seat->keyboard_state.focused_surface == target) {
+		return;
+	}
+	struct wlr_keyboard *kb = wlr_seat_get_keyboard(server->seat);
+	/* keycodes 传 NULL：锁屏界面不需要知道「锁之前按着哪些键」，也不该继承
+	 * 那份状态（被藏起来的窗口的按键状态不该泄给 lock 客户端）。 */
+	wlr_seat_keyboard_notify_enter(server->seat, target, NULL, 0,
+		kb != NULL ? &kb->modifiers : NULL);
+}
+
+/* 锁定瞬间把还在进行的输入手势收掉：拖拽 / 概览操作的都是马上要被藏起来的东西，
+ * 锁上以后它们既收不到输入（各入口的守卫会把入口短路）也没法自己收尾 —— 留着一个
+ * 「半截的拖拽」到解锁之后才发作，比现在就收掉糟得多。
+ *
+ * 手势（gesture.c）**不在这里清**：vidow_gesture_clear() 清的是配置表（config.lua
+ * 重载时用的那份），在这儿调等于把用户绑的手势全删了。正在跑的那个手势由它自己的
+ * end 事件收尾（begin / update 已经被守卫挡住，锁上以后开不了新的）。 */
+static void lock_cancel_input_gestures(struct vidow_server *server) {
+	if (server->grab_mode == VIDOW_GRAB_TILE) {
+		vidow_tile_grab_end(server);
+	} else if (server->grab_mode == VIDOW_GRAB_RESIZE_TILE) {
+		vidow_tile_resize_end(server);
+	} else if (server->grab_mode != VIDOW_GRAB_NONE) {
+		vidow_float_end_grab(server);
+	}
+	vidow_overview_exit(server);
+}
+
+/* ---------------------------------------------------------- lock surface */
 static void lock_surface_handle_destroy(struct wl_listener *listener,
 		void *data) {
 	(void)data;
@@ -261,6 +357,9 @@ static void lock_handle_new_surface(struct wl_listener *listener, void *data) {
 
 	/* 首个 configure 必须我们自己发（见文件头第 2 条）。 */
 	lock_output_apply_box(output, &output->box);
+	/* 键盘焦点也跟着挪过来：光标停在这块屏上时，锁屏界面该当场能收键盘
+	 * （不挪的话键盘要等到下一次指针 / 键盘事件才找到它）。 */
+	vidow_sessionlock_focus(server);
 	wlr_log(WLR_INFO, "sessionlock: %s 的 lock surface 来了，已 configure %dx%d",
 		output->wlr_output->name, ls->cfg_w, ls->cfg_h);
 }
@@ -307,6 +406,9 @@ static void lock_manager_new_lock(struct wl_listener *listener, void *data) {
 	server->session_lock = lock;
 	server->lock_locked_sent = false;
 	server->locked = true;
+
+	/* 还在进行的拖拽 / 手势 / 概览先收掉（见 lock_cancel_input_gestures）。 */
+	lock_cancel_input_gestures(server);
 
 	server->lock_new_surface.notify = lock_handle_new_surface;
 	wl_signal_add(&lock->events.new_surface, &server->lock_new_surface);

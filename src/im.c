@@ -395,6 +395,11 @@ bool vidow_im_grabbed(struct vidow_server *server) {
 bool vidow_im_owns_keyboard(struct vidow_server *server,
 		struct vidow_keyboard *kb) {
 	struct vidow_im *im = &server->im;
+	/* 会话锁（S3）：锁定期间输入法不许抢键盘 —— 它抢到的按键会被回注给
+	 * 「还在打字」的那个输入框，而那是个被藏起来的窗口（方案 §2 环节 3）。 */
+	if (server->locked) {
+		return false;
+	}
 	if (im->grab == NULL) {
 		return false;
 	}
@@ -423,7 +428,9 @@ void vidow_im_set_keyboard(struct vidow_server *server,
 
 void vidow_im_key(struct vidow_server *server, uint32_t time_msec,
 		uint32_t keycode, uint32_t state) {
-	if (server->im.grab == NULL) {
+	/* 会话锁（S3）：锁定期间一个按键都不给输入法（第二道闸，见
+	 * vidow_im_owns_keyboard）。 */
+	if (server->locked || server->im.grab == NULL) {
 		return;
 	}
 	wlr_input_method_keyboard_grab_v2_send_key(server->im.grab, time_msec,
@@ -431,7 +438,8 @@ void vidow_im_key(struct vidow_server *server, uint32_t time_msec,
 }
 
 void vidow_im_modifiers(struct vidow_server *server, struct wlr_keyboard *kb) {
-	if (server->im.grab == NULL) {
+	/* 会话锁（S3）：同上，修饰键也不给。 */
+	if (server->locked || server->im.grab == NULL) {
 		return;
 	}
 	wlr_input_method_keyboard_grab_v2_send_modifiers(server->im.grab,
@@ -441,6 +449,19 @@ void vidow_im_modifiers(struct vidow_server *server, struct wlr_keyboard *kb) {
 void vidow_im_focus(struct vidow_server *server, struct wlr_surface *surface) {
 	wlr_log(WLR_DEBUG, "im focus -> %p", (void *)surface);
 	if (server->text_input_mgr == NULL) {
+		return;
+	}
+	/* 会话锁（S3）：锁定期间不给任何输入框发 enter，而且把已经 enter 过的一律
+	 * leave 掉 —— 输入法连着「被藏起来的那个输入框」，键盘 / 候选词就还漏着
+	 * （方案 §2 环节 3 的 IME 短路）。 */
+	if (server->locked) {
+		struct vidow_text_input *it;
+		wl_list_for_each(it, &server->text_inputs, link) {
+			if (it->input->focused_surface != NULL) {
+				wlr_text_input_v3_send_leave(it->input);
+			}
+		}
+		im_set_active(server, false);
 		return;
 	}
 	struct vidow_text_input *ti;

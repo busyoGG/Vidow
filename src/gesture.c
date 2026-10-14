@@ -218,6 +218,12 @@ static void view_snap(struct vidow_server *server, bool cancelled) {
 /* ------------------------------------------------------------- 事件入口 */
 
 void vidow_gesture_swipe_begin(struct vidow_server *server, int fingers) {
+	/* 会话锁（S3）：锁定期间手势不参与 —— 它操作的是被藏起来的窗口 / 视口
+	 * （方案 §2 环节 3）。begin / update 挡在这里；end 照旧放行，好让锁定
+	 * 之前就开着的手势能自己收尾。 */
+	if (server->locked) {
+		return;
+	}
 	/* 上一个手势还没收尾（设备抽风 / 注入没配对）：先收干净。 */
 	if (g.active) {
 		vidow_gesture_swipe_end(server, true);
@@ -244,6 +250,12 @@ void vidow_gesture_swipe_begin(struct vidow_server *server, int fingers) {
 
 void vidow_gesture_swipe_update(struct vidow_server *server, int fingers,
 		double dx, double dy) {
+	/* 会话锁（S3）：锁定期间手势不参与 —— 它操作的是被藏起来的窗口 / 视口
+	 * （方案 §2 环节 3）。begin / update 挡在这里；end 照旧放行，好让锁定
+	 * 之前就开着的手势能自己收尾。 */
+	if (server->locked) {
+		return;
+	}
 	if (!g.active || g.kind != VIDOW_GESTURE_SWIPE || fingers != g.fingers) {
 		return;
 	}
@@ -285,6 +297,12 @@ void vidow_gesture_swipe_end(struct vidow_server *server, bool cancelled) {
 }
 
 void vidow_gesture_pinch_begin(struct vidow_server *server, int fingers) {
+	/* 会话锁（S3）：锁定期间手势不参与 —— 它操作的是被藏起来的窗口 / 视口
+	 * （方案 §2 环节 3）。begin / update 挡在这里；end 照旧放行，好让锁定
+	 * 之前就开着的手势能自己收尾。 */
+	if (server->locked) {
+		return;
+	}
 	if (g.active) {
 		vidow_gesture_pinch_end(server, true);
 	}
@@ -294,6 +312,12 @@ void vidow_gesture_pinch_begin(struct vidow_server *server, int fingers) {
 
 void vidow_gesture_pinch_update(struct vidow_server *server, int fingers,
 		double scale) {
+	/* 会话锁（S3）：锁定期间手势不参与 —— 它操作的是被藏起来的窗口 / 视口
+	 * （方案 §2 环节 3）。begin / update 挡在这里；end 照旧放行，好让锁定
+	 * 之前就开着的手势能自己收尾。 */
+	if (server->locked) {
+		return;
+	}
 	(void)server;
 	if (!g.active || g.kind != VIDOW_GESTURE_PINCH || fingers != g.fingers) {
 		return;
@@ -317,6 +341,12 @@ void vidow_gesture_pinch_end(struct vidow_server *server, bool cancelled) {
 }
 
 void vidow_gesture_hold_begin(struct vidow_server *server, int fingers) {
+	/* 会话锁（S3）：锁定期间手势不参与 —— 它操作的是被藏起来的窗口 / 视口
+	 * （方案 §2 环节 3）。begin / update 挡在这里；end 照旧放行，好让锁定
+	 * 之前就开着的手势能自己收尾。 */
+	if (server->locked) {
+		return;
+	}
 	if (g.active) {
 		vidow_gesture_hold_end(server, true);
 	}

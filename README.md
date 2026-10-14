@@ -5420,6 +5420,48 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
      - 未做：niri 的 `fixed 1920`（固定像素档）、`preset-window-heights`、`default-column-width {}`（让客户端自己定宽）、
        `always-center-single-column`；窗口规则级的 per-rule 预设覆盖。
 
+266. **会话锁 S3：输入路由 —— 锁定期间键盘 / 指针只给 lock surface，键位只放行白名单（VT 切换）**（用户：「接着 S2 做方案 §5 的 S3，输入路由是最高危的一步；45 分钟时间盒，先把最高危的漏点做完」；方案 `/tmp/vidow-sessionlock-plan.md` §2 环节 3 + §3 D/E + §5 S3；2026-10-14）
+
+     - 落点：`src/sessionlock.{c,h}`（新增三个查询 / 一个聚焦：`vidow_sessionlock_keyboard_surface()` / `_pointer_surface()` / `_focus()`，
+       外加锁定瞬间收掉在跑的手势 `lock_cancel_input_gestures()`）；`src/input.c`（`lock_key_route()` / `lock_pointer_route()` 两条唯一的路，
+       六个输入入口第一行短路）；`src/keybind.c`（白名单 `bind_locked_allowed()` = 只有 `switch-vt`）；`src/drag.c` / `src/gesture.c` /
+       `src/overview.c` / `src/im.c`（各自入口第一行守卫）；`tools/locktest.c`（补 wl_seat：把收到的键 / 指针事件打出来，S3 需要「锁屏那一侧」的观察者）；
+       `test-sessionlock.sh`（补 D / E + 两条语义）。**`view.c` / `fx.c` / `clipboard.c` / `xwayland.c` / `cursorfx.c` 一行没动**，没加任何全屏特例。
+     - **策略**（协议 XML:246-250 允许合成器自定）：键盘焦点和指针焦点都给「**光标所在那块屏**的 lock surface」（光标不在任何屏上 / 那块屏还没 lock surface 时
+       退回第一块有 lock surface 的屏）。指针局部坐标 = 光标位置 − 那块屏的布局框原点。一块 lock surface 都没有时指针焦点**清掉**（`notify_clear_focus`），绝不留给被藏起来的窗口。
+     - **短路清单**（锁判断在每个入口第一行，方案 §4 风险 1 的「单一 choke point」）：键盘 `keyboard_key` / `keyboard_modifiers`；指针 `vidow_pointer_motion` /
+       `vidow_pointer_button` / `vidow_pointer_axis`；`focus_follows_mouse`；`vidow_view_at`（在 input.c 的两个调用点 + `keybind.c` 的 `view_under_cursor()` +
+       `overview.c` 的 `vidow_overview_click()` 前短路 —— `view.c` 里的函数本身不动）；`drag.c` 四个入口；`gesture.c` 五个 begin/update（end 放行，好让锁定前开着的手势自己收尾）；
+       `overview.c` toggle/click/scroll；`im.c`（`vidow_im_owns_keyboard()` 直接返回 false、`vidow_im_key()` / `_modifiers()` 不进、`vidow_im_focus()` 给所有输入框发 leave）。
+       锁定瞬间还会**主动收掉**正在跑的拖拽 / overview（`lock_cancel_input_gestures()`）—— 留着一个半截的拖拽到解锁之后才发作，比当场收掉糟得多。
+       **手势配置表不碰**：`vidow_gesture_clear()` 清的是 `config.lua` 绑的那张表（配置重载用的），锁定瞬间调它等于把用户绑的手势全删了（写完第一版就踩到了，
+       `test-sessionlock.sh` 现在拿 `vidowmsg state` 的 `gestures` 当回归判据：锁定前后都是 `4 指竖扫`）。正在跑的那个手势由它自己的 end 事件收尾。
+     - **键位白名单**（`src/keybind.c`）：`vidow_keybind_key()` 一进门就判 `server->locked`，锁定期间只走 `keybind_locked_key()` —— 绑定表里只认
+       `switch-vt`（VT 切换是客户端死掉时用户唯一的逃生口，方案 §4 风险 5），其余绑定**命中也不跑**，并且打一行
+       `sessionlock: 绑定 Mod+J（focus-workspace 2）锁定期间不生效 —— 白名单只有 VT 切换`（测试 D 就拿这行当判据：有它 = 键确实走到了绑定表，只是被挡住，
+       不是「注入本来就不触发键位」）。鼠标键 / 滚轮绑定同样有第二道闸（`vidow_keybind_button()` / `_wheel()` 锁定期间直接吞）。
+     - **两条语义写死，不靠默认值**（方案 §4 风险 2）：
+       - `mouse_move_enables_dpms` / `key_press_enables_dpms` **继续生效** —— 锁判断放在 `input_note_key_press()` 和 DPMS 唤醒**之后**。
+         否则屏关着就没法输密码。安全性靠「唤醒后画的是黑 rect / lock surface」保证，不靠不唤醒。
+       - `focus_follows_mouse` **必须不生效** —— 用户配成 `true` 也照样不跟（否则会把键盘焦点给被藏起来的窗口）。
+     - 验证（`test-sessionlock.sh`，headless 两块屏，A/B/C/G 仍全绿，只补方案 §3 的 D/E）：
+       - **D**（锁定期间 `vidowmsg send-key tap super+j`，`Mod+J` 已绑定到 `focus-workspace 2`）：工作区 `active=[(1, None) × 3]` **前后一致**、
+         焦点 `focused=2(bluewin)` **前后一致**；日志出现上面那行白名单拒绝；`locktest` 打出 `key 125 down / key 36 down / key 36 up / key 125 up` ×2
+         （键送到了锁屏界面）；
+       - **E**（`move-cursor` 到「没拿到焦点的那个窗口」的几何中心 + `pointer-button press/release left` + `pointer-scroll 0 60`）：
+         焦点仍是 `focused=2(bluewin)`（`focus_follows_mouse = true` 也不跟被藏起来的窗口）；`locktest` 收到 `pfocus` / `button 272 down` / `button 272 up` / `axis 0 900.0`
+         （指针只给了锁屏界面）；
+       - **语义①**：锁定期 `vidowmsg output-power HEADLESS-1 off` → `enabled=[False]` → `move-cursor 20 20` → 日志
+         `输入唤醒: 打开 1 块关着的屏（dpms）`、`enabled=[True]`；
+       - **语义②**：`vidowmsg config focus_follows_mouse` 查回来是 `true`（先证明这条开关真的开着，E 的判据才成立）。
+     - **仍是 S3，别对外宣称支持会话锁**：**解锁（S4）还没做** —— 锁定期间客户端请求 `unlock_and_destroy` 只记一行日志、客户端死掉也不许解锁（协议 XML:111-113），
+       所以**现在锁上之后只能杀掉客户端进程、或者切 VT 退出**（没有别的出口，`vidowmsg` 也**故意**没有强制解锁后门）。S4 的其余部分（解锁恢复桌面 + 重新聚焦 + rearrange、
+       客户端崩溃的「死锁」态定稿、`capture.c` / `screencopy.c` / `screencast.c` 锁定期不泄桌面的审计）也没做。
+       另外两条 S3 遗留（如实记）：① `vidowmsg pick-window x y` 这类**只读探测**命令锁定期间仍会做命中测试（`src/ipc.c:1901`，本次范围外）——
+       它不改输入路由，但会暴露「被藏起来的窗口在哪个位置」；② `vidowmsg send-key` 的注入路在锁定期间已和真键盘同一条路（白名单 + lock surface），
+       但**未锁**时的注入照旧不触发键位表（老行为，没动）。
+       所以 `test-sessionlock.sh` 全过只说明「能锁、能黑屏、能握手、热插拔不漏桌面、输入不漏」，**不说明能当锁屏用**。
+
 265. **会话锁 S2：lock surface 生命周期（尺寸变了重 configure）+ 输出热插拔（锁定期插屏立刻补黑幕 / 拔屏清账）**（用户：「接着 S1 做方案 §5 的 S2，别推倒重写、别做多余的无用测试」；方案 `/tmp/vidow-sessionlock-plan.md`；2026-10-14）
 
      - 落点：`src/sessionlock.c` / `src/sessionlock.h`（`lock_output_apply_box()` 统一「把黑 rect + 这块屏的 lock surface 对齐到一个布局框」，

@@ -13,6 +13,13 @@
  *   LOCKED                         收到 ext_session_lock_v1.locked（测试的同步点）
  *   FINISHED                       收到 finished（合成器拒了这把锁 / 已经解锁）
  *   unlock-sent                    我们发了 unlock_and_destroy
+ *   kbfocus                        键盘焦点落到我们身上（wl_keyboard.enter）
+ *   key <keycode> down|up          收到的按键（S3 的 D：合成器把键送给了锁屏界面，
+ *                                  而不是被藏起来的窗口）
+ *   pfocus                         指针焦点落到我们身上（wl_pointer.enter）
+ *   motion <x> <y>                 指针移动（同上，S3 的 E）
+ *   button <button> down|up        指针按键
+ *   axis <axis> <value>            滚轮
  *
  * 颜色固定 0x226699（RGB），测试脚本拿它当「锁屏内容」的判据。
  *
@@ -42,6 +49,9 @@ static struct wl_display *display;
 static struct wl_compositor *compositor;
 static struct wl_shm *shm;
 static struct ext_session_lock_manager_v1 *lock_mgr;
+static struct wl_seat *seat;
+static struct wl_keyboard *keyboard;
+static struct wl_pointer *pointer;
 static struct ext_session_lock_v1 *lock;
 
 struct output {
@@ -232,6 +242,144 @@ static void make_lock_surface(struct output *o) {
 	emit("locksurface %s", out_name(o));
 }
 
+/* ------------------------------------------------------ seat（键盘 / 指针）
+
+ * S3 的 D / E 两条测的是「锁定期间输入去哪了」，所以这个客户端得把收到的键盘
+ * 和指针事件打出来 —— 它是「锁屏界面」这一侧唯一的观察者。不做任何界面，
+ * 只 emit 行。 */
+
+static void kb_keymap(void *data, struct wl_keyboard *kb, uint32_t format,
+		int32_t fd, uint32_t size) {
+	(void)data; (void)kb; (void)format;
+	if (fd >= 0) {
+		close(fd);
+	}
+	(void)size;
+}
+
+static void kb_enter(void *data, struct wl_keyboard *kb, uint32_t serial,
+		struct wl_surface *surface, struct wl_array *keys) {
+	(void)data; (void)kb; (void)serial; (void)surface; (void)keys;
+	emit("kbfocus");
+}
+
+static void kb_leave(void *data, struct wl_keyboard *kb, uint32_t serial,
+		struct wl_surface *surface) {
+	(void)data; (void)kb; (void)serial; (void)surface;
+	emit("kbblur");
+}
+
+static void kb_key(void *data, struct wl_keyboard *kb, uint32_t serial,
+		uint32_t time, uint32_t key, uint32_t state) {
+	(void)data; (void)kb; (void)serial; (void)time;
+	emit("key %u %s", key,
+		state == WL_KEYBOARD_KEY_STATE_PRESSED ? "down" : "up");
+}
+
+static void kb_modifiers(void *data, struct wl_keyboard *kb, uint32_t serial,
+		uint32_t depressed, uint32_t latched, uint32_t locked,
+		uint32_t group) {
+	(void)data; (void)kb; (void)serial; (void)depressed; (void)latched;
+	(void)locked; (void)group;
+}
+
+static void kb_repeat_info(void *data, struct wl_keyboard *kb, int32_t rate,
+		int32_t delay) {
+	(void)data; (void)kb; (void)rate; (void)delay;
+}
+
+static const struct wl_keyboard_listener keyboard_listener = {
+	.keymap = kb_keymap,
+	.enter = kb_enter,
+	.leave = kb_leave,
+	.key = kb_key,
+	.modifiers = kb_modifiers,
+	.repeat_info = kb_repeat_info,
+};
+
+static void pt_enter(void *data, struct wl_pointer *pt, uint32_t serial,
+		struct wl_surface *surface, wl_fixed_t sx, wl_fixed_t sy) {
+	(void)data; (void)pt; (void)serial; (void)surface; (void)sx; (void)sy;
+	emit("pfocus");
+}
+
+static void pt_leave(void *data, struct wl_pointer *pt, uint32_t serial,
+		struct wl_surface *surface) {
+	(void)data; (void)pt; (void)serial; (void)surface;
+	emit("pblur");
+}
+
+static void pt_motion(void *data, struct wl_pointer *pt, uint32_t time,
+		wl_fixed_t sx, wl_fixed_t sy) {
+	(void)data; (void)pt; (void)time;
+	emit("motion %.0f %.0f", wl_fixed_to_double(sx), wl_fixed_to_double(sy));
+}
+
+static void pt_button(void *data, struct wl_pointer *pt, uint32_t serial,
+		uint32_t time, uint32_t button, uint32_t state) {
+	(void)data; (void)pt; (void)serial; (void)time;
+	emit("button %u %s", button,
+		state == WL_POINTER_BUTTON_STATE_PRESSED ? "down" : "up");
+}
+
+static void pt_axis(void *data, struct wl_pointer *pt, uint32_t time,
+		uint32_t axis, wl_fixed_t value) {
+	(void)data; (void)pt; (void)time;
+	emit("axis %u %.1f", axis, wl_fixed_to_double(value));
+}
+
+static void pt_frame(void *data, struct wl_pointer *pt) {
+	(void)data; (void)pt;
+}
+
+static void pt_axis_source(void *data, struct wl_pointer *pt, uint32_t source) {
+	(void)data; (void)pt; (void)source;
+}
+
+static void pt_axis_stop(void *data, struct wl_pointer *pt, uint32_t time,
+		uint32_t axis) {
+	(void)data; (void)pt; (void)time; (void)axis;
+}
+
+static void pt_axis_discrete(void *data, struct wl_pointer *pt, uint32_t axis,
+		int32_t discrete) {
+	(void)data; (void)pt; (void)axis; (void)discrete;
+}
+
+static const struct wl_pointer_listener pointer_listener = {
+	.enter = pt_enter,
+	.leave = pt_leave,
+	.motion = pt_motion,
+	.button = pt_button,
+	.axis = pt_axis,
+	.frame = pt_frame,
+	.axis_source = pt_axis_source,
+	.axis_stop = pt_axis_stop,
+	.axis_discrete = pt_axis_discrete,
+};
+
+static void seat_capabilities(void *data, struct wl_seat *s,
+		uint32_t caps) {
+	(void)data; (void)s;
+	if ((caps & WL_SEAT_CAPABILITY_KEYBOARD) && keyboard == NULL) {
+		keyboard = wl_seat_get_keyboard(seat);
+		wl_keyboard_add_listener(keyboard, &keyboard_listener, NULL);
+	}
+	if ((caps & WL_SEAT_CAPABILITY_POINTER) && pointer == NULL) {
+		pointer = wl_seat_get_pointer(seat);
+		wl_pointer_add_listener(pointer, &pointer_listener, NULL);
+	}
+}
+
+static void seat_name(void *data, struct wl_seat *s, const char *name) {
+	(void)data; (void)s; (void)name;
+}
+
+static const struct wl_seat_listener seat_listener = {
+	.capabilities = seat_capabilities,
+	.name = seat_name,
+};
+
 /* ---------------------------------------------------------- registry */
 
 static void registry_global(void *data, struct wl_registry *registry,
@@ -252,6 +400,10 @@ static void registry_global(void *data, struct wl_registry *registry,
 		wl_output_add_listener(o->wlr_output, &output_listener, o);
 		/* 锁定期间新插的屏：客户端有义务为它建 lock surface。 */
 		make_lock_surface(o);
+	} else if (strcmp(interface, wl_seat_interface.name) == 0) {
+		seat = wl_registry_bind(registry, name, &wl_seat_interface,
+			version >= 5 ? 5 : version);
+		wl_seat_add_listener(seat, &seat_listener, NULL);
 	} else if (strcmp(interface,
 			ext_session_lock_manager_v1_interface.name) == 0) {
 		lock_mgr = wl_registry_bind(registry, name,

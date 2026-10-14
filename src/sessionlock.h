@@ -15,6 +15,7 @@ struct vidow_server;
 struct vidow_output;
 struct wlr_session_lock_surface_v1;
 struct wlr_scene_surface;
+struct wlr_surface;
 
 /* 客户端为某块屏建的一块锁屏画面。生命周期完全跟着客户端的 surface：它一没，
  * 这个结构就没（见 sessionlock.c 的 lock_surface_handle_destroy）。 */
@@ -56,5 +57,28 @@ void vidow_sessionlock_output_removed(struct vidow_output *output);
 /* 这块屏呈现过一帧了（output.c 的帧回调调）：锁定握手靠它数「每块屏都画过一帧
  * 了没」，数齐了才发 locked（协议 XML:87-107）。 */
 void vidow_sessionlock_frame(struct vidow_output *output);
+
+/* --------------------------------------------------------------- 输入路由
+ *
+ * S3：锁定期间键盘 / 指针的唯一去处就是 lock surface。协议 XML:246-250 把「哪个
+ * surface 拿焦点」交给合成器定，vidow 取「光标所在那块屏的 lock surface」（光标
+ * 不在任何屏上 / 那块屏还没 lock surface 时退回到第一块有 lock surface 的屏）。
+ *
+ * 这两个查询只回答「焦点该给谁、坐标是多少」，**不碰 seat** —— seat 的 notify_*
+ * 调用全留在 input.c（那里本来就是唯一跟 seat 打交道的地方），
+ * vidow_sessionlock_focus 是唯一例外（新 lock surface 来了要主动把键盘焦点挪过去）。 */
+
+/* 锁定期间键盘焦点该给哪个 lock surface。NULL = 客户端一个 lock surface 都还没建
+ * （那键盘就哪也不去，按键在 input.c 里被吞掉，绝不漏给被藏起来的窗口）。 */
+struct wlr_surface *vidow_sessionlock_keyboard_surface(struct vidow_server *server);
+
+/* 锁定期间指针焦点该落在哪：同上那块 surface，外加**表面局部坐标**（光标位置减去
+ * 那块屏的布局框原点）。返回 NULL 时 *sx / *sy 不动。 */
+struct wlr_surface *vidow_sessionlock_pointer_surface(struct vidow_server *server,
+		double *sx, double *sy);
+
+/* 把键盘焦点挪到「光标所在屏的 lock surface」（新 lock surface 来了、光标换屏了、
+ * 键盘事件来了都调）。已经是它就不重发 enter。 */
+void vidow_sessionlock_focus(struct vidow_server *server);
 
 #endif

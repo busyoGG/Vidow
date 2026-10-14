@@ -17,9 +17,20 @@
 #      不崩、日志里记账清干净（黑 rect 收了、lock surface 记账收了、待呈现的账销了）、
 #      剩下那块屏还是锁内容（桌面没漏）
 #
-# **不测**（后续步骤的事，见方案 §5）：D/E 输入路由（S3）、F 客户端崩溃（S4）、
-# H 解锁恢复（S4）。所以这个脚本全过**不等于**可以对外宣称支持会话锁 —— 现在锁上
-# 之后输入还会漏给未锁客户端（S3 才修）。
+#   D 锁定期间注入一个**已绑定**的键（super+j → focus-workspace 2）：
+#      ① 工作区 / 焦点前后不变；② 日志里「绑定 … 锁定期间不生效（白名单只有 VT 切换）」
+#      = 键确实走到了绑定表，只是被白名单挡住（不是「注入本来就不触发键位」）；
+#      ③ locktest 打出了 key down / key up = 键送到了锁屏界面
+#   E 锁定期间指针（move-cursor + pointer-button + pointer-scroll）：
+#      ① 光标压到**没**拿焦点的那个窗口上，focus_follows_mouse 开着也不换焦点；
+#      ② locktest 收到 pfocus / button / axis = 指针只给了锁屏界面
+#   S3 语义① mouse_move_enables_dpms：锁定期 output-power off + move-cursor →
+#      日志「输入唤醒」且屏回来了（否则屏关着没法输密码）
+#   S3 语义② focus_follows_mouse：配成 true 也不把焦点给被藏起来的窗口（同 E ①）
+#
+# **不测**（后续步骤的事，见方案 §5）：F 客户端崩溃（S4）、H 解锁恢复（S4）。
+# 所以这个脚本全过**不等于**可以对外宣称支持会话锁 —— 现在锁上之后只能杀客户端
+# 退出（S4 才做解锁恢复）。
 #
 # 用法：./test-sessionlock.sh    （VIDOW_TEST_KEEP=1 保留运行目录）
 set -u
@@ -63,6 +74,16 @@ chmod 700 "$RUNDIR/run"
 cat > "$CFGDIR/.config/vidow/config.lua" <<'CFG'
 vidow.output{ name = "HEADLESS-1", x = 0 }
 vidow.output{ name = "HEADLESS-2", x = 1280 }
+-- S3：这两条是**故意**打开的，用来验锁定期间的两条语义 ——
+--   mouse_move_enables_dpms：屏关着的时候指针一动要能唤醒（否则没法输密码）
+--   focus_follows_mouse：即使开着，也不许把焦点给被藏起来的窗口
+mouse_move_enables_dpms = true
+focus_follows_mouse = true
+-- D 用：一个**已绑定**的键（注入它，看锁定期间工作区会不会变）
+vidow.bind("Mod+J", "focus-workspace 2")
+-- 手势：锁定瞬间不许动这张配置表（vidow_gesture_clear 是配置重载用的，清的是
+-- 用户绑的手势）。测试拿 vidowmsg state 的 gestures 计数当判据。
+vidow.gesture{ fingers = 4, direction = "up", action = "workspace up" }
 CFG
 
 export XDG_RUNTIME_DIR="$RUNDIR/run"
@@ -143,6 +164,42 @@ sys.exit(0 if lock + black >= total * 0.99 and desktop == 0 else 1)
 PY
 }
 
+# 探测用的两个小工具（S3 的 D / E 要「前后值」）：当前活动工作区 / 焦点窗口。
+msg() { ./build/vidowmsg "$@" 2>/dev/null; }
+active_ws() {
+	msg workspaces | python3 -c '
+import sys, json
+try:
+    ws = json.load(sys.stdin)
+except Exception:
+    print("(读不到)"); sys.exit(0)
+print("active=" + str([(w.get("idx"), w.get("name")) for w in ws if w.get("active")]))'
+}
+focused_win() {
+	msg focused | python3 -c '
+import sys, json
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print("(读不到)"); sys.exit(0)
+win = d.get("window") or {}
+print("focused=%s(%s)" % (d.get("window_id"), win.get("title")))'
+}
+# 没拿到键盘焦点的那个窗口的几何中心（E 的靶子：光标压过去，焦点不许跟过去）
+target_center() {
+	msg windows | python3 -c '
+import sys, json
+try:
+    ws = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+free = [w for w in ws if not w.get("focused") and not w.get("popup")]
+if not free:
+    sys.exit(1)
+g = free[0]["geometry"]
+print("%d %d" % (g["x"] + g["width"] // 2, g["y"] + g["height"] // 2))'
+}
+
 # ============================================================ 第一遍：A / B / C / G1
 
 mark "起 vidow（headless 两块屏，装 G1 热插拔钩子：${HOTPLUG_MS}ms 时插一块新屏）"
@@ -160,6 +217,8 @@ fi
 # ---------------------------------------------------------------- B
 mark "B 锁定握手（locktest 5 秒内打出 LOCKED）"
 # 先摆一个有窗口的桌面：锁后「桌面被藏起来」才有东西可藏。
+# 两个窗口：E 要拿「没拿到键盘焦点的那个」当靶子（光标压过去，焦点不许跟过去）。
+start_bluewin
 start_bluewin
 grim -o HEADLESS-1 "$RUNDIR/before1.png" 2>"$RUNDIR/grim-before.log" &&
 	grim -o HEADLESS-2 "$RUNDIR/before2.png" 2>>"$RUNDIR/grim-before.log" &&
@@ -184,6 +243,11 @@ then
 else
 	fail "两块屏上都没有蓝窗（客户端没起来？C 的「藏桌面」就没证据了）"
 fi
+
+# 锁之前记一笔手势配置数（S3：锁定不许动这张配置表）
+GEST_BEFORE=$(msg state | python3 -c '
+import sys, json
+print(json.load(sys.stdin).get("gestures"))' 2>/dev/null)
 
 LOCKLOG="$RUNDIR/lock.log"
 start_locktest "$RUNDIR/lock.in" "$LOCKLOG"
@@ -271,6 +335,105 @@ else
 	fail "新屏 grim 抓帧失败（$(tail -1 "$RUNDIR/grim-new3.log")）"
 fi
 
+# ---------------------------------------------------------------- D 键盘
+mark "D 锁定期间注入一个已绑定的键（super+j → focus-workspace 2）"
+WS_BEFORE=$(active_ws)
+FOC_BEFORE=$(focused_win)
+msg send-key tap super+j >/dev/null
+msg send-key tap super+j >/dev/null
+sleep 0.4
+WS_AFTER=$(active_ws)
+FOC_AFTER=$(focused_win)
+echo "    工作区：$WS_BEFORE  ->  $WS_AFTER"
+echo "    焦点：  $FOC_BEFORE  ->  $FOC_AFTER"
+if [ "$WS_BEFORE" = "$WS_AFTER" ] && [ "$FOC_BEFORE" = "$FOC_AFTER" ]; then
+	pass "工作区 / 焦点都没变（注入的已绑定键没生效）"
+else
+	fail "锁定期间注入的已绑定键改变了工作区 / 焦点"
+fi
+# 这一行是「键确实走到了绑定表、只是被白名单挡住」的直接证据：
+# 光看「工作区没变」不够 —— 注入那条路平时本来就不触发键位（见 input.c）。
+if grep -a "锁定期间不生效" "$LOG" | grep -aq "Mod+J"; then
+	pass "日志：$(grep -a '锁定期间不生效' "$LOG" | tail -1 | sed 's/.*sessionlock: //')"
+else
+	fail "日志里没有「绑定 Mod+J … 锁定期间不生效」（白名单没生效？还是键没走到绑定表？）"
+fi
+# locktest 那一侧：键送到了锁屏界面
+if grep -aq '^key ' "$LOCKLOG"; then
+	pass "locktest 收到了键：$(grep -a '^key ' "$LOCKLOG" | tr '\n' ' ' | sed 's/ $//')"
+else
+	fail "locktest 没收到任何按键（键没送给 lock surface）"
+fi
+
+# 锁定不许动「手势配置表」（那是配置，不是「在跑的那个手势」）
+GEST_AFTER=$(msg state | python3 -c '
+import sys, json
+print(json.load(sys.stdin).get("gestures"))' 2>/dev/null)
+if [ -n "$GEST_BEFORE" ] && [ "$GEST_BEFORE" = "$GEST_AFTER" ] &&
+		case "$GEST_AFTER" in *竖扫*) true ;; *) false ;; esac; then
+	pass "手势配置表没被锁定动过（$GEST_AFTER）"
+else
+	fail "手势配置表变了：$GEST_BEFORE -> $GEST_AFTER（锁定不该清配置）"
+fi
+
+# ---------------------------------------------------------------- E 指针
+mark "E 锁定期间指针只给锁屏界面（点击 / 滚动不漏给被藏起来的窗口）"
+if TARGET=$(target_center); then
+	FOC_BEFORE=$(focused_win)
+	msg move-cursor $TARGET >/dev/null
+	msg pointer-button press left >/dev/null
+	msg pointer-button release left >/dev/null
+	msg pointer-scroll 0 60 >/dev/null
+	sleep 0.4
+	FOC_AFTER=$(focused_win)
+	echo "    光标压到 $TARGET（一个没拿焦点的窗口），焦点：$FOC_BEFORE -> $FOC_AFTER"
+	if [ "$FOC_BEFORE" = "$FOC_AFTER" ]; then
+		pass "焦点没被抢走（focus_follows_mouse 开着也不跟被藏起来的窗口）"
+	else
+		fail "光标压到被藏起来的窗口上就把焦点抢走了"
+	fi
+else
+	fail "找不到「没拿焦点的窗口」当靶子（E 没法量）"
+fi
+PEV=$(grep -acE '^(pfocus|button|axis|motion)' "$LOCKLOG")
+if grep -aq '^pfocus' "$LOCKLOG" && grep -aq '^button ' "$LOCKLOG" && grep -aq '^axis ' "$LOCKLOG"; then
+	pass "locktest 收到了指针：$(grep -aE '^(pfocus|button|axis)' "$LOCKLOG" | sort -u | tr '\n' ' ')"
+else
+	fail "locktest 没收到完整的指针事件（pfocus/button/axis 有缺，共 $PEV 行）"
+fi
+
+# ------------------------------------------------- S3 语义①：DPMS 唤醒照旧
+mark "S3 语义①：锁定期间 mouse_move_enables_dpms 照旧能唤醒关掉的屏"
+msg output-power HEADLESS-1 off >/dev/null
+sleep 0.4
+WOKE_BEFORE=$(grep -ac "输入唤醒" "$LOG")
+ENABLED_OFF=$(msg outputs | python3 -c '
+import sys, json
+print([o.get("enabled") for o in json.load(sys.stdin) if o.get("name") == "HEADLESS-1"])' 2>/dev/null)
+msg move-cursor 20 20 >/dev/null
+sleep 0.5
+WOKE_AFTER=$(grep -ac "输入唤醒" "$LOG")
+ENABLED_ON=$(msg outputs | python3 -c '
+import sys, json
+print([o.get("enabled") for o in json.load(sys.stdin) if o.get("name") == "HEADLESS-1"])' 2>/dev/null)
+echo "    output-power off 后 enabled=$ENABLED_OFF；move-cursor 后 enabled=$ENABLED_ON"
+if [ "$WOKE_AFTER" -gt "$WOKE_BEFORE" ] && [ "$ENABLED_ON" = "[True]" ]; then
+	pass "指针一动屏就回来了：$(grep -a '输入唤醒' "$LOG" | tail -1 | sed 's/.*vidow: //')"
+else
+	fail "锁定期间指针没唤醒关掉的屏（输入唤醒 行数 $WOKE_BEFORE -> $WOKE_AFTER，enabled=$ENABLED_ON）"
+fi
+CFG_FFM=$(msg config focus_follows_mouse | python3 -c '
+import sys, json
+try:
+    print(json.load(sys.stdin).get("value"))
+except Exception:
+    print("(读不到)")')
+if [ "$CFG_FFM" = "true" ]; then
+	pass "focus_follows_mouse 确实是 true（E 那条「不生效」才有意义）"
+else
+	fail "focus_follows_mouse = $CFG_FFM（不是 true；E 的判据就不成立）"
+fi
+
 if kill -0 "$VPID" 2>/dev/null; then
 	pass "第一遍 vidow 全程活着"
 else
@@ -340,7 +503,7 @@ for p in $(pgrep -x vidow 2>/dev/null); do
 done
 [ -n "$LEAK" ] && echo "注意：有不是这次起的 vidow 进程还活着：$LEAK"
 if [ "$FAILED" -eq 0 ]; then
-	echo "test-sessionlock.sh 全部通过（S1：能锁、能黑屏、能握手；S2：lock surface 生命周期 + 输出热插拔）"
+	echo "test-sessionlock.sh 全部通过（S1：能锁、能黑屏、能握手；S2：lock surface 生命周期 + 输出热插拔；S3：输入路由 + 键位白名单）"
 else
 	echo "test-sessionlock.sh 有失败项"
 fi
