@@ -525,6 +525,46 @@ struct vidow_config {
 	/* 桌面底色：没有壁纸客户端（layer-shell 的 background 层）时垫在最底下的
 	 * 颜色，有壁纸客户端时被它盖住。RRGGBB 或 RRGGBBAA。 */
 	float background_color[4];
+
+	/* ---- 小窗（mini window，configs/24-mini.lua）----
+	 * 小窗是浮动窗口上的一个形态（见 enum vidow_mini_state）：迷你 / 图标 /
+	 * 自由小窗。S1 只铺数据模型 + 配置 + IPC，形态还不会自动切换、渲染与
+	 * 输入路由未动。 */
+	bool mini_enabled;         /* 总开关，false = 这套东西完全不生效 */
+	bool mini_drop_zone;       /* 拖拽时亮落点区 */
+	char mini_drop_zone_w[16]; /* 落点区宽（工作区百分比，如 "15%"） */
+	char mini_drop_zone_h[16];
+	char mini_w[16];           /* 迷你态尺寸（工作区百分比，如 "28%"） */
+	char mini_h[16];
+	char mini_free_w[16];      /* 自由小窗的初始尺寸（工作区百分比） */
+	char mini_free_h[16];
+	int mini_icon_size;        /* 图标边长（逻辑像素） */
+	double mini_icon_overflow; /* 图标沿贴边那一侧出屏的比例，0..0.6 */
+	int mini_icon_hover_ms;    /* 图标悬停多久出预览 */
+	int mini_icon_hover_leave_ms;
+	int mini_icon_hover_grace_ms;
+	bool mini_icon_preview;    /* 悬停预览开关 */
+	bool mini_toolbar;         /* 悬停工具条开关 */
+	int mini_edge_snap_px;     /* 拖到屏边多少像素内算「贴边」 */
+	int mini_transition_ms;    /* 形态转换时长（0 = 不做动画） */
+	int mini_hover_fade_in_ms;
+	int mini_hover_fade_out_ms;
+	bool mini_remember_size;   /* 记住 FREE 的尺寸（false = 每次用初始比例） */
+	int mini_edge_margin;      /* 图标 / 迷你态离屏边的最小留白 */
+	/* 保留客户端原生分辨率：小窗态只是**呈现**变了，由合成器缩放显示。
+	 * false = 小窗态按小窗尺寸重配客户端（省显存，但有的游戏一 resize 就
+	 * 重置成窗口模式）。**不要**再加一个取反的 mini_resize_client，两个键会打架。 */
+	bool mini_preserve_buffer;
+	/* 自由小窗的宽高比策略："auto" / "lock" / "free"（默认 "auto"）。
+	 * 三个取值都是强制语义，优先级：键位 > 窗口规则 > 这个全局键。
+	 * "auto" = 让自动信号决定（X11 有 PAspect / min==max 提示就锁，否则
+	 * free）；lock / free 显式压过自动信号。写错的值当场报错且**值不变**。
+	 * 只对自由小窗有效 —— 迷你 / 图标态永远按内容比例。 */
+	char mini_aspect[16];
+	/* 迷你态「单击 = 放大」vs「拖拽 = 移动」的位移阈值（逻辑像素）。迷你态
+	 * 要同时是「点一下放大」和「拖着挪位置」，只能按位移分：指针按下后走了
+	 * 这么多像素才算拖拽，没走到就松手当单击。 */
+	int mini_drag_threshold_px;
 };
 
 /* gap 的唯一算法：单独设了就用它，没设（-1）跟随统一值 gaps；其余负值当 0
@@ -1120,6 +1160,53 @@ enum vidow_float_mode {
 	VIDOW_FLOAT_FOLLOW,   /* floats at a fixed offset from a parent view */
 };
 
+/* ------------------------------------------------- 小窗（mini window，S1）
+ *
+ * 小窗**不是**新的浮动模式：`float_mode` 仍是 VIDOW_FLOAT_FIXED（复用
+ * float_geom / home_dx,home_dy / float_place_recursive() / vidow_float_set_size()
+ * 那一整套），它只是浮动窗口上的一个「形态」字段。三态 + NONE：
+ *
+ *   NONE  不在小窗态（可能平铺、也可能普通浮动窗口）
+ *   FREE  自由小窗：位置与尺寸都记比例锚点，客户端可以改尺寸
+ *   MINI  迷你态：尺寸跟配置钉死，只记位置锚点
+ *   ICON  图标态：正方形（配置的边长），贴边、按比例超出屏幕一点
+ *
+ * 位置**不记绝对坐标**，记的是「相对自己那块输出工作区的比例锚点」
+ * （mini_ax/mini_ay ∈ 0..1，图标允许 -0.5..1.5 好让它出屏）。理由和
+ * home_dx/home_dy 一样但更强：改工作区尺寸 / 改缩放 / 拔插屏之后比例锚点
+ * 天然跟着走，不需要在每个热插拔路径里补换算。
+ *
+ * 尺寸：FREE 记比例（mini_wf/mini_hf，mini_size_known = 记过没有）；
+ * MINI / ICON 不记 —— 永远跟配置，改配置当场生效。 */
+enum vidow_mini_state {
+	VIDOW_MINI_NONE = 0,
+	VIDOW_MINI_FREE,
+	VIDOW_MINI_MINI,
+	VIDOW_MINI_ICON,
+};
+
+/* 图标态贴着哪条边（沿这条边按比例超出屏幕一点，另一轴按锚点）。 */
+enum vidow_mini_edge {
+	VIDOW_MINI_EDGE_NONE = 0,
+	VIDOW_MINI_EDGE_LEFT,
+	VIDOW_MINI_EDGE_RIGHT,
+	VIDOW_MINI_EDGE_TOP,
+	VIDOW_MINI_EDGE_BOTTOM,
+};
+
+/* 自由小窗的宽高比策略。三个取值都是「强制」语义，优先级：
+ * 键位（运行时）> 窗口规则 > 全局键（config.c 的 mini_aspect）。
+ *   auto  让自动信号决定：X11 有 PAspect / min==max 提示就锁，否则 free
+ *   lock  显式锁内容比例（压过自动信号）
+ *   free  显式自由拖（压过自动信号）
+ * 迷你 / 图标态永远按内容比例显示，不受它影响。 */
+enum vidow_mini_aspect {
+	VIDOW_MINI_ASPECT_UNSET = 0, /* 规则没写（不是 "auto" —— 那是一个值） */
+	VIDOW_MINI_ASPECT_AUTO,
+	VIDOW_MINI_ASPECT_LOCK,
+	VIDOW_MINI_ASPECT_FREE,
+};
+
 enum vidow_grab_mode {
 	VIDOW_GRAB_NONE = 0,
 	VIDOW_GRAB_MOVE,
@@ -1396,6 +1483,32 @@ struct vidow_view {
 	struct wlr_box float_geom; /* FIXED: absolute box
 	                              FOLLOW: x/y = offset from the parent tile */
 	struct vidow_view *parent; /* FOLLOW: the view we track */
+
+	/* ---- 小窗（mini window，S1；见 enum vidow_mini_state 顶上那段）----
+	 * 只有 float_mode == VIDOW_FLOAT_FIXED 时才有意义：进小窗态时
+	 * float_mode 会被设成 FIXED，位置尺寸由下面的锚点算出来。 */
+	enum vidow_mini_state mini;
+	/* 位置锚点：相对**自己那块输出的工作区**的比例。算位置时：
+	 *   x = work.x + round(mini_ax × (work.w − 窗口宽))
+	 * 所以 0 = 贴工作区左 / 上边，1 = 贴右 / 下边。图标态允许超出 0..1
+	 * （夹在 -0.5..1.5），好让它按 mini_icon_overflow 出屏一点。 */
+	double mini_ax, mini_ay;
+	/* FREE 的尺寸比例（相对工作区）；mini_size_known = 记过没有。
+	 * MINI / ICON 不看这两个 —— 它们的尺寸永远跟配置。 */
+	double mini_wf, mini_hf;
+	bool mini_size_known;
+	/* ICON 贴哪条边（沿这条边按比例出屏）。NONE = 不贴边（居中）。 */
+	enum vidow_mini_edge mini_edge;
+	/* 小窗是**屏级对象**（像安卓的画中画），不属于任何工作区：进小窗态时
+	 * view->ws 会被清成 NULL 并把这笔账从那块工作区的 floats 里减掉（不然
+	 * 一块只剩小窗的工作区永远收不掉）。mini_home 按输出名记着它属于哪块屏，
+	 * 拔屏再插回来时按它认领回去。 */
+	struct vidow_output_memory *mini_home;
+	/* 窗口规则写的宽高比策略（VRA_MINI_ASPECT）。UNSET = 规则没写。 */
+	enum vidow_mini_aspect mini_aspect_rule;
+	/* 窗口规则写的「保留客户端原生分辨率」（VRA_MINI_PRESERVE_BUFFER）。 */
+	bool mini_preserve_buffer_set;
+	bool mini_preserve_buffer;
 
 	struct wl_listener map;
 	struct wl_listener unmap;
@@ -3308,6 +3421,21 @@ void vidow_float_center(struct vidow_view *view);
 void vidow_float_place_all(struct vidow_server *server,
 		struct vidow_output *output);
 void vidow_float_on_commit(struct vidow_view *view);
+
+/* ------------------------------------------------------------- 小窗（S1） */
+
+/* 换形态。NONE = 还原成列（等价于 vidow_view_join_layout + 重新记账）。
+ * 只动数据模型与几何（比例锚点 -> float_geom），不碰可见性 / 焦点 / 输入 /
+ * 渲染 / 动画 —— 那些是 S2–S5。 */
+void vidow_mini_set_state(struct vidow_view *view, enum vidow_mini_state state);
+/* 按比例锚点算出 float_geom（幂等，不 configure 客户端）。摆放前调。 */
+void vidow_mini_resolve_geom(struct vidow_view *view);
+/* "none" / "free" / "mini" / "icon" <- 文本（IPC / 日志）。返回 NULL = 不认识。 */
+bool vidow_mini_parse_state(const char *text, enum vidow_mini_state *out);
+const char *vidow_mini_state_name(enum vidow_mini_state state);
+/* "auto" / "lock" / "free" <- 文本。返回 NULL = 不认识。 */
+const char *vidow_mini_aspect_name(enum vidow_mini_aspect aspect);
+bool vidow_mini_parse_aspect(const char *text, enum vidow_mini_aspect *out);
 void vidow_float_detach_children(struct vidow_server *server,
 		struct vidow_view *dying);
 /* from_client = 客户端自己发起的（CSD 标题栏拖拽 / _NET_WM_MOVERESIZE）：它的

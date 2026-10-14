@@ -133,6 +133,12 @@ enum vidow_rule_act {
 	VRA_MAXIMIZE,          /* 开就整列最大化 */
 	VRA_MINIMIZE,          /* 开就收起来（不显示、不抢焦点） */
 	VRA_COLUMN_WIDTH,      /* 新列的宽度占比（0.1 ~ 1.0） */
+	/* 小窗（mini window，S1）：开窗时定形态。优先级是**规则 > 全局键**，
+	 * 运行时键位（S4）再压过规则。 */
+	VRA_MINI_WINDOW,       /* true = 这个窗口开出来就是迷你小窗 */
+	VRA_MINI_STATE,        /* 开出来的初始形态："free" / "mini" / "icon" */
+	VRA_MINI_ASPECT,       /* 自由小窗的宽高比策略："auto" / "lock" / "free" */
+	VRA_MINI_PRESERVE_BUFFER, /* 小窗态保不保留客户端原生分辨率 */
 	/* 一直在的 */
 	VRA_ANIM,              /* false = 这个窗口 / 图层不做开合动画 */
 	VRA_OPEN_MS,           /* 开启动画时长（毫秒，覆盖全局；0 = 不做开启动画） */

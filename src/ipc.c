@@ -547,6 +547,138 @@ static bool cmd_toggle_floating(struct vidow_server *server, struct jval *req,
 	return true;
 }
 
+/* ------------------------------------------------------------- 小窗（S1）
+ *
+ * 形态的入口只有这一个（vidow_mini_set_state）：把窗口塞进迷你 / 图标 / 自由
+ * 小窗，或者还原成列。S1 只有数据模型 + 配置 + IPC —— 形态还不会自动切换
+ * （拖到落点区、悬停工具条那些是 S4），渲染与输入路由也还没动（S2 / S3）。
+ *
+ * 用法：
+ *   vidowmsg mini-window --id 3                     进迷你小窗
+ *   vidowmsg mini-window --id 3 --state free        指定形态（free / mini / icon）
+ *   vidowmsg set-mini-state --id 3 --state icon     显式设形态（含 none = 还原成列）
+ *   vidowmsg unmini-window --id 3                   还原成列
+ *   vidowmsg cycle-mini-state --id 3                三态循环（free → mini → icon → free）
+ *   vidowmsg mini-windows                           当前小窗清单
+ */
+static bool cmd_mini_window(struct vidow_server *server, struct jval *req,
+		struct jbuf *out, char *err, size_t errlen) {
+	struct vidow_view *view = req_view(server, req, err, errlen);
+	if (view == NULL) {
+		return false;
+	}
+	if (view->popup) {
+		snprintf(err, errlen, "弹出物（菜单 / 提示）不进布局，做不了小窗");
+		return false;
+	}
+	/* 不写 --state 就是迷你（这是小窗模式的默认形态）。 */
+	enum vidow_mini_state state = VIDOW_MINI_MINI;
+	const char *want = jget_str(req, "state");
+	if (want != NULL && !vidow_mini_parse_state(want, &state)) {
+		snprintf(err, errlen, "state 只能是 free / mini / icon（none 用 "
+			"unmini-window 或 set-mini-state）；给的是 '%s'", want);
+		return false;
+	}
+	if (state == VIDOW_MINI_NONE) {
+		snprintf(err, errlen, "进小窗要用 free / mini / icon；还原成列用 "
+			"unmini-window");
+		return false;
+	}
+	vidow_mini_set_state(view, state);
+	changed_window(out, server, view);
+	return true;
+}
+
+static bool cmd_unmini_window(struct vidow_server *server, struct jval *req,
+		struct jbuf *out, char *err, size_t errlen) {
+	struct vidow_view *view = req_view(server, req, err, errlen);
+	if (view == NULL) {
+		return false;
+	}
+	if (view->mini == VIDOW_MINI_NONE) {
+		snprintf(err, errlen, "id = %llu 的窗口不在小窗态",
+			(unsigned long long)view->id);
+		return false;
+	}
+	vidow_mini_set_state(view, VIDOW_MINI_NONE);
+	changed_window(out, server, view);
+	return true;
+}
+
+static bool cmd_set_mini_state(struct vidow_server *server, struct jval *req,
+		struct jbuf *out, char *err, size_t errlen) {
+	struct vidow_view *view = req_view(server, req, err, errlen);
+	if (view == NULL) {
+		return false;
+	}
+	if (view->popup) {
+		snprintf(err, errlen, "弹出物不进布局，做不了小窗");
+		return false;
+	}
+	const char *want = jget_str(req, "state");
+	enum vidow_mini_state state = VIDOW_MINI_NONE;
+	if (want == NULL || !vidow_mini_parse_state(want, &state)) {
+		snprintf(err, errlen, "要 state = free / mini / icon / none；给的是 '%s'",
+			want != NULL ? want : "(没写)");
+		return false;
+	}
+	vidow_mini_set_state(view, state);
+	changed_window(out, server, view);
+	return true;
+}
+
+static bool cmd_cycle_mini_state(struct vidow_server *server, struct jval *req,
+		struct jbuf *out, char *err, size_t errlen) {
+	struct vidow_view *view = req_view(server, req, err, errlen);
+	if (view == NULL) {
+		return false;
+	}
+	if (view->popup) {
+		snprintf(err, errlen, "弹出物不进布局，做不了小窗");
+		return false;
+	}
+	/* 三态循环：不在小窗态 / 自由小窗 → 迷你 → 图标 → 自由 → 迷你 …
+	 * （NONE 只在入口出现一次，循环里不出现 —— 否则按键三次回不到起点）。 */
+	enum vidow_mini_state next;
+	switch (view->mini) {
+	case VIDOW_MINI_NONE:
+	case VIDOW_MINI_FREE:
+		next = VIDOW_MINI_MINI;
+		break;
+	case VIDOW_MINI_MINI:
+		next = VIDOW_MINI_ICON;
+		break;
+	case VIDOW_MINI_ICON:
+	default:
+		next = VIDOW_MINI_FREE;
+		break;
+	}
+	vidow_mini_set_state(view, next);
+	changed_window(out, server, view);
+	return true;
+}
+
+/* 当前小窗清单（IPC / 状态栏 / 测试用）：形态、屏、几何、锚点。 */
+static bool cmd_mini_windows(struct vidow_server *server, struct jval *req,
+		struct jbuf *out, char *err, size_t errlen) {
+	(void)req;
+	(void)err;
+	(void)errlen;
+	jb_obj(out);
+	jb_key(out, "windows");
+	jb_arr(out);
+	struct vidow_view *view;
+	wl_list_for_each(view, &server->views, link) {
+		if (view->mini == VIDOW_MINI_NONE || view->popup) {
+			continue;
+		}
+		vidow_ipc_json_window(out, server, view);
+	}
+	jb_arr_end(out);
+	jb_obj_end(out);
+	return true;
+}
+
 static bool cmd_set_floating(struct vidow_server *server, struct jval *req,
 		struct jbuf *out, char *err, size_t errlen) {
 	struct vidow_view *view = req_view(server, req, err, errlen);
@@ -2532,6 +2664,21 @@ static bool ipc_run(struct vidow_server *server, struct ipc_client *c,
 	}
 	if (strcmp(cmd, "set_floating") == 0) {
 		return cmd_set_floating(server, req, out, err, errlen);
+	}
+	if (strcmp(cmd, "mini_window") == 0) {
+		return cmd_mini_window(server, req, out, err, errlen);
+	}
+	if (strcmp(cmd, "unmini_window") == 0) {
+		return cmd_unmini_window(server, req, out, err, errlen);
+	}
+	if (strcmp(cmd, "set_mini_state") == 0) {
+		return cmd_set_mini_state(server, req, out, err, errlen);
+	}
+	if (strcmp(cmd, "cycle_mini_state") == 0) {
+		return cmd_cycle_mini_state(server, req, out, err, errlen);
+	}
+	if (strcmp(cmd, "mini_windows") == 0) {
+		return cmd_mini_windows(server, req, out, err, errlen);
 	}
 	if (strcmp(cmd, "toggle_fullscreen") == 0) {
 		return cmd_toggle_fullscreen(server, req, out, err, errlen);

@@ -5420,6 +5420,26 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
      - 未做：niri 的 `fixed 1920`（固定像素档）、`preset-window-heights`、`default-column-width {}`（让客户端自己定宽）、
        `always-center-single-column`；窗口规则级的 per-rule 预设覆盖。
 
+271. **小窗模式 S1：数据模型（三态形态 + 比例锚点）+ 配置键 + IPC —— 形态还不会自动切换**（用户：「先做方案 §7 的 S1，配置 + IPC 骨架先跑通」；方案 `/tmp/vidow-miniwin-plan.md` §6.1 / §6.2 / §6.5 / §6.6 + §7 S1；2026-10-14）
+
+     - **小窗不是新的浮动模式**，是浮动窗口上的一个**形态**字段：`enum vidow_mini_state` = `NONE` / `FREE`（自由小窗）/ `MINI`（迷你）/ `ICON`（图标，贴边出屏一点）。进小窗 = 复用现成那套（`float_mode = VIDOW_FLOAT_FIXED` + `float_geom` / `home_dx,dy` / `float_place_recursive()` / `vidow_float_set_size()`），**没有**新开一条浮动路径。
+     - **位置不记绝对坐标**，记「相对自己那块输出工作区的比例锚点」`view->mini_ax / mini_ay`（0 = 贴左 / 上，1 = 贴右 / 下；图标允许 −0.5..1.5 好出屏）。换算只有一处：`vidow_mini_resolve_geom()`（`src/float.c`）—— 改工作区尺寸 / 改缩放 / 拔插屏之后比例锚点天然跟着走，不用在每个热插拔路径里补换算。尺寸：`FREE` 记比例 `mini_wf / mini_hf`（`mini_remember_size` = 记住，客户端 resize 会回写比例），`MINI` / `ICON` 永远跟配置（改配置当场生效）。
+     - **小窗是屏级对象**（像安卓的画中画）：进小窗时 `view->ws = NULL` 并从原来那块工作区摘账，`mini_home` 按输出名记着它属于哪块屏（拔屏再插回来按它认领）。
+     - **⚠️ 记账那条有坑（本次修掉）**：`ws->floats` 的 `+1` 只在 `view_map()`（`src/view.c`，`float_mode != NONE` 那条）与 `ws_adopt_view()` 里记 —— `vidow_view_leave_column()` 自己**不动** floats（平铺窗口的账在 `columns` 上）。所以摘账必须**只对「本来就是浮窗」的那个减**：平铺窗口进小窗时再减一下就是减**别人**的账。实测（浮窗 `miniwin` + 平铺 `tilewin` 进小窗）：无条件减会把 `miniwin` 的计数吃掉（floats 1 → 0），修后全程稳定在 1。
+     - **配置键 22 个**（`configs/24-mini.lua`，新文件 + 入口 include 行）：`mini_enabled` / `mini_drop_zone` / `mini_drop_zone_w,h` / `mini_w,h` / `mini_free_w,h` / `mini_icon_size` / `mini_icon_overflow` / `mini_icon_hover_ms` / `mini_icon_hover_leave_ms` / `mini_icon_hover_grace_ms` / `mini_icon_preview` / `mini_toolbar` / `mini_edge_snap_px` / `mini_transition_ms` / `mini_hover_fade_in_ms` / `mini_hover_fade_out_ms` / `mini_remember_size` / `mini_edge_margin` / `mini_preserve_buffer`（默认 `true`）/ `mini_aspect`（默认 `"auto"`）/ `mini_drag_threshold_px`（默认 `4`）。
+     - **`mini_aspect` 是三个取值、三个都是显式选择**：`"auto"`（默认，让自动信号决定）/ `"lock"` / `"free"`，优先级 **键位（运行时）> 窗口规则 > 全局键**；`lock` / `free` 压过自动信号。只对自由小窗有效（迷你 / 图标态永远按内容比例）。读 X11 `PAspect` 的判定属于 S3，本次没做。
+     - **窗口规则 4 个**（`rule.c` 的 `vidow_rule_fields[]`）：`mini_window` / `mini_state`（`"free"` / `"mini"` / `"icon"`）/ `mini_aspect` / `mini_preserve_buffer`。字符串字段取值当场校验（`mini_state = "miny"` 直接报错，不留到开窗才发现）。兑现放在 `vidow_rule_placement()` 里、**在 `VRA_MINIMIZE` 之前**（先定形态，再看要不要收起来）。
+     - **三条写路径自动全吃**（照 `508239e` 的模式）：`mini_icon_size = 48`（config.lua）/ `VIDOW_MINI_ICON_SIZE=48 ./build/vidow`（环境变量）/ `vidowmsg set-config mini_icon_size 48`（IPC）；查询 `vidowmsg config mini_icon_size`。写错当场 `WLR_ERROR` 且**值不变**（`508239e` 的规矩）：`mini_aspect = "maybe"` 与 `mini_w = "60"`（缺 `%`）都被拒，旧值原样。
+     - **IPC**：`mini-window [--state free|mini|icon]`（默认迷你）/ `unmini-window`（还原成列）/ `set-mini-state free|mini|icon|none` / `cycle-mini-state` / `mini-windows`（清单）。`vidowmsg windows` 每个窗口多 `mini` / `mini_output` / `mini_home` / `mini_aspect_rule` / `mini_anchor{x,y,wf,hf,size_known}`；事件 `window-mini-changed`（进了 `hooks.c` 的事件白名单）。
+     - **验证**（headless，`WLR_HEADLESS_OUTPUTS=2`，脚本 `/tmp/vidow-mini-verify.sh`，工作区 = 1280x720 内缩 `gaps=10` → 10,10,1260,700）：
+       - 规则：`vidow.rule{ title="^rulewin$", mini_state="icon" }` → 开出来就是 `icon`，几何 **1228,10,64x64**（= 工作区右缘 1270 − 64 + 出屏 `0.35×64=22`）✓
+       - IPC：平铺窗口 `mini-window --state mini` → **909,18,353x196**（28% 工作区，锚点 1,0 贴右上，`mini_edge_margin=8` 夹回），`view->ws = null`、`mini_home = HEADLESS-1` ✓
+       - 三态互切**保留锚点**（位置是用户拖出来的）：`free` → **758,18,504x315**（40%×45%，锚点还是 1,0，被 margin 夹回来）；`icon` → **1206,10,64x64**（`mini_edge` 只在「从 NONE 进 ICON」时才给，互切不重给 → 这次不贴边）。贴边那条由规则路径（NONE → ICON）验 ✓
+       - 还原成列：`mini=none`、`floating=false`、几何回到条带上（宽 625 = `0.5 × (1260+10) − 10`）✓
+       - `floats` 记账：真浮窗 `miniwin` 进小窗 → floats 减掉，还原 → 还回来；**平铺**窗口进小窗 → floats 不动（没吃掉别人的账）✓
+     - **回归**：`test-defaultconfig.sh` 全过（新增的 `24-mini.lua` 与 `--default-config` 逐字节一致；`14-keys.lua` 里的规则字段说明块在 `config.c` 的生成器里同步加了 4 条）、`test-config.sh` 全过、`test-ipc.sh` 全过。
+     - **未做（S2–S5）**：可见性旁路 / 焦点守卫 / 输入路由 / 渲染 / 过渡动画 / 落点区 / 悬停预览 / 键位动作 —— 所以小窗态现在会被现有可见性判据当成「工作区不亮着」停到屏外，这是预期。`mini_preserve_buffer` 目前只是数据 + 配置（按小窗尺寸重配客户端是 S3）；`mini_aspect` 的自动信号（X11 `PAspect`）读取也是 S3。
+
 270. **窗口抓帧录出来就是「这个窗口在屏上的样子」：背后的模糊底衬 + 那圈画框（默认开，一个开关能关掉）**（用户：「能否混合背景（包括模糊）和 ssd」→ 澄清为「我是说窗口录制的时候」；2026-10-14）
 
      - **改前**：窗口抓帧（`src/wincapture.c` 的私有镜面场景 + 假输出，渲染在 `vidow_win_grab_render()`）画的是**客户端表面本身** —— 没有装饰、模糊、圆角、阴影（照 Hyprland 的窗口导出那个口径）。屏幕上的画框 / 底衬是 `src/fx.c` 的 `decor_pass()`（圆角 + 边框 + 投影 + 模糊底衬 + 颗粒，一个着色器一遍画完）画的，画在**正常场景**的装饰节点上，镜面场景里没有 —— 所以录不到。vidow 不画真标题栏（`src/decoration.c` 只做 CSD 协商），所以「录进去的 SSD」就是这圈画框。

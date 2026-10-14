@@ -1,6 +1,7 @@
 #include "server.h"
 #include "ipc.h"
 
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -280,6 +281,37 @@ void vidow_float_on_commit(struct vidow_view *view) {
 		return;
 	}
 
+	/* 小窗态：尺寸由形态决定，不是「客户端想要的浮窗尺寸」。
+	 *   MINI / ICON  永远跟配置，客户端自己 resize 不作数；
+	 *   FREE         记比例（mini_wf/mini_hf），客户端可以改 —— 改完回写比例。
+	 * 目标尺寸跟客户端现在的不一样就再 configure 一次（尺寸钉子：float_want_w/h
+	 * 一直钉着，一个迟到的提交吃不掉它）。 */
+	if (view->mini != VIDOW_MINI_NONE) {
+		int cw = 0, ch = 0;
+		vidow_view_client_size(view, &cw, &ch);
+		if (view->mini == VIDOW_MINI_FREE && cw > 1 && ch > 1 &&
+				view->server->config.mini_remember_size) {
+			struct wlr_box work =
+				vidow_work_area(view->server, view->output);
+			if (work.width > 0 && work.height > 0) {
+				view->mini_wf = (double)cw / (double)work.width;
+				view->mini_hf = (double)ch / (double)work.height;
+				view->mini_size_known = true;
+			}
+		}
+		vidow_mini_resolve_geom(view);
+		if (view->float_geom.width > 0 && view->float_geom.height > 0 &&
+				(cw != view->float_geom.width ||
+					ch != view->float_geom.height)) {
+			view->float_want_w = view->float_geom.width;
+			view->float_want_h = view->float_geom.height;
+			vidow_view_set_size(view, view->float_geom.width,
+				view->float_geom.height);
+			vidow_arrange(view->server);
+		}
+		return;
+	}
+
 	/* 客户端自己要的尺寸，逻辑单位（X11 的像素在这里已经除掉了 xwayland_scale，
 	 * 否则浮动窗口在 X11 下会大一倍）。 */
 	int w = 0, h = 0;
@@ -391,6 +423,17 @@ static void float_place_recursive(struct vidow_view *view, int depth) {
 
 	if (view->float_mode == VIDOW_FLOAT_FIXED &&
 			view->float_geom.width > 0 && view->float_geom.height > 0) {
+		/* 小窗态：位置尺寸**每次**都按比例锚点重算（锚点 -> 工作区），不走
+		 * 下面那套 home_dx/home_dy 的绝对偏移 —— 小窗是屏级对象，跟的是
+		 * 「工作区的相对位置」，换工作区尺寸 / 改缩放 / 拔插屏之后天然对得上。
+		 * 这是唯一的换算点（vidow_mini_set_state 里那次是为了让 IPC 立刻能
+		 * 查到正确的 float_geometry，不重复也行，重算幂等）。 */
+		if (view->mini != VIDOW_MINI_NONE) {
+			vidow_mini_resolve_geom(view);
+			vidow_place_view(view, view->float_geom.x, view->float_geom.y,
+				view->float_geom.width, view->float_geom.height);
+			return;
+		}
 		/* 浮动窗口remember 的是「相对它现在那块屏原点」的偏移（home_dx/home_dy）。
 		 *
 		 * 为什么不用绝对坐标：拔掉 / 插上一块屏之后 wlroots 会重排剩下的输出
@@ -632,4 +675,320 @@ void vidow_float_end_grab(struct vidow_server *server) {
 	wlr_log(WLR_INFO, "grab: 浮窗拖到 %s 上 → 归到那块屏第 %d 块工作区",
 		under->name, vidow_workspace_index(target));
 	vidow_arrange(server);
+}
+
+/* ------------------------------------------------- 小窗（mini window，S1）
+ *
+ * 数据模型见 server.h 的 enum vidow_mini_state 顶上那段。这里只有三件事：
+ *   1) 形态字段的读写（vidow_mini_set_state）
+ *   2) 比例锚点 -> float_geom 的换算（vidow_mini_resolve_geom）
+ *   3) 进 / 出小窗态时的账：从工作区摘出来（view->ws = NULL）并把那块工作区
+ *      的 floats 减掉 —— 不减的话一块只剩小窗的工作区永远收不掉
+ *      （ws_keeps/ws_empty 看 ws->floats，见 workspace.c）。
+ *
+ * S1 只做数据模型 + 配置 + IPC：可见性旁路、焦点守卫、输入路由、渲染与动画
+ * 一律还没动（S2–S5）。所以小窗态现在会被现有的可见性判据当成「工作区不亮着」
+ * 而停到屏外 —— 这是预期的，S2 的旁路一上来它就留在屏上了。
+ */
+
+const char *vidow_mini_state_name(enum vidow_mini_state state) {
+	switch (state) {
+	case VIDOW_MINI_FREE:
+		return "free";
+	case VIDOW_MINI_MINI:
+		return "mini";
+	case VIDOW_MINI_ICON:
+		return "icon";
+	case VIDOW_MINI_NONE:
+		break;
+	}
+	return "none";
+}
+
+bool vidow_mini_parse_state(const char *text, enum vidow_mini_state *out) {
+	if (text == NULL) {
+		return false;
+	}
+	if (strcmp(text, "none") == 0) {
+		*out = VIDOW_MINI_NONE;
+	} else if (strcmp(text, "free") == 0) {
+		*out = VIDOW_MINI_FREE;
+	} else if (strcmp(text, "mini") == 0) {
+		*out = VIDOW_MINI_MINI;
+	} else if (strcmp(text, "icon") == 0) {
+		*out = VIDOW_MINI_ICON;
+	} else {
+		return false;
+	}
+	return true;
+}
+
+const char *vidow_mini_aspect_name(enum vidow_mini_aspect aspect) {
+	switch (aspect) {
+	case VIDOW_MINI_ASPECT_AUTO:
+		return "auto";
+	case VIDOW_MINI_ASPECT_LOCK:
+		return "lock";
+	case VIDOW_MINI_ASPECT_FREE:
+		return "free";
+	case VIDOW_MINI_ASPECT_UNSET:
+		break;
+	}
+	return "unset";
+}
+
+bool vidow_mini_parse_aspect(const char *text, enum vidow_mini_aspect *out) {
+	if (text == NULL) {
+		return false;
+	}
+	if (strcmp(text, "auto") == 0) {
+		*out = VIDOW_MINI_ASPECT_AUTO;
+	} else if (strcmp(text, "lock") == 0) {
+		*out = VIDOW_MINI_ASPECT_LOCK;
+	} else if (strcmp(text, "free") == 0) {
+		*out = VIDOW_MINI_ASPECT_FREE;
+	} else {
+		return false;
+	}
+	return true;
+}
+
+/* 配置里的百分比键（"28%"）-> 比例（0.28）。读不出来就用兜底值 ——
+ * 写配置那一刻已经校验过（config.c 的 K_STRING 分支），这里不该再报错。 */
+static double mini_frac(struct vidow_server *server, const char *key,
+		double fallback) {
+	const char *text = vidow_config_get(&server->config, key);
+	double pct = 0.0;
+	if (text != NULL && text[0] != '\0' &&
+			vidow_config_parse_percent(text, &pct)) {
+		return pct / 100.0;
+	}
+	return fallback;
+}
+
+/* 进各态的默认锚点：自由小窗居中，迷你 / 图标贴右上角（落点区的默认角）。
+ * 只在「本来不在小窗态」时给一次，三态互切不动它（位置是用户拖出来的）。 */
+static void mini_default_anchor(struct vidow_view *view,
+		enum vidow_mini_state state) {
+	switch (state) {
+	case VIDOW_MINI_FREE:
+		view->mini_ax = 0.5;
+		view->mini_ay = 0.5;
+		break;
+	case VIDOW_MINI_MINI:
+		view->mini_ax = 1.0;
+		view->mini_ay = 0.0;
+		break;
+	case VIDOW_MINI_ICON:
+		view->mini_ax = 1.0;
+		view->mini_ay = 0.0;
+		view->mini_edge = VIDOW_MINI_EDGE_RIGHT;
+		break;
+	case VIDOW_MINI_NONE:
+		break;
+	}
+}
+
+void vidow_mini_resolve_geom(struct vidow_view *view) {
+	if (view == NULL || view->mini == VIDOW_MINI_NONE || view->popup) {
+		return;
+	}
+	struct vidow_server *server = view->server;
+	struct wlr_box work = vidow_work_area(server, view->output);
+	if (work.width < 1 || work.height < 1) {
+		/* 没有屏（嵌套会话的外层窗口关了 / 最后一块屏拔了）：没得算，留着
+		 * 上一次的盒子。屏回来时 arrange 会再算一遍。 */
+		return;
+	}
+	const struct vidow_config *cfg = &server->config;
+
+	int w = 0, h = 0;
+	switch (view->mini) {
+	case VIDOW_MINI_FREE:
+		if (!view->mini_size_known) {
+			view->mini_wf = mini_frac(server, "mini_free_w", 0.40);
+			view->mini_hf = mini_frac(server, "mini_free_h", 0.45);
+		}
+		w = (int)lround(view->mini_wf * (double)work.width);
+		h = (int)lround(view->mini_hf * (double)work.height);
+		break;
+	case VIDOW_MINI_MINI:
+		w = (int)lround(mini_frac(server, "mini_w", 0.28) *
+			(double)work.width);
+		h = (int)lround(mini_frac(server, "mini_h", 0.28) *
+			(double)work.height);
+		break;
+	case VIDOW_MINI_ICON:
+		w = h = cfg->mini_icon_size;
+		break;
+	case VIDOW_MINI_NONE:
+		return;
+	}
+	if (w < FLOAT_MIN_SIZE) {
+		w = FLOAT_MIN_SIZE;
+	}
+	if (h < FLOAT_MIN_SIZE) {
+		h = FLOAT_MIN_SIZE;
+	}
+	if (w > work.width) {
+		w = work.width;
+	}
+	if (h > work.height) {
+		h = work.height;
+	}
+
+	/* 锚点 -> 绝对位置：0 = 贴工作区左 / 上边，1 = 贴右 / 下边。图标允许
+	 * 超出 0..1（夹在 -0.5..1.5），好让它按 mini_icon_overflow 出屏一点。 */
+	double ax = view->mini_ax, ay = view->mini_ay;
+	if (ax < -0.5) {
+		ax = -0.5;
+	} else if (ax > 1.5) {
+		ax = 1.5;
+	}
+	if (ay < -0.5) {
+		ay = -0.5;
+	} else if (ay > 1.5) {
+		ay = 1.5;
+	}
+	int x = work.x + (int)lround(ax * (double)(work.width - w));
+	int y = work.y + (int)lround(ay * (double)(work.height - h));
+
+	if (view->mini == VIDOW_MINI_ICON) {
+		double ov = cfg->mini_icon_overflow;
+		if (ov < 0.0) {
+			ov = 0.0;
+		} else if (ov > 0.6) {
+			ov = 0.6;
+		}
+		int dx = (int)lround(ov * (double)w);
+		int dy = (int)lround(ov * (double)h);
+		switch (view->mini_edge) {
+		case VIDOW_MINI_EDGE_LEFT:
+			x -= dx;
+			break;
+		case VIDOW_MINI_EDGE_RIGHT:
+			x += dx;
+			break;
+		case VIDOW_MINI_EDGE_TOP:
+			y -= dy;
+			break;
+		case VIDOW_MINI_EDGE_BOTTOM:
+			y += dy;
+			break;
+		case VIDOW_MINI_EDGE_NONE:
+			break;
+		}
+	} else {
+		/* 迷你 / 自由小窗夹在工作区里（留 mini_edge_margin 的边）。 */
+		int margin = cfg->mini_edge_margin;
+		if (margin < 0) {
+			margin = 0;
+		}
+		if (x < work.x + margin) {
+			x = work.x + margin;
+		}
+		if (y < work.y + margin) {
+			y = work.y + margin;
+		}
+		if (x + w > work.x + work.width - margin) {
+			x = work.x + work.width - margin - w;
+		}
+		if (y + h > work.y + work.height - margin) {
+			y = work.y + work.height - margin - h;
+		}
+	}
+
+	view->float_geom.x = x;
+	view->float_geom.y = y;
+	view->float_geom.width = w;
+	view->float_geom.height = h;
+}
+
+void vidow_mini_set_state(struct vidow_view *view, enum vidow_mini_state state) {
+	if (view == NULL || view->popup) {
+		return;
+	}
+	struct vidow_server *server = view->server;
+	enum vidow_mini_state old = view->mini;
+	if (old == state) {
+		return;
+	}
+
+	if (state == VIDOW_MINI_NONE) {
+		view->mini = VIDOW_MINI_NONE;
+		view->mini_edge = VIDOW_MINI_EDGE_NONE;
+		/* 还原成列。小窗本来不属于任何工作区，先认领回自己那块屏显示着的
+		 * 工作区（屏没了就留 NULL，view_ensure_column 会安置到一块无屏的
+		 * 工作区上，屏回来时跟着认领回来）。浮窗记账不减 —— 窗口这就回列了，
+		 * 列里的窗口本来就不算 ws->floats（见 vidow_workspace_track）。 */
+		if (view->output != NULL) {
+			view->ws = vidow_workspace_shown_for(server, view->output);
+		}
+		vidow_float_set_mode(view, VIDOW_FLOAT_NONE);
+		wlr_log(WLR_INFO, "mini: %s 还原成列（从 %s）",
+			vidow_view_title(view) != NULL ? vidow_view_title(view) : "?",
+			vidow_mini_state_name(old));
+		vidow_ipc_emit_window(server, "window-mini-changed", view);
+		return;
+	}
+
+	/* 进小窗态 / 三态互切。小窗是浮动窗口上的一个形态：先把浮动这件事办齐
+	 * （float_mode = FIXED，从条带摘走、种子 float_geom），再谈形态。 */
+	bool was_float = view->float_mode != VIDOW_FLOAT_NONE;
+	if (view->float_mode != VIDOW_FLOAT_FIXED) {
+		vidow_view_unfullscreen(view, "进小窗");
+		vidow_float_set_mode(view, VIDOW_FLOAT_FIXED);
+	}
+	if (old == VIDOW_MINI_NONE) {
+		mini_default_anchor(view, state);
+		/* 小窗是**屏级对象**：从工作区摘出来。这一步的账必须减 ——
+		 * ws_keeps() = named || !ws_empty(ws)，而 ws_empty() 看 ws->floats，
+		 * 不减的话一块只剩小窗的工作区永远收不掉（vidow_workspace_cleanup
+		 * 一直跳过它），在 vidowmsg workspaces 和 overview 里永远多一行。
+		 *
+		 * **但只有本来就占着这笔账的那个才减**：ws->floats 的 +1 只在
+		 * view_map()（src/view.c，`float_mode != NONE` 那条）与 ws_adopt_view()
+		 * 里记（vidow_view_leave_column() 自己不动 floats —— 平铺窗口的账在
+		 * columns 上）。平铺窗口进小窗时摘掉那条列已经够了，这里再减一下就是
+		 * 减**别人**的账：同一块工作区里那个真浮窗的计数会被吃掉（实测：
+		 * 浮窗 miniwin + 平铺 tilewin 进小窗，floats 1 → 0，miniwin 的账没了）。 */
+		view->mini_home = NULL;
+		if (view->output != NULL) {
+			struct vidow_output *out =
+				vidow_output_lookup(server, view->output);
+			view->mini_home = out != NULL ? out->memory : NULL;
+		}
+		struct vidow_workspace *ws = view->ws;
+		view->ws = NULL;
+		if (ws != NULL && was_float) {
+			vidow_workspace_track(ws, view, false);
+		}
+	}
+	if (state == VIDOW_MINI_FREE) {
+		/* FREE 的尺寸：记过就接着用（mini_remember_size 关掉 = 每次都用
+		 * 配置的初始比例）。MINI / ICON 不记 —— 尺寸永远跟配置。 */
+		if (!view->mini_size_known || !server->config.mini_remember_size) {
+			view->mini_wf = mini_frac(server, "mini_free_w", 0.40);
+			view->mini_hf = mini_frac(server, "mini_free_h", 0.45);
+			view->mini_size_known = true;
+		}
+	}
+	view->mini = state;
+
+	vidow_mini_resolve_geom(view);
+	if (view->float_geom.width > 0 && view->float_geom.height > 0) {
+		/* 尺寸是客户端的事：configure 一次，并把 float_want_w/h 钉住
+		 * （见 vidow_float_set_size 的说明）。 */
+		vidow_float_set_size(view, view->float_geom.width,
+			view->float_geom.height);
+	}
+	vidow_arrange(server);
+	wlr_log(WLR_INFO, "mini: %s %s -> %s，%dx%d @ %d,%d（锚点 %.3f,%.3f，屏 %s）",
+		vidow_view_title(view) != NULL ? vidow_view_title(view) : "?",
+		vidow_mini_state_name(old), vidow_mini_state_name(state),
+		view->float_geom.width, view->float_geom.height,
+		view->float_geom.x, view->float_geom.y,
+		view->mini_ax, view->mini_ay,
+		view->output != NULL ? view->output->name : "-");
+	vidow_ipc_emit_window(server, "window-mini-changed", view);
 }

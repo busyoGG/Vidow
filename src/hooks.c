@@ -45,6 +45,9 @@ static const char *event_names[] = {
 	"window-unminimized",
 	"window-workspace-changed",
 	"window-focus-changed",
+	/* 小窗（mini window，S1）：形态变了（none / free / mini / icon）。载荷同
+	 * window-floating-changed，多带 mini / mini_output / mini_anchor。 */
+	"window-mini-changed",
 	"column-maximize-changed",
 	"workspace-created",
 	"workspace-removed",

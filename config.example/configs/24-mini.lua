@@ -1,0 +1,55 @@
+-- 小窗（mini window） —— vidow 配置的一类，由入口 config.lua 读进来：
+--     vidow.include("configs/24-mini.lua")
+--
+-- 下面每行都是内置默认值：改哪行哪行才生效，删掉那行就回到默认值。
+-- 迷你 / 图标 / 自由小窗这一族：收成小窗的尺寸与落点区、图标贴边与悬停预览、形态转换时长、宽高比策略
+
+-- ================== 小窗（mini window）
+-- 小窗模式总开关。false = 拖到落点区什么都不发生（零行为变化）
+mini_enabled = true
+-- 拖窗口时亮出落点区（拖到那儿松手 = 收成迷你小窗）
+mini_drop_zone = true
+-- 落点区宽（相对工作区的百分比，如 "15%"）
+mini_drop_zone_w = "15%"
+-- 落点区高（相对工作区的百分比，如 "20%"）
+mini_drop_zone_h = "20%"
+-- 迷你态尺寸宽（相对工作区的百分比，如 "28%"）。迷你态的尺寸**钉死**跟配置，客户端改不动；改配置当场生效
+mini_w = "28%"
+-- 迷你态尺寸高（相对工作区的百分比，如 "28%"）
+mini_h = "28%"
+-- 自由小窗的初始宽（相对工作区的百分比，如 "40%"）；之后尺寸记在窗口自己身上（mini_remember_size = false 就每次都用这个初始值）
+mini_free_w = "40%"
+-- 自由小窗的初始高（相对工作区的百分比，如 "45%"）
+mini_free_h = "45%"
+-- 图标态边长（逻辑像素，正方形）
+mini_icon_size = 64
+-- 图标沿贴的那条边出屏多少（占自己的比例，0..0.6；0 = 完全在屏内）
+mini_icon_overflow = 0.35
+-- 图标悬停多久出预览（毫秒）
+mini_icon_hover_ms = 250
+-- 指针离开图标 / 预览后多久收起来（毫秒）
+mini_icon_hover_leave_ms = 300
+-- 「从图标移向预览」的宽限期（毫秒），这段时间里不出预览也不收
+mini_icon_hover_grace_ms = 200
+-- 图标悬停预览开关
+mini_icon_preview = true
+-- 悬停工具条开关（放大 / 收成迷你 / 收成图标那几个按钮）
+mini_toolbar = true
+-- 拖到屏边多少像素内算「贴边」（松手 = 收成图标）
+mini_edge_snap_px = 24
+-- 形态转换时长（毫秒，0 = 不做动画）
+mini_transition_ms = 260
+-- 悬停预览淡入时长（毫秒）
+mini_hover_fade_in_ms = 120
+-- 悬停预览淡出时长（毫秒）
+mini_hover_fade_out_ms = 150
+-- 记住自由小窗的尺寸（false = 每次进自由小窗都用 mini_free_w/h 那对初始比例）。迷你 / 图标态的尺寸永远跟配置，不受它影响
+mini_remember_size = true
+-- 迷你 / 自由小窗离工作区边缘的最小留白（逻辑像素）
+mini_edge_margin = 8
+-- 小窗化**不改客户端分辨率**：保留客户端原生 buffer，由合成器缩放显示（默认 true）。false = 小窗态按小窗尺寸重配客户端（省显存，但有的游戏一 resize 就重置成窗口模式）
+mini_preserve_buffer = true
+-- 自由小窗的宽高比策略："auto" / "lock" / "free"（默认 "auto"）。三个取值都是强制语义，优先级：键位 > 窗口规则 > 这个全局键。auto = 让自动信号决定（X11 有 PAspect / min==max 提示就锁，否则 free）；lock / free 显式压过自动信号。只对自由小窗有效 —— 迷你 / 图标态永远按内容比例
+mini_aspect = "auto"
+-- 迷你态「单击 = 放大」vs「拖拽 = 移动」的位移阈值（逻辑像素）：指针按下后走了这么多像素才算拖拽，没走到就松手当单击
+mini_drag_threshold_px = 4

@@ -228,6 +228,27 @@ void vidow_ipc_json_window(struct jbuf *b, struct vidow_server *server,
 	jb_kv_bool(b, "workspace_special", view->ws != NULL && view->ws->special);
 	jb_kv_str(b, "float_mode", float_mode_name(view->float_mode));
 	jb_kv_bool(b, "floating", view->float_mode != VIDOW_FLOAT_NONE);
+	/* 小窗（mini window，S1）：形态 + 它跟的那块屏。小窗是**屏级对象**，不属于
+	 * 任何工作区（上面的 workspace 是 null），位置记的是相对那块屏工作区的比例
+	 * 锚点（mini_anchor）。形态：none / free / mini / icon。 */
+	jb_kv_str(b, "mini", vidow_mini_state_name(view->mini));
+	jb_kv_str(b, "mini_output",
+		view->output != NULL ? view->output->name : NULL);
+	jb_kv_str(b, "mini_home",
+		view->mini_home != NULL ? view->mini_home->key : NULL);
+	jb_kv_str(b, "mini_aspect_rule",
+		view->mini_aspect_rule != VIDOW_MINI_ASPECT_UNSET ?
+			vidow_mini_aspect_name(view->mini_aspect_rule) : NULL);
+	if (view->mini != VIDOW_MINI_NONE) {
+		jb_key(b, "mini_anchor");
+		jb_obj(b);
+		jb_kv_double(b, "x", view->mini_ax);
+		jb_kv_double(b, "y", view->mini_ay);
+		jb_kv_double(b, "wf", view->mini_wf);
+		jb_kv_double(b, "hf", view->mini_hf);
+		jb_kv_bool(b, "size_known", view->mini_size_known);
+		jb_obj_end(b);
+	}
 
 	jb_key(b, "geometry");
 	json_box(b, view->geom.x, view->geom.y, view->geom.width, view->geom.height);

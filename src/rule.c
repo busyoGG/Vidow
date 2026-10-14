@@ -124,6 +124,20 @@ const struct vidow_rule_field vidow_rule_fields[] = {
 		"开出来就收起来（留在列里，但不显示、不抢焦点）" },
 	{ "column_width", RK_ACT_DOUBLE, VRA_COLUMN_WIDTH, VIDOW_RULE_WINDOW,
 		"这个窗口新开的列有多宽（占可用宽度的比例，0.1 ~ 1.0；默认 0.5）" },
+	/* 小窗（mini window，S1）。优先级：键位（运行时）> 窗口规则 > 全局键
+	 * （config.c 的 mini_* 那一族）。 */
+	{ "mini_window", RK_ACT_BOOL, VRA_MINI_WINDOW, VIDOW_RULE_WINDOW,
+		"true = 这个窗口一开出来就是迷你小窗（false = 显式不是小窗）" },
+	{ "mini_state", RK_ACT_STR, VRA_MINI_STATE, VIDOW_RULE_WINDOW,
+		"开出来的初始形态：\"free\" / \"mini\" / \"icon\"（比 mini_window 更细）" },
+	{ "mini_aspect", RK_ACT_STR, VRA_MINI_ASPECT, VIDOW_RULE_WINDOW,
+		"这个窗口自由小窗态的宽高比策略：\"auto\" / \"lock\" / \"free\"。"
+		"三个取值都是强制语义，压过全局键 mini_aspect；auto = 让自动信号决定"
+		"（X11 有 PAspect / min==max 提示就锁，否则 free）" },
+	{ "mini_preserve_buffer", RK_ACT_BOOL, VRA_MINI_PRESERVE_BUFFER,
+		VIDOW_RULE_WINDOW,
+		"这个窗口小窗化时保不保留客户端原生分辨率（默认跟全局 "
+		"mini_preserve_buffer；有的全屏游戏必须重配才能正常渲染，单独关掉它）" },
 	{ "anim", RK_ACT_BOOL, VRA_ANIM,
 		VIDOW_RULE_WINDOW | VIDOW_RULE_LAYER,
 		"false = 不做开合动画（窗口 / 图层都是：开、关都瞬间到位）" },
@@ -338,6 +352,24 @@ bool vidow_rule_set_act_str(struct vidow_rule *rule, int slot, const char *value
 		snprintf(err, errlen, "名字太长（最多 %d 个字符）：%s",
 			VIDOW_RULE_VAL - 1, value);
 		return false;
+	}
+	/* 小窗那两个字符串字段的取值是有限的：写错一位（"mini" 敲成 "miny"）
+	 * 当场报错，别等到窗口开出来才发现形态没生效。 */
+	if (slot == VRA_MINI_STATE) {
+		enum vidow_mini_state state;
+		if (!vidow_mini_parse_state(value, &state) ||
+				state == VIDOW_MINI_NONE) {
+			snprintf(err, errlen, "mini_state 只能是 \"free\" / \"mini\" / "
+				"\"icon\"，给的是 \"%s\"", value);
+			return false;
+		}
+	} else if (slot == VRA_MINI_ASPECT) {
+		enum vidow_mini_aspect aspect;
+		if (!vidow_mini_parse_aspect(value, &aspect)) {
+			snprintf(err, errlen, "mini_aspect 只能是 \"auto\" / \"lock\" / "
+				"\"free\"，给的是 \"%s\"", value);
+			return false;
+		}
 	}
 	rule->aset[slot] = true;
 	snprintf(rule->aval[slot].s, sizeof(rule->aval[slot].s), "%s", value);
@@ -1318,6 +1350,47 @@ void vidow_rule_placement(struct vidow_server *server, struct vidow_view *view) 
 			view->column != NULL && !view->column->maximized) {
 		vidow_column_set_maximized(view->column, true);
 		wlr_log(WLR_INFO, "rule: %s 开出来就整列最大化", title);
+	}
+	/* 小窗（mini window，S1）：先定形态（进小窗 = 先变成浮动窗口，位置尺寸由
+	 * 比例锚点算），**再**看要不要最小化 —— 顺序反过来会「先收起来再进小窗」，
+	 * 形态就成了收起来那个窗口的形态。规则是形态的唯一权威（键位在 S4 再加一层
+	 * 运行时覆盖）。 */
+	if (eff->set[VRA_MINI_ASPECT]) {
+		enum vidow_mini_aspect aspect = VIDOW_MINI_ASPECT_UNSET;
+		if (vidow_mini_parse_aspect(eff->val[VRA_MINI_ASPECT].s, &aspect)) {
+			view->mini_aspect_rule = aspect;
+		} else {
+			/* 取值不认识：这条规则不生效，但配置加载那一刻已经报过错
+			 * （vidow.rule 那边按字段类型校验），这里只兜一层。 */
+			wlr_log(WLR_ERROR, "rule: mini_aspect 只能是 auto / lock / free"
+				"（给的是 '%s'），这条规则不生效",
+				eff->val[VRA_MINI_ASPECT].s);
+		}
+	}
+	if (eff->set[VRA_MINI_PRESERVE_BUFFER]) {
+		view->mini_preserve_buffer_set = true;
+		view->mini_preserve_buffer = eff->val[VRA_MINI_PRESERVE_BUFFER].b;
+	}
+	enum vidow_mini_state mini_want = VIDOW_MINI_NONE;
+	bool mini_set = false;
+	if (eff->set[VRA_MINI_STATE]) {
+		if (vidow_mini_parse_state(eff->val[VRA_MINI_STATE].s, &mini_want) &&
+				mini_want != VIDOW_MINI_NONE) {
+			mini_set = true;
+		} else {
+			wlr_log(WLR_ERROR, "rule: mini_state 只能是 free / mini / icon"
+				"（给的是 '%s'），这条规则不生效",
+				eff->val[VRA_MINI_STATE].s);
+		}
+	} else if (eff->set[VRA_MINI_WINDOW] && eff->val[VRA_MINI_WINDOW].b) {
+		mini_want = VIDOW_MINI_MINI;
+		mini_set = true;
+	}
+	if (mini_set && view->mini != mini_want) {
+		vidow_mini_set_state(view, mini_want);
+		wlr_log(WLR_INFO, "rule: %s 开出来就是%s小窗", title,
+			mini_want == VIDOW_MINI_FREE ? "自由" :
+			mini_want == VIDOW_MINI_ICON ? "图标" : "迷你");
 	}
 	/* 最小化放最后：收起来的窗口不抢焦点（下面 view_map 的焦点那一步会跳过它）。 */
 	if (eff->set[VRA_MINIMIZE] && eff->val[VRA_MINIMIZE].b &&

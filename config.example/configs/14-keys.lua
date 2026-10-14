@@ -198,6 +198,12 @@ end
 --     maximize = true            开出来就整列最大化
 --     minimize = true            开出来就收起来（不显示、不抢焦点）
 --     column_width = 0.3         这个窗口新开的列有多宽（占可用宽度的比例，默认 0.5）
+--     mini_window = true         开出来就是迷你小窗（false = 显式不是小窗）
+--     mini_state = "mini"        开出来的初始形态："free" / "mini" / "icon"（比
+--                                mini_window 更细）
+--     mini_aspect = "lock"       这个窗口自由小窗态的宽高比策略："auto" / "lock" /
+--                                "free"（默认跟全局 mini_aspect；三个取值都是强制语义）
+--     mini_preserve_buffer = false  这个小窗化时不保留客户端原生分辨率（默认跟全局）
 --
 --   vidow.rule{ app_id = "^mpv$", force_render = true }
 --   vidow.rule{ title = "^预览", force_render = true, hz = 15 }
