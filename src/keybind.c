@@ -950,6 +950,26 @@ bool vidow_vt_switch(struct vidow_server *server, unsigned vt) {
 	return true;
 }
 
+/* 小窗（S4）键位动作动哪个窗口：优先聚焦窗口（NONE 态 = 入口），其次「最近一个
+ * 小窗」（server->mini_last_id）。迷你 / 图标态不拿键盘焦点，所以后者是唯一
+ * 指认办法 —— 存 id 不存指针（窗口随时可能被关掉，指针会悬空）。 */
+static struct vidow_view *mini_action_view(struct vidow_server *server) {
+	struct vidow_view *focused = server->focused;
+	if (focused != NULL && focused->mini != VIDOW_MINI_NONE) {
+		return focused;
+	}
+	if (server->mini_last_id != 0) {
+		struct vidow_view *view;
+		wl_list_for_each(view, &server->views, link) {
+			if (view->id == server->mini_last_id &&
+					view->mini != VIDOW_MINI_NONE) {
+				return view;
+			}
+		}
+	}
+	return focused;
+}
+
 bool vidow_action_run(struct vidow_server *server, const char *action) {
 	if (server == NULL || action == NULL || action[0] == '\0') {
 		return false;
@@ -1311,6 +1331,105 @@ bool vidow_action_run(struct vidow_server *server, const char *action) {
 			vidow_view_title(view) != NULL ? vidow_view_title(view) : "?",
 			vidow_mini_aspect_name(view->mini_aspect_runtime));
 		vidow_ipc_emit_window(server, "window-mini-changed", view);
+		return true;
+	}
+
+	/* 小窗（S4）键位动作：形态的键盘通路（headless 测试也靠它 —— 不需要真指针）。
+	 *   vidow.bind("Mod+Shift+W", "cycle-mini-state")   三态循环
+	 *   vidow.bind("Mod+Shift+Up", "mini-expand")       单步放大（图标 → 迷你 → 自由）
+	 *   vidow.bind("Mod+Shift+Down", "mini-collapse")   单步收拢（自由 → 迷你 → 图标）
+	 *   vidow.bind("Mod+Shift+Return", "unmini-window") 还原成列（接回条带）
+	 * 循环顺序和 IPC 的 cycle-mini-state 是同一份：不在小窗态 / 自由 → 迷你 → 图标
+	 * → 自由 → 迷你 …（NONE 只在入口出现一次，否则按三次回不到起点）。
+	 *
+	 * 动哪个窗口：迷你 / 图标态**不拿键盘焦点**（S2 的死规矩），所以
+	 * server->focused 指不到它们 —— 聚焦窗口不是小窗时，退到「最近一个小窗」
+	 * （server->mini_last_id，存 id 不存指针：窗口随时可能被关掉）。 */
+	if (strcmp(name, "cycle-mini-state") == 0 ||
+			strcmp(name, "mini-cycle") == 0) {
+		struct vidow_view *view = mini_action_view(server);
+		if (view == NULL || view->popup) {
+			wlr_log(WLR_ERROR, "cycle-mini-state: 现在没有聚焦的窗口");
+			return false;
+		}
+		enum vidow_mini_state next;
+		switch (view->mini) {
+		case VIDOW_MINI_NONE:
+		case VIDOW_MINI_FREE:
+			next = VIDOW_MINI_MINI;
+			break;
+		case VIDOW_MINI_MINI:
+			next = VIDOW_MINI_ICON;
+			break;
+		case VIDOW_MINI_ICON:
+		default:
+			next = VIDOW_MINI_FREE;
+			break;
+		}
+		vidow_mini_set_state(view, next);
+		if (view->mini == VIDOW_MINI_FREE) {
+			vidow_focus_view(view);
+		}
+		log_action(action, "小窗三态循环");
+		return true;
+	}
+	if (strcmp(name, "mini-expand") == 0 ||
+			strcmp(name, "mini-window") == 0) {
+		/* 单步放大：图标 → 迷你 → 自由（自由是最上面那一档，再按不动）。
+		 * 不在小窗态时 = 进迷你（和 IPC 的 mini-window 一个语义）。 */
+		struct vidow_view *view = mini_action_view(server);
+		if (view == NULL || view->popup) {
+			wlr_log(WLR_ERROR, "mini-expand: 现在没有聚焦的窗口");
+			return false;
+		}
+		switch (view->mini) {
+		case VIDOW_MINI_NONE:
+		case VIDOW_MINI_ICON:
+			/* 不在小窗态 = 进迷你；图标 → 迷你（放大一档）。 */
+			vidow_mini_set_state(view, VIDOW_MINI_MINI);
+			break;
+		case VIDOW_MINI_MINI:
+			vidow_mini_set_state(view, VIDOW_MINI_FREE);
+			vidow_focus_view(view);
+			break;
+		case VIDOW_MINI_FREE:
+			break;
+		}
+		log_action(action, "小窗放大一档");
+		return true;
+	}
+	if (strcmp(name, "mini-collapse") == 0 ||
+			strcmp(name, "mini-icon") == 0) {
+		/* 单步收拢：自由 → 迷你 → 图标（图标是最下面那一档，再按不动）。 */
+		struct vidow_view *view = mini_action_view(server);
+		if (view == NULL || view->popup) {
+			wlr_log(WLR_ERROR, "mini-collapse: 现在没有聚焦的窗口");
+			return false;
+		}
+		switch (view->mini) {
+		case VIDOW_MINI_NONE:
+		case VIDOW_MINI_FREE:
+			vidow_mini_set_state(view, VIDOW_MINI_MINI);
+			break;
+		case VIDOW_MINI_MINI:
+			vidow_mini_set_state(view, VIDOW_MINI_ICON);
+			break;
+		case VIDOW_MINI_ICON:
+			break;
+		}
+		log_action(action, "小窗收拢一档");
+		return true;
+	}
+	if (strcmp(name, "unmini-window") == 0) {
+		/* 还原成列（接回条带）：小窗唯一的出口，循环键位里不出现。 */
+		struct vidow_view *view = mini_action_view(server);
+		if (view == NULL || view->popup ||
+				view->mini == VIDOW_MINI_NONE) {
+			wlr_log(WLR_ERROR, "unmini-window: 当前没有小窗");
+			return false;
+		}
+		vidow_mini_set_state(view, VIDOW_MINI_NONE);
+		log_action(action, "小窗还原成列");
 		return true;
 	}
 	if (strcmp(name, "mousemove") == 0) {

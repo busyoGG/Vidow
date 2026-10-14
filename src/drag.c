@@ -28,6 +28,7 @@
 #include "workspace.h"
 
 #include <limits.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -381,6 +382,12 @@ void vidow_insert_hint_update(struct vidow_server *server) {
 	if (server == NULL || server->insert_hint == NULL) {
 		return;
 	}
+	/* 小窗（S4）落点区亮着的时候**不画**插入提示块：两个预览同时画，用户不知道
+	 * 松手会得到哪个（得到的是落点区那个 = 迷你小窗）。 */
+	if (server->mini_drop_active) {
+		vidow_insert_hint_hide(server);
+		return;
+	}
 	struct vidow_view *view = server->grab_mode == VIDOW_GRAB_TILE ?
 		server->grab_view : NULL;
 	struct wlr_output *output = output_under_cursor(server);
@@ -435,6 +442,341 @@ bool vidow_drag_init(struct vidow_server *server) {
 		return false;
 	}
 	wlr_scene_node_set_enabled(&server->insert_hint->node, false);
+	/* 小窗（S4）的落点区 + 悬停工具条也建在这儿（同一个层、同一种「平时关着、
+	 * 用的时候摆出来」的做法）。 */
+	if (!vidow_mini_ui_init(server)) {
+		return false;
+	}
+	return true;
+}
+
+/* ============================================ 小窗（mini window，S4）：落点区
+ *
+ * 用户要的那条主入口：**拖窗口的时候**在每块屏右上角亮出落点区（约 15%×20%，
+ * 带目标预览），松手 → 迷你小窗。
+ *
+ * 三条写死的规矩：
+ *   1. **只在拖拽中出现** —— 光标不在落点区里，两块矩形就是关着的。常亮的话
+ *      「盲拖到角落」会跟现有的平铺落点撞车（用户点名的那条）。
+ *   2. 落点区亮着的时候**不画**平铺的插入提示块（见 vidow_insert_hint_update
+ *      第一句）—— 两个预览同时画，用户不知道松手会得到哪个。
+ *   3. 预览块 = 松手会得到的那个迷你小窗（`mini_w × mini_h`，贴右上角）。不是
+ *      落点区本身的形状 —— 用户看的是「会变成多大」。
+ *
+ * 颜色是**预乘**的（wlr_scene_rect 直接交给预乘混合，见上面 INSERT_HINT_COLOR
+ * 那段说明）：rgb 已经乘过 alpha。 */
+
+/* 落点区底板：偏青的半透明块。预览块亮一点，好在底板里认出来。 */
+static const float MINI_DROP_ZONE_COLOR[4] = { 0.06f, 0.22f, 0.18f, 0.35f };
+static const float MINI_DROP_PREVIEW_COLOR[4] = { 0.09f, 0.42f, 0.32f, 0.45f };
+/* 工具条：深底 + 四个按钮（按钮稍微亮一点，点得中看得见）。 */
+static const float MINI_TOOLBAR_BG_COLOR[4] = { 0.04f, 0.04f, 0.05f, 0.55f };
+static const float MINI_TOOLBAR_BTN_COLOR[4] = { 0.16f, 0.16f, 0.20f, 0.75f };
+
+#define MINI_TOOLBAR_BTN_W 34
+#define MINI_TOOLBAR_BTN_H 26
+#define MINI_TOOLBAR_PAD 3
+
+/* 配置里的百分比键（"15%"）-> 比例。读不出来就用兜底值（写配置那一刻已经校验
+ * 过，见 config.c 的 K_STRING 分支）。float.c 里有一份同样用途的 mini_frac()，
+ * 那份是 static 的 —— 这里不为了共用一行去改它的可见性。 */
+static double mini_drop_pct(const char *text, double fallback) {
+	double pct = 0.0;
+	if (text != NULL && text[0] != '\0' &&
+			vidow_config_parse_percent(text, &pct)) {
+		return pct / 100.0;
+	}
+	return fallback;
+}
+
+bool vidow_mini_drop_zone_box(struct vidow_server *server,
+		struct wlr_output *output, struct wlr_box *zone,
+		struct wlr_box *preview) {
+	if (server == NULL || output == NULL) {
+		return false;
+	}
+	const struct vidow_config *cfg = &server->config;
+	if (!cfg->mini_enabled || !cfg->mini_drop_zone) {
+		return false;
+	}
+	struct wlr_box work = vidow_work_area(server, output);
+	if (work.width < 1 || work.height < 1) {
+		return false;
+	}
+	double wf = mini_drop_pct(cfg->mini_drop_zone_w, 0.15);
+	double hf = mini_drop_pct(cfg->mini_drop_zone_h, 0.20);
+	if (wf <= 0.0 || hf <= 0.0) {
+		return false;
+	}
+	int zw = (int)lround(wf * (double)work.width);
+	int zh = (int)lround(hf * (double)work.height);
+	if (zw < 1) {
+		zw = 1;
+	}
+	if (zh < 1) {
+		zh = 1;
+	}
+	/* 右上角（迷你态的默认锚点就是那儿，见 float.c 的 mini_default_anchor）。 */
+	if (zone != NULL) {
+		*zone = (struct wlr_box){
+			.x = work.x + work.width - zw,
+			.y = work.y,
+			.width = zw,
+			.height = zh,
+		};
+	}
+	if (preview != NULL) {
+		int mw = (int)lround(mini_drop_pct(cfg->mini_w, 0.28) *
+			(double)work.width);
+		int mh = (int)lround(mini_drop_pct(cfg->mini_h, 0.28) *
+			(double)work.height);
+		if (mw < 1) {
+			mw = 1;
+		}
+		if (mh < 1) {
+			mh = 1;
+		}
+		*preview = (struct wlr_box){
+			.x = work.x + work.width - mw,
+			.y = work.y,
+			.width = mw,
+			.height = mh,
+		};
+	}
+	return true;
+}
+
+void vidow_mini_drop_zone_hide(struct vidow_server *server) {
+	if (server == NULL) {
+		return;
+	}
+	server->mini_drop_active = false;
+	server->mini_drop_output = NULL;
+	if (server->mini_drop_zone != NULL) {
+		wlr_scene_node_set_enabled(&server->mini_drop_zone->node, false);
+	}
+	if (server->mini_drop_preview != NULL) {
+		wlr_scene_node_set_enabled(&server->mini_drop_preview->node, false);
+	}
+}
+
+void vidow_mini_drop_zone_update(struct vidow_server *server) {
+	if (server == NULL || server->mini_drop_zone == NULL) {
+		return;
+	}
+	/* 只在拖拽中亮：平铺拖拽 / 浮窗拖拽 / 自由小窗拖拽（三条都走 grab_mode）。 */
+	if (server->grab_mode == VIDOW_GRAB_NONE || server->grab_view == NULL) {
+		vidow_mini_drop_zone_hide(server);
+		return;
+	}
+	struct wlr_output *output = output_under_cursor(server);
+	struct wlr_box zone = {0}, preview = {0};
+	if (!vidow_mini_drop_zone_box(server, output, &zone, &preview)) {
+		vidow_mini_drop_zone_hide(server);
+		return;
+	}
+	if (!wlr_box_contains_point(&zone, server->cursor->x,
+			server->cursor->y)) {
+		/* 光标不在里面：收起来（「只在拖拽中出现」是死规矩，不是「拖拽时一直
+		 * 亮着」—— 盲拖到角落松手不能命中）。 */
+		vidow_mini_drop_zone_hide(server);
+		return;
+	}
+	/* 预览块可能比落点区大（15%×20% vs 28%×28%）：裁到落点区里，不然它糊到
+	 * 落点区外面，用户会以为整个预览块都是「松手区」。 */
+	struct wlr_box clipped = preview;
+	if (!wlr_box_intersection(&clipped, &preview, &zone) ||
+			clipped.width < 1 || clipped.height < 1) {
+		clipped = zone;
+	}
+	wlr_scene_rect_set_size(server->mini_drop_zone, zone.width, zone.height);
+	wlr_scene_node_set_position(&server->mini_drop_zone->node, zone.x, zone.y);
+	wlr_scene_node_set_enabled(&server->mini_drop_zone->node, true);
+	wlr_scene_rect_set_size(server->mini_drop_preview, clipped.width,
+		clipped.height);
+	wlr_scene_node_set_position(&server->mini_drop_preview->node, clipped.x,
+		clipped.y);
+	wlr_scene_node_set_enabled(&server->mini_drop_preview->node, true);
+	raise_node(&server->mini_drop_zone->node);
+	raise_node(&server->mini_drop_preview->node);
+	if (server->grab_view->scene_tree != NULL) {
+		raise_node(&server->grab_view->scene_tree->node);
+	}
+	if (!server->mini_drop_active || server->mini_drop_output != output) {
+		wlr_log(WLR_INFO, "mini: 落点区亮（%s 上 %d,%d %dx%d，松手得到 %dx%d "
+			"@ %d,%d 的迷你小窗）",
+			output != NULL ? output->name : "-", zone.x, zone.y, zone.width,
+			zone.height, preview.width, preview.height, preview.x,
+			preview.y);
+	}
+	server->mini_drop_active = true;
+	server->mini_drop_output = output;
+	/* 落点区一亮，平铺的插入提示块就得收掉（两个预览不能同时画）。 */
+	vidow_insert_hint_hide(server);
+}
+
+bool vidow_mini_drop_zone_hit(struct vidow_server *server, double lx,
+		double ly) {
+	if (server == NULL) {
+		return false;
+	}
+	struct wlr_output *output = wlr_output_layout_output_at(
+		server->output_layout, lx, ly);
+	struct wlr_box zone = {0};
+	if (!vidow_mini_drop_zone_box(server, output, &zone, NULL)) {
+		return false;
+	}
+	return wlr_box_contains_point(&zone, lx, ly);
+}
+
+/* --------------------------------------------- 小窗（S4）：悬停工具条
+ *
+ * 迷你 / 图标态悬停时露出的一排按钮：放大 / 收成图标 / 还原成列 / 关闭。
+ * 它**不是表面**（合成器自绘的矩形），所以命中得靠矩形判定 —— 位置记在
+ * server 上（mini_toolbar_btn_box），绘制和命中用的是同一份，不会各算一套。
+ *
+ * 只读原则照 S2：不抢焦点、不进 MRU、不拿键盘 —— 它只是几个矩形。点中按钮是
+ * 合成器自己的动作（vidow_mini_toolbar_press），不往客户端转任何东西。 */
+
+/* 工具条摆在小窗上方（上面放不下就摆到下面），横向跟小窗左对齐，整体夹进工作区。 */
+static struct wlr_box mini_toolbar_layout(struct vidow_server *server,
+		struct vidow_view *view) {
+	struct wlr_box work = vidow_work_area(server, view->output);
+	struct wlr_box g = view->float_geom;
+	int w = MINI_TOOLBAR_BTN_W * (int)VIDOW_MINI_BTN_COUNT +
+		MINI_TOOLBAR_PAD * ((int)VIDOW_MINI_BTN_COUNT + 1);
+	int h = MINI_TOOLBAR_BTN_H + MINI_TOOLBAR_PAD * 2;
+	int x = g.x;
+	int y = g.y - h - 4;
+	if (work.height > 0 && y < work.y) {
+		y = g.y + g.height + 4; /* 上面放不下 → 摆到下面 */
+	}
+	if (work.width > 0) {
+		if (x + w > work.x + work.width) {
+			x = work.x + work.width - w;
+		}
+		if (x < work.x) {
+			x = work.x;
+		}
+		if (y + h > work.y + work.height) {
+			y = work.y + work.height - h;
+		}
+		if (y < work.y) {
+			y = work.y;
+		}
+	}
+	return (struct wlr_box){ .x = x, .y = y, .width = w, .height = h };
+}
+
+void vidow_mini_toolbar_show(struct vidow_server *server,
+		struct vidow_view *view) {
+	if (server == NULL || view == NULL || server->mini_toolbar_bg == NULL) {
+		return;
+	}
+	if (!server->config.mini_enabled || !server->config.mini_toolbar) {
+		return;
+	}
+	struct wlr_box box = mini_toolbar_layout(server, view);
+	server->mini_toolbar_box = box;
+	server->mini_toolbar_view = view;
+	for (int i = 0; i < (int)VIDOW_MINI_BTN_COUNT; i++) {
+		int bx = box.x + MINI_TOOLBAR_PAD +
+			i * (MINI_TOOLBAR_BTN_W + MINI_TOOLBAR_PAD);
+		int by = box.y + MINI_TOOLBAR_PAD;
+		server->mini_toolbar_btn_box[i] = (struct wlr_box){
+			.x = bx, .y = by,
+			.width = MINI_TOOLBAR_BTN_W,
+			.height = MINI_TOOLBAR_BTN_H,
+		};
+	}
+	wlr_scene_rect_set_size(server->mini_toolbar_bg, box.width, box.height);
+	wlr_scene_node_set_position(&server->mini_toolbar_bg->node, box.x, box.y);
+	wlr_scene_node_set_enabled(&server->mini_toolbar_bg->node, true);
+	for (int i = 0; i < (int)VIDOW_MINI_BTN_COUNT; i++) {
+		struct wlr_scene_rect *btn = server->mini_toolbar_btn[i];
+		if (btn == NULL) {
+			continue;
+		}
+		const struct wlr_box *b = &server->mini_toolbar_btn_box[i];
+		wlr_scene_rect_set_size(btn, b->width, b->height);
+		wlr_scene_node_set_position(&btn->node, b->x, b->y);
+		wlr_scene_node_set_enabled(&btn->node, true);
+		raise_node(&btn->node);
+	}
+	raise_node(&server->mini_toolbar_bg->node);
+	/* 日志里把四个按钮的矩形说清楚（测试靠它注入点击；用户报「点不中」时也能
+	 * 一眼看出工具条摆在哪儿）。 */
+	wlr_log(WLR_INFO, "mini toolbar: %s 露出（整块 %d,%d %dx%d；放大 %d,%d "
+		"收图标 %d,%d 还原成列 %d,%d 关闭 %d,%d）",
+		vidow_view_title(view) != NULL ? vidow_view_title(view) : "?",
+		box.x, box.y, box.width, box.height,
+		server->mini_toolbar_btn_box[0].x, server->mini_toolbar_btn_box[0].y,
+		server->mini_toolbar_btn_box[1].x, server->mini_toolbar_btn_box[1].y,
+		server->mini_toolbar_btn_box[2].x, server->mini_toolbar_btn_box[2].y,
+		server->mini_toolbar_btn_box[3].x, server->mini_toolbar_btn_box[3].y);
+}
+
+void vidow_mini_toolbar_hide(struct vidow_server *server) {
+	if (server == NULL) {
+		return;
+	}
+	server->mini_toolbar_view = NULL;
+	if (server->mini_toolbar_bg != NULL) {
+		wlr_scene_node_set_enabled(&server->mini_toolbar_bg->node, false);
+	}
+	for (int i = 0; i < (int)VIDOW_MINI_BTN_COUNT; i++) {
+		if (server->mini_toolbar_btn[i] != NULL) {
+			wlr_scene_node_set_enabled(
+				&server->mini_toolbar_btn[i]->node, false);
+		}
+	}
+}
+
+int vidow_mini_toolbar_hit(struct vidow_server *server,
+		struct vidow_view *view, double lx, double ly) {
+	if (server == NULL || view == NULL ||
+			server->mini_toolbar_view != view) {
+		return -1;
+	}
+	for (int i = 0; i < (int)VIDOW_MINI_BTN_COUNT; i++) {
+		if (wlr_box_contains_point(&server->mini_toolbar_btn_box[i], lx, ly)) {
+			return i;
+		}
+	}
+	return -1;
+}
+
+bool vidow_mini_ui_init(struct vidow_server *server) {
+	if (server == NULL || server->layer_toplevels == NULL) {
+		return false;
+	}
+	server->mini_drop_zone = wlr_scene_rect_create(server->layer_toplevels,
+		1, 1, (float[4]){ MINI_DROP_ZONE_COLOR[0], MINI_DROP_ZONE_COLOR[1],
+			MINI_DROP_ZONE_COLOR[2], MINI_DROP_ZONE_COLOR[3] });
+	server->mini_drop_preview = wlr_scene_rect_create(server->layer_toplevels,
+		1, 1, (float[4]){ MINI_DROP_PREVIEW_COLOR[0],
+			MINI_DROP_PREVIEW_COLOR[1], MINI_DROP_PREVIEW_COLOR[2],
+			MINI_DROP_PREVIEW_COLOR[3] });
+	server->mini_toolbar_bg = wlr_scene_rect_create(server->layer_toplevels,
+		1, 1, (float[4]){ MINI_TOOLBAR_BG_COLOR[0], MINI_TOOLBAR_BG_COLOR[1],
+			MINI_TOOLBAR_BG_COLOR[2], MINI_TOOLBAR_BG_COLOR[3] });
+	if (server->mini_drop_zone == NULL || server->mini_drop_preview == NULL ||
+			server->mini_toolbar_bg == NULL) {
+		wlr_log(WLR_ERROR, "mini: 落点区 / 工具条的场景节点建不出来");
+		return false;
+	}
+	for (int i = 0; i < (int)VIDOW_MINI_BTN_COUNT; i++) {
+		server->mini_toolbar_btn[i] = wlr_scene_rect_create(
+			server->layer_toplevels, 1, 1, (float[4]){
+				MINI_TOOLBAR_BTN_COLOR[0], MINI_TOOLBAR_BTN_COLOR[1],
+				MINI_TOOLBAR_BTN_COLOR[2], MINI_TOOLBAR_BTN_COLOR[3] });
+		if (server->mini_toolbar_btn[i] == NULL) {
+			wlr_log(WLR_ERROR, "mini: 工具条按钮建不出来");
+			return false;
+		}
+	}
+	vidow_mini_drop_zone_hide(server);
+	vidow_mini_toolbar_hide(server);
 	return true;
 }
 
@@ -476,7 +818,9 @@ void vidow_tile_grab_begin(struct vidow_server *server,
 		vidow_focus_view(view);
 	}
 	/* 落点预览块：起拖就摆出来（按现在这个抓点算），层级收一次口（块在所有窗口
-	 * 之上、被拖的这个之下，见 vidow_insert_hint_update）。 */
+	 * 之上、被拖的这个之下，见 vidow_insert_hint_update）。小窗（S4）的落点区
+	 * 先算 —— 它亮着的话插入提示块要收掉。 */
+	vidow_mini_drop_zone_update(server);
 	vidow_insert_hint_update(server);
 	wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "grabbing");
 	wlr_log(WLR_INFO, "grab tile: %s（%s 上第 %d 块工作区）",
@@ -511,7 +855,10 @@ void vidow_tile_grab_update(struct vidow_server *server, double lx, double ly) {
 	 * 一次渲染，不会变成「每个事件渲染一遍」。 */
 	vidow_view_apply_anim_place(view);
 	vidow_output_schedule_frame(server, view->output, "拖动跟手");
-	/* 落点预览块跟着一起更新（很便宜：就是几个整形比较 + 摆一次节点）。 */
+	/* 落点预览块跟着一起更新（很便宜：就是几个整形比较 + 摆一次节点）。
+	 * 小窗（S4）的落点区同理 —— 顺序不能反：落点区先算，插入提示块才知道
+	 * 要不要让位。 */
+	vidow_mini_drop_zone_update(server);
 	vidow_insert_hint_update(server);
 	/* 顺手把保帧看门狗武装上：要帧那一下可能被「后端已经欠着一帧」挡掉
 	 * （嵌套在别的合成器里时很常见），没有看门狗就没人再推了 —— 拖动会冻住。 */
@@ -525,8 +872,12 @@ void vidow_tile_grab_end(struct vidow_server *server) {
 	if (view != NULL) {
 		vidow_backdrop_damage_box(server, &server->grab_last_box);
 	}
-	/* 预览块收掉（落点算不算得出来都得收）。 */
+	/* 预览块收掉（落点算不算得出来都得收）。小窗（S4）落点区同理 —— 松手那一刻
+	 * 光标在不在里面，先记下来再收（收掉之后 rect 就关了）。 */
+	bool drop_zone = vidow_mini_drop_zone_hit(server, server->cursor->x,
+		server->cursor->y);
 	vidow_insert_hint_hide(server);
+	vidow_mini_drop_zone_hide(server);
 	if (view != NULL) {
 		vidow_ipc_emit_window(server, "drag-ended", view);
 	}
@@ -543,6 +894,20 @@ void vidow_tile_grab_end(struct vidow_server *server) {
 	view->dragging = false;
 	view->anim_off_x = 0.0;
 	view->anim_off_y = 0.0;
+
+	/* 小窗（S4）主入口：松手时光标落在**落点区**里 → 变成迷你小窗（用户点名的
+	 * 那条「拖到右上角松手 = 迷你小窗」，不是自由小窗）。
+	 *
+	 * 「只在拖拽中出现」这条规矩保证不会误触：光标不在落点区里时它根本没亮
+	 * （见 vidow_mini_drop_zone_update），所以这里判的「在不在里面」和用户看到
+	 * 的是同一件事 —— 盲拖到角落松手走的是下面的正常平铺落点。 */
+	if (drop_zone) {
+		wlr_log(WLR_INFO, "mini: 拖拽落进落点区 → %s 变迷你小窗",
+			vidow_view_title(view) != NULL ?
+				vidow_view_title(view) : "?");
+		vidow_mini_set_state(view, VIDOW_MINI_MINI);
+		return;
+	}
 
 	struct wlr_output *output = output_under_cursor(server);
 	struct vidow_workspace *target = shown_workspace(server, output);

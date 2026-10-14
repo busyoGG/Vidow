@@ -2285,6 +2285,32 @@ struct vidow_server {
 	 * 一条横条。平时 node.enabled = false。建在 layer_toplevels 里、压在别的窗口
 	 * 之上、被拖的那个之下（见 vidow_insert_hint_update）。 */
 	struct wlr_scene_rect *insert_hint;
+	/* ---- 小窗（mini window，S4）：拖拽落点区 + 悬停工具条 ----
+	 *
+	 * 落点区**只在拖拽中出现**（拖平铺 / 浮窗 / 自由小窗的时候，光标落在某块屏
+	 * 右上角那块区域里才亮）—— 常亮的话「盲拖到角落」会跟现有的平铺落点撞车。
+	 * 两块半透明矩形：底板 = 落点区本身，preview = 松手会得到的那个迷你小窗的
+	 * 大小和位置（用户要的「带目标预览」）。
+	 *
+	 * 工具条：迷你 / 图标态悬停时露出的四个按钮（放大 / 收成图标 / 还原成列 /
+	 * 关闭）。不是表面，命中靠矩形判定（见 vidow_mini_toolbar_hit）—— 所以位置
+	 * 得记在 server 上，按钮点击和绘制用的是同一份。 */
+	struct wlr_scene_rect *mini_drop_zone;    /* 落点区底板 */
+	struct wlr_scene_rect *mini_drop_preview; /* 落点区里的目标预览块 */
+	bool mini_drop_active;                    /* 这一刻落点区亮着没有 */
+	struct wlr_output *mini_drop_output;      /* 亮在哪块屏上 */
+	struct wlr_scene_rect *mini_toolbar_bg;   /* 工具条底板 */
+	struct wlr_scene_rect *mini_toolbar_btn[4];
+	struct vidow_view *mini_toolbar_view;     /* 工具条现在属于哪个小窗 */
+	/* 工具条按钮的那一对按下 / 松手要成对吃掉（客户端两边都没见过）——
+	 * 按在按钮上的那次按下记在这儿，松手时靠它判断。 */
+	bool mini_toolbar_pressed;
+	/* 最近一个小窗的 id（键位动作用）：迷你 / 图标态**不拿键盘焦点**，所以
+	 * server->focused 指不到它们 —— cycle-mini-state 这类动作得有别的指认办法。
+	 * 存 id 不存指针：窗口随时可能被关掉，指针会悬空。 */
+	uint64_t mini_last_id;
+	struct wlr_box mini_toolbar_box;          /* 工具条整块（布局坐标） */
+	struct wlr_box mini_toolbar_btn_box[4];   /* 四个按钮（布局坐标） */
 	/* 浮动窗口拖拽同理：每帧最多重排一次（见 vidow_float_grab_update）。 */
 	bool arrange_dirty;
 	/* 正在跑的列宽过渡有几条。过渡期间**位置跟着变的那几列不做位移补间**：
@@ -2829,6 +2855,65 @@ bool vidow_drag_init(struct vidow_server *server);
 void vidow_insert_hint_update(struct vidow_server *server);
 /* 收起来（松手、拖到没屏的地方、暂停拖动）。 */
 void vidow_insert_hint_hide(struct vidow_server *server);
+
+/* --------------------------------- 小窗（mini window，S4）：落点区 / 工具条
+ *
+ * 落点区 = 每块屏右上角那一块（尺寸是 mini_drop_zone_w × mini_drop_zone_h 的
+ * 工作区百分比）。**只在拖拽中出现**：光标不在里面时两块矩形都是关着的，所以
+ * 「盲拖到角落松手」不会命中（那样会跟现有的平铺落点撞车）。
+ * 松手时命中 → 那个窗口变成迷你小窗（vidow_mini_set_state(view, MINI)）。 */
+
+/* 算某块屏的落点区（zone）和松手会得到的迷你小窗预览盒（preview）。
+ * 返回 false = 这套东西关着（mini_enabled / mini_drop_zone）或者屏没尺寸。 */
+bool vidow_mini_drop_zone_box(struct vidow_server *server,
+		struct wlr_output *output, struct wlr_box *zone,
+		struct wlr_box *preview);
+/* 拖动中每个指针事件调一次：光标在落点区里就亮（并收掉平铺落点预览块 ——
+ * 两个预览同时画，用户不知道松手会得到哪个）。 */
+void vidow_mini_drop_zone_update(struct vidow_server *server);
+/* 收起来（松手 / 拖拽结束）。 */
+void vidow_mini_drop_zone_hide(struct vidow_server *server);
+/* 松手那一刻光标是不是落在某块屏的落点区里。 */
+bool vidow_mini_drop_zone_hit(struct vidow_server *server, double lx, double ly);
+
+/* 悬停工具条（mini_toolbar）：迷你 / 图标态悬停时露出，四个按钮。
+ * 按钮 id 见 enum vidow_mini_toolbar_btn。 */
+enum vidow_mini_toolbar_btn {
+	VIDOW_MINI_BTN_EXPAND = 0,  /* 放大：图标 → 迷你 → 自由 */
+	VIDOW_MINI_BTN_ICON,        /* 收成图标 */
+	VIDOW_MINI_BTN_RESTORE,     /* 还原成列 */
+	VIDOW_MINI_BTN_CLOSE,       /* 关掉 */
+	VIDOW_MINI_BTN_COUNT,
+};
+/* 给某个小窗摆出工具条（重复调幂等）。view == NULL = 收起来。 */
+void vidow_mini_toolbar_show(struct vidow_server *server,
+		struct vidow_view *view);
+void vidow_mini_toolbar_hide(struct vidow_server *server);
+/* 命中测试：这个点落在工具条的哪个按钮上（没有 = -1）。工具条不是表面，靠矩形。 */
+int vidow_mini_toolbar_hit(struct vidow_server *server,
+		struct vidow_view *view, double lx, double ly);
+/* 点一下某个按钮（工具条自己的动作，见 float.c）。 */
+void vidow_mini_toolbar_press(struct vidow_server *server,
+		struct vidow_view *view, int button);
+/* 建场景节点（main.c 建完场景层之后调一次，和 vidow_drag_init 一起）。 */
+bool vidow_mini_ui_init(struct vidow_server *server);
+
+/* 小窗（S4）边缘判定：这条边**外侧有没有相邻输出** —— 有（跨屏边）→ 拖到那儿
+ * 松手是「移到那块屏、保持形态」；没有（内边缘）→ 收成图标。
+ * 探针沿边的法线取 1px，并要求与目标屏有**非零区间重叠**（只看「角上相接」
+ * 不算相邻边）。返回 NULL = 这条边外侧没有屏。 */
+struct wlr_output *vidow_mini_output_across(struct vidow_server *server,
+		struct wlr_output *self, enum vidow_mini_edge edge);
+/* 光标贴着自己那块屏的哪条边（mini_edge_snap_px 以内）。NONE = 没贴边。 */
+enum vidow_mini_edge vidow_mini_edge_under_cursor(struct vidow_server *server,
+		struct vidow_view *view);
+/* 跨屏边松手：换屏、保持形态（锚点是相对那块屏的工作区记的，天然对得上）。 */
+void vidow_mini_move_to_output(struct vidow_server *server,
+		struct vidow_view *view, struct wlr_output *to);
+/* 形态拖拽松手的落点判定（内边缘 → 图标；跨屏 → 换屏保持形态）。返回 true =
+ * 形态 / 归属变了。浮窗拖拽（float.c）和形态拖拽（input.c）共用这一份。 */
+bool vidow_mini_drag_finish(struct vidow_server *server,
+		struct vidow_view *view);
 
 /* 平铺窗口的 Mod+右键拖拽：改这一列的宽度（niri 的 interactive resize 那条）。
  * 只有横向 —— 平铺窗口的高度是布局给的（整块可用高），没有「单个窗口的高度」。 */

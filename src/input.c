@@ -964,6 +964,18 @@ static bool mini_pointer_press(struct vidow_server *server,
 	if (button != BTN_LEFT) {
 		return true;
 	}
+	/* 小窗（S4）悬停工具条：按下点落在某个按钮上 → 直接做那个动作，不起拖拽。
+	 * 工具条不是表面，命中靠矩形（vidow_mini_toolbar_hit）—— 这里和绘制用的是
+	 * 同一份矩形（server->mini_toolbar_btn_box）。 */
+	int btn = vidow_mini_toolbar_hit(server, view, server->cursor->x,
+		server->cursor->y);
+	if (btn >= 0) {
+		vidow_mini_toolbar_press(server, view, btn);
+		/* 形态可能变了（还原成列 / 关掉 / 换档）：工具条收掉，免得留在
+		 * 一个已经不在小窗态的窗口上。 */
+		vidow_mini_toolbar_hide(server);
+		return true;
+	}
 	server->mini_grab_view = view;
 	server->mini_grab_button = button;
 	server->mini_grab_press_x = server->cursor->x;
@@ -998,6 +1010,13 @@ static bool mini_pointer_release(struct vidow_server *server, uint32_t button) {
 		if (view->mini == VIDOW_MINI_FREE) {
 			vidow_focus_view(view);
 		}
+	} else {
+		/* 小窗（S4）：拖拽松手 = 落点判定（用户点名的那条）——
+		 *   内边缘（外侧没有相邻输出）→ 收成图标；
+		 *   跨屏边（外侧有相邻输出）→ 移到那块屏、保持形态。
+		 * 和浮窗拖拽共用同一份（vidow_mini_drag_finish）。 */
+		vidow_mini_drop_zone_hide(server);
+		vidow_mini_drag_finish(server, view);
 	}
 	return true;
 }
@@ -1007,9 +1026,28 @@ static bool mini_pointer_release(struct vidow_server *server, uint32_t button) {
 static bool mini_pointer_hover_swallow(struct vidow_server *server,
 		struct vidow_view *hit) {
 	if (!mini_swallows_input(hit)) {
+		/* 小窗（S4）：光标落在**工具条自己**身上时工具条留着（它不在窗口的命中
+		 * 范围里 —— 不是表面，vidow_view_at 命中不到它），而且这一份移动也不
+		 * 转给客户端（工具条是合成器盖在桌面上的东西）。不这么写的话，指针
+		 * 一离开窗口往按钮上走，工具条就没了 —— 永远点不中。 */
+		if (server->mini_toolbar_view != NULL &&
+				vidow_mini_toolbar_hit(server, server->mini_toolbar_view,
+					server->cursor->x, server->cursor->y) >= 0) {
+			return true;
+		}
+		/* 光标离开小窗（或落在别的东西上）→ 工具条收起来。只在小窗态之间
+		 * 切换时重新摆（下面那句 show 会重算位置）。 */
+		if (server->mini_toolbar_view != NULL &&
+				server->mini_toolbar_view != hit) {
+			vidow_mini_toolbar_hide(server);
+		}
 		return false;
 	}
 	mini_pointer_clear_client_focus(server);
+	/* 小窗（S4）悬停工具条：迷你 / 图标态悬停就露出来（放大 / 收成图标 /
+	 * 还原成列 / 关闭）。重复调用是幂等的，位置每次重算 —— 窗口被拖动 /
+	 * 换屏之后工具条跟着走。 */
+	vidow_mini_toolbar_show(server, hit);
 	return true;
 }
 
@@ -1082,7 +1120,12 @@ void vidow_pointer_motion(struct vidow_server *server, uint32_t time_msec) {
 
 	/* 小窗（S2）形态拖拽中：指针全归它（客户端一个事件都不收，也不换焦点）。 */
 	if (server->mini_grab_view != NULL) {
+		/* 小窗（S4）：拖拽中工具条收起来（不然它跟着窗口乱飘、还会挡住
+		 * 落点）；落点区照常随时算（拖到落点区松手 = 迷你小窗，和浮窗
+		 * 那条一致）。 */
+		vidow_mini_toolbar_hide(server);
 		mini_grab_update(server);
+		vidow_mini_drop_zone_update(server);
 		mini_pointer_clear_client_focus(server);
 		return;
 	}
@@ -1221,6 +1264,28 @@ void vidow_pointer_button(struct vidow_server *server, uint32_t button,
 	if (server->locked) {
 		lock_pointer_route(server, time_msec, button, pressed, true);
 		return;
+	}
+	/* 小窗（S4）悬停工具条：它不是表面（合成器自绘的矩形），命中得单独判一次
+	 * —— 按在按钮上就整个吃掉（不转给客户端、也不起拖拽），松手那次也成对吃掉
+	 * （客户端两边都没见过，状态才是对称的）。
+	 * 放在形态拖拽那条之前：按钮可能压在窗口上，压在按钮上时不该起拖拽。 */
+	if (server->mini_toolbar_view != NULL) {
+		if (pressed) {
+			int btn = vidow_mini_toolbar_hit(server,
+				server->mini_toolbar_view, server->cursor->x,
+				server->cursor->y);
+			if (btn >= 0) {
+				struct vidow_view *tv = server->mini_toolbar_view;
+				vidow_mini_toolbar_press(server, tv, btn);
+				/* 形态可能变了（还原成列 / 关掉 / 换档）：工具条收掉。 */
+				vidow_mini_toolbar_hide(server);
+				server->mini_toolbar_pressed = true;
+				return;
+			}
+		} else if (server->mini_toolbar_pressed) {
+			server->mini_toolbar_pressed = false;
+			return;
+		}
 	}
 	/* 小窗（S2）形态拖拽：按下那次已经被吃掉（见下面的 mini_pointer_press），
 	 * 这一对松手也整个吃掉 —— 客户端从头到尾没见过这个按键，状态是对称的。 */
@@ -1503,16 +1568,47 @@ void vidow_pointer_axis(struct vidow_server *server,
 		return;
 	}
 
-	/* 小窗（S2）：迷你 / 图标收不到滚轮（客户端一个事件都不收）。命中测试在这儿
-	 * 现做一次 —— 滚轮这条路上没有别处算过命中。自由小窗照旧转发（用户要滚
-	 * 内容）。
-	 * 「往下滚到底 = 收成图标」那条形态入口属于 S4（和落点区 / 工具条一起做），
-	 * 这里先只吞。 */
+	/* 小窗（S2/S4）：迷你 / 图标收不到滚轮（客户端一个事件都不收）。命中测试
+	 * 在这儿现做一次 —— 滚轮这条路上没有别处算过命中。
+	 * S4 的档位入口：在小窗上滚轮 = 形态档位，一次一格
+	 *   往下滚（amount > 0）= 降一档：FREE → MINI → ICON（到底了就停）；
+	 *   往上滚 = 升一档：ICON → MINI → FREE（已经在最上面那档就停）。
+	 * FREE 的上滚**照旧转发给客户端**（它是最上面那一档，没有「升」的目标，
+	 * 小窗要能滚内容）；其余情形一律吞掉，不转发。 */
 	{
 		double wsx = 0, wsy = 0;
 		struct wlr_surface *wsurface = NULL;
 		struct vidow_view *whit = vidow_view_at(server, server->cursor->x,
 			server->cursor->y, &wsurface, &wsx, &wsy);
+		if (whit != NULL && whit->mini != VIDOW_MINI_NONE &&
+				amount != 0) {
+			if (whit->mini == VIDOW_MINI_FREE) {
+				if (amount > 0) {
+					vidow_mini_set_state(whit, VIDOW_MINI_MINI);
+					return;
+				}
+				/* 上滚：已经在最上面那档，转发给客户端滚内容。 */
+			} else {
+				enum vidow_mini_state next = whit->mini;
+				if (amount > 0) {
+					next = whit->mini == VIDOW_MINI_MINI ?
+						VIDOW_MINI_ICON : VIDOW_MINI_ICON;
+				} else {
+					next = whit->mini == VIDOW_MINI_ICON ?
+						VIDOW_MINI_MINI : VIDOW_MINI_FREE;
+				}
+				if (next != whit->mini) {
+					vidow_mini_set_state(whit, next);
+					if (whit->mini == VIDOW_MINI_FREE) {
+						vidow_focus_view(whit);
+					}
+					wlr_log(WLR_INFO, "mini: 滚轮 %s → %s",
+						amount > 0 ? "降一档" : "升一档",
+						vidow_mini_state_name(whit->mini));
+				}
+				return;
+			}
+		}
 		if (mini_swallows_input(whit)) {
 			return;
 		}

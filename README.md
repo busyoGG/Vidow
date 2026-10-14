@@ -5420,6 +5420,26 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
      - 未做：niri 的 `fixed 1920`（固定像素档）、`preset-window-heights`、`default-column-width {}`（让客户端自己定宽）、
        `always-center-single-column`；窗口规则级的 per-rule 预设覆盖。
 
+275. **小窗模式 S4：拖拽落点区（拖到右上角松手 = 迷你小窗）+ 内边缘收图标 / 跨屏边换屏 + 悬停工具条 + 滚轮档位 + 键位动作 —— 小窗终于有鼠标入口了**（用户：「做方案 §7 的 S4（落点区 + 形态入口 + 工具条 + 滚轮收图标 + 键位动作）」；方案 `/tmp/vidow-miniwin-plan.md` §2 / §7 S4；2026-10-14）
+
+     - **落点区**（`src/drag.c` 的 `vidow_mini_drop_zone_box/update/hide/hit`）：每块屏工作区**右上角** `mini_drop_zone_w × mini_drop_zone_h`（默认 15%×20%），两块半透明矩形 —— 底板 = 落点区本身，preview = **松手会得到的那个迷你小窗**（`mini_w × mini_h` 贴右上角，裁进落点区里，所以它比落点区大时不会糊出去）。**只在拖拽中出现**（用户点名的那条）：光标不在落点区里时两块矩形都是关着的，所以「盲拖到角落松手」走的是现有的平铺落点，不会误触。
+       两个预览块**互斥**：落点区亮着时 `vidow_insert_hint_update()` 第一句就把插入提示块收掉（同时画两个，用户不知道松手会得到哪个）。三条拖拽路（平铺 / 浮窗 / 形态拖拽）都走同一份判据，松手落在里面 = `vidow_mini_set_state(view, VIDOW_MINI_MINI)`。
+     - **内边缘 vs 跨屏边**（`vidow_mini_output_across()` / `vidow_mini_edge_under_cursor()` / `vidow_mini_drag_finish()`，`src/float.c`）：判据写死成**「这条边的外侧有没有相邻输出」**。探针沿边的法线取 1px（`wlr_output_layout_output_at`），并要求与目标屏在**那条边的方向上非零区间重叠** —— 对角相接的两块屏不算相邻边（只有角上那一点探得到）。没有相邻输出（内边缘）→ 收成图标，贴那条边（沿边那一轴按光标位置记锚点，图标就贴在「拖到哪儿」那一段）；有（跨屏边）→ **换屏、保持形态**（`vidow_mini_move_to_output()`：改 `view->output` + `mini_home`，锚点是相对工作区的比例，位置尺寸一个字都不用换算）。
+       拖拽的收尾只有一份实现：浮窗拖拽（`vidow_float_end_grab`）和形态拖拽（`input.c` 的 `mini_pointer_release`）都调 `vidow_mini_drag_finish()` —— 两条路各写一遍必然漂移。
+     - **滚轮档位**（`src/input.c` 的 `vidow_pointer_axis`）：在小窗上滚轮 = 形态档位，一次一格。往下滚降一档（FREE → MINI → ICON，到底停住），往上滚升一档（ICON → MINI → FREE）。**唯一的例外**：FREE 已经在最上面那一档，它的**上滚照旧转发给客户端**（自由小窗是可交互态，要能滚内容）；其余情形一律吞掉不转发。
+     - **悬停工具条**（`src/drag.c` 的 `vidow_mini_toolbar_show/hide/hit` + `src/input.c`）：迷你 / 图标态悬停就露出四个按钮（放大 / 收成图标 / 还原成列 / 关闭）。它**不是表面**（合成器自绘的矩形），命中靠矩形判定 —— 绘制和命中共用 `server->mini_toolbar_btn_box` 一份坐标，不会各算一套。摆在小窗上方（上面放不下摆下面），整体夹进工作区。只读原则照 S2：不抢焦点、不进 MRU、不拿键盘，点中按钮是合成器自己的形态动作。
+       两个坑都踩过并写进注释：① 指针从窗口往按钮上走时命中的是 `NULL`（工具条不是表面），不特殊处理的话「一离开窗口工具条就没了 → 永远点不中」；② 按钮可能压在窗口上，所以工具条命中要排在形态拖拽那条之前。按钮的那一对按下 / 松手成对吃掉（客户端两边都没见过）。
+     - **键位动作**（`src/keybind.c`）：`cycle-mini-state`（三态循环：不在小窗态 / 自由 → 迷你 → 图标 → 自由 → 迷你 …，和 IPC 那份同一个顺序）、`mini-expand`（单步放大）、`mini-collapse`（单步收拢）、`unmini-window`（还原成列）。**动哪个窗口**：迷你 / 图标态**不拿键盘焦点**（S2 的死规矩），`server->focused` 指不到它们 —— 所以聚焦窗口不是小窗时退到「最近一个小窗」（`server->mini_last_id`，存 id 不存指针：窗口随时可能被关掉，指针会悬空）。
+     - **实测**（headless 双屏 1280x720 @1x、`gaps = 10`，`HOME`/`XDG_RUNTIME_DIR` 指临时目录；注入走 `VIDOW_TEST_ACTION` 的 `pointer-motion` / `pointer-button`，和真鼠标同一条路）：
+       - 落点区：拖平铺窗口到 `1180,60`（工作区 10,10 1260x700 → 落点区 1080,10 189x140）→ 松手 → `mini = "mini"`、`float_geometry = 909,18 353x196`（= 28% × 1260 / 28% × 700，贴右上角）；拖到 `400,400` 松手 → `mini` 仍是 `none`（**不误触**）。
+       - 内边缘：迷你态拖到左边（外侧没有屏）松手 → `icon`，`float_geometry = -12,116 64x64`（`mini_icon_overflow = 0.35` → 左侧出屏 22px、屏内 42px），日志「拖到内边缘（左，外侧没有相邻输出）→ 收成图标」。
+       - 跨屏边：自由小窗从 `HEADLESS-2` 拖过 x=1280 那条边松手 → `output = HEADLESS-1`、`mini` 仍是 `free`（**没被误收成图标**），geometry `1298,74 504x315`，日志「从 HEADLESS-2 挪到 HEADLESS-1（形态 free 不变）」。
+       - 滚轮：`vidowmsg pointer-scroll 0 1` → `mini → icon`；`0 -1` → `icon → mini`；再 `0 -1` → `mini → free`。
+       - 工具条：悬停露出（日志给了整块 `1298,58 151x32` 和四个按钮坐标），注入点 `1348,71` 按「收成图标」→ `mini → icon`。
+       - 键位：`vidowmsg action cycle-mini-state` 连按四次 → `none → mini → icon → free → mini`；`mini-collapse` 两次 → `icon`、`icon`（到底停住），`mini-expand` → `mini`；`unmini-window` → `none`（还原成列）。
+     - **改动面**：`src/server.h`（落点区 / 工具条的场景节点与命中状态 + `mini_last_id` + 声明）、`src/drag.c`（落点区 + 工具条 + 拖拽更新 / 松手挂点）、`src/float.c`（`vidow_mini_output_across` / `vidow_mini_edge_under_cursor` / `vidow_mini_drag_finish` / `vidow_mini_move_to_output` / `vidow_mini_toolbar_press`）、`src/input.c`（工具条命中与悬停、滚轮档位、拖拽松手判定）、`src/keybind.c`（四个动作 + `mini_action_view`）。`workspace.c` / `overview.c` / `im.c` / `gesture.c` / `main.c` / `config.c` 一行没改，**没有全屏特例**。
+     - **没做 / 请示**：`config.example/configs/14-keys.lua` 里**没加**那四行键位示例 —— 那套分类文件的逐字副本在 `src/config.c` 的 `print_keys_lua()` 里（`test-defaultconfig.sh` 判据 3 逐字比对），而 `src/config.c` 在本次的「别碰」清单里。要落这一行必须同时改 `src/config.c`（约 6 行 C 字符串），一句话就能补。S5 的过渡动画 / 悬停预览 / 图标出帧策略仍未做（S4 里形态切换是瞬时的）。
+
 274. **小窗模式 S3b：`mini_aspect` 三值生效（键位 > 规则 > 全局键）+ X11 `PAspect` 真的读了 + 拖拽锁比例 + contain 居中 —— 设了 `PAspect` 的游戏不再「关不掉锁」**（用户：「做方案 §11.3 + §7 S3 的宽高比那半」；方案 `/tmp/vidow-miniwin-plan.md` §11.3 + §8 判据 35–38b/43；2026-10-14）
 
      - **`mini_aspect` 是「有效值」算出来的，不是散在各处判的**：`vidow_mini_aspect_effective()`（`src/float.c:824`）—— 键位（运行时 `view->mini_aspect_runtime`）> 窗口规则（`mini_aspect_rule`）> 全局键（`config.mini_aspect`），**三级都是显式选择**（`auto` 也是「我选择按自动信号走」）。

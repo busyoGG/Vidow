@@ -655,6 +655,8 @@ void vidow_float_grab_update(struct vidow_server *server, double lx,
 	/* 同上：浮动拖拽的落位是推迟到帧里做的，帧一停它一点都不动，所以这里
 	 * 必须保证「就算后端不给帧事件，帧也照出」（见 output.c 的 anim_watchdog）。 */
 	vidow_output_kick_watchdog(server);
+	/* 小窗（S4）落点区：拖动中随时算（只在光标落进去的时候才亮）。 */
+	vidow_mini_drop_zone_update(server);
 }
 
 void vidow_float_end_grab(struct vidow_server *server) {
@@ -675,14 +677,39 @@ void vidow_float_end_grab(struct vidow_server *server) {
 	if (view != NULL) {
 		vidow_jelly_release(view);
 	}
+	/* 小窗（S4）落点区：松手时光标在不在里面，先记下来（下面那些分支都会提前
+	 * return，收尾只能在这儿做一次）。 */
+	bool drop_zone = vidow_mini_drop_zone_hit(server, server->cursor->x,
+		server->cursor->y);
+	vidow_mini_drop_zone_hide(server);
 
-	/* 松手时光标落在**另一块屏**上：这块浮窗改归那块屏显示着的工作区（跨屏
-	 * 拖拽）。位置保持绝对坐标不变，改完按新屏原点刷新相对偏移 —— 不刷新的话
-	 * 下一次 arrange 会把它按旧偏移摆到新屏的别处去。 */
 	if (view == NULL || view->popup ||
 			view->float_mode == VIDOW_FLOAT_NONE) {
 		return;
 	}
+
+	/* 小窗（S4）主入口：把**自由小窗 / 浮窗**拖进落点区松手 → 迷你小窗（用户
+	 * 要的「拖窗口时在每块屏右上角亮出落点区，松手 → 迷你小窗」在浮窗这条路
+	 * 也一样）。 */
+	if (drop_zone) {
+		wlr_log(WLR_INFO, "mini: 拖拽落进落点区 → %s 变迷你小窗",
+			vidow_view_title(view) != NULL ?
+				vidow_view_title(view) : "?");
+		vidow_mini_set_state(view, VIDOW_MINI_MINI);
+		return;
+	}
+
+	/* 小窗（S4）：迷你 / 图标的形态拖拽（input.c 的 mini_grab_*）和浮窗拖拽
+	 * 共用同一套落点判据 —— 内边缘收图标、跨屏边换屏保持形态。普通浮窗
+	 * （mini == NONE）走这儿什么都没发生。 */
+	if (view->mini != VIDOW_MINI_NONE &&
+			vidow_mini_drag_finish(server, view)) {
+		return;
+	}
+
+	/* 松手时光标落在**另一块屏**上：这块浮窗改归那块屏显示着的工作区（跨屏
+	 * 拖拽）。位置保持绝对坐标不变，改完按新屏原点刷新相对偏移 —— 不刷新的话
+	 * 下一次 arrange 会把它按旧偏移摆到新屏的别处去。 */
 	struct wlr_output *under = wlr_output_layout_output_at(
 		server->output_layout, server->cursor->x, server->cursor->y);
 	if (under == NULL || under == view->output) {
@@ -708,6 +735,251 @@ void vidow_float_end_grab(struct vidow_server *server) {
 	wlr_log(WLR_INFO, "grab: 浮窗拖到 %s 上 → 归到那块屏第 %d 块工作区",
 		under->name, vidow_workspace_index(target));
 	vidow_arrange(server);
+}
+
+/* ================================= 小窗（mini window，S4）：边缘判定 / 工具条动作
+ *
+ * 三件事，全部只在 mini 态生效：
+ *   1) 「这条边的外侧有没有相邻输出」—— 拖迷你小窗到边上的判据（有 = 跨屏边 =
+ *      换屏保持形态；没有 = 内边缘 = 收成图标）。用户写死的：判据只有这一条。
+ *   2) 跨屏边松手：换屏、保持形态。
+ *   3) 工具条按钮的动作（放大 / 收成图标 / 还原成列 / 关闭）。
+ */
+
+/* 这条边的外侧有没有相邻输出。探针沿边的法线取 1px（越过边界一点点），并要求
+ * 与目标屏有**非零区间重叠** —— 只看「角上相接」的两块屏不算相邻边（对角摆的
+ * 显示器：右上角那一点探得到，但那条边外侧其实没有屏）。纯几何，不看后端。 */
+struct wlr_output *vidow_mini_output_across(struct vidow_server *server,
+		struct wlr_output *self, enum vidow_mini_edge edge) {
+	if (server == NULL || self == NULL || edge == VIDOW_MINI_EDGE_NONE) {
+		return NULL;
+	}
+	struct wlr_box box = {0};
+	wlr_output_layout_get_box(server->output_layout, self, &box);
+	if (box.width < 1 || box.height < 1) {
+		return NULL;
+	}
+	int px = 0, py = 0;
+	switch (edge) {
+	case VIDOW_MINI_EDGE_LEFT:
+		px = box.x - 1;
+		py = box.y + box.height / 2;
+		break;
+	case VIDOW_MINI_EDGE_RIGHT:
+		px = box.x + box.width;
+		py = box.y + box.height / 2;
+		break;
+	case VIDOW_MINI_EDGE_TOP:
+		px = box.x + box.width / 2;
+		py = box.y - 1;
+		break;
+	case VIDOW_MINI_EDGE_BOTTOM:
+		px = box.x + box.width / 2;
+		py = box.y + box.height;
+		break;
+	case VIDOW_MINI_EDGE_NONE:
+		return NULL;
+	}
+	struct wlr_output *other =
+		wlr_output_layout_output_at(server->output_layout, px, py);
+	if (other == NULL || other == self) {
+		return NULL;
+	}
+	struct wlr_box obox = {0};
+	wlr_output_layout_get_box(server->output_layout, other, &obox);
+	if (obox.width < 1 || obox.height < 1) {
+		return NULL;
+	}
+	if (edge == VIDOW_MINI_EDGE_LEFT || edge == VIDOW_MINI_EDGE_RIGHT) {
+		/* 左右相邻：两条边在**纵向**上得有非零重叠。 */
+		if (obox.y >= box.y + box.height ||
+				obox.y + obox.height <= box.y) {
+			return NULL;
+		}
+	} else {
+		/* 上下相邻：两条边在**横向**上得有非零重叠。 */
+		if (obox.x >= box.x + box.width ||
+				obox.x + obox.width <= box.x) {
+			return NULL;
+		}
+	}
+	return other;
+}
+
+/* 光标贴着自己那块屏工作区的哪条边（mini_edge_snap_px 以内），没贴边 = NONE。
+ * 只认自己那块屏的四条边 —— 跨屏边也在四条里，收不收图标由调用方按
+ * vidow_mini_output_across() 判。 */
+enum vidow_mini_edge vidow_mini_edge_under_cursor(struct vidow_server *server,
+		struct vidow_view *view) {
+	if (server == NULL || view == NULL) {
+		return VIDOW_MINI_EDGE_NONE;
+	}
+	int snap = server->config.mini_edge_snap_px;
+	if (snap < 0) {
+		snap = 0;
+	}
+	struct wlr_box work = vidow_work_area(server, view->output);
+	if (work.width < 1 || work.height < 1) {
+		return VIDOW_MINI_EDGE_NONE;
+	}
+	double cx = server->cursor->x, cy = server->cursor->y;
+	double d[4] = {
+		fabs(cx - (double)work.x),
+		fabs((double)(work.x + work.width) - cx),
+		fabs(cy - (double)work.y),
+		fabs((double)(work.y + work.height) - cy),
+	};
+	enum vidow_mini_edge edges[4] = {
+		VIDOW_MINI_EDGE_LEFT, VIDOW_MINI_EDGE_RIGHT,
+		VIDOW_MINI_EDGE_TOP, VIDOW_MINI_EDGE_BOTTOM,
+	};
+	/* 光标得真的在这块工作区的范围里（贴着某条边）：横向的边看 y，纵向的边
+	 * 看 x —— 不然「光标在隔壁屏、离这条边很近」也会命中。 */
+	double margin = (double)snap + 1.0;
+	int best = -1;
+	for (int i = 0; i < 4; i++) {
+		bool horizontal = (i >= 2); /* TOP / BOTTOM：边是横的 */
+		if (horizontal) {
+			if (cx < (double)work.x - margin ||
+					cx > (double)(work.x + work.width) + margin) {
+				continue;
+			}
+		} else {
+			if (cy < (double)work.y - margin ||
+					cy > (double)(work.y + work.height) + margin) {
+				continue;
+			}
+		}
+		if (d[i] > (double)snap) {
+			continue;
+		}
+		if (best < 0 || d[i] < d[best]) {
+			best = i;
+		}
+	}
+	return best < 0 ? VIDOW_MINI_EDGE_NONE : edges[best];
+}
+
+/* 小窗（S4）：一次形态拖拽（迷你 / 自由小窗被拖动）松手时的落点判定。
+ * 三条判据，顺序写死：
+ *   1) 光标已经在**另一块屏**上 → 跨屏边松手 = 换屏、保持形态（不收图标）；
+ *   2) 光标贴着自己那块屏的一条边，且**那条边外侧没有相邻输出**（内边缘）→
+ *      收成图标，贴那条边；
+ *   3) 其余（跨屏边但光标还在自己屏上 / 没贴边）→ 什么都不做。
+ * 返回 true = 形态或归属变了（调用方别再走自己的收尾）。
+ *
+ * 「这条边的外侧有没有相邻输出」是唯一的判据（用户写死的），见
+ * vidow_mini_output_across()：探针沿法线取 1px，还要求与目标屏有非零区间重叠。 */
+bool vidow_mini_drag_finish(struct vidow_server *server,
+		struct vidow_view *view) {
+	if (server == NULL || view == NULL || view->mini == VIDOW_MINI_NONE) {
+		return false;
+	}
+	struct wlr_output *under = wlr_output_layout_output_at(
+		server->output_layout, server->cursor->x, server->cursor->y);
+	if (under != NULL && under != view->output) {
+		vidow_mini_move_to_output(server, view, under);
+		return true;
+	}
+	enum vidow_mini_edge edge = vidow_mini_edge_under_cursor(server, view);
+	if (edge == VIDOW_MINI_EDGE_NONE) {
+		return false;
+	}
+	if (vidow_mini_output_across(server, view->output, edge) != NULL) {
+		/* 跨屏边：不收图标（换屏那条已经由上面 1) 管了 —— 光标还在自己
+		 * 屏上就是「拖到边上但没过去」，什么都不做）。 */
+		return false;
+	}
+	/* 内边缘：沿这条边的那一轴按光标位置记锚点（另一轴钉死在边上），图标就贴在
+	 * 「拖到哪儿」的那一段上。 */
+	struct wlr_box work = vidow_work_area(server, view->output);
+	if (work.width > 0 && work.height > 0) {
+		int iw = server->config.mini_icon_size;
+		double span_x = (double)(work.width - iw);
+		double span_y = (double)(work.height - iw);
+		if (edge == VIDOW_MINI_EDGE_LEFT || edge == VIDOW_MINI_EDGE_RIGHT) {
+			view->mini_ax = edge == VIDOW_MINI_EDGE_LEFT ? 0.0 : 1.0;
+			view->mini_ay = span_y > 1.0 ?
+				(server->cursor->y - (double)work.y) / span_y : 0.0;
+		} else {
+			view->mini_ay = edge == VIDOW_MINI_EDGE_TOP ? 0.0 : 1.0;
+			view->mini_ax = span_x > 1.0 ?
+				(server->cursor->x - (double)work.x) / span_x : 0.0;
+		}
+	}
+	view->mini_edge = edge;
+	wlr_log(WLR_INFO, "mini: %s 拖到内边缘（%s，外侧没有相邻输出）→ 收成图标",
+		vidow_view_title(view) != NULL ? vidow_view_title(view) : "?",
+		edge == VIDOW_MINI_EDGE_LEFT ? "左" : edge == VIDOW_MINI_EDGE_RIGHT ?
+			"右" : edge == VIDOW_MINI_EDGE_TOP ? "上" : "下");
+	vidow_mini_set_state(view, VIDOW_MINI_ICON);
+	return true;
+}
+
+/* 跨屏边松手：换屏、保持形态。锚点是「相对那块屏工作区的比例」，所以位置和
+ * 尺寸一个字都不用换算（vidow_mini_resolve_geom 会按新屏的工作区算出来）——
+ * 这就是当初选比例锚点而不是绝对坐标的理由。 */
+void vidow_mini_move_to_output(struct vidow_server *server,
+		struct vidow_view *view, struct wlr_output *to) {
+	if (server == NULL || view == NULL || to == NULL ||
+			view->output == to) {
+		return;
+	}
+	struct wlr_output *from = view->output;
+	view->output = to;
+	/* 跟屏的记账（热插拔按输出名认）：换屏就是换这块 memory。 */
+	struct vidow_output *out = vidow_output_lookup(server, to);
+	view->mini_home = out != NULL ? out->memory : NULL;
+	/* 迷你 / 图标态的位置不靠 home_dx/home_dy（那是给普通浮窗的），FREE 才是
+	 * 普通浮窗的摆放路径 —— 顺手把它刷新一下，免得以后从 FREE 转出来时用旧屏
+	 * 的偏移摆一次（拖了等于没拖那个坑）。 */
+	struct wlr_box box = {0};
+	wlr_output_layout_get_box(server->output_layout, to, &box);
+	if (box.width > 0) {
+		view->home_dx = view->float_geom.x - box.x;
+		view->home_dy = view->float_geom.y - box.y;
+	}
+	vidow_mini_resolve_geom(view);
+	vidow_arrange(server);
+	wlr_log(WLR_INFO, "mini: %s 从 %s 挪到 %s（形态 %s 不变，锚点 %.3f,%.3f）",
+		vidow_view_title(view) != NULL ? vidow_view_title(view) : "?",
+		from != NULL ? from->name : "-", to->name,
+		vidow_mini_state_name(view->mini), view->mini_ax, view->mini_ay);
+	vidow_ipc_emit_window(server, "window-mini-changed", view);
+}
+
+/* 工具条按钮的动作。只读原则照 S2：这些动作是合成器自己的形态操作，不往客户端
+ * 转任何事件（工具条本身也不是表面）。 */
+void vidow_mini_toolbar_press(struct vidow_server *server,
+		struct vidow_view *view, int button) {
+	if (server == NULL || view == NULL) {
+		return;
+	}
+	switch (button) {
+	case VIDOW_MINI_BTN_EXPAND:
+		/* 放大一档：图标 → 迷你 → 自由（自由是最上面那一档）。 */
+		if (view->mini == VIDOW_MINI_ICON) {
+			vidow_mini_set_state(view, VIDOW_MINI_MINI);
+		} else if (view->mini == VIDOW_MINI_MINI) {
+			vidow_mini_set_state(view, VIDOW_MINI_FREE);
+			vidow_focus_view(view);
+		}
+		break;
+	case VIDOW_MINI_BTN_ICON:
+		vidow_mini_set_state(view, VIDOW_MINI_ICON);
+		break;
+	case VIDOW_MINI_BTN_RESTORE:
+		vidow_mini_set_state(view, VIDOW_MINI_NONE);
+		break;
+	case VIDOW_MINI_BTN_CLOSE:
+		vidow_view_close(view);
+		break;
+	default:
+		return;
+	}
+	wlr_log(WLR_INFO, "mini toolbar: %s 点了按钮 %d（现在 %s）",
+		vidow_view_title(view) != NULL ? vidow_view_title(view) : "?",
+		button, vidow_mini_state_name(view->mini));
 }
 
 /* ------------------------------------------------- 小窗（mini window，S1）
@@ -1086,6 +1358,14 @@ void vidow_mini_set_state(struct vidow_view *view, enum vidow_mini_state state) 
 	 * 列里才找得到邻居。FREE 照常拿焦点，不用交。 */
 	if (state == VIDOW_MINI_MINI || state == VIDOW_MINI_ICON) {
 		vidow_view_yield_focus_for_mini(view);
+	}
+	/* 小窗（S4）：形态一变，悬停工具条就收掉（它的位置是照**上一个**形态的
+	 * 盒子算的，留着会画在一个已经不在那儿的窗口旁边）。下一次指针动会重新
+	 * 露出来。 */
+	vidow_mini_toolbar_hide(server);
+	/* 键位动作用的指认（迷你 / 图标态不拿键盘焦点，server->focused 指不到）。 */
+	if (state != VIDOW_MINI_NONE) {
+		server->mini_last_id = view->id;
 	}
 
 	if (state == VIDOW_MINI_NONE) {
