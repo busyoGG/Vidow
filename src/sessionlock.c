@@ -10,8 +10,9 @@
  *   3. 等每块屏各呈现一帧后发 locked（XML:87-107）。某块屏一直不出帧就超时兜底
  *      （XML:96-98 的 "reasonable time limit"），不能无限等。
  *
- * 本文件是 S1：只做「能锁、能黑屏、能握手」。解锁 / 客户端崩溃恢复（S4）、
- * 输入路由（S3）、输出热插拔完善（S2）都不在这里。 */
+ * 本文件到 S2 为止：能锁、能黑屏、能握手，lock surface 生命周期（建 / 输出尺寸变化
+ * 重新 configure / 输出拔掉清账）和输出热插拔（新屏立刻补黑幕、进握手账）都做了。
+ * 解锁 / 客户端崩溃恢复（S4）、输入路由（S3）不在这里。 */
 
 #include "server.h"
 #include "sessionlock.h"
@@ -86,17 +87,131 @@ void vidow_sessionlock_frame(struct vidow_output *output) {
 	}
 }
 
+/* 把这块屏的黑 rect 和它上面的 lock surface 对齐到一个布局框（逻辑坐标）。
+ * 尺寸变了就重新 configure lock surface —— 客户端只认最后一次 configure 的尺寸
+ * （协议要求 commit 的尺寸等于最后一次 ack 的 configure），不重发它就永远按旧尺寸画。
+ * box 从外面传进来：output->box 是渲染时每帧刷新的，输出刚 commit 完那一刻它还是旧的
+ * （见 vidow_sessionlock_output_sync）。 */
+static void lock_output_apply_box(struct vidow_output *output,
+		const struct wlr_box *box) {
+	if (box->width <= 0 || box->height <= 0) {
+		return;
+	}
+	if (output->lock_blank != NULL) {
+		wlr_scene_rect_set_size(output->lock_blank, box->width, box->height);
+		wlr_scene_node_set_position(&output->lock_blank->node, box->x, box->y);
+	}
+	struct vidow_lock_surface *ls;
+	wl_list_for_each(ls, &output->server->lock_surfaces, link) {
+		if (ls->output != output) {
+			continue;
+		}
+		wlr_scene_node_set_position(&ls->scene_surface->buffer->node,
+			box->x, box->y);
+		if (ls->cfg_w == box->width && ls->cfg_h == box->height) {
+			continue;
+		}
+		/* 首次 configure 由 new_surface 那边打日志（它才说得清「谁的 surface
+		 * 来了」）；这里只管「尺寸变了，重发一遍」。 */
+		bool first = ls->cfg_w == 0 && ls->cfg_h == 0;
+		ls->cfg_w = box->width;
+		ls->cfg_h = box->height;
+		wlr_session_lock_surface_v1_configure(ls->lock_surface,
+			(uint32_t)box->width, (uint32_t)box->height);
+		if (!first) {
+			wlr_log(WLR_INFO, "sessionlock: %s 现在是 %dx%d，"
+				"lock surface 重新 configure 了", output->wlr_output->name,
+				box->width, box->height);
+		}
+	}
+}
+
 void vidow_sessionlock_output_update(struct vidow_output *output) {
+	lock_output_apply_box(output, &output->box);
+}
+
+void vidow_sessionlock_output_sync(struct vidow_output *output) {
+	struct vidow_server *server = output->server;
 	if (output->lock_blank == NULL) {
 		return;
 	}
-	if (output->box.width <= 0 || output->box.height <= 0) {
+	/* 直接问布局要当前的框：output->box 要等下一帧渲染才刷新。 */
+	struct wlr_box box = {0};
+	wlr_output_layout_get_box(server->output_layout, output->wlr_output, &box);
+	if (box.width == output->box.width && box.height == output->box.height &&
+			box.x == output->box.x && box.y == output->box.y) {
+		/* 没变（绝大多数 commit 都是这种）：什么都不做，别打扰客户端。 */
 		return;
 	}
-	wlr_scene_rect_set_size(output->lock_blank, output->box.width,
-		output->box.height);
-	wlr_scene_node_set_position(&output->lock_blank->node, output->box.x,
-		output->box.y);
+	wlr_log(WLR_INFO, "sessionlock: %s 提交了新状态（%dx%d @ %d,%d），"
+		"黑 rect / lock surface 跟着对齐", output->wlr_output->name,
+		box.width, box.height, box.x, box.y);
+	lock_output_apply_box(output, &box);
+}
+
+void vidow_sessionlock_output_added(struct vidow_output *output) {
+	struct vidow_server *server = output->server;
+	if (!server->locked) {
+		return;
+	}
+	/* 黑 rect 是 output.c 在 server_new_output 里刚建的（挂在 layer_lock_blank
+	 * 底下，那棵树锁定期间开着）—— 所以新屏从第一帧起就是黑的，桌面漏不出去。
+	 * 这里只记账 + 打一行日志，测试拿它当「新屏补了黑幕」的判据。 */
+	if (output->lock_blank == NULL) {
+		wlr_log(WLR_ERROR, "sessionlock: 锁定期间新屏 %s 没拿到黑 rect"
+			"（layer_lock_blank 没建出来？）", output->wlr_output->name);
+		return;
+	}
+	wlr_log(WLR_INFO, "sessionlock: 锁定期间新屏 %s 到了，黑 rect 已就位"
+		"（%dx%d @ %d,%d）", output->wlr_output->name, output->box.width,
+		output->box.height, output->box.x, output->box.y);
+	/* locked 还没发的话，这块屏的帧也要进握手账 —— 它可能一帧都还没画过，
+	 * 不等它就 send_locked 等于把「可能还有桌面残留」的屏放行了。 */
+	if (!server->lock_locked_sent) {
+		if (!output->lock_frame_pending) {
+			output->lock_frame_pending = true;
+			server->lock_frames_pending++;
+		}
+		vidow_output_schedule_frame(server, output->wlr_output, "锁定期间新屏");
+	}
+}
+
+void vidow_sessionlock_output_removed(struct vidow_output *output) {
+	struct vidow_server *server = output->server;
+	/* 这块屏的 lock surface 记账收干净：wlroots 随后也会销毁这些 lock surface
+	 * （它挂在同一个 output->events.destroy 上，比我们晚注册），但那条路上
+	 * ls->output 已经指着要释放的 vidow_output 了。这里先收：摘掉自己的 destroy
+	 * 监听再释放，两边谁先跑都不会二次回调。 */
+	unsigned cleaned = 0;
+	struct vidow_lock_surface *ls, *tmp;
+	wl_list_for_each_safe(ls, tmp, &server->lock_surfaces, link) {
+		if (ls->output != output) {
+			continue;
+		}
+		wl_list_remove(&ls->destroy.link);
+		wl_list_remove(&ls->link);
+		if (ls->scene_surface != NULL) {
+			wlr_scene_node_destroy(&ls->scene_surface->buffer->node);
+		}
+		free(ls);
+		cleaned++;
+	}
+	/* 这块屏永远画不出「锁后第一帧」了：销掉它的账，别让 locked 一直等着。 */
+	bool was_pending = output->lock_frame_pending;
+	if (was_pending) {
+		output->lock_frame_pending = false;
+		if (server->lock_frames_pending > 0) {
+			server->lock_frames_pending--;
+		}
+	}
+	if (server->locked) {
+		wlr_log(WLR_INFO, "sessionlock: 输出 %s 拔了，清掉 %u 块 lock surface 记账%s"
+			"（还有 %u 块屏没呈现锁后第一帧）", output->wlr_output->name, cleaned,
+			was_pending ? " + 一块待呈现的账" : "", server->lock_frames_pending);
+	}
+	if (was_pending && server->lock_frames_pending == 0) {
+		lock_send_locked(server);
+	}
 }
 
 /* ---------------------------------------------------------- lock surface */
@@ -140,17 +255,14 @@ static void lock_handle_new_surface(struct wl_listener *listener, void *data) {
 		return;
 	}
 	/* 场景树是全屏坐标：把这块屏的 lock surface 摆到这块屏的布局原点上。 */
-	wlr_scene_node_set_position(&ls->scene_surface->buffer->node,
-		output->box.x, output->box.y);
 	ls->destroy.notify = lock_surface_handle_destroy;
 	wl_signal_add(&lock_surface->events.destroy, &ls->destroy);
 	wl_list_insert(&server->lock_surfaces, &ls->link);
 
 	/* 首个 configure 必须我们自己发（见文件头第 2 条）。 */
-	wlr_session_lock_surface_v1_configure(lock_surface,
-		(uint32_t)output->box.width, (uint32_t)output->box.height);
+	lock_output_apply_box(output, &output->box);
 	wlr_log(WLR_INFO, "sessionlock: %s 的 lock surface 来了，已 configure %dx%d",
-		output->wlr_output->name, output->box.width, output->box.height);
+		output->wlr_output->name, ls->cfg_w, ls->cfg_h);
 }
 
 /* ------------------------------------------------------------------ lock */

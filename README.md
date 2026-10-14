@@ -5420,6 +5420,37 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
      - 未做：niri 的 `fixed 1920`（固定像素档）、`preset-window-heights`、`default-column-width {}`（让客户端自己定宽）、
        `always-center-single-column`；窗口规则级的 per-rule 预设覆盖。
 
+265. **会话锁 S2：lock surface 生命周期（尺寸变了重 configure）+ 输出热插拔（锁定期插屏立刻补黑幕 / 拔屏清账）**（用户：「接着 S1 做方案 §5 的 S2，别推倒重写、别做多余的无用测试」；方案 `/tmp/vidow-sessionlock-plan.md`；2026-10-14）
+
+     - 落点：`src/sessionlock.c` / `src/sessionlock.h`（`lock_output_apply_box()` 统一「把黑 rect + 这块屏的 lock surface 对齐到一个布局框」，
+       外加 `vidow_sessionlock_output_sync()` / `_added()` / `_removed()` 三个入口）；`src/output.c`（输出 commit 监听、新屏记账、拔屏清账）；
+       `src/server.h`（每输出一个 `commit` 监听器）；`test-sessionlock.sh`（补 G1/G2）。**S1 的握手语义一行没改**：`send_locked` 还是只发一次，
+       后续新屏的黑 rect 不依赖它。**没加任何全屏特例**，`view.c` 的列逻辑照旧一行不动。
+     - **尺寸变化 → 重新 configure**：S1 只在 `new_surface` 时 configure 一次。现在每输出挂 `wlr_output->events.commit`：
+       锁定期间一旦提交新状态（`vidowmsg output-scale`、SIGHUP 换缩放、换模式、热插拔重排），立刻按 `wlr_output_layout_get_box()` 的当前框
+       对齐黑 rect 并重发 configure（客户端只认最后一次 configure —— 协议要求 commit 的尺寸等于最后一次 ack 的）。
+       **为什么不等下一帧**：`output->box` 是渲染时每帧刷新的（`src/output.c:1023`），而锁定期间没人动的话可能一直不出帧，那客户端就永远按旧尺寸画。
+       所以 commit 回调里直接问布局要框，**不碰 `output->box`**（那条日志 `布局位置 a,b WxH -> c,d WxH` 是 `test-hotplug.sh` 在解析的，不能抢它的活）。
+       实测：锁后 `vidowmsg output-scale HEADLESS-1 2` → 客户端收到第二次 `configure HEADLESS-1 640x360`，
+       日志 `sessionlock: HEADLESS-1 现在是 640x360，lock surface 重新 configure 了`。
+     - **锁定期间插屏**：`server_new_output` 里黑 rect 是照旧建的（挂在 `layer_lock_blank` 下，那棵树锁定期间开着），所以新屏从第一帧起就是黑的，
+       桌面漏不出去；新增的 `vidow_sessionlock_output_added()` 打一行日志给测试当判据，并在 `locked` 还没发时把这块屏记进握手账（它可能一帧都还没画过，
+       不等它就等于把「可能还有桌面残留」的屏放行了）。lock surface 由客户端随后建（走和别的屏一样的 `new_surface`）。
+     - **锁定期间拔屏**：`output_destroy` 里 `vidow_sessionlock_output_removed()` 清掉这块屏的 lock surface 记账（摘自己的 destroy 监听再释放，
+       和 wlroots 那条 `output->events.destroy` 销毁 lock surface 的路谁先跑都不会二次回调）和「还没呈现锁后第一帧」的账
+       （一块永远出不了帧的屏不能把 `locked` 一直拖着）；黑 rect 照旧在 `output_destroy` 里收。
+     - 验证（`test-sessionlock.sh`，headless 两块屏，只跑方案 §3 的 C/G）：
+       - A/B/C 复跑全绿（B：`LOCKED` <5s、两块屏各一次 `configure`；C：锁后两块屏 `#226699` **100.0%**，锁前 `HEADLESS-2` 上 445621 个蓝窗像素）；
+       - **G1 插屏**（`VIDOW_TEST_OUTPUTS="12000:add:1280x720"`，锁定期间）：日志
+         `sessionlock: 锁定期间新屏 HEADLESS-3 到了，黑 rect 已就位（1280x720 @ 2560,0）`；`locktest` 为新屏建了 surface 并收到第 3 次
+         `configure HEADLESS-3 1280x720`；`grim -o HEADLESS-3` 量出来 **锁屏色 100.0% / 纯黑 0.0% / 桌面像素 0**；
+       - **G2 拔屏**（另起一遍 vidow，`VIDOW_TEST_OUTPUTS="12000:remove:HEADLESS-2"`，锁定期间）：日志
+         `sessionlock: 输出 HEADLESS-2 拔了，清掉 1 块 lock surface 记账（还有 0 块屏没呈现锁后第一帧）`；vidow 不崩；
+         `grim -o HEADLESS-2` 失败（真没了）；剩下那块屏 **锁屏色 100.0% / 桌面像素 0**；日志里没有 sessionlock 的错误行。
+     - **仍是 S2，别对外宣称支持会话锁**：**输入路由（S3）还没做** —— 锁上之后键盘 / 指针 / 触摸 / 拖拽 / 手势 / overview / IME
+       仍然会漏给未锁客户端，锁形同虚设。S4（解锁恢复桌面、客户端崩溃保持死锁、抓帧审计）也没做。
+       所以 `test-sessionlock.sh` 全过只说明「能锁、能黑屏、能握手、热插拔不漏桌面」，不说明能当锁屏用。
+
 264. **会话锁 S1：`ext-session-lock-v1` 的 global + 涂黑 + `locked` 握手（新建 `src/sessionlock.{c,h}`、`tools/locktest.c`、`test-sessionlock.sh`）**（用户：「先做方案 §5 的 S1，别做多余的无用测试」；方案 `/tmp/vidow-sessionlock-plan.md`；2026-10-14）
 
      - **协议不用自己实现**：wlroots 0.20（本机 0.20.2）自带 `wlr_session_lock_v1`，

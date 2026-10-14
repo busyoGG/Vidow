@@ -1097,6 +1097,9 @@ struct vidow_output {
 
 	struct wl_listener frame;
 	struct wl_listener request_state;
+	/* 输出提交了新状态（换模式 / 改缩放 / 热插拔重排）。锁定期间靠它立刻把黑 rect
+	 * 和 lock surface 对齐到新的逻辑尺寸 —— 不能等下一帧（见 sessionlock.c）。 */
+	struct wl_listener commit;
 	struct wl_listener destroy;
 };
 

@@ -424,6 +424,18 @@ void vidow_output_kick_all(struct vidow_server *server) {
 	wl_event_source_timer_update(server->kick_timer, 1);
 }
 
+static void output_commit(struct wl_listener *listener, void *data) {
+	(void)data;
+	struct vidow_output *output = wl_container_of(listener, output, commit);
+	/* 会话锁（见 sessionlock.c）：锁定期间这块屏刚提交了新状态（换模式 / 改缩放 /
+	 * 热插拔重排），逻辑尺寸可能变了 —— 立刻对齐黑 rect + 重新 configure 它的
+	 * lock surface。不能等下一帧：锁定期间没人动的话可能一直不出帧。
+	 * 非锁定期间不用管：output->box 在渲染里每帧都会刷新。 */
+	if (output->server->locked) {
+		vidow_sessionlock_output_sync(output);
+	}
+}
+
 static void output_frame(struct wl_listener *listener, void *data) {
 	(void)data;
 	struct vidow_output *output = wl_container_of(listener, output, frame);
@@ -1210,15 +1222,18 @@ static void output_destroy(struct wl_listener *listener, void *data) {
 	}
 	wl_list_remove(&output->frame.link);
 	wl_list_remove(&output->request_state.link);
+	wl_list_remove(&output->commit.link);
 	wl_list_remove(&output->destroy.link);
 	wl_list_remove(&output->link);
 
-	/* 会话锁的黑幕：这块屏没了，它那块黑 rect 也收掉（不然会留在场景里盖住
-	 * 别的地方）。它对应的 lock surface 由 wlroots 的输出销毁监听收掉。 */
+	/* 会话锁（见 sessionlock.c）：这块屏没了，它那块黑 rect 也收掉（不然会留在
+	 * 场景里盖住别的地方），它的 lock surface 记账 + 「还没呈现锁后第一帧」的账
+	 * 一起清干净。必须在 vidow_output 被释放之前调 —— 记账里存着指向它的指针。 */
 	if (output->lock_blank != NULL) {
 		wlr_scene_node_destroy(&output->lock_blank->node);
 		output->lock_blank = NULL;
 	}
+	vidow_sessionlock_output_removed(output);
 
 	vidow_blur_output_finish(output);
 
@@ -1344,6 +1359,10 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 	wl_signal_add(&wlr_output->events.frame, &output->frame);
 	output->request_state.notify = output_request_state;
 	wl_signal_add(&wlr_output->events.request_state, &output->request_state);
+	/* 输出提交新状态（换模式 / 改缩放）：锁定期间靠它立刻对齐黑 rect 和
+	 * lock surface，不等下一帧（见 sessionlock.c）。 */
+	output->commit.notify = output_commit;
+	wl_signal_add(&wlr_output->events.commit, &output->commit);
 	output->destroy.notify = output_destroy;
 	wl_signal_add(&wlr_output->events.destroy, &output->destroy);
 
@@ -1379,6 +1398,9 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 			(const float[4]){ 0.0f, 0.0f, 0.0f, 1.0f });
 		vidow_sessionlock_output_update(output);
 	}
+	/* 锁定期间新插的屏：黑 rect 刚建好（上面那段），这里记账 + 打日志；它的
+	 * lock surface 等客户端来建（见 sessionlock.c）。 */
+	vidow_sessionlock_output_added(output);
 	vidow_arrange_layers(server);
 
 	/* 布局原点也打出来：多屏 / 热插拔时「谁在左边」直接看日志，测试也不用猜。 */
