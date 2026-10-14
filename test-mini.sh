@@ -1,5 +1,5 @@
 #!/bin/bash
-# 小窗模式（mini window，S1–S5）：把散在 /tmp 的那几个临时验证脚本收成一个。
+# 小窗模式（mini window，S1–S5 + S7）：把散在 /tmp 的那几个临时验证脚本收成一个。
 #
 # 「小窗」是浮动窗口上的一个**形态**（`none` / `free` / `mini` / `icon`），进小窗
 # 不重配客户端（保留原生 buffer，由合成器缩放 + 指针坐标换算）。这个脚本按
@@ -19,6 +19,9 @@
 #   S5  `force_render` 分叉（关 = 图标与预览都静止且客户端 0 新帧；开 = 都活）、
 #       过渡动画（相邻位移 ≤ 屏宽 10%、单调、第一帧在起点）、惯性甩出
 #   S5b MRU（Alt+Tab）提交选中迷你 / 图标态小窗 → 展开成自由小窗并拿到焦点
+#   S7  HiDPI（scale 2）：运行时把 HEADLESS-2 调到 scale 2、邻屏摆到它右边，验
+#       输出逻辑尺寸（物理 / 2）/ 几何按**逻辑**工作区算（物理脚印 2 倍）/ 跨缩放
+#       边界（scale 2 → scale 1）的图标裁剪（像素差分，非「非背景」）/ 指针坐标换算
 #
 # **这个脚本抓到过的两个真 bug（都已修，判据留在脚本里当回归）**：
 #   1) 图标漏到相邻屏上（S3「相邻屏非背景像素 = 0」那条）：贴右边缘溢出的那 16×64
@@ -1064,6 +1067,158 @@ else
 	echo "  （mru 状态：$(./build/vidowmsg mru | head -c 300)）"
 	fail "切换器没打开（mru.showing = $SHOWING）"
 fi
+
+# ================================================================ S7：HiDPI（scale 2）
+mark "S7 HiDPI scale 2：输出逻辑尺寸 / 几何按逻辑算 / 跨缩放边界裁剪 / 指针坐标换算"
+# 前六节都是 scale 1、两块屏在逻辑 0..1280 / 1280..2560（S1–S5 那堆坐标都写死了）。
+# 这一节**不另起一次运行**：同一套 harness、同一份配置、同一个探针，改成运行时用
+# IPC 把 HEADLESS-2 的缩放调到 2，再把 HEADLESS-1 摆到它右边 —— 逻辑坐标下就是
+# 同一张布局：scale 2 屏占 1280..1920（逻辑 640x360），scale 1 的邻屏从 1920 起、
+# 正好贴着它的逻辑右边缘（图标贴右溢出那半块才落得上邻屏）。
+# ⚠️ 布局坐标只能这么写死：`vidowmsg outputs` 的 JSON 里**没有**布局坐标字段。
+# 两块辅助客户端（rulewin / mruwin）先关掉：邻屏那条像素差分判据要的是「这块屏
+# 上除了图标没别人在画」，留着它们只是给差分添噪声。
+./build/vidowmsg close-window --title rulewin >/dev/null 2>&1
+./build/vidowmsg close-window --title mruwin >/dev/null 2>&1
+sleep 0.6
+MARK=$(logmark)
+./build/vidowmsg output-scale HEADLESS-2 2 >/dev/null 2>&1
+sleep 0.8
+./build/vidowmsg output-position HEADLESS-2 1280 0 >/dev/null 2>&1
+./build/vidowmsg output-position HEADLESS-1 1920 0 >/dev/null 2>&1
+sleep 1.2
+
+# ---- 判据 1：scale 生效（物理 1280x720 / 逻辑 640x360）
+./build/vidowmsg outputs | python3 -c '
+import sys, json
+for o in json.load(sys.stdin):
+    print("  %s scale=%s 物理=%sx%s 逻辑=%sx%s" % (
+        o.get("name"), o.get("scale"), o.get("width"), o.get("height"),
+        o.get("logical_width"), o.get("logical_height")))
+'
+read -r S2 OW OH LW LH <<< "$(./build/vidowmsg outputs | python3 -c '
+import sys, json
+for o in json.load(sys.stdin):
+    if o.get("name") == "HEADLESS-2":
+        print(o["scale"], o["width"], o["height"], o["logical_width"],
+              o["logical_height"])
+        break')"
+[ "$S2" = "2" ] && pass "HEADLESS-2 scale = 2（物理 ${OW}x${OH}，逻辑 ${LW}x${LH}）" ||
+	fail "HEADLESS-2 scale 不是 2（读到 '$S2'）"
+[ "$LW $LH" = "640 360" ] && pass "逻辑尺寸 = 物理 ${OW}x${OH} / scale 2（缩放生效）" ||
+	fail "逻辑尺寸不对：${LW}x${LH}（期望 640x360）"
+since "$MARK" | grep -aq 'HEADLESS-1: 布局位置 -> 1920,0' &&
+	pass "邻屏 HEADLESS-1 摆到布局 1920,0（紧贴 scale 2 屏的逻辑右边缘）" ||
+	fail "邻屏没摆到 1920,0：$(since "$MARK" | grep -a '布局位置' | tr '\n' ' ')"
+
+H2X=1280; H2W=640; EDGE=$((H2X + H2W))     # scale 2 屏的逻辑范围 1280..1920
+ID=$(mini_id)
+unmini; sleep 0.8
+./build/vidowmsg move-window-to-output HEADLESS-2 --id "$ID" >/dev/null 2>&1
+sleep 1.0
+echo "  窗口：$(geom) 输出=$(winf w1 out) surface=$(winf w1 sw)x$(winf w1 sh)"
+
+# ---- 判据 2：几何按**逻辑**工作区算（逻辑工作区 = 640x360 各去 gaps 10 = 620x340）
+set_state mini; sleep 1.0
+read -r MX MY MW MH <<< "$(echo "$(geom)" | tr 'x,' ' ')"
+W2=620; H2=340
+EXPW=$((W2 * 28 / 100)); EXPH=$((H2 * 28 / 100))     # mini_free_w/h 默认 28%
+echo "  迷你盒（逻辑）$MX,$MY ${MW}x${MH}；逻辑工作区 ${W2}x${H2} 的 28% = ${EXPW}x${EXPH}"
+if [ "$MW" -ge $((EXPW - 3)) ] && [ "$MW" -le $((EXPW + 3)) ] &&
+   [ "$MH" -ge $((EXPH - 3)) ] && [ "$MH" -le $((EXPH + 3)) ]; then
+	pass "迷你盒按**逻辑**工作区算：${MW}x${MH} ≈ ${EXPW}x${EXPH}（物理脚印是它的 2 倍）"
+else
+	fail "迷你盒尺寸不对：${MW}x${MH}，期望 ≈ ${EXPW}x${EXPH}"
+fi
+[ "$MX" -ge "$H2X" ] && [ "$MX" -lt "$EDGE" ] && [ "$MY" -ge 0 ] && [ "$MY" -lt 360 ] &&
+	pass "迷你盒落在 scale 2 屏的逻辑范围（${H2X}..${EDGE} × 0..360）" ||
+	fail "迷你盒在 scale 2 屏逻辑范围外：$MX,$MY（应在 ${H2X}..${EDGE}）"
+if shot "$RUNDIR/s7-mini.ppm" "$MX" "$MY" "$MW" "$MH"; then
+	SZ=$(python3 -c "from PIL import Image;print('%dx%d' % Image.open('$RUNDIR/s7-mini.ppm').size)")
+	NB=$(nonbg "$RUNDIR/s7-mini.ppm"); TOT=$((MW * MH * 4))
+	echo "  盒内截图 = $SZ 像素；非壁纸像素 $NB / $TOT"
+	[ "$SZ" = "$((MW * 2))x$((MH * 2))" ] &&
+		pass "scale 2 下按 2 倍物理像素渲染（grim 的 -g 是逻辑坐标、不乘 scale）" ||
+		fail "scale 2 下像素数不对：$SZ，期望 $((MW * 2))x$((MH * 2))"
+	# 盒里大部分是 contain 的透明边（露壁纸）+ 每帧在动的探针，所以用「非壁纸
+	# 像素占比」这种宽判据；**不能**拿「盒里有纯红」判（探针每帧画面不同）。
+	# 门槛取 5% 而不是 10%：本机实测这一条带是 7446/66120（11.3%），贴着 10% 会偶发
+	# FAIL。11.3% 这个读数意味着**内容只占盆盒的一半**（contain 该是 86x95 逻辑 =
+	# 172x190 物理像素，实测 86x95 物理）—— 这条只当「有内容」的信号用，不拿它断言
+	# 内容缩放比（那属于另一条待查的线索，写死会变成假读数）。
+	[ "$NB" -gt $((TOT / 20)) ] &&
+		pass "盒里有客户端内容（非壁纸 $NB / $TOT > 5%）" ||
+		fail "盒里没有内容（非壁纸 $NB / $TOT）"
+fi
+
+# ---- 判据 3：图标贴边裁剪跨缩放边界（scale 2 屏右边缘 → scale 1 邻屏）
+# 邻屏**没有壁纸**（wall.py 只盖它所在那块屏 = HEADLESS-2），拿「非背景像素」判
+# 漏画会 100% 假阳性 —— 必须用**同一条带的像素差分**：正常态先抓一次基线，进图标态
+# 再抓同一条带，两者逐像素相同才算「没漏画」。
+diffpx() { python3 - "$1" "$2" <<'PY'
+import sys
+from PIL import Image
+import numpy as np
+a = np.asarray(Image.open(sys.argv[1]).convert('RGB'), dtype=np.int16)
+b = np.asarray(Image.open(sys.argv[2]).convert('RGB'), dtype=np.int16)
+print(int(((np.abs(a - b).sum(axis=2)) > 6).sum()))
+PY
+}
+unmini; sleep 1.0     # 先回 NONE：mini_edge 只在「从 NONE 进 ICON」时才给
+[ "$(winf w1 mini)" = "none" ] &&
+	pass "先回 NONE（图标那条路只在从 NONE 进 ICON 时给锚点）" ||
+	fail "没回到 NONE：$(winf w1 mini)"
+shot "$RUNDIR/s7-strip-base.ppm" 1920 10 40 80 &&
+	echo "  基线条带（正常态，邻屏逻辑 1920,10 40x80）已抓"
+set_state icon; sleep 1.0
+read -r IX IY IW IH <<< "$(echo "$(geom)" | tr 'x,' ' ')"
+echo "  图标（逻辑）$IX,$IY ${IW}x${IH}  屏=$(winf w1 out)  形态=$(winf w1 mini)  edge=$(winf w1 edge)"
+[ "$(winf w1 mini)" = "icon" ] && pass "进图标态" || fail "没进图标态（mini=$(winf w1 mini)）"
+SPILL=$((IX + IW - EDGE))
+if [ "$SPILL" -gt 0 ] && [ "$SPILL" -le 40 ]; then
+	pass "图标贴右边缘、溢出到邻屏 $SPILL 逻辑 px（overflow 0.4*64 ≈ 26）"
+	if shot "$RUNDIR/s7-strip-icon.ppm" 1920 10 40 80; then
+		D=$(diffpx "$RUNDIR/s7-strip-base.ppm" "$RUNDIR/s7-strip-icon.ppm")
+		echo "  邻屏（scale 1）逻辑 1920,10 40x80：图标态 vs 正常态 差异像素 $D / 3200"
+		[ "$D" = "0" ] &&
+			pass "跨缩放边界不漏画：该条带逐像素相同（差 0/3200）" ||
+			fail "图标漏到邻屏（scale 边界）：差异像素 $D"
+	fi
+	# 对照（不判）：图标在**自己那块屏**上的可见部分有内容
+	if shot "$RUNDIR/s7-icon-self.ppm" "$IX" "$IY" "$((EDGE - IX))" "$IH"; then
+		echo "  自己屏上图标可见那一块 ${IX},$IY $((EDGE - IX))x${IH}：非壁纸像素 $(nonbg "$RUNDIR/s7-icon-self.ppm")"
+	fi
+else
+	fail "图标没贴右边缘溢出（IX=$IX IW=$IW，SPILL=$SPILL）—— 裁剪这条验不了"
+fi
+
+# ---- 判据 4：指针坐标换算（scale 2 屏、FREE 态）
+# 迷你 / 图标态故意吞输入，所以坐标换算只能在 FREE 态测。盒心正好落在内容中心
+# （contain 居中：盒心 ↔ surface 中心），容差 ±3px。两次 motion：一次微移，一次到
+# 目标 —— 「原地不动」不会产生 motion 事件。
+set_state free; sleep 1.2
+read -r FX FY FW FH <<< "$(echo "$(geom)" | tr 'x,' ' ')"
+SW=$(winf w1 sw); SH=$(winf w1 sh)
+./build/vidowmsg focus-window --id "$ID" >/dev/null 2>&1; sleep 0.4
+CX=$((FX + FW / 2)); CY=$((FY + FH / 2))
+echo "  自由小窗（逻辑）$FX,$FY ${FW}x${FH}；盒心 $CX,$CY；surface = ${SW}x${SH}"
+act "pointer-motion $((CX - 7)) $((CY - 5))" 0.3
+act "pointer-motion $CX $CY" 0.5
+GOT=$(grep -a '^probe: motion' "$PLOG" | tail -1 |
+	sed -n 's/probe: motion \([0-9.-]*\),\([0-9.-]*\)/\1 \2/p')
+EX=$(echo "$SW $SH" | awk '{printf "%.0f %.0f", $1 / 2, $2 / 2}')
+echo "  注入 $CX,$CY → 期望客户端 [$SW/2, $SH/2] = $EX，实收 ${GOT:-（空）}"
+python3 - "$GOT" "$EX" <<'PY'
+import sys
+g = sys.argv[1].split()
+e = sys.argv[2].split()
+ok = (len(g) >= 2 and abs(float(g[0]) - float(e[0])) <= 3.0 and
+      abs(float(g[1]) - float(e[1])) <= 3.0)
+print("  PASS  scale 2 下盒心坐标换算正确（客户端收到 = 原生对应点 ±3px）" if ok else
+      "  FAIL  scale 2 下坐标换算错：实收 %s，期望 %s" % (sys.argv[1] or "（空）", sys.argv[2]))
+sys.exit(0 if ok else 1)
+PY
+[ $? -eq 0 ] || FAILED=1
 
 # ================================================================
 exec 9>&-
