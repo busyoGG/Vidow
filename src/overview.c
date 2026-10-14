@@ -550,17 +550,33 @@ static void overview_apply(struct vidow_server *server) {
 
 /* ------------------------------------------------------------- 进出 */
 
-/* 动画引擎给的 t 永远是 0 → 1（见 anim.c）：方向由 on 决定，起点是「这次动画
- * 开始时 t 是多少」（ov->anim_from）。**不能**把 t 直接当进度用 —— 那样退出会
- * 把「进入」重放一遍再瞬间跳回原位（用户报的「点选之后闪弹一下」：先弹回原样、
- * 又缩下来、最后啪一下再弹回去）。中途反向（进到一半再按一次）也从当前进度接着
- * 走，不跳。 */
+/* 动画引擎给的 t 一般走在 0 → 1（见 anim.c），但**过冲曲线会让它冲过 1**（见下面
+ * 的夹取）。方向由 on 决定，起点是「这次动画开始时 t 是多少」（ov->anim_from）。
+ * **不能**把 t 直接当进度用 —— 那样退出会把「进入」重放一遍再瞬间跳回原位（用户报
+ * 的「点选之后闪弹一下」：先弹回原样、又缩下来、最后啪一下再弹回去）。中途反向
+ * （进到一半再按一次）也从当前进度接着走，不跳。 */
 static void overview_update(void *data, double t, double linear) {
 	(void)linear;
 	struct vidow_server *server = data;
 	struct vidow_overview *ov = &server->overview;
 	double from = ov->anim_from;
-	ov->t = ov->on ? from + (1.0 - from) * t : from * (1.0 - t);
+	double v = ov->on ? from + (1.0 - from) * t : from * (1.0 - t);
+	/* ov->t 是**进度（0..1）**，不是位置：它直接当透明度喂场景
+	 * （row_apply 里 wlr_scene_buffer_set_opacity(row->bg, ov->t)）、乘遮罩
+	 * alpha、还当各种 lerp 的系数，所以**必须夹在 0..1**。
+	 * 「t 永远 0 → 1」只在不过冲的曲线下成立，而 easing 是可配的：out_back /
+	 * out_elastic / "bezier … y>1" 都会让 t 冲过 1。实测（用户真机）：
+	 * easing = "out_back 0.18"（冲到 1.18）时按 Mod+O 直接
+	 * `wlr_scene_buffer_set_opacity: Assertion 'opacity >= 0 && opacity <= 1'
+	 * failed` —— 整个合成器跟着死。夹住之后过冲段 = 「提前到 1 然后停住」，
+	 * 也就是那条曲线在这件事上没有过冲（本该如此：进度没有过冲的余地）。
+	 * NaN 也走第一支（!(v >= 0.0) 为真）。 */
+	if (!(v >= 0.0)) {
+		v = 0.0;
+	} else if (v > 1.0) {
+		v = 1.0;
+	}
+	ov->t = v;
 	overview_apply(server);
 }
 

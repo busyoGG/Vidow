@@ -5459,6 +5459,22 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
      - 未做：niri 的 `fixed 1920`（固定像素档）、`preset-window-heights`、`default-column-width {}`（让客户端自己定宽）、
        `always-center-single-column`；窗口规则级的 per-rule 预设覆盖。
 
+282. **修一个会打死合成器的崩溃：过冲缓动曲线（`easing = "out_back …"`）下按 `Mod+O` 进 overview**（用户：「overview现在一打开就崩溃」；2026-10-14）
+     - **现象**：用户真机上 `easing = "out_back 0.18"`（全局缓动曲线，过冲）时一进 overview 整个合成器就死，日志最后一行是
+       `vidow: types/scene/wlr_scene.c:1133: wlr_scene_buffer_set_opacity: Assertion 'opacity >= 0 && opacity <= 1' failed.`
+     - **复现**：把用户那整份 `~/.config/vidow`（含他自己改过的 `04-anim.lua`）拷进临时 `HOME`，headless 起 vidow + 三个 `tools/pattern.py` 窗口，
+       `wtype -M logo -k o` —— 3.98s 处断言命中，进程死。**用仓库默认配置不崩**，所以是「配置里那个值」触发的（不是超椭圆那次改动：它只碰着色器与 `corner_n`）。
+     - **根因**：`src/overview.c` 的 `overview_update()` 把动画引擎缓动后的 `t` 当**进度**直接算进 `ov->t`，而 `ov->t` 会被当**透明度**喂给场景
+       （`row_apply` 里 `wlr_scene_buffer_set_opacity(row->bg, ov->t)`，`overview.c:327`）、乘遮罩 alpha（`:349`）、当各种 lerp 系数（`:746`）。
+       函数注释里那句「动画引擎给的 t 永远是 0 → 1」只在**不过冲**的曲线下成立 —— `out_back` / `out_elastic` / `"bezier … y>1"` 都会让 `t` 冲过 1
+       （实测 `out_back 0.18` 冲到 1.18），于是 `ov->t = 1.18` → wlroots 断言 → 合成器死。
+     - **修法**：在 `overview_update()` 里把算出来的进度夹到 `0..1`（`!(v >= 0.0)` 那一支同时吃掉 NaN），并在注释里写清「`ov->t` 是进度不是位置，所以必须夹」。
+       过冲段的效果 = 「提前到 1 然后停住」，也就是那条曲线在这件事上没有过冲 —— 本该如此（进度没有过冲的余地）。**只夹这一个变量**：
+       全仓库其余 `set_opacity` 调用点都是 0/1 或已经 `clamp01`（`fx.c:62` / `fx.c:3361` / `catchmask.c` / `layer.c`，逐处核过）。
+     - **回归判据**（进 `test-overview.sh` 末尾新一节，4 条）：`set-config easing "out_back 0.18"` → `wtype -M logo -k o` → ① 进程活着；
+       ② `vidowmsg overview` 状态照常（`active=true scale=0.46 rows=1`）；③ 这段日志没有 assert/abort；④ Esc 退出来也还活着。
+       `test-overview.sh` **62 PASS → 66 PASS / 0 FAIL**。
+
 281. **还债：`24-mini.lua` 忘了重生成（`test-defaultconfig.sh` 3 条既有 FAIL）**（用户：无直接要求，是超椭圆那次改动顺手报出来的既有账；2026-10-14）
      - 三条 FAIL 同一根因：S5 把 `mini_fling_speed` 加进 `entries[]`（`src/config.c:611`，类别 23）时
        **忘了重新生成** `config.example/configs/24-mini.lua`（那份是 `--default-config 24-mini.lua` 的**生成物**）。

@@ -695,6 +695,53 @@ PY
 rc=$?
 [ $rc -ne 0 ] && FAILED=1
 
+# ---------------------------------------------------------------- 过冲缓动
+mark "过冲缓动（easing 让 t 冲过 1）按 Mod+O 不许把合成器打死"
+# 用户真机复现：`easing = "out_back 0.18"`（t 冲到 1.18）时进 overview，
+# ov->t 跟着冲到 1.18 -> wlr_scene_buffer_set_opacity 断言 -> **整个合成器死**。
+# 根因：overview_update() 把缓动后的 t 当进度直接喂 set_opacity，而注释里
+# 「t 永远 0 → 1」只在不过冲的曲线下成立。判据 = 进程活着 + 状态照常 + 日志无 assert。
+start_vidow 1
+python3 tools/wall.py >/dev/null 2>&1 &
+sleep 1.0
+python3 tools/pattern.py ov-back >/dev/null 2>&1 &
+sleep 1.2
+./build/vidowmsg set-config easing "out_back 0.18" >/dev/null 2>&1
+sleep 0.3
+wtype -M logo -k o >/dev/null 2>&1
+sleep 1.2
+if kill -0 "$VIDOW_PGID" 2>/dev/null; then
+	pass "过冲曲线（out_back 0.18）下进 overview：合成器还活着"
+else
+	fail "过冲曲线下进 overview：合成器被打死了（opacity 断言）"
+fi
+./build/vidowmsg overview > "$RUNDIR/ov-overshoot.json" 2>&1
+python3 - "$RUNDIR/ov-overshoot.json" <<'PY'
+import json, sys
+try:
+	d = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception as e:                                  # 进程死了就没有 JSON
+	print("  FAIL  过冲曲线下 overview 状态查不出来：%s" % e)
+	sys.exit(1)
+ok = d.get("active") is True and 0.0 < (d.get("scale") or 0.0) <= 1.0
+print("  %s  过冲曲线下 overview 状态照常（active=%s scale=%s rows=%s）" %
+      ("PASS" if ok else "FAIL", d.get("active"), d.get("scale"), d.get("rows")))
+sys.exit(0 if ok else 1)
+PY
+[ $? -ne 0 ] && FAILED=1
+if grep -ai "Assertion\|abort" "$LOG" >/dev/null 2>&1; then
+	fail "过冲这一段日志里有 assert / abort"
+else
+	pass "过冲这一段日志里没有 assert / abort"
+fi
+wtype -k Escape >/dev/null 2>&1
+sleep 1.0
+if kill -0 "$VIDOW_PGID" 2>/dev/null; then
+	pass "退出来也还活着（过冲曲线进出各一次）"
+else
+	fail "退出 overview 时死了"
+fi
+
 echo
 if [ $FAILED -eq 0 ]; then
 	echo "test-overview.sh: OK"
