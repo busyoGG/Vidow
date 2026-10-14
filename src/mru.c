@@ -1349,33 +1349,107 @@ void vidow_mru_open(struct vidow_server *server, int dir, const char *app_id,
 	vidow_ipc_emit_note(server, "mru-opened");
 }
 
-void vidow_mru_step(struct vidow_server *server, int dir) {
-	struct vidow_mru *mru = &server->mru;
-	if (!mru->on || mru->n <= 0) {
-		return;
-	}
-	int idx = -1;
+/* 选中项在**清单本身**（order，屏幕顺序）里的下标，找不到 = -1。
+ * 步进一律按这个下标走 —— 和连点 Tab 那条路（vidow_mru_step）同一个坐标系，
+ * 不受「装不下的项被挤出去」影响（那是排版的事，见 mru_selected_index）。 */
+static int mru_order_index(const struct vidow_mru *mru) {
 	for (int i = 0; i < mru->n; i++) {
 		if (mru->order[i] == mru->selected) {
-			idx = i;
-			break;
+			return i;
 		}
 	}
+	return -1;
+}
+
+/* 步进的算术：从当前选中项走 dir 格，返回新的下标。
+ *   wrap = true   到头绕回（**Alt+Tab 的语义**，见 README「两个顺序」—— 别改）
+ *   wrap = false  到边停住（滚轮 / 方向键：到底了就是不动，不是绕回）
+ * 到边停住时返回的就是原下标，调用方靠「新下标 == 旧下标」认「没动」。 */
+static int mru_step_index(const struct vidow_mru *mru, int dir, bool wrap) {
+	int idx = mru_order_index(mru);
 	if (idx < 0) {
 		idx = 0;
 	}
 	idx += dir > 0 ? 1 : -1;
 	if (idx < 0) {
-		idx = mru->n - 1;
+		idx = wrap ? mru->n - 1 : 0;
 	}
 	if (idx >= mru->n) {
-		idx = 0;
+		idx = wrap ? 0 : mru->n - 1;
 	}
+	return idx;
+}
+
+/* 走到第 idx 格：改选中项，面板显形时重排（日志由各自的调用方打 —— Tab / 滚轮 /
+ * 方向键的说法不一样）。 */
+static void mru_select_index(struct vidow_server *server, int idx) {
+	struct vidow_mru *mru = &server->mru;
 	mru->selected = mru->order[idx];
 	if (mru->shown) {
 		mru_refresh(server);
 	}
+}
+
+void vidow_mru_step(struct vidow_server *server, int dir) {
+	struct vidow_mru *mru = &server->mru;
+	if (!mru->on || mru->n <= 0) {
+		return;
+	}
+	int idx = mru_step_index(mru, dir, true);
+	mru_select_index(server, idx);
 	wlr_log(WLR_DEBUG, "mru: 走到 #%d %s", idx, mru_name(mru->selected));
+}
+
+/* 滚轮：**选中项换个格**（niri 的窗口切换器也是「滚一格 = 往前走一项」）。
+ * 竖直轴往下滚（amount > 0）= 往后一项（和连点 Tab / 面板里往右一格同一个方向），
+ * 往上滚 = 往前一项；水平和竖直一样吃掉，只是不动选中项（面板里没有「左右」这
+ * 回事 —— 清单是一行，横向滚没有对应的语义）。
+ *
+ * **到边停住，不循环** —— 和 Alt+Tab 的「到头绕回」故意不一样：绕回是「连点 Tab
+ * 一路走」的语义（按下那一刻就知道自己在往前走），滚轮是「来回微调」的语义，
+ * 到头再滚一下跳到另一头会让人找不着自己在哪。别当 bug 改回去（README 也写了）。
+ *
+ * 返回是否消费这次滚轮：切换器没开（或清单空）= 不消费（交给别处），开着 = 一律
+ * 消费（连空滚一格都吃掉，一个字都不透给客户端 —— 面板开着时输入是模态的）。 */
+bool vidow_mru_wheel(struct vidow_server *server,
+		enum wl_pointer_axis orientation, double amount) {
+	struct vidow_mru *mru = &server->mru;
+	if (!mru->on || mru->n <= 0) {
+		return false;
+	}
+	if (amount == 0) {
+		return true; /* 空滚一格：吃掉，别透给客户端 */
+	}
+	if (orientation != WL_POINTER_AXIS_VERTICAL_SCROLL) {
+		return true; /* 横向滚：吃掉，不动选中项 */
+	}
+	int dir = amount > 0 ? 1 : -1;
+	int old = mru_order_index(mru);
+	int idx = mru_step_index(mru, dir, false);
+	if (idx == old) {
+		wlr_log(WLR_INFO, "mru: 滚轮到边（#%d，不动）", idx);
+		return true;
+	}
+	mru_select_index(server, idx);
+	wlr_log(WLR_INFO, "mru: 滚轮 → #%d %s", idx, mru_name(mru->selected));
+	return true;
+}
+
+/* 方向键（input.c 的 MRU 键块调）：走和滚轮同一套 clamp 步进 —— 到边停住、不
+ * 循环。和 Alt+Tab 的区别见 vidow_mru_wheel 上面那段。 */
+void vidow_mru_step_clamp(struct vidow_server *server, int dir) {
+	struct vidow_mru *mru = &server->mru;
+	if (!mru->on || mru->n <= 0) {
+		return;
+	}
+	int old = mru_order_index(mru);
+	int idx = mru_step_index(mru, dir, false);
+	if (idx == old) {
+		wlr_log(WLR_INFO, "mru: 方向键到头（#%d，不动）", idx);
+		return;
+	}
+	mru_select_index(server, idx);
+	wlr_log(WLR_INFO, "mru: 方向键 → #%d %s", idx, mru_name(mru->selected));
 }
 
 /* 关掉（画面恢复）。commit = true 时先把焦点给选中的那个。 */

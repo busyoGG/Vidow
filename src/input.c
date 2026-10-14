@@ -196,9 +196,12 @@ static void keyboard_key(struct wl_listener *listener, void *data) {
 			inhibited) || handled;
 	}
 
-	/* Alt+Tab 切换器开着（按住修饰键期间）：键盘也归它管 —— 窗口马上就要换，
-	 * 按键给谁都可能给错。Esc 取消、Enter 确认；Alt+Tab 那两条绑定在上面已经
-	 * 处理过了（键会重复，每重复一次就是往前走一格）。 */
+	/* Alt+Tab 切换器开着（**按住修饰键期间，从按下 Alt 那一刻算起**）：键盘也归
+	 * 它管 —— 窗口马上就要换，按键给谁都可能给错。Esc 取消、Enter 确认、方向键
+	 * 换个格（Left/Up = 往前、Right/Down = 往后，和滚轮同一套 clamp 步进：**到边
+	 * 停住、不循环**）；Alt+Tab 那两条绑定在上面已经处理过了（键会重复，每重复
+	 * 一次就是往前走一格 —— 那条路是「到头绕回」，故意和方向键 / 滚轮不一样）。
+	 * 没绑的键（打字那些）到这里一律吃掉，不透给客户端。 */
 	if (vidow_mru_active(server)) {
 		if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED && nsyms > 0) {
 			if (syms[0] == XKB_KEY_Escape) {
@@ -206,6 +209,12 @@ static void keyboard_key(struct wl_listener *listener, void *data) {
 			} else if (syms[0] == XKB_KEY_Return ||
 					syms[0] == XKB_KEY_KP_Enter) {
 				vidow_mru_commit(server);
+			} else if (syms[0] == XKB_KEY_Left ||
+					syms[0] == XKB_KEY_Up) {
+				vidow_mru_step_clamp(server, -1);
+			} else if (syms[0] == XKB_KEY_Right ||
+					syms[0] == XKB_KEY_Down) {
+				vidow_mru_step_clamp(server, 1);
 			}
 		}
 		return;
@@ -1135,10 +1144,14 @@ void vidow_pointer_motion(struct vidow_server *server, uint32_t time_msec) {
 		return;
 	}
 
-	/* 切换器显形之后指针也归它管：移动 = 点亮底下那一项（窗口都被摆到预览位置上
-	 * 去了，命中坐标同样对不上，别转给客户端）。 */
-	if (vidow_mru_showing(server)) {
-		vidow_mru_hover(server, server->cursor->x, server->cursor->y);
+	/* 切换器开着指针就归它管（**从按下 Alt 那一刻算起**，不等面板显形）：面板
+	 * 显形之后移动 = 点亮底下那一项；还没显形的 open_delay 期光标底下还是真窗口，
+	 * 事件一转给客户端就漏了（用户口径：模态从按下 Alt 那一刻算起）—— 而且那会儿
+	 * 也不该有 hover 聚焦，不然「按住 Alt 的瞬间鼠标扫过谁就把焦点给了谁」。 */
+	if (vidow_mru_active(server)) {
+		if (vidow_mru_showing(server)) {
+			vidow_mru_hover(server, server->cursor->x, server->cursor->y);
+		}
 		return;
 	}
 
@@ -1412,19 +1425,30 @@ void vidow_pointer_button(struct vidow_server *server, uint32_t button,
 	}
 
 	/* Alt+Tab 切换器：点一下卡片 = 直接切到那个窗口（不用等松修饰键），点空白 =
-	 * 什么都不做。点选那次的按下被吃掉了，对应的松手也一起吃掉。
-	 * 「面板已经关了、只剩 swallow_release 还挂着」时的按下不拦（照常走下面的绑定表）
-	 * —— 不然万一哪次松手丢了，所有按键就永远被吞在这儿。 */
-	if (vidow_mru_showing(server) || server->mru.swallow_release) {
+	 * 什么都不做。移动归它管从**按下 Alt 那一刻**就算（见上面 motion 那一段），
+	 * 指针的按下 / 松开也一样：open_delay 期面板还没摆出来，这一下要是漏给客户端
+	 * 就是「按住 Alt 还没看见面板，鼠标已经点进窗口里了」。
+	 *
+	 * 吃掉的按下要记下来，好把它对应的松手也吃掉（vidow_mru_click 也置这个标志；
+	 * 不这么做客户端会收到一个**没有按下配对的松开**，和第 1370 行那段长注释说的
+	 * 是同一回事）。 */
+	if (vidow_mru_active(server)) {
 		if (!pressed) {
 			server->mru.swallow_release = false;
 			return;
 		}
-		if (vidow_mru_showing(server)) {
-			if (button == BTN_LEFT) {
-				vidow_mru_click(server, server->cursor->x,
-					server->cursor->y);
-			}
+		server->mru.swallow_release = true;
+		if (vidow_mru_showing(server) && button == BTN_LEFT) {
+			vidow_mru_click(server, server->cursor->x, server->cursor->y);
+		}
+		return;
+	}
+
+	/* 「面板已经关了、只剩 swallow_release 还挂着」时的按下不拦（照常走下面的
+	 * 绑定表）—— 不然万一哪次松手丢了，所有按键就永远被吞在这儿。 */
+	if (server->mru.swallow_release) {
+		if (!pressed) {
+			server->mru.swallow_release = false;
 			return;
 		}
 	}
@@ -1619,13 +1643,31 @@ void vidow_pointer_axis(struct vidow_server *server,
 	/* 有些设备只发离散值（老鼠标），所以两个都看 */
 	double amount = delta != 0 ? delta : delta_discrete;
 
-	/* overview 里滚轮滚的是**工作区列表**（上下预览那一列），一次一格。往下滚
-	 * （amount > 0）就往下看后面的工作区。窗口自己的横向预览不归它管 —— 那是
-	 * 「移动窗口焦点」那些键的事（跟着工作区自己的视口走，见 overview.c）。 */
+	/* overview 里滚轮滚的是**工作区列表**（上下预览那一列），**一次一格 = 一块
+	 * 工作区**（格距 = 行距 `row_h + OV_ROW_GAP`，在 overview.c 里算并吸附整数倍；
+	 * 用户：「overview滚轮操作应该是巡航一次滚到一个工作区」）。往下滚（amount > 0）
+	 * 就往下看后面的工作区。窗口自己的横向预览不归它管 —— 那是「移动窗口焦点」那些
+	 * 键的事（跟着工作区自己的视口走，见 overview.c）。
+	 *
+	 * **只认竖直轴**：滚轮左右倾（横向轴）以前也滚同一个列表，那是错的 —— 概览里
+	 * 没有横向可滚的东西（一行的横向预览跟工作区自己的视口走），吃掉不动作。 */
 	if (vidow_overview_active(server)) {
-		if (amount != 0) {
-			vidow_overview_scroll(server, amount > 0 ? 60 : -60);
+		if (orientation == WL_POINTER_AXIS_VERTICAL_SCROLL && amount != 0) {
+			vidow_overview_scroll(server, amount > 0 ? 1 : -1);
 		}
+		return;
+	}
+
+	/* Alt+Tab 切换器开着（**从按下 Alt 那一刻算起**，不等面板显形）：滚轮归它管
+	 * —— 竖直轴 = 选中项往后 / 往前一格（**到边停住，不循环**，见 mru.c），横向轴
+	 * 吃掉不动作。面板开着时输入是模态的，一格都不透给别处。
+	 *
+	 * 必须排在**小窗档位**（下面那段）之前：用户撞的就是这个 —— 按住 Alt 滚滚轮，
+	 * 光标压在某个迷你 / 图标小窗上时先被「档位状态机」抢走；再往下走还会命中绑定
+	 * 表（默认配置里 `Alt+wheel-up/down` = 换工作区，见 configs/14-keys.lua），
+	 * 结果「按着 Alt 想切窗口，工作区真的跳了」。 */
+	if (vidow_mru_active(server)) {
+		vidow_mru_wheel(server, orientation, amount);
 		return;
 	}
 

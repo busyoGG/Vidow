@@ -224,6 +224,12 @@ void vidow_gesture_swipe_begin(struct vidow_server *server, int fingers) {
 	if (server->locked) {
 		return;
 	}
+	/* 切换器（Alt+Tab）开着：手势同样不参与 —— 面板开着时输入是模态的，手势动的
+	 * 又是窗口 / 视口（和锁定期间同一个理由，见上面注释）。begin / update 挡在
+	 * 这儿；end 照旧放行，好让切换器打开之前就开着的手势能自己收尾。 */
+	if (vidow_mru_active(server)) {
+		return;
+	}
 	/* 上一个手势还没收尾（设备抽风 / 注入没配对）：先收干净。 */
 	if (g.active) {
 		vidow_gesture_swipe_end(server, true);
@@ -254,6 +260,12 @@ void vidow_gesture_swipe_update(struct vidow_server *server, int fingers,
 	 * （方案 §2 环节 3）。begin / update 挡在这里；end 照旧放行，好让锁定
 	 * 之前就开着的手势能自己收尾。 */
 	if (server->locked) {
+		return;
+	}
+	/* 切换器（Alt+Tab）开着：手势同样不参与 —— 面板开着时输入是模态的，手势动的
+	 * 又是窗口 / 视口（和锁定期间同一个理由，见上面注释）。begin / update 挡在
+	 * 这儿；end 照旧放行，好让切换器打开之前就开着的手势能自己收尾。 */
+	if (vidow_mru_active(server)) {
 		return;
 	}
 	if (!g.active || g.kind != VIDOW_GESTURE_SWIPE || fingers != g.fingers) {
@@ -303,6 +315,12 @@ void vidow_gesture_pinch_begin(struct vidow_server *server, int fingers) {
 	if (server->locked) {
 		return;
 	}
+	/* 切换器（Alt+Tab）开着：手势同样不参与 —— 面板开着时输入是模态的，手势动的
+	 * 又是窗口 / 视口（和锁定期间同一个理由，见上面注释）。begin / update 挡在
+	 * 这儿；end 照旧放行，好让切换器打开之前就开着的手势能自己收尾。 */
+	if (vidow_mru_active(server)) {
+		return;
+	}
 	if (g.active) {
 		vidow_gesture_pinch_end(server, true);
 	}
@@ -316,6 +334,12 @@ void vidow_gesture_pinch_update(struct vidow_server *server, int fingers,
 	 * （方案 §2 环节 3）。begin / update 挡在这里；end 照旧放行，好让锁定
 	 * 之前就开着的手势能自己收尾。 */
 	if (server->locked) {
+		return;
+	}
+	/* 切换器（Alt+Tab）开着：手势同样不参与 —— 面板开着时输入是模态的，手势动的
+	 * 又是窗口 / 视口（和锁定期间同一个理由，见上面注释）。begin / update 挡在
+	 * 这儿；end 照旧放行，好让切换器打开之前就开着的手势能自己收尾。 */
+	if (vidow_mru_active(server)) {
 		return;
 	}
 	(void)server;
@@ -345,6 +369,12 @@ void vidow_gesture_hold_begin(struct vidow_server *server, int fingers) {
 	 * （方案 §2 环节 3）。begin / update 挡在这里；end 照旧放行，好让锁定
 	 * 之前就开着的手势能自己收尾。 */
 	if (server->locked) {
+		return;
+	}
+	/* 切换器（Alt+Tab）开着：手势同样不参与 —— 面板开着时输入是模态的，手势动的
+	 * 又是窗口 / 视口（和锁定期间同一个理由，见上面注释）。begin / update 挡在
+	 * 这儿；end 照旧放行，好让切换器打开之前就开着的手势能自己收尾。 */
+	if (vidow_mru_active(server)) {
 		return;
 	}
 	if (g.active) {

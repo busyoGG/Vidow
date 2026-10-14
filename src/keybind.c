@@ -629,6 +629,49 @@ static bool keybind_locked_key(struct vidow_server *server, xkb_keysym_t sym,
 
 /* ------------------------------------------------- 会话锁期间的键位白名单 结束 */
 
+/* ------------------------------------------------- 切换器期间的键位白名单 */
+
+/* 动作串是不是就是 name（后面可以跟参数）。动作在 bind->action 里是原样存着的
+ * （`next-window same-app` 这种），所以按前缀比 + 边界。 */
+static bool action_named(const char *action, const char *name) {
+	size_t n = strlen(name);
+	if (strncmp(action, name, n) != 0) {
+		return false;
+	}
+	return action[n] == '\0' || action[n] == ' ' || action[n] == '\t';
+}
+
+/* 切换器开着期间放行的动作：**切换器自己的两个步进动作**。Alt+Tab / Alt+Shift+Tab
+ * 和方向键（方向键见 input.c 的 MRU 键块）都落在这两个动作上，别的动作一律不跑
+ * —— 用户的口径是「面板开着时输入是模态的」：这时候按 Mod+J 不该换工作区、按
+ * Mod+T 不该起终端、按 Alt+滚轮不该换工作区（见 input.c 的滚轮入口）。 */
+static bool bind_mru_allowed(const struct vidow_keybind *bind) {
+	return action_named(bind->action, "next-window") ||
+		action_named(bind->action, "previous-window");
+}
+
+/* 切换器开着时的一个按键：只跑白名单里的动作，其余吃掉（返回 true）。
+ * 命中但不放行的那条打一条 INFO —— 「被白名单挡住」的直接证据（test-mru.sh 的
+ * B5 就断言这一行：光看「动作没发生」不够，得能区分「被挡」和「压根没命中」）。 */
+static bool keybind_mru_key(struct vidow_server *server, xkb_keysym_t sym,
+		bool repeated, uint32_t mods, bool inhibited) {
+	struct vidow_keybind *bind = bind_lookup(server, VIDOW_SRC_KEY,
+		VIDOW_BIND_PRESS, sym, 0, mods, inhibited);
+	if (bind == NULL) {
+		return true; /* 没绑的键（打字那些）：照样吃掉，不透给客户端 */
+	}
+	if (!bind_mru_allowed(bind)) {
+		wlr_log(WLR_INFO, "mru: 绑定 %s（%s）切换器开着期间不生效 —— "
+			"白名单只有 next-window / previous-window",
+			bind->trigger, bind->action);
+		return true;
+	}
+	bind_run(server, bind, repeated);
+	return true;
+}
+
+/* ------------------------------------------------- 切换器期间的键位白名单 结束 */
+
 bool vidow_keybind_key(struct vidow_server *server, xkb_keysym_t sym,
 		bool pressed, uint32_t mods, bool inhibited) {
 	/* 会话锁（S3）：锁定期间只认白名单（VT 切换），其余绑定一律不跑 —— 否则
@@ -640,6 +683,17 @@ bool vidow_keybind_key(struct vidow_server *server, xkb_keysym_t sym,
 	bool repeated = held_note(sym, pressed);
 	if (!pressed) {
 		return pending_release(server, VIDOW_SRC_KEY, sym, 0, mods);
+	}
+
+	/* 切换器开着（从按下 Alt 那一刻算起）：只认它自己的两个步进动作，其余绑定
+	 * 一律不跑（面板开着时输入是模态的）。
+	 *
+	 * **这一闸必须在 held_note / pending_release 之后**：那一套管着「连点算不算
+	 * 重复」（repeatable）和「单独一个修饰键」的武装 / 收尾，切换器自己退出也
+	 * 靠修饰键松开那条路 —— 短路在它们前面会把 Alt+Tab 连点 / 单击 / 松开全打乱
+	 * （test-mru.sh 第 1~5 条盯的就是这个）。 */
+	if (vidow_mru_active(server)) {
+		return keybind_mru_key(server, sym, repeated, mods, inhibited);
 	}
 
 	uint32_t bit = modifier_bit(sym);
@@ -686,6 +740,11 @@ bool vidow_keybind_button(struct vidow_server *server, uint32_t button,
 	if (server->locked) {
 		return true;
 	}
+	/* 切换器开着：鼠标键一个绑定都不跑（同上，第一道闸在 input.c 的指针入口
+	 * —— 那儿连「点空白 / 点卡片」都要自己处理，够不着这儿的绑定表）。 */
+	if (vidow_mru_active(server)) {
+		return true;
+	}
 	if (pressed) {
 		/* 点了鼠标就不算「只按了一下修饰键」。 */
 		pending_disarm_taps();
@@ -712,6 +771,12 @@ bool vidow_keybind_wheel(struct vidow_server *server,
 		bool inhibited) {
 	/* 会话锁：锁定期间的滚轮绑定也不跑（同上，第二道闸）。 */
 	if (server->locked) {
+		return true;
+	}
+	/* 切换器开着：滚轮绑定也不跑（同上，第二道闸 —— 第一道闸在 input.c 的
+	 * vidow_pointer_axis，那儿滚轮归切换器自己：选中项 ±1）。默认配置里
+	 * `Alt+wheel-up/down` = 换工作区，用户撞的就是它。 */
+	if (vidow_mru_active(server)) {
 		return true;
 	}
 	if (amount == 0) {

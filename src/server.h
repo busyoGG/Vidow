@@ -3585,6 +3585,13 @@ bool vidow_mru_showing(const struct vidow_server *server);
 void vidow_mru_open(struct vidow_server *server, int dir, const char *app_id,
 		enum vidow_mru_scope scope);
 void vidow_mru_step(struct vidow_server *server, int dir);
+/* 滚轮：竖直轴 = 选中项换个格（**到边停住，不循环** —— 和 vidow_mru_step 的
+ * 绕回故意不一样，别当 bug 改回去，见 mru.c）；横向轴吃掉但不动选中项。
+ * 返回是否消费这次滚轮（切换器没开 = false；开着 = 连空滚一格都吃掉）。 */
+bool vidow_mru_wheel(struct vidow_server *server,
+		enum wl_pointer_axis orientation, double amount);
+/* 方向键：和滚轮同一套 clamp 步进（到边停住，不循环）。 */
+void vidow_mru_step_clamp(struct vidow_server *server, int dir);
 /* 鼠标在面板上动：命中的那一项点亮（返回 true = 确实换了高亮项，画面要重画）。
  * 只改样式，不动选中 —— 选中的那个还是键盘在走。 */
 bool vidow_mru_hover(struct vidow_server *server, double sx, double sy);

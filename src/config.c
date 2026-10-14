@@ -377,13 +377,17 @@ static const struct entry entries[] = {
 
 	{ "mru_enabled",     K_BOOL,   OFF(mru_enabled),     SZ(mru_enabled), 14,
 		"Alt+Tab 的窗口切换器（niri 的 recent windows，见 src/mru.c）：关掉就不"
-		"记账，那两个动作也不认" },
+		"记账，那两个动作也不认。面板开着期间输入是**模态**的 —— 从**按下 Alt**"
+		"那一刻算起（不等面板显形）：键盘 / 鼠标 / 手势都不透给窗口，只认切换器"
+		"自己的键（Esc / Enter / 方向键）" },
 	{ "mru_debounce_ms", K_INT,    OFF(mru_debounce_ms), SZ(mru_debounce_ms), 14,
 		"焦点要「待够」多久才算真的用过（毫秒）：键盘一路导航碰到的窗口只算路过，"
 		"0 = 立刻记账" },
 	{ "mru_open_delay_ms", K_INT,  OFF(mru_open_delay_ms), SZ(mru_open_delay_ms), 14,
 		"按住多久面板才显形（毫秒）：快速点一下 Alt+Tab 只想切窗口、不该整屏闪一下，"
-		"0 = 立刻显形" },
+		"0 = 立刻显形。按住期间滚轮 = 选中项 ±1、方向键 Left/Up = 前一个 / "
+		"Right/Down = 后一个，**到头停住、不循环** —— 故意和 Alt+Tab 的「到头绕回」"
+		"不一样，别当 bug 改回去" },
 	{ "mru_scope",       K_MRU_SCOPE, OFF(mru_scope),    SZ(mru_scope), 14,
 		"列哪些窗口：workspace（默认，当前工作区）/ all（所有屏所有工作区）/ "
 		"output（当前这块屏）" },

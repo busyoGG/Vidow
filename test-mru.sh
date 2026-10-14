@@ -24,6 +24,15 @@
 #  13) 浮层：切换器**不动窗口** —— 面板开着期间每个窗口的位置/尺寸一字不变；
 #      卡片里画的是窗口内容（缩略图，全亮），桌面那层被压暗（面板浮在窗口之上）；
 #      预览走装饰管线 → 形状和真窗口一样（圆角 / 描边 / 阴影）
+#  15) 滚轮 = 选中项 ±1（日志 `mru: 滚轮 → #`）；**到边停住、不循环**（日志
+#      `mru: 滚轮到边`）—— 故意和 Alt+Tab 的绕回不一样；滚轮不改布局、不换工作区
+#      （测试配置里就写着 `Alt+wheel-up/down` = workspace up/down，改前真的会跳）
+#  16) 模态（B1/B2）：面板按着时字母键进不了客户端；open_delay 期的点击 / 移动
+#      也不透给窗口（模态从**按下 Alt** 那一刻算起，不等面板显形）
+#  17) 模态（B3/B4/B5）：Mod+滚轮不换列；切换器自己的键照常（方向键 ±1 且到边停住、
+#      Esc / Return、点卡片）；别的绑定被白名单挡住（日志「切换器开着期间不生效」）
+#  注：手势（触控板滑 / 捏）也按同一套挡了（src/gesture.c 每个入口一道闸），但这份
+#      脚本里没配手势绑定，没法在这儿判 —— 手势本身的回归在 test-gesture.sh。
 set -u
 cd "$(dirname "$0")"
 
@@ -40,6 +49,7 @@ mark() { echo; echo "== $1 =="; }
 
 cleanup() {
 	stop_clients
+	[ -n "${KEYPROBE_PID:-}" ] && kill "$KEYPROBE_PID" 2>/dev/null
 	if [ -n "$VIDOW_PGID" ]; then
 		kill -TERM -- "-$VIDOW_PGID" 2>/dev/null
 		sleep 0.4
@@ -55,7 +65,7 @@ stop_clients() {
 		[ "$pid" = "$$" ] && continue
 		cmd=$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null) || continue
 		case "$cmd" in
-		*pattern.py*|*wall.py*) kill "$pid" 2>/dev/null ;;
+		*pattern.py*|*wall.py*|*keyprobe.py*) kill "$pid" 2>/dev/null ;;
 		esac
 	done 2>/dev/null
 }
@@ -79,6 +89,18 @@ window_move_ms = 120
 mru = { open_delay_ms = 0, debounce_ms = 0, card_padding = 12 }
 vidow.bind("Alt+Tab", "next-window")
 vidow.bind("Alt+Shift+Tab", "previous-window")
+-- 用户现场那两条（configs/14-keys.lua 的默认键位里就有）：按住 Alt 滚滚轮 =
+-- 换工作区。A3 / B3 拿它们当**证伪手段** —— 改前按住 Alt 滚一下，工作区真的会跳。
+vidow.bind("Alt+wheel-up", "workspace up")
+vidow.bind("Alt+wheel-down", "workspace down")
+-- 「Mod+滚轮 = 换列」在切换器开着时的那一份：切换器自己按着 Alt，所以写成
+-- Mod+Alt+滚轮（只写 Mod 的话按着 Alt 根本匹配不上，测不到东西）。
+vidow.bind("Mod+Alt+wheel-up", "focus-column left")
+vidow.bind("Mod+Alt+wheel-down", "focus-column right")
+-- B5 的对照组：一条「别的动作」的绑定，切换器开着时必须被白名单挡住。
+-- 用 left（不是 right）：探针窗口是最后开的、就在最右边，right 到头是空转，
+-- 焦点不变分不清「被挡」和「到头」。
+vidow.bind("Alt+j", "focus-column left")
 EOF
 
 export XDG_RUNTIME_DIR="$RUNDIR/run"
@@ -161,6 +183,36 @@ hold_tabs() { # hold_tabs <tab 次数> <按住多久再松手 ms>
 	local n=$1 hold=$2
 	local args=(-M alt)
 	for _ in $(seq 1 "$n"); do args+=(-k Tab -d 120); done
+	args+=(-s "$hold" -m alt)
+	wtype "${args[@]}" >/dev/null 2>&1 &
+	WTYPE_PID=$!
+}
+
+# 按住 Alt + 一次 Tab（把切换器打开），**再把别的修饰键也按上**，停住 hold_ms 一起松开。
+# B3 用：切换器开着 + Mod 也按着（「Mod+滚轮 = 换列」那一份绑定才有机会命中）。
+# 顺序不能反：先按 Mod 再按 Tab 的话，那一串修饰键是「Mod+Alt+Tab」，
+# `Alt+Tab` 绑定匹配不上（mods 要正好相等）—— 切换器根本不会开。
+hold_alt_tab_mod() { # hold_alt_tab_mod <hold_ms> <修饰键…>
+	local hold=$1
+	shift
+	local args=(-M alt -k Tab -d 150)
+	for m in "$@"; do args+=(-M "$m"); done
+	args+=(-s "$hold")
+	for m in "$@"; do args+=(-m "$m"); done
+	args+=(-m alt)
+	wtype "${args[@]}" >/dev/null 2>&1 &
+	WTYPE_PID=$!
+}
+
+# 按住 Alt，依次敲一串键（第一个一般是 Tab：把切换器打开），停住 hold_ms 再松开 Alt。
+# **必须在同一个 wtype 里敲**：修饰键状态是**每块键盘**的，另起一个 wtype 敲出来的
+# 键在 vidow 那边 mods = 0，`Alt+…` 的绑定根本匹配不上（B5 要的就是「被白名单挡住
+# 的那条绑定本来会命中」）。
+hold_alt_keys() { # hold_alt_keys <hold_ms> <键…>
+	local hold=$1
+	shift
+	local args=(-M alt)
+	for k in "$@"; do args+=(-k "$k" -d 150); done
 	args+=(-s "$hold" -m alt)
 	wtype "${args[@]}" >/dev/null 2>&1 &
 	WTYPE_PID=$!
@@ -525,7 +577,336 @@ wait $WTYPE_PID 2>/dev/null
 sleep 0.6
 ./build/vidowmsg set-config mru_scope workspace >/dev/null 2>&1
 
-mark "12) 收尾"
+# ------------------------------------------------- 滚轮 / 模态（A1~A4、B1~B5）
+
+# 选中项在清单里的**下标**（entries 是屏幕顺序，和 Tab 的步进同一个顺序）
+sel_idx() { mq "[e['id'] for e in d['entries']].index(d['selected'])"; }
+ent_n() { mq "len(d['entries'])"; }
+
+mark "12) A1/A2 滚轮 = 选中项 ±1；到边停住，不循环"
+# 收小一点：5 张卡片全在清单里（不然选中项一动排版跟着滚、清单长度也变，下标对不上）
+./build/vidowmsg set-config mru_max_scale 0.25 >/dev/null 2>&1
+./build/vidowmsg set-config mru_max_height 200 >/dev/null 2>&1
+./build/vidowmsg set-config mru_layout strip >/dev/null 2>&1
+hold_tabs 1 14000
+sleep 0.7
+ni_0=$(sel_idx)
+nn=$(ent_n)
+geo_0=$(win_geo)
+nlog_0=$(grep -ac "mru: 滚轮 → #" "$LOG")
+# 往下滚一格 = 往后一项（和连点 Tab / 面板里往右一格同一个方向）
+msg pointer-scroll 0 1
+sleep 0.4
+ni_1=$(sel_idx)
+[ "$ni_1" = "$((ni_0 + 1))" ] \
+	&& pass "往下滚一格：选中项下标 $ni_0 → $ni_1（+1）" \
+	|| fail "往下滚一格没 +1：$ni_0 → $ni_1"
+nlog_1=$(grep -ac "mru: 滚轮 → #" "$LOG")
+[ "$nlog_1" -gt "$nlog_0" ] \
+	&& pass "日志：mru: 滚轮 → #（$nlog_0 → $nlog_1）" \
+	|| fail "日志里没有「mru: 滚轮 → #」"
+# 往上滚一格 = 往前一项（回到刚才那格）
+msg pointer-scroll 0 -1
+sleep 0.4
+[ "$(sel_idx)" = "$ni_0" ] && pass "往上滚一格：回到下标 $ni_0" \
+	|| fail "往上滚一格没回到 $ni_0（$(sel_idx)）"
+
+# 到第一个：连发足够多次一定贴到 0；再往上滚两次必须**不动**（不绕回最后一格）
+for _ in $(seq 1 $((nn + 1))); do msg pointer-scroll 0 -1; sleep 0.12; done
+sleep 0.3
+[ "$(sel_idx)" = "0" ] && pass "往上滚到头 = 清单第一格" \
+	|| fail "往上滚到头停在 $(sel_idx)（期望 0）"
+edge_0=$(grep -ac "mru: 滚轮到边" "$LOG")
+msg pointer-scroll 0 -1; sleep 0.2
+msg pointer-scroll 0 -1; sleep 0.3
+[ "$(sel_idx)" = "0" ] && pass "到第一格再往上滚：不动（没绕回最后一格）" \
+	|| fail "到第一格还往上滚，选中项跑到 $(sel_idx) 了"
+edge_1=$(grep -ac "mru: 滚轮到边" "$LOG")
+[ "$edge_1" = "$((edge_0 + 2))" ] \
+	&& pass "日志：到边两次（mru: 滚轮到边，$edge_0 → $edge_1）" \
+	|| fail "「滚轮到边」日志对不上：$edge_0 → $edge_1（期望 +2）"
+# 到最后一格同理
+for _ in $(seq 1 $((nn + 1))); do msg pointer-scroll 0 1; sleep 0.12; done
+sleep 0.3
+[ "$(sel_idx)" = "$((nn - 1))" ] \
+	&& pass "往下滚到头 = 清单最后一格（$((nn - 1))）" \
+	|| fail "往下滚到头停在 $(sel_idx)（期望 $((nn - 1))）"
+edge_2=$(grep -ac "mru: 滚轮到边" "$LOG")
+msg pointer-scroll 0 1; sleep 0.3
+[ "$(sel_idx)" = "$((nn - 1))" ] && pass "到最后一格再往下滚：不动（没绕回第一格）" \
+	|| fail "到最后一格还往下滚，选中项跑到 $(sel_idx) 了"
+edge_3=$(grep -ac "mru: 滚轮到边" "$LOG")
+[ "$edge_3" = "$((edge_2 + 1))" ] && pass "日志：又到边一次（$edge_2 → $edge_3）" \
+	|| fail "「滚轮到边」日志对不上：$edge_2 → $edge_3"
+# A4：滚轮一个字都没喂给客户端（窗口几何逐字段不变 = 面板只是换了个选中项）
+geo_1=$(win_geo)
+[ "$geo_0" = "$geo_1" ] && pass "滚轮全程窗口一个都没动（也没喂客户端）" \
+	|| fail "有窗口被滚轮动了：$(diff <(echo "$geo_0") <(echo "$geo_1") | head -4)"
+wait $WTYPE_PID 2>/dev/null
+sleep 0.8
+
+mark "13) A3 滚轮不换工作区 / 不动布局（Alt+滚轮在默认配置里 = 换工作区）"
+# 先站定第 1 块工作区：往下滚**本来**就是「换到下一块」（改前真的会跳）
+./build/vidowmsg focus-workspace 1 >/dev/null 2>&1
+sleep 0.6
+hold_tabs 1 4000
+sleep 0.7
+f_0=$(focused_title)
+win_0=$(./build/vidowmsg windows 2>/dev/null)
+ws_0=$(./build/vidowmsg workspaces 2>/dev/null)
+msg pointer-scroll 0 1; sleep 0.5
+msg pointer-scroll 0 -1; sleep 0.5
+msg pointer-scroll 0 1; sleep 0.5
+win_1=$(./build/vidowmsg windows 2>/dev/null)
+ws_1=$(./build/vidowmsg workspaces 2>/dev/null)
+if [ -n "$ws_0" ] && [ "$ws_0" = "$ws_1" ]; then
+	pass "滚动前后 workspaces 逐字不变（工作区没跳 —— Alt+wheel = workspace up/down 没跑）"
+else
+	fail "工作区真的跳了（Alt+wheel = workspace up/down 跑了）：$(diff <(echo "$ws_0") <(echo "$ws_1") | head -6)"
+fi
+if [ -n "$win_0" ] && [ "$win_0" = "$win_1" ]; then
+	pass "滚动前后 windows 逐字不变（窗口没动 / 没换屏 / 焦点没搬）"
+else
+	fail "windows 变了：$(diff <(echo "$win_0") <(echo "$win_1") | head -6)"
+fi
+[ "$(focused_title)" = "$f_0" ] && pass "焦点也没动（还是 $f_0）" \
+	|| fail "焦点被滚轮搬走了：$f_0 → $(focused_title)"
+wait $WTYPE_PID 2>/dev/null
+sleep 0.8
+# 改前这一条真的会换工作区：把现场收回工作区 1，后面的判据才算数
+./build/vidowmsg focus-workspace 1 >/dev/null 2>&1
+sleep 0.6
+
+mark "14) B3 Mod+滚轮也不换列 / 不换工作区"
+hold_alt_tab_mod 5000 logo
+sleep 0.7
+[ "$(mq 'd["active"]')" = "True" ] && pass "切换器开着 + Mod 也按着（active=true）" \
+	|| fail "切换器没开着（active=$(mq 'd["active"]')）"
+f_0=$(focused_title)
+col_0=$(grep -ac "action: focus-column" "$LOG")
+geo_0=$(win_geo)
+msg pointer-scroll 0 1; sleep 0.25
+msg pointer-scroll 0 -1; sleep 0.25
+col_1=$(grep -ac "action: focus-column" "$LOG")
+geo_1=$(win_geo)
+[ "$f_0" = "$(focused_title)" ] && pass "焦点没动（Mod+滚轮没换列：还是 $f_0）" \
+	|| fail "焦点被换列动作挪走了：$f_0 → $(focused_title)"
+[ "$col_1" = "$col_0" ] && pass "日志里没有新的 focus-column 动作行（$col_0 → $col_1）" \
+	|| fail "focus-column 动作真的跑了：$col_0 → $col_1"
+[ "$geo_0" = "$geo_1" ] && pass "窗口 / 列一字不变" \
+	|| fail "布局变了：$(diff <(echo "$geo_0") <(echo "$geo_1") | head -4)"
+wait $WTYPE_PID 2>/dev/null
+sleep 0.8
+
+mark "15) B1 面板按着时字母键进不了客户端（wtype，真键盘那条路）"
+cat > "$RUNDIR/keyprobe.py" <<'PY'
+#!/usr/bin/env python3
+# 客户端探针：把自己收到的按键 / 鼠标按下打出来（一行一条）。「面板开着时输入是
+# 模态的」就拿它当判据 —— 客户端收到了 = 漏了。照 test-mini.sh 那个探针的形状。
+import sys
+import time
+import gi
+gi.require_version('Gtk', '3.0')
+from gi.repository import Gtk, Gdk  # noqa: E402
+
+
+def log(m):
+    print("%s %.3f" % (m, time.time()), flush=True)
+
+
+class Probe(Gtk.Window):
+    def __init__(self):
+        super().__init__(title=sys.argv[1] if len(sys.argv) > 1 else 'keyprobe')
+        self.set_default_size(320, 240)
+        self.add_events(Gdk.EventMask.KEY_PRESS_MASK |
+                        Gdk.EventMask.BUTTON_PRESS_MASK |
+                        Gdk.EventMask.BUTTON_RELEASE_MASK |
+                        Gdk.EventMask.SCROLL_MASK)
+        self.connect('key-press-event', lambda w, e: log("key"))
+        self.connect('button-press-event', lambda w, e: log("press"))
+        self.connect('button-release-event', lambda w, e: log("release"))
+        self.connect('scroll-event', lambda w, e: log("scroll"))
+        self.connect('destroy', Gtk.main_quit)
+
+
+Probe().show_all()
+Gtk.main()
+PY
+KEYLOG="$RUNDIR/keyprobe.log"
+rm -f "$KEYLOG"
+python3 "$RUNDIR/keyprobe.py" keyprobe > "$KEYLOG" 2>&1 &
+KEYPROBE_PID=$!
+sleep 1.8
+kp_id=$(./build/vidowmsg windows 2>/dev/null | python3 -c "
+import json,sys
+for w in json.load(sys.stdin):
+    if w.get('title') == 'keyprobe':
+        print(w['id']); break
+" 2>/dev/null)
+[ -n "$kp_id" ] && pass "探针窗口起来了（id $kp_id）" || fail "探针窗口没起来"
+./build/vidowmsg focus-window --id "$kp_id" >/dev/null 2>&1
+sleep 0.5
+# 对照组：没有切换器的时候按键进得来（证明探针是活的）
+wtype -k a >/dev/null 2>&1
+sleep 0.5
+k_a=$(grep -ac "^key" "$KEYLOG")
+[ "$k_a" -ge 1 ] && pass "对照组：没有切换器时按键进得来（$k_a 次）" \
+	|| fail "探针压根收不到按键（探针不活 / 焦点不在它身上）"
+# 切换器按着（面板开着）：同一个键必须进不去
+hold_tabs 1 6000
+sleep 0.7
+wtype -k a >/dev/null 2>&1
+sleep 0.6
+k_b=$(grep -ac "^key" "$KEYLOG")
+[ "$k_b" = "$k_a" ] && pass "切换器按着时按键**进不去**（还是 $k_b 次）" \
+	|| fail "按键漏给客户端了：$k_a → $k_b"
+# 收尾：Esc 取消（焦点原地不动）→ 松开 Alt
+wtype -k Escape >/dev/null 2>&1
+sleep 0.4
+wait $WTYPE_PID 2>/dev/null
+sleep 0.8
+[ "$(focused_title)" = "keyprobe" ] && pass "取消之后焦点没动（还是探针）" \
+	|| fail "焦点变成 $(focused_title) 了"
+
+mark "16) B2 open_delay 期点击不穿透（模态从按下 Alt 那一刻算起）"
+./build/vidowmsg set-config mru_open_delay_ms 3000 >/dev/null 2>&1
+read -r kp_x kp_y <<<"$(./build/vidowmsg windows 2>/dev/null | python3 -c "
+import json,sys
+for w in json.load(sys.stdin):
+    if w.get('title') == 'keyprobe':
+        g = w['geometry']
+        print(g['x'] + g['width'] // 2, g['y'] + g['height'] // 2); break
+" 2>/dev/null)"
+[ -n "${kp_x:-}" ] && pass "拿到探针窗口中心（$kp_x,$kp_y）" || fail "算不出探针窗口中心"
+msg move-cursor "$kp_x" "$kp_y"
+sleep 0.4
+press_0=$(grep -ac "^press" "$KEYLOG")
+geo_0=$(win_geo)
+# 按住 Alt，**等切换器接管（active=true）就点** —— 这时面板还没显形（open_delay
+# 3000ms）。等 active 是必须的：另起的 wtype 要几十毫秒才连上，不等的话这一下点在
+# 「Alt 还没按下去」的时候，本来就该进客户端（那不是穿透，是测量点错了）。
+hold_tabs 1 9000
+for _ in $(seq 1 80); do
+	[ "$(mq 'd["active"]')" = "True" ] && break
+	sleep 0.05
+done
+act=$(mq 'd["active"]')
+[ "$act" = "True" ] && pass "切换器已经接管（active=true，面板还没显形）" \
+	|| fail "切换器没接管（active=$act）"
+msg pointer-button press left
+msg pointer-button release left
+sleep 0.3
+act=$(mq 'd["active"]')
+shw=$(mq 'd["showing"]')
+[ "$act" = "True" ] && [ "$shw" = "False" ] \
+	&& pass "点的时候面板还没显形（active=true / showing=false）" \
+	|| fail "时间点不对：active=$act showing=$shw（open_delay 没生效？）"
+press_1=$(grep -ac "^press" "$KEYLOG")
+[ "$press_1" = "$press_0" ] && pass "open_delay 期的按下没漏给客户端（还是 $press_1 次）" \
+	|| fail "点击穿透进客户端了：$press_0 → $press_1"
+[ "$(focused_title)" = "keyprobe" ] && pass "点击没把焦点搬走" \
+	|| fail "焦点变成 $(focused_title) 了"
+[ "$geo_0" = "$(win_geo)" ] && pass "窗口一个都没动（没有 interactive / drag）" \
+	|| fail "窗口被动了：$(diff <(echo "$geo_0") <(echo "$(win_geo)") | head -4)"
+# 面板显形之后：点空白 = 既有行为不变（vidow_mru_click 那条路），客户端也一个字没收到
+sleep 3.0
+[ "$(mq 'd["showing"]')" = "True" ] && pass "等一会儿面板显形了（open_delay 到点）" \
+	|| fail "面板没显形（showing = $(mq 'd["showing"]')）"
+msg move-cursor $((wx + ww / 2)) $((wy + 4))
+sleep 0.3
+press_2=$(grep -ac "^press" "$KEYLOG")
+blank_0=$(grep -ac "mru: 点在空白处" "$LOG")
+msg pointer-button press left
+msg pointer-button release left
+sleep 0.4
+blank_1=$(grep -ac "mru: 点在空白处" "$LOG")
+[ "$blank_1" = "$((blank_0 + 1))" ] \
+	&& pass "面板显形后点空白：既有行为不变（日志 mru: 点在空白处（窗口不动））" \
+	|| fail "点空白没走到切换器（$blank_0 → $blank_1）"
+[ "$(grep -ac '^press' "$KEYLOG")" = "$press_2" ] \
+	&& pass "点空白也没漏给客户端（还是 $press_2 次）" \
+	|| fail "点空白穿透进客户端了：$press_2 → $(grep -ac '^press' "$KEYLOG")"
+[ "$(focused_title)" = "keyprobe" ] && pass "点空白没换焦点" \
+	|| fail "点空白把焦点换了（$(focused_title)）"
+wtype -k Escape >/dev/null 2>&1
+sleep 0.4
+wait $WTYPE_PID 2>/dev/null
+sleep 0.8
+./build/vidowmsg set-config mru_open_delay_ms 0 >/dev/null 2>&1
+
+mark "17) B4 切换器自己的键照常：方向键 / Return / 点卡片"
+hold_tabs 1 12000
+sleep 0.7
+i_0=$(sel_idx)
+wtype -k Right >/dev/null 2>&1
+sleep 0.4
+i_1=$(sel_idx)
+[ "$i_1" = "$((i_0 + 1))" ] && pass "方向键 Right：选中项 +1（$i_0 → $i_1）" \
+	|| fail "Right 没让选中项 +1：$i_0 → $i_1"
+wtype -k Up >/dev/null 2>&1
+sleep 0.4
+[ "$(sel_idx)" = "$i_0" ] && pass "方向键 Up：往回一格（$i_1 → $i_0）" \
+	|| fail "Up 没让选中项 -1：$i_1 → $(sel_idx)"
+n_ent=$(ent_n)
+for _ in $(seq 1 $((n_ent + 1))); do wtype -k Left >/dev/null 2>&1; sleep 0.12; done
+sleep 0.3
+[ "$(sel_idx)" = "0" ] && pass "方向键 Left 连按到头 = 第一格" \
+	|| fail "Left 连按停在 $(sel_idx)（期望 0）"
+wtype -k Left >/dev/null 2>&1
+sleep 0.3
+[ "$(sel_idx)" = "0" ] && pass "到第一格再按 Left：不动（和滚轮同一套 clamp）" \
+	|| fail "Left 绕回到 $(sel_idx) 了"
+# 点卡片中心：直接切过去（不用等松修饰键）—— 和改前同一条路
+read -r ck2_x ck2_y ck2_title <<<"$(mj "next((e['cx'] + e['cw'] // 2, e['cy'] + e['ch'] // 2, e['title']) for e in d['entries'] if not e['selected'])")"
+msg move-cursor "$ck2_x" "$ck2_y"
+sleep 0.3
+msg pointer-button press left
+sleep 0.4
+msg pointer-button release left
+sleep 0.8
+grep -aq "mru: 点选 $ck2_title" "$LOG" && pass "点卡片中心：日志 mru: 点选 $ck2_title" \
+	|| fail "日志里没有「点选 $ck2_title」"
+[ "$(focused_title)" = "$ck2_title" ] && pass "点完焦点 = $ck2_title" \
+	|| fail "点完焦点 = $(focused_title)，期望 $ck2_title"
+[ "$(mq 'd["showing"]')" = "False" ] && pass "点完面板收了" || fail "点完面板还开着"
+wait $WTYPE_PID 2>/dev/null
+sleep 0.8
+[ "$(focused_title)" = "$ck2_title" ] && pass "松开 Alt 之后焦点没被搬走" \
+	|| fail "松开 Alt 之后焦点变成 $(focused_title) 了"
+
+mark "18) B5 别的键位被挡（日志 + 动作真的没发生）"
+# 先把焦点放到**最右边**那扇（探针窗口）：Alt+j = focus-column left 才有地方可走
+# （焦点压在最左边那列时，「往左一列」是空转，分不清「被挡」和「到头」）
+./build/vidowmsg focus-window --id "$kp_id" >/dev/null 2>&1
+sleep 0.5
+blk_0=$(grep -ac "mru: 绑定 .*切换器开着期间不生效" "$LOG")
+# 同一个 wtype 里：Alt 按下 → Tab（开切换器）→ j（测试配置里 Alt+j = focus-column left）
+hold_alt_keys 8000 Tab j
+sleep 0.7
+f_0=$(focused_title)
+sleep 0.5
+[ "$(focused_title)" = "$f_0" ] && pass "焦点没动（Alt+j 的动作没跑，还是 $f_0）" \
+	|| fail "动作真的跑了：$f_0 → $(focused_title)"
+blk_1=$(grep -ac "mru: 绑定 .*切换器开着期间不生效" "$LOG")
+[ "$blk_1" -gt "$blk_0" ] \
+	&& pass "日志：绑定被白名单挡住（$blk_0 → $blk_1）" \
+	|| fail "日志里没有「切换器开着期间不生效」"
+grep -a "mru: 绑定" "$LOG" | tail -1 | sed 's/^/       /'
+wait $WTYPE_PID 2>/dev/null
+sleep 0.8
+# 白名单里的那条照常生效（Alt+Tab 连点走的就是它：闸没把 next-window 误伤）
+hold_alt_keys 6000 Tab Tab
+sleep 0.7
+[ "$(mq 'd["active"]')" = "True" ] && pass "切换器开着（两次 Alt+Tab 之后 active=true）" \
+	|| fail "切换器没开着（active=$(mq 'd["active"]')）"
+grep -aq "mru: 走到 #" "$LOG" && pass "日志：走了格子（mru: 走到 #，白名单里的动作照常跑）" \
+	|| fail "白名单没放行 next-window（日志里没有「mru: 走到 #」）"
+wtype -k Escape >/dev/null 2>&1
+sleep 0.4
+wait $WTYPE_PID 2>/dev/null
+sleep 0.8
+
+mark "19) 收尾"
 ./build/vidowmsg set-config mru_layout strip >/dev/null 2>&1
 ./build/vidowmsg set-config mru_max_scale 0.5 >/dev/null 2>&1
 [ "$(mq 'd["showing"]')" = "False" ] && pass "面板已收起" || fail "面板还开着"
