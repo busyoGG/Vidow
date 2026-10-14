@@ -15,6 +15,7 @@
 #include "outputconf.h"
 #include "hotplug.h"
 #include "clipboard.h"
+#include "sessionlock.h"
 #include <wlr/render/allocator.h>
 #include <wlr/render/wlr_renderer.h>
 #include <wlr/types/wlr_compositor.h>
@@ -56,6 +57,8 @@
 
 struct vidow_server;
 struct vidow_jelly;
+struct wlr_session_lock_manager_v1;
+struct wlr_session_lock_v1;
 
 /* 一个已经发出去的 xdg-activation 令牌（客户端拿到的那个随机串）。资源销毁了它
  * 还得活着：协议说「收到的令牌继续有效」。实现见 activation.c，IPC 要把它报出来
@@ -1016,6 +1019,11 @@ struct vidow_output {
 	/* 这块屏的热插拔记忆（按输出名认）。在 new_output 里就取好存下：
 	 * 拔线时 wlroots 已经把 wlr_output->name 收走了，那时候再按名字找就晚了。 */
 	struct vidow_output_memory *memory;
+	/* 会话锁（见 sessionlock.c）：这块屏的黑幕 rect（锁定期间不透明黑，垫在
+	 * lock surface 底下；节点常开，由 layer_lock_blank 那棵树统一开关），以及
+	 * 「锁上之后这块屏还没呈现过一帧」的记账（锁定握手靠它数）。 */
+	struct wlr_scene_rect *lock_blank;
+	bool lock_frame_pending;
 	double viewport_x;          /* horizontal scroll offset of the column strip */
 	/* 切工作区的过渡：正在被推开的（旧的）那块工作区，和驱动它的动画。
 	 * 过渡期间 arrange 会把 slide_from 的列也摆一遍（按它自己的 slide_y），
@@ -1882,6 +1890,25 @@ struct vidow_server {
 	struct wlr_scene_tree *layer_top;
 	struct wlr_scene_tree *layer_overlay;
 	struct wlr_scene_tree *layer_im; /* 输入法候选框，压在所有层之上 */
+	/* 会话锁（ext-session-lock-v1，见 sessionlock.c）：锁定期间每块屏一块不透明
+	 * 黑（layer_lock_blank），lock surface 在最顶上（layer_lock）。这两棵树反过来
+	 * —— 只锁定期间开，其余时候关着。 */
+	struct wlr_scene_tree *layer_lock_blank;
+	struct wlr_scene_tree *layer_lock;
+	/* 会话锁的会话级状态（见 sessionlock.c）。locked = true 期间：整棵正常树
+	 * 关着、只画 lock surface；客户端中途死掉也保持 true（协议 XML:111-113
+	 * 允许「死锁」态，不许合成器自己解锁）。 */
+	struct wlr_session_lock_manager_v1 *session_lock_mgr;
+	struct wlr_session_lock_v1 *session_lock;
+	struct wl_listener new_lock;
+	bool locked;
+	bool lock_locked_sent;               /* locked 事件发过没（只能发一次） */
+	struct wl_list lock_surfaces;        /* struct vidow_lock_surface */
+	struct wl_listener lock_new_surface;
+	struct wl_listener lock_unlock;
+	struct wl_listener lock_destroy;
+	unsigned lock_frames_pending;        /* 还没呈现「锁后第一帧」的屏数 */
+	struct wl_event_source *lock_timeout; /* 等帧的超时兜底 */
 	struct wlr_output_layout *output_layout;
 	struct wlr_scene_output_layout *scene_layout;
 

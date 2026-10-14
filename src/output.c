@@ -9,6 +9,7 @@
 
 #include "ipc.h"
 #include "workspace.h"
+#include "sessionlock.h"
 
 #include <wlr/backend/headless.h>
 #include <wlr/util/log.h>
@@ -68,6 +69,8 @@ void vidow_output_render(struct vidow_output *output) {
 				box.width, box.height);
 		}
 		output->box = box;
+		/* 会话锁的黑幕跟着这块屏的布局框走（位置/尺寸都变了）。 */
+		vidow_sessionlock_output_update(output);
 	}
 	double scale = output->wlr_output->scale;
 	server->output_x = (int)lround(box.x * scale);
@@ -180,6 +183,9 @@ void vidow_output_render(struct vidow_output *output) {
 	struct timespec now;
 	clock_gettime(CLOCK_MONOTONIC, &now);
 	wlr_scene_output_send_frame_done(output->scene_output, &now);
+	/* 这块屏画完一帧了：会话锁的锁定握手在这里记账（每块屏都画过一帧才发
+	 * locked，见 sessionlock.c）。 */
+	vidow_sessionlock_frame(output);
 
 	/* 视口外的窗口要不要保活（窗口规则 / 录屏预览）。放在场景补帧之后：已经画在
 	 * 画面上的窗口场景那边已经给过回调了，这里只补没画到的那些。 */
@@ -1207,6 +1213,13 @@ static void output_destroy(struct wl_listener *listener, void *data) {
 	wl_list_remove(&output->destroy.link);
 	wl_list_remove(&output->link);
 
+	/* 会话锁的黑幕：这块屏没了，它那块黑 rect 也收掉（不然会留在场景里盖住
+	 * 别的地方）。它对应的 lock surface 由 wlroots 的输出销毁监听收掉。 */
+	if (output->lock_blank != NULL) {
+		wlr_scene_node_destroy(&output->lock_blank->node);
+		output->lock_blank = NULL;
+	}
+
 	vidow_blur_output_finish(output);
 
 	/* 先把这块屏上的东西安置好，再放它走：任何 view->output / col->output /
@@ -1359,6 +1372,13 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 	wlr_output_layout_get_box(server->output_layout, wlr_output,
 		&output->usable_area);
 	output->box = output->usable_area;
+	/* 会话锁的黑幕（见 sessionlock.c）：每块屏一块不透明黑 rect。节点本身常开，
+	 * 由 layer_lock_blank 那棵树统一开关 —— 锁定期间才开。 */
+	if (server->layer_lock_blank != NULL) {
+		output->lock_blank = wlr_scene_rect_create(server->layer_lock_blank, 1, 1,
+			(const float[4]){ 0.0f, 0.0f, 0.0f, 1.0f });
+		vidow_sessionlock_output_update(output);
+	}
 	vidow_arrange_layers(server);
 
 	/* 布局原点也打出来：多屏 / 热插拔时「谁在左边」直接看日志，测试也不用猜。 */

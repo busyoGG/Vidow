@@ -162,6 +162,7 @@ sources = files(
   'src/ipcstate.c',
   'src/portalconf.c',
   'src/xwayland.c',
+  'src/sessionlock.c',
   'src/capture.c',
   'src/jelly.c',
   'src/screencopy.c',
@@ -445,6 +446,30 @@ rp_code = custom_target('relative-pointer-unstable-v1-protocol.c',
 executable('pointerlock',
   ['tools/pointerlock.c', pc_header, pc_code, rp_header, rp_code,
    xs_header, xs_code],
+  dependencies: [wayland_client_dep],
+  include_directories: include_directories('.'),
+  install: false)
+
+# 测试工具：会话锁客户端（ext-session-lock-v1）。本机一个锁屏客户端都没有
+# （swaylock / waylock / gtklock / hyprlock / i3lock 全缺），所以自己写一个最小
+# 的：lock → 每块屏 get_lock_surface → 收 configure 就 ack + 贴纯色 shm →
+# 收 locked 打 LOCKED（测试脚本拿这行当同步点）。见 tools/locktest.c。
+# XML 用系统的（wayland-protocols 1.49 有 staging/ext-session-lock/），不 vendor
+# 进 protocols/；生成的头/代码也在 build 目录里，不进仓库。
+wp_dep = dependency('wayland-protocols', version: '>= 1.27')
+wp_datadir = wp_dep.get_variable(pkgconfig: 'pkgdatadir')
+sl_xml = wp_datadir + '/staging/ext-session-lock/ext-session-lock-v1.xml'
+sl_header = custom_target('ext-session-lock-v1-client-protocol.h',
+  input: sl_xml,
+  output: 'ext-session-lock-v1-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'])
+sl_code = custom_target('ext-session-lock-v1-protocol.c',
+  input: sl_xml,
+  output: 'ext-session-lock-v1-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
+
+executable('locktest',
+  ['tools/locktest.c', sl_header, sl_code],
   dependencies: [wayland_client_dep],
   include_directories: include_directories('.'),
   install: false)

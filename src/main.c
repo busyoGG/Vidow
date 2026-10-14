@@ -3,6 +3,7 @@
 #include "hooks.h"
 #include "ipc.h"
 #include "gesture.h"
+#include "sessionlock.h"
 
 #include <signal.h>
 #include <stdlib.h>
@@ -130,6 +131,15 @@ static void server_finish(struct vidow_server *server) {
 	wl_list_remove(&server->request_cursor.link);
 	wl_list_remove(&server->request_set_selection.link);
 	wl_list_remove(&server->request_set_primary_selection.link);
+	/* 会话锁：manager 销毁时断言「没人还挂在我的 events.new_lock 上」（和上面
+	 * xdg_shell 那条同一类）。锁对象自己在 destroy 回调里已经把三个监听器摘了。 */
+	if (server->session_lock_mgr != NULL) {
+		wl_list_remove(&server->new_lock.link);
+	}
+	if (server->lock_timeout != NULL) {
+		wl_event_source_remove(server->lock_timeout);
+		server->lock_timeout = NULL;
+	}
 
 	/* 事件源（定时器 / 信号 / FIFO）：loop 没了它们也活不成，主动撤掉干净。 */
 	if (server->anim_timer != NULL) {
@@ -390,6 +400,17 @@ int main(int argc, char *argv[]) {
 	server.layer_overlay = wlr_scene_tree_create(&server.scene->tree);
 	/* 输入法候选框：压在所有东西之上，连 overlay 层也盖住 */
 	server.layer_im = wlr_scene_tree_create(&server.scene->tree);
+	/* 会话锁（ext-session-lock-v1，见 sessionlock.c）：建在 layer_im 之后 = 最顶。
+	 * layer_lock_blank 是每块屏一块不透明黑（锁定期间垫底，把被关掉的桌面全盖住），
+	 * layer_lock 放 lock surface。这两棵树平时关着 —— 它们只在锁定期间开。 */
+	server.layer_lock_blank = wlr_scene_tree_create(&server.scene->tree);
+	server.layer_lock = wlr_scene_tree_create(&server.scene->tree);
+	if (server.layer_lock_blank != NULL) {
+		wlr_scene_node_set_enabled(&server.layer_lock_blank->node, false);
+	}
+	if (server.layer_lock != NULL) {
+		wlr_scene_node_set_enabled(&server.layer_lock->node, false);
+	}
 
 	/* 拖动落点的预览块（niri 的 insert hint）：建在窗口那一层里，平时关着。 */
 	if (!vidow_drag_init(&server)) {
@@ -414,6 +435,7 @@ int main(int argc, char *argv[]) {
 			!vidow_overview_init(&server) || !vidow_mru_init(&server) ||
 			!vidow_im_init(&server) || !vidow_bgeffect_init(&server) ||
 			!vidow_portal_init(&server) || !vidow_xwayland_init(&server) ||
+			!vidow_sessionlock_init(&server) ||
 			!vidow_clipboard_init(&server)) {
 		return 1;
 	}

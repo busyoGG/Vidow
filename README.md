@@ -5420,6 +5420,40 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
      - 未做：niri 的 `fixed 1920`（固定像素档）、`preset-window-heights`、`default-column-width {}`（让客户端自己定宽）、
        `always-center-single-column`；窗口规则级的 per-rule 预设覆盖。
 
+264. **会话锁 S1：`ext-session-lock-v1` 的 global + 涂黑 + `locked` 握手（新建 `src/sessionlock.{c,h}`、`tools/locktest.c`、`test-sessionlock.sh`）**（用户：「先做方案 §5 的 S1，别做多余的无用测试」；方案 `/tmp/vidow-sessionlock-plan.md`；2026-10-14）
+
+     - **协议不用自己实现**：wlroots 0.20（本机 0.20.2）自带 `wlr_session_lock_v1`，
+       一行 `wlr_session_lock_manager_v1_create()` + 听 `new_lock` 就有 `ext_session_lock_manager_v1` 这个 global。
+     - 落点：新 `src/sessionlock.c` / `src/sessionlock.h`；`src/server.h`（`locked` / `session_lock` 等字段 +
+       `layer_lock_blank` / `layer_lock` 两棵树 + 每输出 `lock_blank` rect 与 `lock_frame_pending`）；
+       `src/main.c`（建两棵树、init 链加一行、退出时摘 `new_lock` 监听器）；`src/output.c`（建/收黑 rect、
+       box 变了同步、帧回调里给握手记账）；`meson.build`（源列表 + 生成 `ext-session-lock-v1` 客户端协议 + `locktest`）。
+       **`src/view.c` / `overview.c` / `fx.c` / `input.c` / `keybind.c` 一行没动** —— 锁是**会话级状态**（场景图层 + 输入路由），
+       不是窗口、不进列、不参与焦点/MRU/工作区，所以没有「给全屏加特例」这回事（方案 §2.2）。
+     - 涂黑：锁定瞬间把 `layer_backdrop`…`layer_im` 全部 `wlr_scene_node_set_enabled(false)`，开 `layer_lock_blank`
+       （每输出一块不透明黑 rect，节点常开、由那棵树统一开关）与 `layer_lock`（放 lock surface，建在 `layer_im` 之后 = 最顶）。
+       协议 XML:77-82 要求锁定期间只渲染 lock surface，所以「把别的藏起来」不是可选的美化。
+     - **最容易踩的坑**：wlroots **不会**自动发首个 configure（读 0.20 的 `types/wlr_session_lock_v1.c`：`new_surface` 只建对象就 emit）。
+       所以 `new_surface` 里必须主动 `wlr_session_lock_surface_v1_configure(输出尺寸)`，否则客户端永远收不到尺寸、不 ack、不 commit
+       （协议要求 commit 前必须先 ack 首个 configure）= 锁定握手死锁。实测不 configure 就是客户端一直不 commit。
+     - `locked` 握手：锁上后给每块屏记一笔 `lock_frame_pending`，在已有的每输出帧回调里销账（`src/output.c:182` 的
+       `send_frame_done` 之后），**数齐了才 `wlr_session_lock_v1_send_locked()`**（XML:87-107 不许提前发）。
+       某块屏一直不出帧就 **500ms 超时兜底**照样发（XML:96-98 的 "reasonable time limit"），日志会写明还剩几块屏没画过。
+     - 测试客户端 `tools/locktest.c`：本机 `swaylock`/`wayland`/`gtklock`/`hyprlock`/`i3lock` **一个都没有**，
+       所以照 `tools/pointerlock.c` 的骨架写了个最小的（lock → 每输出 `get_lock_surface` → 收 configure 就 ack + 贴纯色 shm +
+       commit → 收 `locked` 打 `LOCKED`；stdin 输 `u` 解锁 / `q` 退出）。协议 XML 用系统的（`wayland-protocols` 1.49 的
+       `staging/ext-session-lock/`），不往 `protocols/` 里 vendor。
+     - 验证（新 `test-sessionlock.sh`，headless 两块屏 `WLR_HEADLESS_OUTPUTS=2`；只跑方案 §3 的 A/B/C）：
+       - A `wayland-info | grep -c ext_session_lock_manager_v1` = **1**；
+       - B `locktest` 起后 **<5s 内打出 `LOCKED`**（实测同一毫秒内两块屏各收到一次 `configure 1280x720`）；
+       - C `grim` 前后比对：两块屏锁后都是 `locktest` 的纯色 `#226699` **100.0%**，锁前 `HEADLESS-2` 上有 445621 个蓝窗像素
+         （`tools/bluewin.py`），前后最大差 213 / 126 —— 桌面和窗口确实被藏起来了；
+       - 超时兜底专项（`VIDOW_TEST_STALL_OUTPUT=HEADLESS-1` 掐掉那块屏的帧事件）：日志出现「等了 500ms 还有 1 块屏没呈现
+         锁后第一帧，按超时兜底发 locked」，客户端仍在 **508ms** 拿到 `LOCKED`。
+     - **未做（后续步骤，别对外宣称支持会话锁）**：S2 输出热插拔 / 尺寸变化重 configure、**S3 输入路由**（所以现在锁上之后
+       键盘/指针**还会漏给未锁客户端**，锁形同虚设）、S4 解锁恢复桌面 / 客户端崩溃保持死锁 / 抓帧审计。
+       本次**故意**不做解锁：客户端退出后合成器按协议 XML:111-113 保持黑屏锁定态（要恢复桌面得等 S4）。
+
 263. **每窗口按需 VRR（niri 的 `variable-refresh-rate on-demand`）+ 每屏 `layout {}`（`configs/09-output.lua` / `20-layout.lua`）**（用户：「调研 top5 ④」；2026-10-14）
 
      - 顺手改的键位选项名：`["repeat"]` → **`repeatable`**（`repeat` 是 Lua 保留字，写起来只能 `["repeat"]`）。主名
