@@ -976,6 +976,7 @@ VIDOW_TEST_RENDERER=gles2 ./test-screencast.sh
                                      #   set_minimized / set_fullscreen）不许把合成器打死（22 项断言）
 ./test-drag.sh                       # 拖窗口：拖得动 / 跨屏改归属 / 平铺按落点插入（10 项）
 ./test-mini.sh                       # 小窗模式（mini window，S1–S5）：三态与交互 / 跟屏 / 焦点守卫 / 输入路由与 4px 阈值 / 图标裁剪 / 原生 buffer 与坐标换算 / mini_aspect / 落点区 / 工具条 / 出帧分叉 / 过渡动画与惯性甩出（全 headless 双屏，见 277）
+./test-corner.sh                     # 圆角形状：corner_n = 4 超椭圆（角区面积 957 / 对角线第一颗第 5）vs 2 圆弧（815 / 第 9）/ 边框环跟同一形状（沿对角线 11 vs 解析 10.75）/ AA 过渡 1~2px（20 项，见 280）
 ./test-drag-insert.sh                # 拖平铺窗口的落点：插进已有列 / 新开一条列（左右两边的缝都算）/ 落点预览块（23 项）
 ./test-expel.sh                      # 把窗口从列里拎出来单独成列（niri 的 expel-window-from-column：动作 / IPC / 左右 / 拖到右边与空白处 / 取不出来的两种情形，32 项）
 ./test-drag-stall.sh                 # 后端不给帧事件时，拖动照样跟手（浮窗 + 平铺两个case，9 项断言）
@@ -5457,6 +5458,32 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
        `test-defaultconfig.sh` 全过（新增的 `20-layout.lua` 与 `--default-config` 逐字节一致，114 个平铺键都在）。
      - 未做：niri 的 `fixed 1920`（固定像素档）、`preset-window-heights`、`default-column-width {}`（让客户端自己定宽）、
        `always-center-single-column`；窗口规则级的 per-rule 预设覆盖。
+
+281. **还债：`24-mini.lua` 忘了重生成（`test-defaultconfig.sh` 3 条既有 FAIL）**（用户：无直接要求，是超椭圆那次改动顺手报出来的既有账；2026-10-14）
+     - 三条 FAIL 同一根因：S5 把 `mini_fling_speed` 加进 `entries[]`（`src/config.c:611`，类别 23）时
+       **忘了重新生成** `config.example/configs/24-mini.lua`（那份是 `--default-config 24-mini.lua` 的**生成物**）。
+     - 修法：先 `--default-config 24-mini.lua` 出到临时文件 `diff`，确认**只有** `mini_fling_speed` 那一块是新增（无别的漂移），再覆盖回去。
+     - 结果：`test-defaultconfig.sh` **42 PASS / 3 FAIL → 44 PASS / 0 FAIL**（rc=0）。与超椭圆改动无关（改前改后 FAIL 行逐字相同）。
+
+280. **所有圆角统一成超椭圆（squircle n=4）：新增 `corner_n`（默认 4.0，2.0 = 圆弧退路）**（用户：「我还有个问题 现在的ssd圆角是否超椭圆」→「我需要所有圆角都是超椭圆」；2026-10-14）
+     - 普查结论：**全仓库只有一处是圆弧** —— `src/fx.c` 的着色器函数 `sd_round_box()`（同一函数在片段着色器里管三件事：
+       内容遮罩 `inside` / 边框环 `ring` / 阴影 `sa`），外加 `shaders/round.frag`（常驻 `shader_idle` 效果的独立着色器，同一条公式）。
+       `src/mru.c`（MRU 卡片 `MRU_SQUIRCLE_N 4.0`）和 `tools/vidowportal.c`（选择器卡片 `SQUIRCLE_N 4.0`）**本来就是 n=4** ——
+       所以「窗口角和卡片角本来就不一样」；老条目里那句「卡片圆角（超椭圆）」说的是 `mru_card_radius`，不是 `corner_radius`。
+       所有窗口（Wayland / XWayland / 小窗 / 概览）都走同一条 fx 装饰管线，所以改那一处覆盖全部。
+     - 改法：把 `length(max(q, 0.0))` 换成超椭圆范数 `pow(pow(c.x, n) + pow(c.y, n), 1.0 / n)`，n 走新 uniform `u_corner_n`，
+       并乘 **`1/|∇d|` 归一化**（超椭圆不是严格 SDF：直边梯度 1、对角线 `2^(1/n) = 1.19`；不除的话角上 AA 斜坡只剩 1.68px、
+       8px 边框沿对角线只剩 6.7px）。`c` 有 0 分量时该系数 ≡ 1，所以**直边与内侧与原来逐像素一致**；`n <= 2.001` 直接走 `length(c)`。
+     - 四个入口（越界一律夹 2..8）：`config.lua` 的 `corner_n`（含 `decor = { corner_n = … }` 表项）/ 自动派生的 `VIDOW_CORNER_N` /
+       IPC `vidowmsg config|set-config corner_n` / **窗口规则字段** `corner_n`（`rule.c` 字段表 + 范围检查 + `ipcstate.c` 的 `windows` JSON `look.corner_n`，优先级同 `corner_radius`）。
+     - 实测（新脚本 `test-corner.sh`：`corner_radius = 32`、scale 1、纯蓝窗压纯黑底，覆盖率 = `B/255`）：
+       - n=4：角区面积 **957.1**（期望 949.3 = `r²·Γ(1+1/4)²/Γ(1+1/2)`，+0.8%）；对角线第一颗 `α ≥ 0.5` = 第 **5** 颗（期望 5.09 = `0.159r`）。
+       - n=2：面积 **815.4**（期望 804.2 = `πr²/4`）；对角线第 **9** 颗（期望 9.37 = `0.293r`）→ **形状是唯一变量**，没顺手改坏别的。
+       - 边框环 `border_width = 8`：沿直边 8px（两档都是）；沿对角线内边界 15（圆弧）/ 11（超椭圆）= 各自平行曲线的解析值 ±0.3 步 → 环跟同一形状 + 归一化生效。
+       - AA：直边部分覆盖 2 行、对角线 0~1 个对角步 = 过渡 1~2px，无硬边。规则 `corner_n = 8` → 面积 1005.6（更接近正方形上界 1024）。
+     - 回归：`test-mini.sh` 120/0 → **120/0**；`test-overview.sh` 62/0 → **62/0**；`test-clip-stretch.sh` 10/0；`test-mru.sh` 60/0；
+       `config.example/configs/02-decor.lua` 与 `14-keys.lua` 都是生成物，重生成后与原文件 **diff IDENTICAL**（没手改）。
+     - 未做：阴影**没有**独立的像素判据（黑阴影压黑底量不出信号），只做了「和 ring 走同一处 `sd_round_box` 调用」的代码路径确认。
 
 279. **录屏 portal 会话持久化：impl ScreenCast 接口 2 → 4（`persist_mode` / `restore_data`）—— 选过一次的屏 / 窗口，以后不再弹选择器**（用户：「仓库 /home/busyo/Dev/Vidow（C，wlroots 0.20 的 niri 风格滚动平铺合成器 vidow）。用户要求：**录屏 portal 需要持久化**」；2026-10-14）
 
