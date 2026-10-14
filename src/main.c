@@ -12,6 +12,11 @@
 #include <wayland-server-core.h>
 #include <wlr/types/wlr_export_dmabuf_v1.h>
 #include <wlr/types/wlr_fractional_scale_v1.h>
+#include <wlr/types/wlr_idle_inhibit_v1.h>
+#include <wlr/types/wlr_idle_notify_v1.h>
+#include <wlr/types/wlr_input_device.h>
+#include <wlr/types/wlr_keyboard.h>
+#include <wlr/types/wlr_pointer.h>
 #include <wlr/types/wlr_viewporter.h>
 #include <wlr/types/wlr_ext_image_capture_source_v1.h>
 #include <wlr/types/wlr_ext_image_copy_capture_v1.h>
@@ -87,6 +92,168 @@ static void session_active(struct wl_listener *listener, void *data) {
 	}
 }
 
+/* ------------------------------------------------ 空闲通知 / 空闲抑制 */
+
+/* 两个 global + 两处「wlroots 不给、必须自己接」的线：
+ *
+ *   1. ext-idle-notify-v1（wlr_idle_notifier_v1_create）：swayidle / hypridle
+ *      这类「空闲到点就跑命令（锁屏 / 关屏）」的客户端靠它。**活动要自己喂** ——
+ *      wlr_idle_notify_v1.h 原文："Compositors should call this function
+ *      whenever an input event is triggered on a seat"。不喂的话通知在创建后
+ *      timeout 到点就 idled，之后再也不 resumed：swayidle 会一直以为人在发呆
+ *      （等于「一直在锁」）。vidow 自己**不**实现「超时后锁屏」—— 那是它们的事。
+ *   2. zwp-idle-inhibit-unstable-v1（wlr_idle_inhibit_v1_create）：播视频 / 看
+ *      网页的客户端用它说「别锁屏 / 别关屏」。**抑制要自己转达** —— wlroots 那份
+ *      只管收客户端的 new_inhibitor，一个字节都不碰 notifier，得合成器自己调
+ *      wlr_idle_notifier_v1_set_inhibited()。不接这一步，inhibit 客户端连上了也
+ *      等于没连（正是本步要解决的那半边）。
+ *
+ * 活动信号挂在设备上（backend 的 new_input）：真实键盘 / 鼠标 / 触控板全走这条
+ * 路。vidow 里更靠内的单一入口是 input.c 的 input_note_key_press() /
+ * vidow_pointer_motion()，但本步范围只让动 main.c（input.c 归会话锁那条线），
+ * 所以没往那边挂 —— 代价是虚拟设备（wtype / 输入法）和 IPC 注入的键鼠
+ * （vidowmsg send-key 之类）不算「人动了」，真实硬件路径是准的。触屏不在内：
+ * vidow 本来就没接 touch（input.c 只认 KEYBOARD / POINTER）。
+ * 锁定期间照喂不误：锁是 input.c 自己吞的，喂活动没有坏处。 */
+
+struct vidow_idle_activity {
+	struct wl_list link; /* vidow_idle_device.activities */
+	struct wl_listener listener;
+	struct vidow_server *server;
+};
+
+struct vidow_idle_device {
+	struct wl_listener destroy;
+	struct wl_list activities; /* struct vidow_idle_activity */
+};
+
+static void idle_activity(struct wl_listener *listener, void *data) {
+	(void)data;
+	struct vidow_idle_activity *activity =
+		wl_container_of(listener, activity, listener);
+	if (activity->server->idle_notifier != NULL) {
+		wlr_idle_notifier_v1_notify_activity(activity->server->idle_notifier,
+			activity->server->seat);
+	}
+}
+
+static void idle_device_activity_add(struct vidow_server *server,
+		struct vidow_idle_device *device, struct wl_signal *signal) {
+	struct vidow_idle_activity *activity = calloc(1, sizeof(*activity));
+	if (activity == NULL) {
+		return;
+	}
+	activity->server = server;
+	activity->listener.notify = idle_activity;
+	wl_signal_add(signal, &activity->listener);
+	wl_list_insert(&device->activities, &activity->link);
+}
+
+static void idle_device_destroy(struct wl_listener *listener, void *data) {
+	(void)data;
+	struct vidow_idle_device *device =
+		wl_container_of(listener, device, destroy);
+	struct vidow_idle_activity *activity, *tmp;
+	wl_list_for_each_safe(activity, tmp, &device->activities, link) {
+		/* 设备的 finish 会断言「这些信号上没人挂着」（wlr_touch_finish 那种
+		 * assert），所以必须在这里摘干净 —— 现在还在 emit 里，来得及。 */
+		wl_list_remove(&activity->listener.link);
+		wl_list_remove(&activity->link);
+		free(activity);
+	}
+	wl_list_remove(&device->destroy.link);
+	free(device);
+}
+
+static void idle_new_input(struct wl_listener *listener, void *data) {
+	struct vidow_server *server =
+		wl_container_of(listener, server, idle_new_input);
+	struct wlr_input_device *device = data;
+	struct vidow_idle_device *idle = calloc(1, sizeof(*idle));
+	if (idle == NULL) {
+		return;
+	}
+	wl_list_init(&idle->activities);
+	idle->destroy.notify = idle_device_destroy;
+	wl_signal_add(&device->events.destroy, &idle->destroy);
+	switch (device->type) {
+	case WLR_INPUT_DEVICE_KEYBOARD:
+		idle_device_activity_add(server, idle,
+			&wlr_keyboard_from_input_device(device)->events.key);
+		break;
+	case WLR_INPUT_DEVICE_POINTER: {
+		struct wlr_pointer *pointer = wlr_pointer_from_input_device(device);
+		idle_device_activity_add(server, idle, &pointer->events.motion);
+		idle_device_activity_add(server, idle, &pointer->events.motion_absolute);
+		idle_device_activity_add(server, idle, &pointer->events.button);
+		idle_device_activity_add(server, idle, &pointer->events.axis);
+		break;
+	}
+	default:
+		break;
+	}
+}
+
+/* 客户端要了一个 inhibitor。销毁走每个 inhibitor 自己的 destroy 信号 —— 不能靠
+ * 「manager->inhibitors 空没空」判断：wlroots 是先 emit destroy、之后才把它从那个
+ * 链表里摘掉的（见 types/wlr_idle_inhibit_v1.c 的 idle_inhibitor_v1_destroy）。 */
+struct vidow_idle_inhibitor {
+	struct wl_listener destroy;
+	struct vidow_server *server;
+};
+
+static void idle_inhibitor_destroy(struct wl_listener *listener, void *data) {
+	(void)data;
+	struct vidow_idle_inhibitor *inhibitor =
+		wl_container_of(listener, inhibitor, destroy);
+	struct vidow_server *server = inhibitor->server;
+	/* wlroots 在 emit 之后断言「没人还挂在这个信号上」 */
+	wl_list_remove(&inhibitor->destroy.link);
+	free(inhibitor);
+	server->idle_inhibitors--;
+	if (!server->shutting_down && server->idle_notifier != NULL) {
+		wlr_idle_notifier_v1_set_inhibited(server->idle_notifier,
+			server->idle_inhibitors > 0);
+	}
+}
+
+static void idle_new_inhibitor(struct wl_listener *listener, void *data) {
+	struct vidow_server *server =
+		wl_container_of(listener, server, idle_new_inhibitor);
+	struct wlr_idle_inhibitor_v1 *wlr_inhibitor = data;
+	struct vidow_idle_inhibitor *inhibitor = calloc(1, sizeof(*inhibitor));
+	if (inhibitor == NULL) {
+		return;
+	}
+	inhibitor->server = server;
+	inhibitor->destroy.notify = idle_inhibitor_destroy;
+	wl_signal_add(&wlr_inhibitor->events.destroy, &inhibitor->destroy);
+	server->idle_inhibitors++;
+	if (server->idle_notifier != NULL) {
+		wlr_idle_notifier_v1_set_inhibited(server->idle_notifier, true);
+	}
+	wlr_log(WLR_INFO, "空闲抑制: 有客户端要求别锁屏（在抑制 %d 个）",
+		server->idle_inhibitors);
+}
+
+static void idle_init(struct vidow_server *server) {
+	/* 两个 global。建不出来就当没这个协议：vidow 其余部分不依赖它们。 */
+	server->idle_notifier = wlr_idle_notifier_v1_create(server->display);
+	server->idle_inhibit_mgr = wlr_idle_inhibit_v1_create(server->display);
+	if (server->idle_notifier == NULL) {
+		wlr_log(WLR_ERROR, "空闲通知: ext-idle-notify-v1 建不出来");
+	}
+	if (server->idle_inhibit_mgr == NULL) {
+		wlr_log(WLR_ERROR, "空闲抑制: zwp-idle-inhibit-v1 建不出来");
+	} else {
+		server->idle_new_inhibitor.notify = idle_new_inhibitor;
+		wl_signal_add(&server->idle_inhibit_mgr->events.new_inhibitor,
+			&server->idle_new_inhibitor);
+	}
+	server->idle_new_input.notify = idle_new_input;
+	wl_signal_add(&server->backend->events.new_input, &server->idle_new_input);
+}
+
 static void server_finish(struct vidow_server *server) {
 	if (server->session != NULL) {
 		/* 会话销毁时会断言「没人还挂在我的 events.active 上」（和退出时那条
@@ -102,6 +269,13 @@ static void server_finish(struct vidow_server *server) {
 	}
 	wl_list_remove(&server->new_output.link);
 	wl_list_remove(&server->new_input.link);
+	/* 空闲通知 / 空闲抑制（见上面的 idle_*）：inhibit manager 销毁时断言「没人还
+	 * 挂在 events.new_inhibitor 上」。设备上那些活动监听器不用管 —— 设备自己
+	 * 在 backend finish 时销毁，destroy 回调会把它们摘干净。 */
+	wl_list_remove(&server->idle_new_input.link);
+	if (server->idle_inhibit_mgr != NULL) {
+		wl_list_remove(&server->idle_new_inhibitor.link);
+	}
 	wl_list_remove(&server->new_virtual_keyboard.link);
 	if (server->virtual_pointer != NULL) {
 		wl_list_remove(&server->new_virtual_pointer.link);
@@ -439,6 +613,10 @@ int main(int argc, char *argv[]) {
 			!vidow_clipboard_init(&server)) {
 		return 1;
 	}
+
+	/* 空闲通知 / 空闲抑制两个 global（见上面的 idle_*）：要在 backend_start
+	 * 之前起 —— 设备插上来的 new_input 信号从那时开始才有，活动监听得先挂着。 */
+	idle_init(&server);
 
 	const char *socket = wl_display_add_socket_auto(server.display);
 	if (socket == NULL) {

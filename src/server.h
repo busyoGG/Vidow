@@ -1912,6 +1912,15 @@ struct vidow_server {
 	struct wl_listener lock_destroy;
 	unsigned lock_frames_pending;        /* 还没呈现「锁后第一帧」的屏数 */
 	struct wl_event_source *lock_timeout; /* 等帧的超时兜底 */
+	/* 空闲通知 / 空闲抑制（ext-idle-notify-v1 + zwp-idle-inhibit-unstable-v1，
+	 * 见 main.c 的 idle_*）：swayidle / hypridle 靠前者拿 idled / resumed 事件
+	 * 触发锁屏；播视频的客户端靠后者说「别锁屏」。wlroots 只提供协议、语义归
+	 * 合成器 —— 活动要自己喂、inhibit 要自己转达，两处接线都在 main.c。 */
+	struct wlr_idle_notifier_v1 *idle_notifier;
+	struct wlr_idle_inhibit_manager_v1 *idle_inhibit_mgr;
+	struct wl_listener idle_new_inhibitor;
+	struct wl_listener idle_new_input;
+	int idle_inhibitors; /* 活着的 inhibitor 数（> 0 = 抑制中） */
 	struct wlr_output_layout *output_layout;
 	struct wlr_scene_output_layout *scene_layout;
 

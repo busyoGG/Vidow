@@ -5420,6 +5420,42 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
      - 未做：niri 的 `fixed 1920`（固定像素档）、`preset-window-heights`、`default-column-width {}`（让客户端自己定宽）、
        `always-center-single-column`；窗口规则级的 per-rule 预设覆盖。
 
+269. **空闲通知 + 空闲抑制两个 global（`ext-idle-notify-v1` / `zwp-idle-inhibit-v1`）：swayidle / hypridle 这类自动锁屏能接上了、播视频的客户端也能「别锁屏」（实测抑制真的生效）**（用户：「给 vidow 建这两个 global（各一行 create 的量级）；先核实 API 与版本；如果 wlroots 侧要求额外接线，照它的要求做」；方案 `/tmp/vidow-sessionlock-plan.md` §4 末尾 + §5 S5（独立可选步）；2026-10-14）
+
+     - **API 照头文件核过（本机 wlroots 0.20.2）**：`/usr/include/wlroots-0.20/wlr/types/wlr_idle_notify_v1.h` →
+       `struct wlr_idle_notifier_v1 *wlr_idle_notifier_v1_create(struct wl_display *display)`（**名字是 notifier，不是 notify** —— 所以
+       `wayland-info | grep idle_notify` 永远不中，global 的接口名是 `ext_idle_notifier_v1`）；
+       `/usr/include/wlroots-0.20/wlr/types/wlr_idle_inhibit_v1.h` → `struct wlr_idle_inhibit_manager_v1 *wlr_idle_inhibit_v1_create(struct wl_display *display)`。
+       两个协议 XML 本机都有（`/usr/share/wayland-protocols/staging/ext-idle-notify/ext-idle-notify-v1.xml`、
+       `/usr/share/wayland-protocols/unstable/idle-inhibit/idle-inhibit-unstable-v1.xml`），但**两份都是 wlroots 自带实现**，
+       不用像 `xdg-activation-v1` / `ext-background-effect-v1` 那样自己生成 + 自己实现。
+     - **只建 global 不够 —— 两处接线 wlroots 不给，必须合成器自己接**（读 0.20.0 的 `types/wlr_idle_notify_v1.c` /
+       `types/wlr_idle_inhibit_v1.c` 确认）：
+       ① **活动要自己喂**：`wlr_idle_notifier_v1_notify_activity()`，头文件原话 "Compositors should call this function whenever an
+       input event is triggered on a seat"。不喂的话通知在创建后 timeout 到点就 `idled`、之后再也不 `resumed` —— swayidle 会
+       一直以为人在发呆（等于「一直在锁」）。vidow 自己**不**实现「超时后锁屏」，那是 swayidle / hypridle 的事。
+       ② **抑制要自己转达**：`wlr_idle_inhibit_v1_create()` 只管收客户端的 `new_inhibitor`，一个字节都不碰 notifier；合成器得
+       自己数着有几个 inhibitor 再调 `wlr_idle_notifier_v1_set_inhibited()`。计数不能靠「`manager->inhibitors` 空没空」判断 ——
+       wlroots 是先 emit destroy、之后才把它从那个链表里摘掉。
+     - **改了两个文件**：`src/main.c` 加一段 `idle_*`（两个 create + 活动监听 + inhibitor 计数 + `idle_init()` 调用 +
+       `server_finish()` 里摘监听器）+ 4 个 include；`src/server.h` 加 5 个字段。`src/view.c` / `src/input.c` 等一行没动。
+       活动信号挂在设备上（backend 的 `new_input`：键盘 `key`、指针 `motion` / `motion_absolute` / `button` / `axis`），
+       设备销毁时把监听器摘干净 —— `wlr_input_device_finish()` 是先 emit destroy、再断言 `listener_list` 为空，所以只能在
+       destroy 回调里摘（否则退出时 abort）。
+     - **实测 global**（headless 双屏，`WLR_HEADLESS_OUTPUTS=2` + 软件渲染，临时 `HOME` / `XDG_RUNTIME_DIR`）：
+       `wayland-info` 里 `ext_idle_notifier_v1` **v2**（name 39）+ `zwp_idle_inhibit_manager_v1` **v1**（name 40），两条都在。
+     - **实测抑制 —— 真客户端，不是自造的一对**：本机有 `hypridle` v0.1.8（真 `ext-idle-notify` 客户端）当观察者，另写一个
+       60 行的最小 inhibit 客户端（`/tmp/vidow-idle-test/inhibit.c`，**不进仓库**）当抑制者，`hypridle.conf` 里 `listener { timeout = 3;
+       on-timeout = touch …/idled }`：
+       ① 只有 hypridle → 3s 后 `on-timeout` 跑了（`idled` 文件出现）= `ext-idle-notify` 端到端通；
+       ② 抑制着（inhibit 客户端先起）→ 7s 都没 `idled`（hypridle 的 3s 早过了）= **抑制生效**；
+       ③ 抑制客户端 14s 后释放 → 3s 后 `idled` 出现 = 计数归零后通知恢复正常。vidow 日志同时有
+       `空闲抑制: 有客户端要求别锁屏（在抑制 1 个）`。
+     - **已知边界**：活动只挂**真设备**，所以虚拟设备（wtype / 输入法回注）和 IPC 注入的键鼠（`vidowmsg send-key` 之类）不算
+       「人动了」—— 本步范围只让动 `main.c`；更靠内的单一入口是 `src/input.c` 的 `input_note_key_press()` 与
+       `vidow_pointer_motion()`，把那两条接上就全覆盖（一行调用的事）。触屏没接（vidow 本来就没接 touch）。
+       没有全屏特例。
+
 267. **会话锁 S4：能解锁了（桌面恢复 + 焦点还给窗口）、客户端崩溃保持锁定、锁定期间抓帧不泄桌面（实测）**（用户：「接着 S3 做方案 §5 的 S4，先做解锁（最缺的）再做抓帧审计；别做多余的无用测试」；方案 `/tmp/vidow-sessionlock-plan.md` §2 环节 6 + §3 F/H + §4 风险 3 + §5 S4；2026-10-14）
 
      - **解锁**（S3 遗留的最大缺口：以前锁上只能杀客户端或切 VT）：`src/sessionlock.c` 新增 `lock_restore_desktop()`，在 `lock_handle_unlock()`（`lock->events.unlock`，
