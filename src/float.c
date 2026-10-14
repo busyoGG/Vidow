@@ -287,6 +287,17 @@ void vidow_float_on_commit(struct vidow_view *view) {
 	 * 目标尺寸跟客户端现在的不一样就再 configure 一次（尺寸钉子：float_want_w/h
 	 * 一直钉着，一个迟到的提交吃不掉它）。 */
 	if (view->mini != VIDOW_MINI_NONE) {
+		/* S3：保留客户端原生分辨率（默认）时，小窗态**不采纳客户端尺寸、也不
+		 * configure** —— 客户端 buffer 保持原生，由合成器把场景节点缩到小窗盒
+		 * 显示（view.c 的 view_mini_scale）。客户端完全不知道自己在小窗里：
+		 * 不重配、不重建 swapchain、不触发它的 resize 路径（有的游戏一 resize
+		 * 就重置成窗口模式）。盒子由形态 / 锚点决定，客户端说什么都不作数。
+		 *
+		 * 只有关掉保留（规则 / 全局键 mini_preserve_buffer = false）才走下面
+		 * 那条老路：把客户端 configure 成小窗尺寸。 */
+		if (vidow_mini_preserve_buffer(view)) {
+			return;
+		}
 		int cw = 0, ch = 0;
 		vidow_view_client_size(view, &cw, &ch);
 		if (view->mini == VIDOW_MINI_FREE && cw > 1 && ch > 1 &&
@@ -690,6 +701,18 @@ void vidow_float_end_grab(struct vidow_server *server) {
  * 一律还没动（S2–S5）。所以小窗态现在会被现有的可见性判据当成「工作区不亮着」
  * 而停到屏外 —— 这是预期的，S2 的旁路一上来它就留在屏上了。
  */
+
+/* S3：小窗态要不要保留客户端原生分辨率（默认 true）。规则 > 全局键，
+ * 和 mini_aspect 那套三级优先级无关 —— 这个只有两级（规则写了就是它）。 */
+bool vidow_mini_preserve_buffer(const struct vidow_view *view) {
+	if (view == NULL) {
+		return true;
+	}
+	if (view->mini_preserve_buffer_set) {
+		return view->mini_preserve_buffer;
+	}
+	return view->server->config.mini_preserve_buffer;
+}
 
 const char *vidow_mini_state_name(enum vidow_mini_state state) {
 	switch (state) {

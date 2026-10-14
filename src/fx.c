@@ -1797,6 +1797,16 @@ bool vidow_view_scanout_ok(struct vidow_view *view) {
 	if (scanout_off()) {
 		return false;
 	}
+	/* 小窗（mini window，S3）：一律走合成。直通的定义是「屏幕上该显示的像素就是
+	 * 缓冲自己」，而小窗要的正是「把原生 buffer 缩进一个小盒子」—— 两者互斥。
+	 *
+	 * **必须放在 fullscreen 判断之前**：小窗态刻意保留 fullscreen 标志（不重配
+	 * 客户端、不发 set_fullscreen(false)，见 float.c 的 on_commit），全屏游戏进
+	 * 小窗之后这条判据照样成立 —— 不挡住的话场景会把 2560x1440 的原生 buffer
+	 * 整块扫上屏，小窗化完全失效。 */
+	if (view->mini != VIDOW_MINI_NONE) {
+		return false;
+	}
 	/* 只做全屏：只有它铺满整块输出（wlroots 要求节点的框正好等于输出框）。 */
 	if (!view->fullscreen || view->scene_parked) {
 		return false;

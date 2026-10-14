@@ -5420,6 +5420,36 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
      - 未做：niri 的 `fixed 1920`（固定像素档）、`preset-window-heights`、`default-column-width {}`（让客户端自己定宽）、
        `always-center-single-column`；窗口规则级的 per-rule 预设覆盖。
 
+273. **小窗模式 S3a：原生分辨率保留（合成器缩放显示）+ 图标贴边裁剪 + 指针坐标换算 + 直通 / 基线两个守卫 —— 小窗化**不**重配客户端**（用户：「做方案 §7 的 S3 里『正确性』那半，宽高比留给 S3b」；方案 `/tmp/vidow-miniwin-plan.md` §7 S3 + §11.1/§11.2/§11.7；2026-10-14）
+
+     - **原则**：小窗化只改**呈现**，不改客户端 —— 不 configure、不重建 swapchain、不触发客户端的 resize 路径（有的游戏一 resize 就重置成窗口模式）。
+       默认 `mini_preserve_buffer = true`（S1 已有这个键 + 同名窗口规则），客户端从头到尾不知道自己进了小窗。
+     - **一处挡口，三处生效**：`vidow_view_set_size()`（`src/view.c:395`）最前面加 `mini != NONE && 保留` → return。进小窗（`float.c` 的 `vidow_mini_set_state`）、arrange 摆位（`vidow_place_view`）、拖拽改盒子全走这个出口，
+       所以挡一处就够。`vidow_float_on_commit()`（`src/float.c:289`）在保留时也直接 return：**不采纳客户端尺寸**（尺寸只由形态 / 锚点定）。
+       关掉保留（`mini_preserve_buffer = false`）走原来那条：把客户端 configure 成小窗尺寸。
+     - **缩放复用 overview 那条 `set_dest_size`**：`view_mini_scale()`（`src/view.c`，新）＝ `contain`（`min(盒宽/原生宽, 盒高/原生高)`，原生取 `base_dst`，没有就取表面逻辑尺寸），
+       在 `view_anim_place()` 里把**场景节点**缩到 `原生 × ms` —— 放在 `fx.active` 判断**之前**（装饰全关 + 全屏直通正是「全屏游戏进小窗」最可能的状态，写在里面等于不生效）。
+       装饰那条路跟着缩：`vidow_view_anim_bake()` 把 `view_scale(view) * ov` 和 `ov` **同乘** ms 传给 `vidow_fx_frame()`（`out_scale = scale/ov` 不变，画布和节点一起小）。
+       副作用一个：`ov < 0.98` 会关掉这一次渲染的底衬模糊 —— 缩到几十像素的小窗本来也不该叠一层按原尺寸算的模糊（overview / MRU 缩略图同理）。
+     - **每次 commit 都要重设**：wlroots 的 `surface_reconfigure()`（`types/scene/surface.c`）在**每次** commit 时把 dst 重置成表面自己的尺寸。我们的 commit 监听器排在它后面（xdg：`wlr_scene_xdg_surface_create` 先注册；X11：见 `x11_attach_surface`），所以设得住 ——
+       但 `view_commit()` 里那句 `apply_anim` 原来挂在 `fx.active` 上，装饰全关的小窗就会每交一帧弹回原生尺寸，现在对迷你态也调（`view.c` 两处 commit 分支各改一个条件）。
+     - **指针坐标换算（唯一的口子，泛化）**：`vidow_view_hit_scale()`（`src/view.c:585`）原来只对 X11 生效，现在对**所有**窗口算「表面逻辑宽 / 节点 dst 宽」；尺寸一致时返回 1.0（非小窗 / 非缩放路径逐字节不变）。
+       `vidow_view_at()` 在返回前乘它，于是指针 motion / button / `vidowmsg pick-window` / overview 点击全部自动正确；drag 的取景框只用场景坐标，一行没动。
+     - **两个必须挡的地方**：`vidow_view_scanout_ok()`（`src/fx.c:1791`）在 `fullscreen` 判断**之前**排除小窗（小窗刻意保留 `fullscreen` 标志不重配客户端，不挡就会把 2560x1440 的原生 buffer 整块扫上屏 = 小窗化失效）；
+       `view_dst_capture()`（`src/view.c:663`）在小窗态**不记基线**（记了就把小窗尺寸当成 1:1 基线，退出小窗后 overview 里那个窗口永久变小一圈），退出小窗时 `view_anim_place` 还原节点尺寸并重记一次。
+     - **图标贴边裁剪**：`view_clip_box()`（`src/view.c:1242`）加小窗分支，**强制裁到自己那块屏** —— 放在「浮动窗口一律不裁」那条放行**之前**（小窗态 `float_mode` 是 FIXED，晚一步就被放走）。
+       这和浮窗允许跨屏是**相反**的语义，注释里写清了别合并（合并会搞坏跨屏拖拽 / `test-mixdpi`）。整块都在屏里时不裁（省一次重烘）。
+     - **保活**：`vidow_view_render_pump()` 的 `want` 加 `mini != NONE`（被停到屏外 / 所在屏关了时补帧，否则游戏自己停帧、点开是死画面）；`view_on_screen()` 为真时它照样 `continue`，正常情况一分钱不花。
+     - **实测**（headless 双屏 1280x720 @1x，`HOME`/`XDG_RUNTIME_DIR` 指临时目录；pattern.py 625×700 原生）：
+       - **裁剪**：图标 64x64 贴 HEADLESS-1 右边、`mini_icon_overflow = 0.4` → 盒 `1232,10 64x64`，出屏 26px（其中 16px 落在屏 2）。
+         屏 1 图标区非背景像素 **3000**（内容包围盒 `1231..1279 × 9..71`，可见那 48 列都在）；**屏 2 上「本该溢出的 16×64 条」非背景像素 = 0、整屏非背景像素 = 0**。
+       - **缩放**：进图标态前后客户端收到的 `xdg_toplevel.configure` 条数 **2 → 3，三条全是 `625, 700`**（第三条只是 `set_tiled` 的状态位变化，尺寸没变；`vidowmsg windows` 的 `surface` 字段全程 `665x740` 缓冲 = 原生的 GTK CSD 尺寸，`geometry` 才是 64x64 的小窗盒）。
+         grim 里图标内四个象限原色都在（`(1238,20)=(255,0,0)`、`(1270,20)=(0,255,0)`、`(1238,60)=(0,0,255)`、`(1270,60)=(255,255,255)`）= 625×700 的内容按比例缩进了 64px 的盒子。
+       - **坐标换算**：wev（625×700 原生）进 FREE 态 → 盒 `1668,203 504x315`，`ms = 0.45`、`hit_scale = 2.2222`。光标注入到盒内 `(252,157)` → **wev 自己打印 `motion: x, y = 560.500000, 349.199219`**（期望 `560, 349`，差 < 1px）；`vidowmsg pick-window` 同一口子回 `(560.498, 349.199)`。盒内 `(126,78)` → `(280.249, 173.488)`（期望 `280,173`）。
+     - **已知偏差（留给 S3b）**：`contain` 不居中（内容顶部左对齐贴在盒里），所以 FREE 盒里**信件箱那一条点不着**（上面 `0.75` 那个探针落在 281px 宽的内容盒右边 → 无命中）。盒子尺寸本身跟着内容比例走（「迷你 / 图标态永远按内容比例显示」）是宽高比那半的事。
+     - **没碰**：宽高比（`mini_aspect` / X11 `PAspect` / 拖拽锁比例）、`mini_icon_pause_render` 快照方案、悬停预览 / 工具条 —— 全是 S3b/S5。`src/input.c` / `keybind.c` / `workspace.c` / `overview.c` 一行没改，**没有全屏特例**。
+     - **改动面**：`src/view.c`（hit_scale 泛化、view_mini_scale / view_mini_native、anim_place 缩放 + 还原、anim_bake 传 `ov*ms`、clip_box 小窗分支、set_size 挡口、render_pump 保活、commit 两处条件）、`src/float.c`（`vidow_mini_preserve_buffer()` + on_commit 提前 return）、`src/fx.c`（scanout 排除小窗）、`src/server.h`（`mini_scaled` 字段 + 一个声明）。
+
 272. **小窗模式 S2：可见性旁路（跟屏不跟工作区）+ 焦点守卫 + 输入路由 —— 小窗现在真的留在屏上、不抢焦点、收不到输入**（用户：「做方案 §7 的 S2」；方案 `/tmp/vidow-miniwin-plan.md` §3 / §4 / §5.3 + §7 S2；2026-10-14）
 
      - **可见性旁路（本次最重要的一条，做完小窗才留在屏上）**：`vidow_workspace_view_visible()`（`src/workspace.c:731`）在「最小化不算可见」那条**之后**加了一句 `if (view->mini != VIDOW_MINI_NONE) return view->output != NULL;` —— 和 overview 那条旁路同一个位置、同一个思想（可见性只有这一个判据口，所以旁路也只开在这儿）。为什么必须开：进小窗时 `view->ws = NULL`（S1 定的「小窗是屏级对象」），下面那句 `view->ws == active` 必然为假。改这一处，`vidow_view_should_park()` / `view_on_screen()` / `vidow_workspace_apply_visibility()` 三处**自动跟着对**（它们都问这个函数）。

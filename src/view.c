@@ -393,6 +393,14 @@ void vidow_view_client_size(const struct vidow_view *view, int *w, int *h) {
 }
 
 void vidow_view_set_size(struct vidow_view *view, int w, int h) {
+	/* 小窗 + 保留客户端原生分辨率（S3，默认开）：**一个尺寸 configure 都不发**
+	 * —— 客户端 buffer 保持原生，由合成器把场景节点缩到小窗盒显示（见
+	 * view_mini_scale）。挡在唯一的出口上：进小窗、arrange 摆位、拖拽改盒子、
+	 * 迟到的 commit 全都走这儿，挡一处就够。退出小窗（mini == NONE）之后照常
+	 * configure —— 还原成列 / 浮动窗口那边要按布局重新定尺寸。 */
+	if (view->mini != VIDOW_MINI_NONE && vidow_mini_preserve_buffer(view)) {
+		return;
+	}
 	if (!vidow_view_configure_ready(view)) {
 		/* 客户端第一帧还没来：几何先记着，初始 configure 由 commit 那边发。 */
 		return;
@@ -582,18 +590,31 @@ struct vidow_view *vidow_view_from_xwayland_surface(struct vidow_server *server,
 	return NULL;
 }
 
-/* 场景单位 -> surface 局部坐标的倍数。只有 X11 不是 1：它的缓冲区被我们按
- * xwayland_scale 倍声明过，场景里占的位置比客户端自己的坐标空间小。 */
+/* 场景单位 -> surface 局部坐标的倍数。**这是「往客户端发坐标」的唯一口子**
+ * （vidow_view_at 在返回前乘它，指针 motion / button / view-at / overview 点击
+ * 全走那儿）—— 场景里节点占的位置和表面自己的坐标空间不一样大时，只有这里知道
+ * 差多少。
+ *
+ * 两个来源：
+ *   X11     缓冲区被我们按 xwayland_scale 倍声明过，场景里占的位置比客户端
+ *           自己的坐标空间小；
+ *   小窗     保留原生分辨率时（S3），场景节点被缩到小窗盒，表面还是原生的。
+ * 两者是同一个式子：表面宽 / 节点宽。尺寸一致时返回 1.0（这条保证非小窗 /
+ * 非缩放路径逐字节不变）。 */
 double vidow_view_hit_scale(const struct vidow_view *view) {
-	if (view->kind != VIDOW_VIEW_X11 || view->scene_surface == NULL ||
-			view->x11 == NULL || view->x11->surface == NULL) {
+	if (view == NULL || view->scene_surface == NULL) {
 		return 1.0;
 	}
 	struct wlr_scene_buffer *node = view->scene_surface->buffer;
 	if (node == NULL || node->dst_width <= 0) {
 		return 1.0;
 	}
-	return (double)view->x11->surface->current.width / (double)node->dst_width;
+	struct wlr_surface *surface = vidow_view_surface(view);
+	if (surface == NULL || surface->current.width <= 0) {
+		return 1.0;
+	}
+	double hit = (double)surface->current.width / (double)node->dst_width;
+	return hit != 1.0 ? hit : 1.0;
 }
 
 void vidow_view_x11_scale(struct vidow_view *view) {
@@ -661,7 +682,12 @@ void vidow_view_x11_scale(struct vidow_view *view) {
  * 只在没进 overview 的时候记 —— overview 里是我们自己把场景尺寸改小的，
  * 再记一次就等于把缩放叠进去（越缩越小）。 */
 static void view_dst_capture(struct vidow_view *view) {
-	if (view->server->overview.t > 0.0 || view->scene_surface == NULL) {
+	/* 小窗态（S3）也照 overview 那条办：现在节点上是**缩过的**尺寸，记进基线
+	 * 就等于把缩放叠进去 —— 退出小窗之后 base_dst_* 永久是错的（overview 里
+	 * 那个窗口会越缩越小）。退出小窗态时 view_anim_place 会把节点还原成原生尺寸
+	 * 并在这里重记一次。 */
+	if (view->server->overview.t > 0.0 || view->mini != VIDOW_MINI_NONE ||
+			view->scene_surface == NULL) {
 		return;
 	}
 	struct wlr_scene_buffer *src = view->scene_surface->buffer;
@@ -1223,6 +1249,42 @@ bool vidow_view_in_output_box(struct vidow_server *server,
 /* 这块窗口现在该不该裁到自己那块屏里，裁的话边界是哪块屏的框。 */
 static bool view_clip_box(struct vidow_view *view, struct wlr_box *out) {
 	struct vidow_server *server = view->server;
+	/* 小窗（mini window，S3）：**强制裁到自己那块屏**。
+	 *
+	 * ⚠️ 这条和下面「浮动窗口一律不裁」是**相反**的语义，别合并：浮动窗口跨屏
+	 * 是允许的（拖到一半正好骑在两块屏中间，裁了就会缺一块 —— test-mixdpi 钉着
+	 * 这条），而小窗是**屏级对象**（像安卓的画中画），图标态还会按
+	 * mini_icon_overflow 刻意探出屏边一点。不裁的话那半块会画到隔壁显示器上
+	 * （场景图是全局坐标的，隔壁那块屏照画落在自己坐标里的所有节点）。
+	 *
+	 * 放在「浮动不裁」那条放行**之前**：小窗态 float_mode 是 FIXED，晚一步就
+	 * 被上面那行 return false 放走了。 */
+	if (view->mini != VIDOW_MINI_NONE) {
+		if (!view->mapped || view->output == NULL ||
+				view->geom.width <= 0 || view->geom.height <= 0) {
+			return false;
+		}
+		if (vidow_overview_active(server) ||
+				vidow_view_should_park(server, view)) {
+			return false;
+		}
+		struct wlr_box mbox = {0};
+		wlr_output_layout_get_box(server->output_layout, view->output, &mbox);
+		if (mbox.width < 1 || mbox.height < 1) {
+			return false;
+		}
+		/* 整块都在自己那块屏里就不裁：裁一次要把场景节点的显示范围改小，
+		 * 白白多一次损伤和一次重烘（判据和下面那条一样，比的是这一帧画在
+		 * 哪儿 —— 几何 + 动画偏移）。 */
+		struct wlr_box mat = vidow_view_screen_box(view);
+		struct wlr_box minter;
+		if (wlr_box_intersection(&minter, &mat, &mbox) &&
+				minter.width == mat.width && minter.height == mat.height) {
+			return false;
+		}
+		*out = mbox;
+		return true;
+	}
 	if (!view->mapped || view->float_mode != VIDOW_FLOAT_NONE ||
 			view->dragging || vidow_overview_active(server) ||
 			view->output == NULL ||
@@ -1427,7 +1489,12 @@ void vidow_view_render_pump(struct vidow_server *server,
 	wl_list_for_each(view, &server->views, link) {
 		bool want = view->mapped && !view->popup && view->output ==
 			output->wlr_output &&
-			(view->force_render || vidow_view_capture_held(view));
+			(view->force_render || vidow_view_capture_held(view) ||
+				/* 小窗（S3）：被停到屏外（图标暂停出帧那条路）/ 所在屏关了
+				 * 的时候也要保活，否则游戏自己停帧，点开是一张死画面。
+				 * 下面 view_on_screen() 为真时会 continue，所以这条只在
+				 * 「真的没画到」时才生效 —— 正常情况一分钱不花。 */
+				view->mini != VIDOW_MINI_NONE);
 		if (!want) {
 			if (view->render_pumping) {
 				view->render_pumping = false;
@@ -1687,6 +1754,46 @@ static double view_overview_alpha(struct vidow_server *server,
 	return alpha;
 }
 
+/* 小窗（mini window，S3）：内容的**原生**尺寸（场景里的 1:1 尺寸）。X11 那条在
+ * commit 时记过 base_dst（已经除过 xwayland_scale），没有就取表面自己的逻辑尺寸
+ * —— 两者都是「没被小窗缩过」的量，所以每帧算出来稳定（拿节点现在的 dst 算就会
+ * 越缩越小）。 */
+static void view_mini_native(const struct vidow_view *view, int *w, int *h) {
+	int nw = view->base_dst_w, nh = view->base_dst_h;
+	if (nw <= 0 || nh <= 0) {
+		struct wlr_surface *surface = vidow_view_surface(view);
+		nw = surface != NULL ? surface->current.width : 0;
+		nh = surface != NULL ? surface->current.height : 0;
+	}
+	*w = nw > 0 ? nw : 0;
+	*h = nh > 0 ? nh : 0;
+}
+
+/* 小窗（mini window，S3）：把原生内容缩到小窗盒的系数。1.0 = 不缩。
+ *
+ * contain（取宽高比里小的那个）：内容整个塞得进盒子、按比例不拉伸。宽高比策略
+ * 本身（mini_aspect / PAspect / 拖拽锁比例）是 S3b 的事，这里只保证「缩了、没
+ * 拉伸」。盒子比内容大时按比例放大 —— 图标是固定边长，小窗口也该填满它。
+ *
+ * 关掉保留（mini_preserve_buffer = false）时恒为 1.0：那条路是直接把客户端
+ * configure 成小窗尺寸，场景节点不动。 */
+static double view_mini_scale(const struct vidow_view *view) {
+	if (view->mini == VIDOW_MINI_NONE || view->float_geom.width <= 0 ||
+			view->float_geom.height <= 0 ||
+			!vidow_mini_preserve_buffer(view)) {
+		return 1.0;
+	}
+	int nw = 0, nh = 0;
+	view_mini_native(view, &nw, &nh);
+	if (nw <= 0 || nh <= 0) {
+		return 1.0;
+	}
+	double sx = (double)view->float_geom.width / (double)nw;
+	double sy = (double)view->float_geom.height / (double)nh;
+	double s = sx < sy ? sx : sy;
+	return s > 0.0 ? s : 1.0;
+}
+
 /* 「摆在哪」落到场景节点上：位置 / 透明度 / overview 的显示尺寸 / 装饰的采样
  * 偏移和 ext-background-effect 的区域。**便宜**，拖动跟手时每个指针事件都走这条。
  * 装饰图的重烘（贵：整块窗口那么大的离屏渲染）在 vidow_view_anim_bake 里，一帧
@@ -1726,6 +1833,46 @@ static void view_anim_place(struct vidow_view *view) {
 	/* 客户端该按几倍渲染也在这儿钉（跟位置一起，每帧一次、只在真的变了时发）：
 	 * 停到停车位之后它就不在任何输出上了，不钉的话客户端会掉回 1 倍。 */
 	view_pin_scale(view);
+
+	/* 小窗（mini window，S3）：保留原生分辨率时，把场景节点缩到小窗盒 ——
+	 * 客户端 buffer 一个像素都不动（不 configure、不重建 swapchain，见
+	 * float.c 的 on_commit / view.c 的 vidow_view_set_size）。
+	 *
+	 * **必须放在下面那个 fx.active 判断之前**：装饰全关（fx 不 active）正是
+	 * 「全屏游戏进小窗」最可能的状态，写在里面就等于不生效。
+	 *
+	 * 为什么在这儿设得住：wlroots 每次 commit 都会把 dst 重置成表面自己的尺寸
+	 * （types/scene/surface.c 的 surface_reconfigure），而我们的 commit 监听器
+	 * 排在它的后面（xdg：wlr_scene_xdg_surface_create 先注册；X11：见
+	 * x11_attach_surface 的顺序），所以这里设的值当帧就留下 —— 但**每个 commit
+	 * 都得重设一次**，view_commit 那边因此对迷你态也调 apply_anim。 */
+	if (view->scene_surface != NULL && view->scene_surface->buffer != NULL) {
+		struct wlr_scene_buffer *mini_src = view->scene_surface->buffer;
+		double ms = view_mini_scale(view);
+		if (ms != 1.0) {
+			int nw = 0, nh = 0;
+			view_mini_native(view, &nw, &nh);
+			int dw = (int)lround((double)nw * ms);
+			int dh = (int)lround((double)nh * ms);
+			wlr_scene_buffer_set_dest_size(mini_src, dw > 0 ? dw : 1,
+				dh > 0 ? dh : 1);
+			view->mini_scaled = true;
+		} else if (view->mini_scaled) {
+			/* 退出小窗（或者关掉了保留）：把节点还原成原生尺寸，并重记一次
+			 * 1:1 基线 —— 小窗期间 view_dst_capture 是挡着的，不重记的话
+			 * base_dst_* 会一直停在进小窗之前那一版（X11 那边下一步就
+			 * commit 重记了，这里补的是「不 commit 也要对」）。 */
+			view->mini_scaled = false;
+			if (view->kind == VIDOW_VIEW_X11) {
+				vidow_view_x11_scale(view);
+			} else {
+				/* 0 = 用缓冲自己的尺寸（wlroots 下次 commit 会再按表面
+				 * 尺寸设一遍，那时它已经出小窗了）。 */
+				wlr_scene_buffer_set_dest_size(mini_src, 0, 0);
+			}
+			view_dst_capture(view);
+		}
+	}
 
 	if (!view->fx.active || view->scene_surface == NULL) {
 		return;
@@ -1849,10 +1996,20 @@ void vidow_view_anim_bake(struct vidow_view *view) {
 	/* 装饰节点摆在「可见窗口」左上角（视图树的原点就是它，见 vidow_fx_geo），
 	 * 不在源缓冲的原点上：源缓冲多出来的那圈 CSD 留白落在装饰矩形外面。 */
 	view->fx.anim_scale = view->anim_scale;
+	/* 小窗（mini window，S3）：装饰那条路也得跟着缩 —— 烘图那块画布是按
+	 * 「可见窗口几何 × 倍率」开的，倍率里不含小窗系数的话，图标里的窗口还是
+	 * 原生那么大一块（装饰节点盖在缩过的表面节点上，看着就是没缩）。
+	 *
+	 * 复用 overview 的那个 ov：它同时决定「画布开多大」和「节点画多大」，两个
+	 * 一起乘上小窗系数，结果正好是「内容按比例缩到小窗盒」。out_scale（设备像素
+	 * / 逻辑像素）= scale / ov 里两者同乘一个系数，所以输出倍率一点没变。
+	 * 副作用只有一个：ov < 0.98 会关掉这一次渲染的底衬模糊 —— 缩到几十像素的
+	 * 小窗本来也不该叠一层按原尺寸算的模糊（overview / MRU 缩略图同理）。 */
+	double fx_ov = ov * view_mini_scale(view);
 	int64_t bake_t0 = vidow_now_ns();
 	bool fx_drawn = vidow_fx_frame(view->server, &view->fx, src, &geo, 0, 0,
 		x, y, alpha, view->server->focused == view, view->fullscreen,
-		view_scale(view) * ov, ov, &view->rule_eff);
+		view_scale(view) * fx_ov, fx_ov, &view->rule_eff);
 	/* 探针：整块窗口那么大的离屏渲染一共多少钱（见统计行的「重烘」；次数由
 	 * vidow_fx_frame 的 vidow_stats.bakes 记）。拖动 / 滚动动画里每个在动的
 	 * 窗口每帧都要烘一次，所以这项随窗口数线性涨。 */
@@ -4384,7 +4541,8 @@ static void view_commit(struct wl_listener *listener, void *data) {
 		if (view->float_mode != VIDOW_FLOAT_NONE) {
 			vidow_float_on_commit(view);
 		}
-		if (view->mapped && view->fx.active) {
+		if (view->mapped && (view->fx.active ||
+				view->mini != VIDOW_MINI_NONE)) {
 			vidow_view_apply_anim(view);
 		}
 		struct wlr_client_buffer *client =
@@ -4472,7 +4630,13 @@ static void view_commit(struct wl_listener *listener, void *data) {
 
 	/* The visible pixels come from our offscreen decoration buffer now, so a
 	 * client repaint has to be pushed through it again. */
-	if (view->mapped && view->fx.active) {
+	/* 小窗（S3）也走这一趟，哪怕 fx 不 active：wlroots 在每次 commit 时会把场景
+	 * 节点的显示尺寸重置成表面自己的尺寸（types/scene/surface.c 的
+	 * surface_reconfigure），而我们的 commit 监听器排在它后面 —— 不在这一趟里
+	 * 重设一次小窗那条缩放，客户端每交一帧节点就弹回原生尺寸（画面忽大忽小、
+	 * 点击范围也跟着错）。装饰开着时本来就会走到这儿，这条只多覆盖「装饰全关 +
+	 * 小窗」那一种。 */
+	if (view->mapped && (view->fx.active || view->mini != VIDOW_MINI_NONE)) {
 		vidow_view_apply_anim(view);
 	}
 

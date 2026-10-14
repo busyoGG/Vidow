@@ -1421,6 +1421,10 @@ struct vidow_view {
 	/* 内容在场景里的 1:1 尺寸（不带 overview 缩放）。overview 里尺寸要乘上缩放，
 	 * 而 multiply 是会累加的 —— 所以基线只在 commit 时（没进 overview 时）记一次。 */
 	int base_dst_w, base_dst_h;
+	/* 小窗（S3）：场景节点现在被缩过（保留原生分辨率那条路，见 view.c 的
+	 * view_mini_scale / view_anim_place）。退出小窗 / 关掉保留之后要还原成原生
+	 * 尺寸，这个标志就是「该不该还原」。 */
+	bool mini_scaled;
 	/* 上次记「缓冲区多大 / 几倍」日志时的值：每个 commit 都刷一行没意义。 */
 	int logged_scale;
 	int logged_buf_w;
@@ -3444,6 +3448,9 @@ void vidow_mini_set_state(struct vidow_view *view, enum vidow_mini_state state);
 void vidow_view_yield_focus_for_mini(struct vidow_view *view);
 /* 按比例锚点算出 float_geom（幂等，不 configure 客户端）。摆放前调。 */
 void vidow_mini_resolve_geom(struct vidow_view *view);
+/* S3：这个窗口现在要不要**保留客户端原生分辨率**（小窗态不 configure 客户端、
+ * 由合成器把场景节点缩到小窗盒显示）。规则写了就按规则的，没写按全局键。 */
+bool vidow_mini_preserve_buffer(const struct vidow_view *view);
 /* "none" / "free" / "mini" / "icon" <- 文本（IPC / 日志）。返回 NULL = 不认识。 */
 bool vidow_mini_parse_state(const char *text, enum vidow_mini_state *out);
 const char *vidow_mini_state_name(enum vidow_mini_state state);
