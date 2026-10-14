@@ -698,10 +698,26 @@ static void view_dst_capture(struct vidow_view *view) {
 	if (src == NULL) {
 		return;
 	}
-	int w = src->dst_width > 0 ? src->dst_width :
-		(src->buffer != NULL ? (int)src->buffer->width : 0);
-	int h = src->dst_height > 0 ? src->dst_height :
-		(src->buffer != NULL ? (int)src->buffer->height : 0);
+	int w = src->dst_width;
+	int h = src->dst_height;
+	if (w <= 0 || h <= 0) {
+		/* 节点的 dst 是 0（退出小窗那一刻会把它清成 0，wlroots 要等这个表面
+		 * 下一次 commit 才按表面尺寸重设）：这个字段量的是**场景单位**里的
+		 * 1:1 尺寸，所以退回「表面自己的逻辑尺寸」—— 不是缓冲像素数：输出缩放
+		 * 2 的客户端（buffer scale 2）缓冲宽高是逻辑的两倍，照缓冲像素记下来
+		 * 基线就大了一倍，之后每次进小窗算出的缩放系数都小一半（实测：盒里
+		 * 的内容只画成该有的 1/2 —— 172x190 的物理脚印变成 86x95）。 */
+		struct wlr_surface *surface = vidow_view_surface(view);
+		if (surface != NULL && surface->current.width > 0 &&
+				surface->current.height > 0) {
+			w = surface->current.width;
+			h = surface->current.height;
+		} else if (src->buffer != NULL) {
+			/* 连表面都没有（理论上到不了）：退回缓冲像素。 */
+			w = (int)src->buffer->width;
+			h = (int)src->buffer->height;
+		}
+	}
 	if (w > 0 && h > 0) {
 		view->base_dst_w = w;
 		view->base_dst_h = h;
@@ -1907,6 +1923,23 @@ static double view_overview_alpha(struct vidow_server *server,
  * 越缩越小）。 */
 static void view_mini_native(const struct vidow_view *view, int *w, int *h) {
 	int nw = view->base_dst_w, nh = view->base_dst_h;
+	/* xdg（非 X11）：表面的逻辑尺寸**就是**场景里的 1:1 尺寸 —— 小窗 / 图标态
+	 * 不下发 configure（保留原生 buffer，见 vidow_view_set_size），客户端那一份
+	 * 一直没变，随时读都是当前值。这里优先读它，别读 base_dst_*：那个字段 xdg
+	 * 只在小窗退出那一刻记一次（commit 那条路不记），输出缩放一变、工作区逻辑
+	 * 尺寸跟着变、客户端被重新 configure 成另一个大小之后就永久过期了 ——
+	 * 重进小窗时 contain 系数按过期的原生尺寸算，盒里内容只有该有的一半
+	 * （实测：172x190 物理脚印变成 84x94；从小窗态里改 scale 那条不重进，反而
+	 * 是对的，因为 base_dst_* 还是 0、走的正是这个兜底）。 */
+	if (view->kind != VIDOW_VIEW_X11) {
+		struct wlr_surface *live = vidow_view_surface(view);
+		if (live != NULL && live->current.width > 0 &&
+				live->current.height > 0) {
+			*w = live->current.width;
+			*h = live->current.height;
+			return;
+		}
+	}
 	if (nw <= 0 || nh <= 0) {
 		struct wlr_surface *surface = vidow_view_surface(view);
 		nw = surface != NULL ? surface->current.width : 0;
@@ -2053,9 +2086,18 @@ static void view_anim_place(struct vidow_view *view) {
 			if (view->kind == VIDOW_VIEW_X11) {
 				vidow_view_x11_scale(view);
 			} else {
-				/* 0 = 用缓冲自己的尺寸（wlroots 下次 commit 会再按表面
-				 * 尺寸设一遍，那时它已经出小窗了）。 */
-				wlr_scene_buffer_set_dest_size(mini_src, 0, 0);
+				/* 还原成**表面自己的逻辑尺寸**（wlroots 下一次 commit 也会设
+				 * 成这个值）—— 不用 0：0 在 wlroots 那边是「按缓冲像素当场景
+				 * 单位」，2 倍缓冲的客户端会被先画大一倍，而且它下一次 commit
+				 * 之前一直错（窗口不再交帧的话就一直错下去）。 */
+				struct wlr_surface *surface = vidow_view_surface(view);
+				if (surface != NULL && surface->current.width > 0 &&
+						surface->current.height > 0) {
+					wlr_scene_buffer_set_dest_size(mini_src,
+						surface->current.width, surface->current.height);
+				} else {
+					wlr_scene_buffer_set_dest_size(mini_src, 0, 0);
+				}
 			}
 			view_dst_capture(view);
 		}
@@ -4236,8 +4278,8 @@ static void preview_show(struct vidow_server *server, struct vidow_view *view) {
 	}
 	/* 尺寸：contain 塞进预览盒（和 S3 的 view_mini_scale 同一条算法 —— 不拉伸、
 	 * 按内容自己的比例），居中摆。 */
-	int nw = view->base_dst_w > 0 ? view->base_dst_w : surface->current.width;
-	int nh = view->base_dst_h > 0 ? view->base_dst_h : surface->current.height;
+	int nw = 0, nh = 0;
+	view_mini_native(view, &nw, &nh);
 	int dw = box.width, dh = box.height;
 	if (nw > 0 && nh > 0) {
 		double s = (double)box.width / (double)nw;

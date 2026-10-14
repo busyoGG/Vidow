@@ -23,7 +23,7 @@
 #       输出逻辑尺寸（物理 / 2）/ 几何按**逻辑**工作区算（物理脚印 2 倍）/ 跨缩放
 #       边界（scale 2 → scale 1）的图标裁剪（像素差分，非「非背景」）/ 指针坐标换算
 #
-# **这个脚本抓到过的两个真 bug（都已修，判据留在脚本里当回归）**：
+# **这个脚本抓到过的三个真 bug（都已修，判据留在脚本里当回归）**：
 #   1) 图标漏到相邻屏上（S3「相邻屏非背景像素 = 0」那条）：贴右边缘溢出的那 16×64
 #      条带被隔壁那块屏照画，修前 832/1024 非背景像素（其中 172 个是客户端纯红），
 #      修后 0/1024。根因两处，都在「缩放节点不能借 wlroots 那套 1:1 语义的裁剪」上：
@@ -45,6 +45,13 @@
 #      现场 `place w1 -> 464,506`）。修法：松手那一半无条件清标志，并且标志被吞过、
 #      grab 还挂着时接着走小窗那条松手把它一起收掉。回归判据见 S4 那节最后三条
 #      （单击放大 / 无按键 motion 不拖窗口）。
+#
+#   3) HiDPI（运行时 `output-scale` 改到 2）之后**重进**小窗，盒里的内容只有该有的
+#      一半大（判据是 S7「盒里内容 = contain 几何的 2 倍物理像素」）：修前脚印
+#      86x95 物理（该 172x190），修后 172x190。根因在 `src/view.c`：`view_dst_capture()`
+#      记 1:1 基线时兜底读的是**缓冲像素**（缩放 2 的客户端缓冲是逻辑的两倍），而
+#      `view_mini_native()` 优先读这份缓存、xdg 那条路又只在小窗退出那一刻记一次
+#      （读到的时刻客户端还没按新逻辑尺寸交帧）→ 永久过期。修法与取证见 README 278。
 #
 # **怎么注入**：headless 里没有真鼠标 / 真键盘，用 `VIDOW_TEST_ACTION` 的 FIFO
 # 形式发 `pointer-motion x y` / `pointer-button left press|release mod`。它走的是和
@@ -234,6 +241,22 @@ import numpy as np
 a = np.asarray(Image.open(sys.argv[1]).convert('RGB'), dtype=np.int16)
 d = (np.abs(a - np.array([255, 0, 255], dtype=np.int16)).sum(axis=2) > 6)
 print(int(d.sum()))
+PY
+}
+# 非壁纸像素的**外接框**（物理 px，"w h"）：小窗盒里客户端内容到底铺了多大一块。
+# 背景 = wall.py 的纯洋红 #ff00ff（和 nonbg 同一套判据）。
+nonbgbox() {
+	python3 - "$1" <<'PY'
+import sys
+from PIL import Image
+import numpy as np
+a = np.asarray(Image.open(sys.argv[1]).convert('RGB'), dtype=np.int16)
+m = (np.abs(a - np.array([255, 0, 255], dtype=np.int16)).sum(axis=2) > 6)
+ys, xs = np.nonzero(m)
+if len(xs) == 0:
+    print("0 0")
+else:
+    print(int(xs.max() - xs.min() + 1), int(ys.max() - ys.min() + 1))
 PY
 }
 shot() {  # $1 输出文件，$2..$5 = x y w h（grim 的几何是 "x,y WxH"！）
@@ -1140,15 +1163,26 @@ if shot "$RUNDIR/s7-mini.ppm" "$MX" "$MY" "$MW" "$MH"; then
 	[ "$SZ" = "$((MW * 2))x$((MH * 2))" ] &&
 		pass "scale 2 下按 2 倍物理像素渲染（grim 的 -g 是逻辑坐标、不乘 scale）" ||
 		fail "scale 2 下像素数不对：$SZ，期望 $((MW * 2))x$((MH * 2))"
-	# 盒里大部分是 contain 的透明边（露壁纸）+ 每帧在动的探针，所以用「非壁纸
-	# 像素占比」这种宽判据；**不能**拿「盒里有纯红」判（探针每帧画面不同）。
-	# 门槛取 5% 而不是 10%：本机实测这一条带是 7446/66120（11.3%），贴着 10% 会偶发
-	# FAIL。11.3% 这个读数意味着**内容只占盆盒的一半**（contain 该是 86x95 逻辑 =
-	# 172x190 物理像素，实测 86x95 物理）—— 这条只当「有内容」的信号用，不拿它断言
-	# 内容缩放比（那属于另一条待查的线索，写死会变成假读数）。
-	[ "$NB" -gt $((TOT / 20)) ] &&
-		pass "盒里有客户端内容（非壁纸 $NB / $TOT > 5%）" ||
-		fail "盒里没有内容（非壁纸 $NB / $TOT）"
+	# 内容脚印 = contain 几何的 2 倍物理像素（这才是「小窗按逻辑尺寸缩、按物理
+	# 像素画」该有的样子）。盒里剩下的透明边露壁纸，探针每帧画面不同 —— **不能**
+	# 拿「盒里有纯红」判。判据是**非壁纸像素的外接框**（含 CSD 那圈半透明阴影，
+	# 它也盖在壁纸上，所以正好等于整块内容的脚印）。
+	#
+	# 这条以前只当「有内容」的信号用（门槛放宽到 5%）：那时实测脚印是 86x95 物理
+	# 像素（= 该有的一半），根因是 `view_mini_native()` 读到过期的原生尺寸（见
+	# README 278），修完按真值判。
+	SW2=$(winf w1 sw); SH2=$(winf w1 sh)
+	read -r EXW EXH <<< "$(python3 -c "
+mw, mh, sw, sh = $MW, $MH, $SW2, $SH2
+s = min(mw / sw, mh / sh)
+print(round(sw * s * 2), round(sh * s * 2))")"
+	read -r CBW CBH <<< "$(nonbgbox "$RUNDIR/s7-mini.ppm")"
+	DW=$((CBW > EXW ? CBW - EXW : EXW - CBW)); DH=$((CBH > EXH ? CBH - EXH : EXH - CBH))
+	echo "  内容脚印 ${CBW}x${CBH} 物理（原生 ${SW2}x${SH2} contain 进 ${MW}x${MH} 逻辑"\
+		"= ${EXW}x${EXH} 物理，非壁纸 $NB / $TOT）"
+	[ "$DW" -le $((EXW * 12 / 100)) ] && [ "$DH" -le $((EXH * 12 / 100)) ] &&
+		pass "盒里内容 = contain 几何的 2 倍物理像素（实测 ${CBW}x${CBH} ≈ ${EXW}x${EXH}）" ||
+		fail "盒里内容脚印不对：${CBW}x${CBH} 物理，期望 ≈ ${EXW}x${EXH}（含 CSD 阴影，±12%）"
 fi
 
 # ---- 判据 3：图标贴边裁剪跨缩放边界（scale 2 屏右边缘 → scale 1 邻屏）
