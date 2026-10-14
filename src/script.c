@@ -778,10 +778,12 @@ static int l_bind(lua_State *L) {
 	/* { on = "release" } = 松开才触发（默认按下触发；单独一个修饰键的绑定默认
 	 * 就是松开触发，见 keybind.c）。 */
 	bool on_release = false;
-	/* { repeat = false } = 按住键的自动重复不再触发（niri 的 binds { repeat }，
-	 * 默认 true）；{ cooldown_ms = 200 } = 两次触发之间至少隔 200ms
-	 * （niri 的 binds { cooldown-ms }，默认 0 = 不限）。 */
-	bool repeat = true;
+	/* { repeatable = false } = 按住键的自动重复不再触发（niri 的 binds
+	 * { repeat }，默认 true）；{ cooldown_ms = 200 } = 两次触发之间至少隔
+	 * 200ms（niri 的 binds { cooldown-ms }，默认 0 = 不限）。
+	 * 主名是 `repeatable`：`repeat` 是 Lua 保留字，写起来只能 `["repeat"]`。
+	 * 老写法 `["repeat"]` 继续认（别名，README 262 就是这么写的）。 */
+	bool repeatable = true;
 	int cooldown_ms = 0;
 	if (lua_istable(L, 3)) {
 		lua_getfield(L, 3, "inhibited");
@@ -803,12 +805,19 @@ static int l_bind(lua_State *L) {
 			}
 		}
 		lua_pop(L, 1);
-		lua_getfield(L, 3, "repeat");
+		lua_getfield(L, 3, "repeatable");
+		if (lua_isnil(L, -1)) {
+			/* 老名字（Lua 保留字，只能写成 ["repeat"]）：两个都写时以
+			 * repeatable 为准。 */
+			lua_pop(L, 1);
+			lua_getfield(L, 3, "repeat");
+		}
 		if (lua_isboolean(L, -1)) {
-			repeat = lua_toboolean(L, -1) != 0;
+			repeatable = lua_toboolean(L, -1) != 0;
 		} else if (!lua_isnil(L, -1)) {
 			lua_pop(L, 1);
-			return luaL_error(L, "vidow.bind 的 repeat 只能是 true / false");
+			return luaL_error(L, "vidow.bind 的 repeatable（老名字 "
+				"repeat，得写 [\"repeat\"]）只能是 true / false");
 		}
 		lua_pop(L, 1);
 		lua_getfield(L, 3, "cooldown_ms");
@@ -828,7 +837,7 @@ static int l_bind(lua_State *L) {
 	}
 	char err[160];
 	if (vidow_keybind_add(s->server, trigger, action, inhibited, on_release,
-			repeat, cooldown_ms, err, sizeof(err)) == NULL) {
+			repeatable, cooldown_ms, err, sizeof(err)) == NULL) {
 		return luaL_error(L, "%s", err);
 	}
 	lua_pushboolean(L, 1);
@@ -1296,6 +1305,84 @@ static int l_output(lua_State *L) {
 	}
 	lua_pop(L, 1);
 
+	/* 按需 VRR（niri 的 variable-refresh-rate on-demand=true）：这块屏「有窗口
+	 * 要 VRR 才提刷新率」。不写就继承全局 vrr_on_demand。 */
+	lua_getfield(L, 1, "vrr_on_demand");
+	if (!lua_isnil(L, -1)) {
+		spec.has_vrr_on_demand = true;
+		spec.vrr_on_demand = lua_toboolean(L, -1) != 0;
+	}
+	lua_pop(L, 1);
+
+	/* 每屏 layout{} 覆盖（niri 的 output { layout { … } }）：表里写了的项覆盖
+	 * 全局，没写的继承。这里把它翻成 output_layout 那份文本（校验 / 落值都在
+	 * config.c 的 parse_output_layout 里，两条写路径同一套解析）。 */
+	lua_getfield(L, 1, "layout");
+	if (!lua_isnil(L, -1)) {
+		if (!lua_istable(L, -1)) {
+			lua_pop(L, 1);
+			return luaL_error(L, "vidow.output{ name = \"%s\" }: layout 得是一张表"
+				"（比如 layout = { gaps = 20, center_focused_column = \"always\" }）",
+				who);
+		}
+		char text[512];
+		size_t n = (size_t)snprintf(text, sizeof(text), "%s:", who);
+		bool first = true;
+		lua_pushnil(L);
+		while (lua_next(L, -2) != 0) {
+			/* key 在 -2，值在 -1 */
+			if (lua_type(L, -2) != LUA_TSTRING) {
+				lua_pop(L, 2);
+				return luaL_error(L, "vidow.output{ name = \"%s\" }: layout 的项名"
+					"得是字符串（gaps / center_focused_column / …）", who);
+			}
+			const char *key = lua_tostring(L, -2);
+			char value[192];
+			value[0] = '\0';
+			if (lua_isnumber(L, -1)) {
+				snprintf(value, sizeof(value), "%.10g", lua_tonumber(L, -1));
+			} else if (lua_isstring(L, -1)) {
+				snprintf(value, sizeof(value), "%s", lua_tostring(L, -1));
+			} else if (lua_istable(L, -1)) {
+				/* 数表（preset_column_widths = { 0.25, 0.5 }）→ 逗号分隔。 */
+				size_t vn = 0;
+				int idx = 0;
+				lua_pushnil(L);
+				while (lua_next(L, -2) != 0) {
+					if (!lua_isnumber(L, -1)) {
+						lua_pop(L, 3);
+						return luaL_error(L, "vidow.output{ name = \"%s\" }: "
+							"layout.%s 的表里只能放数（比例 0 ~ 1）", who, key);
+					}
+					vn += (size_t)snprintf(value + (vn < sizeof(value) ? vn :
+						sizeof(value) - 1), sizeof(value) - (vn < sizeof(value) ?
+						vn : sizeof(value) - 1), "%s%.10g", idx > 0 ? ", " : "",
+						lua_tonumber(L, -1));
+					idx++;
+					lua_pop(L, 1);
+				}
+			} else {
+				lua_pop(L, 2);
+				return luaL_error(L, "vidow.output{ name = \"%s\" }: layout.%s 的值"
+					"认不出来（数 / 字符串 / 数表）", who, key);
+			}
+			n += (size_t)snprintf(text + (n < sizeof(text) ? n : sizeof(text) - 1),
+				sizeof(text) - (n < sizeof(text) ? n : sizeof(text) - 1),
+				"%s%s=%s", first ? " " : "; ", key, value);
+			first = false;
+			lua_pop(L, 1);
+		}
+		char err[192];
+		err[0] = '\0';
+		if (!vidow_output_layout_apply_text(&s->server->config, text, err,
+				sizeof(err))) {
+			lua_pop(L, 1);
+			return luaL_error(L, "vidow.output{ name = \"%s\" }: layout 不认"
+				"（%s）", who, err[0] != '\0' ? err : "看日志");
+		}
+	}
+	lua_pop(L, 1);
+
 	/* 位深：8 / 10（10 位要显卡 + 显示器 + 渲染器都支持） */
 	lua_getfield(L, 1, "depth");
 	if (!lua_isnil(L, -1)) {
@@ -1331,7 +1418,7 @@ static int l_output(lua_State *L) {
 	/* 项名写错（scalee / pos）不该悄悄不生效：列一遍能写什么。 */
 	static const char *const fields[] = {
 		"name", "scale", "x", "y", "mode", "enabled", "vrr", "depth",
-		"transform",
+		"transform", "vrr_on_demand", "layout",
 	};
 	lua_pushnil(L);
 	while (lua_next(L, 1) != 0) {
@@ -1349,7 +1436,7 @@ static int l_output(lua_State *L) {
 			lua_pop(L, 2);
 			return luaL_error(L, "vidow.output{…}: 没有 '%s' 这一项"
 				"（能写：name / scale / x / y / mode / enabled / vrr / depth / "
-				"transform）", field != NULL ? field : "?");
+				"transform / vrr_on_demand / layout）", field != NULL ? field : "?");
 		}
 		lua_pop(L, 1);
 	}

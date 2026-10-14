@@ -141,6 +141,40 @@ enum vidow_center_focused_column {
  * 配置值是一行文本，用一个定长数组收下）。 */
 #define VIDOW_MAX_COLUMN_WIDTH_PRESETS 16
 
+/* 能写 layout{} 的屏最多几块（vidow.output{ name=…, layout={…} } 一个名字一条）。 */
+#define VIDOW_MAX_OUTPUT_LAYOUTS 16
+
+/* 一块屏的 layout{} 覆盖（niri 的 `output "DP-3" { layout { … } }`）：一块屏一组，
+ * **只记写了的项**（has_* 那一排），没写的继承全局 —— 这就是「没配就继承」的实现
+ * 方式。配置里写在 vidow.output{ name = "DP-3", layout = { gaps = 20 } }，平铺键
+ * output_layout 是它的文本写法（见 config.c 的 parse_output_layout）。 */
+struct vidow_output_layout {
+	char name[64];
+	bool has_gaps;        int gaps;
+	bool has_gaps_top;    int gaps_top;
+	bool has_gaps_bottom; int gaps_bottom;
+	bool has_gaps_left;   int gaps_left;
+	bool has_gaps_right;  int gaps_right;
+	bool has_gaps_inner;  int gaps_inner;
+	bool has_center_focused_column;
+	enum vidow_center_focused_column center_focused_column;
+	bool has_preset_column_widths;
+	double preset_column_widths[VIDOW_MAX_COLUMN_WIDTH_PRESETS];
+	int preset_column_widths_count;
+	bool has_default_column_width;
+	double default_column_width;
+};
+
+/* 一块屏最终生效的那份布局参数（全局值 + 该屏 layout{} 覆盖）。布局 / 列宽那边
+ * 拿这个算，不再直接读 server->config 里的那几个字段 —— 见 vidow_layout_for()。 */
+struct vidow_layout {
+	int gaps, gaps_top, gaps_bottom, gaps_left, gaps_right, gaps_inner;
+	enum vidow_center_focused_column center_focused_column;
+	double preset_column_widths[VIDOW_MAX_COLUMN_WIDTH_PRESETS];
+	int preset_column_widths_count;
+	double default_column_width;
+};
+
 /* libinput 那些开 / 关设置的取值（configs/19-input.lua；套到设备上的地方在
  * input.c 的 vidow_input_apply_libinput）。
  *
@@ -205,6 +239,19 @@ struct vidow_config {
 	 * 1/3、1/2、2/3 —— 就是原来写死在 view.c 的那三个。 */
 	double preset_column_widths[VIDOW_MAX_COLUMN_WIDTH_PRESETS];
 	int preset_column_widths_count;
+	/* 每屏 layout{} 覆盖（niri 的 output { layout { … } }）：一块屏一条，只记
+	 * 写了的项，没写的继承上面那几个全局值（见 vidow_layout_for）。写在
+	 * vidow.output{ name=…, layout={…} }，或平铺键 output_layout（文本写法）。 */
+	struct vidow_output_layout output_layouts[VIDOW_MAX_OUTPUT_LAYOUTS];
+	int output_layouts_count;
+	/* output_layout 的文本形式（vidowmsg config output_layout /
+	 * VIDOW_OUTPUT_LAYOUT 读写的就是这一份；写进去当场解析成上面那张表）。 */
+	char output_layout[512];
+	/* 按需 VRR（niri 的 `variable-refresh-rate on-demand=true`）：这块屏默认
+	 * 「有窗口要才提刷新率」，静止就降回来。默认 false = 不碰 VRR（vidow 以前
+	 * 的行为：vidow.output{ vrr = true } 静态开）。见 output.c 的
+	 * vidow_output_vrr_on_demand_update。 */
+	bool vrr_on_demand;
 	/* 新列（窗口规则没写 column_width 的）开出来多宽，比例。默认 0.5 —— 就是
 	 * 原来 view.c 里那个 DEFAULT_COLUMN_WIDTH。niri 的 default-column-width。 */
 	double default_column_width;
@@ -519,6 +566,40 @@ static inline double vidow_column_fraction_of_px(const struct vidow_config *cfg,
 	int full = work_width + inner;
 	return full > 0 ? (px + inner) / (double)full : 1.0;
 }
+
+/* 上面那几个的「每屏版」：参数是 vidow_layout_for() 算出来的那块屏的最终布局值
+ * （全局 + 该屏 layout{} 覆盖）。算法一字不差，只是值可能来自覆盖表。 */
+static inline int vidow_layout_gap_side(const struct vidow_layout *lay, int side) {
+	return vidow_gap_resolve(side, lay->gaps);
+}
+
+static inline int vidow_layout_gap_inner(const struct vidow_layout *lay) {
+	return vidow_gap_resolve(lay->gaps_inner, lay->gaps);
+}
+
+static inline int vidow_layout_column_width_px(const struct vidow_layout *lay,
+		int work_width, double fraction) {
+	int inner = vidow_layout_gap_inner(lay);
+	int w = (int)((work_width + inner) * fraction) - inner;
+	return w > 1 ? w : 1;
+}
+
+/* 这块屏最终生效的布局参数（全局 + 该屏 layout{} 覆盖；output 可以是 NULL = 只
+ * 要全局那份）。定义在 config.c。 */
+void vidow_layout_for(const struct vidow_server *server,
+		const struct wlr_output *output, struct vidow_layout *out);
+
+/* 按需 VRR（niri 的 variable-refresh-rate on-demand）：这块屏上有没有「要 VRR」
+ * 的窗口显示着，据此把 adaptive sync 提上去 / 降回来。没开按需模式的屏什么都不
+ * 做。定义在 output.c。 */
+void vidow_output_vrr_on_demand_update(struct vidow_server *server,
+		struct wlr_output *wlr_output);
+
+/* output_layout 文本写法（`DP-3: gaps=20; center_focused_column=always | DP-2: gaps=8`）
+ * → 每屏覆盖表；写完把文本重新规范化一遍（读回来就是同一个写法）。定义在
+ * config.c。 */
+bool vidow_output_layout_apply_text(struct vidow_config *cfg, const char *text,
+		char *err, size_t errlen);
 
 /* --------------------------------------------------------------- animation */
 
@@ -945,6 +1026,11 @@ struct vidow_output {
 	 * 说了算，arrange 不做「把焦点列滚回可见区」那套（见 view.c 的 Pass 2）。 */
 	bool gesture_drag;
 	double gesture_viewport;
+	/* 按需 VRR（niri 的 variable-refresh-rate on-demand）：这块屏是不是按需模式
+	 * （配置说了算，每次 arrange 对一遍账），以及上一次按需要到的状态（省掉
+	 * 每帧一次 commit —— 见 output.c 的 vidow_output_vrr_on_demand_update）。 */
+	bool vrr_on_demand_mode;
+	bool vrr_on_demand_on;
 	/* 上一次在这块屏上亮着的工作区（focus-workspace-previous / auto-back-and-forth） */
 	uint64_t prev_ws_id;
 	int64_t last_frame_ns;      /* last frame event, for the animation watchdog */
@@ -1201,6 +1287,10 @@ struct vidow_view {
 	 * 这两条就是给那种窗口留的开关。 */
 	bool focus_on_open;
 	bool focus_on_activate;
+	/* 这个窗口要 VRR（窗口规则 vrr = true，niri 的 variable-refresh-rate）：它
+	 * 显示在「按需 VRR」的屏上时把那块屏的刷新率提上去（见 output.c 的
+	 * vidow_output_vrr_on_demand_update）。默认 false = 不提，跟以前一样。 */
+	bool vrr;
 	/* 这个窗口的激活请求即使 serial 校验不过也照样理（窗口规则 honor_invalid_serial，
 	 * 见 activation.c）。默认 false = 不理。 */
 	bool honor_invalid_serial;

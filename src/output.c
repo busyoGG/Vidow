@@ -8,6 +8,7 @@
 #include <time.h>
 
 #include "ipc.h"
+#include "workspace.h"
 
 #include <wlr/backend/headless.h>
 #include <wlr/util/log.h>
@@ -846,6 +847,71 @@ bool vidow_output_set_vrr(struct vidow_server *server,
 	return true;
 }
 
+/* 按需 VRR（niri 的 `variable-refresh-rate on-demand=true` + 窗口规则
+ * `variable-refresh-rate true`）：
+ *
+ *   屏那边写了 vrr_on_demand = true（或者全局 vrr_on_demand = true）→ 这块屏是
+ *   「按需」模式：只要屏上**显示着**要 VRR 的窗口（窗口规则 vrr = true），就把
+ *   adaptive sync 提上去；那种窗口一个都不显示了（切走工作区 / 关窗 / 最小化 /
+ *   挪到别的屏）就降回来。
+ *
+ * 静态写死的 vrr（vidow.output{ vrr = true/false }）优先：那种屏整块恒定开 / 关，
+ * 不看窗口（由 output_apply_conf_extra 一次定死）。两边都没写 = 什么都不碰，
+ * 和改前一样。
+ *
+ * 每次 arrange 都会调一次（开窗 / 关窗 / 切工作区 / 换屏都会 arrange），但先比
+ * 一遍现状：模式和要求都没变就立刻返回，不会每帧 commit。 */
+void vidow_output_vrr_on_demand_update(struct vidow_server *server,
+		struct wlr_output *wlr_output) {
+	if (server == NULL || wlr_output == NULL) {
+		return;
+	}
+	struct vidow_output *output = output_of(server, wlr_output);
+	if (output == NULL || !wlr_output->enabled) {
+		return;
+	}
+	const struct vidow_output_conf *conf =
+		vidow_output_conf_for(server, wlr_output->name);
+	if (conf != NULL && conf->has_vrr) {
+		return; /* 静态开 / 关：这块屏不按需 */
+	}
+	bool mode = conf != NULL && conf->has_vrr_on_demand ?
+		conf->vrr_on_demand : server->config.vrr_on_demand;
+
+	bool want = false;
+	if (mode) {
+		/* 「显示着」= 它属于这块屏现在亮着的那块工作区，而且没被收起来。 */
+		struct vidow_workspace *shown =
+			vidow_workspace_shown_for(server, wlr_output);
+		struct vidow_view *view;
+		wl_list_for_each(view, &server->views, link) {
+			if (!view->vrr || !view->mapped || view->minimized ||
+					view->output != wlr_output) {
+				continue;
+			}
+			if (shown != NULL && view->ws != shown) {
+				continue;
+			}
+			want = true;
+			break;
+		}
+	}
+	if (mode == output->vrr_on_demand_mode &&
+			want == output->vrr_on_demand_on) {
+		return;
+	}
+	bool was_on = output->vrr_on_demand_on;
+	output->vrr_on_demand_mode = mode;
+	output->vrr_on_demand_on = want;
+	if (!want && !was_on) {
+		return; /* 本来也没提上去过：不用 commit 一次去「降」 */
+	}
+	wlr_log(WLR_INFO, "output %s: 按需 VRR -> %s（%s）", wlr_output->name,
+		want ? "提上去" : "降回来",
+		want ? "屏上显示着要 VRR 的窗口" : "没有要 VRR 的窗口了");
+	vidow_output_set_vrr(server, wlr_output, want);
+}
+
 /* 渲染位深：10 位 = DRM_FORMAT_XRGB2101010 的输出缓冲。
  *
  * 「支不支持」不猜：先看后端报的格式表（能问就问），再直接提交试一次（后端
@@ -1033,6 +1099,9 @@ void vidow_output_apply_state_all(struct vidow_server *server) {
 			vidow_output_set_transform(server, wlr_output, conf->transform);
 		}
 		output_apply_conf_extra(server, output);
+		/* 按需 VRR：配置改了（全局开关 / 这块屏的 vrr_on_demand / 静态 vrr）
+		 * 也对一遍账 —— 该提的提、该降的降。 */
+		vidow_output_vrr_on_demand_update(server, wlr_output);
 	}
 }
 

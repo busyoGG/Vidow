@@ -7,6 +7,8 @@
 -- ================== 缩放与输出
 -- 所有输出的默认缩放：auto = 按 EDID 的 ppi 推，也可以写死 "1" / "1.5"；单块屏点名用 vidow.output{ name = …, scale = … }
 scale = "auto"
+-- 按需可变刷新率（niri 的 variable-refresh-rate on-demand=true）：默认 false = 不碰 VRR。true = 这块屏「有窗口要 VRR 才提刷新率」（窗口规则写 vrr = true，见 14-keys.lua），静止就降回来；每块屏可以用 vidow.output{ name="eDP-1", vrr_on_demand=true } 单独覆盖
+vrr_on_demand = false
 -- 指针一动就把「关着的屏」打开（Hyprland 的 misc { mouse_move_enables_dpms }）；默认 false = 不唤醒（以前的样子：关掉的屏只有再发一条 vidowmsg output-power 才回来）
 mouse_move_enables_dpms = false
 -- 按一下键就把「关着的屏」打开（Hyprland 的 misc { key_press_enables_dpms }）；默认 false = 不唤醒
@@ -27,7 +29,15 @@ key_press_enables_dpms = false
 --     scale      "auto"（按 EDID 的 ppi 推）/ "off"（不缩放）/ 一个正数（2 = 两倍）
 --     x, y       摆在布局的哪个逻辑坐标（写哪个算哪个；只写 x = 0 = 摆到最左边）
 --     mode       "3840x2160@144" / "3840x2160"（刷新率不挑）/ "…@59.94"（小数也行）
---     vrr        true / false（自适应同步，屏不支持就忽略）
+--     vrr        true / false（自适应同步，静态开 / 关这块屏；屏不支持就忽略）
+--     vrr_on_demand  true = 按需 VRR（niri 的 variable-refresh-rate on-demand）：
+--                有窗口要 VRR（窗口规则 vrr = true）才提刷新率，静止降回来；
+--                不写就继承全局 vrr_on_demand（默认 false = 不碰）
+--     layout     每屏覆盖全局布局参数（niri 的 output { layout { … } }）：
+--                gaps / gaps_top / gaps_bottom / gaps_left / gaps_right /
+--                gaps_inner / center_focused_column / preset_column_widths /
+--                default_column_width，**没写的继承全局**；比如
+--                layout = { gaps = 20, center_focused_column = "always" }
 --     depth      位深，只能 8 或 10
 --     transform  方向：normal / 90 / 180 / 270 / flipped / flipped-90 / flipped-180 /
 --                flipped-270（也认 "0" 当 normal）

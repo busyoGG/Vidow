@@ -148,6 +148,10 @@ end
 --                                缓冲区不除（只对 X11 窗口有意义）
 --     capture = "hide"           截图 / 录屏里怎么出现："off"（默认，照常）/
 --                                "hide"（不出现）/ "mosaic"（打马赛克）
+--     vrr = true                 这个窗口显示在「按需 VRR」的屏上时把那块屏的
+--                                刷新率提上去（niri 的 variable-refresh-rate；
+--                                屏那边要写 vrr_on_demand = true 才有效，见
+--                                configs/09-output.lua）。默认不提。
 --     capture_mosaic = 24        马赛克的块边长（屏幕像素，默认 16，最小 2）；只在
 --                                capture = "mosaic" 时有用，单独写不算一个作用
 --     overview = "only"          进全景（Mod+O）的时候露不露："always"（默认，照常）/

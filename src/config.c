@@ -18,6 +18,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <math.h>
+#include <stdarg.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -488,6 +489,17 @@ static const struct entry entries[] = {
 		"新列的默认宽度，比例（0.5 = 半宽）；窗口规则里写了 column_width 的窗口"
 		"按规则走。默认 0.5 —— 原来 view.c 里那个 DEFAULT_COLUMN_WIDTH"
 		"（niri 的 layout { default-column-width }）" },
+	{ "output_layout", K_STRING, OFF(output_layout), SZ(output_layout), 19,
+		"每屏 layout{} 覆盖（niri 的 output { layout { … } }）：每块屏一份，"
+		"**没写的项继承全局**。写法 \"DP-3: gaps=20; center_focused_column="
+		"always | DP-2: gaps=8\" —— `|` 分屏、`输出名:` 起一组、`;` 分数项、"
+		"`键=值`（能写上面那几个全局布局键）。也可以写成 "
+		"vidow.output{ name=\"DP-3\", layout={ gaps=20 } }" },
+	{ "vrr_on_demand", K_BOOL, OFF(vrr_on_demand), SZ(vrr_on_demand), 8,
+		"按需可变刷新率（niri 的 variable-refresh-rate on-demand=true）：默认 "
+		"false = 不碰 VRR。true = 这块屏「有窗口要 VRR 才提刷新率」（窗口规则写 "
+		"vrr = true，见 14-keys.lua），静止就降回来；每块屏可以用 "
+		"vidow.output{ name=\"eDP-1\", vrr_on_demand=true } 单独覆盖" },
 
 	/* 光标隐藏（照 niri 的 cursor {} 那一节）。默认 = 改前行为：都不藏。 */
 	{ "hide_when_typing", K_BOOL, OFF(hide_when_typing),
@@ -1194,7 +1206,374 @@ static void config_notify(struct vidow_config *cfg, const char *key) {
 
 /* Returns false if the key is unknown or the value cannot be parsed. */
 static bool apply_one(struct vidow_config *cfg, const char *key,
+		const char *value);
+
+/* --------------------------------------------------------- 每屏 layout{}
+ *
+ * niri 的 `output "DP-3" { layout { gaps 20; center-focused-column "always" } }`：
+ * 每块屏可以覆盖全局 layout 参数，**没写的继承全局**。vidow 侧同一件事有两种写法：
+ *
+ *   vidow.output{ name = "DP-3", layout = { gaps = 20, center_focused_column = "always" } }
+ *   output_layout = "DP-3: gaps=20; center_focused_column=always | DP-2: gaps=8"
+ *
+ * 后者是平铺键（三条写路径 config.lua / VIDOW_OUTPUT_LAYOUT / set-config 都吃它）。
+ * 语法：`|` 分屏，`<输出名>:` 起一组，组内 `;` 分数项，每项 `键=值`；值里可以带
+ * 逗号（preset_column_widths 的数表就是逗号分隔的）。值一律走全局键那套解析
+ * （apply_one），所以取值范围、报错话术和全局键一字不差。
+ *
+ * 能覆盖的就是 20-layout.lua 那几个全局键 —— 覆盖表里没写的项回全局值，
+ * 不是回「vidow 的内置默认」，所以全局改了它跟着变。 */
+
+static const char *const output_layout_keys[] = {
+	"gaps", "gaps_top", "gaps_bottom", "gaps_left", "gaps_right", "gaps_inner",
+	"center_focused_column", "preset_column_widths", "default_column_width",
+};
+
+static bool output_layout_key_known(const char *key) {
+	for (size_t i = 0; i < sizeof(output_layout_keys) / sizeof(output_layout_keys[0]);
+			i++) {
+		if (strcmp(key, output_layout_keys[i]) == 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/* 往定长缓冲里接一段（截断了就停，保证结尾有 0）。 */
+static void text_append(char *buf, size_t len, size_t *n, const char *fmt, ...) {
+	if (*n + 1 >= len) {
+		return;
+	}
+	va_list ap;
+	va_start(ap, fmt);
+	int m = vsnprintf(buf + *n, len - *n, fmt, ap);
+	va_end(ap);
+	if (m < 0) {
+		return;
+	}
+	*n += (size_t)m;
+	if (*n >= len) {
+		*n = len - 1;
+	}
+}
+
+/* 覆盖表 → 文本（vidow_config_get / 打印默认配置 / 日志都用它）。读回来是同一个
+ * 写法：每项的值按它自己的规范文本打（比例 %.10g，数表逗号分隔）。 */
+static void output_layout_sync_text(struct vidow_config *cfg) {
+	size_t n = 0;
+	cfg->output_layout[0] = '\0';
+	for (int i = 0; i < cfg->output_layouts_count; i++) {
+		const struct vidow_output_layout *ov = &cfg->output_layouts[i];
+		text_append(cfg->output_layout, sizeof(cfg->output_layout), &n,
+			"%s%s:", i > 0 ? " | " : "", ov->name);
+		bool first = true;
+		if (ov->has_gaps) {
+			text_append(cfg->output_layout, sizeof(cfg->output_layout), &n,
+				"%sgaps=%d", first ? " " : "; ", ov->gaps);
+			first = false;
+		}
+		if (ov->has_gaps_top) {
+			text_append(cfg->output_layout, sizeof(cfg->output_layout), &n,
+				"%sgaps_top=%d", first ? " " : "; ", ov->gaps_top);
+			first = false;
+		}
+		if (ov->has_gaps_bottom) {
+			text_append(cfg->output_layout, sizeof(cfg->output_layout), &n,
+				"%sgaps_bottom=%d", first ? " " : "; ", ov->gaps_bottom);
+			first = false;
+		}
+		if (ov->has_gaps_left) {
+			text_append(cfg->output_layout, sizeof(cfg->output_layout), &n,
+				"%sgaps_left=%d", first ? " " : "; ", ov->gaps_left);
+			first = false;
+		}
+		if (ov->has_gaps_right) {
+			text_append(cfg->output_layout, sizeof(cfg->output_layout), &n,
+				"%sgaps_right=%d", first ? " " : "; ", ov->gaps_right);
+			first = false;
+		}
+		if (ov->has_gaps_inner) {
+			text_append(cfg->output_layout, sizeof(cfg->output_layout), &n,
+				"%sgaps_inner=%d", first ? " " : "; ", ov->gaps_inner);
+			first = false;
+		}
+		if (ov->has_center_focused_column) {
+			text_append(cfg->output_layout, sizeof(cfg->output_layout), &n,
+				"%scenter_focused_column=%s", first ? " " : "; ",
+				center_focused_names[ov->center_focused_column >= 0 &&
+					ov->center_focused_column < 3 ?
+					ov->center_focused_column : 0]);
+			first = false;
+		}
+		if (ov->has_preset_column_widths) {
+			text_append(cfg->output_layout, sizeof(cfg->output_layout), &n,
+				"%spreset_column_widths=", first ? " " : "; ");
+			first = false;
+			for (int k = 0; k < ov->preset_column_widths_count; k++) {
+				text_append(cfg->output_layout, sizeof(cfg->output_layout), &n,
+					"%s%.10g", k > 0 ? ", " : "",
+					ov->preset_column_widths[k]);
+			}
+		}
+		if (ov->has_default_column_width) {
+			text_append(cfg->output_layout, sizeof(cfg->output_layout), &n,
+				"%sdefault_column_width=%.10g", first ? " " : "; ",
+				ov->default_column_width);
+			first = false;
+		}
+	}
+}
+
+/* 文本 → 覆盖表（写错了整段不生效，值保持原样：不静默退回默认）。 */
+bool vidow_output_layout_apply_text(struct vidow_config *cfg, const char *text,
+		char *err, size_t errlen) {
+	struct vidow_output_layout table[VIDOW_MAX_OUTPUT_LAYOUTS];
+	int count = 0;
+
+	const char *p = text;
+	while (*p != '\0') {
+		while (isspace((unsigned char)*p) || *p == '|') {
+			p++;
+		}
+		if (*p == '\0') {
+			break;
+		}
+		/* 一组：<输出名>: 项=值; 项=值 */
+		const char *group_end = p;
+		while (*group_end != '\0' && *group_end != '|') {
+			group_end++;
+		}
+		const char *colon = NULL;
+		for (const char *q = p; q < group_end; q++) {
+			if (*q == ':') {
+				colon = q;
+				break;
+			}
+		}
+		if (colon == NULL) {
+			snprintf(err, errlen, "output_layout 的每一组都要以「输出名:」开头"
+				"（比如 \"DP-3: gaps=20\"），现在这一段没有冒号");
+			wlr_log(WLR_ERROR, "config: output_layout 不对：%s", err);
+			return false;
+		}
+		if (count >= VIDOW_MAX_OUTPUT_LAYOUTS) {
+			snprintf(err, errlen, "output_layout 最多写 %d 块屏",
+				VIDOW_MAX_OUTPUT_LAYOUTS);
+			wlr_log(WLR_ERROR, "config: %s", err);
+			return false;
+		}
+		struct vidow_output_layout ov;
+		memset(&ov, 0, sizeof(ov));
+		size_t name_len = (size_t)(colon - p);
+		while (name_len > 0 && isspace((unsigned char)p[0])) {
+			p++;
+			name_len--;
+		}
+		while (name_len > 0 && isspace((unsigned char)colon[-1])) {
+			colon--;
+			name_len--;
+		}
+		if (name_len == 0 || name_len >= sizeof(ov.name)) {
+			snprintf(err, errlen, "output_layout: 输出名得写在冒号前面"
+				"（1 ~ %zu 个字符）", sizeof(ov.name) - 1);
+			wlr_log(WLR_ERROR, "config: %s", err);
+			return false;
+		}
+		snprintf(ov.name, sizeof(ov.name), "%.*s", (int)name_len, p);
+		for (int i = 0; i < count; i++) {
+			if (strcmp(table[i].name, ov.name) == 0) {
+				snprintf(err, errlen, "output_layout: 屏 \"%s\" 写了两遍"
+					"（一块屏一组）", ov.name);
+				wlr_log(WLR_ERROR, "config: %s", err);
+				return false;
+			}
+		}
+
+		/* 组内的项：`;` 分，每项 `键=值`。 */
+		const char *q = colon + 1;
+		while (q < group_end) {
+			while (q < group_end && (isspace((unsigned char)*q) || *q == ';')) {
+				q++;
+			}
+			if (q >= group_end) {
+				break;
+			}
+			const char *item_end = q;
+			while (item_end < group_end && *item_end != ';') {
+				item_end++;
+			}
+			const char *eq = NULL;
+			for (const char *r = q; r < item_end; r++) {
+				if (*r == '=') {
+					eq = r;
+					break;
+				}
+			}
+			if (eq == NULL) {
+				snprintf(err, errlen, "output_layout: \"%.*s\" 不是「键=值」",
+					(int)(item_end - q), q);
+				wlr_log(WLR_ERROR, "config: %s", err);
+				return false;
+			}
+			char key[64];
+			size_t key_len = (size_t)(eq - q);
+			while (key_len > 0 && isspace((unsigned char)q[0])) {
+				q++;
+				key_len--;
+			}
+			while (key_len > 0 && isspace((unsigned char)eq[-1])) {
+				eq--;
+				key_len--;
+			}
+			if (key_len == 0 || key_len >= sizeof(key)) {
+				snprintf(err, errlen, "output_layout: 等号前面得是键名");
+				wlr_log(WLR_ERROR, "config: %s", err);
+				return false;
+			}
+			snprintf(key, sizeof(key), "%.*s", (int)key_len, q);
+			char value[256];
+			const char *v = eq + 1;
+			size_t v_len = (size_t)(item_end - v);
+			while (v_len > 0 && isspace((unsigned char)v[0])) {
+				v++;
+				v_len--;
+			}
+			while (v_len > 0 && isspace((unsigned char)v[v_len - 1])) {
+				v_len--;
+			}
+			if (v_len == 0 || v_len >= sizeof(value)) {
+				snprintf(err, errlen, "output_layout: %s 的值是空的", key);
+				wlr_log(WLR_ERROR, "config: %s", err);
+				return false;
+			}
+			snprintf(value, sizeof(value), "%.*s", (int)v_len, v);
+			if (!output_layout_key_known(key)) {
+				snprintf(err, errlen, "output_layout: 没有 '%s' 这一项"
+					"（能写：gaps / gaps_top / gaps_bottom / gaps_left / "
+					"gaps_right / gaps_inner / center_focused_column / "
+					"preset_column_widths / default_column_width）", key);
+				wlr_log(WLR_ERROR, "config: %s", err);
+				return false;
+			}
+			/* 值走全局键那套解析：校验规则 / 报错话术一处不差。 */
+			struct vidow_config scratch = *cfg;
+			if (!apply_one(&scratch, key, value)) {
+				snprintf(err, errlen, "output_layout: %s 的值 '%s' 不合法"
+					"（屏 \"%s\"）", key, value, ov.name);
+				return false;
+			}
+			if (strcmp(key, "gaps") == 0) {
+				ov.has_gaps = true; ov.gaps = scratch.gaps;
+			} else if (strcmp(key, "gaps_top") == 0) {
+				ov.has_gaps_top = true; ov.gaps_top = scratch.gaps_top;
+			} else if (strcmp(key, "gaps_bottom") == 0) {
+				ov.has_gaps_bottom = true; ov.gaps_bottom = scratch.gaps_bottom;
+			} else if (strcmp(key, "gaps_left") == 0) {
+				ov.has_gaps_left = true; ov.gaps_left = scratch.gaps_left;
+			} else if (strcmp(key, "gaps_right") == 0) {
+				ov.has_gaps_right = true; ov.gaps_right = scratch.gaps_right;
+			} else if (strcmp(key, "gaps_inner") == 0) {
+				ov.has_gaps_inner = true; ov.gaps_inner = scratch.gaps_inner;
+			} else if (strcmp(key, "center_focused_column") == 0) {
+				ov.has_center_focused_column = true;
+				ov.center_focused_column = scratch.center_focused_column;
+			} else if (strcmp(key, "preset_column_widths") == 0) {
+				ov.has_preset_column_widths = true;
+				memcpy(ov.preset_column_widths, scratch.preset_column_widths,
+					sizeof(ov.preset_column_widths));
+				ov.preset_column_widths_count = scratch.preset_column_widths_count;
+			} else if (strcmp(key, "default_column_width") == 0) {
+				ov.has_default_column_width = true;
+				ov.default_column_width = scratch.default_column_width;
+			}
+			q = item_end;
+		}
+		table[count++] = ov;
+		p = group_end;
+	}
+
+	memcpy(cfg->output_layouts, table, sizeof(table));
+	cfg->output_layouts_count = count;
+	output_layout_sync_text(cfg);
+	return true;
+}
+
+/* 这块屏最终生效的布局参数：全局那份，再压上该屏 layout{} 里写了的项。
+ * output == NULL = 只要全局那份。 */
+void vidow_layout_for(const struct vidow_server *server,
+		const struct wlr_output *output, struct vidow_layout *out) {
+	const struct vidow_config *cfg = &server->config;
+	out->gaps = cfg->gaps;
+	out->gaps_top = cfg->gaps_top;
+	out->gaps_bottom = cfg->gaps_bottom;
+	out->gaps_left = cfg->gaps_left;
+	out->gaps_right = cfg->gaps_right;
+	out->gaps_inner = cfg->gaps_inner;
+	out->center_focused_column = cfg->center_focused_column;
+	memcpy(out->preset_column_widths, cfg->preset_column_widths,
+		sizeof(out->preset_column_widths));
+	out->preset_column_widths_count = cfg->preset_column_widths_count;
+	out->default_column_width = cfg->default_column_width;
+	if (output == NULL) {
+		return;
+	}
+	const struct vidow_output_layout *ov = NULL;
+	for (int i = 0; i < cfg->output_layouts_count; i++) {
+		if (strcmp(cfg->output_layouts[i].name, output->name) == 0) {
+			ov = &cfg->output_layouts[i];
+			break;
+		}
+	}
+	if (ov == NULL) {
+		return;
+	}
+	if (ov->has_gaps) {
+		out->gaps = ov->gaps;
+	}
+	if (ov->has_gaps_top) {
+		out->gaps_top = ov->gaps_top;
+	}
+	if (ov->has_gaps_bottom) {
+		out->gaps_bottom = ov->gaps_bottom;
+	}
+	if (ov->has_gaps_left) {
+		out->gaps_left = ov->gaps_left;
+	}
+	if (ov->has_gaps_right) {
+		out->gaps_right = ov->gaps_right;
+	}
+	if (ov->has_gaps_inner) {
+		out->gaps_inner = ov->gaps_inner;
+	}
+	if (ov->has_center_focused_column) {
+		out->center_focused_column = ov->center_focused_column;
+	}
+	if (ov->has_preset_column_widths) {
+		memcpy(out->preset_column_widths, ov->preset_column_widths,
+			sizeof(out->preset_column_widths));
+		out->preset_column_widths_count = ov->preset_column_widths_count;
+	}
+	if (ov->has_default_column_width) {
+		out->default_column_width = ov->default_column_width;
+	}
+}
+
+/* Returns false if the key is unknown or the value cannot be parsed. */
+static bool apply_one(struct vidow_config *cfg, const char *key,
 		const char *value) {
+	/* 平铺键 output_layout：整串文本 → 每屏覆盖表（见上面那一节）。它没有对应
+	 * 的结构体字段，值就是那张表本身，所以在这儿先拦一道。 */
+	if (strcmp(key, "output_layout") == 0) {
+		char err[192];
+		err[0] = '\0';
+		if (!vidow_output_layout_apply_text(cfg, value, err, sizeof(err))) {
+			if (err[0] != '\0') {
+				wlr_log(WLR_ERROR, "config: %s", err);
+			}
+			return false;
+		}
+		return true;
+	}
 	for (size_t i = 0; i < sizeof(entries) / sizeof(entries[0]); i++) {
 		const struct entry *e = &entries[i];
 		if (strcmp(e->key, key) != 0) {
@@ -1612,6 +1991,12 @@ static void defaults(struct vidow_config *cfg) {
 	cfg->preset_column_widths[2] = 0.6666666667;
 	cfg->preset_column_widths_count = 3;
 	cfg->default_column_width = 0.5;
+	/* 每屏 layout{} 覆盖：默认一条都没有（每块屏都继承上面那套全局值）—— 不配置
+	 * 零变化。文本形式跟着清空（两者永远同步，见 output_layout_sync_text）。 */
+	cfg->output_layouts_count = 0;
+	cfg->output_layout[0] = '\0';
+	/* 按需 VRR：默认 false = 一个 VRR 相关的字段都不碰，跟改前一样。 */
+	cfg->vrr_on_demand = false;
 	cfg->workspace_switch_ms = 200;
 	cfg->layer_open_ms = 200;
 	cfg->layer_close_ms = 150;
@@ -1944,10 +2329,13 @@ void vidow_config_log(const struct vidow_config *cfg) {
 	/* 布局那一族（configs/20-layout.lua）：单独一条，数表用
 	 * vidow_config_get 打回「0.3333333333, 0.5, 0.6666666667」那种文本。 */
 	wlr_log(WLR_INFO, "config: layout center-focused-column=%s "
-		"preset-column-widths=[%s] default-column-width=%.10g",
+		"preset-column-widths=[%s] default-column-width=%.10g"
+		" 每屏 layout 覆盖=[%s]（按需 VRR %s）",
 		vidow_config_get(cfg, "center_focused_column"),
 		vidow_config_get(cfg, "preset_column_widths"),
-		cfg->default_column_width);
+		cfg->default_column_width,
+		cfg->output_layout[0] != '\0' ? cfg->output_layout : "无",
+		cfg->vrr_on_demand ? "on" : "off");
 }
 
 /* 回到默认值，再压上环境变量。配置文件（Lua）跑之前、以及每次重载之前都调
@@ -2150,7 +2538,15 @@ static void print_output_hint(FILE *f) {
 "--     scale      \"auto\"（按 EDID 的 ppi 推）/ \"off\"（不缩放）/ 一个正数（2 = 两倍）\n"
 "--     x, y       摆在布局的哪个逻辑坐标（写哪个算哪个；只写 x = 0 = 摆到最左边）\n"
 "--     mode       \"3840x2160@144\" / \"3840x2160\"（刷新率不挑）/ \"…@59.94\"（小数也行）\n"
-"--     vrr        true / false（自适应同步，屏不支持就忽略）\n"
+"--     vrr        true / false（自适应同步，静态开 / 关这块屏；屏不支持就忽略）\n"
+"--     vrr_on_demand  true = 按需 VRR（niri 的 variable-refresh-rate on-demand）：\n"
+"--                有窗口要 VRR（窗口规则 vrr = true）才提刷新率，静止降回来；\n"
+"--                不写就继承全局 vrr_on_demand（默认 false = 不碰）\n"
+"--     layout     每屏覆盖全局布局参数（niri 的 output { layout { … } }）：\n"
+"--                gaps / gaps_top / gaps_bottom / gaps_left / gaps_right /\n"
+"--                gaps_inner / center_focused_column / preset_column_widths /\n"
+"--                default_column_width，**没写的继承全局**；比如\n"
+"--                layout = { gaps = 20, center_focused_column = \"always\" }\n"
 "--     depth      位深，只能 8 或 10\n"
 "--     transform  方向：normal / 90 / 180 / 270 / flipped / flipped-90 / flipped-180 /\n"
 "--                flipped-270（也认 \"0\" 当 normal）\n"
@@ -2363,6 +2759,10 @@ static void print_keys_lua(FILE *f) {
 "--                                缓冲区不除（只对 X11 窗口有意义）\n"
 "--     capture = \"hide\"           截图 / 录屏里怎么出现：\"off\"（默认，照常）/\n"
 "--                                \"hide\"（不出现）/ \"mosaic\"（打马赛克）\n"
+"--     vrr = true                 这个窗口显示在「按需 VRR」的屏上时把那块屏的\n"
+"--                                刷新率提上去（niri 的 variable-refresh-rate；\n"
+"--                                屏那边要写 vrr_on_demand = true 才有效，见\n"
+"--                                configs/09-output.lua）。默认不提。\n"
 "--     capture_mosaic = 24        马赛克的块边长（屏幕像素，默认 16，最小 2）；只在\n"
 "--                                capture = \"mosaic\" 时有用，单独写不算一个作用\n"
 "--     overview = \"only\"          进全景（Mod+O）的时候露不露：\"always\"（默认，照常）/\n"

@@ -153,6 +153,10 @@ enum vidow_rule_act {
 	VRA_BLUR_XRAY,         /* 重叠时也用整屏那份底衬 */
 	/* 图层专属：进全景的时候露不露（见 enum vidow_overview_mode） */
 	VRA_OVERVIEW,
+	/* 这个窗口要 VRR（niri 的 variable-refresh-rate）：它显示在「按需 VRR」
+	 * 的屏上时把那块屏的刷新率提上去（见 output.c 的
+	 * vidow_output_vrr_on_demand_update）。默认 false = 不提。 */
+	VRA_VRR,
 	VRA_COUNT
 };
 

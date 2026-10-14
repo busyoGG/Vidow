@@ -795,16 +795,21 @@ static double focus_viewport_target(struct vidow_server *server,
 		return viewport;
 	}
 
+	/* 居中策略可以按屏覆盖（niri 的 output { layout { center-focused-column } }）：
+	 * 读这块屏最终生效的那份值。 */
+	struct vidow_layout lay;
+	vidow_layout_for(server, output->wlr_output, &lay);
+
 	/* 这条列在条带上占多宽（全屏那条 = 一整屏）。 */
 	int cw = column_strip_width(focused_col, work_width);
 	/* 居中要用的宽度：列比视口还宽就没法居中（夹住，跟 niri 一样）。 */
 	int center_w = cw > work_width ? work_width : cw;
 
-	if (server->config.center_focused_column == VIDOW_CENTER_ALWAYS) {
+	if (lay.center_focused_column == VIDOW_CENTER_ALWAYS) {
 		return focused_col->offset - (work_width - center_w) / 2.0;
 	}
 
-	if (server->config.center_focused_column == VIDOW_CENTER_ON_OVERFLOW) {
+	if (lay.center_focused_column == VIDOW_CENTER_ON_OVERFLOW) {
 		/* 和上一个焦点列能不能一起完整放进视口。上一个没了 / 在别的屏上 /
 		 * 就在同一条列里 —— 都算「放得下」（不居中）。 */
 		struct vidow_column *prev = server->last_focused_col;
@@ -873,9 +878,11 @@ static void view_ensure_column(struct vidow_server *server,
 	 * DEFAULT_COLUMN_WIDTH —— 见 configs/20-layout.lua）。新列不做过渡
 	 * （它是刚生出来的，宽度没有「变化」），width_shown 跟逻辑值一起给上
 	 * —— arrange 画的是 width_shown。 */
+	struct vidow_layout lay;
+	vidow_layout_for(server, view->output, &lay);
 	col->width_fraction = view->rule_eff.set[VRA_COLUMN_WIDTH] ?
 		view->rule_eff.val[VRA_COLUMN_WIDTH].d :
-		server->config.default_column_width;
+		lay.default_column_width;
 	col->width_shown = col->width_fraction;
 	wl_list_init(&col->views);
 
@@ -2272,12 +2279,15 @@ struct wlr_box vidow_work_area(struct vidow_server *server,
 
 	/* 缩进可用区：窗口不贴屏幕边、也不贴状态栏。四边可以分别设
 	 * （gaps_top/bottom/left/right 或一张表 gaps = { top = … }），
-	 * 没设就一起用统一值 gaps。 */
-	const struct vidow_config *cfg = &server->config;
-	int top = vidow_gap_side(cfg, cfg->gaps_top);
-	int bottom = vidow_gap_side(cfg, cfg->gaps_bottom);
-	int left = vidow_gap_side(cfg, cfg->gaps_left);
-	int right = vidow_gap_side(cfg, cfg->gaps_right);
+	 * 没设就一起用统一值 gaps。每块屏可以用 layout{} 覆盖（niri 的
+	 * output { layout { … } }）：vidow_layout_for 算的就是「全局 + 这块屏的
+	 * 覆盖」，所以这里读的是这块屏最终生效的那份值。 */
+	struct vidow_layout lay;
+	vidow_layout_for(server, output, &lay);
+	int top = vidow_layout_gap_side(&lay, lay.gaps_top);
+	int bottom = vidow_layout_gap_side(&lay, lay.gaps_bottom);
+	int left = vidow_layout_gap_side(&lay, lay.gaps_left);
+	int right = vidow_layout_gap_side(&lay, lay.gaps_right);
 	area.x += left;
 	area.y += top;
 	area.width -= left + right;
@@ -2363,7 +2373,10 @@ int vidow_workspace_preview_layout(struct vidow_server *server,
 	if (server == NULL || ws == NULL || work_w < 1 || work_h < 1) {
 		return 0;
 	}
-	int inner = vidow_gap_inner(&server->config);
+	/* 这块工作区住的那块屏的布局值（没住屏 = 全局那份）。 */
+	struct vidow_layout lay;
+	vidow_layout_for(server, ws->output, &lay);
+	int inner = vidow_layout_gap_inner(&lay);
 	int cursor = 0;
 	struct vidow_column *col;
 	/* 就是上面 arrange_columns 那一套（Pass 1 + Pass 3），只是**不写进
@@ -2375,7 +2388,7 @@ int vidow_workspace_preview_layout(struct vidow_server *server,
 		if (!column_has_shown_views(col)) {
 			continue;
 		}
-		int width = vidow_column_width_px(&server->config, work_w,
+		int width = vidow_layout_column_width_px(&lay, work_w,
 			column_layout_fraction(col));
 		bool col_full = column_has_fullscreen(col);
 		int x = cursor;
@@ -2428,8 +2441,12 @@ static void output_arrange(struct vidow_server *server,
 		full_box = work; /* 布局里还查不到这块屏：退回工作区，别给个空框 */
 	}
 
-	/* 窗口之间（列与列、同列上下）的间距 = gaps_inner，没设就跟 gaps 一样。 */
-	int inner = vidow_gap_inner(&server->config);
+	/* 窗口之间（列与列、同列上下）的间距 = gaps_inner，没设就跟 gaps 一样。
+	 * 每块屏可以用 layout{} 覆盖（niri 的 output { layout { … } }）：这里读的是
+	 * 这块屏最终生效的那份值（全局 + 覆盖，见 vidow_layout_for）。 */
+	struct vidow_layout lay;
+	vidow_layout_for(server, output->wlr_output, &lay);
+	int inner = vidow_layout_gap_inner(&lay);
 
 	/* Pass 1: column widths and offsets, measured from the work area. */
 	struct wl_list *shown = output_shown_columns(server, output->wlr_output);
@@ -2446,7 +2463,7 @@ static void output_arrange(struct vidow_server *server,
 		/* 比例 → 像素用 vidow_column_width_px（连 gap 一起分那块区域）：
 		 * 两条 0.5 连着中间的 gap 正好铺满可用区，不会多出一个 gap。
 		 * 比例取 column_layout_fraction：列宽过渡在跑时是补间中间值。 */
-		int width = vidow_column_width_px(&server->config, work.width,
+		int width = vidow_layout_column_width_px(&lay, work.width,
 			column_layout_fraction(col));
 		col->width = width;
 		col->offset = cursor;
@@ -2529,6 +2546,11 @@ static void output_arrange(struct vidow_server *server,
 		vidow_backdrop_damage_view(fullscreen);
 		wlr_scene_node_raise_to_top(&fullscreen->scene_tree->node);
 	}
+
+	/* 按需 VRR（niri 的 variable-refresh-rate on-demand）：这块屏现在有没有
+	 * 「要 VRR 的窗口显示着」—— 有就把刷新率提上去，没有就降回来。没开按需
+	 * 模式的屏在函数第一行就返回了，所以这里等于白调一次。 */
+	vidow_output_vrr_on_demand_update(server, output->wlr_output);
 }
 
 void vidow_arrange(struct vidow_server *server) {
@@ -3851,8 +3873,10 @@ void vidow_cycle_column_width(struct vidow_server *server) {
 	/* 预设表来自配置（preset_column_widths，configs/20-layout.lua）：默认
 	 * 1/3、1/2、2/3，就是原来写死在这儿的那三个。表为空的话兜一个 0.5 ——
 	 * 配置解析保证至少一档，这里只是不给「空表除以零」的机会。 */
-	const double *presets = server->config.preset_column_widths;
-	size_t n = (size_t)server->config.preset_column_widths_count;
+	struct vidow_layout lay;
+	vidow_layout_for(server, view->output, &lay);
+	const double *presets = lay.preset_column_widths;
+	size_t n = (size_t)lay.preset_column_widths_count;
 	if (n == 0) {
 		static const double fallback[] = { 0.5 };
 		presets = fallback;

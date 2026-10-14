@@ -46,6 +46,11 @@ static void describe(const struct vidow_output_conf *conf, char *buf,
 		n += (size_t)snprintf(buf + (n < len ? n : len - 1),
 			len - (n < len ? n : len - 1), " vrr=%s", conf->vrr ? "on" : "off");
 	}
+	if (conf->has_vrr_on_demand) {
+		n += (size_t)snprintf(buf + (n < len ? n : len - 1),
+			len - (n < len ? n : len - 1), " 按需VRR=%s",
+			conf->vrr_on_demand ? "on" : "off");
+	}
 	if (conf->has_depth) {
 		n += (size_t)snprintf(buf + (n < len ? n : len - 1),
 			len - (n < len ? n : len - 1), " %d位色", conf->depth);
@@ -59,7 +64,8 @@ static void describe(const struct vidow_output_conf *conf, char *buf,
 			len - (n < len ? n : len - 1), " %s", conf->enabled ? "开" : "关");
 	}
 	if (!conf->has_scale && !conf->has_pos && !conf->has_mode &&
-			!conf->has_vrr && !conf->has_depth && !conf->has_transform &&
+			!conf->has_vrr && !conf->has_vrr_on_demand &&
+			!conf->has_depth && !conf->has_transform &&
 			!conf->has_enabled) {
 		snprintf(buf + (n < len ? n : len - 1),
 			len - (n < len ? n : len - 1), "（什么也没写：缩放和位置都自动）");
@@ -96,6 +102,8 @@ struct vidow_output_conf *vidow_output_conf_add(struct vidow_server *server,
 	conf->mode_hz = spec->mode_hz;
 	conf->has_vrr = spec->has_vrr;
 	conf->vrr = spec->vrr;
+	conf->has_vrr_on_demand = spec->has_vrr_on_demand;
+	conf->vrr_on_demand = spec->vrr_on_demand;
 	conf->has_depth = spec->has_depth;
 	conf->depth = spec->depth;
 	conf->has_transform = spec->has_transform;

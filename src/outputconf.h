@@ -43,6 +43,12 @@ struct vidow_output_conf {
 	bool has_vrr;
 	bool vrr;
 
+	/* 按需 VRR（niri 的 `variable-refresh-rate on-demand=true`）：这块屏默认
+	 * 「有要 VRR 的窗口显示着才提刷新率」。不写就继承全局 vrr_on_demand
+	 * （默认 false = 不碰 VRR）；写了 vrr（静态开 / 关）时它让位给 vrr。 */
+	bool has_vrr_on_demand;
+	bool vrr_on_demand;
+
 	/* 渲染位深：8 或 10。10 位走 DRM_FORMAT_XRGB2101010 的输出缓冲，需要
 	 * 显卡 + 显示器 + 渲染器都支持；不支持时保持 8 位并说清楚。 */
 	bool has_depth;
@@ -69,6 +75,8 @@ struct vidow_output_spec {
 	double mode_hz;
 	bool has_vrr;
 	bool vrr;
+	bool has_vrr_on_demand;
+	bool vrr_on_demand;
 	bool has_depth;
 	int depth;
 	bool has_transform;

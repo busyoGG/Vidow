@@ -287,7 +287,7 @@ bool vidow_keybind_init(struct vidow_server *server) {
 
 struct vidow_keybind *vidow_keybind_add(struct vidow_server *server,
 		const char *trigger, const char *action, bool inhibited,
-		bool on_release, bool repeat, int cooldown_ms, char *err,
+		bool on_release, bool repeatable, int cooldown_ms, char *err,
 		size_t errlen) {
 	if (err != NULL && errlen > 0) {
 		err[0] = '\0';
@@ -326,7 +326,7 @@ struct vidow_keybind *vidow_keybind_add(struct vidow_server *server,
 	bind->axis = t.axis;
 	bind->axis_dir = t.axis_dir;
 	bind->modifier_only = t.modifier_only;
-	bind->repeat = repeat;
+	bind->repeatable = repeatable;
 	bind->cooldown_ms = cooldown_ms > 0 ? cooldown_ms : 0;
 	/* 单独一个修饰键默认**松开才触发**：按下就触发的话 `Super+Q` 会顺带把
 	 * 全景也打开（那条绑定本来只想在「只按了 Super」时生效）。 */
@@ -338,7 +338,7 @@ struct vidow_keybind *vidow_keybind_add(struct vidow_server *server,
 			bind->src == VIDOW_SRC_WHEEL ? "（滚轮）" : "",
 		bind->on == VIDOW_BIND_RELEASE ? "（松开触发）" : "",
 		inhibited ? "（抑制期间也生效）" : "",
-		!bind->repeat || bind->cooldown_ms > 0 ? "（有重复限制）" : "");
+		!bind->repeatable || bind->cooldown_ms > 0 ? "（有重复限制）" : "");
 	return bind;
 }
 
@@ -422,11 +422,11 @@ static bool bind_hits(const struct vidow_keybind *bind, enum vidow_bind_src src,
 	return sym == bind->keysym || xkb_keysym_to_lower(sym) == bind->keysym;
 }
 
-/* 这条绑定现在能不能跑：自动重复（repeat = false 的绑定只认第一次按下）和
+/* 这条绑定现在能不能跑：自动重复（repeatable = false 的绑定只认第一次按下）和
  * cooldown_ms（两次触发之间的最小间隔，0 = 不限）。返回 false = 这次跳过 ——
  * 键照样算被我们吃了（调用者返回 true），只是动作不跑。 */
 static bool bind_allowed(struct vidow_keybind *bind, bool repeated) {
-	if (repeated && !bind->repeat) {
+	if (repeated && !bind->repeatable) {
 		return false;
 	}
 	if (bind->cooldown_ms > 0) {
@@ -444,8 +444,8 @@ static bool bind_allowed(struct vidow_keybind *bind, bool repeated) {
 static void bind_run(struct vidow_server *server, struct vidow_keybind *bind,
 		bool repeated) {
 	if (!bind_allowed(bind, repeated)) {
-		wlr_log(WLR_DEBUG, "keybind: %s 这次跳过（repeat=%s cooldown=%dms）",
-			bind->trigger, bind->repeat ? "true" : "false",
+		wlr_log(WLR_DEBUG, "keybind: %s 这次跳过（repeatable=%s cooldown=%dms）",
+			bind->trigger, bind->repeatable ? "true" : "false",
 			bind->cooldown_ms);
 		return;
 	}
@@ -562,7 +562,7 @@ static bool pending_release(struct vidow_server *server,
 /* 现在按着哪些键（只看 keysym）。用来认「这一下是自动重复」：同一个 keysym
  * 还没松开又收到一次按下 = 重复。wlroots 0.20 自己不做重复（客户端做），所以
  * 平时这里一直是空的 —— 留着是为了虚拟键盘 / 输入法回注 / 以后 wlroots 自己
- * 重复时，repeat = false 的绑定不会连着跑。 */
+ * 重复时，repeatable = false 的绑定不会连着跑。 */
 #define HELD_MAX 32
 static xkb_keysym_t held_syms[HELD_MAX];
 static int held_count;

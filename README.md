@@ -5420,6 +5420,72 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
      - 未做：niri 的 `fixed 1920`（固定像素档）、`preset-window-heights`、`default-column-width {}`（让客户端自己定宽）、
        `always-center-single-column`；窗口规则级的 per-rule 预设覆盖。
 
+263. **每窗口按需 VRR（niri 的 `variable-refresh-rate on-demand`）+ 每屏 `layout {}`（`configs/09-output.lua` / `20-layout.lua`）**（用户：「调研 top5 ④」；2026-10-14）
+
+     - 顺手改的键位选项名：`["repeat"]` → **`repeatable`**（`repeat` 是 Lua 保留字，写起来只能 `["repeat"]`）。主名
+       `repeatable`（bool，默认 `true` = 改前行为），**老写法 `["repeat"]` 继续认**（别名；两个都写以 `repeatable` 为准），
+       README 262 里已经写过的那种用户配置一个字不用改。`vidowmsg keybinds` 现在报 `repeatable` + `repeat`（同一个值，
+       老脚本不改）+ `cooldown_ms`。落点：`src/script.c`（`l_bind` 的选项解析）、`src/keybind.c` /
+       `src/keybind.h`（字段改名）、`src/ipcstate.c`（多报一个字段名）。**`src/config.c` 没动** —— 绑定选项的说明本来就不在
+       默认配置里（14-keys.lua 只讲规则字段）。
+     - **每窗口按需 VRR**（niri 的窗口规则 `variable-refresh-rate on-demand=true` + 规则 `variable-refresh-rate true`）：
+       ```lua
+       vrr_on_demand = true                                     -- 全局：所有屏都按需（默认 false = 不碰 VRR）
+       vidow.output{ name = "eDP-1", vrr_on_demand = true }     -- 每屏覆盖（不写继承全局）
+       vidow.rule{ app_id = "^gamescope$", vrr = true }         -- 这个窗口要 VRR
+       ```
+       语义：这块屏是「按需」模式时，屏上**显示着**要 VRR 的窗口（属于该屏当前亮着的工作区、没被最小化）→ 把 adaptive
+       sync 提上去；那种窗口一个都不显示了（切工作区 / 关窗 / 最小化 / 挪走）→ 降回来。**静态 `vrr = true/false` 优先**
+       （那种屏整块恒定，不按需）；两边都没写 = 一个 VRR 字段都不碰，和改前一样。实现：`src/output.c` 的
+       `vidow_output_vrr_on_demand_update()`，调用点 = `output_arrange` 末尾（开窗 / 关窗 / 切工作区 / 换屏都会 arrange）
+       + 规则重放时（`src/rule.c` 的 `apply_view`）+ 配置改了（`vidow_output_apply_state_all`）；先比一遍现状再 commit，
+       不会每帧提交。**没加任何 fullscreen 特例分支** —— 判据就是「显示着」= 工作区 + `!minimized`。
+     - **每屏 `layout {}`**（niri 25.11 的 `output "DP-3" { layout { … } }`）：一块屏覆盖全局 layout 参数，
+       **没写的继承全局**（不是继承内置默认 —— 全局改了它跟着变）：
+       ```lua
+       vidow.output{ name = "DP-3", layout = { gaps = 20, center_focused_column = "always" } }
+       output_layout = "DP-3: gaps=20; center_focused_column=always | DP-2: gaps=8"   -- 平铺键写法
+       ```
+       能覆盖的就是 20-layout.lua 那几个：`gaps` / `gaps_top` / `gaps_bottom` / `gaps_left` / `gaps_right` / `gaps_inner` /
+       `center_focused_column` / `preset_column_widths` / `default_column_width`（最多 16 块屏）。两条写路径共用一套解析
+       （`vidow_output_layout_apply_text`，值走全局键那套校验，报错话术一字不差）：Lua 表 → 翻成文本 → 解析；文本直接解析。
+       生效点全在 `vidow_layout_for(server, 输出, &lay)`：`vidow_work_area`（四边 gap）、`output_arrange`（列宽 / 内间距）、
+       `focus_viewport_target`（居中策略）、`view_ensure_column`（新列默认宽）、`vidow_cycle_column_width`（预设档位）、
+       `vidow_workspace_preview_layout`。默认一条覆盖都没有 → 每个键都走全局那份，**不配置零变化**。
+     - 三条写路径都吃（照 508239e）：config.lua / `VIDOW_OUTPUT_LAYOUT="…"`、`VIDOW_VRR_ON_DEMAND=true` /
+       `vidowmsg set-config output_layout "HEADLESS-1: gaps=12"`；查询 `vidowmsg config output_layout` / `vrr_on_demand`
+       （写进去当场规范化，读回来是同一个写法）。写错当场 `WLR_ERROR` + 该行不生效（没有冒号 / 项名不认识 / 一块屏写两遍 /
+       值不合法都拒，旧值不动）。`vidowmsg outputs` 多两个字段：`vrr_on_demand`（这块屏是不是按需模式）、
+       `vrr_on_demand_want`（上一次算出来要不要提刷新率）。
+     - 验证（headless 两块屏 `WLR_HEADLESS_OUTPUTS=2`，脚本 `/tmp/vd/t263.sh`、`/tmp/vd/t263b.sh`）：
+       - **不配 `output_layout`**：两块屏逐字相同 —— 都是 `gaps 6`、窗口 `631x708`、焦点列 `x=6`（屏内）/`643`，`center_focused_column`
+         都是全局的 `never`。
+       - **只给 `HEADLESS-1` 配** `gaps=40; center_focused_column=always; preset_column_widths=0.25,0.5,0.75; default_column_width=0.8`：
+         HEADLESS-1 的窗口 `y=40`、宽 `580`（gap 40 的工作区），HEADLESS-2 一个数字都没变（`6` / `631` / `643`）—— 继承全局。
+       - 居中策略对比（两块屏同样 3 条列，只有 HEADLESS-1 是 `always`）：HEADLESS-1 焦点列（中间那条，宽 580）屏内 `x=350`
+         → **中心 640 = 屏中心**；HEADLESS-2（`never`，继承全局）焦点列屏内 `x=643` → 中心 958.5（贴右边，不居中）。
+       - 列宽预设按屏不同：HEADLESS-1（`0.25/0.5/0.75`）`cycle-column-width` 一次 → 宽 `952`；HEADLESS-2（继承全局 `1/3,1/2,2/3`）
+         同样一次 → 宽 `418`。
+       - `vidow.output{ layout = { gaps=20, center_focused_column="always", default_column_width=0.25 } }` 表写法：
+         `vidowmsg config output_layout` 查回 `HEADLESS-2: gaps=20; center_focused_column=always; default_column_width=0.25`；
+         HEADLESS-2 的窗口 `20,20 610x680`，HEADLESS-1 仍继承全局（`x=6`）。`set-config output_layout "HEADLESS-1: gaps=12"`
+         → 查回同一串、窗口立刻变 `12,12`；写错（`HEADLESS-9: nope=1`）→ `没有 'nope' 这一项` + 查回**不变**。
+       - 键位改名：`{ repeatable = false, cooldown_ms = 200 }` / `{ ["repeat"] = false }` 两条都生效（`keybinds` 里
+         `repeatable=false repeat=false cooldown_ms=200` / `repeatable=false repeat=false`）；`{ repeatable = 1 }` 当场报错
+         `vidow.bind 的 repeatable（老名字 repeat，得写 ["repeat"]）只能是 true / false`；两个都写以 `repeatable` 为准。
+       - 默认值：什么都不配时 `vidowmsg config` 里 `output_layout` = `""`、`vrr_on_demand` = `false`，与改前逐字相同。
+     - **VRR 在 headless 里验不到端到端**（后端不吃 adaptive sync），所以只能给到这三层：① 能力探测 `vidowmsg outputs` 报
+       `vrr_supported=false`（真机 DRM 看连接器的 `vrr_capable`）；② 状态机真的动了 —— 给 HEADLESS-1 配
+       `vrr_on_demand=true` + `vidow.rule{ title="^w1$", vrr=true }` 后，`vrr_on_demand=true`、`vrr_on_demand_want=true`
+       （HEADLESS-2 两个都是 `false`）；③ 日志逐条：`rule: w1 要 VRR 是` → `output HEADLESS-1: 按需 VRR -> 提上去` →
+       `这块屏 / 这个后端不支持 VRR（adaptive sync），开不生效`（`adaptive_sync` 因此仍是 `false`）。真机上提上去那一步走的是
+       原来的 `vidow_output_set_vrr()`，没改。
+     - 回归：`test-config.sh` / `test-defaultconfig.sh` 改前改后都全过（默认配置与 `--default-config` 逐字节一致，新键都在）。
+     - 边界（没做 / 已知）：① `src/drag.c` 的拖拽落点预览和平铺改宽起拖宽仍读全局 `gaps_inner` / 列宽换算 —— 它不在这次
+       的可碰清单里，屏上覆盖了 gap 时那块预览会差一个 gap；② 新列的 `default_column_width` 按「**建列那一刻**窗口所在的
+       屏」取（新窗口先落在聚焦屏、再被规则搬到目标屏），所以被规则搬到另一块屏的窗口，列宽还是按原屏那份算；
+       ③ 没做 niri 的 `output { layout { struts } }`、每屏 `focus-at-startup`、`variable-refresh-rate` 的「全屏才开」变体。
+
 262. **光标隐藏 / 键盘参数 / 输入唤醒 / 键位限制这一批小开关（`configs/21-keyboard.lua`、`22-workspace.lua`）**（用户：「把调研第 5 节剩下的 S 成本项打包做完」；2026-10-14）
 
      - 新增 9 个配置键 + 2 个键位选项 + 1 个动作，**默认值全部 = vidow 改前的行为**（不配置零变化）：
@@ -5433,7 +5499,7 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
        mouse_move_enables_dpms = false           -- 指针一动唤醒关掉的屏（Hyprland 的 misc{}）
        key_press_enables_dpms  = false           -- 按一下键唤醒关掉的屏
        workspace_auto_back_and_forth = false     -- 切到「当前就在的」工作区改成切回上一个（niri 同名键）
-       vidow.bind("Mod+Q", "close-window", { ["repeat"] = false, cooldown_ms = 200 })
+       vidow.bind("Mod+Q", "close-window", { repeatable = false, cooldown_ms = 200 })
        vidow.bind("Mod+R", "toggle-touchpad")    -- 动作：触控板整体关 / 开
        ```
      - 三条写路径都吃（照「可配置缓动」508239e）：config.lua / `VIDOW_NUMLOCK=true`、`VIDOW_MOD_KEY=alt`、
@@ -5446,10 +5512,11 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
      - 键盘：`repeat_delay` / `repeat_rate` 走 `wlr_keyboard_set_repeat_info()`（就是原来那两个写死的数，现在能配），
        插键盘和配置改了都重套；`numlock` 用 xkb 的 `XKB_MOD_NAME_NUM` 锁定位 + `wlr_seat_keyboard_notify_modifiers()`
        （wlroots 0.20 没有 keyboard 级的 notify），只对 seat 正拿着的那把键盘发。**注意：自动重复是客户端自己做的**
-       （wlroots 0.20 不在合成器里重复，`repeat_info` 只是把速率报给客户端），所以 `repeat = false` / `cooldown_ms`
+       （wlroots 0.20 不在合成器里重复，`repeat_info` 只是把速率报给客户端），所以 `repeatable = false` / `cooldown_ms`
        这两个绑定选项今天基本看不到效果 —— 它们按「同一个 keysym 没松开又来一次按下 = 重复」实现（`held_syms[]`），
        留着给虚拟键盘 / 输入法回注 / 以后 wlroots 自己重复。绑定选项写在 `vidow.bind()` 第三个参数里，
-       **`repeat` 是 Lua 保留字，必须写成 `["repeat"] = false`**；`vidowmsg keybinds` 两个字段都报出来。
+       **选项名 2026-10-14 改成了 `repeatable`**（`repeat` 是 Lua 保留字，只能写成 `["repeat"]`，见 263）：
+       `["repeat"]` 作为别名继续认；`vidowmsg keybinds` 的 `repeatable` / `repeat` / `cooldown_ms` 三个字段都报出来。
      - 输入唤醒关掉的屏（`output.c` 的 `vidow_output_wake_disabled()`）：vidow 没有单独的 DPMS 状态，
        「关掉的输出」本身就是那个状态，所以唤醒 = 把所有关着的输出打开（笔记本合盖 / `output-power off` 都算）。
        `input.c` 里指针一动 / 按键一下各看一眼开关；注入的键也算「人按了键」（headless 只有这条路能验）。
@@ -5462,7 +5529,7 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
          `hide_when_typing = true` + 注入一个按键 → `光标: 藏起来`。
        - DPMS：`output-power headless-1 off` + `move-cursor` → `输入唤醒: 打开 1 块关着的屏`；再关屏 + 按键 → 第二次唤醒；
          两个开关 `set-config` 成 false 后同样操作**一次都不唤醒**，`state` 里那块屏仍是 `enabled: false`。
-       - `mod_key = "alt"` → `vidowmsg keybinds` 里 `Mod+Q` 的 `mods` 从 64（LOGO）变成 8（ALT）；`repeat=false` /
+       - `mod_key = "alt"` → `vidowmsg keybinds` 里 `Mod+Q` 的 `mods` 从 64（LOGO）变成 8（ALT）；`repeatable=false` /
          `cooldown_ms=250` 两个字段也报出来。
        - 工作区往返（两块具名工作区 chat / mail）：`workspace mail` → mail；再按一次 → 日志
          `workspace: 就在这块上，回到上一块（chat）` 且真的回到 chat；`workspace chat` 再按一次同样回到 mail。
@@ -5474,8 +5541,8 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
        连配置面都没铺）；niri 的 `mod-key-nested`（嵌套里换另一个 Mod）；真机上的触控板开关 / NumLock LED。
      - 改了：`src/config.c`（2 个分节 + 9 个键 + 校验）、`src/server.h`（字段 + 声明）、`src/input.c`（键盘参数 /
        numlock / 光标隐藏定时器 / DPMS 唤醒 / toggle-touchpad）、`src/output.c`（`vidow_output_wake_disabled`）、
-       `src/keybind.c` + `src/keybind.h`（repeat / cooldown_ms / mod_key / 两个动作）、`src/script.c`（绑定选项解析）、
-       `src/ipcstate.c`（keybinds 报 repeat / cooldown_ms）、`src/cursorfx.c`（藏 / 显示）、
+       `src/keybind.c` + `src/keybind.h`（repeatable / cooldown_ms / mod_key / 两个动作）、`src/script.c`（绑定选项解析）、
+       `src/ipcstate.c`（keybinds 报 repeatable / repeat / cooldown_ms）、`src/cursorfx.c`（藏 / 显示）、
        `config.example/`（重新生成，新增两份分类文件）。
 
 260. **libinput 设备配置族：触控板 / 鼠标那十一个设置终于能配了（`configs/19-input.lua`）**（用户：「照 niri 的 `input {}` 那套，给 vidow 加 libinput 设备配置族」；2026-10-14）

@@ -3,6 +3,7 @@
 #include "clipboard.h"
 #include "gesture.h"
 #include "ipcstate.h"
+#include "outputconf.h"
 
 #include <limits.h>
 #include <math.h>
@@ -511,6 +512,19 @@ void vidow_ipc_json_output(struct jbuf *b, struct vidow_server *server,
 	jb_kv_bool(b, "adaptive_sync", o->adaptive_sync_status ==
 		WLR_OUTPUT_ADAPTIVE_SYNC_ENABLED);
 	jb_kv_bool(b, "vrr_supported", o->adaptive_sync_supported);
+	/* 按需 VRR（niri 的 variable-refresh-rate on-demand）：这块屏是不是按需
+	 * 模式、上一次算出来「要不要提刷新率」。真机上前者开 + 后者 true 时
+	 * adaptive_sync 才会是 true（headless 后端不支持，只会看到这两个字段动）。 */
+	{
+		const struct vidow_output_conf *conf =
+			vidow_output_conf_for(server, o->name);
+		bool on_demand = conf != NULL && conf->has_vrr_on_demand ?
+			conf->vrr_on_demand :
+			(conf != NULL && conf->has_vrr ? false :
+				server->config.vrr_on_demand);
+		jb_kv_bool(b, "vrr_on_demand", on_demand);
+		jb_kv_bool(b, "vrr_on_demand_want", output->vrr_on_demand_on);
+	}
 	{
 		/* 输出缓冲的位深（vidow.output 的 depth）：10 位走 XRGB2101010。 */
 		const char *name = "?";
@@ -880,10 +894,11 @@ void vidow_ipc_json_keybinds(struct jbuf *b, struct vidow_server *server) {
 		jb_kv_str(b, "trigger", bind->trigger);
 		jb_kv_str(b, "action", bind->action);
 		jb_kv_uint(b, "mods", bind->mods);
-		/* 绑定上的重复限制（vidow.bind 第三个参数）：repeat 默认 true、
+		/* 绑定上的重复限制（vidow.bind 第三个参数）：repeatable 默认 true、
 		 * cooldown_ms 默认 0 —— 两个都报出来，脚本 / 状态栏能看出「这条为什么
-		 * 按住不连发」。 */
-		jb_kv_bool(b, "repeat", bind->repeat);
+		 * 按住不连发」。`repeat` 是老字段名，同一个值照报一份（老脚本不改）。 */
+		jb_kv_bool(b, "repeatable", bind->repeatable);
+		jb_kv_bool(b, "repeat", bind->repeatable);
 		jb_kv_int(b, "cooldown_ms", bind->cooldown_ms);
 		jb_obj_end(b);
 	}

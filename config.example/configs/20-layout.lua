@@ -11,3 +11,5 @@ center_focused_column = never
 preset_column_widths = { 0.3333333333, 0.5, 0.6666666667 }
 -- 新列的默认宽度，比例（0.5 = 半宽）；窗口规则里写了 column_width 的窗口按规则走。默认 0.5 —— 原来 view.c 里那个 DEFAULT_COLUMN_WIDTH（niri 的 layout { default-column-width }）
 default_column_width = 0.5
+-- 每屏 layout{} 覆盖（niri 的 output { layout { … } }）：每块屏一份，**没写的项继承全局**。写法 "DP-3: gaps=20; center_focused_column=always | DP-2: gaps=8" —— `|` 分屏、`输出名:` 起一组、`;` 分数项、`键=值`（能写上面那几个全局布局键）。也可以写成 vidow.output{ name="DP-3", layout={ gaps=20 } }
+output_layout = ""

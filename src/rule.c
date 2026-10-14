@@ -98,6 +98,10 @@ const struct vidow_rule_field vidow_rule_fields[] = {
 		"显示）/ \"never\"（全景里不出现）。全景用另一张壁纸靠它 —— 跑第二个"
 		"壁纸客户端（比如 awww-daemon -n ov，namespace 就成了 awww-daemonov）"
 		"再按 namespace 匹配，写 \"only\"" },
+	/* 一直在的：这个窗口要 VRR（niri 的 variable-refresh-rate）。 */
+	{ "vrr", RK_ACT_BOOL, VRA_VRR, VIDOW_RULE_WINDOW,
+		"true = 这个窗口显示在「按需 VRR」的屏上时把那块屏的刷新率提上去"
+		"（niri 的 variable-refresh-rate；屏那边写 vrr_on_demand = true 才有效）" },
 	/* 开窗时兑现一次的 */
 	{ "float", RK_ACT_BOOL, VRA_FLOAT, VIDOW_RULE_WINDOW,
 		"true = 强制浮动（对话框那类本来就会浮的不用写），false = 强制平铺" },
@@ -1009,7 +1013,12 @@ static void apply_view(struct vidow_server *server, struct vidow_view *view,
 	/* 抓帧遮挡：默认不管（照常出现在截图里）。 */
 	int capture = VIDOW_CAPTURE_OFF;
 	int capture_mosaic = VIDOW_CAPTURE_MOSAIC_DEFAULT;
+	/* 要 VRR：默认不要（niri 的 variable-refresh-rate，规则没写就是不提）。 */
+	bool vrr = false;
 
+	if (eff->set[VRA_VRR]) {
+		vrr = eff->val[VRA_VRR].b;
+	}
 	if (eff->set[VRA_FORCE_RENDER]) {
 		force_render = eff->val[VRA_FORCE_RENDER].b;
 	}
@@ -1046,6 +1055,17 @@ static void apply_view(struct vidow_server *server, struct vidow_view *view,
 	view->focus_on_open = focus_on_open;
 	view->focus_on_activate = focus_on_activate;
 	view->honor_invalid_serial = honor_invalid_serial;
+
+	/* 要 VRR：规则改了立刻对一遍账（按需 VRR 的屏上，这个窗口在不在 = 刷新率
+	 * 提不提上去）。窗口还没上屏（output == NULL）时那次调用什么也不做。 */
+	if (view->vrr != vrr) {
+		view->vrr = vrr;
+		wlr_log(WLR_INFO, "rule: %s 要 VRR %s（%s）",
+			vidow_view_title(view) != NULL ? vidow_view_title(view) : "(无题)",
+			vrr ? "是" : "否",
+			vrr ? "它在的按需 VRR 屏会提刷新率" : "不再提");
+		vidow_output_vrr_on_demand_update(server, view->output);
+	}
 
 	/* X11 缩放桥变了：缓冲区按新倍数重新声明一遍（逻辑尺寸跟着变），布局也要
 	 * 重摆 —— 规则是 SIGHUP 重载时整体重放的，所以「改了配置没重启」也能生效。 */

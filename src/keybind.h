@@ -8,9 +8,11 @@
  *   vidow.bind("Mod+grave", "special scratch")
  *   vidow.bind("Mod+Shift+grave", "move scratch")
  *   vidow.bind("Mod+Escape", "quit", { inhibited = true })  -- 抑制期间也生效
- *   vidow.bind("Mod+Shift+R", "…", { repeat = false, cooldown_ms = 200 })
+ *   vidow.bind("Mod+Shift+R", "…", { repeatable = false, cooldown_ms = 200 })
  *
- * 第三个参数（可选）是选项表：`inhibited` / `on` / `repeat` / `cooldown_ms`。焦点那个表面上有
+ * 第三个参数（可选）是选项表：`inhibited` / `on` / `repeatable` / `cooldown_ms`
+ * （`["repeat"]` 是 `repeatable` 的老名字，还认 —— 它是 Lua 保留字，写起来只能
+ * 写成 `["repeat"]`，所以主名换成了 `repeatable`）。焦点那个表面上有
  * 生效中的「快捷键抑制」（虚拟机的窗口要原样收 Super / Alt+Tab）时，这条绑定
  * 照样生效 —— 逃生口，不然抑制着的窗口能把用户锁死（见 keyboardgrab.c）。
  *
@@ -58,12 +60,13 @@ struct vidow_keybind {
 	/* 触发里**只有修饰键**（`vidow.bind("Mod", …)`）：按一下 Super 那种。 */
 	bool modifier_only;
 	/* 按住键的自动重复要不要再触发一遍（niri 的 binds { repeat }，默认 true）。
+	 * 配置里写 `repeatable`（老名字 `["repeat"]` 也认，见 keybind.h 顶上的注释）。
 	 *
 	 * 注意：wlroots 0.20 **不在合成器里做自动重复**（wl_keyboard.repeat_info
 	 * 只是把速率报给客户端，重复是客户端自己做的），所以 vidow 平时根本收不到
 	 * 「重复的按下」——这个开关是给「万一收到」留的（虚拟键盘 / 输入法回注 /
-	 * 以后 wlroots 自己重复）：那时 repeat = false 的绑定只认第一次按下。 */
-	bool repeat;
+	 * 以后 wlroots 自己重复）：那时 repeatable = false 的绑定只认第一次按下。 */
+	bool repeatable;
 	/* 两次触发之间至少隔这么多毫秒（niri 的 binds { cooldown-ms }，默认 0 =
 	 * 不限）。按住一个键疯狂触发、或者一条绑定被别的路径连着调两次时挡一下。 */
 	int cooldown_ms;
@@ -76,7 +79,7 @@ bool vidow_keybind_init(struct vidow_server *server);
  * 失败时把原因写进 err（不超过 errlen），返回 NULL。 */
 struct vidow_keybind *vidow_keybind_add(struct vidow_server *server,
 		const char *trigger, const char *action, bool inhibited,
-		bool on_release, bool repeat, int cooldown_ms, char *err,
+		bool on_release, bool repeatable, int cooldown_ms, char *err,
 		size_t errlen);
 
 /* 清空全部绑定（config.lua 重载时用：重载等于重新声明一遍）。 */
