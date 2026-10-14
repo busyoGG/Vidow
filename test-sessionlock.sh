@@ -28,9 +28,21 @@
 #      日志「输入唤醒」且屏回来了（否则屏关着没法输密码）
 #   S3 语义② focus_follows_mouse：配成 true 也不把焦点给被藏起来的窗口（同 E ①）
 #
-# **不测**（后续步骤的事，见方案 §5）：F 客户端崩溃（S4）、H 解锁恢复（S4）。
-# 所以这个脚本全过**不等于**可以对外宣称支持会话锁 —— 现在锁上之后只能杀客户端
-# 退出（S4 才做解锁恢复）。
+#   F kill -9 locktest（客户端在锁定期崩溃）→ **不解锁**（协议 XML:111-113 的
+#      「黑屏死锁」态）：vidow 不崩、日志有「客户端崩溃 / 被 kill，按协议保持锁定」、
+#      grim 仍不是桌面（桌面像素 0，给数字）、注入已绑定键仍不生效
+#   H locktest stdin 写 u（unlock_and_destroy）→ 桌面回来：日志「解锁了，桌面树恢复」、
+#      grim 与锁前**逐像素相同 ≥99%**（给数字）、注入已绑定键真的切了工作区、
+#      解锁后屏上不再有大块锁屏色（layer_lock 那两棵树关掉了）
+#   抓帧审计（方案 §4 风险 3，锁定期间）：vidow 的输出抓帧是**自己渲染一帧**，
+#      锁定期间必须实测不含桌面 —— ① grim（zwlr_screencopy → src/screencopy.c →
+#      src/capture.c 自己渲染）② wf-recorder 录像抽一帧（screencopy 连续帧 / damage
+#      那条路）。两条都断言「锁屏色 + 纯黑 = 100%、桌面像素 0」（给数字）
+#
+# **不测**：ext-image-copy-capture 输出源（xdg-desktop-portal 截图）/ KDE screencast
+# 输出流没有便宜的免 portal 客户端 —— 那两条和 ① ② 走的是**同一个** vidow_capture_grab*
+# （src/capture.c:226，见 src/screencopy.c:388 / src/screencast.c:1048,1069），
+# 靠代码路径证据，不是实测。
 #
 # 用法：./test-sessionlock.sh    （VIDOW_TEST_KEEP=1 保留运行目录）
 set -u
@@ -44,6 +56,7 @@ VIDOW_PGID=""
 VPID=""
 CLIENTS=""
 LOCK_PID=""
+RECPID=""
 
 pass() { echo "  PASS  $1"; }
 fail() { echo "  FAIL  $1"; FAILED=1; }
@@ -52,6 +65,7 @@ mark() { echo; echo "== $1 =="; }
 cleanup() {
 	exec 9>&- 2>/dev/null
 	[ -n "$LOCK_PID" ] && kill "$LOCK_PID" 2>/dev/null
+	[ -n "$RECPID" ] && kill -INT -- "-$RECPID" 2>/dev/null
 	for p in $CLIENTS; do kill "$p" 2>/dev/null; done
 	[ -n "$VIDOW_PGID" ] && kill -TERM -- "-$VIDOW_PGID" 2>/dev/null
 	sleep 0.4
@@ -67,6 +81,9 @@ python3 -c "import numpy, PIL" 2>/dev/null ||
 python3 -c "import gi; gi.require_version('Gtk','3.0')" 2>/dev/null ||
 	{ echo "test-sessionlock.sh: 需要 python3-gobject + gtk3（有窗口的客户端）"; exit 1; }
 [ -x ./build/locktest ] || { echo "test-sessionlock.sh: 先 ninja -C build（缺 ./build/locktest）"; exit 1; }
+# F / H 要「真键盘」那条路（wtype 造虚拟键盘 → input.c 的 keyboard_key）：vidowmsg
+# send-key 走的是注入那条路，它平时**本来就不触发键位表**，量不了「解锁后键位恢复」。
+command -v wtype >/dev/null || { echo "test-sessionlock.sh: 需要 wtype"; exit 1; }
 
 rm -rf "$RUNDIR"; mkdir -p "$CFGDIR/.config/vidow" "$RUNDIR/run"
 chmod 700 "$RUNDIR/run"
@@ -79,8 +96,11 @@ vidow.output{ name = "HEADLESS-2", x = 1280 }
 --   focus_follows_mouse：即使开着，也不许把焦点给被藏起来的窗口
 mouse_move_enables_dpms = true
 focus_follows_mouse = true
--- D 用：一个**已绑定**的键（注入它，看锁定期间工作区会不会变）
-vidow.bind("Mod+J", "focus-workspace 2")
+-- D 用：一个**已绑定**的键（注入它，看锁定期间工作区会不会变）。
+-- 动作名是 "workspace 2"（README 动作表）。以前这里写的是 "focus-workspace 2" ——
+-- 那不是动作（vidow 打「不认识的动作」），D 的断言照样成立（白名单在动作解析之前就
+-- 挡下了），但 H 要「解锁后键位真的生效」，动作名必须是对的。
+vidow.bind("Mod+J", "workspace 2")
 -- 手势：锁定瞬间不许动这张配置表（vidow_gesture_clear 是配置重载用的，清的是
 -- 用户绑的手势）。测试拿 vidowmsg state 的 gestures 计数当判据。
 vidow.gesture{ fingers = 4, direction = "up", action = "workspace up" }
@@ -144,23 +164,72 @@ start_locktest() {
 }
 
 # 抓到的画面是不是「锁屏内容」（lock 客户端的纯色，或者没 lock surface 时的纯黑）：
-# 打印锁屏色占比 / 纯黑占比 / 桌面像素数。$1 = 图，$2 = 标签
+# 打印锁屏色占比 / 纯黑占比 / 桌面像素数。$1 = 图，$2 = 标签，$3 = 颜色容差（缺省 2；
+# 视频帧过了一趟 YUV420 往返，色偏能到 ±10，那条路给 24）。
 check_not_desktop() {
-	python3 - "$1" "$2" <<'PY'
+	python3 - "$1" "$2" "${3:-2}" <<'PY'
 import sys
 import numpy as np
 from PIL import Image
 LOCK = np.array((0x22, 0x66, 0x99), dtype=np.int16)
+TOL = int(sys.argv[3])
 a = np.asarray(Image.open(sys.argv[1]).convert('RGB'), dtype=np.int16)
 total = a.shape[0] * a.shape[1]
-lock = int((np.abs(a - LOCK).max(axis=2) <= 2).sum())
+lock = int((np.abs(a - LOCK).max(axis=2) <= TOL).sum())
 black = int((a.max(axis=2) <= 2).sum())
 # 既不是锁屏纯色、也不是纯黑 = 桌面（壁纸 / 窗口）漏出来了
 desktop = total - lock - black
-print("    %s %dx%d：锁屏色 %.1f%%、纯黑 %.1f%%、桌面像素 %d"
-      % (sys.argv[2], a.shape[1], a.shape[0], lock * 100.0 / total,
-         black * 100.0 / total, desktop))
-sys.exit(0 if lock + black >= total * 0.99 and desktop == 0 else 1)
+print("    %s %dx%d：锁屏色 %.2f%%（容差 ±%d）、纯黑 %.2f%%、桌面像素 %d（%.2f%%）"
+      % (sys.argv[2], a.shape[1], a.shape[0], lock * 100.0 / total, TOL,
+         black * 100.0 / total, desktop, desktop * 100.0 / total))
+sys.exit(0 if lock + black >= total * 0.99 and desktop <= total * 0.01 else 1)
+PY
+}
+
+# 锁前 / 解锁后逐像素比对（H 的判据：桌面真的回来了）。$1 $2 = 两张图，$3 = 标签
+compare_desktop() {
+	python3 - "$1" "$2" "$3" <<'PY'
+import sys
+import numpy as np
+from PIL import Image
+a = np.asarray(Image.open(sys.argv[1]).convert('RGB'), dtype=np.int16)
+b = np.asarray(Image.open(sys.argv[2]).convert('RGB'), dtype=np.int16)
+if a.shape != b.shape:
+    print("    %s 尺寸不同：%s vs %s" % (sys.argv[3], a.shape, b.shape))
+    sys.exit(1)
+d = np.abs(a - b).max(axis=2)
+total = d.size
+same = int((d <= 2).sum())
+print("    %s：逐像素相同 %.2f%%、最大差 %d、平均差 %.3f"
+      % (sys.argv[3], same * 100.0 / total, int(d.max()), float(d.mean())))
+sys.exit(0 if same >= total * 0.99 else 1)
+PY
+}
+
+# 录像抽出来的那一帧：除了「是锁屏色」，还要跟**锁前的桌面图**逐像素比一遍 —— 视频帧
+# 过了一趟 YUV420 往返（色偏 ±10 量级），拿容差 24 比，两条一起看才说得清「录屏这条
+# 路没把桌面录进去」。$1 = 锁前桌面图，$2 = 录像帧，$3 = 标签
+check_video_frame() {
+	python3 - "$1" "$2" "$3" <<'PY'
+import sys
+import numpy as np
+from PIL import Image
+LOCK = np.array((0x22, 0x66, 0x99), dtype=np.int16)
+TOL = 24
+a = np.asarray(Image.open(sys.argv[2]).convert('RGB'), dtype=np.int16)
+total = a.shape[0] * a.shape[1]
+lock = int((np.abs(a - LOCK).max(axis=2) <= TOL).sum())
+like = -1
+try:
+    d = np.asarray(Image.open(sys.argv[1]).convert('RGB'), dtype=np.int16)
+    if d.shape == a.shape:
+        like = int((np.abs(a - d).max(axis=2) <= TOL).sum())
+except Exception:
+    pass
+print("    %s %dx%d：锁屏色 %.2f%%、与锁前桌面相同 %s"
+      % (sys.argv[3], a.shape[1], a.shape[0], lock * 100.0 / total,
+         "%.2f%%" % (like * 100.0 / total) if like >= 0 else "(没有对照图)"))
+sys.exit(0 if lock >= total * 0.99 and (like < 0 or like <= total * 0.01) else 1)
 PY
 }
 
@@ -493,6 +562,241 @@ else
 	pass "第二遍日志里没有 sessionlock 的错误"
 fi
 
+# ============================================================ 第三遍：F + 抓帧审计
+
+mark "第三遍：锁定期间抓帧审计（方案 §4 风险 3）+ F 客户端崩溃保持锁定"
+stop_clients
+stop_vidow
+start_vidow ""
+start_bluewin
+grim -o HEADLESS-1 "$RUNDIR/free1.png" 2>/dev/null &&
+	pass "第三遍：锁前桌面抓到了（free1.png，审计的对照）" ||
+	fail "第三遍：锁前 grim 抓帧失败"
+LOCKLOG="$RUNDIR/lock3.log"
+start_locktest "$RUNDIR/lock3.in" "$LOCKLOG"
+if grep -aq LOCKED "$LOCKLOG"; then
+	pass "第三遍：锁上了（LOCKED）"
+else
+	fail "第三遍没等到 LOCKED"
+	tail -5 "$LOCKLOG" | sed 's/^/        /'
+fi
+sleep 0.5
+
+# ---------------------------------------------------------------- 抓帧审计
+#
+# 为什么要实测（方案 §4 风险 3）：vidow 的输出抓帧是**自己渲染一帧**，不是把屏幕缓冲
+# 拷给客户端。锁定期间那台「自己渲染」必须走同一棵「正常树已关」的场景图，否则
+# grim / 录屏能拿到锁屏前的桌面。三条输出抓帧路径（代码路径见报告）：
+#   ① zwlr_screencopy（grim）→ src/screencopy.c:388 → src/capture.c 的
+#      vidow_capture_grab → capture_render_box_size → wlr_scene_output_build_state
+#      （渲染的是 server->scene 整棵树，被 set_enabled(false) 的树天然不参与）
+#   ② 连续帧 / damage 那条（wf-recorder 默认 copy_with_damage）→ 同一个 vidow_capture_grab
+#   ③ ext-image-copy-capture 输出源（xdg-desktop-portal 截图）/ KDE screencast 输出流
+#      → src/capture.c:226 与 src/screencast.c:1048/1069，同一个 vidow_capture_grab_into
+# ① ② 用真客户端抓真像素；③ 没有便宜的免 portal 客户端，靠「和 ①② 同一个函数」这条
+# 代码路径证据（本机没装 ext-image-copy-capture 的输出源客户端）。
+mark "抓帧审计 ①：grim（zwlr_screencopy → src/screencopy.c → src/capture.c 自己渲染）"
+if grim -o HEADLESS-1 "$RUNDIR/audit-grim.png" 2>"$RUNDIR/grim-audit.log"; then
+	if check_not_desktop "$RUNDIR/audit-grim.png" "锁定期间 grim"; then
+		pass "grim 抓出来的是锁屏内容，桌面像素 0（见上面数字）"
+	else
+		fail "grim 抓出来的帧里有桌面像素（抓帧绕过了被关掉的场景树）"
+	fi
+else
+	fail "锁定期间 grim 抓帧失败（$(tail -1 "$RUNDIR/grim-audit.log")）"
+fi
+
+mark "抓帧审计 ②：wf-recorder 录 2 秒 → ffmpeg 抽一帧（screencopy 连续帧 / damage 路）"
+if command -v wf-recorder >/dev/null && command -v ffmpeg >/dev/null; then
+	setsid wf-recorder -o HEADLESS-1 -c libx264 -p crf=28 \
+		-f "$RUNDIR/rec-locked.mkv" \
+		> "$RUNDIR/rec.log" 2>&1 &
+	RECPID=$!
+	sleep 2
+	kill -INT -- "-$RECPID" 2>/dev/null
+	sleep 1.5
+	if [ -s "$RUNDIR/rec-locked.mkv" ] &&
+			ffmpeg -y -loglevel error -i "$RUNDIR/rec-locked.mkv" \
+			-frames:v 1 "$RUNDIR/audit-rec.png" 2>"$RUNDIR/ffmpeg.log"; then
+		if check_video_frame "$RUNDIR/free1.png" "$RUNDIR/audit-rec.png" \
+				"锁定期间录像第 1 帧"; then
+			pass "录像里那一帧是锁屏内容、和锁前桌面几乎不相同（见上面数字）"
+		else
+			fail "录像里有桌面像素（录屏那条路漏了）"
+		fi
+	else
+		fail "wf-recorder / ffmpeg 这一路没拿到帧（$(tail -2 "$RUNDIR/rec.log" | tr '\n' ' ')）"
+	fi
+else
+	echo "    （跳过：没装 wf-recorder 或 ffmpeg）"
+fi
+
+# ---------------------------------------------------------------- F
+mark "F 锁定期间 kill -9 locktest → 按协议**不解锁**（黑屏死锁，XML:111-113）"
+WS_BEFORE=$(active_ws)
+FOC_BEFORE=$(focused_win)
+kill -9 "$LOCK_PID" 2>/dev/null
+LOCK_PID=""
+sleep 0.8
+if kill -0 "$VPID" 2>/dev/null; then
+	pass "客户端被 kill -9 后 vidow 还活着"
+else
+	fail "客户端被 kill -9 把 vidow 搞崩了"
+fi
+if grep -a "客户端崩溃 / 被 kill" "$LOG" >/dev/null; then
+	pass "日志：$(grep -a '客户端崩溃 / 被 kill' "$LOG" | tail -1 | sed 's/.*sessionlock: //')"
+else
+	fail "日志里没有「客户端崩溃 / 被 kill，按协议保持锁定」"
+fi
+if grim -o HEADLESS-1 "$RUNDIR/dead.png" 2>"$RUNDIR/grim-dead.log"; then
+	if check_not_desktop "$RUNDIR/dead.png" "崩溃后 HEADLESS-1"; then
+		pass "崩溃后屏上还是锁屏内容 / 纯黑，桌面像素 0（没自动解锁）"
+	else
+		fail "崩溃后桌面漏回来了（自动解锁了？）"
+	fi
+else
+	fail "崩溃后 grim 抓帧失败（$(tail -1 "$RUNDIR/grim-dead.log")）"
+fi
+# 键位仍然不生效：**真键盘**那条路（wtype 造虚拟键盘 → input.c 的 keyboard_key
+# → keybind 的锁定白名单）按已绑定的键 → 工作区 / 焦点不变，日志里仍有「不生效」。
+# 这里不用 vidowmsg send-key：注入那条路**平时本来就不触发键位表**（见 input.c 的
+# inject_key），只有锁定期才被特意接到白名单上 —— 用它量「解锁后键位恢复」量不到。
+wtype -M logo -k j >/dev/null 2>&1
+wtype -M logo -k j >/dev/null 2>&1
+sleep 0.4
+WS_AFTER=$(active_ws)
+FOC_AFTER=$(focused_win)
+echo "    工作区：$WS_BEFORE  ->  $WS_AFTER"
+echo "    焦点：  $FOC_BEFORE  ->  $FOC_AFTER"
+if [ "$WS_BEFORE" = "$WS_AFTER" ] && [ "$FOC_BEFORE" = "$FOC_AFTER" ]; then
+	pass "崩溃后真键盘按已绑定的键仍不生效（工作区 / 焦点没变）"
+else
+	fail "崩溃后真键盘按已绑定的键生效了（锁定态没守住）"
+fi
+grep -a "锁定期间不生效" "$LOG" | grep -aq "Mod+J" &&
+	pass "日志里仍有「绑定 Mod+J … 锁定期间不生效」（键照旧被白名单挡）" ||
+	fail "崩溃后日志里没有「锁定期间不生效」—— 键可能漏给了别的路径"
+if grep -a 'sessionlock:' "$LOG" | grep -aqE 'ERROR' ; then
+	# 崩溃这条路**故意**打一条 ERROR（那就是判据），只看有没有别的异常
+	:
+fi
+
+# ============================================================ 第四遍：H 解锁恢复
+
+mark "第四遍：H 解锁恢复（locktest stdin 写 u → 桌面回来 + 键位恢复）"
+stop_clients
+stop_vidow
+start_vidow ""
+start_bluewin
+sleep 0.5
+grim -o HEADLESS-1 "$RUNDIR/h-free1.png" 2>/dev/null &&
+	grim -o HEADLESS-2 "$RUNDIR/h-free2.png" 2>/dev/null &&
+	pass "解锁前的桌面抓到了（h-free1.png / h-free2.png）" ||
+	fail "解锁前 grim 抓帧失败"
+WS_BEFORE=$(active_ws)
+FOC_BEFORE=$(focused_win)
+LOCKLOG="$RUNDIR/lock4.log"
+start_locktest "$RUNDIR/lock4.in" "$LOCKLOG"
+if grep -aq LOCKED "$LOCKLOG"; then
+	pass "第四遍：锁上了（LOCKED）"
+else
+	fail "第四遍没等到 LOCKED"
+	tail -5 "$LOCKLOG" | sed 's/^/        /'
+fi
+sleep 0.5
+grim -o HEADLESS-1 "$RUNDIR/h-locked1.png" 2>/dev/null
+# 锁定期先用**真键盘**按一次那个已绑定的键：工作区不许动，而且日志里要留下
+# 「锁定期间不生效」—— 解锁后同一个动作必须反过来（这样 before/after 才是同一把尺）。
+BLOCKED_BEFORE=$(grep -ac "锁定期间不生效" "$LOG")
+wtype -M logo -k j >/dev/null 2>&1
+sleep 0.4
+BLOCKED_AFTER=$(grep -ac "锁定期间不生效" "$LOG")
+if [ "$(active_ws)" = "$WS_BEFORE" ] && [ "$BLOCKED_AFTER" -gt "$BLOCKED_BEFORE" ]; then
+	pass "锁定期真键盘按 Mod+J：工作区没动，日志多了「锁定期间不生效」（$BLOCKED_BEFORE -> $BLOCKED_AFTER）"
+else
+	fail "锁定期真键盘按 Mod+J 的结果不对（工作区 $(active_ws)，不生效行 $BLOCKED_BEFORE -> $BLOCKED_AFTER）"
+fi
+# 往 locktest 的 stdin（fifo，脚本这边是 fd 9）写 u = unlock_and_destroy
+printf 'u\n' >&9
+for _ in $(seq 1 50); do grep -aq "unlock-sent" "$LOCKLOG" && break; sleep 0.1; done
+grep -aq "unlock-sent" "$LOCKLOG" &&
+	pass "locktest 发了 unlock_and_destroy" ||
+	fail "locktest 没打出 unlock-sent"
+for _ in $(seq 1 50); do grep -aq "sessionlock: 解锁了" "$LOG" && break; sleep 0.1; done
+if grep -a "sessionlock: 解锁了" "$LOG" >/dev/null; then
+	pass "日志：$(grep -a 'sessionlock: 解锁了' "$LOG" | tail -1 | sed 's/.*sessionlock: //')"
+else
+	fail "日志里没有「解锁了，桌面树恢复」"
+	tail -8 "$LOG" | sed 's/^/        /'
+fi
+sleep 0.6
+if grim -o HEADLESS-1 "$RUNDIR/h-after1.png" 2>"$RUNDIR/grim-h.log" &&
+		grim -o HEADLESS-2 "$RUNDIR/h-after2.png" 2>>"$RUNDIR/grim-h.log"; then
+	if compare_desktop "$RUNDIR/h-free1.png" "$RUNDIR/h-after1.png" "HEADLESS-1 解锁后 vs 锁前" &&
+			compare_desktop "$RUNDIR/h-free2.png" "$RUNDIR/h-after2.png" "HEADLESS-2 解锁后 vs 锁前"; then
+		pass "两块屏的桌面都回来了（逐像素相同 ≥99%）"
+	else
+		fail "解锁后画面和锁前对不上（见上面数字）"
+	fi
+	# 锁中那张得和锁前不一样，否则上面那条「对上了」没有意义
+	if python3 - "$RUNDIR/h-free1.png" "$RUNDIR/h-locked1.png" <<'PY'
+import sys
+import numpy as np
+from PIL import Image
+a = np.asarray(Image.open(sys.argv[1]).convert('RGB'), dtype=np.int16)
+b = np.asarray(Image.open(sys.argv[2]).convert('RGB'), dtype=np.int16)
+print("    锁中 vs 锁前最大差 %d" % int(np.abs(a - b).max()))
+sys.exit(0 if int(np.abs(a - b).max()) > 0 else 1)
+PY
+	then
+		pass "锁定期间那一帧确实不是桌面（和锁前不同）"
+	else
+		fail "锁中那张和锁前一样（锁没生效？H 的「桌面回来了」就没证据）"
+	fi
+else
+	fail "解锁后 grim 抓帧失败（$(tail -1 "$RUNDIR/grim-h.log")）"
+fi
+# 键位恢复：**真键盘**按同一个已绑定的键 → 工作区真的切了（锁定期那次是「没动」）
+BLOCKED_UNLOCK=$(grep -ac "锁定期间不生效" "$LOG")
+wtype -M logo -k j >/dev/null 2>&1
+sleep 0.5
+WS_AFTER=$(active_ws)
+FOC_AFTER=$(focused_win)
+echo "    工作区：$WS_BEFORE  ->  $WS_AFTER"
+echo "    焦点：  $FOC_BEFORE  ->  $FOC_AFTER"
+if [ "$WS_AFTER" != "$WS_BEFORE" ]; then
+	pass "解锁后真键盘按同一个已绑定的键生效了（工作区真的切了：$WS_BEFORE -> $WS_AFTER）"
+else
+	fail "解锁后真键盘按同一个已绑定的键没生效（白名单还拦着？键位没恢复？）"
+fi
+if [ "$(grep -ac '锁定期间不生效' "$LOG")" = "$BLOCKED_UNLOCK" ]; then
+	pass "解锁后不再有新的「锁定期间不生效」（白名单不再拦，共 $BLOCKED_UNLOCK 行都是锁定期留下的）"
+else
+	fail "解锁后还新增了「锁定期间不生效」：$(grep -a '锁定期间不生效' "$LOG" | tail -1 | sed 's/.*sessionlock: //')"
+fi
+if kill -0 "$VPID" 2>/dev/null; then
+	pass "解锁全程 vidow 没崩"
+else
+	fail "解锁把 vidow 搞崩了"
+fi
+# 解锁后 lock 那两棵树必须关掉，不然锁屏内容会盖在桌面上
+if python3 - "$RUNDIR/h-after1.png" <<'PY'
+import sys
+import numpy as np
+from PIL import Image
+LOCK = np.array((0x22, 0x66, 0x99), dtype=np.int16)
+a = np.asarray(Image.open(sys.argv[1]).convert('RGB'), dtype=np.int16)
+total = a.shape[0] * a.shape[1]
+lock = int((np.abs(a - LOCK).max(axis=2) <= 2).sum())
+print("    解锁后锁屏色占比 %.1f%%" % (lock * 100.0 / total))
+sys.exit(0 if lock < total * 0.5 else 1)
+PY
+then
+	pass "解锁后 layer_lock 那两棵树的节点不再画出来（锁屏色 <50%）"
+else
+	fail "解锁后屏上还有大块锁屏色（lock 树没关掉？）"
+fi
+
 # ---------------------------------------------------------------- 收尾
 echo
 # 自己起的那一坨由 trap 收（cleanup 里 kill -TERM -- -PGID）；这里只看有没有别人留下的。
@@ -503,7 +807,7 @@ for p in $(pgrep -x vidow 2>/dev/null); do
 done
 [ -n "$LEAK" ] && echo "注意：有不是这次起的 vidow 进程还活着：$LEAK"
 if [ "$FAILED" -eq 0 ]; then
-	echo "test-sessionlock.sh 全部通过（S1：能锁、能黑屏、能握手；S2：lock surface 生命周期 + 输出热插拔；S3：输入路由 + 键位白名单）"
+	echo "test-sessionlock.sh 全部通过（S1：能锁、能黑屏、能握手；S2：lock surface 生命周期 + 输出热插拔；S3：输入路由 + 键位白名单；S4：能解锁 / 崩溃保持锁定 / 抓帧不泄桌面）"
 else
 	echo "test-sessionlock.sh 有失败项"
 fi

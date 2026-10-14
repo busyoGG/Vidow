@@ -5420,6 +5420,49 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
      - 未做：niri 的 `fixed 1920`（固定像素档）、`preset-window-heights`、`default-column-width {}`（让客户端自己定宽）、
        `always-center-single-column`；窗口规则级的 per-rule 预设覆盖。
 
+267. **会话锁 S4：能解锁了（桌面恢复 + 焦点还给窗口）、客户端崩溃保持锁定、锁定期间抓帧不泄桌面（实测）**（用户：「接着 S3 做方案 §5 的 S4，先做解锁（最缺的）再做抓帧审计；别做多余的无用测试」；方案 `/tmp/vidow-sessionlock-plan.md` §2 环节 6 + §3 F/H + §4 风险 3 + §5 S4；2026-10-14）
+
+     - **解锁**（S3 遗留的最大缺口：以前锁上只能杀客户端或切 VT）：`src/sessionlock.c` 新增 `lock_restore_desktop()`，在 `lock_handle_unlock()`（`lock->events.unlock`，
+       也就是客户端的 `unlock_and_destroy`）里调，做三件和「锁上」严格对称的事 —— ① 正常树（`layer_backdrop`…`layer_im`）`set_enabled(true)`、
+       `layer_lock_blank` / `layer_lock` 关掉；② `vidow_focus_view(server->focused)` 把键盘焦点还回原来那个窗口（`focused` 为空就 `vidow_seat_focus_surface(seat, NULL)` 清焦点，
+       别留在一个马上要被销毁的 lock surface 上）；③ `vidow_arrange(server)` 重排一次（锁定期间可能插拔过输出）+ 给每块屏主动要一帧。
+       恢复放在 unlock 事件里而不是等 destroy：两者在同一次事件循环分发里跑完（wlroots 的 `lock_handle_unlock_and_destroy` 先 emit `unlock` 再销毁 resource），
+       中间不渲染，所以不存在「桌面回来了但 lock surface 还画着」的中间帧。
+     - **客户端崩溃 / 被 kill → 不解锁**（协议 XML:111-113）：`lock_handle_destroy()` 现在按 `server->locked` 分流 —— `true` = 没走 unlock 就没了，
+       什么都不恢复（树继续关、每块屏的黑 rect 继续开着、`locked` 继续吞输入），打一行 ERROR `lock 对象没了但没有 unlock ——客户端崩溃 / 被 kill，按协议保持锁定（黑屏死锁，只剩 VT 切换能出去）`；
+       `false` = 解锁流程收尾。黑 rect 是锁上那一刻建的（不依赖 lock 对象），所以这条路上屏只会退回协议允许的「纯色」兜底，**绝不会漏桌面**。
+       崩溃后如果又来一个锁屏客户端，`new_lock` 会照常接管（协议允许「新客户端接手解锁」，`session_lock` 已经是 NULL）。
+     - **`src/view.c` 一行没动**（方案 §4 明确要求）：重聚焦直接复用现成的 `vidow_focus_view()`。`capture.c` / `screencopy.c` / `screencast.c` 也**一行没改**（审计下来零泄漏，见下）。
+     - **抓帧审计（方案 §4 风险 3，最高优先）—— 实测，不是推断**。vidow 的输出抓帧是**自己渲染一帧**，三条输出路径都汇到同一个渲染引擎：
+       ① `zwlr_screencopy`（`grim` / `wf-recorder`）→ `src/screencopy.c:388` 的 `vidow_capture_grab()`；
+       ② `ext-image-copy-capture` 输出源（xdg-desktop-portal 截图）→ `src/capture.c:226` 的 `wlr_scene_output_build_state()`（渲染的是 `server->scene` **整棵树**，
+       `set_enabled(false)` 的树天然不参与，和屏幕那一帧同一个场景图）；
+       ③ KDE screencast 输出流 → `src/screencast.c:1048,1069` 的 `vidow_capture_grab_into()`（同一个函数）。
+       ① ② 用真客户端抓真像素（`test-sessionlock.sh` 的「抓帧审计」两步）：
+       - **grim**（zwlr_screencopy）锁定期抓 HEADLESS-1：**锁屏色 100.00%（容差 ±2）、纯黑 0.00%、桌面像素 0（0.00%）**；
+       - **wf-recorder** 锁定期录 2 秒（screencopy 的连续帧 / `copy_with_damage` 那条路，`-o HEADLESS-1`）→ `ffmpeg` 抽第 1 帧：
+         **锁屏色 100.00%、与锁前桌面逐像素相同 0.00%**（容差 ±24 —— 视频帧过一趟 YUV420 往返有色偏 ±10 量级，所以这条路的容差要放宽，
+         同时拿锁前桌面图当对照：真漏了的话「与锁前桌面相同」会接近 100%）。
+       ③ 没有便宜的免 portal 客户端（本机没装 `ext-image-copy-capture` 输出源客户端），只给代码路径证据（同一个 `vidow_capture_grab_into`）。**结论：三条输出路径都没泄漏，零改动。**
+     - 验证（`test-sessionlock.sh`，headless 两块屏；A/B/C/G1/G2/D/E 仍全绿，只补方案 §3 的 F/H + 抓帧审计）：
+       - **F**（锁定期 `kill -9` locktest）：vidow 活着；日志有上面那行「客户端崩溃 / 被 kill」；`grim` 抓 HEADLESS-1 = **纯黑 100.00%、桌面像素 0**（没自动解锁）；
+         **真键盘**（`wtype -M logo -k j`，走 `input.c` 的 `keyboard_key`）按已绑定的 `Mod+J` → 工作区 / 焦点前后一致 + 日志仍有「锁定期间不生效」。
+       - **H**（locktest stdin 写 `u` → `unlock_and_destroy`）：日志「解锁了，桌面树恢复（focused 已重新聚焦）」；两块屏 `grim` 与锁前**逐像素相同 100.00%、最大差 0、平均差 0.000**
+         （对照：锁中那张与锁前最大差 126）；解锁后同一个 `wtype -M logo -k j` → **工作区真的切了**（`active=[(1,None),(1,None)]` → `[(1,None),(2,None)]`，即 HEADLESS-1 切到 2 号），
+         且不再新增「锁定期间不生效」；解锁后屏上锁屏色占比 0.0%（`layer_lock` 那两棵树确实关掉了）。
+     - **顺手修掉一个测试自身的坑**：`test-sessionlock.sh` 的配置里那个绑定以前写的是 `vidow.bind("Mod+J", "focus-workspace 2")` —— `focus-workspace` **不是动作**
+       （vidow 会打 `action: 不认识的动作 'focus-workspace 2'`），D 那条断言照样成立（白名单在动作解析之前就挡下了），但 H 要「解锁后键位真的生效」就必须用真动作名，
+       已改成 README 动作表里的 `"workspace 2"`。同理 F/H 不用 `vidowmsg send-key` 而用 `wtype`：**注入那条路平时本来就不触发键位表**（`src/input.c` 的 `inject_key`），
+       只有锁定期才被特意接到白名单上，拿它量不了「解锁后键位恢复」。
+     - **会话锁现在的准确状态**：**能锁、能解锁**（客户端 `unlock_and_destroy` → 桌面 + 焦点 + 布局都回来）、**客户端崩溃保持锁定**（黑屏死锁，只剩 VT 切换能出去，
+       `vidowmsg` 故意没有强制解锁后门）、**锁定期间输出抓帧 / 录屏不含桌面**（上面三组像素数字）。回归 `test-sessionlock.sh` 全绿。
+     - **还没做 / 已知边界**（如实记）：
+       - **自动锁屏（idle）没做**：`wlr_idle_notify_v1` / `wlr_idle_inhibit_v1` 两个 global 都没建，`swayidle` / `hypridle` 这类「空闲触发锁屏」的客户端现在还接不上（方案 §5 的 S5，独立可选步）。
+       - `vidowmsg pick-window x y` 这类**只读探测**锁定期间仍会做命中测试（`src/ipc.c:1901`）—— 它不改输入路由，但会暴露「被藏起来的窗口在哪」。本次范围外，没动。
+       - **窗口**抓帧（`src/wincapture.c` 的 `vidow_win_grab_render()`，给 `ext-image-copy-capture` 的 toplevel 源 / KDE 的窗口录屏用）走的是**单独一棵镜面场景**，
+         不经过被关掉的那棵正常树 —— 锁定期间它仍然能抓到被藏起来的那个窗口的内容。这不在方案 §4 风险 3（「输出抓帧漏桌面」）的范围里，`wincapture.c` 也不在本次允许改的文件里，**只记不修**，要处理得单独定策（合成器对 toplevel 源有没有权限模型是另一个问题）。
+       - 锁定期间 lock surface 的键盘焦点策略仍是「光标所在那块屏」（S3 定的），多屏手感的调优没做。
+
 266. **会话锁 S3：输入路由 —— 锁定期间键盘 / 指针只给 lock surface，键位只放行白名单（VT 切换）**（用户：「接着 S2 做方案 §5 的 S3，输入路由是最高危的一步；45 分钟时间盒，先把最高危的漏点做完」；方案 `/tmp/vidow-sessionlock-plan.md` §2 环节 3 + §3 D/E + §5 S3；2026-10-14）
 
      - 落点：`src/sessionlock.{c,h}`（新增三个查询 / 一个聚焦：`vidow_sessionlock_keyboard_surface()` / `_pointer_surface()` / `_focus()`，

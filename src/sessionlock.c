@@ -10,10 +10,11 @@
  *   3. 等每块屏各呈现一帧后发 locked（XML:87-107）。某块屏一直不出帧就超时兜底
  *      （XML:96-98 的 "reasonable time limit"），不能无限等。
  *
- * 本文件到 S3 为止：能锁、能黑屏、能握手，lock surface 生命周期（建 / 输出尺寸变化
+ * 本文件到 S4 为止：能锁、能黑屏、能握手，lock surface 生命周期（建 / 输出尺寸变化
  * 重新 configure / 输出拔掉清账）和输出热插拔（新屏立刻补黑幕、进握手账）都做了，
- * 输入路由（键盘 / 指针只给 lock surface，见本文件末尾）也做了。解锁 / 客户端崩溃
- * 恢复（S4）不在这里。 */
+ * 输入路由（键盘 / 指针只给 lock surface，见本文件末尾）也做了，解锁（客户端说
+ * 「不锁了」→ 桌面整棵恢复 + 焦点还回窗口 + 重排）也做了。客户端崩溃**不解锁**
+ * （协议 XML:111-113 的「黑屏死锁」态）是刻意的：只有客户端的 unlock 才恢复桌面。 */
 
 #include "server.h"
 #include "sessionlock.h"
@@ -366,12 +367,60 @@ static void lock_handle_new_surface(struct wl_listener *listener, void *data) {
 
 /* ------------------------------------------------------------------ lock */
 
+/* 解锁：桌面整棵恢复。**只有**客户端发 unlock 才走这儿（见 lock_handle_unlock）——
+ * 客户端崩溃走的是 destroy，那条路上什么都不恢复（协议 XML:111-113）。
+ *
+ * 三件事，顺序有讲究：
+ *   1. 树：正常树（layer_backdrop…layer_im）开回来，layer_lock_blank / layer_lock
+ *      关掉。和锁上时那一步严格对称。
+ *   2. 焦点：S3 期间键盘一直在 lock surface 上，解锁后得还给原来那个窗口 —— 不还的话
+ *      键盘要等到用户点一下才回来（`vidow_focus_view` 会顺手做掉 set_activated /
+ *      restack / IME 那一套，和平时换焦点是同一条路）。focused 为空（没窗口）就把
+ *      焦点清掉，别留在一个马上要被销毁的 lock surface 上。
+ *   3. 重排：锁定期间输出可能插拔过、窗口尺寸可能变过，解锁后布局要跟上。
+ *
+ * 这个函数在 unlock 事件里跑，紧接着（同一次事件循环分发里）wlroots 会销毁 lock
+ * 对象 → 销毁所有 lock surface（挂在它们上面的场景节点由 lock_surface_handle_destroy
+ * 收掉）。两件事之间**不渲染**，所以不存在「桌面回来了但 lock surface 还画着」的
+ * 中间帧；而先换焦点再让 lock surface 消失也是安全的 —— wlroots 的
+ * wlr_seat_keyboard_notify_enter 换焦点时会摘掉旧表面的 destroy 监听。 */
+static void lock_restore_desktop(struct vidow_server *server) {
+	server->locked = false;
+	server->lock_frames_pending = 0;
+	struct vidow_output *output;
+	wl_list_for_each(output, &server->outputs, link) {
+		output->lock_frame_pending = false;
+	}
+
+	set_desktop_enabled(server, true);
+	if (server->layer_lock_blank != NULL) {
+		wlr_scene_node_set_enabled(&server->layer_lock_blank->node, false);
+	}
+	if (server->layer_lock != NULL) {
+		wlr_scene_node_set_enabled(&server->layer_lock->node, false);
+	}
+
+	if (server->focused != NULL) {
+		vidow_focus_view(server->focused);
+	} else if (server->seat != NULL) {
+		vidow_seat_focus_surface(server->seat, NULL);
+	}
+	vidow_arrange(server);
+
+	/* 主动要一帧：桌面整棵刚从关到开，damage 是有的，但别赌后端一定给帧。 */
+	wl_list_for_each(output, &server->outputs, link) {
+		vidow_output_schedule_frame(server, output->wlr_output, "解锁恢复桌面");
+	}
+	wlr_log(WLR_INFO, "sessionlock: 解锁了，桌面树恢复（focused %s）",
+		server->focused != NULL ? "已重新聚焦" : "为空，已清键盘焦点");
+}
+
 static void lock_handle_unlock(struct wl_listener *listener, void *data) {
 	(void)data;
 	struct vidow_server *server =
 		wl_container_of(listener, server, lock_unlock);
-	/* 解锁是 S4 的事：这里只记一笔。接下来客户端会销毁 lock（destroy 事件）。 */
-	wlr_log(WLR_INFO, "sessionlock: 客户端请求解锁（恢复桌面是 S4）");
+	wlr_log(WLR_INFO, "sessionlock: 客户端请求解锁（unlock_and_destroy）");
+	lock_restore_desktop(server);
 }
 
 static void lock_handle_destroy(struct wl_listener *listener, void *data) {
@@ -385,10 +434,18 @@ static void lock_handle_destroy(struct wl_listener *listener, void *data) {
 		wl_event_source_timer_update(server->lock_timeout, 0);
 	}
 	server->session_lock = NULL;
-	/* 客户端走了（或解锁了）：协议 XML:111-113 不许合成器自己解锁 —— 保持黑屏 +
-	 * 锁定态（「死锁」态），恢复桌面是 S4。 */
-	wlr_log(WLR_INFO, "sessionlock: lock 对象没了（客户端退出 / 解锁）；"
-		"按协议保持锁定态（恢复桌面见 S4）");
+	if (server->locked) {
+		/* 没走 unlock 就没了 = 客户端在锁定期间崩溃 / 被 kill。协议 XML:111-113：
+		 * 合成器**不许**因此解锁（允许永久锁死）。这里什么都不恢复：树继续关着、
+		 * 每块屏的黑 rect 继续开着（lock surface 已经随 lock 对象销毁了，所以
+		 * 画面退回协议允许的「纯色」兜底）、`locked` 继续吞输入。逃生口只剩 VT
+		 * 切换。黑 rect 在锁上那一刻就建好了，不依赖 lock 对象，所以这条路上
+		 * 屏幕绝不会漏出桌面。 */
+		wlr_log(WLR_ERROR, "sessionlock: lock 对象没了但没有 unlock ——"
+			"客户端崩溃 / 被 kill，按协议保持锁定（黑屏死锁，只剩 VT 切换能出去）");
+	} else {
+		wlr_log(WLR_INFO, "sessionlock: lock 对象已销毁（解锁流程收尾）");
+	}
 }
 
 static void lock_manager_new_lock(struct wl_listener *listener, void *data) {
