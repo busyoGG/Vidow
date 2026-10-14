@@ -47,11 +47,11 @@ mini_hover_fade_in_ms = 120
 mini_hover_fade_out_ms = 150
 -- 记住自由小窗的尺寸（false = 每次进自由小窗都用 mini_free_w/h 那对初始比例）。迷你 / 图标态的尺寸永远跟配置，不受它影响
 mini_remember_size = true
--- 迷你 / 自由小窗离工作区边缘的最小留白（逻辑像素）
+-- 迷你小窗离工作区边缘的最小留白（逻辑像素）；**自由小窗不吃这个留白**（它是自由摆放的正常窗户，要能贴到工作区的边上）
 mini_edge_margin = 8
--- 小窗化**不改客户端分辨率**：保留客户端原生 buffer，由合成器缩放显示（默认 true）。false = 小窗态按小窗尺寸重配客户端（省显存，但有的游戏一 resize 就重置成窗口模式）
+-- **迷你 / 图标态**要不要保留客户端原生分辨率：保留（默认 true）时合成器缩放显示、不重配客户端；false = 按小窗尺寸重配客户端（省显存，但有的游戏一 resize 就重置成窗口模式）。自由小窗**不受这个键影响**：它总是按盒子尺寸 configure 客户端（客户端跟着重新排版）
 mini_preserve_buffer = true
--- 自由小窗的宽高比策略："auto" / "lock" / "free"（默认 "auto"）。三个取值都是强制语义，优先级：键位 > 窗口规则 > 这个全局键。auto = 让自动信号决定（X11 有 PAspect / min==max 提示就锁，否则 free）；lock / free 显式压过自动信号。只对自由小窗有效 —— 迷你 / 图标态永远按内容比例
-mini_aspect = "auto"
+-- 自由小窗的宽高比策略："auto" / "lock" / "free"（默认 "free"）。三个取值都是强制语义，优先级：键位 > 窗口规则 > 这个全局键。auto = 让自动信号决定（X11 有 PAspect / min==max 提示就锁，否则 free）；lock / free 显式压过自动信号。只对自由小窗有效 —— 迷你 / 图标态永远按内容比例
+mini_aspect = "free"
 -- 迷你态「单击 = 放大」vs「拖拽 = 移动」的位移阈值（逻辑像素）：指针按下后走了这么多像素才算拖拽，没走到就松手当单击
 mini_drag_threshold_px = 4

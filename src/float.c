@@ -294,13 +294,24 @@ void vidow_float_on_commit(struct vidow_view *view) {
 		 * 就重置成窗口模式）。盒子由形态 / 锚点决定，客户端说什么都不作数。
 		 *
 		 * 只有关掉保留（规则 / 全局键 mini_preserve_buffer = false）才走下面
-		 * 那条老路：把客户端 configure 成小窗尺寸。 */
-		if (vidow_mini_preserve_buffer(view)) {
+		 * 那条老路：把客户端 configure 成小窗尺寸。
+		 *
+		 * **只管迷你 / 图标**：自由小窗是正常窗户语义，盒子多大就 configure 客户端
+		 * 多大多，它的提交照常采纳（见 view.c 的 vidow_view_set_size 同一处收窄）。 */
+		if ((view->mini == VIDOW_MINI_MINI ||
+				view->mini == VIDOW_MINI_ICON) &&
+				vidow_mini_preserve_buffer(view)) {
 			return;
 		}
 		int cw = 0, ch = 0;
 		vidow_view_client_size(view, &cw, &ch);
-		if (view->mini == VIDOW_MINI_FREE && cw > 1 && ch > 1 &&
+		/* 「我让它多大」还没被客户端认下来（拖拽改大小刚 configure、它还在交
+		 * 旧尺寸）：这次提交**不采纳** —— 采纳就等于让一个迟到的旧尺寸把刚拖出
+		 * 来的盒子改回去（拖了等于没拖）。下面那段「盒子跟客户端不一样就再催一次
+		 * configure」负责把 want 再钉一遍。 */
+		bool stale = view->float_want_w > 0 &&
+			(cw != view->float_want_w || ch != view->float_want_h);
+		if (!stale && view->mini == VIDOW_MINI_FREE && cw > 1 && ch > 1 &&
 				view->server->config.mini_remember_size) {
 			struct wlr_box work =
 				vidow_work_area(view->server, view->output);
@@ -571,6 +582,85 @@ void vidow_float_begin_grab(struct vidow_server *server,
 		resize ? "se-resize" : "grabbing");
 }
 
+/* ---------------------------------------- FREE 小窗拖动中的跨屏 / 锚点（S8）
+ *
+ * FREE 是「自由摆放」那一档，拖拽语义和普通浮窗一样：跟着光标、能跨屏、落在
+ * 光标处。它不能直接改 float_geom —— 小窗的位置是**比例锚点**，唯一的换算点是
+ * vidow_mini_resolve_geom()（见 float_place_recursive 的小窗分支）。所以拖动里
+ * 每次都得把「光标想要的绝对位置」换算成锚点回写，换算用的工作区必须是**盒子
+ * 现在归属的那块屏**（跨屏的瞬间就换过去，见 mini_free_drag_to_output）。
+ *
+ * 锚点 0 = 贴工作区左 / 上边、1 = 贴右 / 下边。FREE 的锚点**夹在 0..1**：MINI /
+ * ICON 允许 -0.5..1.5（图标刻意出屏一点），FREE 是正常窗户，摆在工作区里就行
+ * —— 不夹的话「光标拖出屏外」会把锚点记成 1.6，换屏之后被 resolve 夹到远边。 */
+static void mini_free_anchor_from(struct vidow_view *view,
+		struct wlr_box work, int w, int h, double bx, double by) {
+	double span_x = (double)(work.width - w);
+	double span_y = (double)(work.height - h);
+	double ax = span_x > 1.0 ? (bx - (double)work.x) / span_x : 0.0;
+	double ay = span_y > 1.0 ? (by - (double)work.y) / span_y : 0.0;
+	if (ax < 0.0) {
+		ax = 0.0;
+	} else if (ax > 1.0) {
+		ax = 1.0;
+	}
+	if (ay < 0.0) {
+		ay = 0.0;
+	} else if (ay > 1.0) {
+		ay = 1.0;
+	}
+	view->mini_ax = ax;
+	view->mini_ay = ay;
+}
+
+/* 同一块屏上的拖动：把「盒子该在的绝对位置」换算成锚点回写，再按锚点把盒子算
+ * 出来（这样盒子就真的跟着光标走了 —— 以前只写 float_geom.x/y，下一次 arrange
+ * 被 resolve_geom 按旧锚点抹回去，整段拖拽盒子一动不动）。 */
+static void mini_free_drag_set_anchor(struct vidow_server *server,
+		struct vidow_view *view, int x, int y) {
+	struct wlr_box work = vidow_work_area(server, view->output);
+	if (work.width < 1 || work.height < 1) {
+		return;
+	}
+	mini_free_anchor_from(view, work, view->float_geom.width,
+		view->float_geom.height, (double)x, (double)y);
+	vidow_mini_resolve_geom(view);
+}
+
+/* 拖动中光标跨过屏边界：**当场**把归属换到光标底下那块屏，并按「抓取偏移不变」
+ * 把锚点算在新屏的工作区里（从右边进来 → 贴新屏左边缘，不是远边）。松手那条路
+ * （vidow_mini_drag_finish）也走 vidow_mini_move_to_output，但那要等到松手 ——
+ * 拖动中不换的话盒子会被旧屏工作区夹住、跟不上光标。 */
+static void mini_free_drag_to_output(struct vidow_server *server,
+		struct vidow_view *view, struct wlr_output *to, double lx, double ly) {
+	struct wlr_box work = vidow_work_area(server, to);
+	if (work.width < 1 || work.height < 1) {
+		return;
+	}
+	/* 盒子在新屏上的尺寸：和 vidow_mini_resolve_geom 同一套换算（比例锚点 ×
+	 * 新屏工作区，夹到工作区里），这里先算出来只是为了拿到 span。 */
+	int w = (int)lround(view->mini_wf * (double)work.width);
+	int h = (int)lround(view->mini_hf * (double)work.height);
+	if (w < FLOAT_MIN_SIZE) {
+		w = FLOAT_MIN_SIZE;
+	}
+	if (h < FLOAT_MIN_SIZE) {
+		h = FLOAT_MIN_SIZE;
+	}
+	if (w > work.width) {
+		w = work.width;
+	}
+	if (h > work.height) {
+		h = work.height;
+	}
+	/* 抓取偏移 = 按下那一刻光标在盒子里的位置：整个拖拽里保持不变，手感才是
+	 * 「拎着它走」而不是「盒子跳到光标底下」。 */
+	double bx = lx - (server->grab_x - (double)server->grab_geom.x);
+	double by = ly - (server->grab_y - (double)server->grab_geom.y);
+	mini_free_anchor_from(view, work, w, h, bx, by);
+	vidow_mini_move_to_output(server, view, to);
+}
+
 void vidow_float_grab_update(struct vidow_server *server, double lx,
 		double ly) {
 	struct vidow_view *view = server->grab_view;
@@ -591,11 +681,21 @@ void vidow_float_grab_update(struct vidow_server *server, double lx,
 		struct wlr_box all = {0};
 		wlr_output_layout_get_box(server->output_layout, NULL, &all);
 		if (all.width > 0 && all.height > 0) {
-			if (x + server->grab_geom.width > all.x + all.width) {
-				x = all.x + all.width - server->grab_geom.width;
+			/* 夹取用**盒子当前的尺寸**，不是按下那一刻那份（grab_geom）：拖动中
+			 * 跨屏会当场换归属，盒子尺寸跟着新屏重算（FREE 是比例锚点，见下面
+			 * mini 那支），拿旧尺寸夹就少走「旧 - 新」那一段 —— 实测从 1260x700
+			 * 的屏（盒 504x315）拖到 620x340 的屏（盒 248x153）之后，盒子右边缘
+			 * 停在 1416 = 1920 - 504，明明还差 248 才到布局右边界。位置本身照旧
+			 * 按 grab_geom 推（抓取偏移不变才是「拎着走」）。 */
+			int cw = view->float_geom.width > 0 ?
+				view->float_geom.width : server->grab_geom.width;
+			int ch = view->float_geom.height > 0 ?
+				view->float_geom.height : server->grab_geom.height;
+			if (x + cw > all.x + all.width) {
+				x = all.x + all.width - cw;
 			}
-			if (y + server->grab_geom.height > all.y + all.height) {
-				y = all.y + all.height - server->grab_geom.height;
+			if (y + ch > all.y + all.height) {
+				y = all.y + all.height - ch;
 			}
 			if (x < all.x) {
 				x = all.x;
@@ -614,7 +714,29 @@ void vidow_float_grab_update(struct vidow_server *server, double lx,
 		 * 里盒子的 x/y 逐字段不变）。和 input.c 的 mini_grab_update()（拖迷你 /
 		 * 图标）以及下面 resize 分支回写 mini_wf/hf 是同一规矩：**拖出来的东西
 		 * 必须回写锚点**。放在夹取之后：夹出来的位置才是真正要落地的那个。 */
-		if (view->mini != VIDOW_MINI_NONE) {
+		if (view->mini == VIDOW_MINI_FREE) {
+			/* FREE 态与普通浮窗**同权**（自由摆放）：拖动中跟着光标走、能跨屏。
+			 *
+			 * 以前这一支用**旧屏**的工作区算 span 把锚点写回去（还不夹 0..1），
+			 * 紧接着 resolve_geom 又按旧屏工作区把盒子夹回来 —— 盒子一出旧屏
+			 * 边界就卡住（实测光标在邻屏 1500 时盒子还卡在旧屏 x = 758）；
+			 * 改归属又只发生在**松手**那一刻（那时锚点已被旧屏算成 1.638），
+			 * 新屏上按这个锚点摆就被夹到**远边**，正是用户报的「跨屏弹到同向边」。
+			 *
+			 * 现在的规矩：光标在哪块屏上，归属**当场**换过去（不等松手）；锚点
+			 * 按「光标在新屏工作区里的相对位置」算，而且抓取偏移（光标按下去
+			 * 那一点在盒子里的位置）保持不变 —— 于是盒子始终跟着光标，从右边
+			 * 进新屏就贴新屏的**左**边缘。 */
+			struct wlr_output *under = wlr_output_layout_output_at(
+				server->output_layout, lx, ly);
+			if (under != NULL && under != view->output) {
+				mini_free_drag_to_output(server, view, under, lx, ly);
+			} else {
+				mini_free_drag_set_anchor(server, view, x, y);
+			}
+			x = view->float_geom.x;
+			y = view->float_geom.y;
+		} else if (view->mini != VIDOW_MINI_NONE) {
 			struct wlr_box work = vidow_work_area(server, view->output);
 			double span_x = (double)(work.width - view->float_geom.width);
 			double span_y = (double)(work.height - view->float_geom.height);
@@ -671,7 +793,22 @@ void vidow_float_grab_update(struct vidow_server *server, double lx,
 				view->mini_wf = (double)w / (double)work.width;
 				view->mini_hf = (double)h / (double)work.height;
 				view->mini_size_known = true;
+				/* 锚点跟着**新尺寸**重算一次，钉住盒子的左上角：锚点是「盒子
+				 * 在工作区里的比例位置」，尺寸一变同一个锚点就落到别处 ——
+				 * 拖右边缘时左边缘会跟着往回跑（实测 1648 → 1601）。普通浮窗
+				 * 改大小的语义就是左上角不动，FREE 照它。 */
+				mini_free_anchor_from(view, work, w, h,
+					(double)view->float_geom.x,
+					(double)view->float_geom.y);
 			}
+			/* FREE 走普通浮窗那条路：盒子多大就**命令客户端**多大多（它跟着
+			 * 重新排版），不是把原生 buffer 缩进一个更大的盒子里留白 —— 后者
+			 * 拖出来的只是留白，内容比例一动不动（用户报的「改大小被限制了
+			 * 比例」）。float_want_w/h 一起钉住：客户端为别的原因提交的旧尺寸
+			 * 不能把盒子改回去（见 vidow_float_on_commit 的小窗分支）。 */
+			view->float_want_w = w;
+			view->float_want_h = h;
+			vidow_view_set_size(view, w, h);
 		}
 	}
 
@@ -921,6 +1058,20 @@ bool vidow_mini_drag_finish(struct vidow_server *server,
 	if (under != NULL && under != view->output) {
 		vidow_mini_move_to_output(server, view, under);
 		return true;
+	}
+	/* FREE 是**自由摆放**那一档：拖到工作区边缘松手就是「摆在那儿」，不收成
+	 * 图标。判据三条：
+	 *   ① 语义不同 —— MINI / ICON 是贴边的缩略图（尺寸钉死、不吃输入），
+	 *      「拖到内边缘 = 收成图标」是它们的形态语言；FREE 是正常窗户（客户端
+	 *      拿得到焦点 / 键盘 / 滚轮，尺寸由客户端自己说了算），摆到哪就是哪。
+	 *   ② 会打架 —— FREE 已经能**改大小**（resize 会真的重配客户端），而收成
+	 *      图标会把这个窗口的客户端尺寸 / 比例一起丢掉，用户改大的窗口拖到边上
+	 *      就白改了。
+	 *   ③ 有别的路 —— 收成图标有专门的入口：拖进落点区（正上方那条路）、
+	 *      工具条按钮、滚轮降档、甩出（甩出那条不改，见 vidow_mini_fling）。
+	 * MINI / ICON 那条一字不动。 */
+	if (view->mini == VIDOW_MINI_FREE) {
+		return false;
 	}
 	enum vidow_mini_edge edge = vidow_mini_edge_under_cursor(server, view);
 	if (edge == VIDOW_MINI_EDGE_NONE) {
@@ -1208,10 +1359,18 @@ void vidow_mini_toolbar_press(struct vidow_server *server,
  */
 
 /* S3：小窗态要不要保留客户端原生分辨率（默认 true）。规则 > 全局键，
- * 和 mini_aspect 那套三级优先级无关 —— 这个只有两级（规则写了就是它）。 */
+ * 和 mini_aspect 那套三级优先级无关 —— 这个只有两级（规则写了就是它）。
+ *
+ * **只管 MINI / ICON**（缩略图语义：保留原生 buffer，合成器缩着画，便宜且
+ * 「内容比例不能变」正是它们要的）。FREE 恒为 false：它是自由摆放的正常窗口，
+ * 盒子多大就 configure 客户端多大（客户端跟着重新排版）—— 保留缓冲那条路上，
+ * 改盒子只改留白、内容比例一动不动，正是用户报的「改大小被限制了比例」。 */
 bool vidow_mini_preserve_buffer(const struct vidow_view *view) {
 	if (view == NULL) {
 		return true;
+	}
+	if (view->mini == VIDOW_MINI_FREE) {
+		return false;
 	}
 	if (view->mini_preserve_buffer_set) {
 		return view->mini_preserve_buffer;
@@ -1292,10 +1451,18 @@ bool vidow_mini_parse_aspect(const char *text, enum vidow_mini_aspect *out) {
  * 拿 surface->current.width 混 X11 的缩放桥（计划 §11.3 那条）。 */
 static bool mini_native_ratio(const struct vidow_view *view, double *ratio) {
 	int nw = view->base_dst_w, nh = view->base_dst_h;
-	if (nw <= 0 || nh <= 0) {
+	/* FREE 的「内容比例」就是**当前**表面比例：FREE 不保留原生 buffer（盒子多大
+	 * 就 configure 客户端多大），base_dst_* 那份 1:1 基线只在小窗态之外记（见
+	 * view.c 的 view_dst_capture），进 FREE 之后它就是过期的 —— 拿它当内容比例
+	 * 会把锁比例算错（实测锁着改窄：客户端被 configure 成 404 宽、高按过期的
+	 * 0.89 算成 452，而表面自己的比例是 1.53）。 */
+	if (view->mini == VIDOW_MINI_FREE || nw <= 0 || nh <= 0) {
 		struct wlr_surface *surface = vidow_view_surface(view);
-		nw = surface != NULL ? surface->current.width : 0;
-		nh = surface != NULL ? surface->current.height : 0;
+		if (surface != NULL && surface->current.width > 0 &&
+				surface->current.height > 0) {
+			nw = surface->current.width;
+			nh = surface->current.height;
+		}
 	}
 	if (nw <= 0 || nh <= 0) {
 		return false;
@@ -1528,8 +1695,12 @@ void vidow_mini_resolve_geom(struct vidow_view *view) {
 			break;
 		}
 	} else {
-		/* 迷你 / 自由小窗夹在工作区里（留 mini_edge_margin 的边）。 */
-		int margin = cfg->mini_edge_margin;
+		/* 迷你小窗夹在工作区里（留 mini_edge_margin 的边）；**自由小窗不吃这个
+		 * 留白** —— 它是自由摆放的正常窗户，用户报的「小窗移动范围受限、左右
+		 * 有不可移动区域」就是这 8px（实测最左 x = 18 = 10 + 8，最右 758 =
+		 * 10 + 1260 - 8 - 504）。FREE 只夹在工作区框里（margin = 0）。 */
+		int margin = view->mini == VIDOW_MINI_FREE ? 0 :
+			cfg->mini_edge_margin;
 		if (margin < 0) {
 			margin = 0;
 		}

@@ -401,9 +401,17 @@ void vidow_view_set_size(struct vidow_view *view, int w, int h) {
 	 * —— 客户端 buffer 保持原生，由合成器把场景节点缩到小窗盒显示（见
 	 * view_mini_scale）。挡在唯一的出口上：进小窗、arrange 摆位、拖拽改盒子、
 	 * 迟到的 commit 全都走这儿，挡一处就够。退出小窗（mini == NONE）之后照常
-	 * configure —— 还原成列 / 浮动窗口那边要按布局重新定尺寸。 */
-	if (view->mini != VIDOW_MINI_NONE && vidow_mini_preserve_buffer(view)) {
-		return;
+	 * configure —— 还原成列 / 浮动窗口那边要按布局重新定尺寸。
+	 *
+	 * **只管迷你 / 图标两个形态**：那两态是「缩略图」语义（只缩不重排，保留原生
+	 * buffer 才便宜）。自由小窗（FREE）是**正常窗户**语义 —— 盒子多大就命令客户端
+	 * 多大多，它跟着重新排版（用户报的「自由小窗改大小被限制了比例」：以前 FREE
+	 * 也吃这条，改盒子只改留白、客户端一次 configure 都不发，内容比例一动不动，
+	 * 看起来就像被锁了比例）。 */
+	if (view->mini == VIDOW_MINI_MINI || view->mini == VIDOW_MINI_ICON) {
+		if (vidow_mini_preserve_buffer(view)) {
+			return;
+		}
 	}
 	if (!vidow_view_configure_ready(view)) {
 		/* 客户端第一帧还没来：几何先记着，初始 configure 由 commit 那边发。 */
@@ -2119,19 +2127,31 @@ static void view_anim_place(struct vidow_view *view) {
 				(view->float_geom.height - dh) / 2 - (py - vy);
 			wlr_scene_node_set_position(&mini_src->node, off_x, off_y);
 			view->mini_scaled = true;
-		} else if (view->mini_scaled) {
-			/* 退出小窗（或者关掉了保留）：把节点还原成原生尺寸，并重记一次
-			 * 1:1 基线 —— 小窗期间 view_dst_capture 是挡着的，不重记的话
-			 * base_dst_* 会一直停在进小窗之前那一版（X11 那边下一步就
-			 * commit 重记了，这里补的是「不 commit 也要对」）。 */
+		} else if (view->mini_scaled || view->mini != VIDOW_MINI_NONE) {
+			/* 退出缩放态，**或者**本来就不缩放的小窗态（FREE：保留 buffer 不再
+			 * 管它，客户端已经被 configure 成盒子大小，内容是 1:1 的）。
+			 *
+			 * 第二种情形必须也钉一遍：wlroots 每次 commit 都会把 dst 重算成
+			 * 「缓冲像素 ÷ 缓冲缩放」，而那个值不一定等于表面自己的逻辑尺寸
+			 * —— 实测 FREE 里一个逻辑 544x355 的表面被设成 **277x355**。屏上
+			 * 画的是装饰图（fx 那条路）所以看着没错，但**命中测试认的是内容
+			 * 节点**（wlroots 的 scene_node_get_size + 表面输入区域）⇒ 半个
+			 * 窗口「看得见、点不着」：实测点盒心 (1018,167) 命中不到窗口、命中
+			 * 区只剩 x∈[746,1023]（= 277 宽），而盒子是 766..1270。
+			 *
+			 * 位置只在**离开缩放态**时才撤居中偏移；FREE 这种本来就 1:1 的，
+			 * 位置由 wlroots 按窗口几何留白（CSD 阴影）摆，别去动它。 */
+			bool was_scaled = view->mini_scaled;
 			view->mini_scaled = false;
-			/* 居中偏移一起撤掉（位置还原成进缩放态之前那一版）。 */
-			wlr_scene_node_set_position(&mini_src->node, view->mini_base_dx,
-				view->mini_base_dy);
+			if (was_scaled) {
+				/* 居中偏移一起撤掉（位置还原成进缩放态之前那一版）。 */
+				wlr_scene_node_set_position(&mini_src->node,
+					view->mini_base_dx, view->mini_base_dy);
+			}
 			if (view->kind == VIDOW_VIEW_X11) {
 				vidow_view_x11_scale(view);
 			} else {
-				/* 还原成**表面自己的逻辑尺寸**（wlroots 下一次 commit 也会设
+				/* 钉成**表面自己的逻辑尺寸**（wlroots 下一次 commit 也会设
 				 * 成这个值）—— 不用 0：0 在 wlroots 那边是「按缓冲像素当场景
 				 * 单位」，2 倍缓冲的客户端会被先画大一倍，而且它下一次 commit
 				 * 之前一直错（窗口不再交帧的话就一直错下去）。 */
@@ -2140,13 +2160,14 @@ static void view_anim_place(struct vidow_view *view) {
 						surface->current.height > 0) {
 					wlr_scene_buffer_set_dest_size(mini_src,
 						surface->current.width, surface->current.height);
-				} else {
+				} else if (was_scaled) {
 					wlr_scene_buffer_set_dest_size(mini_src, 0, 0);
 				}
 			}
 			view_dst_capture(view);
 		}
 	}
+
 
 	if (!view->fx.active || view->scene_surface == NULL) {
 		return;

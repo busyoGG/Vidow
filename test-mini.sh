@@ -70,7 +70,7 @@
 set -u
 cd "$(dirname "$0")"
 
-RUNDIR=/tmp/vidow-mini-test
+RUNDIR=${VIDOW_MINI_RUNDIR:-/tmp/vidow-mini-test}
 CFGDIR="$RUNDIR/home"
 LOG="$RUNDIR/log"
 PLOG="$RUNDIR/probe.log"
@@ -304,11 +304,20 @@ PY
 # 最早的「这一趟之后」的新日志行号（给「只看这一段」的断言用）
 logmark() { wc -l < "$LOG"; }
 since() { tail -n +"$1" "$LOG"; }
+# 同上，但看的是**客户端探针**的日志（客户端自己收到的 configure / motion）
+plogmark() { wc -l < "$PLOG"; }
+psince() { tail -n +"$1" "$PLOG"; }
 
 # ================================================================ S1：形态 IPC
 mark "S1 形态 IPC：三态 / 循环 / 清单 / 还原"
 ID=$(mini_id)
 [ -n "$ID" ] && pass "拿到窗口 id = $ID" || fail "没拿到窗口 id"
+# 默认值：mini_aspect = "free"（自由小窗是自由摆放的正常窗户，默认不锁比例 —— 用户
+# 报的「自由小窗默认应该不限制比例」）。得在 S3b **之前**查：那一节会显式写三个取值。
+DEF_ASPECT=$(./build/vidowmsg config mini_aspect |
+	python3 -c 'import sys,json;print(json.load(sys.stdin)["value"])')
+[ "$DEF_ASPECT" = "free" ] && pass "mini_aspect 默认 = free（vidowmsg config）" ||
+	fail "mini_aspect 默认不是 free：$DEF_ASPECT"
 
 ./build/vidowmsg mini-window --id "$ID" >/dev/null
 sleep 1.0
@@ -373,26 +382,44 @@ FOC2=$(./build/vidowmsg focused 2>/dev/null | grep -ac 'w1' || true)
 set_state mini; sleep 1.0
 
 # ================================================================ S3：缩放 / 路由 / 坐标
-mark "S3 原生 buffer：小窗化不重配客户端"
+mark "S3 原生 buffer：迷你 / 图标保留（不重配），FREE 按盒子重配客户端"
+# `mini_preserve_buffer` 的语义**只管迷你 / 图标态**（缩略图：保留原生 buffer、由
+# 合成器缩着画）；自由小窗不受它影响 —— 盒子多大就 configure 客户端多大，客户端
+# 跟着重新排版。用户报的「自由小窗改大小被限制了比例」就是保留缓冲那条路：改盒子
+# 只改留白，内容比例一动不动。
 unmini; sleep 0.8
 SW0=$(winf w1 sw); SH0=$(winf w1 sh); CF0=$(pev configure)
 echo "  平铺态 surface = ${SW0}x${SH0}，客户端 configure 事件 $CF0 条"
 MARK=$(logmark)
-set_state free; sleep 1.0
-SW1=$(winf w1 sw); SH1=$(winf w1 sh); CF1=$(pev configure)
-[ "$SW1" = "$SW0" ] && [ "$SH1" = "$SH0" ] &&
-	pass "进自由小窗：客户端 surface 尺寸不变（${SW1}x${SH1} = 原生）" ||
-	fail "客户端被重配了：${SW0}x${SH0} → ${SW1}x${SH1}"
+PMARK0=$(plogmark)
+set_state mini; sleep 1.0
+SWM=$(winf w1 sw); SHM=$(winf w1 sh)
+[ "$SWM" = "$SW0" ] && [ "$SHM" = "$SH0" ] &&
+	pass "进迷你态：客户端 surface 尺寸不变（${SWM}x${SHM} = 原生，保留 buffer 那档）" ||
+	fail "迷你态客户端被重配了：${SW0}x${SH0} → ${SWM}x${SHM}"
 # 进小窗会多出一条 configure（set_tiled 的状态位变化，niri 那条路一样）—— 判据
 # 不是「一条都不许多」，而是**多出来的那些尺寸还是原生的**（尺寸才是重配）。
-BAD=$(since "$MARK" | grep -a 'probe: configure' | grep -avc "configure ${SW0}x${SH0}" || true)
-NEW=$(since "$MARK" | grep -ac 'probe: configure' || true)
+# 看的是**客户端探针的日志**（psince）：configure 是客户端自己收到的事件，合成器
+# 日志里没有它 —— 以前这里读的是 vidow 日志，于是永远 0 条、判据空转。
+BAD=$(psince "$PMARK0" | grep -a 'probe: configure' | grep -avc "configure ${SW0}x${SH0}" || true)
+NEW=$(psince "$PMARK0" | grep -ac 'probe: configure' || true)
 if [ "${BAD:-0}" = "0" ]; then
-	pass "小窗化后客户端收到的 configure（$NEW 条）尺寸全是原生 ${SW0}x${SH0}"
+	pass "进迷你态后客户端收到的 configure（$NEW 条）尺寸全是原生 ${SW0}x${SH0}"
 else
-	fail "客户端被重配成别的尺寸了：$(since "$MARK" | grep -a 'probe: configure' | tail -1)"
+	fail "迷你态客户端被重配成别的尺寸了：$(psince "$PMARK0" | grep -a 'probe: configure' | tail -1)"
 fi
-FB=$(geom); echo "  自由小窗盒 = $FB（原生 ${SW1}x${SH1} 缩进去显示）"
+MARK=$(logmark)
+PMARK1=$(plogmark)
+set_state free; sleep 1.4
+SW1=$(winf w1 sw); SH1=$(winf w1 sh)
+FB=$(geom)
+[ "$SW1" != "$SW0" ] &&
+	pass "进自由小窗：客户端**被重配成盒子尺寸**（${SW0}x${SH0} → ${SW1}x${SH1}，盒 $FB）" ||
+	fail "自由小窗里客户端没被重配（还是 ${SW1}x${SH1}）—— FREE 该走 configure 那条路"
+psince "$PMARK1" | grep -aq "probe: configure ${SW1}x${SH1}" &&
+	pass "客户端自己收到 configure ${SW1}x${SH1}（probe 日志）" ||
+	fail "客户端没收到 configure ${SW1}x${SH1}：$(psince "$PMARK1" | grep -a 'probe: configure' | tail -1)"
+echo "  自由小窗盒 = $FB（1:1：盒里就是客户端自己的窗口几何，surface 比它大的是 CSD 阴影那圈）"
 
 mark "S3 输入路由：迷你 / 图标态收不到，FREE 态收得到"
 set_state mini; sleep 1.0
@@ -429,18 +456,16 @@ S3=$(pev scroll)
 [ "$S3" -gt "$S2" ] && pass "自由小窗：上滚转发给客户端（$S2 → $S3）" ||
 	fail "自由小窗的上滚被吞了"
 
-mark "S3 指针坐标换算：客户端收到的坐标 = 原生对应点 ±3px"
-# 盒子是「原生 surface × ms 居中」摆的（contain 居中），换算 = (光标 - 内容原点) / ms
+mark "S3 指针坐标换算：客户端收到的坐标 = 盒内对应点 ±3px"
+# FREE 是 **1:1** 的：盒子里就是客户端自己的窗口几何（盒子多大就 configure 多大），
+# surface 比盒子大的那一圈是 CSD 阴影（居中）。换算 = 盒内相对位置 + 阴影偏移。
 read -r EX EY <<< "$(python3 - "$FX" "$FY" "$FW" "$FH" "$SW1" "$SH1" <<'PY'
 import sys
-bx, by, bw, bh, nw, nh = (float(v) for v in sys.argv[1:7])
-ms = min(bw / nw, bh / nh)
-ox = bx + (bw - nw * ms) / 2.0
-oy = by + (bh - nh * ms) / 2.0
-# 盒内取一点（离边 1/3、2/5），期望它落到原生的哪一点
+bx, by, bw, bh, sw, sh = (float(v) for v in sys.argv[1:7])
+# 盒内取一点（离边 1/3、2/5），期望它落到客户端自己的哪一点
 px = bx + bw * 0.33
 py = by + bh * 0.40
-print("%.1f %.1f" % ((px - ox) / ms, (py - oy) / ms))
+print("%.1f %.1f" % (px - bx + (sw - bw) / 2.0, py - by + (sh - bh) / 2.0))
 PY
 )"
 PX=$(python3 -c "print(int($FX + $FW * 0.33))")
@@ -534,6 +559,9 @@ read -r W1 H1 <<< "$(resize_w 100)"
 read -r W0 H0 <<< "$(free_box)"
 ./build/vidowmsg set-config mini_aspect lock >/dev/null; sleep 0.3
 MARK=$(logmark); read -r W0 H0 <<< "$(free_box)"
+# 锁比例锁的是**客户端当前的内容比例**。FREE 里客户端跟着盒子 configure，表面比例
+# 会随盒子变 —— 期望值必须在这一趟小窗里现量一次，不能沿用 S3 那一趟的旧值。
+RATIO=$(python3 -c "print($(winf w1 sw) / $(winf w1 sh))")
 E=$(aspect_eff "$MARK")
 [ "$E" = "lock" ] && pass "全局 lock：有效值 = lock" || fail "有效值不是 lock：$E"
 read -r W1 H1 <<< "$(resize_w -100)"
@@ -969,29 +997,35 @@ echo "$LAST" | grep -q "缩放 1.000" && pass "转换结束缩放归 1" || fail 
 # **盒面积**推的 sqrt(area_from/area_to)，只在内容正好填满盒子时才等于屏上真正画的
 # contain 系数。判据两条（都只读日志 + geometry，不依赖时序）：
 #   ① 起点缩放 ≈ min(盒宽/原生宽, 盒高/原生高)（自由小窗那趟推出来是 0.602、
-#      真值是 0.426，差 41%；图标那趟 0.097 vs 0.087）；
+#      真值是 0.426，差 41%；图标那趟 0.097 vs 0.087）—— **自由小窗例外**：它按
+#      盒子尺寸 configure 客户端（不保留 buffer），内容与盒子 1:1，起点缩放 = 1.0、
+#      内容原点 = 盒原点（第 2 个参数传 1:1）；
 #   ② 起点位置是**内容**原点（盒原点 + contain 居中偏移），不是盒原点。
 # ②的容差给 ±16：实现里的居中用的是「可见窗口」几何，测试只能从 surface 尺寸算
 # （GTK CSD 那圈留白差 ~9px）。
-check_exit_from() {  # $1 = 退出前的形态
+check_exit_from() {  # $1 = 退出前的形态，$2 = 1:1（内容与盒子 1:1，FREE 那条）
 	local st="$1" bx by bw bh sw sh ms cx line sc sx0
 	set_state "$st"; sleep 1.3
 	read -r bx by bw bh <<< "$(echo "$(geom)" | tr 'x,' ' ')"
 	sw=$(winf w1 sw); sh=$(winf w1 sh)
-	read -r ms cx < <(python3 - "$bw" "$bh" "$sw" "$sh" <<'PY'
+	if [ "${2:-}" = "1:1" ]; then
+		ms="1.0000"; cx=0
+	else
+		read -r ms cx < <(python3 - "$bw" "$bh" "$sw" "$sh" <<'PY'
 import sys
 bw, bh, sw, sh = (float(v) for v in sys.argv[1:5])
 ms = min(bw / sw, bh / sh)
 print("%.4f %d" % (ms, round((bw - sw * ms) / 2.0)))
 PY
 )
+	fi
 	MARK=$(logmark)
 	unmini; sleep 1.3
 	line=$(since "$MARK" | grep -a 'mini: 过渡动画' | tail -1)
 	sc=$(echo "$line" | sed -n 's/.*缩放 \([0-9.]*\) → 1.*/\1/p')
 	sx0=$(echo "$line" | sed -n 's/.*起点 \([0-9-]*\),\([0-9-]*\).*/\1/p')
 	echo "  $st→none：盒 $bx,$by ${bw}x${bh} / 原生 ${sw}x${sh}"
-	echo "    期望起点缩放 $ms（contain）、起点 x ≈ $((bx + cx))（内容原点）；日志：$line"
+	echo "    期望起点缩放 $ms、起点 x ≈ $((bx + cx))；日志：$line"
 	python3 - "$st" "$sc" "$ms" "$sx0" "$bx" "$cx" <<'PY'
 import sys
 st, sc, ms, sx0, bx, cx = sys.argv[1], sys.argv[2], float(sys.argv[3]), \
@@ -1017,7 +1051,7 @@ sys.exit(0 if (d <= 0.005 and d2 <= 16) else 1)
 PY
 	[ $? -eq 0 ] || FAILED=1
 }
-check_exit_from free
+check_exit_from free 1:1
 check_exit_from icon
 
 # ================================================================ S5：甩出
@@ -1188,10 +1222,13 @@ fi
 RID=$(winf rulewin id)
 [ "$(winf rulewin w)" = "64" ] && pass "规则窗口的图标盒也是 64x64" ||
 	fail "规则窗口的盒子不对：$(winf rulewin w)x$(winf rulewin h)"
+# 全局显式写成 auto（默认值现在是 free，这条判的是「规则 lock 压过全局」——
+# 全局值必须写死，不然它跟着默认值走，判据就变成「lock 压过 free」，弱一些）。
+./build/vidowmsg set-config mini_aspect auto >/dev/null; sleep 0.3
 MARK=$(logmark)
 ./build/vidowmsg set-mini-state --id "$RID" --state free >/dev/null; sleep 0.8
 E=$(since "$MARK" | grep -ao '有效值=[a-z]*' | tail -1 | cut -d= -f2)
-[ "$E" = "lock" ] && pass "规则 mini_aspect = \"lock\" 压过全局（有效值 lock）" ||
+[ "$E" = "lock" ] && pass "规则 mini_aspect = \"lock\" 压过全局 auto（有效值 lock）" ||
 	fail "规则 mini_aspect 没生效：有效值 $E"
 SWS=$(winf rulewin sw); SHS=$(winf rulewin sh)
 echo "  规则窗口在列里时 surface = ${SWS}x${SHS}（原生）"
@@ -1472,6 +1509,212 @@ else
 	fi
 	kill "$(pgrep -f 'probe.py closewin' | head -1)" 2>/dev/null
 fi
+
+
+# ================================================================ S8：FREE 自由摆放
+mark "S8 FREE 自由摆放：拖动跟手 / 拖动中跨屏改归属 / 全屏可达 / resize 真的重配客户端"
+# 用户报的三条（这一节是它们的回归）：
+#   ① 「小窗移动范围受限，没有全屏幕移动，左右有不可移动区域」+「跨显示器小窗应该
+#      移动到临近边，现在会弹到同向边」——FREE 拖动的范围 / 归属；
+#   ② 「自由小窗默认应该不限制比例，改大小的时候被限制了比例」——FREE 的 resize 要
+#      **真的改客户端尺寸**（客户端跟着重新排版），不是只改留白；
+#   ③ 「按盒子右边缘起 Mod+右键没反应」——resize 的命中区。
+# 这一节先把布局复位成两块 scale 1 的屏并排（S7 把 HEADLESS-2 调成 scale 2 挪到了
+# 右边），判据里的坐标才写死得住：屏 1 工作区 10,10 1260x700、屏 2 工作区 1290,10
+# 1260x700（两块屏都是 gaps 10、scale 1）。
+./build/vidowmsg output-position HEADLESS-1 0 0 >/dev/null 2>&1; sleep 0.5
+./build/vidowmsg output-scale HEADLESS-2 1 >/dev/null 2>&1; sleep 0.6
+./build/vidowmsg output-position HEADLESS-2 1280 0 >/dev/null 2>&1; sleep 1.0
+# 全局 mini_aspect 在 S3b 里被改过（那节验三值）；FREE 的拖动 / resize 判据要在
+# 「不锁比例」下做 —— 那正是新默认值 free。
+./build/vidowmsg set-config mini_aspect free >/dev/null; sleep 0.3
+ID=$(mini_id)
+unmini; sleep 0.7
+./build/vidowmsg move-window-to-output HEADLESS-1 --id "$ID" >/dev/null 2>&1; sleep 0.8
+[ "$(winf w1 out)" = "HEADLESS-1" ] || fail "w1 没挪回屏 1（$(winf w1 out)）"
+set_state free; sleep 1.2
+A_X=10; A_Y=10; A_W=1260; A_H=700      # 屏 1 工作区
+B_X=1290                              # 屏 2 工作区左上（1280 + gaps 10）
+read -r X Y W H <<< "$(echo "$(geom)" | tr 'x,' ' ')"
+echo "  自由小窗 $X,$Y ${W}x${H}（屏 $(winf w1 out)；工作区 ${A_X},${A_Y} ${A_W}x${A_H}）"
+
+# ---- 判据 1：拖动跟手 + **拖动中**（不松手）跨屏改归属 + 从右边进新屏贴左边缘
+GX=$((X + W / 2)); GY=$((Y + H / 2))   # 抓盒子中心
+OFF=$((GX - X))                        # 抓取偏移：整个拖拽里不变
+MARK=$(logmark)
+act "pointer-motion $GX $GY" 0.25
+act "pointer-button left press mod" 0.2
+act "pointer-motion 900 $GY" 0.2       # 同一块屏上先挪一挪
+read -r X1 Y1 W1 H1 <<< "$(echo "$(geom)" | tr 'x,' ' ')"
+[ $((X1 - (900 - OFF))) -le 3 ] && [ $((X1 - (900 - OFF))) -ge -3 ] &&
+	pass "同屏拖动跟手：光标 900 → 盒原点 $X1 ≈ 900 - $OFF = $((900 - OFF))" ||
+	fail "同屏拖动没跟手：盒原点 $X1，期望 ≈ $((900 - OFF))"
+act "pointer-motion 1300 $GY" 0.25     # 跨过 1280 边界
+MID_OUT=$(winf w1 out); MID_GEOM=$(geom)
+since "$MARK" | grep -aq '挪到 HEADLESS-2' &&
+	pass "拖过边界 → **拖动中**（没松手）就改归属：日志有「挪到 HEADLESS-2」" ||
+	fail "拖动中没改归属（$(since "$MARK" | grep -a '挪到' | tail -1)）"
+[ "$MID_OUT" = "HEADLESS-2" ] && pass "拖动中 vidowmsg windows 已经报 HEADLESS-2" ||
+	fail "拖动中归属还是 $MID_OUT"
+read -r X2 Y2 W2 H2 <<< "$(echo "$MID_GEOM" | tr 'x,' ' ')"
+echo "  光标 1300（刚过界 20px）→ 盒 $X2,$Y2 ${W2}x${H2}"
+[ "$X2" = "$B_X" ] &&
+	pass "从右边进新屏 → 盒贴新屏**左**边缘（x=$X2 = 工作区左 $B_X，不是远边）" ||
+	fail "进新屏没贴左边缘：x=$X2（期望 $B_X；改前的二进制这里会弹到远边）"
+act "pointer-motion 1700 $GY" 0.25
+read -r X3 Y3 W3 H3 <<< "$(echo "$(geom)" | tr 'x,' ' ')"
+[ $((X3 - (1700 - OFF))) -le 3 ] && [ $((X3 - (1700 - OFF))) -ge -3 ] &&
+	pass "跨屏后继续跟手：光标 1700 → 盒原点 $X3 ≈ $((1700 - OFF))" ||
+	fail "跨屏后没跟手：盒原点 $X3，期望 ≈ $((1700 - OFF))"
+act "pointer-button left release mod" 1.2
+read -r X4 Y4 W4 H4 <<< "$(echo "$(geom)" | tr 'x,' ' ')"
+[ $((X4 - (1700 - OFF))) -le 3 ] && [ $((X4 - (1700 - OFF))) -ge -3 ] &&
+	pass "松手落在光标处：盒原点 $X4 ≈ 1700 - $OFF（屏 $(winf w1 out)）" ||
+	fail "松手没落在光标处：盒原点 $X4，期望 ≈ $((1700 - OFF))"
+[ "$(winf w1 mini)" = "free" ] && [ "$(winf w1 out)" = "HEADLESS-2" ] &&
+	pass "松手后形态仍是 free、归属 HEADLESS-2" ||
+	fail "松手后形态/归属不对：$(winf w1 mini) / $(winf w1 out)"
+[ "$W4" = "$W" ] && [ "$H4" = "$H" ] &&
+	pass "拖动全程盒子尺寸不变（${W4}x${H4} = ${W}x${H}）" ||
+	fail "拖动把盒子尺寸改了：${W}x${H} → ${W4}x${H4}"
+
+# ---- 判据 2：FREE 拖到工作区**边缘**松手不收成图标（MINI / ICON 那条一字不改）
+MARK=$(logmark)
+read -r X Y W H <<< "$(echo "$(geom)" | tr 'x,' ' ')"
+GX=$((X + W / 2)); GY=$((Y + H / 2))
+act "pointer-motion $GX $GY" 0.25
+act "pointer-button left press mod" 0.2
+act "pointer-motion $((B_X + 1260 - 2)) $GY" 0.25
+act "pointer-motion $((B_X + 1260 - 1)) $((GY + 1))" 0.25
+act "pointer-button left release mod" 1.2
+read -r X5 Y5 W5 H5 <<< "$(echo "$(geom)" | tr 'x,' ' ')"
+[ "$(winf w1 mini)" = "free" ] &&
+	pass "拖到工作区右边缘松手：形态仍是 free（盒 $X5,$Y5 ${W5}x${H5}）" ||
+	fail "FREE 拖到边缘被收成图标了：$(winf w1 mini)"
+[ "$W5" = "$W" ] && pass "盒子尺寸没被换掉（${W5}x${H5}）" ||
+	fail "边缘松手把盒子换掉了：${W}x${H} → ${W5}x${H5}"
+since "$MARK" | grep -aq '拖到内边缘' &&
+	fail "FREE 走了「拖到内边缘 → 收成图标」那条路（日志有）" ||
+	pass "日志里没有「拖到内边缘 → 收成图标」（FREE 不吃这条）"
+
+# ---- 判据 3：可达范围 = 整块工作区（四个方向的极限坐标）
+# 拖到每个方向的极限：光标甩到屏外，盒子该顶到工作区的边上（不是内缩
+# mini_edge_margin 的 18 / 758）。
+./build/vidowmsg move-window-to-output HEADLESS-1 --id "$ID" >/dev/null 2>&1; sleep 0.8
+extreme() {  # $1 = 方向名，$2 = 光标 x，$3 = 光标 y
+	local bx by bw bh
+	read -r bx by bw bh <<< "$(echo "$(geom)" | tr 'x,' ' ')"
+	act "pointer-motion $((bx + bw / 2)) $((by + bh / 2))" 0.2
+	act "pointer-button left press mod" 0.15
+	act "pointer-motion $2 $3" 0.3
+	act "pointer-motion $(($2 + 2)) $(($3 + 1))" 0.3
+	echo "    $1：光标 $2,$3 → 盒 $(winf w1 x),$(winf w1 y) $(winf w1 w)x$(winf w1 h)"
+	act "pointer-button left release mod" 0.7
+}
+E_L=$(winf w1 w); E_H=$(winf w1 h)
+echo "  四个方向的极限（盒子左上角；工作区 ${A_X},${A_Y} ${A_W}x${A_H}，盒 ${E_L}x${E_H}）："
+extreme "最左" 5 $((A_Y + A_H / 2))
+LX=$(winf w1 x); EX_L=$A_X; [ "$LX" -le $((A_X + 1)) ] &&
+	pass "最左 = 工作区左边缘（x=$LX ≤ $A_X + 1）" ||
+	fail "最左到不了工作区左边缘：x=$LX（期望 $A_X；改前是 $((A_X + 8)) = 内缩 mini_edge_margin 8）"
+extreme "最右" 1270 $((A_Y + A_H / 2))
+RX=$(winf w1 x); EX_R=$((A_X + A_W - E_L))
+[ "$RX" -ge $((EX_R - 1)) ] &&
+	pass "最右 = 工作区右边缘（x=$RX ≥ $EX_R；改前是 $((EX_R - 8))）" ||
+	fail "最右到不了工作区右边缘：x=$RX（期望 $EX_R）"
+extreme "最上" $((A_X + A_W / 2)) 5
+TY=$(winf w1 y)
+[ "$TY" -le $((A_Y + 1)) ] && pass "最上 = 工作区上边缘（y=$TY ≤ $A_Y + 1）" ||
+	fail "最上到不了工作区上边缘：y=$TY（期望 $A_Y）"
+extreme "最下" $((A_X + A_W / 2)) 710
+BY=$(winf w1 y); EX_B=$((A_Y + A_H - E_H))
+[ "$BY" -ge $((EX_B - 1)) ] &&
+	pass "最下 = 工作区下边缘（y=$BY ≥ $EX_B）" ||
+	fail "最下到不了工作区下边缘：y=$BY（期望 $EX_B）"
+echo "  可达范围：x ∈ [$A_X, $EX_R]、y ∈ [$A_Y, $EX_B]（整块工作区 ${A_W}x${A_H} 都能放）"
+
+# ---- 判据 4：resize 摸得到（按盒子右边缘起 Mod+右键）且**真的**改客户端尺寸
+read -r X Y W H <<< "$(echo "$(geom)" | tr 'x,' ' ')"
+SWA=$(winf w1 sw); SHA=$(winf w1 sh)
+PMARK=$(plogmark)
+MARK=$(logmark)
+act "pointer-motion $((X + W - 3)) $((Y + H / 2))" 0.25
+act "pointer-button right press mod" 0.25
+act "pointer-motion $((X + W + 97)) $((Y + H / 2))" 0.5
+act "pointer-button right release mod" 1.3
+read -r X6 Y6 W6 H6 <<< "$(echo "$(geom)" | tr 'x,' ' ')"
+SWB=$(winf w1 sw); SHB=$(winf w1 sh)
+since "$MARK" | grep -aq 'grab resize:' &&
+	pass "按盒子右边缘起 resize 命中（日志 grab resize: w1）" ||
+	fail "resize 没命中（日志没有 grab resize:；改前的二进制这里抓不住）"
+DW=$((W6 - W))
+[ "$DW" -ge 90 ] && [ "$DW" -le 104 ] &&
+	pass "盒子跟着拖动的宽度改：${W}x${H} → ${W6}x${H6}（宽 +$DW）" ||
+	fail "盒子宽度没跟着走：${W}x${H} → ${W6}x${H6}"
+[ "$H6" = "$H" ] && pass "高不动（$H6，mini_aspect = free 不锁比例）" ||
+	fail "free 下改宽动了高：${H6}（期望 $H）"
+DSW=$((SWB - SWA))
+[ "${DSW#-}" -ge 90 ] && [ "${DSW#-}" -le 104 ] &&
+	pass "客户端**真的**被改成那个大小：surface ${SWA}x${SHA} → ${SWB}x${SHB}（宽 +$DSW）" ||
+	fail "客户端尺寸没跟着盒子变：${SWA}x${SHA} → ${SWB}x${SHB}（改前 FREE 里一个 configure 都不发）"
+psince "$PMARK" | grep -aq "configure ${SWB}x${SHB}" &&
+	pass "客户端自己收到 configure ${SWB}x${SHB}（probe 日志）" ||
+	fail "客户端没收到 configure ${SWB}x${SHB}：$(psince "$PMARK" | grep -a 'configure' | tail -1)"
+R0=$(python3 -c "print(round($SWA / $SHA, 3))")
+R1=$(python3 -c "print(round($SWB / $SHB, 3))")
+python3 - "$R0" "$R1" <<'PY'
+import sys
+r0, r1 = float(sys.argv[1]), float(sys.argv[2])
+d = abs(r1 - r0)
+print("  PASS  内容比例跟着盒子变（%.3f → %.3f，差 %.3f ≥ 0.2 —— 不是只改留白）" % (r0, r1, d)
+      if d >= 0.2 else
+      "  FAIL  内容比例没变（%.3f → %.3f）：盒子只改了留白？" % (r0, r1))
+sys.exit(0 if d >= 0.2 else 1)
+PY
+[ $? -eq 0 ] || FAILED=1
+
+# ---- 判据 5：scale 2 的屏上再走一趟（跨屏 / 贴边 / 跟手都得对）
+./build/vidowmsg output-scale HEADLESS-2 2 >/dev/null 2>&1; sleep 0.9
+./build/vidowmsg output-position HEADLESS-2 1280 0 >/dev/null 2>&1; sleep 0.9
+./build/vidowmsg move-window-to-output HEADLESS-1 --id "$ID" >/dev/null 2>&1; sleep 0.8
+set_state free; sleep 1.2
+read -r X Y W H <<< "$(echo "$(geom)" | tr 'x,' ' ')"
+echo "  scale 2 布局：屏 1 工作区 ${A_W}x${A_H}（scale 1）、屏 2 工作区 ${B_X},10 620x340（scale 2）"
+GX=$((X + W / 2)); GY=$((Y + H / 2)); OFF=$((GX - X))
+# 拖过界之后的 y 必须落在**目标屏的逻辑范围里**：注入走的是 wlr_cursor_warp，落在
+# 所有输出之外的坐标 wlroots 直接不认（光标原地不动 → 后面每一次 motion 都是「没
+# 动」，判据看着就像「拖不动」）。scale 2 的屏逻辑只有 620x340，屏 1 上盒子中心那
+# 个 y（$GY）正好在它下沿之外 —— 真鼠标到不了这种点，测试也别用。
+TY=180
+MARK=$(logmark)
+act "pointer-motion $GX $GY" 0.25
+act "pointer-button left press mod" 0.2
+act "pointer-motion 1300 $TY" 0.3
+# 读「刚进屏那一刻」的位置：再往下走光标盒子会跟着跟手（那是下一条判据），
+# 在这里读 x 才对得上「进屏贴左边缘」。
+read -r X7 Y7 W7 H7 <<< "$(echo "$(geom)" | tr 'x,' ' ')"
+OUT7=$(winf w1 out)
+[ "$OUT7" = "HEADLESS-2" ] && pass "scale 2 屏：拖动中改归属（out = HEADLESS-2）" ||
+	fail "scale 2 屏上没换屏：$OUT7"
+[ "$X7" = "$B_X" ] &&
+	pass "scale 2 屏：从右进 → 贴左边缘（x=$X7 = $B_X）" ||
+	fail "scale 2 屏进屏没贴左边缘：x=$X7（期望 $B_X）"
+# 盒子尺寸按**记住的比例 × 新屏工作区**重算（mini_remember_size 默认开：记的是
+# 比例不是像素），所以从拖之前那个盒子（${W}x${H}，屏 1 的 ${A_W}x${A_H}）推。
+XW=$((W * 620 / 1260)); XH=$((H * 340 / 700))
+[ "$W7" -ge $((XW - 3)) ] && [ "$W7" -le $((XW + 3)) ] &&
+	[ "$H7" -ge $((XH - 3)) ] && [ "$H7" -le $((XH + 3)) ] &&
+	pass "scale 2 屏：盒按**逻辑**工作区算（${W7}x${H7} ≈ ${XW}x${XH} = ${W}x${H} × 620/1260 × 340/700）" ||
+	fail "scale 2 屏的盒尺寸不对：${W7}x${H7}（期望 ≈ ${XW}x${XH}）"
+act "pointer-motion 1500 $TY" 0.3
+act "pointer-motion 1900 $TY" 0.3
+read -r X8 Y8 W8 H8 <<< "$(echo "$(geom)" | tr 'x,' ' ')"
+[ $((X8 - (1900 - OFF))) -le 3 ] && [ $((X8 - (1900 - OFF))) -ge -3 ] &&
+	pass "scale 2 屏：继续跟手（光标 1900 → 盒原点 $X8 ≈ $((1900 - OFF))）" ||
+	fail "scale 2 屏上没跟手：盒原点 $X8，期望 ≈ $((1900 - OFF))"
+act "pointer-button left release mod" 1.2
+echo "  跨屏日志：$(since "$MARK" | grep -a '挪到' | tail -1)"
+./build/vidowmsg output-scale HEADLESS-2 1 >/dev/null 2>&1; sleep 0.6
 
 # ================================================================
 exec 9>&-

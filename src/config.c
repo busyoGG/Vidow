@@ -99,7 +99,9 @@ static const struct section sections[] = {
 	 * 配置读崩。 */
 	{ "最近窗口（Alt+Tab）", "15-mru.lua",
 		"Alt+Tab 的窗口切换器（niri 的 recent windows）：列哪些窗口、怎么排版、"
-		"选中框长什么样" },
+		"选中框长什么样。按住 Alt 期间输入是模态的（从按下 Alt 那一刻算起）："
+		"滚轮 / 方向键选上一个下一个（到头停住、不循环），别的键位 / 鼠标 / 手势"
+		"都不透给窗口" },
 	/* 会话环境同样是往后加（16-…）：前面那些文件名早就写进用户的 config.lua 了。 */
 	{ "会话环境 / 自启动 / 事件钩子", "16-env.lua",
 		"和 systemd 用户管理器对账（吸 / 推）、exec_once 自启动、vidow.on() 事件钩子" },
@@ -632,14 +634,16 @@ static const struct entry entries[] = {
 		"初始比例）。迷你 / 图标态的尺寸永远跟配置，不受它影响" },
 	{ "mini_edge_margin", K_INT, OFF(mini_edge_margin),
 		SZ(mini_edge_margin), 23,
-		"迷你 / 自由小窗离工作区边缘的最小留白（逻辑像素）" },
+		"迷你小窗离工作区边缘的最小留白（逻辑像素）；**自由小窗不吃这个留白**"
+		"（它是自由摆放的正常窗户，要能贴到工作区的边上）" },
 	{ "mini_preserve_buffer", K_BOOL, OFF(mini_preserve_buffer),
 		SZ(mini_preserve_buffer), 23,
-		"小窗化**不改客户端分辨率**：保留客户端原生 buffer，由合成器缩放显示"
-		"（默认 true）。false = 小窗态按小窗尺寸重配客户端（省显存，但有的游戏"
-		"一 resize 就重置成窗口模式）" },
+		"**迷你 / 图标态**要不要保留客户端原生分辨率：保留（默认 true）时合成器"
+		"缩放显示、不重配客户端；false = 按小窗尺寸重配客户端（省显存，但有的游戏"
+		"一 resize 就重置成窗口模式）。自由小窗**不受这个键影响**：它总是按盒子"
+		"尺寸 configure 客户端（客户端跟着重新排版）" },
 	{ "mini_aspect", K_STRING, OFF(mini_aspect), SZ(mini_aspect), 23,
-		"自由小窗的宽高比策略：\"auto\" / \"lock\" / \"free\"（默认 \"auto\"）。"
+		"自由小窗的宽高比策略：\"auto\" / \"lock\" / \"free\"（默认 \"free\"）。"
 		"三个取值都是强制语义，优先级：键位 > 窗口规则 > 这个全局键。auto = 让"
 		"自动信号决定（X11 有 PAspect / min==max 提示就锁，否则 free）；lock / "
 		"free 显式压过自动信号。只对自由小窗有效 —— 迷你 / 图标态永远按内容比例" },
@@ -2223,11 +2227,15 @@ static void defaults(struct vidow_config *cfg) {
 	cfg->mini_hover_fade_out_ms = 150;
 	cfg->mini_remember_size = true;
 	cfg->mini_edge_margin = 8;
-	/* 默认 true：小窗化只是**呈现**变了，客户端分辨率不动（见 README 第 271 条） */
+	/* 默认 true：**迷你 / 图标态**保留客户端原生 buffer（缩略图呈现）。
+	 * 自由小窗不受它影响 —— 永远按盒子尺寸 configure 客户端，见
+	 * vidow_mini_preserve_buffer()。 */
 	cfg->mini_preserve_buffer = true;
-	/* 默认 "auto"：只有 X11 的 PAspect / min==max 提示算「自动锁比例」，
-	 * 其余 free。窗口规则是唯一权威，优先级：键位 > 规则 > 这个键。 */
-	snprintf(cfg->mini_aspect, sizeof(cfg->mini_aspect), "auto");
+	/* 默认 "free"：自由小窗是**自由摆放的正常窗户**，改大小就该改客户端尺寸、
+	 * 不锁比例（用户报的「自由小窗默认应该不限制比例」）。要按自动信号锁就显式
+	 * 写 "auto"（X11 的 PAspect / min==max 提示才算数），"lock" 是强制锁。
+	 * 窗口规则 / 键位优先级照旧：键位 > 规则 > 这个键。 */
+	snprintf(cfg->mini_aspect, sizeof(cfg->mini_aspect), "free");
 	cfg->mini_drag_threshold_px = 4;
 
 	cfg->blur_enabled = true;
