@@ -5487,6 +5487,24 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
      - 未做：niri 的 `fixed 1920`（固定像素档）、`preset-window-heights`、`default-column-width {}`（让客户端自己定宽）、
        `always-center-single-column`；窗口规则级的 per-rule 预设覆盖。
 
+286. **overview：滚轮一次一格（巡航到一个工作区）+ 全景里点小窗没焦点 + 有 mini 同屏时命中盒吞掉邻列**（用户：「overview滚轮操作应该是巡航一次滚到一个工作区。而且为什么overview切窗口焦点的操作无效」；2026-10-14）
+     - **A 滚轮以前是像素平移，而且不看方向轴**：`vidow_pointer_axis` 里写死 `vidow_overview_scroll(server, ±60)` —— 实测一格 `570.7 → 630.7`（+60，撞上 max），
+       而行距是 `row_h + OV_ROW_GAP` = **337.7**，要滚 6 下才走一行，滚到哪儿停下全看滚了几格、永远对不齐行；横向轴（滚轮左右倾）也滚同一个列表。
+       修法：`vidow_overview_scroll(server, int steps)` 改成**走几行**，落点先把当前位置吸附到行距整数倍再走 `steps` 步（到顶 / 到底夹在 `[0, max_scroll]`）；
+       `src/input.c` 只认 `WL_POINTER_AXIS_VERTICAL_SCROLL`，横轴吃掉不动作（概览里没有横向可滚的东西）。
+       判据：`630.72 → 337.68`（吸附，正好一个行距）→ `0`；往下滚到底停在 `630.72` 不再涨；横轴一格不动。
+     - **B 全景里点 mini / 图标态窗口点不出焦点**：`src/overview.c` 的 `vidow_overview_click()` 用的是 `vidow_focus_view()`，而它开头就把 `MINI` / `ICON` 挡回去
+       （不变量：`focused` 永远不指小窗）—— 于是点上去只有日志 `选中 <title>`、焦点一点没动（实测点 wm 盒心后 `focused` 仍是 wn1；退出 overview 后点同一位置就正常换焦点）。
+       修法：换成 `vidow_focus_view_expand_mini()`（和 Alt+Tab 提交、IPC `focus-window` 同一个入口、同一个语义：先摊成普通窗口再给焦点）。
+     - **C 屏上有 mini 时，命中盒和画出来的格子不一致（点右列命中左列）**：真因**不是** `src_box`（实测一直是整块缓冲 `0,0 665x740`），
+       而是**内容节点的 `dst` 没跟着概览缩放走** —— `view_anim_place()` 里那一支要求 `view->base_dst_w/h > 0`，而那个 1:1 基线**xdg(Wayland) 从来没记过**
+       （只在 X11 的 commit 和「退出小窗」两处写，恒为 0），守卫根本进不去 ⇒ 内容节点在概览里一直是 1:1。
+       实测 3 列时最后一列的命中盒从 `646` 一路伸到 `1291`（矩形只到 `934`，≈ 整行宽 × 0.46），把邻列整片吞掉。
+       修法：1:1 尺寸改走 `view_mini_native()`（唯一按 kind 分派的来源：非 X11 读表面当前逻辑尺寸、X11 读 `base_dst_*`）⇒ **X11 行为一个字没变**；
+       内容节点的偏移（xdg 的 CSD 留白）也按 `ov` 缩（X11 的几何 x/y 是 0，这条对它天然是空操作）；MINI / ICON 不进这一支（那两态的内容几何由小窗机制管）。
+       没改 `base_dst_*` 的记账规则：它还挂在 `mru.c`（卡片内容尺寸）和 `float.c`（小窗内容比例）上，让 xdg 开始记它等于顺带改那两处取值。
+     - **判据**：`test-overview.sh` **66 → 100 PASS / 0 FAIL**（+31 条：mini / 图标态点选、每个格子的中心与边缘都命中它自己、空白处不命中、scale 1 / 2 各一遍、滚轮踏步与横轴）。
+
 285. **Alt+Tab 切换器（MRU）：鼠标滚轮控制选中项 + 面板开着时输入完全模态**（用户：「MRU鼠标滚轮控制预览滚动，且打开MRU的时候阻止所有和MRU无关的交互」；2026-10-14）
      - **决策**：滚轮 = 选中项前后一格，**到边停住、不循环**（和 Alt+Tab 键本身的循环语义**故意不同**，日志写明）；模态从**按下 Alt 那一刻**算起（含 `mru_open_delay_ms` 那段还没显形的空窗期），只有 MRU 自己的键（`next-window` / `previous-window` / 方向键 / Esc / Return）和卡片点击能过。
      - **A 滚轮**：`vidow_pointer_axis` 里根本没有 MRU 分支 —— 按住 Alt 滚滚轮时先被**小窗档位状态机**抢走（光标压在迷你 / 图标小窗上时），再往下命中绑定表

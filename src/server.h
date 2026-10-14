@@ -3558,8 +3558,9 @@ void vidow_overview_map(struct vidow_server *server, struct vidow_view *view,
 double vidow_overview_scale(const struct vidow_server *server);
 /* 点一下：选中命中的那列（返回 true = 这次点击被 overview 吃掉了）。 */
 bool vidow_overview_click(struct vidow_server *server, double sx, double sy);
-/* 滚轮：滚的是工作区列表（上下预览），不是窗口。 */
-void vidow_overview_scroll(struct vidow_server *server, double dy);
+/* 滚轮：滚的是工作区列表（上下预览），不是窗口。`steps` = 走几**行**（一格 = 一块
+ * 工作区，落点吸附到行距的整数倍；正数往下、负数往上，到顶 / 到底就停）。 */
+void vidow_overview_scroll(struct vidow_server *server, int steps);
 
 /* -------------------------------------------------- MRU（Alt+Tab 切换器） */
 

@@ -795,7 +795,13 @@ bool vidow_overview_click(struct vidow_server *server, double sx, double sy) {
 			/* 弹出物在 overview 里是收着的，不该被点到 */
 			return true;
 		}
-		vidow_focus_view(hit);
+		/* 迷你 / 图标态的窗口：先摊成普通窗口再给焦点（和 Alt+Tab 提交、
+		 * IPC focus-window 同一个入口、同一个语义，见 server.h）。
+		 * 这里以前用的是那个「什么都不做」的 vidow_focus_view()：它开头就把
+		 * MINI / ICON 挡回去了（不变量：focused 永远不指小窗），于是全景里
+		 * 小窗那块格子点上去只有日志、焦点一点没动 —— 用户桌上那堆小窗就是
+		 * 「点谁都不动」的真凶。 */
+		vidow_focus_view_expand_mini(hit);
 		/* 点下去就退出，但客户端从没收到这次按下；对应的松手也吃掉，
 		 * 免得它收到一个没有按下配对的 release。 */
 		ov->swallow_release = true;
@@ -806,13 +812,20 @@ bool vidow_overview_click(struct vidow_server *server, double sx, double sy) {
 	return true;
 }
 
-/* 滚轮：滚的是**工作区列表**（上下预览），不是窗口、更不是相机 —— 一次一格
- * （写死 60 屏幕像素）。列表排得下的时候夹在 0 上，滚不动。
+/* 滚轮：滚的是**工作区列表**（上下预览），不是窗口、更不是相机 —— **一次一格，
+ * 一格 = 一行 = 一块工作区**（行距 `row_h + OV_ROW_GAP`）。列表排得下的时候夹在 0
+ * 上，滚不动。
  *
- * 以前这里是平移相机（ov->pan）：列带比屏宽，一直滚就把整条带滚出屏外（用户报的
+ * 以前这里 /= 平移相机（ov->pan），列带比屏宽，一直滚就把整条带滚出屏外（用户报的
  * 「滚轮一直滚会左右滚动窗口，会跨屏」）。行内横向预览现在跟**那块工作区自己的
- * 视口**走 —— 也就是「移动窗口焦点」那些键，滚轮不再碰它。 */
-void vidow_overview_scroll(struct vidow_server *server, double dy) {
+ * 视口**走 —— 也就是「移动窗口焦点」那些键，滚轮不再碰它。
+ *
+ * 步进而不是像素（用户：「overview滚轮操作应该是巡航一次滚到一个工作区」）：
+ * 以前每次写死 60 像素 —— 行距 337.7 的时候要滚 6 下才走一行，而且滚到哪儿停下
+ * 全看滚了几格，永远对不齐行。现在把当前位置**先吸附到行距的整数倍**再走 `steps`
+ * 步，落点也永远在整数倍上（`row_h` 随屏幕变，所以整倍数是这块屏、这个 scale 下
+ * 的行距 —— 见 rows_place 的排版）。到顶 / 到底就停（夹在 [0, max_scroll]）。 */
+void vidow_overview_scroll(struct vidow_server *server, int steps) {
 	/* 会话锁（S3）：锁定期间不开概览 / 不响应概览上的点击和滚轮 —— 概览里
 	 * 全是窗口预览，锁上以后它既不该出现也不该被操作（方案 §2 环节 3）。 */
 	if (server->locked) {
@@ -822,7 +835,23 @@ void vidow_overview_scroll(struct vidow_server *server, double dy) {
 	if (!vidow_overview_active(server)) {
 		return;
 	}
-	ov->list_scroll += dy;
+	double pitch = ov->row_h + (double)OV_ROW_GAP;
+	if (steps == 0 || pitch <= 0.0) {
+		return;
+	}
+	double max_scroll = rows_total(ov) - (double)ov->out_h;
+	if (max_scroll < 0.0) {
+		max_scroll = 0.0;
+	}
+	int idx = (int)lround(ov->list_scroll / pitch) + steps;
+	if (idx < 0) {
+		idx = 0;
+	}
+	double want = (double)idx * pitch;
+	if (want > max_scroll) {
+		want = max_scroll;
+	}
+	ov->list_scroll = want;
 	overview_apply(server);
 }
 

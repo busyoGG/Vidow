@@ -145,6 +145,232 @@ stop_clients
 kill -TERM -- "-$VIDOW_PGID" 2>/dev/null
 sleep 0.6
 
+
+# ---------------------------------------------------- 迷你 / 图标态 + 命中盒（A + B）
+# A：全景里 mini / 图标态的窗口**点得中**。以前这里是 vidow_focus_view()：它开头就把
+#    MINI / ICON 挡回去了（不变量：focused 永远不指小窗），于是点小窗只有一行「选中」
+#    日志、焦点一点没动。现在和 Alt+Tab 提交 / IPC focus-window 走同一个入口
+#    （vidow_focus_view_expand_mini：先摊成普通窗口再给焦点）。
+# B：**命中盒必须和画出来的格子一致**。命中走 wlroots 的场景图：盒子 = 内容节点的
+#    dst_width/dst_height（scene_node_get_size），再被表面尺寸卡一遍边界。全景里内容
+#    节点的尺寸/偏移没跟着行缩放走的时候，一格能吞掉整排（实测 3 列时最后一个窗口的
+#    盒子是 646..1291，而它的格子只到 934），用户看到的就是「点谁都不是谁」。
+mark "全景里点小窗（A）+ 命中盒和画出来的格子一致（B）"
+start_vidow 1
+python3 tools/wall.py >/dev/null 2>&1 &
+sleep 0.9
+for n in wa wb wm; do
+	python3 tools/pattern.py "$n" >/dev/null 2>&1 &
+	sleep 0.8
+done
+sleep 1.2
+
+wid() {
+	./build/vidowmsg windows 2>/dev/null | python3 -c '
+import json,sys
+for w in json.load(sys.stdin):
+    if w["title"] == sys.argv[1]:
+        print(w["id"]); break' "$1"
+}
+wfield() {
+	./build/vidowmsg windows 2>/dev/null | python3 -c '
+import json,sys
+for w in json.load(sys.stdin):
+    if w["title"] == sys.argv[1]:
+        print(w.get(sys.argv[2])); break' "$1" "$2"
+}
+wbox() { # 小窗那块盒子：迷你态在 float_geometry，图标态在 geometry
+	./build/vidowmsg windows 2>/dev/null | python3 -c '
+import json,sys
+for w in json.load(sys.stdin):
+    if w["title"] == sys.argv[1]:
+        g = w.get("float_geometry") or w.get("geometry") or {}
+        print(g.get("x",0), g.get("y",0), g.get("width",0), g.get("height",0)); break' "$1"
+}
+what() { # <x> <y> → 命中的窗口名（没命中就是空）
+	./build/vidowmsg pick-window "$1" "$2" 2>/dev/null | python3 -c '
+import json,sys
+print((json.load(sys.stdin).get("window") or {}).get("title", ""))'
+}
+click_at() { # <x> <y>：光标挪过去按下再松开（全景里 = 点选）
+	local nx=$(( $1 * 10000 / 1280 )) ny=$(( $2 * 10000 / 720 ))
+	./build/vdrag "$nx" "$ny" "$nx" "$ny" >/dev/null 2>&1
+}
+ov_rect() {
+	grep -a "overview: 窗口 $1 -> 屏幕 " "$LOG" | tail -1 |
+		sed 's/.*屏幕 //; s/（.*//; s/,/ /; s/x/ /'
+}
+check_cell() { # <title> <x> <y> <说明>
+	local got
+	got=$(what "$2" "$3")
+	[ "$got" = "$1" ] && pass "$4（$1 @ $2,$3）" ||
+		fail "$4：$2,$3 命中「$got」（应该是 $1）"
+}
+check_picked() { # <title> <说明> [expand]：选中日志 + 缩回去 + 焦点换成它
+	local f mini
+	grep -aq "overview: 选中 $1" "$LOG" && pass "$2：日志记了「选中 $1」" ||
+		fail "$2：日志里没有「overview: 选中 $1」"
+	awk -v t="$1" '$0 ~ ("overview: 选中 " t) {seen=1}
+		seen && /overview: 退出/ {found=1} END {exit !found}' "$LOG" &&
+		pass "$2：选中之后就缩回去了" || fail "$2：选中之后没退出 overview"
+	f=$(wfield "$1" focused)
+	[ "$f" = "True" ] && pass "$2：焦点真的换成 $1 了" ||
+		fail "$2：焦点没换（$1 focused=$f）"
+	[ "${3:-}" = "expand" ] || return 0
+	mini=$(wfield "$1" mini)
+	case "$mini" in
+	none | free) pass "$2：小窗摊成普通窗口了（mini=$mini）" ;;
+	*) fail "$2：还是小窗态（mini=$mini），没展开" ;;
+	esac
+}
+
+# wm 变迷你态、焦点留给 wa（这样「点 wm 换焦点」才有对照）
+./build/vidowmsg focus-window --id "$(wid wm)" >/dev/null 2>&1
+sleep 0.4
+./build/vidowmsg set-mini-state --id "$(wid wm)" --state mini >/dev/null 2>&1
+sleep 0.8
+./build/vidowmsg focus-window --id "$(wid wa)" >/dev/null 2>&1
+sleep 0.5
+[ "$(wfield wm mini)" = "mini" ] && pass "wm 进了迷你态、焦点在 wa" ||
+	fail "wm 没进迷你态（mini=$(wfield wm mini)）"
+
+wtype -M logo -k o >/dev/null 2>&1
+sleep 1.0
+read -r AX AY AW AH <<<"$(ov_rect wa)"
+read -r BX BY BW BH <<<"$(ov_rect wb)"
+echo "  全景里的格子：wa $AX,$AY ${AW}x${AH} / wb $BX,$BY ${BW}x${BH}"
+[ -n "${AX:-}" ] && [ -n "${BX:-}" ] && pass "两条普通列都报了格子" ||
+	fail "普通列的格子没报全（wa $AX,$AY ${AW}x${AH} / wb $BX,$BY ${BW}x${BH}）"
+
+# 3 / 4 / 5 / 6：命中盒的判据（都用 pick-window —— 合成器真正的命中那条路）。
+#
+# 命中盒的语义（照现有实现，说清）：盒子 = **表面脚印 × 行缩放**（wlroots 的
+# scene_node_get_size() 拿内容节点的 dst，再被表面尺寸卡一遍边界）。表面脚印比窗口
+# 矩形大一圈 CSD 留白（pattern.py 每边 20px，缩到 0.46 之后每边 ≈9px），所以相邻两列
+# 的盒子在缝里会重叠 —— 这和 t=0 桌面上是同一个语义（那儿留白 20px、缝只有 10px，
+# 重叠得更多），带内谁在上由层级定（焦点列在上），不算错。
+python3 - "$RUNDIR" "$LOG" "$AX" "$AY" "$AW" "$AH" "$BX" "$BY" "$BW" "$BH" <<'PY2'
+import json, re, subprocess, sys
+
+rundir, log, ax, ay, aw, ah, bx, by, bw, bh = sys.argv[1:]
+cells = [("wa", int(ax), int(ay), int(aw), int(ah)),
+         ("wb", int(bx), int(by), int(bw), int(bh))]
+text = open(log, encoding="utf-8", errors="replace").read()
+m = re.search(r"overview: 窗口 \S+ -> 屏幕 \d+,\d+ \d+x\d+（缩放 ([\d.]+)）", text)
+scale = float(m.group(1)) if m else 1.0
+win = json.loads(subprocess.run(["./build/vidowmsg", "windows"],
+                                capture_output=True, text=True).stdout)
+pad = 0
+for w in win:
+    # 只按普通窗口算：小窗 / 图标态的 geometry 是那块小盒子（353x196），和表面
+    # 尺寸（665x740）差得远，混进来会把留白圈撑成一百多像素、判据就形同虚设。
+    if str(w.get("mini", "none")) not in ("none", "free"):
+        continue
+    s, g = w.get("surface") or {}, w.get("geometry") or {}
+    if s and g:
+        pad = max(pad, (s["width"] - g["width"]) / 2.0,
+                  (s["height"] - g["height"]) / 2.0)
+margin = int(pad * scale) + 1
+print("  命中盒 = 格子 ±%dpx（缩放后的 CSD 留白：%d × %.3f）" % (margin, pad, scale))
+
+failed = []
+
+def check(ok, what):
+    print(("  PASS  " if ok else "  FAIL  ") + what)
+    if not ok:
+        failed.append(what)
+
+def pick(x, y):
+    out = subprocess.run(["./build/vidowmsg", "pick-window", str(x), str(y)],
+                         capture_output=True, text=True).stdout
+    try:
+        return ((json.loads(out).get("window") or {}).get("title") or "")
+    except Exception:
+        return ""
+
+def neighbours(t):
+    out = []
+    for n, x, y, w, h in cells:
+        if n != t:
+            out.append((n, x - margin, y - margin, w + 2 * margin, h + 2 * margin))
+    return out
+
+for t, x, y, w, h in cells:
+    cx, cy = x + w // 2, y + h // 2
+    check(pick(cx, cy) == t,
+          "格子中心命中它自己（%s @ %d,%d）" % (t, cx, cy))
+    for px, py, where in ((x + 4, y + 4, "左上"), (x + w - 5, y + 4, "右上"),
+                          (x + 4, y + h - 5, "左下"), (x + w - 5, y + h - 5, "右下")):
+        got = pick(px, py)
+        near = [n for n, nx, ny, nw, nh in neighbours(t)
+                if nx <= px < nx + nw and ny <= py < ny + nh]
+        if near:
+            check(got in (t,) + tuple(near),
+                  "格子%s内缩 4px：%d,%d 命中 %s（这点在 %s 的留白圈里，"
+                  "落两者之一都算对）" % (where, px, py, got or "空", "/".join(near)))
+        else:
+            check(got == t,
+                  "格子%s内缩 4px 命中它自己（%s @ %d,%d）"
+                  % (where, t, px, py))
+
+gx = (cells[0][1] + cells[0][3] + cells[1][1]) // 2
+got = pick(gx, cells[0][2] + cells[0][4] // 2)
+check(got in (cells[0][0], cells[1][0]),
+      "两列之间的缝命中相邻那列（x=%d → %s）" % (gx, got or "空"))
+
+for px, py in ((4, 716), (1276, 4), (1276, 716)):
+    got = pick(px, py)
+    check(got == "", "空白处不命中窗口（%d,%d → %s）" % (px, py, got or "空"))
+
+sys.exit(1 if failed else 0)
+PY2
+[ $? -ne 0 ] && FAILED=1
+
+# 1：点迷你窗那块 → 焦点换成它
+read -r WX WY WW WH <<<"$(wbox wm)"
+MCX=$((WX + WW / 2)); MCY=$((WY + WH / 2))
+GOT=$(what "$MCX" "$MCY")
+[ "$GOT" = "wm" ] && pass "迷你窗那块也画出来了、中心命中它自己（$MCX,$MCY）" ||
+	fail "迷你窗中心 $MCX,$MCY 命中「$GOT」（应该是 wm）"
+click_at "$MCX" "$MCY"
+sleep 1.3
+check_picked wm "点迷你窗" expand
+
+# 1（图标态）：同一条路再走一遍
+./build/vidowmsg set-mini-state --id "$(wid wm)" --state icon >/dev/null 2>&1
+sleep 0.9
+./build/vidowmsg focus-window --id "$(wid wa)" >/dev/null 2>&1
+sleep 0.5
+wtype -M logo -k o >/dev/null 2>&1
+sleep 1.0
+read -r WX WY WW WH <<<"$(wbox wm)"
+MCX=$((WX + WW / 2)); MCY=$((WY + WH / 2))
+GOT=$(what "$MCX" "$MCY")
+[ "$GOT" = "wm" ] && pass "图标那块中心命中它自己（$MCX,$MCY）" ||
+	fail "图标中心 $MCX,$MCY 命中「$GOT」（应该是 wm）"
+read -r AX AY AW AH <<<"$(ov_rect wa)"
+check_cell wa "$((AX + AW / 2))" "$((AY + AH / 2))" "格子中心命中它自己（屏上有图标）"
+click_at "$MCX" "$MCY"
+sleep 1.3
+check_picked wm "点图标态" expand
+
+# 2：普通窗照旧（屏上刚有小窗折腾过：先让焦点停在 wb，再点 wa 的格子）
+./build/vidowmsg focus-window --id "$(wid wb)" >/dev/null 2>&1
+sleep 0.5
+wtype -M logo -k o >/dev/null 2>&1
+sleep 1.0
+read -r AX AY AW AH <<<"$(ov_rect wa)"
+[ "$(wfield wb focused)" = "True" ] && pass "进第二次全景前焦点在 wb" ||
+	fail "进第二次全景前焦点不在 wb（wb focused=$(wfield wb focused)）"
+click_at "$((AX + AW / 2))" "$((AY + AH / 2))"
+sleep 1.3
+check_picked wa "点普通窗（wa）"
+
+cp "$LOG" "$RUNDIR/log-miniov.txt"
+stop_clients
+kill -TERM -- "-$VIDOW_PGID" 2>/dev/null
+sleep 0.6
+
 # ---------------------------------------------------------------- 双屏
 mark "双屏：只缩当前那块屏，另一块的窗口淡出"
 start_vidow 2
@@ -740,6 +966,99 @@ if kill -0 "$VIDOW_PGID" 2>/dev/null; then
 	pass "退出来也还活着（过冲曲线进出各一次）"
 else
 	fail "退出 overview 时死了"
+fi
+
+# ---------------------------------------------------------------- 滚轮巡航
+mark "滚轮：一次一格 = 一块工作区（不是写死 60 像素），横轴不吃这条"
+# 用户：「overview滚轮操作应该是巡航一次滚到一个工作区」。以前每次写死 60 屏幕像素
+# （诊断实测 570.7→630.7 = +60）：行距 334 的时候要滚 6 下才走一行，而且滚到哪儿停下
+# 全看滚了几格，永远对不齐行。现在一格 = 一行（行距 row_h + OV_ROW_GAP）。
+# 判据：往上滚两格，每格位移 = 行距（±2px）；往下滚到底后不再增长；横向轴（滚轮
+# 左右倾）一格都不动（以前它也滚同一个列表 —— 概览里没有横向可滚的东西）。
+ovfield() {
+	./build/vidowmsg overview 2>/dev/null |
+		python3 -c "import sys,json;print(json.load(sys.stdin).get('$1'))"
+}
+start_vidow 1
+python3 tools/wall.py >/dev/null 2>&1 &
+sleep 0.8
+for n in 1 2 3 4; do
+	python3 tools/pattern.py "r-$n" >/dev/null 2>&1 &
+	sleep 1.0
+	if [ "$n" != 4 ]; then
+		./build/vidowmsg action "workspace down" >/dev/null 2>&1
+		sleep 0.7
+	fi
+done
+sleep 1.0
+./build/vidowmsg action "toggle-overview" >/dev/null 2>&1
+sleep 1.2
+ROWS=$(ovfield rows)
+ROWH=$(ovfield row_h)
+PITCH=$(python3 -c "print($ROWH + 12.0)")
+echo "   概览里 rows=$ROWS row_h=$ROWH → 行距 $PITCH"
+if [ "${ROWS:-0}" -ge 3 ] 2>/dev/null; then
+	pass "有 $ROWS 行（>=3，够测踏步）"
+else
+	fail "行数不够（$ROWS），测不了踏步"
+fi
+
+PREV=$(ovfield list_scroll)
+for k in 1 2; do
+	./build/vidowmsg pointer-scroll 0 -1 >/dev/null 2>&1
+	sleep 0.6
+	NOW=$(ovfield list_scroll)
+	python3 - "$PREV" "$NOW" "$PITCH" <<'PY'
+import sys
+a, b, p = float(sys.argv[1]), float(sys.argv[2]), float(sys.argv[3])
+d = a - b
+# 一格 = 一个行距（±2px）。两个正常例外：① 从「夹在 max 上」的位置起滚时，第一格
+# 先吸附到下面的整数倍上（位移不足一个行距，实测 630.72 → 337.68 = 293）；② 到顶。
+on_grid = abs(b) < 0.5 or abs(b / p - round(b / p)) < 0.02
+ok = on_grid and 0.0 < d <= p + 2.0
+print("  %s  往上滚一格走了 %.1f 像素（行距 %.1f，落点 %s）"
+      % ("PASS" if ok else "FAIL", d, p,
+         "行距整数倍" if on_grid else "不在整数倍上"))
+sys.exit(0 if ok else 1)
+PY
+	[ $? -ne 0 ] && FAILED=1
+	PREV=$NOW
+done
+
+for _ in $(seq 1 8); do
+	./build/vidowmsg pointer-scroll 0 1 >/dev/null 2>&1
+	sleep 0.3
+done
+E1=$(ovfield list_scroll)
+./build/vidowmsg pointer-scroll 0 1 >/dev/null 2>&1
+sleep 0.5
+E2=$(ovfield list_scroll)
+if [ "$E1" = "$E2" ]; then
+	pass "往下滚到底就停住，再滚不涨（停在 $E1）"
+else
+	fail "到底还会继续涨：$E1 → $E2"
+fi
+
+H1=$(ovfield list_scroll)
+./build/vidowmsg pointer-scroll 1 0 >/dev/null 2>&1
+sleep 0.5
+H2=$(ovfield list_scroll)
+if [ "$H1" = "$H2" ]; then
+	pass "横向轴（滚轮左右倾）不滚列表（$H1 → $H2）"
+else
+	fail "横向轴把列表滚了：$H1 → $H2"
+fi
+if kill -0 "$VIDOW_PGID" 2>/dev/null; then
+	pass "滚了这么多次还活着"
+else
+	fail "滚轮把合成器滚死了"
+fi
+./build/vidowmsg action "toggle-overview" >/dev/null 2>&1
+sleep 0.8
+if [ "$(ovfield active)" = "False" ]; then
+	pass "退出概览（active=false）"
+else
+	fail "退不出概览（active=$(ovfield active)）"
 fi
 
 echo

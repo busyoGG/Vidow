@@ -2155,10 +2155,53 @@ static void view_anim_place(struct vidow_view *view) {
 	if (src == NULL) {
 		return;
 	}
-	if (ov != 1.0 && view->base_dst_w > 0 && view->base_dst_h > 0) {
-		int dw = (int)lround(view->base_dst_w * ov);
-		int dh = (int)lround(view->base_dst_h * ov);
+	/* overview 里**内容节点的盒子就是命中盒**：wlroots 的 scene_node_get_size()
+	 * 拿 dst_width/dst_height 当节点盒子，wlr_scene_surface 再按表面尺寸卡一遍
+	 * 边界 —— 所以这个盒子必须跟着缩放走，不然全景里点谁都不是谁（实测 3 列时
+	 * 最后一个窗口的盒子从 646 一路伸到 1291，把整排吞掉）。src_box 不是原因：
+	 * 它一直是整块缓冲（实测 0,0 665x740）。
+	 *
+	 * 1:1 尺寸走 view_mini_native()，不走 base_dst_*：那个字段 xdg 从来不记
+	 * （只在 X11 的 commit 和「退出小窗」两处写），恒为 0，下面这个守卫根本进不来
+	 * —— 这正是「xdg 窗口在全景里内容尺寸一次都没缩过」的原因。view_mini_native()
+	 * 是唯一一处按 kind 分派的 1:1 尺寸来源（小窗那套缩放用的也是它）：非 X11 读
+	 * 表面当前逻辑尺寸（随时读都是当前值），X11 读 base_dst_*（已除过
+	 * xwayland_scale）—— X11 这边行为因此一个字没变。
+	 *
+	 * 偏移（内容节点在它父树里的位置 = xdg 的 CSD 留白）也要一起缩：只缩尺寸不缩
+	 * 偏移，盒子会整体往左上偏 ~20px、右边还盖不满格子（实测右侧差 2px、左侧多出
+	 * 20px 伸进两列之间的缝里）。X11 的窗口几何 x/y 是 0，这条对它天然是空操作。
+	 *
+	 * 小窗（MINI / ICON）不进这一支：那两态的**内容节点几何是小窗那套机制管的**
+	 * （min 尺寸按 mini 缩放、位置在盒子居中，见上面 mini_scaled 那段 + 图标快照），
+	 * 而且小窗不参与行布局、全景里不重映射（vidow_overview_map 对它原样返回）——
+	 * 照这里乘 ov 会把盒子撑到 306x340，比小窗那块卡片还高，白盖掉旁边一列的
+	 * 一条（实测 14px 宽、160px 高）。X11 那一支保持原样：它读的就是 base_dst_*，
+	 * 和小窗态的既有行为一致。 */
+	int nw = 0, nh = 0;
+	view_mini_native(view, &nw, &nh);
+	if (ov != 1.0 && nw > 0 && nh > 0 &&
+			(view->mini == VIDOW_MINI_NONE || view->kind == VIDOW_VIEW_X11) &&
+			view->mini_snapshot == NULL) {
+		int dw = (int)lround(nw * ov);
+		int dh = (int)lround(nh * ov);
 		wlr_scene_buffer_set_dest_size(src, dw > 0 ? dw : 1, dh > 0 ? dh : 1);
+		if (view->kind != VIDOW_VIEW_X11) {
+			/* 目标是「内容节点在场景里的绝对位置 = 窗口矩形原点 - 留白 ×
+			 * 缩放」—— 留白（xdg 的窗口几何偏移）不一定挂在缓冲节点自己身上：
+			 * 它是 wlroots 设在这一层还是父树那一层，得减掉父节点的偏移才算
+			 * 得对（和上面小窗居中那段同一个算法）。只按「节点自己的 x」设就
+			 * 会在父树再叠一份 -20px。 */
+			struct wlr_box geo = vidow_view_geometry(view);
+			int vx = 0, vy = 0, px = 0, py = 0;
+			wlr_scene_node_coords(&view->scene_tree->node, &vx, &vy);
+			if (src->node.parent != NULL) {
+				wlr_scene_node_coords(&src->node.parent->node, &px, &py);
+			}
+			wlr_scene_node_set_position(&src->node,
+				(int)lround((double)vx - (double)geo.x * ov) - px,
+				(int)lround((double)vy - (double)geo.y * ov) - py);
+		}
 	}
 	int vx = 0, vy = 0, sx = 0, sy = 0;
 	wlr_scene_node_coords(&view->scene_tree->node, &vx, &vy);
