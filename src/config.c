@@ -180,6 +180,9 @@ static const struct entry entries[] = {
 		"（GTK3）也听得见 —— 客户端把标题栏一起收回去，窗口只剩 vidow 的边框" },
 	{ "corner_radius",   K_DOUBLE, OFF(corner_radius),   SZ(corner_radius), 1,
 		"圆角半径（逻辑像素，0 = 直角）" },
+	{ "corner_n",        K_DOUBLE, OFF(corner_n),        SZ(corner_n), 1,
+		"圆角的形状指数：4 = 超椭圆（squircle，和 Alt+Tab 卡片 / portal 选择器"
+		"同一种），2 = 圆弧（原来那种）；越大越方，夹在 2 ~ 8" },
 	{ "border_width",    K_DOUBLE, OFF(border_width),    SZ(border_width), 1,
 		"边框宽度（0 = 不画边框）" },
 	{ "border_color",    K_COLOR,  OFF(border_color),    SZ(border_color), 1,
@@ -676,6 +679,7 @@ static const struct group_field gaps_fields[] = {
 static const struct group_field decor_fields[] = {
 	{ "enabled",       "decor_enabled" },
 	{ "corner_radius", "corner_radius" },
+	{ "corner_n",      "corner_n" },
 	{ "opacity",       "window_opacity" },
 	{ "noise",         "noise" },
 };
@@ -1713,6 +1717,13 @@ static bool apply_one(struct vidow_config *cfg, const char *key,
 				return true;
 			}
 			*(double *)field = atof(value);
+			/* 圆角的形状指数：越界（< 2 或 > 8）当场夹住，不报错 ——
+			 * 它是形状参数，写 1.5 想说的多半就是「更圆一点」= 2。
+			 * 三条入口（Lua 键 / VIDOW_CORNER_N / IPC set-config）都
+			 * 走这里，夹的是同一个数（见 rule.h 的 vidow_corner_n_clamp）。 */
+			if (strcmp(e->key, "corner_n") == 0) {
+				*(double *)field = vidow_corner_n_clamp(atof(value));
+			}
 			/* 回弹幅度是派生的（见 sync_easings）：改了它，三条曲线
 			 * 得跟着重算一遍。 */
 			if (strcmp(e->key, "back_overshoot") == 0) {
@@ -2151,6 +2162,11 @@ static void defaults(struct vidow_config *cfg) {
 	 * 见 decoration.c —— GTK3 只有这条老协议听得见。 */
 	cfg->prefer_no_csd = false;
 	cfg->corner_radius = 12.0;
+	/* 圆角是超椭圆（squircle）不是圆弧：默认 4，和 Alt+Tab 的 MRU 卡片
+	 * （mru.c 的 MRU_SQUIRCLE_N）、portal 选源对话框（tools/vidowportal.c 的
+	 * SQUIRCLE_N）同一种形状 —— 三处同值，改要一起改。写 2 就退回圆弧
+	 * （原来那种，作为退路留着）。 */
+	cfg->corner_n = 4.0;
 	cfg->border_width = 2.0;
 	cfg->border_color[0] = 0.30f; /* unfocused: dim */
 	cfg->border_color[1] = 0.33f;
@@ -2408,11 +2424,13 @@ void vidow_config_log(const struct vidow_config *cfg) {
 	 * 一次日志里三条曲线各要一个。 */
 	char ease_buf[3][64];
 	wlr_log(WLR_INFO,
-		"config: decor=%s prefer_no_csd=%s radius=%.1f border=%.1f "
+		"config: decor=%s prefer_no_csd=%s radius=%.1f corner_n=%.2f "
+		"border=%.1f "
 		"shadow=%.1f/%.1f,%d opacity=%.2f noise=%.2f blur=%s all=%s "
 		"levels=%d strength=%.2f alpha_min=%.2f",
 		cfg->decor_enabled ? "on" : "off",
 		cfg->prefer_no_csd ? "on" : "off", cfg->corner_radius,
+		cfg->corner_n,
 		cfg->border_width, cfg->shadow_radius, cfg->shadow_color[3] * 255.0,
 		cfg->shadow_offset_y, cfg->window_opacity, cfg->noise,
 		cfg->blur_enabled ? "on" : "off", cfg->blur_all ? "on" : "off",
@@ -2958,6 +2976,9 @@ static void print_keys_lua(FILE *f) {
 "--     opacity = 0.9              整块的不透明度（窗口 = 内容 + 边框；图层 = 面板\n"
 "--                                自己的内容，底衬的模糊不跟着淡）\n"
 "--     corner_radius = 12         圆角半径（逻辑像素）\n"
+"--     corner_n = 4               圆角的形状指数：4 = 超椭圆（squircle，和 Alt+Tab\n"
+"--                                卡片 / portal 选择器同一种），2 = 圆弧（原来那种）；\n"
+"--                                范围 2 ~ 8\n"
 "--     border_width = 0           边框宽度（0 = 不画边框）\n"
 "--     border_color = \"ff0000\"    没聚焦时的边框颜色（RRGGBB / RRGGBBAA）\n"
 "--     border_color_focus = \"00ff00\"  聚焦时的边框颜色\n"

@@ -295,6 +295,12 @@ struct vidow_config {
 	 * 听得见 —— 见 decoration.c。*/
 	bool prefer_no_csd;
 	double corner_radius;
+	/* 圆角的形状指数：2 = 圆弧（原来那种），4 = 超椭圆（squircle）。默认 4 ——
+	 * 和 Alt+Tab 的 MRU 卡片（mru.c 的 MRU_SQUIRCLE_N）、portal 选源对话框
+	 * （tools/vidowportal.c 的 SQUIRCLE_N）同一种形状。**三处都是 4.0，改要
+	 * 一起改**（那两处是 CPU 光栅 / Cairo 路径，没有 uniform 通道）。夹在
+	 * 2 ~ 8，越界由 vidow_corner_n_clamp() 夹住（见 rule.h）。 */
+	double corner_n;
 	double border_width;
 	float border_color[4];       /* straight (non-premultiplied) rgba */
 	float border_color_focus[4];
@@ -711,7 +717,7 @@ struct vidow_mesh_prog {
 struct vidow_decor_prog {
 	unsigned int program;
 	int u_texture, u_blur, u_size, u_target_size, u_content_off, u_content_alpha;
-	int u_radius, u_border_width, u_border_color, u_shadow_color;
+	int u_radius, u_corner_n, u_border_width, u_border_color, u_shadow_color;
 	int u_shadow_offset, u_shadow_radius, u_opacity, u_noise, u_alpha;
 	int u_origin, u_output_size, u_flip_y;
 	int u_blur_strength;

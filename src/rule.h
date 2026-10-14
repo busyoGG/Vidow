@@ -147,6 +147,7 @@ enum vidow_rule_act {
 	VRA_DECOR,             /* false = 这个窗口不画装饰（边框 / 圆角 / 阴影） */
 	VRA_OPACITY,           /* 整块（含装饰）的不透明度 */
 	VRA_CORNER_RADIUS,
+	VRA_CORNER_N,          /* 圆角的形状指数：2 = 圆弧、4 = 超椭圆 */
 	VRA_BORDER_WIDTH,
 	VRA_BORDER_COLOR,      /* 没聚焦时的边框颜色 */
 	VRA_BORDER_COLOR_FOCUS,
@@ -221,12 +222,28 @@ static inline double vidow_rule_opacity(const struct vidow_rule_eff *eff) {
 	return eff != NULL && eff->set[VRA_OPACITY] ? eff->val[VRA_OPACITY].d : 1.0;
 }
 
+/* 圆角的形状指数（corner_n）的取值范围：2 = 圆弧、4 = 超椭圆（squircle）。
+ * 小于 2 是「往内凹」的角（没人要，着色器里那个 1/n 也会反过来），大于 8
+ * 在 n 次方上先丢精度、角也早就是直角了 —— 越界一律**夹住**，不报错
+ * （它是形状参数，写 1.5 想表达的多半就是「更圆一点」= 2）。
+ * 四条入口（config.lua 键 / VIDOW_CORNER_N / IPC set-config / 窗口规则）都夹
+ * 到这一段，统一走这个函数。 */
+#define VIDOW_CORNER_N_MIN 2.0
+#define VIDOW_CORNER_N_MAX 8.0
+static inline double vidow_corner_n_clamp(double n) {
+	if (!(n >= VIDOW_CORNER_N_MIN)) {   /* NaN 也走这一支 */
+		return VIDOW_CORNER_N_MIN;
+	}
+	return n > VIDOW_CORNER_N_MAX ? VIDOW_CORNER_N_MAX : n;
+}
+
 /* 一个窗口 / layer 现在的装饰参数：窗口规则写了就用规则的，没写用全局配置。
  * 渲染（fx.c）和 IPC（vidowmsg windows 的 look 那一块）都看这一份 ——
  * 「规则有没有生效」不用去量像素。 */
 struct vidow_look {
 	double opacity;
 	double corner_radius;
+	double corner_n;      /* 圆角形状：2 = 圆弧、4 = 超椭圆（见上面的 clamp） */
 	double border_width;
 	float border_color[4];
 	float border_color_focus[4];

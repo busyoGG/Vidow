@@ -185,6 +185,9 @@ end
 --     opacity = 0.9              整块的不透明度（窗口 = 内容 + 边框；图层 = 面板
 --                                自己的内容，底衬的模糊不跟着淡）
 --     corner_radius = 12         圆角半径（逻辑像素）
+--     corner_n = 4               圆角的形状指数：4 = 超椭圆（squircle，和 Alt+Tab
+--                                卡片 / portal 选择器同一种），2 = 圆弧（原来那种）；
+--                                范围 2 ~ 8
 --     border_width = 0           边框宽度（0 = 不画边框）
 --     border_color = "ff0000"    没聚焦时的边框颜色（RRGGBB / RRGGBBAA）
 --     border_color_focus = "00ff00"  聚焦时的边框颜色

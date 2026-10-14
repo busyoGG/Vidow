@@ -187,6 +187,8 @@ static const char *decor_fragment_src =
 	"uniform vec2 u_target_size;\n"  /* padded size */
 	"uniform vec2 u_content_off;\n" /* 内容左上角在目标里的位置（目标像素） */
 	"uniform float u_radius;\n"
+	/* 圆角的形状指数（配置键 corner_n）：2 = 圆弧、4 = 超椭圆（squircle）。 */
+	"uniform float u_corner_n;\n"
 	"uniform float u_border_width;\n"
 	"uniform vec4 u_border_color;\n" /* premultiplied */
 	"uniform vec4 u_shadow_color;\n" /* premultiplied */
@@ -220,9 +222,30 @@ static const char *decor_fragment_src =
 	"uniform float u_mask_min;\n"
 	"varying vec2 v_uv;\n"
 	"\n"
-	"float sd_round_box(vec2 p, vec2 half_size, float r) {\n"
+	"float sd_round_box(vec2 p, vec2 half_size, float r, float n) {\n"
 	"	vec2 q = abs(p) - half_size + r;\n"
-	"	return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;\n"
+	"	vec2 c = max(q, 0.0);\n"
+	"	float d;\n"
+	"	float k;\n"
+	"	if (n > 2.001) {\n"
+	/* 圆弧（n = 2）换成**超椭圆**：|x|^n + |y|^n = r^n 那条曲线（n = 4 就是
+	 * squircle）。直边和内侧和圆弧**逐像素一样** —— c 里有个分量是 0 时
+	 * 这个范数就退化成另一个分量的绝对值。 */
+	"		float s = pow(c.x, n) + pow(c.y, n);\n"
+	"		d = pow(s, 1.0 / n);\n"
+	/* 它**不是**严格的 SDF：梯度模沿直边是 1、沿对角线涨到 2^(1/n)（n = 4
+	 * 时 1.19）。下面这个因子 = 1 / |∇d|：不除的话 smoothstep(-1, 1, d) 那条
+	 * 抗锯齿斜坡在角上只有 2 / 1.19 = 1.68px 宽（直边还是 2px），边框 / 阴影
+	 * 沿对角线的厚度也跟着细一圈（8px 的边框沿对角线只剩 6.7px）。除完斜坡
+	 * 宽度与方向无关，边框厚度处处 ≈ border_width。c 有个分量是 0 时这个因子
+	 * 恒等于 1，所以直边和圆弧完全一致。 */
+	"		float den = length(vec2(pow(c.x, n - 1.0), pow(c.y, n - 1.0)));\n"
+	"		k = den > 1e-4 ? pow(s, (n - 1.0) / n) / den : 1.0;\n"
+	"	} else {\n"
+	"		d = length(c);\n"
+	"		k = 1.0;\n"
+	"	}\n"
+	"	return (d - r) * k + min(max(q.x, q.y), 0.0);\n"
 	"}\n"
 	"\n"
 	"void main() {\n"
@@ -230,7 +253,7 @@ static const char *decor_fragment_src =
 	"	vec2 wp = p - u_content_off;\n"
 	"	vec2 half_size = u_size * 0.5;\n"
 	"	float r = min(u_radius, min(half_size.x, half_size.y));\n"
-	"	float d = sd_round_box(wp - half_size, half_size, r);\n"
+	"	float d = sd_round_box(wp - half_size, half_size, r, u_corner_n);\n"
 	"	float inside = 1.0 - smoothstep(-1.0, 1.0, d);\n"
 	"\n"
 	"	vec2 cuv = clamp(wp / u_size, 0.0, 1.0);\n"
@@ -242,7 +265,7 @@ static const char *decor_fragment_src =
 	"	vec4 border = u_border_color * u_opacity * ring;\n"
 	"\n"
 	"	float sa = 1.0 - smoothstep(-1.0, u_shadow_radius,\n"
-	"		sd_round_box(wp - u_shadow_offset - half_size, half_size, r));\n"
+	"		sd_round_box(wp - u_shadow_offset - half_size, half_size, r, u_corner_n));\n"
 	/* Only outside the window: otherwise the shadow shows through a
 	 * translucent window instead of staying behind it. */
 	"	vec4 shadow = u_shadow_color * sa * (1.0 - inside);\n"
@@ -433,6 +456,7 @@ static void load_decor_program(struct vidow_server *server) {
 	LOC(u_target_size, "u_target_size");
 	LOC(u_content_off, "u_content_off");
 	LOC(u_radius, "u_radius");
+	LOC(u_corner_n, "u_corner_n");
 	LOC(u_border_width, "u_border_width");
 	LOC(u_border_color, "u_border_color");
 	LOC(u_shadow_color, "u_shadow_color");
@@ -2808,6 +2832,9 @@ static void decor_pass(struct vidow_server *server,
 	glUniform2f(d->u_target_size, (float)g->dst_w, (float)g->dst_h);
 	glUniform2f(d->u_content_off, g->off_x, g->off_y);
 	glUniform1f(d->u_radius, (float)(look->corner_radius * scale));
+	/* 圆角的形状指数：2 = 圆弧、4 = 超椭圆。夹一道（配置 / 环境变量 / IPC /
+	 * 窗口规则四条路都夹过，这里只是「进着色器的值一定是合法的」）。 */
+	glUniform1f(d->u_corner_n, (float)vidow_corner_n_clamp(look->corner_n));
 	glUniform1f(d->u_border_width, (float)(look->border_width * scale));
 	/* The decoration shader works in premultiplied alpha; the config keeps
 	 * straight values so a script can read them back. */

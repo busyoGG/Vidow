@@ -341,6 +341,7 @@ void vidow_ipc_json_window(struct jbuf *b, struct vidow_server *server,
 	jb_obj(b);
 	jb_kv_double(b, "opacity", look.opacity);
 	jb_kv_double(b, "corner_radius", look.corner_radius);
+	jb_kv_double(b, "corner_n", look.corner_n);
 	jb_kv_double(b, "border_width", look.border_width);
 	jb_kv_color(b, "border_color", look.border_color);
 	jb_kv_color(b, "border_color_focus", look.border_color_focus);

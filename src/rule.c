@@ -157,6 +157,9 @@ const struct vidow_rule_field vidow_rule_fields[] = {
 		"底衬的模糊不跟着淡）" },
 	{ "corner_radius", RK_ACT_DOUBLE, VRA_CORNER_RADIUS, VIDOW_RULE_WINDOW,
 		"圆角半径（逻辑像素，0 = 直角）" },
+	{ "corner_n", RK_ACT_DOUBLE, VRA_CORNER_N, VIDOW_RULE_WINDOW,
+		"圆角的形状指数：4 = 超椭圆（squircle，和 Alt+Tab 卡片 / portal 选择器"
+		"同一种）、2 = 圆弧（原来那种）；范围 2 ~ 8" },
 	{ "border_width", RK_ACT_DOUBLE, VRA_BORDER_WIDTH, VIDOW_RULE_WINDOW,
 		"边框宽度（0 = 不画边框）" },
 	{ "border_color", RK_ACT_COLOR, VRA_BORDER_COLOR, VIDOW_RULE_WINDOW,
@@ -449,6 +452,7 @@ void vidow_rule_look(const struct vidow_config *cfg,
 		const struct vidow_rule_eff *eff, struct vidow_look *out) {
 	out->opacity = cfg->window_opacity;
 	out->corner_radius = cfg->corner_radius;
+	out->corner_n = vidow_corner_n_clamp(cfg->corner_n);
 	out->border_width = cfg->border_width;
 	memcpy(out->border_color, cfg->border_color, sizeof(out->border_color));
 	memcpy(out->border_color_focus, cfg->border_color_focus,
@@ -469,6 +473,11 @@ void vidow_rule_look(const struct vidow_config *cfg,
 	}
 	if (eff->set[VRA_CORNER_RADIUS]) {
 		out->corner_radius = eff->val[VRA_CORNER_RADIUS].d;
+	}
+	/* 规则的和全局的一样夹到 2 ~ 8（范围检查那边已经拦过一次，这里再夹一道
+	 * 是为了「不管值从哪来，进 look 的一定是合法形状」）。 */
+	if (eff->set[VRA_CORNER_N]) {
+		out->corner_n = vidow_corner_n_clamp(eff->val[VRA_CORNER_N].d);
 	}
 	if (eff->set[VRA_BORDER_WIDTH]) {
 		out->border_width = eff->val[VRA_BORDER_WIDTH].d;
@@ -716,10 +725,12 @@ bool vidow_rule_commit(struct vidow_server *server, struct vidow_rule *rule,
 			return false;
 		}
 	}
-	/* 外观参数的取值范围：比例 / 长度都得是非负，透明度 0 ~ 1。 */
+	/* 外观参数的取值范围：比例 / 长度都得是非负，透明度 0 ~ 1，圆角形状
+	 * 指数 2（圆弧）~ 8（VIDOW_CORNER_N_MIN / MAX，见 rule.h）。 */
 	struct { int slot; const char *name; double lo, hi; } ranges[] = {
 		{ VRA_OPACITY, "opacity", 0.0, 1.0 },
 		{ VRA_CORNER_RADIUS, "corner_radius", 0.0, 1e9 },
+		{ VRA_CORNER_N, "corner_n", VIDOW_CORNER_N_MIN, VIDOW_CORNER_N_MAX },
 		{ VRA_BORDER_WIDTH, "border_width", 0.0, 1e9 },
 		{ VRA_SHADOW_RADIUS, "shadow_radius", 0.0, 1e9 },
 		{ VRA_NOISE, "noise", 0.0, 1e9 },

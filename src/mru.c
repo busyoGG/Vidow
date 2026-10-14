@@ -557,7 +557,9 @@ static void mru_layout(struct vidow_server *server) {
  * 和 pixman 两条渲染器都是从这条路把像素上传成纹理的，和客户端递上来的 shm 缓冲
  * 同一条 —— 不用 memfd、不用 GL 上下文、不碰渲染线程。 */
 
-/* 超椭圆的指数（portal 的 SQUIRCLE_N 同值）：n = 2 是普通圆角，4 = 「方中带圆」。 */
+/* 超椭圆的指数（portal 的 SQUIRCLE_N 同值）：n = 2 是普通圆角，4 = 「方中带圆」。
+ * 窗口装饰那份（fx.c 的 sd_round_box，配置键 corner_n）默认也是 4.0 ——
+ * 三处同值 4.0，改要一起改（那两个是 GLSL / Cairo，各有自己的通道）。 */
 #define MRU_SQUIRCLE_N 4.0
 /* 圆角覆盖率的超采样倍数：4x4 = 16 级灰阶，够圆角用了。 */
 #define MRU_SS 4
