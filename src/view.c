@@ -1414,6 +1414,74 @@ static void view_snapshot_content_box(struct vidow_view *view) {
 	}
 }
 
+/* 缩放节点的越界裁剪（S3 修）：把表面那份内容节点裁成「这一帧落在屏里那一块」。
+ *
+ * 为什么不能借 wlroots 的 wlr_scene_subsurface_tree_set_clip()：那套是给
+ * **1:1 逻辑坐标**的窗口准备的（内部把 clip 当节点位置用、src_box 按表面尺寸
+ * 比例缩、dst 不动，见 types/scene/subsurface_tree.c 的
+ * subsurface_tree_reconfigure_clip + types/scene/surface.c 的 src_box 换算）。
+ * 缩放态（小窗保留原生 buffer：图标 / 迷你 / 自由小窗，以及过渡动画那几帧）
+ * 下它三件事一起错：内容挪到错的地方、剩下那一小条拉伸铺满整块 dst、而且
+ * dst 不缩 → 越界那半块照画到隔壁屏上（实测 16×64 条带 832 像素）。
+ *
+ * 这里自己裁：**源框取可见那一块、目标框也取可见那一块**，缩放比一个像素都不变，
+ * 框外那部分根本不画。缓冲像素 ↔ 场景像素按「整块有效源区对应整块 dst」换算
+ * （整块源区从 wlr_surface_get_buffer_source_box() 拿，客户端声明的 viewport 也
+ * 算在里面）。
+ *
+ * 返回 true = 这一档接管了（调用方别再走 wlroots 那套）；false = 没接管（不是
+ * 能安全处理的缩放表面：没有缓冲 / 旋转过 / 拿不到源区），退回原路。 */
+static bool view_scaled_crop(struct vidow_view *view, const struct wlr_box *clip) {
+	struct wlr_scene_buffer *sb = view->scene_surface != NULL ?
+		view->scene_surface->buffer : NULL;
+	struct wlr_surface *surface = vidow_view_surface(view);
+	if (sb == NULL || sb->buffer == NULL || surface == NULL ||
+			sb->dst_width <= 0 || sb->dst_height <= 0 ||
+			surface->current.transform != WL_OUTPUT_TRANSFORM_NORMAL) {
+		return false;
+	}
+	int cx = 0, cy = 0;
+	wlr_scene_node_coords(&sb->node, &cx, &cy);
+	struct wlr_box cbox = {.x = cx, .y = cy,
+		.width = sb->dst_width, .height = sb->dst_height};
+	struct wlr_box vis;
+	if (!wlr_box_intersection(&vis, &cbox, clip)) {
+		/* 这一帧整个身子都在自己那块屏外：一个像素都不该画（场景图是全局
+		 * 坐标，画了就是画到隔壁屏上）。甩到所有输出框外面去 —— 和 fx 那边
+		 * 同一招（src_box 空着 wlroots 会当成「整块」，那是另一个意思）。 */
+		wlr_scene_buffer_set_source_box(sb, NULL);
+		wlr_scene_node_set_position(&sb->node,
+			sb->node.x - cx - 1000000, sb->node.y - cy - 1000000);
+		return true;
+	}
+	if (vis.width == cbox.width && vis.height == cbox.height) {
+		wlr_scene_buffer_set_source_box(sb, NULL); /* 可见那块 = 整块：不用裁 */
+		return true;
+	}
+	struct wlr_fbox full = {0};
+	wlr_surface_get_buffer_source_box(surface, &full);
+	if (full.width <= 0.0 || full.height <= 0.0) {
+		return false;
+	}
+	double kx = (double)full.width / (double)cbox.width;
+	double ky = (double)full.height / (double)cbox.height;
+	struct wlr_fbox src = {
+		.x = full.x + (double)(vis.x - cx) * kx,
+		.y = full.y + (double)(vis.y - cy) * ky,
+		.width = (double)vis.width * kx,
+		.height = (double)vis.height * ky,
+	};
+	/* 裁之前先抄一份没裁过的有效区：装饰管线（fx）采源缓冲的哪一块照的是
+	 * view->fx.content_box 那一份，别让它认成裁剩下的一小条（187 那个坑）。 */
+	wlr_scene_buffer_set_source_box(sb, NULL);
+	view_snapshot_content_box(view);
+	wlr_scene_buffer_set_source_box(sb, &src);
+	wlr_scene_node_set_position(&sb->node,
+		sb->node.x + (vis.x - cx), sb->node.y + (vis.y - cy));
+	wlr_scene_buffer_set_dest_size(sb, vis.width, vis.height);
+	return true;
+}
+
 void vidow_view_apply_clip(struct vidow_view *view) {
 	if (view == NULL) {
 		return;
@@ -1478,6 +1546,20 @@ void vidow_view_apply_clip(struct vidow_view *view) {
 	 * 拉伸铺满整块窗口（187）。现在那边改成认 view->fx.content_box（没裁过的
 	 * 那一版，见 view_snapshot_content_box），裁剪和装饰就互不干扰了。 */
 	if (on) {
+		/* 缩放态（迷你 / 图标 / 保留原生 buffer 的自由小窗，也包括过渡动画那几
+		 * 帧）**不走 wlroots 那套 clip**：它是「1:1 逻辑坐标」语义 ——
+		 * types/scene/subsurface_tree.c 里把 clip 直接当节点位置用
+		 * （`set_position(clip.x, clip.y)`）、src_box 只按**表面尺寸**比例缩，
+		 * dst 一个像素都不动。缩放态下这三件事一起错：① 内容被挪到错的地方；
+		 * ② 剩下那一小条被拉伸铺满整块 dst；③ 越界那半块**照画**（dst 没缩、
+		 * 节点还在原处）—— 实测贴右边的图标漏到隔壁屏那 16×64 条带里 832 个
+		 * 像素。这一档自己裁，见 view_scaled_crop()。 */
+		if (vidow_view_hit_scale(view) != 1.0 &&
+				view->mini != VIDOW_MINI_NONE &&
+				view_scaled_crop(view, &box)) {
+			view->fx.clip_local = (struct wlr_box){0};
+			return;
+		}
 		/* 表面局部坐标（逻辑单位，wlroots 自己乘缓冲倍率）。原点取**这一帧
 		 * 画在哪儿**（几何 + 动画偏移）：表面树挂在那个位置上，减布局目标
 		 * 位置的话，滚动动画里裁出来的那块会跟着偏移。位置变了就得重调一次
@@ -3781,9 +3863,56 @@ static void mini_snapshot_place(struct vidow_view *view) {
 			dh = 1;
 		}
 	}
+	int px = x + (view->geom.width - dw) / 2;
+	int py = y + (view->geom.height - dh) / 2;
+	/* 越界裁剪（S3 修）：快照节点挂在**全局**的 layer_toplevels 上（不在窗口自己
+	 * 的场景树里），而场景图是全局坐标 —— 图标按 mini_icon_overflow 刻意探出屏边
+	 * 那一块会被隔壁那块屏照画（实测那条 16×64 带里 832 个非背景像素、其中 172 个
+	 * 是客户端的纯红）。裁法和 fx 那边同一招：源框（缓冲像素）取可见那一块、目标框
+	 * （场景尺寸）也取可见那一块 —— 缩放比一个像素不变，框外那部分不画。
+	 *
+	 * 判据用**自己那块屏的框**（view_clip_box 那条路对停到停车位的窗口是「不裁」：
+	 * 它那边裁的是真实节点，而快照模式下真实节点本来就被停到屏外了）。 */
+	struct wlr_box clip = {0};
+	if (view->output != NULL) {
+		wlr_output_layout_get_box(view->server->output_layout, view->output,
+			&clip);
+	}
+	if (clip.width >= 1 && clip.height >= 1) {
+		struct wlr_box full = {.x = px, .y = py, .width = dw, .height = dh};
+		struct wlr_box vis;
+		int bw = view->last_buffer != NULL ? view->last_buffer->width : 0;
+		int bh = view->last_buffer != NULL ? view->last_buffer->height : 0;
+		if (!wlr_box_intersection(&vis, &full, &clip)) {
+			/* 整个身子都在自己那块屏外：一个像素都不该画（画了就是画到隔壁
+			 * 屏上）。甩到所有输出框外面去 —— 和 fx 那边同一招。 */
+			wlr_scene_buffer_set_source_box(view->mini_snapshot, NULL);
+			px -= 1000000;
+			py -= 1000000;
+			dw = 1;
+			dh = 1;
+		} else if ((vis.width != dw || vis.height != dh) && bw > 0 && bh > 0) {
+			double kx = (double)bw / (double)dw;
+			double ky = (double)bh / (double)dh;
+			struct wlr_fbox src = {
+				.x = (double)(vis.x - px) * kx,
+				.y = (double)(vis.y - py) * ky,
+				.width = (double)vis.width * kx,
+				.height = (double)vis.height * ky,
+			};
+			wlr_scene_buffer_set_source_box(view->mini_snapshot, &src);
+			px = vis.x;
+			py = vis.y;
+			dw = vis.width;
+			dh = vis.height;
+		} else {
+			wlr_scene_buffer_set_source_box(view->mini_snapshot, NULL);
+		}
+	} else {
+		wlr_scene_buffer_set_source_box(view->mini_snapshot, NULL);
+	}
 	wlr_scene_buffer_set_dest_size(view->mini_snapshot, dw, dh);
-	wlr_scene_node_set_position(&view->mini_snapshot->node,
-		x + (view->geom.width - dw) / 2, y + (view->geom.height - dh) / 2);
+	wlr_scene_node_set_position(&view->mini_snapshot->node, px, py);
 	wlr_scene_node_set_enabled(&view->mini_snapshot->node, true);
 }
 

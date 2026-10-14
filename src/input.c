@@ -1319,21 +1319,32 @@ void vidow_pointer_button(struct vidow_server *server, uint32_t button,
 	 * —— 按在按钮上就整个吃掉（不转给客户端、也不起拖拽），松手那次也成对吃掉
 	 * （客户端两边都没见过，状态才是对称的）。
 	 * 放在形态拖拽那条之前：按钮可能压在窗口上，压在按钮上时不该起拖拽。 */
-	if (server->mini_toolbar_view != NULL) {
-		if (pressed) {
-			int btn = vidow_mini_toolbar_hit(server,
-				server->mini_toolbar_view, server->cursor->x,
-				server->cursor->y);
-			if (btn >= 0) {
-				struct vidow_view *tv = server->mini_toolbar_view;
-				vidow_mini_toolbar_press(server, tv, btn);
-				/* 形态可能变了（还原成列 / 关掉 / 换档）：工具条收掉。 */
-				vidow_mini_toolbar_hide(server);
-				server->mini_toolbar_pressed = true;
-				return;
-			}
-		} else if (server->mini_toolbar_pressed) {
-			server->mini_toolbar_pressed = false;
+	if (server->mini_toolbar_view != NULL && pressed) {
+		int btn = vidow_mini_toolbar_hit(server,
+			server->mini_toolbar_view, server->cursor->x,
+			server->cursor->y);
+		if (btn >= 0) {
+			struct vidow_view *tv = server->mini_toolbar_view;
+			vidow_mini_toolbar_press(server, tv, btn);
+			/* 形态可能变了（还原成列 / 关掉 / 换档）：工具条收掉。 */
+			vidow_mini_toolbar_hide(server);
+			server->mini_toolbar_pressed = true;
+			return;
+		}
+	}
+	/* 松手那一半**无条件**吃、并且**无条件清标志**（S3 修）：以前这一支写在
+	 * `if (server->mini_toolbar_view != NULL)` 里面，而按下那条路紧接着
+	 * `vidow_mini_toolbar_hide()` 就把 view 清成 NULL —— 标志就此留在 true 没人
+	 * 清。后果是「悬停着工具条的迷你窗口」上的**下一对**按下 / 松开被这对陈旧
+	 * 标志吞掉：形态不变（按一下没反应），而且那次按下起的 mini_grab 再没人收尾
+	 * —— 紧接着一次普通 pointer-motion 就能把窗口**在没按键的情况下**拖走
+	 * （实测 `place w1 -> 464,506` 就是这么来的）。
+	 *
+	 * 标志被吞过之后 grab 还挂着时（旧状态 / 别的路径丢过松手）接着往下走，让
+	 * 小窗那条松手把它一起收掉。 */
+	if (!pressed && server->mini_toolbar_pressed) {
+		server->mini_toolbar_pressed = false;
+		if (server->mini_grab_view == NULL) {
 			return;
 		}
 	}

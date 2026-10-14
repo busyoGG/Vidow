@@ -975,6 +975,7 @@ VIDOW_TEST_RENDERER=gles2 ./test-screencast.sh
 ./test-preinit.sh                    # 状态请求抢在第一次 commit 之前（set_maximized /
                                      #   set_minimized / set_fullscreen）不许把合成器打死（22 项断言）
 ./test-drag.sh                       # 拖窗口：拖得动 / 跨屏改归属 / 平铺按落点插入（10 项）
+./test-mini.sh                       # 小窗模式（mini window，S1–S5）：三态与交互 / 跟屏 / 焦点守卫 / 输入路由与 4px 阈值 / 图标裁剪 / 原生 buffer 与坐标换算 / mini_aspect / 落点区 / 工具条 / 出帧分叉 / 过渡动画与惯性甩出（全 headless 双屏，见 277）
 ./test-drag-insert.sh                # 拖平铺窗口的落点：插进已有列 / 新开一条列（左右两边的缝都算）/ 落点预览块（23 项）
 ./test-expel.sh                      # 把窗口从列里拎出来单独成列（niri 的 expel-window-from-column：动作 / IPC / 左右 / 拖到右边与空白处 / 取不出来的两种情形，32 项）
 ./test-drag-stall.sh                 # 后端不给帧事件时，拖动照样跟手（浮窗 + 平铺两个case，9 项断言）
@@ -5419,6 +5420,60 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
        `test-defaultconfig.sh` 全过（新增的 `20-layout.lua` 与 `--default-config` 逐字节一致，114 个平铺键都在）。
      - 未做：niri 的 `fixed 1920`（固定像素档）、`preset-window-heights`、`default-column-width {}`（让客户端自己定宽）、
        `always-center-single-column`；窗口规则级的 per-rule 预设覆盖。
+
+277. **小窗模式 S6：验证脚本收进仓库（`test-mini.sh`）+ 小窗模式文档定稿 —— 下面这一段就是小窗的参考手册**（用户：「做方案 §7 的 S6（测试 + 文档），只做测试与文档、不改功能代码」；方案 `/tmp/vidow-miniwin-plan.md` §7 S6；2026-10-14）
+
+     - **测试进仓库**：散在 `/tmp` 的 7 个临时脚本（anim / fling / preview / frames-run / ghost / prevdeath / flip）并成 `./test-mini.sh`（headless 双屏、独立临时 `HOME` / `XDG_RUNTIME_DIR`、`PASS/FAIL` 计数、最后按 `FAILED` 给退出码；收尾 `kill -TERM -- "-$PGID"` 自己的进程组，`pgrep -a vidow` 干净）。**顺手修掉两个「让脚本假通过」的坑**：
+       - `grim` 的几何参数是 **`"x,y WxH"`**，原来写成 niri 那套 `"WxH+X+Y"` → 截出 0 字节的文件，而「两张空图逐像素相同」永远成立（静止那条判据假通过）；
+       - `vidowmsg` 的子命令是 **`set-mini-state --id N --state icon`**，原来写的 `set_mini_state --state` 是错的（IPC 报「不认识」），形态压根没变、后面的断言照样过。
+     - **客户端探针**（脚本里现场生成 `$RUNDIR/probe.py`，不用新增 tools 文件）：纯红底 + **每帧都在动**的白条（纯色窗口两帧永远逐像素相同 —— 「在不在出帧」那条会假通过）+ 每个 configure / motion / scroll / key 事件打一行。输入路由（迷你 / 图标态客户端一个事件都收不到、FREE 态收得到）和指针坐标换算（客户端收到的坐标 = 原生对应点 ±3px）都靠它。
+     - **覆盖**（脚本里一层一个 mark）：形态 IPC / 三态循环 / `mini-windows` / 还原成列；跟屏（切工作区 geometry 逐字段不变）；焦点守卫（`focused` 不指向小窗；`focus_follows_mouse = true` 时指针压上去也不抢；`focus-window` 对迷你态是「先摊成自由小窗再聚焦」）；输入路由 + 4px 单击 / 拖拽阈值；图标贴边裁剪（相邻屏那条「本该溢出」的条带非背景像素 = 0）；原生 buffer（`surface` 尺寸不变 + 新 configure 的尺寸仍是原生；规则 `mini_preserve_buffer = false` 反向验一次：真的被重配小了）；`mini_aspect` 三值（全局 free / lock / auto + 运行时 `toggle-mini-aspect` 压过全局，判据是**改宽拖动时高跟不跟**——进小窗那一刻盒子照旧按 `mini_free_w/h` 摆，锁比例管的是拖拽那条路）；落点区（区内松手 → mini、区外松手不误触、区外落点区不亮）；内边缘 → 收图标 / 跨屏边 → 换屏保持形态；滚轮降档（一次一格、到底停住、上滚升档、FREE 态上滚转发给客户端）；悬停工具条（悬停露出 → 点「还原成列」按钮）；`force_render` 分叉（关 = 客户端 0 新帧 + 图标与预览两帧逐像素相同；开 = 客户端恢复出帧 + 预览两份截图不同）；过渡动画（相邻位移 ≤ 屏宽 10%、全程单调、第一帧在起点、结束偏移归零）；惯性甩出（速度阈值、方向取最近边、不过冲、时长 < 普通转换、<4px 快甩的逃生口）；MRU（Alt+Tab）提交选中图标态小窗 → 展开成自由小窗并拿到焦点。
+     - **没进脚本的**（时序太敏感，宁可留注释也不写会偶发 FAIL 的断言）：X11 `PAspect` 那两条（「全局 free + X11 PAspect 不再自动锁」「改回 auto 自动锁」需要一个能设 aspect hints 的 X11 客户端，本机手工验过、见 274）、触摸板滑移手势。文件头有明确注释。
+     - **小窗模式参考手册**（用户向的完整说明，S1–S5 的细节见 271–276）：
+
+       **三态与交互**。小窗是浮动窗口上的一个**形态**：`none`（不在小窗态）/ `free`（自由小窗）/ `mini`（迷你）/ `icon`（贴边图标）。交互全在这几条：
+       - **拖窗口进落点区**（每块屏工作区右上角 `mini_drop_zone_w × mini_drop_zone_h`，默认 15%×20%；**只在光标底下那块屏亮**）松手 = 迷你小窗；松手在区外照旧走原来的平铺 / 浮窗落点（不误触）；
+       - **单击** = 放大一档（图标 → 迷你 → 自由小窗，自由小窗再单击给焦点）；**拖拽** = 移动（判据：从按下点起的累计位移 > `mini_drag_threshold_px`，单向不回锁）；
+       - **内边缘**（那条边外侧没有相邻输出）拖动松手 → 收成图标；**跨屏边** → 换屏并保持形态；
+       - **滚轮** = 形态档位（下滚降一档、上滚升一档，到底 / 到顶停住；FREE 态的上滚照旧转发给客户端滚内容）；
+       - **悬停工具条**（迷你 / 图标态悬停露出：放大 / 收成图标 / 还原成列 / 关闭）；**悬停图标** `mini_icon_hover_ms` 后出实时预览（朝屏内展开，只读但吞点击）；
+       - **惯性甩出**：快速甩向边缘（松手速度 ≥ `mini_fling_speed`）→ 那条边外侧有相邻输出就换屏保持形态，没有就收成图标；时长由速度推（越快越短，夹在 110ms..`mini_transition_ms`），位置曲线不过冲；
+       - **键位**：`Mod+Shift+W` = `cycle-mini-state`（三态循环）、`Mod+Shift+Up` = `mini-expand`、`Mod+Shift+Down` = `mini-collapse`、`Mod+Shift+Return` = `unmini-window`（还原成列）；另有 `toggle-mini-aspect`（把当前自由小窗的宽高比锁 / 不锁翻过来，**只作用于运行时、不写回配置**）。
+
+       **配置键**（`configs/24-mini.lua` 那一族，默认全开；尺寸都是「相对工作区的百分比」）：
+
+       | 键 | 默认 | 说明 |
+       | --- | --- | --- |
+       | `mini_enabled` | `true` | 小窗模式总开关（false = 拖到落点区什么都不发生，零行为变化） |
+       | `mini_drop_zone` | `true` | 拖窗口时亮落点区 |
+       | `mini_drop_zone_w` / `mini_drop_zone_h` | `"15%"` / `"20%"` | 落点区宽 / 高（占工作区） |
+       | `mini_w` / `mini_h` | `"28%"` / `"28%"` | 迷你态尺寸（钉死跟配置，客户端改不动） |
+       | `mini_free_w` / `mini_free_h` | `"40%"` / `"45%"` | 自由小窗初始尺寸（之后记在窗口自己身上） |
+       | `mini_icon_size` | `64` | 图标边长（逻辑像素，正方形） |
+       | `mini_icon_overflow` | `0.35` | 图标沿贴的那条边出屏多少（占自己比例，0..0.6） |
+       | `mini_icon_hover_ms` | `250` | 悬停多久出预览 |
+       | `mini_icon_hover_leave_ms` | `300` | 离开图标 / 预览多久收起来 |
+       | `mini_icon_hover_grace_ms` | `200` | 「从图标移向预览」的宽限期（跨空隙不闪） |
+       | `mini_icon_preview` | `true` | 悬停预览开关 |
+       | `mini_toolbar` | `true` | 悬停工具条开关 |
+       | `mini_edge_snap_px` | `24` | 拖到屏边多少像素内算「贴边」 |
+       | `mini_fling_speed` | `800` | 甩出阈值（px/s）：慢拖通常 < 300、随手一甩 > 1500，800 取中间偏保守 |
+       | `mini_transition_ms` | `260` | 形态转换时长（0 = 不做动画） |
+       | `mini_hover_fade_in_ms` / `mini_hover_fade_out_ms` | `120` / `150` | 预览淡入 / 淡出 |
+       | `mini_remember_size` | `true` | 记住自由小窗的尺寸（false = 每次都用 `mini_free_w/h`） |
+       | `mini_edge_margin` | `8` | 迷你 / 自由小窗离工作区边缘的最小留白 |
+       | `mini_preserve_buffer` | `true` | 小窗化**不重配客户端**（保留原生 buffer，合成器缩放显示）；false = 按小窗尺寸重配（省显存，但有的游戏一 resize 就重置成窗口模式） |
+       | `mini_aspect` | `"auto"` | 自由小窗宽高比策略：`"auto"` / `"lock"` / `"free"`（三个取值都是强制语义；优先级 键位 > 窗口规则 > 这个全局键） |
+       | `mini_drag_threshold_px` | `4` | 「单击 = 放大」vs「拖拽 = 移动」的累计位移阈值 |
+
+       **IPC**（`vidowmsg`）：`mini-window [--state free|mini|icon]`（默认迷你）、`set-mini-state --id N --state free|mini|icon|none`（显式设形态，含还原）、`unmini-window --id N`（还原成列）、`cycle-mini-state --id N`（三态循环）、`mini-windows`（当前小窗清单）。指认目标照通用那套：`--id N` / `--app-id` / `--title 子串` / `--output` / `--workspace`。
+
+       **窗口规则**（4 个字段，`vidow.rule{ … }`）：`mini_window = true`（开出来就是迷你小窗）、`mini_state = "free"|"mini"|"icon"`（更细的初始形态）、`mini_aspect = "auto"|"lock"|"free"`（这个窗口的策略，压过全局键）、`mini_preserve_buffer = true|false`（这个窗口保不保留原生分辨率）。规则是形态的唯一权威，键位（运行时）压过规则、规则压过全局键。
+
+       **已知限制**：① 悬停预览在窗口换屏 / 跨屏移动时不跟随（预览是图标那一份镜子的临时节点，换屏那一帧先收掉再重开）；② 落点区只在光标底下那块屏亮（其它屏不预告，盲拖到角落走的是原来的平铺落点）；③ 图标态出帧按 `force_render` 分叉（关 = 停成快照那一帧、开 = 活镜面一直出帧）；④ 全屏游戏进小窗**不重配客户端**（`mini_preserve_buffer = true` 那条：合成器缩放 + 指针坐标换算，客户端完全不知道自己在小窗里；代价是它照旧按原生分辨率出帧）。
+       **`test-mini.sh` 抓到的两个真 bug（都已修，判据留在脚本里当回归）**：
+       - **图标漏画到相邻屏**（贴右边缘溢出的那 16×64 条带：修前 832/1024 非背景像素、其中 172 个是客户端纯红；修后 **0/1024**，图标在屏内那部分照旧 3072/3072）。根因两处，都是「缩放过的节点不能借 wlroots 那套 1:1 语义的裁剪」：① `src/view.c` 新增 `view_scaled_crop()` —— 缩放态（图标 / 迷你 / 保留原生 buffer 的自由小窗、也含过渡动画那几帧）不再走 `wlr_scene_subsurface_tree_set_clip()`（它内部把 clip 当节点位置用、src_box 只按表面尺寸比例缩、dst 一个像素不动：缩放态下内容会被挪位 + 拉伸，越界那半块照样画），改成「源框（缓冲像素）取可见那一块、目标框（场景尺寸）也取可见那一块」，缩放比不变；② `src/view.c` 的 `mini_snapshot_place()` —— 图标快照那份节点挂在**全局**的 `layer_toplevels` 上（不在窗口自己的场景树里），以前一个裁剪都没有，现在按**自己那块屏的框**把框外那部分裁掉（判据不能用 `view_clip_box()`：它对停到停车位的窗口按设计就是「不裁」）。顺带更正 273 的读数：那条「相邻屏非背景像素 = 0」是踩了 `grim` 几何参数写错那个坑（截出 0 字节文件，空图比空图当然一样）。
+       - **工具条点过一次按钮之后，迷你窗口上的下一对按下 / 松开被吞**（`src/input.c` 的 `vidow_pointer_button()`）：松手那一支以前写在 `if (server->mini_toolbar_view != NULL)` 里面，而按下那条路紧接着 `vidow_mini_toolbar_hide()` 就把 `mini_toolbar_view` 清成 NULL —— 标志永远留在 true。症状：悬停着工具条的迷你窗口上**按一下没反应**（形态不变，`mini_grab` 也没人收尾），紧接着一次**不带按键**的 `pointer-motion` 就把窗口拖走（修前现场 `place w1 -> 464,506`）。修法：松手那一半**无条件**清标志，并且标志被吞过、grab 还挂着时接着往下走，让小窗那条松手把它一起收掉。回归判据：S4「单击迷你 → 放大（工具条点过按钮之后也一样）」+「不带按键的 pointer-motion 不拖窗口」。
 
 276. **小窗模式 S5：形态转换过渡动画（起点取「上一帧画在哪」）+ 图标悬停实时预览 + 惯性甩出 —— 小窗开始「像安卓那样」动了**（用户：「做方案 §7 的 S5（过渡动画 + 悬停预览 + 图标出帧）」+ 追加「要像安卓那样惯性甩出」；方案 `/tmp/vidow-miniwin-plan.md` §1.4 / §7 S5 / §8 判据 16–19；2026-10-14）
 
