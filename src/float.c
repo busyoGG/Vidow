@@ -1792,8 +1792,19 @@ void vidow_mini_set_state(struct vidow_view *view, enum vidow_mini_state state) 
 			vidow_view_fixed_size_hint(view, &anum, &aden) ? "有" : "没有",
 			alock ? "锁" : "不锁", aratio);
 	}
+	/* S5：图标态的出帧策略（§9②）—— 退化情形说清楚：客户端一帧都还没交过
+	 * （last_buffer 空）时没有快照可用，只能退回活节点（客户端继续出帧），
+	 * 屏上照旧是动的图标。 */
+	if (state == VIDOW_MINI_ICON && !view->force_render &&
+			view->last_buffer == NULL) {
+		wlr_log(WLR_INFO, "mini: %s 进图标态但手里没有最后一帧（客户端还没交过"
+			"帧）→ 退回活节点、客户端继续出帧（force_render 关）",
+			vidow_view_title(view) != NULL ? vidow_view_title(view) : "?");
+	}
 	/* S5：进小窗 / 三态互切 —— 上面那次 arrange 已经把目标盒摆进 geom 了，
 	 * 这里起过渡动画（起点是进函数时取的「上一帧画在哪」）。 */
 	mini_transition_start(view, &from);
+	/* 形态刚定下来：出帧策略（快照 / 活）与快照节点跟着走一趟。 */
+	vidow_mini_frames_sync(view);
 	vidow_ipc_emit_window(server, "window-mini-changed", view);
 }

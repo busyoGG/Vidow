@@ -1535,6 +1535,14 @@ struct vidow_view {
 	double mini_scale_from;            /* 缩放补间起点（相对目标盒） */
 	struct vidow_ease mini_scale_ease; /* 只用在缩放上（可过冲） */
 
+	/* ---- 小窗（mini window，S5）：图标态的「快照」节点 ----
+	 *
+	 * 按该窗口**有效**的 force_render 分叉：开 → 图标就是窗口自己那块活节点
+	 * （render_pump 保活，图标和预览都是动的）；关 → 真实节点停到停车位（客户端
+	 * 停帧）、屏上由这个快照节点画 `view->last_buffer` 的最后一帧。见 view.c 的
+	 * vidow_mini_uses_snapshot() / mini_snapshot_place()。 */
+	struct wlr_scene_buffer *mini_snapshot;
+
 	struct wl_listener map;
 	struct wl_listener unmap;
 	struct wl_listener commit;
@@ -2340,8 +2348,11 @@ struct vidow_server {
 	 * 离开 300ms → 收；指针从图标移向预览要跨那 8px 空隙，所以「既不在图标
 	 * 也不在预览」时给 200ms 宽限，进到预览矩形里就把计时清掉（宽限期只是
 	 * 视觉稳定性，不引入新的输入语义 —— 预览不吃点击语义、只吞掉）。 */
-	struct wlr_scene_tree *mini_preview;      /* 预览的镜面节点（layer_toplevels 里） */
+	struct wlr_scene_tree *mini_preview;      /* 预览的镜面节点（layer_top 里） */
 	struct wlr_scene_surface *mini_preview_surface; /* 里面那层内容节点（缩放 / 透明度） */
+	/* 预览的快照节点（同一个窗口走快照那条路时用它，**和图标同一份策略** ——
+	 * 不能出现「图标静止、预览还在动」）。 */
+	struct wlr_scene_buffer *mini_preview_snap;
 	struct vidow_view *mini_preview_view;     /* 预览现在属于哪个图标 */
 	bool mini_preview_shown;                  /* 已经露出来了（含淡入中） */
 	struct wlr_box mini_preview_box;          /* 预览那块（布局坐标，命中用） */
@@ -2956,6 +2967,14 @@ void vidow_mini_preview_hide(struct vidow_server *server);
 /* 这个点是不是落在预览那块上（预览吞点击用 —— 它是只读的，但点下去不能
  * 落到背后的窗口上）。 */
 bool vidow_mini_preview_hit(struct vidow_server *server, double lx, double ly);
+/* ---- 小窗（S5）图标 / 预览的出帧策略 ----
+ * 该窗口这一刻是不是走「快照」那条路（图标态 + force_render 关 + 手里有最后一帧）。 */
+bool vidow_mini_uses_snapshot(const struct vidow_view *view);
+/* `view->last_buffer` 换了之后同步快照节点（图标 + 预览共用一份；图标态下也会把
+ * 快照节点重新摆一次 —— 进快照态时 last_buffer 还是空的那种情况靠它兜住）。 */
+void vidow_mini_frames_sync(struct vidow_view *view);
+/* 出帧策略（快照 / 活）跟着有效 force_render 翻面时，把摆位接上（幂等）。 */
+void vidow_mini_frames_recheck(struct vidow_view *view);
 /* 建场景节点（main.c 建完场景层之后调一次，和 vidow_drag_init 一起）。 */
 bool vidow_mini_ui_init(struct vidow_server *server);
 

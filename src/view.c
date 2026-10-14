@@ -11,6 +11,10 @@
  * 管全部，单边设了就用单边的，-1 = 跟随。 */
 
 void vidow_place_view(struct vidow_view *view, int x, int y, int w, int h);
+/* 小窗（S5）：图标态的快照节点（定义在文件后半段的预览那一节里）。 */
+static void mini_snapshot_place(struct vidow_view *view);
+/* 小窗（S3）：窗口的原生尺寸（场景坐标）。 */
+static void view_mini_native(const struct vidow_view *view, int *w, int *h);
 static void view_ensure_column(struct vidow_server *server,
 		struct vidow_view *view);
 void vidow_view_leave_column(struct vidow_view *view);
@@ -704,9 +708,56 @@ static void view_dst_capture(struct vidow_view *view) {
 	}
 }
 
+/* 小窗（S5）：**图标态**那块矩形上的命中，单独判一次，不走场景图。两个理由：
+ *   - 走快照那条路时场景图里根本命不中它（真实节点停在停车位上，屏上画的是快照
+ *     节点，而快照节点**故意不带 view tag** —— 带了会被 vidow_restack 当成窗口
+ *     节点参与层级排序，一个窗口两个节点）；
+ *   - 图标是**贴边 + 缩放 + 裁到自己那块屏**的一小块，场景图那条路（表面节点 +
+ *     裁剪）本来就容易差几像素。小窗的输入是合成器自己吃的（mini_swallows_input），
+ *     坐标只用来定形态，不需要像素级精确。
+ * 盒子取 geom + anim_off（和摆位同源）—— 贴边时有一半在屏外，照收。 */
+static struct vidow_view *mini_icon_view_at(struct vidow_server *server,
+		double lx, double ly, double *sx, double *sy) {
+	struct vidow_view *view;
+	wl_list_for_each(view, &server->views, link) {
+		if (view->mini != VIDOW_MINI_ICON ||
+				!view->mapped || view->output == NULL ||
+				!vidow_workspace_view_visible(server, view)) {
+			continue;
+		}
+		int x = view->geom.x + (int)lround(view->anim_off_x);
+		int y = view->geom.y + (int)lround(view->anim_off_y);
+		if (lx < x || lx >= x + view->geom.width ||
+				ly < y || ly >= y + view->geom.height) {
+			continue;
+		}
+		/* 本地坐标：图标是缩放的，按缩放比折回去（小窗吞输入，这两个数只用来
+		 * 定形态，不精确也不影响判断 —— 但别给错得离谱的）。 */
+		int nw = 0, nh = 0;
+		view_mini_native(view, &nw, &nh);
+		double k = (nw > 0 && view->geom.width > 0) ?
+			(double)nw / (double)view->geom.width : 1.0;
+		if (sx != NULL) {
+			*sx = (lx - x) * k;
+		}
+		if (sy != NULL) {
+			*sy = (ly - y) * k;
+		}
+		return view;
+	}
+	return NULL;
+}
+
 struct vidow_view *vidow_view_at(struct vidow_server *server,
 		double lx, double ly, struct wlr_surface **surface,
 		double *sx, double *sy) {
+	struct vidow_view *snap = mini_icon_view_at(server, lx, ly, sx, sy);
+	if (snap != NULL) {
+		if (surface != NULL) {
+			*surface = vidow_view_surface(snap);
+		}
+		return snap;
+	}
 	struct wlr_scene_node *node =
 		wlr_scene_node_at(&server->scene->tree.node, lx, ly, sx, sy);
 	if (node == NULL || node->type != WLR_SCENE_NODE_BUFFER) {
@@ -1487,6 +1538,10 @@ void vidow_view_render_pump(struct vidow_server *server,
 	int64_t next_due = 0; /* 被节流挡下的那些窗口里，最早该醒的时刻 */
 	struct vidow_view *view;
 	wl_list_for_each(view, &server->views, link) {
+		/* 出帧策略跟 force_render 走：翻面了就接上（见 frames_recheck）。 */
+		if (view->mini == VIDOW_MINI_ICON || view->mini_snapshot != NULL) {
+			vidow_mini_frames_recheck(view);
+		}
 		bool want = view->mapped && !view->popup && view->output ==
 			output->wlr_output &&
 			(view->force_render || vidow_view_capture_held(view) ||
@@ -1494,7 +1549,11 @@ void vidow_view_render_pump(struct vidow_server *server,
 				 * 的时候也要保活，否则游戏自己停帧，点开是一张死画面。
 				 * 下面 view_on_screen() 为真时会 continue，所以这条只在
 				 * 「真的没画到」时才生效 —— 正常情况一分钱不花。 */
-				view->mini != VIDOW_MINI_NONE);
+				/* 但**走快照那条路的图标不算**（S5）：它就该停帧（屏上画的是
+				 * 最后一帧快照），保活会把它又推活、和「静止的最后一帧」
+				 * 自相矛盾。 */
+				(view->mini != VIDOW_MINI_NONE &&
+					!vidow_mini_uses_snapshot(view)));
 		if (!want) {
 			if (view->render_pumping) {
 				view->render_pumping = false;
@@ -1683,6 +1742,12 @@ bool vidow_view_should_park(struct vidow_server *server,
 	if (view->popup || !view->mapped || view->scene_tree == NULL) {
 		return false; /* 弹出物 / 还没上屏的：各有各的路（见 workspace.c） */
 	}
+	/* 小窗（S5）：图标态 + 该窗口不保活 + 手里有最后一帧 → 真实节点停到停车位
+	 * （它不在任何输出上，客户端于是停帧），屏上由快照节点画（见
+	 * mini_snapshot_place）—— 这就是「图标是静止的最后一帧」那条路。 */
+	if (vidow_mini_uses_snapshot(view)) {
+		return true;
+	}
 	if (!vidow_workspace_view_visible(server, view) &&
 			!view_sliding_out(server, view)) {
 		/* overview 里**这块屏上别的工作区也要画**（它们上下排成一列，见
@@ -1823,6 +1888,12 @@ static void view_anim_place(struct vidow_view *view) {
 	 * 这儿定，别在别处再 wlr_scene_node_set_position 一次。判据每帧现算（动画帧
 	 * 里窗口会扫过屏边界，存下来的标志会过期）。 */
 	vidow_view_set_parked(view, vidow_view_should_park(server, view));
+	/* 小窗（S5）：图标态走快照那条路时，屏上那块由快照节点画 —— 位置取
+	 * 「图标画在哪」（geom + anim_off，和下面 park 用的是同一个来源），
+	 * 不是停车位。 */
+	if (view->mini == VIDOW_MINI_ICON || view->mini_snapshot != NULL) {
+		mini_snapshot_place(view);
+	}
 	if (view->scene_parked) {
 		view_park_pos(view, &x, &y);
 	}
@@ -3610,6 +3681,159 @@ void vidow_view_yield_focus_for_mini(struct vidow_view *view) {
  * 从图标移到预览要跨那 8px 空隙，不给宽限会闪一下再回来）。
  */
 
+/* ---- 小窗（S5）：图标 / 预览的出帧策略（计划 §9②） ----
+ *
+ * 按该窗口**有效**的 force_render 分叉：
+ *   - 开 → 活节点（图标就是窗口自己那块节点，预览是表面第二份镜面）+ 客户端
+ *     照常出帧（render_pump 在它被停到屏外时保活）→ 图标和预览都是**动的**；
+ *   - 关 → 快照节点（`view->last_buffer` 的最后一帧）+ **真实节点停到停车位**
+ *     → 客户端停帧，图标和预览都是**静止的最后一帧**。
+ *
+ * 两条路必须**一致**：预览不许出现「图标静止、预览还在动」—— 所以它走的是同一个
+ * 判据（vidow_mini_uses_snapshot），不是各判一份。
+ *
+ * 为什么不算新生命周期路径：快照节点的 buffer 由 `wlr_scene_buffer_set_buffer()`
+ * 自己管引用（它 ref 新的、unref 旧的），所以只要在 `view->last_buffer` 换新
+ * 的那一处同步一次就够 —— 不用另建监听、不用管窗口什么时候没。
+ *
+ * 退化情形：`last_buffer == NULL`（客户端一帧都没交过）→ **退回活节点**，
+ * 在进图标态那次打一行 INFO（见 float.c 的 vidow_mini_set_state）。
+ */
+bool vidow_mini_uses_snapshot(const struct vidow_view *view) {
+	return view != NULL && view->mapped && view->mini == VIDOW_MINI_ICON &&
+		!view->force_render && view->last_buffer != NULL;
+}
+
+/* 快照节点收掉。它是 `layer_toplevels` 的孩子，**不跟着 view->scene_tree 走** ——
+ * 窗口 unmap / 销毁时留着它，屏上就是一块「窗口都没了、还冻着最后一帧」的鬼影
+ * （而且攥着那帧缓冲）。下次再进图标态 mini_snapshot_place() 会重建。 */
+static void mini_snapshot_free(struct vidow_view *view) {
+	if (view->mini_snapshot == NULL) {
+		return;
+	}
+	wlr_scene_node_destroy(&view->mini_snapshot->node);
+	view->mini_snapshot = NULL;
+}
+
+/* 图标态的快照节点：位置尺寸跟着图标那块盒子（contain 居中，和 view_mini_scale
+ * 同一条算法），只在「快照那条路」上开。 */
+static void mini_snapshot_place(struct vidow_view *view) {
+	if (view->scene_tree == NULL) {
+		return;
+	}
+	if (!vidow_mini_uses_snapshot(view)) {
+		if (view->mini_snapshot != NULL) {
+			wlr_scene_node_set_enabled(&view->mini_snapshot->node, false);
+		}
+		return;
+	}
+	if (view->mini_snapshot == NULL) {
+		if (view->server->layer_toplevels == NULL) {
+			return;
+		}
+		view->mini_snapshot = wlr_scene_buffer_create(
+			view->server->layer_toplevels, view->last_buffer);
+		if (view->mini_snapshot == NULL) {
+			return;
+		}
+		wlr_log(WLR_INFO, "mini: %s 图标态走快照（force_render 关）→ 真实节点"
+			"停到停车位、客户端停帧，图标和预览都是最后一帧",
+			vidow_view_title(view) != NULL ? vidow_view_title(view) : "(无题)");
+	} else if (view->mini_snapshot->buffer != view->last_buffer) {
+		wlr_scene_buffer_set_buffer(view->mini_snapshot, view->last_buffer);
+	}
+	int x = view->geom.x + (int)lround(view->anim_off_x);
+	int y = view->geom.y + (int)lround(view->anim_off_y);
+	int nw = 0, nh = 0;
+	view_mini_native(view, &nw, &nh);
+	int dw = view->geom.width, dh = view->geom.height;
+	if (nw > 0 && nh > 0) {
+		double s = (double)view->geom.width / (double)nw;
+		double sy = (double)view->geom.height / (double)nh;
+		if (sy < s) {
+			s = sy;
+		}
+		dw = (int)lround((double)nw * s);
+		dh = (int)lround((double)nh * s);
+		if (dw < 1) {
+			dw = 1;
+		}
+		if (dh < 1) {
+			dh = 1;
+		}
+	}
+	wlr_scene_buffer_set_dest_size(view->mini_snapshot, dw, dh);
+	wlr_scene_node_set_position(&view->mini_snapshot->node,
+		x + (view->geom.width - dw) / 2, y + (view->geom.height - dh) / 2);
+	wlr_scene_node_set_enabled(&view->mini_snapshot->node, true);
+}
+
+void vidow_mini_frames_sync(struct vidow_view *view) {
+	if (view == NULL) {
+		return;
+	}
+	struct vidow_server *server = view->server;
+	if (view->mini_snapshot != NULL) {
+		if (view->last_buffer == NULL) {
+			/* 窗口没了 / 还没交过帧：把快照收掉（留着会攥着一张过期缓冲）。 */
+			wlr_scene_node_set_enabled(&view->mini_snapshot->node, false);
+		} else if (view->mini_snapshot->buffer != view->last_buffer) {
+			wlr_scene_buffer_set_buffer(view->mini_snapshot, view->last_buffer);
+		}
+	}
+	/* 预览也吃同一份快照：不能出现「图标静止、预览还在动」。 */
+	if (server->mini_preview_snap != NULL &&
+			server->mini_preview_view == view &&
+			view->last_buffer != NULL &&
+			server->mini_preview_snap->buffer != view->last_buffer) {
+		wlr_scene_buffer_set_buffer(server->mini_preview_snap, view->last_buffer);
+	}
+	/* 进快照态那一刻 last_buffer 还是空的话，这里补摆一次（客户端下一帧就到）。 */
+	vidow_mini_frames_recheck(view);
+}
+
+/* 出帧策略（快照 / 活）跟**有效** force_render 走：规则 / IPC 把它改了之后，
+ * 得有人把这一面接上 —— 快照那条路要把真实节点停到停车位（客户端停帧），活
+ * 那条路要把它摆回图标那块。不接的话图标会「两边都不画」（快照关了、真实节点
+ * 还在停车位上，看起来就是图标凭空消失），或者反过来一直冻着。
+ *
+ * 谁调用：换 last_buffer 的那条路（客户端交帧）、指针一动（用户刚改完多半就在
+ * 鼠标上）、每帧的补帧循环（vidow_view_render_pump）。三条都便宜，且都幂等。 */
+void vidow_mini_frames_recheck(struct vidow_view *view) {
+	if (view == NULL || !view->mapped) {
+		return;
+	}
+	bool was = view->mini_snapshot != NULL && view->mini_snapshot->node.enabled;
+	mini_snapshot_place(view);
+	bool now = view->mini_snapshot != NULL && view->mini_snapshot->node.enabled;
+	if (was != now) {
+		vidow_view_apply_anim(view);
+	}
+}
+
+/* 预览的内容节点 / 缓冲：活镜面那条路是树里的 scene_surface，快照那条路是
+ * 一个 scene_buffer 节点 —— 位置、尺寸、透明度三个出口都走这两个取。 */
+static struct wlr_scene_node *preview_content_node(struct vidow_server *server) {
+	if (server->mini_preview_snap != NULL) {
+		return &server->mini_preview_snap->node;
+	}
+	if (server->mini_preview != NULL) {
+		return &server->mini_preview->node;
+	}
+	return NULL;
+}
+
+static struct wlr_scene_buffer *preview_content_buffer(
+		struct vidow_server *server) {
+	if (server->mini_preview_snap != NULL) {
+		return server->mini_preview_snap;
+	}
+	if (server->mini_preview_surface != NULL) {
+		return server->mini_preview_surface->buffer;
+	}
+	return NULL;
+}
+
 /* 镜面树里那层内容节点（wlr_scene_subsurface_tree_create 建的第一层就是它；
  * 子表面另外挂。和 capturemask.c 的写法一致）。 */
 static struct wlr_scene_surface *preview_find_surface(
@@ -3720,9 +3944,9 @@ static void preview_apply_alpha(struct vidow_server *server, double a) {
 		a = 1.0;
 	}
 	server->mini_preview_alpha = a;
-	if (server->mini_preview_surface != NULL) {
-		wlr_scene_buffer_set_opacity(server->mini_preview_surface->buffer,
-			(float)a);
+	struct wlr_scene_buffer *buf = preview_content_buffer(server);
+	if (buf != NULL) {
+		wlr_scene_buffer_set_opacity(buf, (float)a);
 	}
 }
 
@@ -3740,9 +3964,16 @@ static void preview_fade_done(void *data, bool cancelled) {
 		return;
 	}
 	if (server->mini_preview_alpha_to <= 0.0) {
-		/* 淡出完：收节点、忘掉 view（节点留着复用，下次换个表面就重建）。 */
-		if (server->mini_preview != NULL) {
-			wlr_scene_node_set_enabled(&server->mini_preview->node, false);
+		/* 淡出完：收节点、忘掉 view（节点留着复用，下次换个表面 / 换个模式就重建）。 */
+		struct wlr_scene_node *node = preview_content_node(server);
+		if (node != NULL) {
+			wlr_scene_node_set_enabled(node, false);
+		}
+		/* 快照那份是客户端缓冲的一张裸引用（wlr_scene_buffer 一直攥着）：收起来
+		 * 时松开，别替一个已经没了的窗口把缓冲扣着。活镜面那条路是
+		 * scene_surface，缓冲跟着它自己的生命周期走。 */
+		if (server->mini_preview_snap != NULL) {
+			wlr_scene_buffer_set_buffer(server->mini_preview_snap, NULL);
 		}
 		server->mini_preview_view = NULL;
 		server->mini_preview_shown = false;
@@ -3777,7 +4008,8 @@ void vidow_mini_preview_hide(struct vidow_server *server) {
 	server->mini_hover_timer = NULL;
 	server->mini_hover_view = NULL;
 	server->mini_preview_pressed = false;
-	if (!server->mini_preview_shown || server->mini_preview == NULL) {
+	if (!server->mini_preview_shown ||
+			(server->mini_preview == NULL && server->mini_preview_snap == NULL)) {
 		server->mini_preview_view = NULL;
 		server->mini_preview_shown = false;
 		server->mini_preview_box = (struct wlr_box){0};
@@ -3802,27 +4034,56 @@ static void preview_show(struct vidow_server *server, struct vidow_view *view) {
 	if (!preview_box_for(server, view, &box)) {
 		return;
 	}
-	/* 换了窗口（或者第一次）：重建镜面 —— 同一张表面挂第二棵树是允许的
-	 * （见 wincapture.c 那段注释）。 */
-	if (server->mini_preview == NULL || server->mini_preview_view != view) {
+	/* 出帧策略和图标**同一份判据**：走快照那条路时预览也是静止的最后一帧。 */
+	bool snapshot = vidow_mini_uses_snapshot(view);
+	if (snapshot) {
 		if (server->mini_preview != NULL) {
 			wlr_scene_node_destroy(&server->mini_preview->node);
 			server->mini_preview = NULL;
 			server->mini_preview_surface = NULL;
 		}
-		/* 挂 layer_top（不是 layer_toplevels）：它在窗口之上、会话锁和 overview
-		 * 都会把它整棵关掉（sessionlock.c / overview.c 那两个数组），而且
-		 * **不在模糊底衬抓取 / 裁剪检查的遍历范围里**（fx.c 那两处走的是
-		 * layer_toplevels）—— 挂错地方的话，悬停预览那块镜面会被当成一个窗口
-		 * 抓进底衬里，留下一块鬼影。 */
-		server->mini_preview = wlr_scene_subsurface_tree_create(
-			server->layer_top, surface);
-		if (server->mini_preview == NULL) {
+		if (server->mini_preview_snap == NULL) {
+			server->mini_preview_snap = wlr_scene_buffer_create(
+				server->layer_top, view->last_buffer);
+			if (server->mini_preview_snap == NULL) {
+				return;
+			}
+		} else if (server->mini_preview_snap->buffer != view->last_buffer) {
+			wlr_scene_buffer_set_buffer(server->mini_preview_snap,
+				view->last_buffer);
+		}
+	} else {
+		if (server->mini_preview_snap != NULL) {
+			wlr_scene_node_destroy(&server->mini_preview_snap->node);
+			server->mini_preview_snap = NULL;
+		}
+		/* 换了窗口（或者第一次）：重建镜面 —— 同一张表面挂第二棵树是允许的
+		 * （见 wincapture.c 那段注释）。 */
+		if (server->mini_preview == NULL || server->mini_preview_view != view) {
+			if (server->mini_preview != NULL) {
+				wlr_scene_node_destroy(&server->mini_preview->node);
+				server->mini_preview = NULL;
+				server->mini_preview_surface = NULL;
+			}
+			/* 挂 layer_top（不是 layer_toplevels）：它在窗口之上、会话锁和 overview
+			 * 都会把它整棵关掉（sessionlock.c / overview.c 那两个数组），而且
+			 * **不在模糊底衬抓取 / 裁剪检查的遍历范围里**（fx.c 那两处走的是
+			 * layer_toplevels）—— 挂错地方的话，悬停预览那块镜面会被当成一个窗口
+			 * 抓进底衬里，留下一块鬼影。 */
+			server->mini_preview = wlr_scene_subsurface_tree_create(
+				server->layer_top, surface);
+			if (server->mini_preview == NULL) {
+				return;
+			}
+			server->mini_preview_surface = preview_find_surface(server->mini_preview);
+		}
+		if (server->mini_preview_surface == NULL) {
 			return;
 		}
-		server->mini_preview_surface = preview_find_surface(server->mini_preview);
 	}
-	if (server->mini_preview_surface == NULL) {
+	struct wlr_scene_buffer *content = preview_content_buffer(server);
+	struct wlr_scene_node *node = preview_content_node(server);
+	if (content == NULL || node == NULL) {
 		return;
 	}
 	/* 尺寸：contain 塞进预览盒（和 S3 的 view_mini_scale 同一条算法 —— 不拉伸、
@@ -3845,27 +4106,92 @@ static void preview_show(struct vidow_server *server, struct vidow_view *view) {
 			dh = 1;
 		}
 	}
-	wlr_scene_buffer_set_dest_size(server->mini_preview_surface->buffer,
-		dw, dh);
-	wlr_scene_node_set_position(&server->mini_preview->node,
+	wlr_scene_buffer_set_dest_size(content, dw, dh);
+	wlr_scene_node_set_position(node,
 		box.x + (box.width - dw) / 2, box.y + (box.height - dh) / 2);
-	wlr_scene_node_set_enabled(&server->mini_preview->node, true);
+	wlr_scene_node_set_enabled(node, true);
 	/* 压在别的窗口之上：它可能比这些窗口后建出来（新开的窗口挂在后面）。 */
-	wlr_scene_node_raise_to_top(&server->mini_preview->node);
+	wlr_scene_node_raise_to_top(node);
 	server->mini_preview_view = view;
 	server->mini_preview_box = box;
 	server->mini_preview_shown = true;
 	preview_apply_alpha(server, 0.0);
 	preview_fade_to(server, 1.0, server->config.mini_hover_fade_in_ms);
 	wlr_log(WLR_INFO, "mini preview: %s 的预览在 %d,%d %dx%d（图标 %d,%d %dx%d，"
-		"贴 %s 边 → 朝屏内展开）",
+		"贴 %s 边 → 朝屏内展开，%s）",
 		vidow_view_title(view) != NULL ? vidow_view_title(view) : "(无题)",
 		box.x, box.y, box.width, box.height,
 		view->geom.x, view->geom.y, view->geom.width, view->geom.height,
 		view->mini_edge == VIDOW_MINI_EDGE_LEFT ? "左" :
 			view->mini_edge == VIDOW_MINI_EDGE_RIGHT ? "右" :
 			view->mini_edge == VIDOW_MINI_EDGE_TOP ? "上" :
-			view->mini_edge == VIDOW_MINI_EDGE_BOTTOM ? "下" : "（无）");
+			view->mini_edge == VIDOW_MINI_EDGE_BOTTOM ? "下" : "（无）",
+		snapshot ? "快照（force_render 关，静止的最后一帧）" :
+			"活镜面（force_render 开，动的）");
+}
+
+/* 指针是不是在「图标 → 预览」那条**空隙走廊**里（正朝预览走）：这时候用
+ * mini_icon_hover_grace_ms（200ms）而不是离开的 300ms —— 跨那 8px 空隙本来就要
+ * 一两帧「既不在图标也不在预览」，按 300ms 收会让用户看到闪一下再回来。
+ * 移向别处（不在走廊里）才按 mini_icon_hover_leave_ms 收。 */
+static bool preview_in_corridor(struct vidow_server *server, double lx,
+		double ly) {
+	if (!server->mini_preview_shown || server->mini_preview_view == NULL) {
+		return false;
+	}
+	struct vidow_view *view = server->mini_preview_view;
+	struct wlr_box prev = server->mini_preview_box;
+	struct wlr_box icon = {
+		.x = view->geom.x + (int)lround(view->anim_off_x),
+		.y = view->geom.y + (int)lround(view->anim_off_y),
+		.width = view->geom.width,
+		.height = view->geom.height,
+	};
+	int margin = server->config.mini_edge_margin;
+	if (margin < 0) {
+		margin = 0;
+	}
+	int y1 = icon.y < prev.y ? icon.y : prev.y;
+	int y2 = icon.y + icon.height > prev.y + prev.height ?
+		icon.y + icon.height : prev.y + prev.height;
+	struct wlr_box gap = {0};
+	if (prev.x + prev.width <= icon.x) {          /* 预览在图标左边 */
+		gap = (struct wlr_box){ .x = prev.x + prev.width, .y = y1,
+			.width = icon.x - (prev.x + prev.width), .height = y2 - y1 };
+	} else if (icon.x + icon.width <= prev.x) {   /* 预览在图标右边 */
+		gap = (struct wlr_box){ .x = icon.x + icon.width, .y = y1,
+			.width = prev.x - (icon.x + icon.width), .height = y2 - y1 };
+	} else if (prev.y + prev.height <= icon.y) {  /* 预览在图标上方 */
+		gap = (struct wlr_box){ .x = 0, .y = prev.y + prev.height,
+			.width = 0, .height = icon.y - (prev.y + prev.height) };
+		int x1 = icon.x < prev.x ? icon.x : prev.x;
+		int x2 = icon.x + icon.width > prev.x + prev.width ?
+			icon.x + icon.width : prev.x + prev.width;
+		gap.x = x1;
+		gap.width = x2 - x1;
+	} else if (icon.y + icon.height <= prev.y) {  /* 预览在图标下方 */
+		int x1 = icon.x < prev.x ? icon.x : prev.x;
+		int x2 = icon.x + icon.width > prev.x + prev.width ?
+			icon.x + icon.width : prev.x + prev.width;
+		gap = (struct wlr_box){ .x = x1, .y = icon.y + icon.height,
+			.width = x2 - x1, .height = prev.y - (icon.y + icon.height) };
+	} else {
+		return false; /* 两块贴在一起（没有空隙）：不存在「跨空隙」 */
+	}
+	/* 走廊在法线方向放宽 margin（指针抖一点也还算在走廊里），纵向也要覆盖
+	 * 两块盒子合起来的范围（指针从图标往预览斜着走）。 */
+	gap.x -= margin;
+	gap.y -= margin;
+	gap.width += margin * 2;
+	gap.height += margin * 2;
+	if (gap.width < 1) {
+		gap.width = 1;
+	}
+	if (gap.height < 1) {
+		gap.height = 1;
+	}
+	return lx >= gap.x && lx < gap.x + gap.width &&
+		ly >= gap.y && ly < gap.y + gap.height;
 }
 
 static void hover_timer_done(void *data, bool cancelled) {
@@ -3909,6 +4235,15 @@ void vidow_mini_preview_motion(struct vidow_server *server,
 	}
 	struct vidow_view *icon = (hit != NULL && hit->mini == VIDOW_MINI_ICON) ?
 		hit : NULL;
+	/* 用户刚用 IPC / 规则把 force_render 改了的话，指针一动就把出帧策略接上
+	 * （改完多半鼠标就动起来了 —— 快照态下客户端已经停帧，没有提交来触发
+	 * 重新摆位，指针一动是最靠得住的那个触发点）。 */
+	struct vidow_view *iv;
+	wl_list_for_each(iv, &server->views, link) {
+		if (iv->mini == VIDOW_MINI_ICON || iv->mini_snapshot != NULL) {
+			vidow_mini_frames_recheck(iv);
+		}
+	}
 	if (icon == NULL) {
 		/* 指针在预览上（只读，但算「还在看它」）→ 清掉离开计时 = 宽限期。 */
 		if (vidow_mini_preview_hit(server, server->cursor->x,
@@ -3918,8 +4253,19 @@ void vidow_mini_preview_motion(struct vidow_server *server,
 			server->mini_hover_view = NULL;
 			return;
 		}
-		/* 既不在图标也不在预览：起 / 保持离开计时（已经起着就不重起，
-		 * 免得每动一下都把 300ms 推倒重来 —— 那样永远收不掉）。 */
+		/* 既不在图标也不在预览：
+		 *   - 在「图标 → 预览」那条空隙走廊里（正朝预览走）→ 用宽限期
+		 *     mini_icon_hover_grace_ms（200ms），而且**每动一下重起**：人还
+		 *     在往预览走，不该被收走；
+		 *   - 移向别处 → 用 mini_icon_hover_leave_ms（300ms），**已经起着就
+		 *     不重起**（不然每动一下都推倒重来，永远收不掉）。 */
+		bool corridor = preview_in_corridor(server, server->cursor->x,
+			server->cursor->y);
+		if (corridor) {
+			hover_timer_start(server,
+				server->config.mini_icon_hover_grace_ms, true, NULL);
+			return;
+		}
 		if ((server->mini_preview_shown ||
 				server->mini_hover_timer != NULL) &&
 				(server->mini_hover_timer == NULL ||
@@ -3935,7 +4281,14 @@ void vidow_mini_preview_motion(struct vidow_server *server,
 		server->mini_hover_timer = NULL;
 	}
 	if (server->mini_preview_shown && server->mini_preview_view == icon) {
-		return; /* 已经露着 */
+		/* 已经露着 —— 但出帧策略可能刚翻面（force_render 被 IPC / 规则改了）：
+		 * 那就重建一次，免得「图标活了预览还冻着」（或反过来）—— 两条路必须
+		 * 一致。 */
+		if ((server->mini_preview_snap != NULL) !=
+				vidow_mini_uses_snapshot(icon)) {
+			preview_show(server, icon);
+		}
+		return;
 	}
 	if (server->mini_hover_timer != NULL &&
 			server->mini_hover_view == icon) {
@@ -4761,6 +5114,10 @@ static void view_unmap(struct wl_listener *listener, void *data) {
 	}
 	view_snapshot_close(view);
 	wlr_scene_node_set_enabled(&view->scene_tree->node, false);
+	/* 图标态那块快照同样要收：窗口 unmap 了就不该再有它的画面（它是
+	 * layer_toplevels 的孩子，scene_tree 关掉管不着它）。重新 map 时客户端一
+	 * 交帧，mini_snapshot_place() 会照现状重建。 */
+	mini_snapshot_free(view);
 	vidow_backdrop_damage_view(view);
 
 	if (server->mini_grab_view == view) {
@@ -4966,6 +5323,8 @@ static void view_commit(struct wl_listener *listener, void *data) {
 				client->source != view->last_buffer) {
 			wlr_buffer_unlock(view->last_buffer);
 			view->last_buffer = wlr_buffer_lock(client->source);
+			/* 小窗（S5）：换了最后一帧 → 快照节点（图标 + 预览）跟上。 */
+			vidow_mini_frames_sync(view);
 		}
 		return;
 	}
@@ -5066,6 +5425,8 @@ static void view_commit(struct wl_listener *listener, void *data) {
 			client->source != view->last_buffer) {
 		wlr_buffer_unlock(view->last_buffer);
 		view->last_buffer = wlr_buffer_lock(client->source);
+		/* 小窗（S5）：换了最后一帧 → 快照节点（图标 + 预览）跟上。 */
+		vidow_mini_frames_sync(view);
 	}
 }
 
@@ -5138,6 +5499,9 @@ static void view_destroy(struct wl_listener *listener, void *data) {
 		vidow_float_end_grab(server);
 	}
 	vidow_float_detach_children(server, view);
+	/* 图标态那块快照挂在 layer_toplevels 上，不跟着 scene_tree 走：窗口没了
+	 * 就得自己收（不收 = 屏上冻着一块「窗口已经没了」的鬼影）。 */
+	mini_snapshot_free(view);
 	wlr_buffer_unlock(view->last_buffer);
 	view->last_buffer = NULL;
 	vidow_fx_release(&view->fx);
@@ -5934,6 +6298,9 @@ static void x11_destroy_view(struct wl_listener *listener, void *data) {
 		vidow_float_end_grab(server);
 	}
 	vidow_float_detach_children(server, view);
+	/* 图标态那块快照挂在 layer_toplevels 上，不跟着 scene_tree 走：窗口没了
+	 * 就得自己收（不收 = 屏上冻着一块「窗口已经没了」的鬼影）。 */
+	mini_snapshot_free(view);
 	wlr_buffer_unlock(view->last_buffer);
 	view->last_buffer = NULL;
 	vidow_fx_release(&view->fx);
