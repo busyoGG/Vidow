@@ -5459,6 +5459,22 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
      - 未做：niri 的 `fixed 1920`（固定像素档）、`preset-window-heights`、`default-column-width {}`（让客户端自己定宽）、
        `always-center-single-column`；窗口规则级的 per-rule 预设覆盖。
 
+283. **还债：生成的配置里字符串型枚举漏了引号（`20-layout.lua` 打出 `center_focused_column = never`）**（用户「新增的配置应该给我本地的配置加上」时顺手撞出来的；2026-10-14）
+     - **怎么撞上的**：把用户本地 `~/.config/vidow`（旧快照，缺 7 个分类文件）和仓库当前默认对齐、headless 起来验一遍 —— 日志里一行
+       `[ERROR] … config.lua: …/20-layout.lua:9: center_focused_column: cannot use a nil as a config value`。
+     - **根因**：`src/config.c` 那个「打默认值」的函数有一份**加引号白名单**（`K_STRING` / `K_COLOR` / `K_EASING` / `K_MRU_SCOPE` / `K_MRU_LAYOUT` /
+       `K_TRISTATE` / `K_OPT_DOUBLE`），**漏了 `K_CENTER_FOCUSED`** —— 它也是字符串型枚举（`never` / `always` / `on-overflow`），于是打成裸词，
+       Lua 眼里是 `nil`。影响所有 `--default-config` 用户：拷这份生成物进自己配置就吃一个 ERROR，而且**照文档把 `never` 改成 `always` 会静默不生效**
+       （报错被吞成一行日志，值退回内置默认）。
+     - **修法**：白名单补上 `K_CENTER_FOCUSED`（注释里写明「字符串型枚举也必须加引号，判据 = 生成物必须能被原样读回来」）；重生成后**只有** `20-layout.lua`
+       这一处变化（`never` → `"never"`，逐个文件 `diff` 核过）。
+     - **新判据**（`test-defaultconfig.sh` 第 7 节，3 条）：① `--default-config all` 的文本里不许有裸词值（正则扫 `^key = 裸词$`，白名单只留 `true/false/auto`）；
+       ② 整份生成物**真当配置加载一遍**能起来；③ 加载日志里没有 `ERROR.*config` / `cannot use` / `不认识` / `未知`。
+       `test-defaultconfig.sh` **44 PASS → 47 PASS / 0 FAIL**。
+     - 顺带：和它同一批对齐的还有用户的本地配置本身（缺 `16-env` / `19-input` / `20-layout` / `21-keyboard` / `22-workspace` / `23-wincapture` / `24-mini`
+       七份文件、`15-mru.lua` 还是老的表语法 `mru = { … }`、`02-decor.lua` 缺 `corner_n`、`09-output.lua` 缺 3 个键、`13-cursor.lua` 缺 6 个键、`14-keys.lua` 缺 11 个键位）——
+       已按「只补缺失、不动你已有值」补上，整份备份在 `~/.config/vidow.bak-<时间戳>`。
+
 282. **修一个会打死合成器的崩溃：过冲缓动曲线（`easing = "out_back …"`）下按 `Mod+O` 进 overview**（用户：「overview现在一打开就崩溃」；2026-10-14）
      - **现象**：用户真机上 `easing = "out_back 0.18"`（全局缓动曲线，过冲）时一进 overview 整个合成器就死，日志最后一行是
        `vidow: types/scene/wlr_scene.c:1133: wlr_scene_buffer_set_opacity: Assertion 'opacity >= 0 && opacity <= 1' failed.`

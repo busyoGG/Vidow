@@ -2591,7 +2591,13 @@ static void print_lua_value(FILE *f, const struct vidow_config *cfg,
 	}
 	if (kind != K_STRING && kind != K_COLOR && kind != K_EASING &&
 			kind != K_MRU_SCOPE && kind != K_MRU_LAYOUT &&
-			kind != K_TRISTATE && kind != K_OPT_DOUBLE) {
+			kind != K_TRISTATE && kind != K_OPT_DOUBLE &&
+			/* 字符串型枚举也必须加引号：漏了它就会打成
+			 * `center_focused_column = never` —— Lua 眼里那是 nil，
+			 * 加载时 `cannot use a nil as a config value`，谁把这份
+			 * 生成物拷进自己配置就吃一个 ERROR（20-layout.lua 就这么错到
+			 * 用户那儿去的）。判据：生成物必须能被原样读回来。 */
+			kind != K_CENTER_FOCUSED) {
 		fputs(v, f);
 		return;
 	}

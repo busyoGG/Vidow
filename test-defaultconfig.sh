@@ -344,4 +344,37 @@ print("全部通过 / test-defaultconfig.sh: OK")
 PY
 ASSERTED=$?
 [ $ASSERTED -eq 0 ] || FAILED=1
+
+# ---------------------------------------------------------------- 生成物能被读回来
+mark "7) 生成物必须能被 Lua 原样读回来（字符串/枚举都要带引号）"
+# 走过的坑：生成器给「字符串型枚举」漏了引号 —— 20-layout.lua 打出的是
+# `center_focused_column = never`，Lua 眼里那是 nil，加载时报
+# `cannot use a nil as a config value`。谁把这份生成物拷进自己配置就吃一个 ERROR
+# （用户真机上就是这么撞上的）。两条判据：文本上不许有裸词值 + 真当配置加载一遍。
+"$VIDOW" --default-config all > "$RUNDIR/all-gen.lua" 2> "$RUNDIR/all-gen.err"
+bare=$(grep -nE '^[a-z_]+ = [A-Za-z][A-Za-z0-9_-]*$' "$RUNDIR/all-gen.lua" |
+	grep -vE '= (true|false|auto)$')
+if [ -n "$bare" ]; then
+	fail "生成物里有没加引号的裸词值（Lua 里是 nil）：$(echo "$bare" | head -3 | tr '\n' ' ')"
+else
+	pass "生成物里没有裸词值（字符串 / 枚举都带引号）"
+fi
+
+rm -f "$LOG"
+VIDOW_CONFIG="$RUNDIR/all-gen.lua" setsid "$VIDOW" > "$LOG" 2>&1 &
+VIDOW_PID=$!
+for _ in $(seq 1 60); do grep -aq "vidow ready" "$LOG" && break; sleep 0.25; done
+if grep -aq "vidow ready" "$LOG"; then
+	pass "整份生成物（--default-config all）能当配置起起来"
+else
+	fail "整份生成物起不来"; grep -a "ERROR" "$LOG" | head -3
+fi
+badcfg=$(grep -aE "ERROR.*config|config.*cannot use|config.*不认识|config.*未知" "$LOG" | head -3)
+if [ -n "$badcfg" ]; then
+	fail "加载生成物时报了配置错误：$(echo "$badcfg" | head -2 | tr '\n' ' ')"
+else
+	pass "加载生成物没有配置解析错误"
+fi
+stop_vidow
+
 exit $FAILED
