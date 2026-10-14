@@ -3674,6 +3674,11 @@ struct vidow_view *vidow_view_at(struct vidow_server *server,
 		double lx, double ly, struct wlr_surface **surface,
 		double *sx, double *sy);
 void vidow_focus_view(struct vidow_view *view);
+/* 「跳到这个窗口」的入口（MRU 切换器提交 / IPC 的 focus-window）：目标是迷你 /
+ * 图标态的话，先把它摊成自由小窗（FREE）**再**给焦点 —— 顺序不能反，
+ * vidow_focus_view 对 MINI / ICON 有守卫（不变量：server->focused 永不指向
+ * MINI / ICON）。FREE 态与普通窗口照旧。 */
+void vidow_focus_view_expand_mini(struct vidow_view *view);
 /* 「聚焦这个窗口会让条带滚多少像素」—— 和 arrange 的 Pass 2（把焦点列滚回可见
  * 区）算的是同一件事。focus-follows-mouse 的 max-scroll-amount 拿它跟阈值比
  * （见 input.c 的 focus_follows_mouse）。 */

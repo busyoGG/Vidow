@@ -1397,8 +1397,10 @@ static void mru_close(struct vidow_server *server, bool commit) {
 	mru_scene_apply(server);
 	vidow_backdrop_damage(server, false);
 	if (target != NULL && target->mapped && !target->minimized) {
-		/* 明确选中 = 明确使用：直接落账，不等 debounce。 */
-		vidow_focus_view(target);
+		/* 明确选中 = 明确使用：直接落账，不等 debounce。目标是迷你 / 图标态
+		 * 的小窗时先摊成自由小窗再给焦点 —— 它们在切换器里列着（这是想要的），
+		 * 选中就要能用它（vidow_focus_view_expand_mini）。 */
+		vidow_focus_view_expand_mini(target);
 		/* 切换器也是键盘选窗口，所以一样带光标过去（niri 的
 		 * confirm_mru → focus_window 就是这么做的；默认关）。 */
 		vidow_warp_cursor_to_focus(server);

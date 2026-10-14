@@ -429,7 +429,9 @@ static bool cmd_focus_window(struct vidow_server *server, struct jval *req,
 	if (view == NULL) {
 		return false;
 	}
-	vidow_focus_view(view);
+	/* 「跳到这个窗口」和 MRU 切换器提交是同一个语义：目标是迷你 / 图标态的小窗
+	 * 就先摊成自由小窗再给焦点（vidow_focus_view 对这两种形态有守卫）。 */
+	vidow_focus_view_expand_mini(view);
 	changed_window(out, server, view);
 	return true;
 }

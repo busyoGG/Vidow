@@ -3420,6 +3420,25 @@ void vidow_focus_view(struct vidow_view *view) {
 	}
 }
 
+/* 「跳到这个窗口」= 迷你 / 图标态先摊成自由小窗，再给焦点（见 server.h）。
+ *
+ * 为什么在这儿：MRU 切换器（Alt+Tab 提交 / 点击卡片，src/mru.c）和 IPC 的
+ * focus-window（src/ipc.c）是「选中即跳过去」的同一个语义，共用这一个入口；
+ * 迷你 / 图标态是列在切换器里的（mru_listable 不管形态），选中它就该能用它。
+ *
+ * 顺序反过来（先 vidow_focus_view）会被上面那条守卫挡回来：什么都不发生，
+ * 也就是这次改动之前的行为。摊成 FREE 走的是 float.c 的形态机，过渡动画、
+ * 出帧策略、宽高比那套一件不少。 */
+void vidow_focus_view_expand_mini(struct vidow_view *view) {
+	if (view == NULL) {
+		return;
+	}
+	if (view->mini == VIDOW_MINI_MINI || view->mini == VIDOW_MINI_ICON) {
+		vidow_mini_set_state(view, VIDOW_MINI_FREE);
+	}
+	vidow_focus_view(view);
+}
+
 /* 「把这个窗口端到人面前」：xdg-activation（点通知 / 客户端自己顶上来）、
  * 任务栏按钮（foreign-toplevel 的 activate）、X11 的 _NET_ACTIVE_WINDOW 都走这里。
  *
