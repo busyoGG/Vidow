@@ -957,6 +957,31 @@ static void mini_grab_update(struct vidow_server *server) {
 	 * 出屏幕（用户视频 /tmp/mini.mp4）。图标态照旧允许出屏一点（mini_icon_overflow）。 */
 	vidow_mini_anchor_from(view, work, view->float_geom.width,
 		view->float_geom.height, x, y, view->mini != VIDOW_MINI_MINI);
+	if (view->mini == VIDOW_MINI_ICON) {
+		/* 图标吸附：永远贴最近那条工作区边 —— 那条轴上钉死在边上，另一轴跟着
+		 * 光标（所以还能沿边上下 / 左右挪）；出屏方向也跟着这条边（resolve 里
+		 * 按 mini_edge 让 mini_icon_overflow 那点探出屏外）。用户：
+		 * 「icon态需要吸附在屏幕边缘」。 */
+		enum vidow_mini_edge e = vidow_mini_nearest_edge(server, view,
+			view->float_geom.width, view->float_geom.height, x, y);
+		view->mini_edge = e;
+		switch (e) {
+		case VIDOW_MINI_EDGE_LEFT:
+			view->mini_ax = 0.0;
+			break;
+		case VIDOW_MINI_EDGE_RIGHT:
+			view->mini_ax = 1.0;
+			break;
+		case VIDOW_MINI_EDGE_TOP:
+			view->mini_ay = 0.0;
+			break;
+		case VIDOW_MINI_EDGE_BOTTOM:
+			view->mini_ay = 1.0;
+			break;
+		case VIDOW_MINI_EDGE_NONE:
+			break;
+		}
+	}
 	vidow_mini_resolve_geom(view);
 	vidow_arrange(server);
 }
@@ -1658,6 +1683,17 @@ void vidow_pointer_axis(struct vidow_server *server,
 	 * **只认竖直轴**：滚轮左右倾（横向轴）以前也滚同一个列表，那是错的 —— 概览里
 	 * 没有横向可滚的东西（一行的横向预览跟工作区自己的视口走），吃掉不动作。 */
 	if (vidow_overview_active(server)) {
+		/* 先问绑定表：按着 Mod 滚滚轮 = 「移动窗口焦点」（用户自己的
+		 * 14-keys.lua：Mod+wheel-up/down = focus-column left/right）。以前这里
+		 * 把整段滚轮直接交给列表滚动、从不问绑定表，于是 overview 里
+		 * Mod+滚轮什么都不做（用户报的「overview状态下还是无法通过mod+滚轮
+		 * 移动窗口焦点」）。没命中绑定才轮到列表滚动。 */
+		struct wlr_keyboard *kb0 = wlr_seat_get_keyboard(server->seat);
+		uint32_t mods0 = kb0 != NULL ? wlr_keyboard_get_modifiers(kb0) : 0;
+		if (vidow_keybind_wheel(server, orientation, amount, mods0,
+				vidow_shortcuts_inhibited(server))) {
+			return;
+		}
 		if (orientation == WL_POINTER_AXIS_VERTICAL_SCROLL && amount != 0) {
 			vidow_overview_scroll(server, amount > 0 ? 1 : -1);
 		}

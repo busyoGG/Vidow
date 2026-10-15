@@ -787,7 +787,12 @@ static struct vidow_view *mini_box_view_at(struct vidow_server *server,
 	}
 	struct vidow_view *view;
 	wl_list_for_each(view, &server->views, link) {
-		if (view->mini != VIDOW_MINI_MINI ||
+		/* 迷你**和自由**小窗都整盒命中：内容被 contain 缩放过，盒里左右（或
+		 * 上下）留着壁纸色的留白 —— 只靠场景图命中的话，点在留白上什么也不
+		 * 发生（用户报的「还是左右有死区」）。图标态不在这儿：它有自己的命中
+		 * 盒（mini_icon_view_at，贴边那一块）。 */
+		if ((view->mini != VIDOW_MINI_MINI &&
+				view->mini != VIDOW_MINI_FREE) ||
 				!view->mapped || view->output == NULL ||
 				!vidow_workspace_view_visible(server, view) ||
 				view->float_geom.width <= 0 || view->float_geom.height <= 0) {

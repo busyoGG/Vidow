@@ -3027,6 +3027,10 @@ bool vidow_mini_ui_init(struct vidow_server *server);
 struct wlr_output *vidow_mini_output_across(struct vidow_server *server,
 		struct wlr_output *self, enum vidow_mini_edge edge);
 /* 光标贴着自己那块屏的哪条边（mini_edge_snap_px 以内）。NONE = 没贴边。 */
+/* 离 (bx,by,w,h) 这个盒子最近的那条工作区边（图标态拖拽吸附用）。 */
+enum vidow_mini_edge vidow_mini_nearest_edge(struct vidow_server *server,
+		struct vidow_view *view, int w, int h, double bx, double by);
+
 enum vidow_mini_edge vidow_mini_edge_under_cursor(struct vidow_server *server,
 		struct vidow_view *view);
 /* 跨屏边松手：换屏、保持形态（锚点是相对那块屏的工作区记的，天然对得上）。 */

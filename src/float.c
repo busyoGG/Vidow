@@ -1016,6 +1016,41 @@ struct wlr_output *vidow_mini_output_across(struct vidow_server *server,
 /* 光标贴着自己那块屏工作区的哪条边（mini_edge_snap_px 以内），没贴边 = NONE。
  * 只认自己那块屏的四条边 —— 跨屏边也在四条里，收不收图标由调用方按
  * vidow_mini_output_across() 判。 */
+/* 离这个位置最近的那条工作区边（**always** 有答案，除非工作区退化）。
+ * 图标态拖拽用它吸附：图标永远贴最近那条边（用户：「icon态需要吸附在屏幕边缘」）
+ * —— vidow_mini_edge_under_cursor() 那个是「光标在 mini_edge_snap_px 以内才算贴
+ * 边」，给收图标用；这里要的是「无论拖到哪儿都挑一条边」。按**盒子中心**量，不按
+ * 光标：光标在盒子里的抓点位置是任意的，按光标会让吸附跟着抓点跳。 */
+enum vidow_mini_edge vidow_mini_nearest_edge(struct vidow_server *server,
+		struct vidow_view *view, int w, int h, double bx, double by) {
+	if (server == NULL || view == NULL) {
+		return VIDOW_MINI_EDGE_NONE;
+	}
+	struct wlr_box work = vidow_work_area(server, view->output);
+	if (work.width < 1 || work.height < 1) {
+		return VIDOW_MINI_EDGE_NONE;
+	}
+	double cx = bx + (double)w / 2.0;
+	double cy = by + (double)h / 2.0;
+	double d[4] = {
+		fabs(cx - (double)work.x),
+		fabs((double)(work.x + work.width) - cx),
+		fabs(cy - (double)work.y),
+		fabs((double)(work.y + work.height) - cy),
+	};
+	enum vidow_mini_edge edges[4] = {
+		VIDOW_MINI_EDGE_LEFT, VIDOW_MINI_EDGE_RIGHT,
+		VIDOW_MINI_EDGE_TOP, VIDOW_MINI_EDGE_BOTTOM,
+	};
+	int best = 0;
+	for (int i = 1; i < 4; i++) {
+		if (d[i] < d[best]) {
+			best = i;
+		}
+	}
+	return edges[best];
+}
+
 enum vidow_mini_edge vidow_mini_edge_under_cursor(struct vidow_server *server,
 		struct vidow_view *view) {
 	if (server == NULL || view == NULL) {
