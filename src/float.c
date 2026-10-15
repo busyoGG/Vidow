@@ -1768,12 +1768,15 @@ void vidow_mini_resolve_geom(struct vidow_view *view) {
 			break;
 		}
 	} else {
-		/* 迷你小窗夹在工作区里（留 mini_edge_margin 的边）；**自由小窗不吃这个
-		 * 留白** —— 它是自由摆放的正常窗户，用户报的「小窗移动范围受限、左右
-		 * 有不可移动区域」就是这 8px（实测最左 x = 18 = 10 + 8，最右 758 =
-		 * 10 + 1260 - 8 - 504）。FREE 只夹在工作区框里（margin = 0）。 */
-		int margin = view->mini == VIDOW_MINI_FREE ? 0 :
-			cfg->mini_edge_margin;
+		/* 边距**只给迷你态**：它是「贴边的小窗」，留一点缝好看。
+		 * 自由小窗（FREE）和普通浮窗（NONE）都不吃 —— 它们能贴到工作区边上。
+		 *
+		 * 用户报的「迷你态和自由态一样的啊，现在还是左右有死区」就是这里：以前
+		 * 只有 FREE 被特判成 0，MINI 和 NONE 都拿 mini_edge_margin（8px）—— 于是
+		 * 「迷你态」和「普通浮窗/自由态」在左右各留 8px 进不去，一模一样。普通
+		 * 浮窗更冤：它不是小窗家族的东西，凭什么吃小窗的边距。 */
+		int margin = view->mini == VIDOW_MINI_MINI ?
+			cfg->mini_edge_margin : 0;
 		if (margin < 0) {
 			margin = 0;
 		}
