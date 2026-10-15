@@ -864,7 +864,14 @@ static bool view_alive(struct vidow_server *server, struct vidow_view *want) {
 static void focus_workspace(struct vidow_server *server,
 		struct vidow_workspace *ws) {
 	/* 先回到上次离开时那个窗口（还在、还映射着、还属于这块工作区才算），
-	 * 否则找这块工作区里的第一列，再没有就把焦点放空。 */
+	 * 否则找这块工作区里的第一列，再找浮窗，最后才把焦点放空。
+	 *
+	 * 「找浮窗」这一档是补的：一块工作区上的窗口**全是浮窗 / 自由小窗**时
+	 * （用户桌上那堆小窗就是），只翻列的话一个都找不到 —— 焦点被清空，键盘
+	 * 打进虚空。现象就是「切过去之后焦点没跟过来」。小窗（MINI / ICON）跳过：
+	 * 不变量是 focused 永远不指小窗（要给焦点得先摊开，见
+	 * vidow_focus_view_expand_mini，那条路是 Alt+Tab / 全景点选 / IPC 走
+	 * 的，不该在切工作区时替用户把窗口改形态）。 */
 	if (ws->focused != NULL && view_alive(server, ws->focused) &&
 			ws->focused->mapped && ws->focused->ws == ws) {
 		vidow_focus_view(ws->focused);
@@ -878,6 +885,15 @@ static void focus_workspace(struct vidow_server *server,
 		struct vidow_view *view = wl_container_of(col->views.next, view,
 			column_link);
 		vidow_focus_view(view);
+		return;
+	}
+	struct vidow_view *fv;
+	wl_list_for_each(fv, &server->views, link) {
+		if (fv->ws != ws || !fv->mapped || fv->minimized || fv->popup ||
+				fv->mini != VIDOW_MINI_NONE) {
+			continue;
+		}
+		vidow_focus_view(fv);
 		return;
 	}
 	server->focused = NULL;
@@ -937,6 +953,10 @@ struct ws_slide {
 	struct vidow_anim *anim;
 	int height; /* 推开多远：整块屏高 */
 	int dir;    /* +1 = 新的从下面进来（旧往上走），-1 = 反过来 */
+	/* 起手那一刻**这两块**画在哪（快速连切时不是 0，见 slide_start）。插值从
+	 * 这儿走到目标，而不是永远从 0 起步 —— 从 0 起步就是「先啪地跳回去再滑」，
+	 * 用户报的「工作区快速切换的动画不够丝滑」。 */
+	double from0, to0;
 };
 
 static void slide_update(void *data, double t, double linear) {
@@ -946,13 +966,13 @@ static void slide_update(void *data, double t, double linear) {
 		return;
 	}
 	double off = (double)sl->height * t;
-	if (sl->dir > 0) {
-		sl->from->slide_y = -off;
-		sl->to->slide_y = (double)sl->height - off;
-	} else {
-		sl->from->slide_y = off;
-		sl->to->slide_y = off - (double)sl->height;
-	}
+	double from_to = sl->dir > 0 ? -off : off;
+	double to_to = sl->dir > 0 ? (double)sl->height - off
+				   : off - (double)sl->height;
+	/* 从**起手那一刻的位置**插值（正常起手时 from0/to0 都是 0，和以前逐字节
+	 * 等价；只有快速连切接手上一条没滑完的进度时它们才非 0）。 */
+	sl->from->slide_y = sl->from0 + (from_to - sl->from0) * t;
+	sl->to->slide_y = sl->to0 + (to_to - sl->to0) * t;
 	vidow_arrange(sl->server);
 	vidow_output_schedule_frame(sl->server, sl->output->wlr_output,
 		"切工作区过渡");
@@ -1008,6 +1028,12 @@ static void slide_start(struct vidow_server *server, struct vidow_output *output
 	if (output == NULL || from == NULL || to == NULL || from == to) {
 		return;
 	}
+	/* 快速连切（1 → 2 → 3，上一条还没滑完）：屏幕上正停在中间，而下面掐掉上
+	 * 一条时它的 done 会把**所有**偏移清零 —— 所以先把这次要用的这两块**当前
+	 * 位置**记下来，让新的这条从那儿接着走。不记的话就是「先啪地跳回原位、再从
+	 * 原位滑一遍」，用户报的「工作区快速切换的动画不够丝滑」。 */
+	double from0 = from->slide_y;
+	double to0 = to->slide_y;
 	/* 还在滑的那条先掐掉：它的 done 会把偏移清零、把计数减回去。 */
 	if (output->slide_anim != NULL) {
 		vidow_anim_cancel(output->slide_anim);
@@ -1031,6 +1057,8 @@ static void slide_start(struct vidow_server *server, struct vidow_output *output
 	sl->height = height;
 	/* 新的在栈里比旧的靠下 → 它从下面进来（旧往上走）。 */
 	sl->dir = vidow_workspace_index(to) > vidow_workspace_index(from) ? 1 : -1;
+	sl->from0 = from0;
+	sl->to0 = to0;
 
 	output->slide_from = from;
 	server->workspace_slide_n++;
