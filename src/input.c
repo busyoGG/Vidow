@@ -1057,10 +1057,16 @@ static bool mini_pointer_hover_swallow(struct vidow_server *server,
 		/* 小窗（S4）：光标落在**工具条自己**身上时工具条留着（它不在窗口的命中
 		 * 范围里 —— 不是表面，vidow_view_at 命中不到它），而且这一份移动也不
 		 * 转给客户端（工具条是合成器盖在桌面上的东西）。不这么写的话，指针
-		 * 一离开窗口往按钮上走，工具条就没了 —— 永远点不中。 */
+		 * 一离开窗口往按钮上走，工具条就没了 —— 永远点不中。
+		 *
+		 * 判的是**附近**（vidow_mini_toolbar_near，整块外扩 12px）而不是按钮矩形：
+		 * 工具条跟窗口之间隔着 4px（摆在小窗上方 `g.y - h - 4`），指针穿那条缝的
+		 * 一帧既不在窗口上、也不在按钮上 —— 只认按钮矩形的话工具条就在缝里被收掉
+		 * 了（用户报的「整个工具条都不能交互」；注入测试一步跳到按钮上，所以没
+		 * 暴露出来）。 */
 		if (server->mini_toolbar_view != NULL &&
-				vidow_mini_toolbar_hit(server, server->mini_toolbar_view,
-					server->cursor->x, server->cursor->y) >= 0) {
+				vidow_mini_toolbar_near(server, server->cursor->x,
+					server->cursor->y)) {
 			return true;
 		}
 		/* 光标离开小窗（或落在别的东西上）→ 工具条收起来。只在小窗态之间

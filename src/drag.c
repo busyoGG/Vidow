@@ -794,6 +794,27 @@ void vidow_mini_toolbar_hide(struct vidow_server *server) {
 	}
 }
 
+/* 光标在工具条**附近**吗（整块往外扩 margin 像素）。悬停路由用它「留住」工具条：
+ * 工具条摆在小窗上方 4px（mini_toolbar_layout 里的 `g.y - h - 4`），指针从窗口往
+ * 按钮上走**必须穿过那条缝** —— 只按按钮矩形判的话，缝里那一帧就把工具条收掉了，
+ * 用户永远点不中（用户报的「整个工具条都不能交互」）。按下那一路仍然只认按钮矩形
+ * （vidow_mini_toolbar_hit），不吃这条放宽。 */
+bool vidow_mini_toolbar_near(struct vidow_server *server, double lx, double ly) {
+	if (server == NULL || server->mini_toolbar_view == NULL) {
+		return false;
+	}
+	const int margin = 12;
+	struct wlr_box b = server->mini_toolbar_box;
+	if (b.width <= 0 || b.height <= 0) {
+		return false;
+	}
+	b.x -= margin;
+	b.y -= margin;
+	b.width += margin * 2;
+	b.height += margin * 2;
+	return wlr_box_contains_point(&b, lx, ly);
+}
+
 int vidow_mini_toolbar_hit(struct vidow_server *server,
 		struct vidow_view *view, double lx, double ly) {
 	if (server == NULL || view == NULL ||

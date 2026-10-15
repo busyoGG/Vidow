@@ -801,6 +801,18 @@ if [ -n "$TL" ]; then
 	BX=$(echo "$TL" | sed -n 's/.*还原成列 \([0-9]*\),\([0-9]*\).*/\1/p')
 	BY=$(echo "$TL" | sed -n 's/.*还原成列 \([0-9]*\),\([0-9]*\).*/\2/p')
 	CCX=$((BX + 17)); CCY=$((BY + 13))
+	# 走**真实路径**：先经过工具条与窗口之间那条 4px 缝，再到按钮上。一步跳到按钮
+	# 上测不出「缝里被收掉」那个 bug（用户报的「整个工具条都不能交互」）。修法见
+	# vidow_mini_toolbar_near()。
+	# 缝在哪取决于工具条摆上还是摆下（摆上方放不下时会翻到窗口下面，见
+	# mini_toolbar_layout），所以按日志里工具条实际的 y 取。
+	TBY=$(echo "$TL" | sed -n 's/.*整块 [0-9]*,\([0-9]*\) [0-9]*x[0-9]*.*/\1/p')
+	if [ -n "$TBY" ] && [ "$TBY" -gt "$IY" ]; then
+		GAPY=$((IY + IH + 2))
+	else
+		GAPY=$((IY - 2))
+	fi
+	act "pointer-motion $CCX $GAPY" 0.3
 	act "pointer-motion $CCX $CCY" 0.25
 	act "pointer-button left press" 0.5
 	act "pointer-button left release" 0.8
@@ -1774,6 +1786,54 @@ read -r X8 Y8 W8 H8 <<< "$(echo "$(geom)" | tr 'x,' ' ')"
 act "pointer-button left release mod" 1.2
 echo "  跨屏日志：$(since "$MARK" | grep -a '挪到' | tail -1)"
 ./build/vidowmsg output-scale HEADLESS-2 1 >/dev/null 2>&1; sleep 0.6
+
+# ================================================================ S9：工具条在 scale 2 屏上
+# 用户：「整个工具条都不能交互」（他在 DP-2，3840x2160 @ scale 2 上）。上面那条
+# 判据只在 scale 1 的单屏上验过 —— 这里在 scale 2 屏上照同一条路再走一遍：
+# 悬停迷你小窗 → 工具条露出 → 点「还原成列」→ 形态回到 none。
+mark "S9 工具条在 scale 2 屏上：悬停露出 + 点「还原成列」"
+ID=$(mini_id)
+unmini; sleep 0.7
+./build/vidowmsg move-window-to-output HEADLESS-2 --id "$ID" >/dev/null 2>&1
+./build/vidowmsg output-scale HEADLESS-2 2 >/dev/null 2>&1
+sleep 1.0
+set_state mini; sleep 1.0
+read -r IX IY IW IH <<< "$(echo "$(geom)" | tr 'x,' ' ')"
+echo "  scale 2 屏上的迷你盒：$IX,$IY ${IW}x${IH}"
+MARK=$(logmark)
+act "pointer-motion $((IX + IW / 2)) $((IY + IH / 2))" 0.5
+TL=$(since "$MARK" | grep -a 'mini toolbar: w1 露出' | tail -1)
+echo "  ${TL:-(工具条没露出)}"
+if [ -n "$TL" ]; then
+	pass "scale 2 屏：悬停迷你小窗 → 工具条露出"
+	BX=$(echo "$TL" | sed -n 's/.*还原成列 \([0-9]*\),\([0-9]*\).*/\1/p')
+	BY=$(echo "$TL" | sed -n 's/.*还原成列 \([0-9]*\),\([0-9]*\).*/\2/p')
+	CCX=$((BX + 17)); CCY=$((BY + 13))
+	# 走**真实路径**：先经过工具条与窗口之间那条 4px 缝，再到按钮上。一步跳到按钮
+	# 上测不出「缝里被收掉」那个 bug（用户报的「整个工具条都不能交互」）。修法见
+	# vidow_mini_toolbar_near()。
+	# 缝在哪取决于工具条摆上还是摆下（摆上方放不下时会翻到窗口下面，见
+	# mini_toolbar_layout），所以按日志里工具条实际的 y 取。
+	TBY=$(echo "$TL" | sed -n 's/.*整块 [0-9]*,\([0-9]*\) [0-9]*x[0-9]*.*/\1/p')
+	if [ -n "$TBY" ] && [ "$TBY" -gt "$IY" ]; then
+		GAPY=$((IY + IH + 2))
+	else
+		GAPY=$((IY - 2))
+	fi
+	act "pointer-motion $CCX $GAPY" 0.3
+	act "pointer-motion $CCX $CCY" 0.25
+	act "pointer-button left press" 0.5
+	act "pointer-button left release" 0.8
+	BTN=$(since "$MARK" | grep -a '点了按钮' | tail -1)
+	echo "  ${BTN:-(没有点按钮的日志)}"
+	[ -n "$BTN" ] && pass "scale 2 屏：点中按钮（工具条 $BX,$BY，点的是 $CCX,$CCY）" ||
+		fail "scale 2 屏：按钮没点中（工具条 $BX,$BY，点的是 $CCX,$CCY）"
+	[ "$(winf w1 mini)" = "none" ] && pass "scale 2 屏：「还原成列」→ 形态回到 none" ||
+		fail "scale 2 屏：按钮点了但形态没还原：$(winf w1 mini)"
+else
+	fail "scale 2 屏：工具条没露出来"
+fi
+./build/vidowmsg output-scale HEADLESS-2 1 >/dev/null 2>&1; sleep 0.5
 
 # ================================================================
 exec 9>&-

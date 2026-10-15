@@ -2984,6 +2984,8 @@ void vidow_mini_toolbar_show(struct vidow_server *server,
 		struct vidow_view *view);
 void vidow_mini_toolbar_hide(struct vidow_server *server);
 /* 命中测试：这个点落在工具条的哪个按钮上（没有 = -1）。工具条不是表面，靠矩形。 */
+bool vidow_mini_toolbar_near(struct vidow_server *server, double lx, double ly);
+
 int vidow_mini_toolbar_hit(struct vidow_server *server,
 		struct vidow_view *view, double lx, double ly);
 /* 点一下某个按钮（工具条自己的动作，见 float.c）。 */
