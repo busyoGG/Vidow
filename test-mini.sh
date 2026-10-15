@@ -526,6 +526,26 @@ else
 	fail "按在左留白上拖不动：盒子 $X,$Y → $NX,$NY（期望 x 减 ≈100）"
 fi
 
+mark "S3 自由小窗能拖出屏边：屏幕左右那两片区域不再卡住它"
+# 用户：「小窗在屏幕上拖拽的时候，左右屏幕区域会把小窗卡住不让过去」+「能拖出屏幕
+# 边缘（允许一半在屏外）」。以前 FREE 的锚点夹在 0..1、resolve 的兜底又把盒子夹回
+# 工作区 ⇒ 盒子左边缘最多停在 work.x + span，离屏边还差一整个盒子宽（实测光标顶到
+# 1919，盒子还卡在 1151 = 1908 - 763）。现在同一块屏内拖动允许**出屏半个盒子**，
+# 跨屏改归属那支照旧贴新屏边缘（上一轮用户要的「移动到临近边」）。
+set_state free; sleep 1.2
+read -r X Y W H <<< "$(box)"
+echo "  自由小窗 $X,$Y ${W}x${H}（屏 $(winf w1 out)）；往右拖到光标能到的最右边 2559"
+act "pointer-motion $((X + W / 2)) $((Y + H / 2))" 0.25
+act "pointer-button left press mod" 0.25
+act "pointer-motion 2559 $((Y + H / 2))" 0.4
+read -r NX NY NW NH <<< "$(box)"
+act "pointer-button left release mod" 0.5
+if [ "$NX" -gt "$X" ] && [ $((NX + NW)) -gt 2550 ]; then
+	pass "拖到屏右边：盒子跟到 $NX，右边缘 $((NX + NW)) 越过工作区右边界 2550（出屏 $((NX + NW - 2550)) px ≈ 半个盒子）"
+else
+	fail "还被卡在屏里：盒子 $X → $NX，右边缘 $((NX + NW))（工作区右边界 2550，期望越过它）"
+fi
+
 mark "S3 图标贴边裁剪：相邻屏上「本该溢出」的条带非背景像素 = 0"
 unmini; sleep 0.8
 # 先把窗口摆回屏 1：图标默认贴**右边**，屏 1 的右边外侧才是屏 2（spill 才落得上屏）

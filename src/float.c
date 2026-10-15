@@ -594,20 +594,40 @@ void vidow_float_begin_grab(struct vidow_server *server,
  * ICON 允许 -0.5..1.5（图标刻意出屏一点），FREE 是正常窗户，摆在工作区里就行
  * —— 不夹的话「光标拖出屏外」会把锚点记成 1.6，换屏之后被 resolve 夹到远边。 */
 static void mini_free_anchor_from(struct vidow_view *view,
-		struct wlr_box work, int w, int h, double bx, double by) {
+		struct wlr_box work, int w, int h, double bx, double by,
+		bool allow_over) {
 	double span_x = (double)(work.width - w);
 	double span_y = (double)(work.height - h);
 	double ax = span_x > 1.0 ? (bx - (double)work.x) / span_x : 0.0;
 	double ay = span_y > 1.0 ? (by - (double)work.y) / span_y : 0.0;
-	if (ax < 0.0) {
-		ax = 0.0;
-	} else if (ax > 1.0) {
-		ax = 1.0;
+	/* 允许**出屏半个盒子**（用户：「能拖出屏幕边缘，允许一半在屏外」）：锚点
+	 * 0 = 贴工作区左/上边、1 = 贴右/下边，出屏半个盒子对应的锚点偏移是
+	 * w / (2 * span)。以前夹在 0..1 ⇒ 盒子永远进不了屏幕左右那两片区域
+	 * （左边缘最多停在 work.x + span，离屏边还有一个盒子宽 —— 用户报的
+	 * 「左右屏幕区域把小窗卡住不让过去」就是这条）。
+	 *
+	 * 上限还要跟 vidow_mini_resolve_geom 那边对齐（它夹 -0.5..1.5）：盒子接近
+	 * 满屏时 span 很小，w/(2*span) 会远超 0.5 —— 存一个 resolve 摆不出来的
+	 * 锚点，拖动就会「盒子先停、锚点还在涨」，往回拖要先空转掉那一段。 */
+	double over_x = allow_over && span_x > 1.0 ?
+		(double)w / (2.0 * span_x) : 0.0;
+	double over_y = allow_over && span_y > 1.0 ?
+		(double)h / (2.0 * span_y) : 0.0;
+	if (over_x > 0.5) {
+		over_x = 0.5;
 	}
-	if (ay < 0.0) {
-		ay = 0.0;
-	} else if (ay > 1.0) {
-		ay = 1.0;
+	if (over_y > 0.5) {
+		over_y = 0.5;
+	}
+	if (ax < -over_x) {
+		ax = -over_x;
+	} else if (ax > 1.0 + over_x) {
+		ax = 1.0 + over_x;
+	}
+	if (ay < -over_y) {
+		ay = -over_y;
+	} else if (ay > 1.0 + over_y) {
+		ay = 1.0 + over_y;
 	}
 	view->mini_ax = ax;
 	view->mini_ay = ay;
@@ -623,7 +643,7 @@ static void mini_free_drag_set_anchor(struct vidow_server *server,
 		return;
 	}
 	mini_free_anchor_from(view, work, view->float_geom.width,
-		view->float_geom.height, (double)x, (double)y);
+		view->float_geom.height, (double)x, (double)y, true);
 	vidow_mini_resolve_geom(view);
 }
 
@@ -657,7 +677,7 @@ static void mini_free_drag_to_output(struct vidow_server *server,
 	 * 「拎着它走」而不是「盒子跳到光标底下」。 */
 	double bx = lx - (server->grab_x - (double)server->grab_geom.x);
 	double by = ly - (server->grab_y - (double)server->grab_geom.y);
-	mini_free_anchor_from(view, work, w, h, bx, by);
+	mini_free_anchor_from(view, work, w, h, bx, by, false);
 	vidow_mini_move_to_output(server, view, to);
 }
 
@@ -691,17 +711,22 @@ void vidow_float_grab_update(struct vidow_server *server, double lx,
 				view->float_geom.width : server->grab_geom.width;
 			int ch = view->float_geom.height > 0 ?
 				view->float_geom.height : server->grab_geom.height;
-			if (x + cw > all.x + all.width) {
-				x = all.x + all.width - cw;
+			/* 小窗（mini）再放开**半个盒子**：用户要的是「能拖出屏幕边缘、
+			 * 一半在屏外」。普通浮窗照旧整个夹在布局里（看不见的窗口找不回
+			 * 来）。两条路的界限一样：盒子至少还有一半在屏上。 */
+			int out_x = view->mini == VIDOW_MINI_FREE ? cw / 2 : 0;
+			int out_y = view->mini == VIDOW_MINI_FREE ? ch / 2 : 0;
+			if (x + cw > all.x + all.width + out_x) {
+				x = all.x + all.width + out_x - cw;
 			}
-			if (y + ch > all.y + all.height) {
-				y = all.y + all.height - ch;
+			if (y + ch > all.y + all.height + out_y) {
+				y = all.y + all.height + out_y - ch;
 			}
-			if (x < all.x) {
-				x = all.x;
+			if (x < all.x - out_x) {
+				x = all.x - out_x;
 			}
-			if (y < all.y) {
-				y = all.y;
+			if (y < all.y - out_y) {
+				y = all.y - out_y;
 			}
 		}
 
@@ -799,7 +824,7 @@ void vidow_float_grab_update(struct vidow_server *server, double lx,
 				 * 改大小的语义就是左上角不动，FREE 照它。 */
 				mini_free_anchor_from(view, work, w, h,
 					(double)view->float_geom.x,
-					(double)view->float_geom.y);
+					(double)view->float_geom.y, true);
 			}
 			/* FREE 走普通浮窗那条路：盒子多大就**命令客户端**多大多（它跟着
 			 * 重新排版），不是把原生 buffer 缩进一个更大的盒子里留白 —— 后者
@@ -1704,17 +1729,24 @@ void vidow_mini_resolve_geom(struct vidow_view *view) {
 		if (margin < 0) {
 			margin = 0;
 		}
-		if (x < work.x + margin) {
-			x = work.x + margin;
+		/* 自由小窗还要能**出屏半个盒子**（用户：「能拖出屏幕边缘，允许一半在
+		 * 屏外」）：它的位置语义是锚点，这里只是兜底 —— 兜底夹回工作区就等于
+		 * 「屏幕左右那两片区域进不去」（左边缘最多停在 work.x + span，离屏边
+		 * 还差一整个盒子宽）。迷你 / 图标照旧夹在工作区里（留 mini_edge_margin
+		 * 的边）。 */
+		int out_x = view->mini == VIDOW_MINI_FREE ? w / 2 : 0;
+		int out_y = view->mini == VIDOW_MINI_FREE ? h / 2 : 0;
+		if (x < work.x + margin - out_x) {
+			x = work.x + margin - out_x;
 		}
-		if (y < work.y + margin) {
-			y = work.y + margin;
+		if (y < work.y + margin - out_y) {
+			y = work.y + margin - out_y;
 		}
-		if (x + w > work.x + work.width - margin) {
-			x = work.x + work.width - margin - w;
+		if (x + w > work.x + work.width - margin + out_x) {
+			x = work.x + work.width - margin + out_x - w;
 		}
-		if (y + h > work.y + work.height - margin) {
-			y = work.y + work.height - margin - h;
+		if (y + h > work.y + work.height - margin + out_y) {
+			y = work.y + work.height - margin + out_y - h;
 		}
 	}
 
