@@ -768,13 +768,11 @@ void vidow_float_grab_update(struct vidow_server *server, double lx,
 			x = view->float_geom.x;
 			y = view->float_geom.y;
 		} else if (view->mini != VIDOW_MINI_NONE) {
-			/* MINI / ICON：照旧不出工作区（allow_over = false）。以前这里手算
-			 * 锚点、不夹 —— 和 input.c 的 mini_grab_update 同一个 bug（能把小窗
-			 * 整个拖出屏，见 vidow_mini_anchor_from 的注释）。 */
+			/* 迷你 / 图标：和自由态一样允许越界（allow_over = true）—— 用户
+			 * 要的就是「迷你态和自由态一样」，别在这儿搞区别。 */
 			struct wlr_box work = vidow_work_area(server, view->output);
 			vidow_mini_anchor_from(view, work, view->float_geom.width,
-				view->float_geom.height, (double)x, (double)y,
-				view->mini != VIDOW_MINI_MINI);
+				view->float_geom.height, (double)x, (double)y, true);
 			vidow_mini_resolve_geom(view);
 			x = view->float_geom.x;
 			y = view->float_geom.y;
@@ -1725,10 +1723,12 @@ void vidow_mini_resolve_geom(struct vidow_view *view) {
 	 * 里，图标那点出屏是下面 mini_icon_overflow 额外加的偏移。以前 MINI / ICON
 	 * 也照 -0.5..1.5 兜底 = 允许半个工作区在外面：迷你盒整个能被拖出屏幕。 */
 	double ax = view->mini_ax, ay = view->mini_ay;
-	/* 只有 MINI 夹在 0..1（它就该在工作区里）；FREE 和 ICON 照旧 -0.5..1.5 ——
-	 * FREE 是「出屏半个盒子」要越界，ICON 那点出屏本来就走越界锚点。 */
-	double over = view->mini == VIDOW_MINI_MINI ? 0.0 : 0.5;
-	double lo = -over, hi = 1.0 + over;
+	/* 迷你态和自由态**同一套夹取**（-0.5..1.5）：用户要的就是「两者一样」——
+	 * 他原话「迷你态在工作区有左右死区，无法拖拽过去，自由态可以拖过去」。上一轮
+	 * 我把迷你态单独夹在 0..1（当时是为了修视频里「盒子整个拖出屏、两秒看不见」），
+	 * 结果正好造出他报的左右死区 —— 迷你态再也推不到工作区边上、更推不出去。
+	 * 图标态走它自己的出屏偏移（mini_icon_overflow），同样不夹死。 */
+	double lo = -0.5, hi = 1.5;
 	if (ax < lo) {
 		ax = lo;
 	} else if (ax > hi) {
@@ -1775,18 +1775,22 @@ void vidow_mini_resolve_geom(struct vidow_view *view) {
 		 * 只有 FREE 被特判成 0，MINI 和 NONE 都拿 mini_edge_margin（8px）—— 于是
 		 * 「迷你态」和「普通浮窗/自由态」在左右各留 8px 进不去，一模一样。普通
 		 * 浮窗更冤：它不是小窗家族的东西，凭什么吃小窗的边距。 */
-		int margin = view->mini == VIDOW_MINI_MINI ?
-			cfg->mini_edge_margin : 0;
+		/* 内缩 = 0：**迷你态和自由态一模一样**（用户原话：「迷你态在工作区有
+		 * 左右死区，无法拖拽过去，自由态可以拖过去」）。死区实测正好 8px = 旧
+		 * 的 cfg->mini_edge_margin，两态都吃它 —— 这就是他说的「两者不一样 /
+		 * 左右有死区」。mini_edge_margin 这个配置项留着（旧配置里有它，别报
+		 * 未知键），但不再参与位置计算。 */
+		int margin = 0;
 		if (margin < 0) {
 			margin = 0;
 		}
-		/* 自由小窗还要能**出屏半个盒子**（用户：「能拖出屏幕边缘，允许一半在
-		 * 屏外」）：它的位置语义是锚点，这里只是兜底 —— 兜底夹回工作区就等于
-		 * 「屏幕左右那两片区域进不去」（左边缘最多停在 work.x + span，离屏边
-		 * 还差一整个盒子宽）。迷你 / 图标照旧夹在工作区里（留 mini_edge_margin
-		 * 的边）。 */
-		int out_x = view->mini == VIDOW_MINI_FREE ? w / 2 : 0;
-		int out_y = view->mini == VIDOW_MINI_FREE ? h / 2 : 0;
+		/* **迷你态和自由态一样**能出屏半个盒子（用户：「迷你态在工作区有左右
+		 * 死区，无法拖拽过去，自由态可以拖过去」+「死区显然不止 8px」）。这里
+		 * 以前只有 FREE 拿 w/2、h/2，MINI 是 0 —— 兜底夹回工作区就等于「工作区
+		 * 左右那两片进不去」：盒子左边缘最多停在 work.x，离屏边还差整整半个
+		 * 盒子。8px 那点只是它的尾巴（mini_edge_margin），大头是这儿。 */
+		int out_x = w / 2;
+		int out_y = h / 2;
 		if (x < work.x + margin - out_x) {
 			x = work.x + margin - out_x;
 		}

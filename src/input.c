@@ -951,12 +951,11 @@ static void mini_grab_update(struct vidow_server *server) {
 	}
 	double x = server->cursor->x - server->mini_grab_dx;
 	double y = server->cursor->y - server->mini_grab_dy;
-	/* 锚点 0 = 贴工作区左 / 上边，1 = 贴右 / 下边。**迷你态**夹在工作区里
-	 * （allow_over = false，见 vidow_mini_anchor_from）—— 这里以前完全不夹、
-	 * 只靠 resolve 兜底的 -0.5..1.5（半个工作区），264px 宽的迷你盒能被整个拖
-	 * 出屏幕（用户视频 /tmp/mini.mp4）。图标态照旧允许出屏一点（mini_icon_overflow）。 */
+	/* 锚点 0 = 贴工作区左 / 上边，1 = 贴右 / 下边。迷你态**和自由态一样**允许
+	 * 越界（allow_over = true）—— 用户原话「迷你态在工作区有左右死区，无法拖拽
+	 * 过去，自由态可以拖过去」，两者就该一模一样。 */
 	vidow_mini_anchor_from(view, work, view->float_geom.width,
-		view->float_geom.height, x, y, view->mini != VIDOW_MINI_MINI);
+		view->float_geom.height, x, y, true);
 	if (view->mini == VIDOW_MINI_ICON) {
 		/* 图标吸附：永远贴最近那条工作区边 —— 那条轴上钉死在边上，另一轴跟着
 		 * 光标（所以还能沿边上下 / 左右挪）；出屏方向也跟着这条边（resolve 里
