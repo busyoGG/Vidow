@@ -409,6 +409,10 @@ static void rows_place(struct vidow_server *server) {
 /* 进来先把列表滚到「现在这块工作区」那一行看得见的地方（列表比屏高时才用得上）。 */
 static void rows_scroll_to_active(struct vidow_server *server) {
 	struct vidow_overview *ov = &server->overview;
+	/* 进概览时吸附到「现在这块工作区」那一行是**瞬时**的（进来就该看到自己在
+	 * 哪），别让上一轮没跑完的滚动动画接着写 list_scroll。 */
+	vidow_anim_cancel(ov->scroll_anim);
+	ov->scroll_anim = NULL;
 	struct vidow_workspace *shown =
 		vidow_workspace_shown_for(server, ov->output);
 	double total = rows_total(ov);
@@ -591,6 +595,8 @@ static void overview_done(void *data, bool cancelled) {
 	ov->t = ov->on ? 1.0 : 0.0;
 	overview_apply(server);
 	if (!ov->on) {
+		vidow_anim_cancel(ov->scroll_anim);
+		ov->scroll_anim = NULL;
 		ov->output = NULL;
 		ov->list_scroll = 0.0;
 		/* 收掉那张糊壁纸的缓冲（整屏那么大，4K 上两份 33MB）。场景节点留着
@@ -610,6 +616,36 @@ static void overview_done(void *data, bool cancelled) {
 	 * 的窗口都要画（缩到画面里），所以平时按工作区藏起来的那些得先放回来；退出
 	 * 之后又要按框剔除一次（不然它们会一直显示着，串到隔壁屏上）。 */
 	vidow_workspace_apply_visibility(server);
+}
+
+/* 列表滚动的缓动。用**夹过的** t 当进度：滚动没有过冲的余地（out_back 那类曲线
+ * 会让列表冲过目标行再弹回来，看着像抖了一下）。滚轮一步一格，但走的是缓动，
+ * 不是瞬移。 */
+static void overview_scroll_update(void *data, double t, double linear) {
+	(void)linear;
+	struct vidow_server *server = data;
+	struct vidow_overview *ov = &server->overview;
+	double v = t;
+	if (!(v >= 0.0)) {
+		v = 0.0;
+	} else if (v > 1.0) {
+		v = 1.0;
+	}
+	ov->list_scroll = ov->scroll_from + (ov->scroll_to - ov->scroll_from) * v;
+	overview_apply(server);
+}
+
+static void overview_scroll_done(void *data, bool cancelled) {
+	struct vidow_server *server = data;
+	struct vidow_overview *ov = &server->overview;
+	ov->scroll_anim = NULL;
+	if (cancelled) {
+		/* 被紧接着的一格接管了：scroll_from / scroll_to 归新的那次管，这里
+		 * 别拍端点（一拍就跳一下）。 */
+		return;
+	}
+	ov->list_scroll = ov->scroll_to;
+	overview_apply(server);
 }
 
 static void overview_start(struct vidow_server *server) {
@@ -852,7 +888,10 @@ void vidow_overview_scroll(struct vidow_server *server, int steps) {
 	if (max_scroll < 0.0) {
 		max_scroll = 0.0;
 	}
-	int idx = (int)lround(ov->list_scroll / pitch) + steps;
+	/* 步进的基准取「正在去的那一格」而不是当前插值位置：连滚时 list_scroll 还
+	 * 在半路上，按它 lround 会把两格并成一格（快速连滚丢步）。 */
+	double base = ov->scroll_anim != NULL ? ov->scroll_to : ov->list_scroll;
+	int idx = (int)lround(base / pitch) + steps;
 	if (idx < 0) {
 		idx = 0;
 	}
@@ -860,7 +899,22 @@ void vidow_overview_scroll(struct vidow_server *server, int steps) {
 	if (want > max_scroll) {
 		want = max_scroll;
 	}
-	ov->list_scroll = want;
+	if (want == base) {
+		overview_apply(server);
+		return;
+	}
+	/* 缓动过去，不再一步到位（用户：「overview 滚动需要过渡动画」）。中途再滚一
+	 * 次就把当前插值位置当新起点接着走，所以快速连滚是连续的、不重新起步。 */
+	vidow_anim_cancel(ov->scroll_anim);
+	ov->scroll_anim = NULL;
+	ov->scroll_from = ov->list_scroll;
+	ov->scroll_to = want;
+	ov->scroll_anim = vidow_anim_start(server, "overview-scroll",
+		server->config.workspace_switch_ms, server->config.easing,
+		overview_scroll_update, overview_scroll_done, server);
+	if (ov->scroll_anim == NULL) {
+		ov->list_scroll = want;
+	}
 	overview_apply(server);
 }
 

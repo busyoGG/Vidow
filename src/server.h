@@ -1015,6 +1015,13 @@ struct vidow_overview {
 	struct vidow_fx_target fx;
 	bool fx_on;                     /* 这一帧真的画上了 */
 	struct vidow_anim *anim;
+	/* 列表滚动的缓动（滚轮）。**独立于**进出那条 anim：进出管 t / 透明度，
+	 * 这条只管 list_scroll —— 进出动画跑着的时候滚一下，两条能同时走，不该
+	 * 互相打断。以前滚轮直接写 list_scroll，是瞬移（用户报的「overview 滚动
+	 * 需要过渡动画」）。 */
+	struct vidow_anim *scroll_anim;
+	double scroll_from;      /* 这次滚动的起点（起手那一刻画在屏上的 list_scroll） */
+	double scroll_to;        /* 目标（连滚时按它算下一格，见 vidow_overview_scroll） */
 };
 
 /* 「有人正拿着这个窗口」（窗口截图源：录屏 / 窗口预览）。记录挂在窗口上，源自己

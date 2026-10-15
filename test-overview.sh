@@ -1025,6 +1025,33 @@ PY
 	PREV=$NOW
 done
 
+# 判据：滚动是**缓动**过去的，不是瞬移（用户：「overview 滚动需要过渡动画」）。
+# 发一次滚轮后连采 8 帧 list_scroll：必须采到至少一个**严格在起点与目标之间**的
+# 值（瞬移的话每次采样都已经是目标值）；等缓动跑完再采一次，应该正好落在目标上。
+S0=$(ovfield list_scroll)
+./build/vidowmsg pointer-scroll 0 1 >/dev/null 2>&1
+MIDS=""
+for _ in 1 2 3 4 5 6 7 8; do MIDS="$MIDS $(ovfield list_scroll)"; done
+sleep 0.8
+SEND=$(ovfield list_scroll)
+python3 - "$S0" "$SEND" $MIDS <<'ZZPY'
+import sys
+s0, end = float(sys.argv[1]), float(sys.argv[2])
+mids = [float(x) for x in sys.argv[3:]]
+moved = end > s0 + 1.0
+between = [m for m in mids if s0 + 0.5 < m < end - 0.5]
+if not moved:
+	print("  FAIL  这一格没滚起来（%.1f → %.1f）" % (s0, end))
+	sys.exit(1)
+if not between:
+	print("  FAIL  没有中间态：起点 %.1f 目标 %.1f，8 帧采到 %s（瞬移的话每帧都等于目标）"
+	      % (s0, end, " ".join("%.1f" % m for m in mids[:4])))
+	sys.exit(1)
+print("  PASS  缓动：起点 %.1f → 目标 %.1f，途中采到 %d 个中间态（%s）"
+      % (s0, end, len(between), " ".join("%.1f" % b for b in between[:4])))
+ZZPY
+[ $? -ne 0 ] && FAILED=1
+
 for _ in $(seq 1 8); do
 	./build/vidowmsg pointer-scroll 0 1 >/dev/null 2>&1
 	sleep 0.3
