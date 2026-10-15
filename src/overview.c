@@ -795,12 +795,21 @@ bool vidow_overview_click(struct vidow_server *server, double sx, double sy) {
 			/* 弹出物在 overview 里是收着的，不该被点到 */
 			return true;
 		}
-		/* 迷你 / 图标态的窗口：先摊成普通窗口再给焦点（和 Alt+Tab 提交、
-		 * IPC focus-window 同一个入口、同一个语义，见 server.h）。
-		 * 这里以前用的是那个「什么都不做」的 vidow_focus_view()：它开头就把
-		 * MINI / ICON 挡回去了（不变量：focused 永远不指小窗），于是全景里
-		 * 小窗那块格子点上去只有日志、焦点一点没动 —— 用户桌上那堆小窗就是
-		 * 「点谁都不动」的真凶。 */
+		/* 先把**它的工作区端出来**，再给焦点。全景里点的是哪块工作区的窗口都
+		 * 可能 —— 只调 vidow_focus_view_expand_mini() 的话，焦点落在一个看不见
+		 * 的窗口上（那块工作区没亮着），屏幕上什么都不变，看起来就是「点了没
+		 * 反应」（用户报的「点击窗口无法切换焦点」）。vidow_view_activate() 就是
+		 * 「把这个窗口端到人面前」那条路（点通知 / 任务栏 / xdg-activation 同一个
+		 * 入口）：窗口在别的屏上就把焦点挪过去，工作区藏着就先端出来。
+		 *
+		 * 它带窗口规则的 focus_on_activate 闸（后台 Electron 反复顶自己那类），
+		 * 但这里是**用户点了一下**，闸不该拦；所以后面照样再给一次焦点。
+		 *
+		 * 迷你 / 图标态：摊成普通窗口再给焦点（和 Alt+Tab 提交、IPC focus-window
+		 * 同一个入口、同一个语义，见 server.h）。以前用的是那个「什么都不做」的
+		 * vidow_focus_view()：它开头就把 MINI / ICON 挡回去了（不变量：focused
+		 * 永远不指小窗），于是全景里小窗那块格子点上去只有日志、焦点一点没动。 */
+		vidow_view_activate(hit);
 		vidow_focus_view_expand_mini(hit);
 		/* 点下去就退出，但客户端从没收到这次按下；对应的松手也吃掉，
 		 * 免得它收到一个没有按下配对的 release。 */
