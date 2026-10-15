@@ -3687,6 +3687,11 @@ void vidow_view_yield_focus_for_mini(struct vidow_view *view);
 /* 按比例锚点算出 float_geom（幂等，不 configure 客户端）。摆放前调。 */
 void vidow_mini_resolve_geom(struct vidow_view *view);
 
+/* 拖拽中把迷你 / 图标 / 自由小窗的归属换到 to 那块屏上，并按新屏的工作区重算
+ * 比例锚点（抓取偏移保持不变）。 */
+void vidow_mini_drag_to_output(struct vidow_server *server,
+		struct vidow_view *view, struct wlr_output *to, double lx, double ly);
+
 /* 把一个绝对位置（盒子左上角）换算成小窗的比例锚点，并按 allow_over 夹取：
  * MINI 传 false（夹在工作区里），FREE / ICON 传 true（允许出屏一点）。 */
 void vidow_mini_anchor_from(struct vidow_view *view, struct wlr_box work,

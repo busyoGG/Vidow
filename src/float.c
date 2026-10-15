@@ -657,7 +657,7 @@ static void mini_free_drag_set_anchor(struct vidow_server *server,
  * 把锚点算在新屏的工作区里（从右边进来 → 贴新屏左边缘，不是远边）。松手那条路
  * （vidow_mini_drag_finish）也走 vidow_mini_move_to_output，但那要等到松手 ——
  * 拖动中不换的话盒子会被旧屏工作区夹住、跟不上光标。 */
-static void mini_free_drag_to_output(struct vidow_server *server,
+void vidow_mini_drag_to_output(struct vidow_server *server,
 		struct vidow_view *view, struct wlr_output *to, double lx, double ly) {
 	struct wlr_box work = vidow_work_area(server, to);
 	if (work.width < 1 || work.height < 1) {
@@ -683,6 +683,8 @@ static void mini_free_drag_to_output(struct vidow_server *server,
 	 * 「拎着它走」而不是「盒子跳到光标底下」。 */
 	double bx = lx - (server->grab_x - (double)server->grab_geom.x);
 	double by = ly - (server->grab_y - (double)server->grab_geom.y);
+	/* allow_over = false：换屏那一刻**贴新屏边缘**（「从右边进新屏就贴新屏的
+	 * 左边缘」）—— 这正是「能拖到另一块屏」的手感，别放开成半挂屏外。 */
 	vidow_mini_anchor_from(view, work, w, h, bx, by, false);
 	vidow_mini_move_to_output(server, view, to);
 }
@@ -761,18 +763,32 @@ void vidow_float_grab_update(struct vidow_server *server, double lx,
 			struct wlr_output *under = wlr_output_layout_output_at(
 				server->output_layout, lx, ly);
 			if (under != NULL && under != view->output) {
-				mini_free_drag_to_output(server, view, under, lx, ly);
+				vidow_mini_drag_to_output(server, view, under, lx, ly);
 			} else {
 				mini_free_drag_set_anchor(server, view, x, y);
 			}
 			x = view->float_geom.x;
 			y = view->float_geom.y;
 		} else if (view->mini != VIDOW_MINI_NONE) {
-			/* 迷你 / 图标：和自由态一样允许越界（allow_over = true）—— 用户
-			 * 要的就是「迷你态和自由态一样」，别在这儿搞区别。 */
-			struct wlr_box work = vidow_work_area(server, view->output);
-			vidow_mini_anchor_from(view, work, view->float_geom.width,
-				view->float_geom.height, (double)x, (double)y, true);
+			/* 迷你 / 图标：和自由态一样 —— 允许越界（allow_over = true），而且
+			 * **光标在哪块屏上，归属当场换过去**（用户：「没有死区了，但无法拖拽
+			 * 到另一个屏幕」）。这里以前只按**当前**屏的工作区写锚点，`view->output`
+			 * 一直不变，所以迷你 / 图标态永远换不了屏 —— 换屏那支以前只在 FREE
+			 * 分支里。 */
+			struct wlr_output *under = wlr_output_layout_output_at(
+				server->output_layout, lx, ly);
+			if (under != NULL && under != view->output) {
+				vidow_mini_drag_to_output(server, view, under, lx, ly);
+			} else {
+				struct wlr_box work = vidow_work_area(server,
+					view->output);
+				vidow_mini_anchor_from(view, work,
+					view->float_geom.width,
+					view->float_geom.height, (double)x,
+					(double)y, true);
+			}
+			x = view->float_geom.x;
+			y = view->float_geom.y;
 			vidow_mini_resolve_geom(view);
 			x = view->float_geom.x;
 			y = view->float_geom.y;
@@ -1203,7 +1219,9 @@ void vidow_mini_fling_sample(struct vidow_server *server, double x, double y) {
 
 bool vidow_mini_fling_velocity(struct vidow_server *server, double *vx,
 		double *vy) {
-	if (server == NULL || server->mini_fling_n < 3) {
+	/* 至少 2 个点：快速一甩（144Hz 下 8 格采样环只覆盖 ~55ms）常常只有 2-3 个
+	 * 点，要求 3 个 + dt ≥ 20ms 会让最快的那些甩动直接「没有速度」。 */
+	if (server == NULL || server->mini_fling_n < 2) {
 		return false;
 	}
 	int n = server->mini_fling_n;
@@ -1224,7 +1242,7 @@ bool vidow_mini_fling_velocity(struct vidow_server *server, double *vx,
 	}
 	int64_t dt = server->mini_fling_pts[last].ns -
 		server->mini_fling_pts[first].ns;
-	if (dt < 20000000LL) {
+	if (dt < 8000000LL) {
 		return false;
 	}
 	double secs = (double)dt / 1e9;

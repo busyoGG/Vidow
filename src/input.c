@@ -954,6 +954,16 @@ static void mini_grab_update(struct vidow_server *server) {
 	/* 锚点 0 = 贴工作区左 / 上边，1 = 贴右 / 下边。迷你态**和自由态一样**允许
 	 * 越界（allow_over = true）—— 用户原话「迷你态在工作区有左右死区，无法拖拽
 	 * 过去，自由态可以拖过去」，两者就该一模一样。 */
+	/* 光标在哪块屏上就换归属（和自由态一样）：不换的话迷你态永远拖不到邻屏
+	 * —— 用户：「无法拖拽到另一个屏幕」。 */
+	struct wlr_output *under = wlr_output_layout_output_at(
+		server->output_layout, server->cursor->x, server->cursor->y);
+	if (under != NULL && under != view->output) {
+		vidow_mini_drag_to_output(server, view, under,
+			server->cursor->x, server->cursor->y);
+		vidow_arrange(server);
+		return;
+	}
 	vidow_mini_anchor_from(view, work, view->float_geom.width,
 		view->float_geom.height, x, y, true);
 	if (view->mini == VIDOW_MINI_ICON) {
