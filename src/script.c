@@ -785,9 +785,23 @@ static int l_bind(lua_State *L) {
 	 * 老写法 `["repeat"]` 继续认（别名，README 262 就是这么写的）。 */
 	bool repeatable = true;
 	int cooldown_ms = 0;
+	/* { locked = true } = 会话锁定期间这条绑定照样生效（音量 / 亮度 / 播放
+	 * 控制这类「看不见桌面也要能用」的键，Hyprland 的 binds { locked } 同义）。
+	 * 默认 false：锁屏时只有 switch-vt 和标了它的绑定放行，见 keybind.c。 */
+	bool locked = false;
+	/* { bare = true } = 允许**裸键**（不带修饰键）。默认拒绝（裸字母键会毁掉
+	 * 打字）；XF86 媒体键不用写这个（keybind.c 里自动放行那一段），print /
+	 * F 键这种要裸绑就得显式写。 */
+	bool bare = false;
 	if (lua_istable(L, 3)) {
 		lua_getfield(L, 3, "inhibited");
 		inhibited = lua_toboolean(L, -1) != 0;
+		lua_pop(L, 1);
+		lua_getfield(L, 3, "locked");
+		locked = lua_toboolean(L, -1) != 0;
+		lua_pop(L, 1);
+		lua_getfield(L, 3, "bare");
+		bare = lua_toboolean(L, -1) != 0;
 		lua_pop(L, 1);
 		lua_getfield(L, 3, "on");
 		if (lua_isstring(L, -1)) {
@@ -837,7 +851,7 @@ static int l_bind(lua_State *L) {
 	}
 	char err[160];
 	if (vidow_keybind_add(s->server, trigger, action, inhibited, on_release,
-			repeatable, cooldown_ms, err, sizeof(err)) == NULL) {
+			repeatable, cooldown_ms, locked, bare, err, sizeof(err)) == NULL) {
 		return luaL_error(L, "%s", err);
 	}
 	lua_pushboolean(L, 1);

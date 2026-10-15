@@ -94,6 +94,19 @@ static bool key_sym(const char *name, xkb_keysym_t *out) {
 			return true;
 		}
 	}
+	/* 表里没列的名字，交给 libxkbcommon 按 keysym 名字解：XF86AudioRaiseVolume /
+	 * XF86MonBrightnessUp / XF86AudioPlay / XF86Tools 这些**媒体键**都在它的表
+	 * 里，不必在这儿一个个抄（抄漏一个 = 那个键「绑不了」）。大小写不敏感，和上
+	 * 面表里的名字一个口径；顺带把别的冷门 keysym（XF86Back、dead_grave…）也开
+	 * 了。解不出来还是走「unknown token」那条错，不会静默吃掉。
+	 *
+	 * 注意：**裸键仍然拒绝**（下面 have_key && m == 0 那道判断）—— 能绑 XF86 不
+	 * 等于能裸绑字母键，那是另一条规矩。 */
+	xkb_keysym_t sym = xkb_keysym_from_name(name, XKB_KEYSYM_CASE_INSENSITIVE);
+	if (sym != XKB_KEY_NoSymbol) {
+		*out = sym;
+		return true;
+	}
 	/* XF86Switch_VT_1..12：自定义 keymap 里可能直接给这个 keysym
 	 * （默认 keymap 给的是 F1..F12 + ctrl|alt，见 README 的「切 tty」）。 */
 	if (strncasecmp(name, "xf86switch_vt_", 14) == 0) {
@@ -195,7 +208,7 @@ static bool wheel_name(const char *token, enum wl_pointer_axis *axis, int *dir) 
  *   Mod+wheel-up              滚轮（纵向，往上）
  *   Mod                       单独一个修饰键（没有主键） */
 static bool parse_trigger(const char *trigger, struct trigger_parsed *out,
-		uint32_t mod_mask, char *err, size_t errlen) {
+		uint32_t mod_mask, bool allow_bare, char *err, size_t errlen) {
 	char buf[sizeof(((struct vidow_keybind *)0)->trigger)];
 	snprintf(buf, sizeof(buf), "%s", trigger);
 
@@ -260,9 +273,17 @@ static bool parse_trigger(const char *trigger, struct trigger_parsed *out,
 		return true;
 	}
 	if (have_key) {
-		if (m == 0) {
+		/* 裸键默认拒绝：不带修饰键的字母 / 数字键抢下来会毁掉正常打字。
+		 * 两个例外：
+		 *   ① XF86 段（0x10080000..0x1008FFFF）—— 媒体键 / 亮度键天生没有修饰
+		 *      键，而且没有别的消费者（客户端不绑这些），Hyprland 也是裸绑的；
+		 *   ② 绑定上显式写了 { bare = true } —— 给 print / F 键这种「不参与打字、
+		 *      但客户端可能自己要用」的键留的口子：要就拿，不写还是拒绝。 */
+		bool xf86 = out->sym >= 0x10080000 && out->sym <= 0x1008FFFF;
+		if (m == 0 && !xf86 && !allow_bare) {
 			snprintf(err, errlen, "trigger '%s' has no modifier "
-				"(refusing to grab a bare key)", trigger);
+				"(refusing to grab a bare key; "
+				"要裸绑就写 { bare = true })", trigger);
 			return false;
 		}
 		return true;
@@ -287,8 +308,8 @@ bool vidow_keybind_init(struct vidow_server *server) {
 
 struct vidow_keybind *vidow_keybind_add(struct vidow_server *server,
 		const char *trigger, const char *action, bool inhibited,
-		bool on_release, bool repeatable, int cooldown_ms, char *err,
-		size_t errlen) {
+		bool on_release, bool repeatable, int cooldown_ms, bool locked,
+		bool bare, char *err, size_t errlen) {
 	if (err != NULL && errlen > 0) {
 		err[0] = '\0';
 	}
@@ -305,7 +326,7 @@ struct vidow_keybind *vidow_keybind_add(struct vidow_server *server,
 	uint32_t mod_mask = strcasecmp(server->config.mod_key, "alt") == 0 ?
 		WLR_MODIFIER_ALT : WLR_MODIFIER_LOGO;
 	struct trigger_parsed t;
-	if (!parse_trigger(trigger, &t, mod_mask, err, errlen)) {
+	if (!parse_trigger(trigger, &t, mod_mask, bare, err, errlen)) {
 		return NULL;
 	}
 
@@ -327,6 +348,7 @@ struct vidow_keybind *vidow_keybind_add(struct vidow_server *server,
 	bind->axis_dir = t.axis_dir;
 	bind->modifier_only = t.modifier_only;
 	bind->repeatable = repeatable;
+	bind->locked = locked;
 	bind->cooldown_ms = cooldown_ms > 0 ? cooldown_ms : 0;
 	/* 单独一个修饰键默认**松开才触发**：按下就触发的话 `Super+Q` 会顺带把
 	 * 全景也打开（那条绑定本来只想在「只按了 Super」时生效）。 */
@@ -591,6 +613,13 @@ static bool held_note(xkb_keysym_t sym, bool pressed) {
  * 死掉时合成器不许解锁（协议 XML:111），用户的逃生口就只剩切 tty 了（方案 §4
  * 风险 5）。加新动作进来之前先想清楚：它能不能碰到被藏起来的桌面。 */
 static bool bind_locked_allowed(const struct vidow_keybind *bind) {
+	/* 声明过 { locked = true } 的绑定：锁屏期间照跑（音量 / 亮度 / 播放控制
+	 * 这类「看不见桌面也要能用」的键，Hyprland 的 binds { locked } 同义）。
+	 * 它能不能碰到桌面由动作自己决定 —— 动作串里没有「切工作区 / 动窗口」这些
+	 * 就没问题，加新动作进来之前照旧先想清楚（见下面 switch-vt 那段注释）。 */
+	if (bind->locked) {
+		return true;
+	}
 	return strncmp(bind->action, "switch-vt", 9) == 0 &&
 		(bind->action[9] == '\0' || bind->action[9] == ' ');
 }

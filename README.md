@@ -309,9 +309,15 @@ end
 `<方向>` = `-1` / `1`，也认 `left` / `right` / `up` / `down` / `prev` / `next`。
 
 `vidow.bind` 的键名大小写不敏感，修饰键认 `Mod`/`Super`/`Logo`/`Win`、`Shift`、`Alt`/`Mod1`、
-`Ctrl`/`Control`；键名可以是单字符（字母、数字）或 X11 惯用名（`grave`、`minus`、`equal`、
-`tab`、`space`、`escape`、`bracketleft`…）。**必须带修饰键**：裸键不抢（抢了客户端就没法
-打字了），配置写错会在 `config.lua` 那行报错并打一行日志。
+`Ctrl`/`Control`；键名可以是单字符（字母、数字）、X11 惯用名（`grave`、`minus`、`equal`、
+`tab`、`space`、`escape`、`bracketleft`…），**或者任何 libxkbcommon 认识的 keysym 名字** ——
+表里没有的名字按 keysym 解（大小写不敏感），所以 `XF86AudioRaiseVolume`、`XF86MonBrightnessUp`、
+`XF86Tools`、`XF86Calculator` 这些媒体键 / 亮度键直接就能绑，不必在表里一个个列。
+
+**裸键（不带修饰键）默认拒绝**：抢下来客户端就没法打字了，配置写错会在 `config.lua` 那行报错
+并打一行日志。两个例外：① **XF86 段**（`0x10080000..0x1008FFFF`）自动放行 —— 媒体键天生没
+修饰键、也没有别的消费者；② 显式写 `{ bare = true }` —— 给 `print` / `F2` 这种「不参与打字、
+但客户端可能自己要用」的键留的口子，要就拿。
 
 ### 浮窗的位置是「相对屏幕」记的
 
@@ -5487,6 +5493,20 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
      - 未做：niri 的 `fixed 1920`（固定像素档）、`preset-window-heights`、`default-column-width {}`（让客户端自己定宽）、
        `always-center-single-column`；窗口规则级的 per-rule 预设覆盖。
 
+290. **媒体键能绑了：键名解析加 keysym 兜底；裸键开 XF86 段 + `{ bare = true }`；锁屏放行 `{ locked = true }`**（用户：「媒体键怎么解决」；2026-10-15）
+     - **根因**：键名只有一张固定表 + `F1..F35` + `XF86Switch_VT_1..12`，`XF86AudioRaiseVolume` 这种名字落在表外 → 报
+       `unknown token`；就算解出来，紧接着还有一道**裸键拒绝**（不带修饰键的键盘触发一律不抢），媒体键天生没修饰键，照样绑不上。
+     - **修法**：① `key_sym()` 表查不到时交给 `xkb_keysym_from_name(name, XKB_KEYSYM_CASE_INSENSITIVE)` —— libxkbcommon 自己的
+       keysym 表认识全部 XF86 名字（媒体键 / 亮度键 / `XF86Tools` / `XF86Calculator`…），不必在 vidow 里抄一份（抄漏一个就是一个
+       「这个键绑不了」）；解不出来照旧报 `unknown token`，不静默。② 裸键拒绝加两个例外：**XF86 段自动放行**（`0x10080000..0x1008FFFF`，
+       没有别的消费者），其它键要裸绑得显式写 `{ bare = true }`（`print` / `F2` / `F9` / `F13` 这种 —— 默认不动别人的键）。③ 新增绑定选项
+       `{ locked = true }`：会话锁定期间照样生效（音量 / 亮度 / 播放控制），`keybind.c` 的锁屏白名单从「只有 switch-vt」变成
+       「switch-vt + 标了 locked 的」。按住连发不用管：`repeatable` 默认 true，和 Hyprland 的 `repeating` 同义。
+     - 判据：`vidow.bind("XF86AudioRaiseVolume", …)` / `XF86AudioPlay` / `XF86MonBrightnessUp` / `XF86Tools` 全部注册成功（`vidowmsg keybinds`
+       里 `locked` 字段跟着报出来），`print` / `F2` / `F9` / `F13` 加 `{ bare = true }` 也注册成功；不带 `{ bare }` 的裸 `print` 仍然报
+       「refusing to grab a bare key; 要裸绑就写 { bare = true }」。
+     - 落点：`src/keybind.c`（`key_sym` 兜底、裸键例外、`bind_locked_allowed`）、`src/keybind.h`（`locked` 字段 + `vidow_keybind_add` 多两个参数
+       `locked` / `bare`）、`src/script.c`（`vidow.bind` 选项解析）、`src/ipcstate.c`（`keybinds` 报 `locked`）。
 289. **小窗拖拽：屏幕左右那两片区域进不去 —— 盒子被夹在工作区里（用户：「我说的是小窗在屏幕上拖拽的时候 左右屏幕区域会把小窗卡住不让过去」+「卡在离屏幕边缘还有一段距离的地方」+ 期望「能拖出屏幕边缘（允许一半在屏外）」；2026-10-15）**
      - **根因**：FREE 的位置语义是**比例锚点**（唯一换算点 `vidow_mini_resolve_geom`），而两处夹取把盒子锁在工作区里 ——
        ① `float.c` 的 `mini_free_anchor_from()` 把 FREE 的锚点夹在 `0..1`；② `vidow_mini_resolve_geom()` 的兜底又把盒子夹回工作区（FREE 只是 margin = 0）。于是盒子**左边缘**最多停在 `work.x + span`（span = 工作区宽 − 盒子宽），

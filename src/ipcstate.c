@@ -922,6 +922,8 @@ void vidow_ipc_json_keybinds(struct jbuf *b, struct vidow_server *server) {
 		jb_kv_bool(b, "repeatable", bind->repeatable);
 		jb_kv_bool(b, "repeat", bind->repeatable);
 		jb_kv_int(b, "cooldown_ms", bind->cooldown_ms);
+		/* 会话锁定期间也生效（vidow.bind 的 { locked = true }，默认 false）。 */
+		jb_kv_bool(b, "locked", bind->locked);
 		jb_obj_end(b);
 	}
 	jb_arr_end(b);

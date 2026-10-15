@@ -52,6 +52,9 @@ struct vidow_keybind {
 	xkb_keysym_t keysym; /* VIDOW_SRC_KEY：主键；单独修饰键时是 NoSymbol */
 	/* 抑制期间也生效（vidow.bind 第三个参数 { inhibited = true }）。 */
 	bool inhibited;
+	/* 会话锁定期间也生效（{ locked = true }）：音量 / 亮度 / 播放控制这类。
+	 * 默认 false —— 锁屏时只有 switch-vt 和它放行，见 keybind.c 的白名单。 */
+	bool locked;
 	enum vidow_bind_on on;
 	enum vidow_bind_src src;
 	uint32_t button;            /* VIDOW_SRC_MOUSE：BTN_LEFT 这种 */
@@ -79,8 +82,8 @@ bool vidow_keybind_init(struct vidow_server *server);
  * 失败时把原因写进 err（不超过 errlen），返回 NULL。 */
 struct vidow_keybind *vidow_keybind_add(struct vidow_server *server,
 		const char *trigger, const char *action, bool inhibited,
-		bool on_release, bool repeatable, int cooldown_ms, char *err,
-		size_t errlen);
+		bool on_release, bool repeatable, int cooldown_ms, bool locked,
+		bool bare, char *err, size_t errlen);
 
 /* 清空全部绑定（config.lua 重载时用：重载等于重新声明一遍）。 */
 void vidow_keybind_clear(struct vidow_server *server);
