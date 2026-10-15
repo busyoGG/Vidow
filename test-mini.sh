@@ -757,6 +757,15 @@ scroll_on 1
 scroll_on -1
 [ "$(winf w1 mini)" = "mini" ] && pass "上滚升一档 → mini" || fail "上滚升档没生效"
 
+# 前置：把迷你盒挪回工作区里。上面的判据（迷你态 / 自由态能拖出屏边）会把它留在
+# 屏边半挂的位置 —— 那是**合法**位置，但工具条摆位会夹回工作区
+# （mini_toolbar_layout），下面那条「工具条跟小窗居中」就没法断言了。
+./build/vidowmsg move-window-to-output HEADLESS-2 --id "$(wid w1)" >/dev/null 2>&1
+sleep 0.8
+set_state mini; sleep 0.6
+read -r RX0 RY0 RW0 RH0 <<< "$(echo "$(geom)" | tr 'x,' ' ')"
+echo "  工具条前置：迷你盒 $RX0,$RY0 ${RW0}x${RH0}（工作区 1290..2550）"
+
 mark "S4 工具条：悬停露出 + 点「还原成列」"
 # 悬停 **迷你** 小窗（不是图标）：图标悬停 250ms 会出预览，预览会吞点击 ——
 # 那条路走的是「预览只读但吞点击」，不是工具条这条。
@@ -777,9 +786,17 @@ if [ -n "$TL" ]; then
 	if [ -n "$TBX" ] && [ -n "$TBW" ]; then
 		DX=$((TBX + TBW / 2 - (IX + IW / 2)))
 		echo "  工具条 $TBX + $TBW/2 中心 $((TBX + TBW / 2))，窗口中心 $((IX + IW / 2))，差 $DX px"
-		[ "${DX#-}" -le 2 ] &&
-			pass "工具条横向跟小窗居中（差 $DX px ≤ 2）" ||
-			fail "工具条没跟小窗居中：偏 $DX px（窗口 $IX,$IY ${IW}x${IH}）"
+		# 前置：盒子得**整个在工作区里**才谈得上居中 —— 工具条摆位会夹回工作区
+		# （mini_toolbar_layout），盒子半挂屏外时它当然不居中，那是正确行为。
+		# 盒子现在可以合法地半挂屏外（用户要的「迷你态和自由态一样，能拖出屏边」），
+		# 所以这一条按前置判断，不成立就跳过。
+		if [ "$IX" -ge 1290 ] && [ $((IX + IW)) -le 2550 ]; then
+			[ "${DX#-}" -le 2 ] &&
+				pass "工具条横向跟小窗居中（差 $DX px ≤ 2）" ||
+				fail "工具条没跟小窗居中：偏 $DX px（窗口 $IX,$IY ${IW}x${IH}）"
+		else
+			echo "  跳过居中判据：盒子半挂屏外（$IX..$((IX + IW))，工作区 1290..2550）"
+		fi
 		BAD=0
 		GBOX=""
 		for grp in "放大" "收图标" "还原成列" "关闭"; do
