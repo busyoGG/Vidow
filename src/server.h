@@ -865,6 +865,10 @@ struct vidow_fx_target {
 	 * 里的那部分。clip = 那块屏的框（布局逻辑坐标），clip_on 为 false 时整块
 	 * 都画。裁剪只作用在**显示**上：几何、客户端、录屏抓帧都不动。 */
 	bool clip_on;
+	/* 这一份 fx 属于哪个窗口（小窗 / 图标 / MRU 卡片那些不是窗口，是 NULL）。
+	 * 裁剪在 vidow_fx_frame() 里做，那个函数只拿得到 target、拿不到 view ——
+	 * 而「overview 开着时裁到 overview 那块屏」这条判据需要 view。 */
+	struct vidow_view *view;
 	struct wlr_box clip;
 	/* 没装饰（着色器也关着）时窗口是客户端表面自己在画，那一份裁的是表面树
 	 * （wlr_scene_subsurface_tree_set_clip，见 view.c）。存的是**上一次真的

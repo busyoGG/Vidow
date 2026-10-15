@@ -1608,6 +1608,13 @@ void vidow_view_apply_clip(struct vidow_view *view) {
 			view->fx.clip = (struct wlr_box){.x = ov->out_x,
 				.y = ov->out_y, .width = ov->out_w,
 				.height = ov->out_h};
+			/* 这条日志是给「overview 跨屏」这个 bug 留的判据锚点：overview
+			 * 开着时每个窗口都该打一行，裁的范围就是 overview 那块屏的
+			 * 工作区。看不见这行 = 这段没跑（裁剪没生效）。 */
+			wlr_log(WLR_INFO,
+				"overview clip: view %p 裁到 %d,%d %dx%d",
+				(void *)view, ov->out_x, ov->out_y,
+				ov->out_w, ov->out_h);
 			return; /* 表面树那一份不裁：保住命中测试 */
 		}
 	}
@@ -2359,6 +2366,7 @@ static bool view_scanout_switch(struct vidow_view *view) {
 		/* 装饰那条路接回来：和 view_open_done / view_swap_decor 一个套路 ——
 		 * 装饰开着就重建 fx 节点（自定义的 idle shader 再挂上）。 */
 		struct vidow_config *cfg = &view->server->config;
+		view->fx.view = view; /* 裁剪要按窗口算（见 struct vidow_fx_target） */
 		if (vidow_fx_begin(view->server, &view->fx, view->scene_tree, NULL) &&
 				cfg->shader_idle[0] != '\0') {
 			vidow_fx_set_shader(view->server, &view->fx, cfg->shader_idle,

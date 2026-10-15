@@ -544,10 +544,17 @@ static void overview_apply(struct vidow_server *server) {
 	/* 上面那几刀是整棵树一起开关；图层规则可以逐个 surface 覆盖它 */
 	bool layers_changed = overview_layers_apply(server);
 
-	/* 所有窗口重新摆一遍：变换在 vidow_view_apply_anim 里生效 */
+	/* 所有窗口重新摆一遍：变换在 vidow_view_apply_anim 里生效。
+	 *
+	 * ⚠️ 这里必须**显式**再调一次 vidow_view_apply_clip()：它平时只由 arrange
+	 * 那条路（view.c 的 ..._place、workspace.c）调，overview 的每帧变换路径不
+	 * 经过那儿 —— 于是 fx 那份裁剪（fx->clip_on/clip）在 overview 里一直没被
+	 * 设过，条带超出屏宽的那些列就照画到隔壁屏上（用户：「overview 窗口太多会
+	 * 跨屏」）。判据锚点：`overview clip: view ... 裁到 ...` 每个窗口一行。 */
 	struct vidow_view *view;
 	wl_list_for_each(view, &server->views, link) {
 		vidow_view_apply_anim(view);
+		vidow_view_apply_clip(view);
 	}
 	vidow_backdrop_damage(server, layers_changed);
 }

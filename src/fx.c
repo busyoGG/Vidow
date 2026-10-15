@@ -3312,11 +3312,32 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 	 * 窗口烘，只是这张图上只采「框里的那一块」、铺到框里的那点地方。 */
 	bool cropped = false;
 	struct wlr_fbox crop_src = {0};
-	if (fx->clip_on) {
+	/* overview 开着：**在这儿**裁到 overview 那块屏的工作区。
+	 *
+	 * 为什么不靠 view.c 的 fx->clip_on/clip：实测那条管线在 overview 里根本
+	 * 不被调用（日志锚点 `overview clip:` 0 行），所以条带比屏宽的那些列一直
+	 * 照画到隔壁屏上（用户：「overview 窗口太多会跨屏」）。裁剪真正生效的地方
+	 * 就是下面这段（crop_src / node_x），在这儿算最可靠。
+	 *
+	 * 只裁画：不碰 wlr_scene_subsurface_tree_set_clip（它连**输入**一起裁，裁了
+	 * 预览就命不中 —— test-overview 的「点某个窗口 = 选中它」当场红）。 */
+	bool ov_clip = false;
+	struct wlr_box ov_clip_box = {0};
+	if (fx->view != NULL && vidow_overview_active(fx->view->server) &&
+			fx->view->mini == VIDOW_MINI_NONE && fx->view->mapped) {
+		struct vidow_overview *ov = &fx->view->server->overview;
+		if (ov->output != NULL && ov->out_w > 0 && ov->out_h > 0) {
+			ov_clip_box = (struct wlr_box){.x = ov->out_x,
+				.y = ov->out_y, .width = ov->out_w,
+				.height = ov->out_h};
+			ov_clip = true;
+		}
+	}
+	if (fx->clip_on || ov_clip) {
 		/* fx->clip 是**布局坐标**里的那块屏；这个节点的位置是相对父树的
 		 * （父树就是窗口的场景树，摆在窗口的位置上）—— 减掉父树的原点才
 		 * 在同一个坐标系里。 */
-		struct wlr_box clip = fx->clip;
+		struct wlr_box clip = ov_clip ? ov_clip_box : fx->clip;
 		if (fx->node->node.parent != NULL) {
 			clip.x -= fx->node->node.parent->node.x;
 			clip.y -= fx->node->node.parent->node.y;
@@ -3339,6 +3360,15 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 			dst_w = inter.width;
 			dst_h = inter.height;
 			cropped = true;
+			if (ov_clip) {
+				wlr_log(WLR_INFO,
+					"overview clip: view %p 裁到 %d,%d %dx%d（源 %d,%d %dx%d → 显示 %dx%d）",
+					(void *)fx->view, clip.x, clip.y,
+					clip.width, clip.height,
+					(int)crop_src.x, (int)crop_src.y,
+					(int)crop_src.width, (int)crop_src.height,
+					inter.width, inter.height);
+			}
 		} else if (!wlr_box_intersection(&inter, &node_box, &clip)) {
 			/* 这一帧整个身子都在自己那块屏外面：一个像素都不该画（画了就是
 			 * 画到隔壁屏上 —— 场景图是全局坐标，那边正画着这块框）。把落点
