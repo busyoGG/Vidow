@@ -772,6 +772,65 @@ static struct vidow_view *mini_icon_view_at(struct vidow_server *server,
 	return NULL;
 }
 
+/* 小窗（S3）：**迷你态**的命中按整个**盒子**算，不走场景图。理由：内容是按比例
+ * contain 摆在盒子中间的（665x740 的内容装进 534x299 的盒子 → 左右各留 130 像素
+ * 的留白），而命中测试只认内容节点 —— 那两块留白按下去不算窗口，拖不起来。用户
+ * 报的「小窗左右有死区、拖不动、窗口卡在范围内」就是这条。
+ * 盒子取 float_geom + anim_off（和摆位、和拖拽夹取同源）。 */
+static struct vidow_view *mini_box_view_at(struct vidow_server *server,
+		double lx, double ly, double *sx, double *sy) {
+	/* 全景里不算这一笔：那时小窗画在**全景网格**里，float_geom 还是全景之前的
+	 * 盒子 —— 照它判会让屏上别处的格子被这个窗口吞掉（test-overview 的「格子
+	 * 右上内缩 4px 命中它自己」就是这么挂的）。全景自己的命中走场景图。 */
+	if (vidow_overview_active(server)) {
+		return NULL;
+	}
+	struct vidow_view *view;
+	wl_list_for_each(view, &server->views, link) {
+		if (view->mini != VIDOW_MINI_MINI ||
+				!view->mapped || view->output == NULL ||
+				!vidow_workspace_view_visible(server, view) ||
+				view->float_geom.width <= 0 || view->float_geom.height <= 0) {
+			continue;
+		}
+		double x = view->float_geom.x + view->anim_off_x;
+		double y = view->float_geom.y + view->anim_off_y;
+		if (lx < x || lx >= x + view->float_geom.width ||
+				ly < y || ly >= y + view->float_geom.height) {
+			continue;
+		}
+		/* 局部坐标：从**内容节点**在场景里的原点量，再乘回表面坐标（内容被缩
+		 * 过：dst ≠ surface 尺寸，见 vidow_view_hit_scale）。落在留白里会得到
+		 * 负数 / 超出表面的值，夹进表面里 —— 客户端收到越界坐标没意义。 */
+		if (sx != NULL && sy != NULL && view->scene_surface != NULL) {
+			int nx = 0, ny = 0;
+			if (wlr_scene_node_coords(&view->scene_surface->buffer->node,
+					&nx, &ny)) {
+				double k = vidow_view_hit_scale(view);
+				struct wlr_surface *surf = vidow_view_surface(view);
+				*sx = (lx - nx) * k;
+				*sy = (ly - ny) * k;
+				if (surf != NULL) {
+					if (*sx < 0) {
+						*sx = 0;
+					}
+					if (*sy < 0) {
+						*sy = 0;
+					}
+					if (*sx > surf->current.width) {
+						*sx = surf->current.width;
+					}
+					if (*sy > surf->current.height) {
+						*sy = surf->current.height;
+					}
+				}
+			}
+		}
+		return view;
+	}
+	return NULL;
+}
+
 struct vidow_view *vidow_view_at(struct vidow_server *server,
 		double lx, double ly, struct wlr_surface **surface,
 		double *sx, double *sy) {
@@ -781,6 +840,14 @@ struct vidow_view *vidow_view_at(struct vidow_server *server,
 			*surface = vidow_view_surface(snap);
 		}
 		return snap;
+	}
+	/* 迷你小窗同理（整盒命中，见上）：它画在平铺窗口之上，所以先于场景图判。 */
+	struct vidow_view *mini = mini_box_view_at(server, lx, ly, sx, sy);
+	if (mini != NULL) {
+		if (surface != NULL) {
+			*surface = vidow_view_surface(mini);
+		}
+		return mini;
 	}
 	struct wlr_scene_node *node =
 		wlr_scene_node_at(&server->scene->tree.node, lx, ly, sx, sy);
@@ -3053,6 +3120,11 @@ static void output_arrange(struct vidow_server *server,
 	 * 松手那段吸附动画也走这里（gesture_drag 一直挂到动画结束）。 */
 	if (output->gesture_drag) {
 		viewport = output->gesture_viewport;
+	} else if (output->drag_scroll) {
+		/* 平铺拖拽期间视口归拖拽自己（贴边自动滚条带，见 drag.c 的
+		 * vidow_tile_drag_autoscroll）：不能跑下面那套「把焦点列滚回可见区」
+		 * —— 刚为了看落点滚出去，立刻就被它拽回来，等于滚不动。 */
+		viewport = output->drag_viewport;
 	} else {
 		viewport = focus_viewport_target(server, output, viewport, work.width);
 	}

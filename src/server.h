@@ -1089,6 +1089,18 @@ struct vidow_output {
 	 * 说了算，arrange 不做「把焦点列滚回可见区」那套（见 view.c 的 Pass 2）。 */
 	bool gesture_drag;
 	double gesture_viewport;
+	/* 平铺窗口拖拽时的**贴边自动滚条带**（niri 的 Dnd 手感）：光标压进工作区
+	 * 左右边缘那条带里，条带就按秒速往那边滚 —— 停着不动也继续滚，所以推进放
+	 * 在每帧（output.c 的 vidow_output_render 调 vidow_tile_drag_scroll_step），
+	 * 这里只记「视口归拖拽说了算」和「往哪边、多快」。
+	 *
+	 * 为什么必须有：条带比屏宽时，屏幕外那些列（和它们之间的落点）光靠推光标
+	 * 永远够不到 —— 用户报的「整个显示器左右有一部分死区 / 窗口拖过去被弹回」
+	 * 就是这一条。 */
+	bool drag_scroll;
+	double drag_viewport;
+	double drag_scroll_speed;   /* 像素/秒，正 = 往右滚，0 = 不在边缘带里 */
+	int64_t drag_scroll_ns;     /* 上一次推进的时刻（算 dt） */
 	/* 按需 VRR（niri 的 variable-refresh-rate on-demand）：这块屏是不是按需模式
 	 * （配置说了算，每次 arrange 对一遍账），以及上一次按需要到的状态（省掉
 	 * 每帧一次 commit —— 见 output.c 的 vidow_output_vrr_on_demand_update）。 */
@@ -2924,6 +2936,11 @@ void vidow_tile_grab_begin(struct vidow_server *server,
 		struct vidow_view *view);
 void vidow_tile_grab_update(struct vidow_server *server, double lx, double ly);
 void vidow_tile_grab_end(struct vidow_server *server);
+/* 平铺拖拽的贴边自动滚条带（niri 的 Dnd 手感）：update 里记意图，每帧推进一次。
+ * 光标压着工作区左右边缘不动也会一直滚 —— 条带比屏宽时，屏幕外那些落点只有这
+ * 样才够得到（用户报的「整个显示器左右有一部分死区」）。 */
+void vidow_tile_drag_autoscroll(struct vidow_server *server, double lx);
+bool vidow_tile_drag_scroll_step(struct vidow_server *server);
 
 /* 落点预览块（niri 的 insert hint）：建在 layer_toplevels 里，main.c 建完场景层
  * 之后调一次。拖平铺窗口的每个指针事件都会重算一遍落点并摆这块（见 drag.c）。 */

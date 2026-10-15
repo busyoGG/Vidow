@@ -114,6 +114,12 @@ void vidow_output_render(struct vidow_output *output) {
 		server->grab_last_box = vidow_view_screen_box(gv);
 	}
 
+	/* 平铺拖拽的**贴边自动滚条带**（niri 的 Dnd 手感）：光标压在工作区左右边缘
+	 * 那条带里就按秒速推视口 —— 放在这里是因为「停着不动也要继续滚」，只有每帧
+	 * 才推得动。滚了的话它自己会再要一帧，所以压着边缘不动就能一直滚下去，直到
+	 * 光标离开边缘或者松手。 */
+	vidow_tile_drag_scroll_step(server);
+
 	/* 临时探针（VIDOW_RENDER_STATS=1）：每帧各阶段耗时 + 贴图导入/重建次数 */
 	int64_t st_t0 = vidow_now_ns();
 	vidow_blur_update(output);

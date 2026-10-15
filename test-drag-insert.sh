@@ -235,7 +235,6 @@ else
 	fail "列数不对：$(cols)（期望 1）"
 fi
 
-exec 9>&-
 echo
 python3 - "$SHOT" <<'PY'
 import sys
@@ -347,9 +346,102 @@ PY
 [ $? -ne 0 ] && FAILED=1
 
 echo
-if [ $FAILED -eq 0 ]; then
-	echo "全部通过 / test-drag-insert.sh: OK"
+echo "== 贴边自动滚条带：条带比屏宽时，屏幕外那些落点光靠推光标够不到 =="
+# 用户报的「整个显示器左右有一部分死区 / 窗口拖过去被弹回」就是这条：niri 的 Dnd
+# 里光标压进工作区左右边缘那条带（40 逻辑像素）就按秒速往那边滚条带 —— **停着不动
+# 也继续滚**。这里把条带撑到比屏宽（5 条列：5×381−10 = 1895 > 可用区 1260），量四件
+# 事：视口自己滚 / 滚到头夹住 / 松手落在那一端 / 松手后视口交回 arrange。
+#
+# 注意：`wins` 里的 x 是**屏上**坐标（已经减过视口），所以条带里的位置要自己加回
+# 视口（见 strip_x）；选「谁在最右」也得按屏上坐标排（见 rightmost/middle）。
+viewport() {
+	./build/vidowmsg outputs | python3 -c '
+import sys, json
+for o in json.load(sys.stdin):
+    if o.get("viewport_x") is not None:
+        print("%.0f" % o["viewport_x"])
+        break
+else:
+    print(0)'
+}
+strip_x() { echo $(( $(field "$1" 4) + $(viewport) )); }
+rightmost() { wins | sort -k4 -n | tail -1 | awk '{print $1}'; }
+middle() { wins | sort -k4 -n | sed -n '3p' | awk '{print $1}'; }
+
+echo "-- 先把前面那些窗口收掉：这一节自己摆一张干净的条带（5 条列）--"
+for p in $CLIENT_PIDS; do kill "$p" 2>/dev/null; done
+CLIENT_PIDS=""
+sleep 2.0
+spawn a1
+spawn a2
+spawn a3
+spawn a4
+spawn a5
+LAST=$(rightmost)
+./build/vidowmsg focus-window --title "$LAST" >/dev/null
+sleep 0.5
+VP_MAX=$(viewport)
+if [ "$(cols)" = "5" ] && [ "${VP_MAX:-0}" -ge 600 ]; then
+	pass "五条列、条带 1895 > 可用区 1260：视口顶到 $VP_MAX（条带比屏宽）"
 else
-	echo "有判据没过（见上面的清单）"
+	fail "条带没撑起来：列数=$(cols) 视口=$VP_MAX"
 fi
+
+echo "-- 把最右那条列（$LAST）拖到左边缘那条带里（x=40：带 40 宽 → 半速）停住不动 --"
+start_drag "$LAST" 40 200 $GRAB_DX $GRAB_DY
+act "pointer-motion 40 200" 0.3
+VP1=$(viewport)
+sleep 0.6
+VP2=$(viewport)
+if [ "${VP2:-0}" -lt "${VP1:-0}" ] && [ "${VP1:-0}" -lt "${VP_MAX:-0}" ]; then
+	pass "光标停着不动、没有新 motion 事件，视口自己滚：$VP_MAX → $VP1 → $VP2"
+else
+	fail "视口没自己滚：$VP_MAX → $VP1 → $VP2"
+fi
+sleep 2.0
+VP3=$(viewport)
+if [ "$VP3" = "0" ]; then
+	pass "滚到头就停住：视口 = 0（夹在 [0, max] 里，不会滚穿）"
+else
+	fail "没滚到头：视口 = $VP3"
+fi
+release
+if [ "$(strip_x "$LAST")" = "10" ]; then
+	pass "松手落在最前面：$LAST 成第 1 条列（条带 x=10）"
+else
+	fail "落点不对：$LAST 在条带 x=$(strip_x "$LAST")（列序 $(wins | sort -k4 -n | awk '{print $1}' | tr '\n' ' ')）"
+fi
+
+echo "-- 反向：条带中间那条列拖到右边缘停住 --"
+MID=$(middle)
+./build/vidowmsg focus-window --title "$MID" >/dev/null
+sleep 0.5
+VP_L=$(viewport)
+start_drag "$MID" 1250 200 $GRAB_DX $GRAB_DY
+act "pointer-motion 1250 200" 0.3
+sleep 1.2
+VP_R=$(viewport)
+if [ "${VP_R:-0}" -gt "${VP_L:-0}" ]; then
+	pass "右边缘同样自己滚：视口 $VP_L → $VP_R"
+else
+	fail "右边缘没滚：视口 $VP_L → $VP_R"
+fi
+release
+if [ "$(strip_x "$MID")" = "1534" ]; then
+	pass "松手落在最后面：$MID 挪到条带末端（第 5 条列，条带 x=1534）"
+else
+	fail "落点不对：$MID 在条带 x=$(strip_x "$MID")（列序 $(wins | sort -k4 -n | awk '{print $1}' | tr '\n' ' ')）"
+fi
+
+echo "-- 松手后视口交回 arrange：焦点一动视口该跟着走（没被拖拽锁死）--"
+./build/vidowmsg focus-window --title "$(wins | sort -k4 -n | head -1 | awk '{print $1}')" >/dev/null
+sleep 0.6
+VP_F=$(viewport)
+if [ "$VP_F" = "0" ]; then
+	pass "焦点回到第 1 条列，视口跟着回到 0（拖拽的接管已交回）"
+else
+	fail "视口被拖拽锁死了：还是 $VP_F"
+fi
+
+exec 9>&-
 exit $FAILED

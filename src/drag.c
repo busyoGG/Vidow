@@ -954,9 +954,132 @@ void vidow_tile_grab_update(struct vidow_server *server, double lx, double ly) {
 	 * 要不要让位。 */
 	vidow_mini_drop_zone_update(server);
 	vidow_insert_hint_update(server);
+	/* 贴边自动滚条带：光标压进工作区左右边缘那条带里就按秒速往那边推视口。
+	 * 停着不动也要继续滚，所以这里只记「往哪边、多快」，推进在每帧
+	 * （vidow_tile_drag_scroll_step，output.c 的渲染里调）。niri 的 Dnd 就是这个
+	 * 手感：条带比屏宽时，屏幕外那些列（和它们之间的落点）光靠推光标永远够不到。 */
+	vidow_tile_drag_autoscroll(server, lx);
 	/* 顺手把保帧看门狗武装上：要帧那一下可能被「后端已经欠着一帧」挡掉
 	 * （嵌套在别的合成器里时很常见），没有看门狗就没人再推了 —— 拖动会冻住。 */
 	vidow_output_kick_watchdog(server);
+}
+
+/* 边缘带多宽（逻辑像素）：光标进到离工作区左右边这么近就开始滚。 */
+#define DRAG_SCROLL_EDGE 40.0
+/* 压在最边上时的速度（逻辑像素/秒）：条带一屏 1920 的话，最边上大约 1.2 秒滚
+ * 过一屏 —— 够快，又不至于一下冲过头。 */
+#define DRAG_SCROLL_MAX 1600.0
+
+void vidow_tile_drag_autoscroll(struct vidow_server *server, double lx) {
+	struct vidow_view *view = server->grab_view;
+	if (view == NULL) {
+		return;
+	}
+	/* 用**光标底下**那块屏（和落点判定同一个来源）：跨屏拖的时候窗口的
+	 * view->output 还挂在老屏上，照它算就会去滚老屏的条带。光标不在任何屏上
+	 * 才退回窗口自己那块。 */
+	struct wlr_output *wlr_out = output_under_cursor(server);
+	struct vidow_output *out = wlr_out != NULL ?
+		vidow_output_lookup(server, wlr_out) : NULL;
+	if (out == NULL) {
+		out = vidow_output_lookup(server, view->output);
+	}
+	if (out == NULL) {
+		return;
+	}
+	/* 只有光标底下这一块屏接管视口：跨屏拖时刚离开的那块要还回去（不然它的
+	 * 视口就永久锁在拖拽手里了）。 */
+	struct vidow_output *o;
+	wl_list_for_each(o, &server->outputs, link) {
+		if (o != out && o->drag_scroll) {
+			o->drag_scroll = false;
+			o->drag_scroll_speed = 0.0;
+			o->drag_scroll_ns = 0;
+			server->arrange_dirty = true;
+		}
+	}
+	/* 视口这期间归拖拽：不滚的时候也要接管（否则 arrange 的「把焦点列滚回可见
+	 * 区」会在拖拽途中自己滚一下）。接管那一刻取当前视口当起点。 */
+	if (!out->drag_scroll) {
+		out->drag_scroll = true;
+		out->drag_viewport = out->viewport_x;
+	}
+	struct wlr_box work = vidow_work_area(server, out->wlr_output);
+	if (work.width < 1) {
+		out->drag_scroll_speed = 0.0;
+		return;
+	}
+	double lo = (double)work.x + DRAG_SCROLL_EDGE;
+	double hi = (double)(work.x + work.width) - DRAG_SCROLL_EDGE;
+	double speed = 0.0;
+	if (lx < lo) {
+		double t = (lo - lx) / DRAG_SCROLL_EDGE;
+		if (t > 1.0) {
+			t = 1.0;
+		}
+		speed = -t * DRAG_SCROLL_MAX;
+	} else if (lx > hi) {
+		double t = (lx - hi) / DRAG_SCROLL_EDGE;
+		if (t > 1.0) {
+			t = 1.0;
+		}
+		speed = t * DRAG_SCROLL_MAX;
+	}
+	out->drag_scroll_speed = speed;
+}
+
+bool vidow_tile_drag_scroll_step(struct vidow_server *server) {
+	struct vidow_view *view = server->grab_view;
+	bool active = server->grab_mode == VIDOW_GRAB_TILE && view != NULL;
+	if (!active) {
+		/* 拖拽没了（松手 / 窗口半路没了）：接管到此为止，视口交回 arrange。
+		 * 顺手把所有屏清一遍 —— 这条自愈是为了「哪条退出路径漏了清」不会把
+		 * 视口永久锁在拖拽手里（正常路径在 vidow_tile_grab_end 里清）。 */
+		struct vidow_output *o;
+		wl_list_for_each(o, &server->outputs, link) {
+			if (o->drag_scroll) {
+				o->drag_scroll = false;
+				o->drag_scroll_speed = 0.0;
+				o->drag_scroll_ns = 0;
+				server->arrange_dirty = true;
+			}
+		}
+		return false;
+	}
+	/* 谁在接管视口就推谁（跨屏拖的时候接管的那块未必是窗口的 view->output，
+	 * 见 vidow_tile_drag_autoscroll）。同一时刻只有一块屏接管。 */
+	struct vidow_output *out = NULL;
+	struct vidow_output *o;
+	wl_list_for_each(o, &server->outputs, link) {
+		if (o->drag_scroll) {
+			out = o;
+			break;
+		}
+	}
+	if (out == NULL) {
+		return false;
+	}
+	int64_t now = vidow_now_ns();
+	double dt = out->drag_scroll_ns > 0 ?
+		(double)(now - out->drag_scroll_ns) / 1e9 : 0.0;
+	out->drag_scroll_ns = now;
+	if (out->drag_scroll_speed == 0.0 || dt <= 0.0) {
+		return false;
+	}
+	if (dt > 0.1) {
+		dt = 0.1;   /* 卡了一帧不要跳一大段 */
+	}
+	out->drag_viewport += out->drag_scroll_speed * dt;
+	/* 视口一变，列的 screen_x 全变：重排一次（arrange 会把视口夹回
+	 * [0, max_viewport]，所以滚到头自然停住），落点提示跟着重算。被拖的窗口
+	 * 自己不用动 —— 它跟的是光标。 */
+	vidow_arrange(server);
+	vidow_insert_hint_update(server);
+	/* arrange 会把视口夹回 [0, max_viewport]：把夹过的值抄回来。不抄的话滚到
+	 * 头之后还接着累加，等光标移到另一边要先「空转」掉这一段才开始动。 */
+	out->drag_viewport = out->viewport_x;
+	vidow_output_schedule_frame(server, out->wlr_output, "拖拽贴边自动滚");
+	return true;
 }
 
 void vidow_tile_grab_end(struct vidow_server *server) {
@@ -978,6 +1101,17 @@ void vidow_tile_grab_end(struct vidow_server *server) {
 	server->grab_dirty = false;
 	server->grab_mode = VIDOW_GRAB_NONE;
 	server->grab_view = NULL;
+	/* 贴边自动滚的接管到此为止：视口交回 arrange（按新的焦点列重算 = 滚到刚
+	 * 落下的那个窗口）。放在下面那些提前返回之前 —— 哪条路走不通都不能把视口
+	 * 留在拖拽手里。 */
+	if (view != NULL) {
+		struct vidow_output *out = vidow_output_lookup(server, view->output);
+		if (out != NULL) {
+			out->drag_scroll = false;
+			out->drag_scroll_speed = 0.0;
+			out->drag_scroll_ns = 0;
+		}
+	}
 	wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "left_ptr");
 	/* 松手：解掉抓点，网格自己晃回去（位置照旧归下面的布局逻辑管）。
 	 * 放在所有提前返回之前 —— 不管这条路走不走得通，果冻都得收手。 */

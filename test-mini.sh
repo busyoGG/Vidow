@@ -487,6 +487,45 @@ PY
 [ $? -eq 0 ] || FAILED=1
 
 # ================================================================ S3：图标裁剪
+mark "S3 迷你态命中：整个盒子都算窗口（左右留白也要抓得住）"
+# 用户报的：「小窗左右有死区、拖不动、窗口直接卡在范围内」。根因：内容是按比例
+# contain 摆在盒子**中间**的（345x318 的内容装进 353x196 的盒子 → 左右各留 ~70
+# 像素留白），而命中测试只认内容节点 ⇒ 留白按下去不算窗口、拖不起来。修法：迷你态
+# 命中按整个盒子算（view.c 的 mini_box_view_at，盒子取 float_geom + anim_off）。
+box() {
+	./build/vidowmsg windows | python3 -c '
+import sys, json
+for w in json.load(sys.stdin):
+    if w["title"] == "w1":
+        g = w["float_geometry"] or w["geometry"]
+        print(g["x"], g["y"], g["width"], g["height"])
+        break'
+}
+hit() { ./build/vidowmsg pick-window "$1" "$2" 2>/dev/null | grep -q "w1" && echo yes || echo no; }
+set_state mini; sleep 1.2
+read -r X Y W H <<< "$(box)"
+echo "  迷你盒 $X,$Y ${W}x${H}（原生内容 $(winf w1 sw)x$(winf w1 sh) → 左右有留白）"
+L=$(hit $((X + 3)) $((Y + H / 2)))
+R=$(hit $((X + W - 3)) $((Y + H / 2)))
+C=$(hit $((X + W / 2)) $((Y + H / 2)))
+if [ "$L" = yes ] && [ "$R" = yes ] && [ "$C" = yes ]; then
+	pass "贴左边缘 3px / 盒心 / 贴右边缘 3px 都命中它自己（留白也算窗口）"
+else
+	fail "盒子里有死区：左 3px=$L 盒心=$C 右 3px=$R（期望都是 yes）"
+fi
+# 真动作：按在**左留白**上拖 —— 以前这一步抓不住窗口（拖动完全不发生）
+CX=$((X + 6)); CY=$((Y + H / 2))
+act "pointer-motion $CX $CY" 0.25
+act "pointer-button left press mod" 0.25
+act "pointer-motion $((CX - 100)) $CY" 0.45
+read -r NX NY NW NH <<< "$(box)"
+act "pointer-button left release mod" 0.5
+if [ "$NX" -lt "$((X - 50))" ]; then
+	pass "按在左留白（盒 x+6）上能拖动：盒子跟手 $X → $NX"
+else
+	fail "按在左留白上拖不动：盒子 $X,$Y → $NX,$NY（期望 x 减 ≈100）"
+fi
+
 mark "S3 图标贴边裁剪：相邻屏上「本该溢出」的条带非背景像素 = 0"
 unmini; sleep 0.8
 # 先把窗口摆回屏 1：图标默认贴**右边**，屏 1 的右边外侧才是屏 2（spill 才落得上屏）
