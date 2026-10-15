@@ -1396,6 +1396,7 @@ bool vidow_view_in_output_box(struct vidow_server *server,
 /* 这块窗口现在该不该裁到自己那块屏里，裁的话边界是哪块屏的框。 */
 static bool view_clip_box(struct vidow_view *view, struct wlr_box *out) {
 	struct vidow_server *server = view->server;
+
 	/* 小窗（mini window，S3）：**强制裁到自己那块屏**。
 	 *
 	 * ⚠️ 这条和下面「浮动窗口一律不裁」是**相反**的语义，别合并：浮动窗口跨屏
@@ -1592,6 +1593,24 @@ void vidow_view_apply_clip(struct vidow_view *view) {
 	}
 	view->fx.clip_on = on;
 	view->fx.clip = box;
+	/* overview：**只裁画**（fx 那一份离屏缓冲），不裁表面树 ——
+	 * wlr_scene_subsurface_tree_set_clip 连**输入**一起裁，裁了预览就命不中
+	 * （test-overview 的「点某个窗口 = 选中它」当场红）。
+	 *
+	 * 以前 overview 是整条放行（不裁），于是条带比屏宽的那些列直接画到隔壁
+	 * 显示器上 —— 用户：「overview 窗口太多会跨屏」。裁到 overview 自己那块屏
+	 * 的工作区（ov->out_* 就是它的工作区，布局坐标，和 fx->clip 同一坐标系）。 */
+	if (vidow_overview_active(view->server) &&
+			view->mini == VIDOW_MINI_NONE && view->mapped) {
+		struct vidow_overview *ov = &view->server->overview;
+		if (ov->output != NULL && ov->out_w > 0 && ov->out_h > 0) {
+			view->fx.clip_on = true;
+			view->fx.clip = (struct wlr_box){.x = ov->out_x,
+				.y = ov->out_y, .width = ov->out_w,
+				.height = ov->out_h};
+			return; /* 表面树那一份不裁：保住命中测试 */
+		}
+	}
 	if (on != was_on) {
 		/* 这是个**状态**（跟「藏起 / 显示」一样）：裁不裁决定客户端被叫去按哪块屏
 		 * 的缩放渲染（wlroots 的 wlr_scene_surface 按「可见面积最大的那块输出」
