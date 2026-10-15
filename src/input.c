@@ -951,12 +951,12 @@ static void mini_grab_update(struct vidow_server *server) {
 	}
 	double x = server->cursor->x - server->mini_grab_dx;
 	double y = server->cursor->y - server->mini_grab_dy;
-	double span_x = (double)(work.width - view->float_geom.width);
-	double span_y = (double)(work.height - view->float_geom.height);
-	/* 锚点 0 = 贴工作区左 / 上边，1 = 贴右 / 下边（vidow_mini_resolve_geom 会
-	 * 夹进 -0.5..1.5，图标允许出屏一点）。 */
-	view->mini_ax = span_x > 1.0 ? (x - work.x) / span_x : 0.5;
-	view->mini_ay = span_y > 1.0 ? (y - work.y) / span_y : 0.5;
+	/* 锚点 0 = 贴工作区左 / 上边，1 = 贴右 / 下边。**迷你态**夹在工作区里
+	 * （allow_over = false，见 vidow_mini_anchor_from）—— 这里以前完全不夹、
+	 * 只靠 resolve 兜底的 -0.5..1.5（半个工作区），264px 宽的迷你盒能被整个拖
+	 * 出屏幕（用户视频 /tmp/mini.mp4）。图标态照旧允许出屏一点（mini_icon_overflow）。 */
+	vidow_mini_anchor_from(view, work, view->float_geom.width,
+		view->float_geom.height, x, y, view->mini != VIDOW_MINI_MINI);
 	vidow_mini_resolve_geom(view);
 	vidow_arrange(server);
 }

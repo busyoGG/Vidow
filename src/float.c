@@ -590,10 +590,16 @@ void vidow_float_begin_grab(struct vidow_server *server,
  * 每次都得把「光标想要的绝对位置」换算成锚点回写，换算用的工作区必须是**盒子
  * 现在归属的那块屏**（跨屏的瞬间就换过去，见 mini_free_drag_to_output）。
  *
- * 锚点 0 = 贴工作区左 / 上边、1 = 贴右 / 下边。FREE 的锚点**夹在 0..1**：MINI /
- * ICON 允许 -0.5..1.5（图标刻意出屏一点），FREE 是正常窗户，摆在工作区里就行
- * —— 不夹的话「光标拖出屏外」会把锚点记成 1.6，换屏之后被 resolve 夹到远边。 */
-static void mini_free_anchor_from(struct vidow_view *view,
+ * 锚点 0 = 贴工作区左 / 上边、1 = 贴右 / 下边。
+ *
+ * allow_over 决定「能探出工作区多少」，**按形态给**：
+ *   FREE  → true ：出屏**半个盒子**（用户要的「允许一半在屏外」）
+ *   MINI  → false：不出工作区（拖到屏边就停）—— 这一档是这次修的
+ *   ICON  → true ：照旧允许越界一点（图标出屏那点，见 mini_icon_overflow）
+ * 以前 MINI / ICON 那两条路**完全不夹**，只靠 resolve 的兜底 -0.5..1.5 —— 那是
+ * 「半个**工作区**」（1908 屏上 ≈954px），而迷你盒才 264px 宽：能把盒子整个拖出
+ * 屏幕（用户视频 /tmp/mini.mp4：拖出去两秒完全看不见，回来时贴右边缘只剩 200px）。 */
+void vidow_mini_anchor_from(struct vidow_view *view,
 		struct wlr_box work, int w, int h, double bx, double by,
 		bool allow_over) {
 	double span_x = (double)(work.width - w);
@@ -642,7 +648,7 @@ static void mini_free_drag_set_anchor(struct vidow_server *server,
 	if (work.width < 1 || work.height < 1) {
 		return;
 	}
-	mini_free_anchor_from(view, work, view->float_geom.width,
+	vidow_mini_anchor_from(view, work, view->float_geom.width,
 		view->float_geom.height, (double)x, (double)y, true);
 	vidow_mini_resolve_geom(view);
 }
@@ -677,7 +683,7 @@ static void mini_free_drag_to_output(struct vidow_server *server,
 	 * 「拎着它走」而不是「盒子跳到光标底下」。 */
 	double bx = lx - (server->grab_x - (double)server->grab_geom.x);
 	double by = ly - (server->grab_y - (double)server->grab_geom.y);
-	mini_free_anchor_from(view, work, w, h, bx, by, false);
+	vidow_mini_anchor_from(view, work, w, h, bx, by, false);
 	vidow_mini_move_to_output(server, view, to);
 }
 
@@ -762,15 +768,13 @@ void vidow_float_grab_update(struct vidow_server *server, double lx,
 			x = view->float_geom.x;
 			y = view->float_geom.y;
 		} else if (view->mini != VIDOW_MINI_NONE) {
+			/* MINI / ICON：照旧不出工作区（allow_over = false）。以前这里手算
+			 * 锚点、不夹 —— 和 input.c 的 mini_grab_update 同一个 bug（能把小窗
+			 * 整个拖出屏，见 vidow_mini_anchor_from 的注释）。 */
 			struct wlr_box work = vidow_work_area(server, view->output);
-			double span_x = (double)(work.width - view->float_geom.width);
-			double span_y = (double)(work.height - view->float_geom.height);
-			/* 锚点 0 = 贴工作区左 / 上边、1 = 贴右 / 下边（夹取规则见
-			 * vidow_mini_resolve_geom，图标允许超出一点）。 */
-			view->mini_ax = span_x > 1.0 ?
-				((double)x - work.x) / span_x : 0.5;
-			view->mini_ay = span_y > 1.0 ?
-				((double)y - work.y) / span_y : 0.5;
+			vidow_mini_anchor_from(view, work, view->float_geom.width,
+				view->float_geom.height, (double)x, (double)y,
+				view->mini != VIDOW_MINI_MINI);
 			vidow_mini_resolve_geom(view);
 			x = view->float_geom.x;
 			y = view->float_geom.y;
@@ -822,7 +826,7 @@ void vidow_float_grab_update(struct vidow_server *server, double lx,
 				 * 在工作区里的比例位置」，尺寸一变同一个锚点就落到别处 ——
 				 * 拖右边缘时左边缘会跟着往回跑（实测 1648 → 1601）。普通浮窗
 				 * 改大小的语义就是左上角不动，FREE 照它。 */
-				mini_free_anchor_from(view, work, w, h,
+				vidow_mini_anchor_from(view, work, w, h,
 					(double)view->float_geom.x,
 					(double)view->float_geom.y, true);
 			}
@@ -1680,11 +1684,20 @@ void vidow_mini_resolve_geom(struct vidow_view *view) {
 
 	/* 锚点 -> 绝对位置：0 = 贴工作区左 / 上边，1 = 贴右 / 下边。图标允许
 	 * 超出 0..1（夹在 -0.5..1.5），好让它按 mini_icon_overflow 出屏一点。 */
+	/* 锚点 -> 绝对位置：0 = 贴工作区左 / 上边，1 = 贴右 / 下边。
+	 * FREE 允许越界（拖动里出屏半个盒子，盒子接近满屏时 w/(2*span) 能到 0.5，
+	 * 所以兜底夹 -0.5..1.5）；MINI / ICON **夹在 0..1** —— 它们本来就该在工作区
+	 * 里，图标那点出屏是下面 mini_icon_overflow 额外加的偏移。以前 MINI / ICON
+	 * 也照 -0.5..1.5 兜底 = 允许半个工作区在外面：迷你盒整个能被拖出屏幕。 */
 	double ax = view->mini_ax, ay = view->mini_ay;
-	if (ax < -0.5) {
-		ax = -0.5;
-	} else if (ax > 1.5) {
-		ax = 1.5;
+	/* 只有 MINI 夹在 0..1（它就该在工作区里）；FREE 和 ICON 照旧 -0.5..1.5 ——
+	 * FREE 是「出屏半个盒子」要越界，ICON 那点出屏本来就走越界锚点。 */
+	double over = view->mini == VIDOW_MINI_MINI ? 0.0 : 0.5;
+	double lo = -over, hi = 1.0 + over;
+	if (ax < lo) {
+		ax = lo;
+	} else if (ax > hi) {
+		ax = hi;
 	}
 	if (ay < -0.5) {
 		ay = -0.5;
