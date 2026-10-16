@@ -1087,6 +1087,64 @@ if [ "$(ovfield active)" = "False" ]; then
 else
 	fail "退不出概览（active=$(ovfield active)）"
 fi
+# ---------------------------------------------------------------- overview 不跨屏
+mark "overview 不跨屏：开 overview 前后，隔壁屏的非背景像素不增加"
+# 用户：「overview 窗口太多会跨屏」。条带比屏宽的那些列本来就在行矩形外（场景没有
+# 裁剪节点，见 overview.c 里 row->rect_x 那段注释），不裁就画到隔壁显示器上 ——
+# 全景开在**左屏**（光标在哪块屏，全景锁哪块屏），溢出的列会落到右屏地界。
+# 亮像素数（任一通道 > 200）：预览里的图案是纯色高亮，壁纸 / 压暗遮罩都是暗的。
+# 不能按「非洋红」数 —— 右屏没铺壁纸（wall.py 只画光标那块屏），整屏都算「非背景」。
+bright() {
+	python3 - "$1" <<'PYNB'
+import sys
+from PIL import Image
+import numpy as np
+a = np.asarray(Image.open(sys.argv[1]).convert('RGB'), dtype=np.int16)
+print(int((a.max(axis=2) > 200).sum()))
+PYNB
+}
+stop_clients
+start_vidow 2
+point_at 640 2560 720
+python3 tools/wall.py >/dev/null 2>&1 &
+sleep 0.8
+point_at 1920 2560 720
+python3 tools/wall.py >/dev/null 2>&1 &
+sleep 0.8
+point_at 640 2560 720
+sleep 0.3
+for n in ov-1 ov-2 ov-3 ov-4 ov-5 ov-6 ov-7; do
+	python3 tools/pattern.py "$n" >/dev/null 2>&1 &
+	sleep 0.6
+done
+sleep 1.5
+grim -t ppm -g "1280,0 1280x720" - > "$RUNDIR/ov-before.ppm" 2>/dev/null
+point_at 640 2560 720
+sleep 0.3
+wtype -M logo -k o >/dev/null 2>&1
+sleep 1.2
+grim -t ppm -g "1280,0 1280x720" - > "$RUNDIR/ov-after.ppm" 2>/dev/null
+wtype -k Escape >/dev/null 2>&1
+sleep 0.6
+if [ ! -s "$RUNDIR/ov-before.ppm" ] || [ ! -s "$RUNDIR/ov-after.ppm" ]; then
+	fail "截图是空的（before/after）"
+else
+	B=$(bright "$RUNDIR/ov-before.ppm")
+	A=$(bright "$RUNDIR/ov-after.ppm")
+	echo "  右屏亮像素：开全景前 $B → 开全景后 $A"
+	# 断言**完全相等**：右屏只该有壁纸，开全景不该动它一个像素。漏过去的
+	# 预览会把洋红换成别的颜色（计数涨）或盖住金色方块（计数跌）—— 两头都能
+	# 抓到；而压暗只是把洋红变暗洋红，计数不变。
+	if [ "$A" = "$B" ]; then
+		pass "overview 没往隔壁屏画东西（右屏 $B 个亮像素，前后一致）"
+	else
+		fail "overview 漏到隔壁屏：右屏亮像素 $B → $A（差 $((A - B))）"
+	fi
+fi
+stop_clients
+kill -TERM -- "-$VIDOW_PGID" 2>/dev/null
+sleep 0.6
+
 
 echo
 if [ $FAILED -eq 0 ]; then
