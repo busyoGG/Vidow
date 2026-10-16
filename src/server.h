@@ -3590,6 +3590,12 @@ void vidow_overview_update(struct vidow_server *server);
 void vidow_overview_map(struct vidow_server *server, struct vidow_view *view,
 		double ox, double oy, double *sx, double *sy);
 double vidow_overview_scale(const struct vidow_server *server);
+
+/* 这个窗口在 overview 里画出来的框 + 它那一行的矩形（都布局坐标）。给「整块
+ * 落在行矩形外就不画」这条判据用。返回 false = 不适用。 */
+bool vidow_overview_view_box(struct vidow_server *server,
+		struct vidow_view *view, struct wlr_box *out,
+		struct wlr_box *row_out);
 /* 点一下：选中命中的那列（返回 true = 这次点击被 overview 吃掉了）。 */
 bool vidow_overview_click(struct vidow_server *server, double sx, double sy);
 /* 滚轮：滚的是工作区列表（上下预览），不是窗口。`steps` = 走几**行**（一格 = 一块

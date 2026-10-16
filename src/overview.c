@@ -806,6 +806,45 @@ void vidow_overview_map(struct vidow_server *server, struct vidow_view *view,
 	*sy = wy + (y1 - wy) * ov->t;
 }
 
+/* 这个窗口在 overview 里**画出来的那块框**（布局坐标）+ 它那一行的矩形。
+ * 返回 false = 不适用（不在 overview 里 / 不在这块屏 / 不在行里）。
+ *
+ * 给 view.c 的 view_overview_alpha() 判「整块落在行矩形外」用：场景没有裁剪
+ * 节点，那些列不藏就直接画到隔壁显示器上（见 row->rect_x 那段注释 + 用户报的
+ * 「overview 窗口太多会跨屏」）。 */
+bool vidow_overview_view_box(struct vidow_server *server,
+		struct vidow_view *view, struct wlr_box *out,
+		struct wlr_box *row_out) {
+	const struct vidow_overview *ov = &server->overview;
+	if (ov->t <= 0.0 || ov->output == NULL || view->output != ov->output) {
+		return false;
+	}
+	struct vidow_ov_row *row = row_of(server, view->ws);
+	if (row == NULL) {
+		return false;
+	}
+	/* 用**场景节点真实坐标 + dst**（就是这一帧画出来的那块）—— 只读，没有
+	 * 副作用。
+	 *
+	 * ⚠️ 别在这儿调 row_view_rect() / vidow_overview_map()：这个函数是从
+	 * view_overview_alpha() 调的，而 alpha 在**摆放之前**算，顺序比正常路径早
+	 * 一步；row_view_rect() 会写行的视口状态（row->content_x 那些），提前调就把
+	 * 后面的摆放带歪 —— 实测 test-overview 的四象限颜色 / 没被压暗三条当场红
+	 * （而且一行 OVHIDE 都没打：不是藏错了，是顺序被搅了）。 */
+	struct wlr_scene_buffer *sb = view->scene_surface != NULL ?
+		view->scene_surface->buffer : NULL;
+	if (sb == NULL || sb->dst_width <= 0 || sb->dst_height <= 0) {
+		return false;
+	}
+	int cx = 0, cy = 0;
+	wlr_scene_node_coords(&sb->node, &cx, &cy);
+	*out = (struct wlr_box){.x = cx, .y = cy,
+		.width = sb->dst_width, .height = sb->dst_height};
+	*row_out = (struct wlr_box){.x = row->rect_x, .y = row->y,
+		.width = row->rect_w, .height = (int)lround(ov->row_h)};
+	return true;
+}
+
 double vidow_overview_scale(const struct vidow_server *server) {
 	const struct vidow_overview *ov = &server->overview;
 	if (ov->t <= 0.0) {

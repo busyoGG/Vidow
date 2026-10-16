@@ -2020,6 +2020,24 @@ static double view_overview_alpha(struct vidow_server *server,
 	if (!vidow_workspace_view_visible(server, view)) {
 		return alpha * server->overview.t;
 	}
+	/* 整块落在**这一行的矩形外**：不画（alpha 0）。条带比屏宽的那些列本来就在
+	 * 矩形外（在屏幕上它们在屏幕外），而场景没有裁剪节点（见 overview.c 里
+	 * row->rect_x 那段注释）—— 不藏就直接画到隔壁显示器上（用户：「overview
+	 * 窗口太多会跨屏」）。
+	 *
+	 * 只藏**整块都在外面**的：边界上那块部分溢出的照旧画（藏了会把该看见的
+	 * 一半也弄没），那点残余属于另一个小问题。 */
+	struct wlr_box vb = {0}, rb = {0};
+	if (vidow_overview_view_box(server, view, &vb, &rb)) {
+		struct wlr_box inter;
+		if (!wlr_box_intersection(&inter, &vb, &rb)) {
+			wlr_log(WLR_ERROR,
+				"OVHIDE view %p 框 %d,%d %dx%d 行 %d,%d %dx%d",
+				(void *)view, vb.x, vb.y, vb.width, vb.height,
+				rb.x, rb.y, rb.width, rb.height);
+			return 0.0;
+		}
+	}
 	return alpha;
 }
 
