@@ -1115,7 +1115,9 @@ static bool mini_pointer_hover_swallow(struct vidow_server *server,
 	/* 小窗（S4）悬停工具条：迷你 / 图标态悬停就露出来（放大 / 收成图标 /
 	 * 还原成列 / 关闭）。重复调用是幂等的，位置每次重算 —— 窗口被拖动 /
 	 * 换屏之后工具条跟着走。 */
-	vidow_mini_toolbar_show(server, hit);
+		/* 工具条**删掉了**（用户：「小窗工具栏去掉」）：唯一的 show 调用就在这儿，
+		 * 去掉之后工具栏在任何配置下都不可能露出来。剩下的死代码（drag.c 的
+		 * layout/glyph/show/hide/near、float.c 的 hit/press）下一步整段删。 */
 	return true;
 }
 

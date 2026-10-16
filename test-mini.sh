@@ -766,84 +766,6 @@ set_state mini; sleep 0.6
 read -r RX0 RY0 RW0 RH0 <<< "$(echo "$(geom)" | tr 'x,' ' ')"
 echo "  工具条前置：迷你盒 $RX0,$RY0 ${RW0}x${RH0}（工作区 1290..2550）"
 
-mark "S4 工具条：悬停露出 + 点「还原成列」"
-# 悬停 **迷你** 小窗（不是图标）：图标悬停 250ms 会出预览，预览会吞点击 ——
-# 那条路走的是「预览只读但吞点击」，不是工具条这条。
-set_state mini; sleep 1.0
-read -r IX IY IW IH <<< "$(echo "$(geom)" | tr 'x,' ' ')"
-MARK=$(logmark)
-act "pointer-motion $((IX + IW / 2)) $((IY + IH / 2))" 0.5
-TL=$(since "$MARK" | grep -a 'mini toolbar: w1 露出' | tail -1)
-echo "  ${TL:-(工具条没露出)}"
-if [ -n "$TL" ]; then
-	pass "悬停迷你小窗 → 工具条露出"
-	# ---- 工具条**有内容**（每个按钮上真画了字形）且**横向跟小窗居中对齐** ----
-	# 用户报的「没有内容只有四个格子且位置偏左」：以前四个按钮就是四个纯色
-	# wlr_scene_rect（实测每个按钮 0/884 个非底色像素 = 空方框），整条 x = 窗口
-	# 左边（迷你盒 353 宽 / 工具条 151 宽 → 比窗口中心偏左 101px）。
-	TBX=$(echo "$TL" | sed -n 's/.*整块 \([0-9]*\),\([0-9]*\) \([0-9]*\)x\([0-9]*\).*/\1/p')
-	TBW=$(echo "$TL" | sed -n 's/.*整块 \([0-9]*\),\([0-9]*\) \([0-9]*\)x\([0-9]*\).*/\3/p')
-	if [ -n "$TBX" ] && [ -n "$TBW" ]; then
-		DX=$((TBX + TBW / 2 - (IX + IW / 2)))
-		echo "  工具条 $TBX + $TBW/2 中心 $((TBX + TBW / 2))，窗口中心 $((IX + IW / 2))，差 $DX px"
-		# 前置：盒子得**整个在工作区里**才谈得上居中 —— 工具条摆位会夹回工作区
-		# （mini_toolbar_layout），盒子半挂屏外时它当然不居中，那是正确行为。
-		# 盒子现在可以合法地半挂屏外（用户要的「迷你态和自由态一样，能拖出屏边」），
-		# 所以这一条按前置判断，不成立就跳过。
-		if [ "$IX" -ge 1290 ] && [ $((IX + IW)) -le 2550 ]; then
-			[ "${DX#-}" -le 2 ] &&
-				pass "工具条横向跟小窗居中（差 $DX px ≤ 2）" ||
-				fail "工具条没跟小窗居中：偏 $DX px（窗口 $IX,$IY ${IW}x${IH}）"
-		else
-			echo "  跳过居中判据：盒子半挂屏外（$IX..$((IX + IW))，工作区 1290..2550）"
-		fi
-		BAD=0
-		GBOX=""
-		for grp in "放大" "收图标" "还原成列" "关闭"; do
-			BX=$(echo "$TL" | sed -n "s/.*$grp \([0-9]*\),\([0-9]*\).*/\1/p")
-			BY=$(echo "$TL" | sed -n "s/.*$grp \([0-9]*\),\([0-9]*\).*/\2/p")
-			[ -z "$BX" ] && continue
-			if shot "$RUNDIR/tb-$grp.ppm" "$BX" "$BY" 34 26; then
-				N=$(inkpix "$RUNDIR/tb-$grp.ppm")
-				GBOX="$GBOX $grp=$N"
-				[ "${N%%/*}" -ge 40 ] || BAD=$((BAD + 1))
-			fi
-		done
-		echo "  四个按钮上的字形像素（非底色/整块）$GBOX"
-		[ "$BAD" = "0" ] &&
-			pass "四个按钮上都有字形（每个 ≥ 40 个字形像素 —— 不是四个空格子）" ||
-			fail "有 $BAD 个按钮是空的（没有字形）"
-	fi
-	# 日志里四个按钮的左上角：放大 / 收图标 / 还原成列 / 关闭（每个 34x26）
-	BX=$(echo "$TL" | sed -n 's/.*还原成列 \([0-9]*\),\([0-9]*\).*/\1/p')
-	BY=$(echo "$TL" | sed -n 's/.*还原成列 \([0-9]*\),\([0-9]*\).*/\2/p')
-	CCX=$((BX + 17)); CCY=$((BY + 13))
-	# 走**真实路径**：先经过工具条与窗口之间那条 4px 缝，再到按钮上。一步跳到按钮
-	# 上测不出「缝里被收掉」那个 bug（用户报的「整个工具条都不能交互」）。修法见
-	# vidow_mini_toolbar_near()。
-	# 缝在哪取决于工具条摆上还是摆下（摆上方放不下时会翻到窗口下面，见
-	# mini_toolbar_layout），所以按日志里工具条实际的 y 取。
-	TBY=$(echo "$TL" | sed -n 's/.*整块 [0-9]*,\([0-9]*\) [0-9]*x[0-9]*.*/\1/p')
-	if [ -n "$TBY" ] && [ "$TBY" -gt "$IY" ]; then
-		GAPY=$((IY + IH + 2))
-	else
-		GAPY=$((IY - 2))
-	fi
-	act "pointer-motion $CCX $GAPY" 0.3
-	act "pointer-motion $CCX $CCY" 0.25
-	act "pointer-button left press" 0.5
-	act "pointer-button left release" 0.8
-	BTN=$(since "$MARK" | grep -a '点了按钮' | tail -1)
-	echo "  ${BTN:-(没有点按钮的日志)}"
-	[ -n "$BTN" ] && pass "点中按钮（日志：「点了按钮 2（现在 还原成列）」）" ||
-		fail "按钮没点中（工具条 $(echo "$BX,$BY")，点的是 $CCX,$CCY）"
-	[ "$(winf w1 mini)" = "none" ] && pass "「还原成列」按钮 → 形态回到 none" ||
-		fail "按钮点了但形态没还原：$(winf w1 mini)"
-else
-	fail "工具条没露出来"
-fi
-
-# ================================================================ S4：自由小窗拖拽
 mark "S4 自由小窗拖拽：Mod+左键 interactive-move（跟手 + 尺寸不许跳回原生）"
 # 用户原话：「自由小窗的时候没有拖拽的方式……我试图用 win+鼠标 拖拽自由小窗，
 # 此时小窗的大小会变成原始大小且拖不动」。两个现象、两个根因：
@@ -1808,53 +1730,7 @@ echo "  跨屏日志：$(since "$MARK" | grep -a '挪到' | tail -1)"
 # 用户：「整个工具条都不能交互」（他在 DP-2，3840x2160 @ scale 2 上）。上面那条
 # 判据只在 scale 1 的单屏上验过 —— 这里在 scale 2 屏上照同一条路再走一遍：
 # 悬停迷你小窗 → 工具条露出 → 点「还原成列」→ 形态回到 none。
-mark "S9 工具条在 scale 2 屏上：悬停露出 + 点「还原成列」"
-ID=$(mini_id)
-unmini; sleep 0.7
-./build/vidowmsg move-window-to-output HEADLESS-2 --id "$ID" >/dev/null 2>&1
-./build/vidowmsg output-scale HEADLESS-2 2 >/dev/null 2>&1
-sleep 1.0
-set_state mini; sleep 1.0
-read -r IX IY IW IH <<< "$(echo "$(geom)" | tr 'x,' ' ')"
-echo "  scale 2 屏上的迷你盒：$IX,$IY ${IW}x${IH}"
-MARK=$(logmark)
-act "pointer-motion $((IX + IW / 2)) $((IY + IH / 2))" 0.5
-TL=$(since "$MARK" | grep -a 'mini toolbar: w1 露出' | tail -1)
-echo "  ${TL:-(工具条没露出)}"
-if [ -n "$TL" ]; then
-	pass "scale 2 屏：悬停迷你小窗 → 工具条露出"
-	BX=$(echo "$TL" | sed -n 's/.*还原成列 \([0-9]*\),\([0-9]*\).*/\1/p')
-	BY=$(echo "$TL" | sed -n 's/.*还原成列 \([0-9]*\),\([0-9]*\).*/\2/p')
-	CCX=$((BX + 17)); CCY=$((BY + 13))
-	# 走**真实路径**：先经过工具条与窗口之间那条 4px 缝，再到按钮上。一步跳到按钮
-	# 上测不出「缝里被收掉」那个 bug（用户报的「整个工具条都不能交互」）。修法见
-	# vidow_mini_toolbar_near()。
-	# 缝在哪取决于工具条摆上还是摆下（摆上方放不下时会翻到窗口下面，见
-	# mini_toolbar_layout），所以按日志里工具条实际的 y 取。
-	TBY=$(echo "$TL" | sed -n 's/.*整块 [0-9]*,\([0-9]*\) [0-9]*x[0-9]*.*/\1/p')
-	if [ -n "$TBY" ] && [ "$TBY" -gt "$IY" ]; then
-		GAPY=$((IY + IH + 2))
-	else
-		GAPY=$((IY - 2))
-	fi
-	act "pointer-motion $CCX $GAPY" 0.3
-	act "pointer-motion $CCX $CCY" 0.25
-	act "pointer-button left press" 0.5
-	act "pointer-button left release" 0.8
-	BTN=$(since "$MARK" | grep -a '点了按钮' | tail -1)
-	echo "  ${BTN:-(没有点按钮的日志)}"
-	[ -n "$BTN" ] && pass "scale 2 屏：点中按钮（工具条 $BX,$BY，点的是 $CCX,$CCY）" ||
-		fail "scale 2 屏：按钮没点中（工具条 $BX,$BY，点的是 $CCX,$CCY）"
-	[ "$(winf w1 mini)" = "none" ] && pass "scale 2 屏：「还原成列」→ 形态回到 none" ||
-		fail "scale 2 屏：按钮点了但形态没还原：$(winf w1 mini)"
-else
-	fail "scale 2 屏：工具条没露出来"
-fi
-./build/vidowmsg output-scale HEADLESS-2 1 >/dev/null 2>&1; sleep 0.5
 
-# ================================================================
-exec 9>&-
-echo
 if [ "$FAILED" = 0 ]; then
 	echo "全部通过 / test-mini.sh: OK"
 else
