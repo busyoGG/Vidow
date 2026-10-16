@@ -51,6 +51,11 @@
  * 很常见，但甩不了这么久、也甩不了这么多次。 */
 #define SHAKE_WINDOW_MS 800
 #define SHAKE_MIN_TRAVEL 16.0
+/* 一段（同方向连续走的路）超过这么远 = 这是在**真移动**指针，不是原地晃 →
+ * 整串作废、从头数。用户报「晃动鼠标放大太容易触发」的根就在这儿：正常用鼠标
+ * 时来回甩几下，每段都是几十上百像素、换向也快，照样凑够换向次数 —— 光调大
+ * SHAKE_FLIPS 是治标（幅度量级不同，拿「每段走多远」一刀切开最直接）。
+ * 真晃的每段是 20~50 逻辑像素这个量级。 */
 #define SHAKE_FLIPS 5
 #define SHAKE_MIN_SPAN_MS 250
 /* 两次换向之间超过这么久就算「这一串断了」，从头数 —— 顺手甩两下之后过一会儿
@@ -80,8 +85,8 @@ struct vidow_cursor_fx {
 	/* 摇晃判定 */
 	double last_x, last_y;
 	bool have_last;
-	int dir;        /* 上一次的主方向：-1 / 0 / 1 */
-	double acc;     /* 当前方向累计走了多远 */
+	int dir_x, dir_y;   /* 两轴各自上一次的方向：-1 / 0 / 1 */
+	double acc_x, acc_y; /* 两轴各自累计走了多远 */
 	int flips;      /* 窗口内换了几次向 */
 	int64_t window_ns;
 	int64_t span_ns; /* 这一串摇晃的第一次换向在哪（「晃了多久」的起点） */
@@ -116,6 +121,20 @@ struct vidow_cursor_fx {
 	 * 三个字段留着「显示回来该给哪张」。 */
 	bool hidden;
 };
+
+static void shake_count_flip(struct vidow_cursor_fx *fx, int64_t now);
+
+/* 记一次「换向」：同一串里还要管「隔太久算断」和「这一串从哪开始计时」。 */
+static void shake_count_flip(struct vidow_cursor_fx *fx, int64_t now) {
+	if (fx->flips > 0 && now - fx->flip_ns > (int64_t)SHAKE_GAP_MS * 1000000) {
+		fx->flips = 0; /* 隔太久了：上一串断掉，从头数 */
+	}
+	if (fx->flips == 0) {
+		fx->span_ns = now; /* 这一串的第一段走完了：从现在开始算「晃了多久」 */
+	}
+	fx->flip_ns = now;
+	fx->flips++;
+}
 
 /* 前置声明：定时器（动画的推手）在上面，重画光标图那两段在下面。 */
 static bool shake_draw_at(struct vidow_server *server, double f,
@@ -536,8 +555,6 @@ void vidow_cursor_fx_motion(struct vidow_server *server) {
 	if (adx < 1.0 && ady < 1.0) {
 		return; /* 抖不动的不算 */
 	}
-	int dir = adx >= ady ? (dx > 0 ? 1 : -1) : (dy > 0 ? 1 : -1);
-	double dist = adx >= ady ? adx : ady;
 
 	int64_t now = vidow_now_ns();
 	if (now - fx->window_ns > (int64_t)SHAKE_WINDOW_MS * 1000000) {
@@ -545,27 +562,38 @@ void vidow_cursor_fx_motion(struct vidow_server *server) {
 		fx->window_ns = now;
 		fx->flips = 0;
 		fx->span_ns = now;
-		fx->acc = 0;
-		fx->dir = 0;
+		fx->acc_x = fx->acc_y = 0.0;
+		fx->dir_x = fx->dir_y = 0;
 	}
 
-	if (dir == fx->dir) {
-		fx->acc += dist;
-	} else {
-		if (fx->acc >= SHAKE_MIN_TRAVEL) {
-			if (fx->flips > 0 && now - fx->flip_ns >
-					(int64_t)SHAKE_GAP_MS * 1000000) {
-				fx->flips = 0; /* 隔太久了：上一串断掉，从头数 */
+	/* 两轴各记各的。以前是拿**单次事件**的 |dx| vs |dy| 选「主导轴」、只留一个
+	 * 方向：斜着移动时两者差不多大，主导轴就在两轴之间来回跳 → 方向跟着跳 →
+	 * **一次平滑的斜向移动也能凑够换向次数**，于是「晃一下」就放大（用户：
+	 * 「晃动鼠标放大太容易触发」）。之前只把阈值往上抬，抬了还在犯，根因在
+	 * 这儿：现在只有**同一条轴上真的反了向**才算一次换向。 */
+	if (adx >= 1.0) {
+		int d = dx > 0 ? 1 : -1;
+		if (d == fx->dir_x) {
+			fx->acc_x += adx;
+		} else {
+			if (fx->acc_x >= SHAKE_MIN_TRAVEL) {
+				shake_count_flip(fx, now);
 			}
-			if (fx->flips == 0) {
-				/* 这一串的第一段走完了：从现在开始算「晃了多久」 */
-				fx->span_ns = now;
-			}
-			fx->flip_ns = now;
-			fx->flips++;
+			fx->acc_x = adx;
+			fx->dir_x = d;
 		}
-		fx->acc = dist;
-		fx->dir = dir;
+	}
+	if (ady >= 1.0) {
+		int d = dy > 0 ? 1 : -1;
+		if (d == fx->dir_y) {
+			fx->acc_y += ady;
+		} else {
+			if (fx->acc_y >= SHAKE_MIN_TRAVEL) {
+				shake_count_flip(fx, now);
+			}
+			fx->acc_y = ady;
+			fx->dir_y = d;
+		}
 	}
 
 	if (fx->flips >= SHAKE_FLIPS &&
@@ -573,8 +601,8 @@ void vidow_cursor_fx_motion(struct vidow_server *server) {
 		wlr_log(WLR_DEBUG, "摇晃: %d 次换向、跨了 %dms，触发放大",
 			fx->flips, (int)((now - fx->span_ns) / 1000000));
 		fx->flips = 0;
-		fx->acc = 0;
-		fx->dir = 0;
+		fx->acc_x = fx->acc_y = 0.0;
+		fx->dir_x = fx->dir_y = 0;
 		fx->window_ns = now;
 		fx->span_ns = now;
 		const char *why = NULL;
