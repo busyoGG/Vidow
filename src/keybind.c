@@ -703,6 +703,26 @@ static bool keybind_mru_key(struct vidow_server *server, xkb_keysym_t sym,
 
 bool vidow_keybind_key(struct vidow_server *server, xkb_keysym_t sym,
 		bool pressed, uint32_t mods, bool inhibited) {
+	/* ===== VT 切换：**内置**，不走绑定表 =====
+	 *
+	 * 合成器把键盘 EVIOCGRAB 了，内核收不到 Ctrl+Alt+Fn —— 不自己处理就切不走
+	 * tty（用户报的「vidow 启动的时候无法切换 tty」）。
+	 *
+	 * 而且它**不能**是热键配置：绑在表里还有个坑 —— 不带数字的 `Ctrl+Alt+F`
+	 * 这类绑定会把 F1..F12 一起吃掉（用户配置里那条 fit-expand 就是）。
+	 * 放在最前面先判掉，配置里怎么写都不影响逃生口。
+	 *
+	 * 锁定期间也认（锁屏界面切不走 tty 同样说不过去），所以排在 locked 之前。 */
+	if ((mods & INTERESTING_MODS) ==
+			(WLR_MODIFIER_CTRL | WLR_MODIFIER_ALT) &&
+			sym >= XKB_KEY_F1 && sym <= XKB_KEY_F12) {
+		if (pressed) {
+			vidow_vt_switch(server, (unsigned)(sym - XKB_KEY_F1 + 1));
+		}
+		/* 松开也吃掉：不往下走绑定表，免得出现「按下切了、松开又触发一条」。 */
+		return true;
+	}
+
 	/* 会话锁（S3）：锁定期间只认白名单（VT 切换），其余绑定一律不跑 —— 否则
 	 * 锁屏界面上按 Super+J 就把工作区换了，锁形同虚设（方案 §2 环节 3 /
 	 * §4 风险 5）。inhibited 不看：锁屏时不该有客户端的抑制生效。 */
