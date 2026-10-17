@@ -59,6 +59,20 @@ bgeffect_code = custom_target('ext-background-effect-v1-protocol.c',
   output: 'ext-background-effect-v1-protocol.c',
   command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
 
+# ext-workspace-v1：wlroots 0.20 没实现，服务端自己生成（见 src/extworkspace.c）。
+# 新 noctalia（C++ 原生 Wayland）判断「工作区占满没有」只能走这个协议 —— 它的文档：
+# "Workspace integration works through compositor-native backends where needed,
+#  or through ext-workspace-v1 on compositors that implement it"。
+ws_xml = 'protocols/ext-workspace-v1.xml'
+extws_server_header = custom_target('ext-workspace-v1-server-protocol.h',
+  input: ws_xml,
+  output: 'ext-workspace-v1-server-protocol.h',
+  command: [wayland_scanner, 'server-header', '@INPUT@', '@OUTPUT@'])
+extws_code = custom_target('ext-workspace-v1-protocol.c',
+  input: ws_xml,
+  output: 'ext-workspace-v1-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
+
 # xdg-activation-v1：服务端**自己实现**（见 src/activation.c —— wlroots 那份把
 # serial 校验写死了，配不了「invalid serial 也认」），所以服务端头 + 代码自己生成。
 xa_xml = 'protocols/xdg-activation-v1.xml'
