@@ -1413,6 +1413,12 @@ void vidow_pan_begin(struct vidow_server *server, struct vidow_view *view) {
 	server->grab_client_press = true;
 	pan_cursor_x = server->cursor->x;
 	pan_base = pan_output->viewport_x;
+	/* ⚠️ 必须走 gesture_drag 这条：arrange 里只有 gesture_drag / drag_scroll
+	 * 两种情况**不跑**「把焦点列滚回可见区」（view.c:3181 那段），其它时候
+	 * 视口每帧都按焦点重算 —— 直接写 output->viewport_x 会被立刻覆盖，
+	 * 表现就是「拖了没反应」（第一次实现就是这么错的）。 */
+	pan_output->gesture_drag = true;
+	pan_output->gesture_viewport = pan_base;
 	wlr_log(WLR_DEBUG, "pan: 开始（viewport_x=%.0f）", pan_base);
 }
 
@@ -1421,9 +1427,9 @@ void vidow_pan_motion(struct vidow_server *server) {
 		return;
 	}
 	/* 往右拖 = 视图往左滑（手指拖纸的直觉，和触控板手势一致）。 */
-	pan_output->viewport_x = pan_base - (server->cursor->x - pan_cursor_x);
-	wlr_log(WLR_DEBUG, "pan: motion cursor=%.0f viewport_x=%.0f",
-		server->cursor->x, pan_output->viewport_x);
+	pan_output->gesture_viewport = pan_base - (server->cursor->x - pan_cursor_x);
+	wlr_log(WLR_DEBUG, "pan: motion cursor=%.0f viewport=%.0f",
+		server->cursor->x, pan_output->gesture_viewport);
 	vidow_arrange(server);
 }
 
@@ -1444,6 +1450,12 @@ void vidow_pan_end(struct vidow_server *server) {
 		if (psurf != NULL) {
 			wlr_seat_pointer_notify_enter(server->seat, psurf, px, py);
 		}
+	}
+	if (pan_output != NULL) {
+		/* 松手：把手指算出来的位置落成正式视口，再放开 gesture_drag
+		 * （放开之后 arrange 又会按焦点重算 —— 所以先把值写进去）。 */
+		pan_output->viewport_x = pan_output->gesture_viewport;
+		pan_output->gesture_drag = false;
 	}
 	if (server != NULL && server->grab_mode == VIDOW_GRAB_PAN) {
 		server->grab_mode = VIDOW_GRAB_NONE;
