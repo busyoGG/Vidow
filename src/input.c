@@ -113,9 +113,16 @@ static void keyboard_modifiers(struct wl_listener *listener, void *data) {
 		return;
 	}
 
-	/* 输入法抢着键盘时修饰键也归它：它会连同按键一起用虚拟键盘回注。 */
+	/* 输入法抢着键盘时修饰键也归它：它会连同按键一起用虚拟键盘回注。
+	 *
+	 * **但 seat 上的修饰键状态也必须跟着更新** —— 合成器自己的键位（Mod+滚轮
+	 * 那类）读的是 seat->keyboard_state.modifiers，不更新就会「按着 Mod 滚一次
+	 * 之后，再滚就不认了，得松开重按」（用户报的）。这里只更新状态，按键本身
+	 * 仍然只发给输入法。 */
 	if (vidow_im_owns_keyboard(kb->server, kb)) {
 		vidow_im_modifiers(kb->server, kb->wlr_keyboard);
+		wlr_seat_keyboard_notify_modifiers(kb->server->seat,
+			&kb->wlr_keyboard->modifiers);
 		return;
 	}
 
