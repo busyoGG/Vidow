@@ -5965,6 +5965,23 @@ static void view_commit(struct wl_listener *listener, void *data) {
 		vidow_view_apply_anim(view);
 	}
 
+	/* **fractional-scale 客户端的尺寸**（Chromium / Electron 全走这条路）。
+	 *
+	 * 它们故意 set_buffer_scale(1)，但 buffer 按 2x 画（实测 vivaldi 在 DP-2
+	 * 上：buffer 3808x2050、surface 1904x1025、scale 1）—— 协议的本意是让合成器
+	 * 用 wp_viewporter 缩回去。而 wlroots 的 surface_reconfigure 拿
+	 * buffer_width / buffer_scale 当节点尺寸，于是 3808 直接铺在 1904 的位置上：
+	 * 画面变成 1/4，配合后面的重排又弹回 1 倍 —— 用户看到的「1/4 和 1 不停变化」，
+	 * 也是「Electron 卡」的直接原因（每帧都在重排重画）。
+	 *
+	 * 修：每次 commit 后把客户端节点的显示尺寸钉回逻辑尺寸（surface->width /
+	 * height 已经是逻辑值）。fx / 小窗那条路自己会设，不打架。 */
+	if (view->scene_surface != NULL && surface != NULL &&
+			surface->current.width > 0 && surface->current.height > 0) {
+		wlr_scene_buffer_set_dest_size(view->scene_surface->buffer,
+			surface->current.width, surface->current.height);
+	}
+
 	/* Keep a locked reference to the last frame: the close animation needs
 	 * pixels, and by the time unmap fires the surface has none.
 	 *
