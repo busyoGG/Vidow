@@ -230,6 +230,13 @@ void vidow_ipc_json_window(struct jbuf *b, struct vidow_server *server,
 	jb_kv_str(b, "output", view->output != NULL ? view->output->name : NULL);
 	jb_kv_str(b, "home", view->home != NULL ? view->home->key : NULL);
 	jb_kv_str(b, "workspace", view->ws != NULL ? view->ws->name : NULL);
+	/* 稳定编号。`workspace` 是**名字**，动态工作区没名字就是空串 —— 而
+	 * noctalia 的 workspaceKeyMatchesAssignment() 见到空串直接 return false，
+	 * 于是 dock 的 smart_auto_hide 永远认为活动工作区是空的（用户报的
+	 * 「dock 不自动隐藏」）。给它一个永远非空、和工作区列表 id 对得上的值。 */
+	if (view->ws != NULL) {
+		jb_kv_int(b, "workspace_id", (long long)view->ws->id);
+	}
 	jb_kv_bool(b, "workspace_special", view->ws != NULL && view->ws->special);
 	jb_kv_str(b, "float_mode", float_mode_name(view->float_mode));
 	jb_kv_bool(b, "floating", view->float_mode != VIDOW_FLOAT_NONE);

@@ -144,8 +144,11 @@ std::vector<WorkspaceWindow> VidowWorkspaceBackend::workspaceWindows(wl_output* 
     // vidow 的 workspace 字段是工作区**名字**；空串 = 没名字的动态工作区，
     // 用 id 兜底（和 workspaces[] 的 id 对齐）。
     w.workspaceKey = win.value("workspace", "");
-    if (w.workspaceKey.empty()) {
-      w.workspaceKey = win.value("workspace_id", "");
+    if (w.workspaceKey.empty() && win.contains("workspace_id") &&
+        win["workspace_id"].is_number()) {
+      // 动态工作区没有名字，vidow 给一个稳定编号（和 workspaces[] 的 id 一致）。
+      // noctalia 的 workspaceKeyMatchesAssignment() 见到空串直接 false。
+      w.workspaceKey = std::to_string(win["workspace_id"].get<long long>());
     }
     w.appId = win.value("app_id", "");
     w.title = win.value("title", "");
