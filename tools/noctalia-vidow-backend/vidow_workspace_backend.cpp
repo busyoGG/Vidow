@@ -1,6 +1,7 @@
 #include "vidow_workspace_backend.h"
 
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <sys/socket.h>
@@ -122,6 +123,8 @@ VidowWorkspaceBackend::VidowWorkspaceBackend() {
   if (path != nullptr && path[0] != '\0') {
     m_socketPath = path;
   }
+  std::fprintf(stderr, "[vidow-backend] ctor VIDOW_SOCKET=%s -> available=%d\n",
+      path != nullptr ? path : "(未设)", (int)available());
 }
 
 VidowWorkspaceBackend::~VidowWorkspaceBackend() = default;
@@ -176,6 +179,8 @@ std::vector<Workspace> VidowWorkspaceBackend::forOutput(wl_output* output) const
   }
   const std::string wantOutput = outputNameFor(output);
 
+  std::fprintf(stderr, "[vidow-backend] state: 顶层 workspaces=%zu 条\n",
+      doc["workspaces"].size());
   for (const auto& ws : doc["workspaces"]) {
     if (bool_or_false(ws, "special")) {
       continue; // 特殊工作区（scratchpad 那类）不进 dock 的工作区列表
@@ -195,8 +200,12 @@ std::vector<Workspace> VidowWorkspaceBackend::forOutput(wl_output* output) const
       w.occupied = !ws["windows"].empty();
     }
     w.urgent = false;
+    std::fprintf(stderr,
+        "[vidow-backend]   ws id=%s idx=%u active=%d occupied=%d out=%s\n",
+        w.id.c_str(), w.index, (int)w.active, (int)w.occupied, wsOutput.c_str());
     result.push_back(std::move(w));
   }
+  std::fprintf(stderr, "[vidow-backend] forOutput -> %zu 个工作区\n", result.size());
   return result;
 }
 
@@ -243,8 +252,11 @@ std::vector<WorkspaceWindow> VidowWorkspaceBackend::workspaceWindows(wl_output* 
       w.y = static_cast<std::int32_t>(int_or_zero(win["geometry"], "y"));
     }
     w.outputName = outName;
+    std::fprintf(stderr, "[vidow-backend]   win id=%s key=%s app=%s\n",
+        w.windowId.c_str(), w.workspaceKey.c_str(), w.appId.c_str());
     result.push_back(std::move(w));
   }
+  std::fprintf(stderr, "[vidow-backend] workspaceWindows -> %zu 个\n", result.size());
   return result;
 }
 
@@ -300,6 +312,20 @@ void VidowWorkspaceBackend::activateForOutput(wl_output* output, const std::stri
 void VidowWorkspaceBackend::activateForOutput(wl_output* output, const Workspace& workspace) {
   (void)output;
   activate(workspace.id);
+}
+
+void VidowWorkspaceBackend::dispatchPoll(short /*revents*/) {
+  /* pollFd() 是 -1，所以这里只会被 pollTimeoutMs() 的超时唤醒。每次醒来比一下
+   * 工作区状态，变了就通知 —— 没有这条，dock 的 smart_auto_hide 只在启动时
+   * 算一次。 */
+  const std::string now = vidowQuery(m_socketPath, "state");
+  if (now.empty() || now == m_lastState) {
+    return;
+  }
+  m_lastState = now;
+  if (m_changeCallback) {
+    m_changeCallback();
+  }
 }
 
 void VidowWorkspaceBackend::cleanup() {

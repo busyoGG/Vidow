@@ -50,6 +50,13 @@ public:
   [[nodiscard]] std::unordered_map<std::uintptr_t, WorkspaceWindow>
   assignTaskbarWindows(const std::vector<TaskbarWindowCandidate>& windows, wl_output* output) const override;
 
+  // **定时轮询**：vidow 的 IPC 是同步查询，没有推送。不给 pollTimeoutMs
+  // 返回值的话 WaylandWorkspaces 永远等不到变更通知 —— dock 就只在启动时算
+  // 一次「活动工作区有没有窗口」，之后再也不重算（用户报的「dock 不隐藏」）。
+  [[nodiscard]] int pollTimeoutMs() const noexcept override { return 500; }
+  [[nodiscard]] int pollFd() const noexcept override { return -1; }
+  void dispatchPoll(short /*revents*/) override;
+
   void cleanup() override;
 
 private:
@@ -62,6 +69,7 @@ private:
   // queryState() 的 50ms 缓存（见 .cpp 里的注释）。
   mutable std::string m_stateCache;
   mutable std::chrono::steady_clock::time_point m_stateStamp{};
+  mutable std::string m_lastState;
   ChangeCallback m_changeCallback;
 };
 
