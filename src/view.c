@@ -5935,6 +5935,7 @@ static void view_destroy(struct wl_listener *listener, void *data) {
 	wl_list_remove(&view->request_fullscreen.link);
 	wl_list_remove(&view->request_maximize.link);
 	wl_list_remove(&view->request_minimize.link);
+	wl_list_remove(&view->surface_commit.link);
 	wl_list_remove(&view->request_move.link);
 	wl_list_remove(&view->request_resize.link);
 	wl_list_remove(&view->destroy.link);
@@ -6107,6 +6108,20 @@ static void view_request_minimize(struct wl_listener *listener, void *data) {
 	struct vidow_view *view = wl_container_of(listener, view, request_minimize);
 
 	vidow_view_set_minimized(view, true);
+}
+
+/* 客户端交帧了 → 排一帧。
+ *
+ * vidow 是**按需渲染**：客户端自己 damage 场景之后没人踢这一脚，帧回调就只能
+ * 等别的事件（光标移动 / 动画 / 补帧闹钟）碰巧到来时才发 —— 表现就是「应用
+ * 内部像 60 帧，桌面本身却是 160」。这一条让「客户端想画」直接变成「排一帧」。 */
+static void view_surface_commit(struct wl_listener *listener, void *data) {
+	(void)data;
+	struct vidow_view *view = wl_container_of(listener, view, surface_commit);
+	if (view->server == NULL || view->output == NULL || view->server->locked) {
+		return;
+	}
+	vidow_output_schedule_frame(view->server, view->output, "客户端交帧");
 }
 
 static void view_request_move(struct wl_listener *listener, void *data) {
@@ -6981,6 +6996,11 @@ static void server_new_toplevel(struct wl_listener *listener, void *data) {
 	wl_signal_add(&xdg_toplevel->events.request_maximize, &view->request_maximize);
 	view->request_minimize.notify = view_request_minimize;
 	wl_signal_add(&xdg_toplevel->events.request_minimize, &view->request_minimize);
+	view->surface_commit.notify = view_surface_commit;
+	if (vidow_view_surface(view) != NULL) {
+		wl_signal_add(&vidow_view_surface(view)->events.commit,
+			&view->surface_commit);
+	}
 	view->request_move.notify = view_request_move;
 	wl_signal_add(&xdg_toplevel->events.request_move, &view->request_move);
 	view->request_resize.notify = view_request_resize;

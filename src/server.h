@@ -1583,6 +1583,8 @@ struct vidow_view {
 	struct wl_listener request_fullscreen;
 	struct wl_listener request_maximize;
 	struct wl_listener request_move;
+	/* 客户端交帧 → 排一帧（见 view.c 的 view_surface_commit） */
+	struct wl_listener surface_commit;
 	struct wl_listener request_resize;
 	struct wl_listener request_minimize;
 
