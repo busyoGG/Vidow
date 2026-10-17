@@ -227,8 +227,7 @@ static void bind_manager(struct wl_client *client, void *data, uint32_t version,
 	struct vidow_output *output;
 	wl_list_for_each(output, &server->outputs, link) {
 		struct wl_resource *gr = wl_resource_create(client,
-			&ext_workspace_group_handle_v1_interface, (int)version,
-			wl_display_next_serial(server->display) & 0xffffff);
+			&ext_workspace_group_handle_v1_interface, (int)version, 0);
 		if (gr == NULL) {
 			continue;
 		}
@@ -254,8 +253,7 @@ static void bind_manager(struct wl_client *client, void *data, uint32_t version,
 			continue; /* 特殊工作区不进 shell 的列表 */
 		}
 		struct wl_resource *wr = wl_resource_create(client,
-			&ext_workspace_handle_v1_interface, (int)version,
-			wl_display_next_serial(server->display) & 0xffffff);
+			&ext_workspace_handle_v1_interface, (int)version, 0);
 		if (wr == NULL) {
 			continue;
 		}
