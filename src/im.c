@@ -336,6 +336,22 @@ static void im_grab_destroy(struct wl_listener *listener, void *data) {
 	struct vidow_im *im = wl_container_of(listener, im, grab_destroy);
 	wl_list_remove(&im->grab_destroy.link);
 	im->grab = NULL;
+	/* 把键盘**还给**焦点客户端。
+	 *
+	 * grab 期间键事件全给了输入法，客户端那边等于「键盘被拔了」；grab 一没，
+	 * 必须重新 notify_enter（带当前修饰键）它才会继续收键 —— 少了这一步就是
+	 * 用户报的「Fcitx5 启动的时候键盘无法获取输入」：fcitx5 起来时抓一次键盘、
+	 * 抓完放掉，放掉之后没人还给客户端。 */
+	{
+		struct vidow_server *server = im->server;
+		struct wlr_keyboard *kb = wlr_seat_get_keyboard(server->seat);
+		struct wlr_surface *focused =
+			server->seat->keyboard_state.focused_surface;
+		if (kb != NULL && focused != NULL) {
+			wlr_seat_keyboard_notify_enter(server->seat, focused,
+				kb->keycodes, kb->num_keycodes, &kb->modifiers);
+		}
+	}
 	wlr_log(WLR_DEBUG, "input method released the keyboard");
 }
 
