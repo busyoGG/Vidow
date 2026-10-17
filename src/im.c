@@ -318,11 +318,37 @@ static void im_commit(struct wl_listener *listener, void *data) {
 
 static void im_grab_destroy(struct wl_listener *listener, void *data);
 
+/* 当前抓着键盘的输入法 grab（没有就是 NULL）。
+ *
+ * ⚠️ grab 期间键事件**必须**发给它 —— 以前 im->grab 只被赋值和清空，从来没用过，
+ * 于是 fcitx5 一抓键盘所有按键就被丢掉（用户报的「启动了 Fcitx5 之后键盘都不能
+ * 用了」）。这里存一份静态指针，键 / 修饰键的出口在 input.c 里查它。 */
+static struct wlr_input_method_keyboard_grab_v2 *active_grab;
+
+bool vidow_im_grab_active(void) {
+	return active_grab != NULL;
+}
+
+void vidow_im_grab_send_key(uint32_t time_msec, uint32_t keycode, bool pressed) {
+	if (active_grab == NULL) {
+		return;
+	}
+	wlr_input_method_keyboard_grab_v2_send_key(active_grab, time_msec, keycode,
+		pressed ? WL_KEYBOARD_KEY_STATE_PRESSED : WL_KEYBOARD_KEY_STATE_RELEASED);
+}
+
+void vidow_im_grab_send_modifiers(struct wlr_keyboard_modifiers *mods) {
+	if (active_grab != NULL && mods != NULL) {
+		wlr_input_method_keyboard_grab_v2_send_modifiers(active_grab, mods);
+	}
+}
+
 static void im_grab_keyboard(struct wl_listener *listener, void *data) {
 	struct vidow_im *im = wl_container_of(listener, im, grab_keyboard);
 	struct wlr_input_method_keyboard_grab_v2 *grab = data;
 
 	im->grab = grab;
+	active_grab = grab;
 	im->grab_destroy.notify = im_grab_destroy;
 	wl_signal_add(&grab->events.destroy, &im->grab_destroy);
 
@@ -336,6 +362,7 @@ static void im_grab_destroy(struct wl_listener *listener, void *data) {
 	struct vidow_im *im = wl_container_of(listener, im, grab_destroy);
 	wl_list_remove(&im->grab_destroy.link);
 	im->grab = NULL;
+	active_grab = NULL;
 	/* 把键盘**还给**焦点客户端。
 	 *
 	 * grab 期间键事件全给了输入法，客户端那边等于「键盘被拔了」；grab 一没，
@@ -364,6 +391,7 @@ static void im_destroy(struct wl_listener *listener, void *data) {
 	if (im->grab != NULL) {
 		wl_list_remove(&im->grab_destroy.link);
 		im->grab = NULL;
+		active_grab = NULL;
 	}
 	wl_list_remove(&im->commit.link);
 	wl_list_remove(&im->new_popup.link);

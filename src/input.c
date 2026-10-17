@@ -247,6 +247,15 @@ static void keyboard_key(struct wl_listener *listener, void *data) {
 		/* X11 抓着键盘时按键一律给抓着它的那个表面（XGrabKeyboard 的语义：谁抓
 		 * 谁收，用户点了别的窗口也照给）—— 见 keyboardgrab.c。 */
 		vidow_xwayland_grab_assert(server);
+		/* 输入法抓着键盘 → 按键归它。修饰键那条早就有 vidow_im_owns_keyboard
+		 * 这个判据（见上面的 modifiers 分支），只有按键这条漏了 —— 于是
+		 * fcitx5 一抓键盘，按键被**丢掉**（既不到它也不到客户端）= 用户报的
+		 * 「启动了 Fcitx5 之后键盘都不能用了」。用同一个判据，锁定守卫也一起有。 */
+		if (vidow_im_owns_keyboard(server, kb)) {
+			vidow_im_grab_send_key(event->time_msec, event->keycode,
+				event->state == WL_KEYBOARD_KEY_STATE_PRESSED);
+			return;
+		}
 		wlr_seat_set_keyboard(server->seat, kb->wlr_keyboard);
 		wlr_seat_keyboard_notify_key(server->seat, event->time_msec,
 			event->keycode, event->state);

@@ -2629,6 +2629,12 @@ void vidow_im_modifiers(struct vidow_server *server, struct wlr_keyboard *kb);
 /* 键盘焦点变了：把 text-input 的 enter/leave 转给客户端。 */
 void vidow_im_focus(struct vidow_server *server, struct wlr_surface *surface);
 
+/* 输入法抓着键盘时的按键出口（见 im.c 的 active_grab）：抓着就发给它，否则
+ * 调用方走 seat。以前 grab 只存不用，fcitx5 一抓键盘所有按键就丢了。 */
+bool vidow_im_grab_active(void);
+void vidow_im_grab_send_key(uint32_t time_msec, uint32_t keycode, bool pressed);
+void vidow_im_grab_send_modifiers(struct wlr_keyboard_modifiers *mods);
+
 /* 把键盘焦点按到某个表面上。**surface 可能是 NULL**（Xwayland 的窗口刚建出来 /
  * 表面刚销毁但窗口还在 —— wine 那些游戏起来时会来回好几趟），所以统一从这里走：
  * wlroots 的 wlr_seat_keyboard_notify_enter 里是 assert(surface)，传 NULL 就是
