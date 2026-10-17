@@ -139,6 +139,21 @@ VidowWorkspaceBackend::VidowWorkspaceBackend() {
   const char* path = std::getenv("VIDOW_SOCKET");
   if (path != nullptr && path[0] != '\0') {
     m_socketPath = path;
+  } else {
+    /* **环境是空的**（实测 noctalia 某些启动路径下连 XDG_CURRENT_DESKTOP
+     * 都没有），所以不能只靠 VIDOW_SOCKET —— 按 vidow 的固定 IPC 路径猜：
+     * $XDG_RUNTIME_DIR/vidow-wayland-0.sock，再退回 /run/user/<uid>/。 */
+    std::string guess;
+    const char* runtime = std::getenv("XDG_RUNTIME_DIR");
+    if (runtime != nullptr && runtime[0] != '\0') {
+      guess = std::string(runtime) + "/vidow-wayland-0.sock";
+    } else {
+      guess = "/run/user/" + std::to_string(static_cast<unsigned>(getuid())) +
+              "/vidow-wayland-0.sock";
+    }
+    if (access(guess.c_str(), F_OK) == 0) {
+      m_socketPath = guess;
+    }
   }
   VB_LOG("ctor VIDOW_SOCKET={} -> available={}",
       path != nullptr ? path : "(未设)", available());
@@ -165,10 +180,14 @@ std::string VidowWorkspaceBackend::queryState() const {
 }
 
 std::string VidowWorkspaceBackend::outputNameFor(wl_output* output) const {
-  // Noctalia 的 WaylandConnection 有 wl_output → 名字的映射，但它不在这个类的
-  // 头文件依赖里。留空表示「不限输出」，调用方按需接上（见 README 的接入说明）。
-  (void)output;
-  return {};
+  /* WaylandWorkspaces::setOutputNameResolver() 会把「wl_output → 输出名」的
+   * 解析函数塞进来（Noctalia 的 WaylandConnection 知道每个 wl_output 的名字）。
+   * 没有它就只能「不限输出」—— 那样两块屏的 dock 会拿到同一份工作区列表，
+   * 表现为「分不清哪个显示器有哪些工作区」。 */
+  if (output == nullptr || !m_outputResolver) {
+    return {};
+  }
+  return m_outputResolver(output);
 }
 
 std::vector<Workspace> VidowWorkspaceBackend::all() const {

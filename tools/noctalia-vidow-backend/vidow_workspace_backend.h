@@ -21,7 +21,11 @@
 
 namespace compositors::vidow {
 
-class VidowWorkspaceBackend final : public WorkspaceBackend {
+// 同时实现 WorkspaceOutputNameResolver：WaylandWorkspaces 会把「wl_output →
+// 输出名」的解析函数塞进来，我们靠它把工作区按屏过滤（不实现的话
+// outputNameFor() 永远返回空 = 不过滤，两块屏的 dock 拿到同一份工作区列表）。
+class VidowWorkspaceBackend final : public WorkspaceBackend,
+                                    public WorkspaceOutputNameResolver {
 public:
   VidowWorkspaceBackend();
   ~VidowWorkspaceBackend() override;
@@ -59,6 +63,11 @@ public:
 
   void cleanup() override;
 
+  // WorkspaceOutputNameResolver
+  void setOutputNameResolver(Resolver resolver) override {
+    m_outputResolver = std::move(resolver);
+  }
+
 private:
   // 一次 state 查询 + 解析。失败返回空。
   [[nodiscard]] std::string queryState() const;
@@ -70,6 +79,7 @@ private:
   mutable std::string m_stateCache;
   mutable std::chrono::steady_clock::time_point m_stateStamp{};
   mutable std::string m_lastState;
+  Resolver m_outputResolver;
   ChangeCallback m_changeCallback;
 };
 
