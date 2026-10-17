@@ -365,6 +365,26 @@ void vidow_exec_detached(const char *script) {
 				close(devnull);
 			}
 		}
+		/* ① 信号屏蔽字复位。
+		 * vidow 自己会屏蔽一批信号（事件循环那一套），子进程**继承**过去 ——
+		 * 应用一旦等被屏蔽的信号（SIGCHLD 最典型）就永久卡住，表现就是用户报的
+		 * 「自启动应用会自杀 / 感觉像是被卡死一样」。fork+exec 之间只允许
+		 * async-signal-safe 的调用，sigprocmask 正好是。 */
+		sigset_t empty;
+		sigemptyset(&empty);
+		sigprocmask(SIG_SETMASK, &empty, NULL);
+		/* ② 继承来的 fd 全关掉（vidow 的 DRM fd / Wayland socket / epoll /
+		 * 客户端缓冲）。撒手的进程不该攥着合成器的 fd —— 有应用会因此判定
+		 * 「我在某个会话里」而行为异常，也会拖住 socket 的释放。
+		 * close_range 没有就用 close 循环兜底。 */
+#if defined(__linux__) && defined(SYS_close_range)
+		if (syscall(SYS_close_range, 3U, ~0U, 0U) != 0)
+#endif
+		{
+			for (int fd = 3; fd < 1024; fd++) {
+				close(fd);
+			}
+		}
 		execl("/bin/sh", "sh", "-c", script, (char *)NULL);
 		_exit(127);
 	}
