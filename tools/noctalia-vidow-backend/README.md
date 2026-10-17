@@ -62,3 +62,52 @@ vidow 侧已经就绪（commit `09d9d90`）：`vidowmsg state` 的窗口 JSON �
 
 - 失败一律返回 `false`（宁可让 dock 显示着，也不要因为查询失败把它藏起来）。
 - `state` 是纯查询，不会阻塞；socket 带 `SOCK_CLOEXEC`。
+
+---
+
+# 工作区 / 窗口识别 backend（推荐，替代上面的最小版）
+
+`vidow_workspace_backend.{h,cpp}` —— 完整的 `WorkspaceBackend` 实现，一次解决三件事：
+
+| Noctalia 需要 | vidow 的 IPC |
+|---|---|
+| 工作区列表 + 哪个是活动 | `state` → `outputs[].workspaces[]`（`id` / `name` / `active` ✓） |
+| 工作区里有没有窗口（`occupied`） | 同上，`windows[]` 非空 ✓ |
+| 哪个窗口在哪块工作区（`WorkspaceWindow`） | `windows` → `workspace` / `app_id` / `title` / `geometry` / `output` ✓ |
+| 切工作区（`activate`） | `focus-workspace <id>` ✓ |
+
+**实测**（假 vidow 回复）：
+```
+available=1 name=vidow
+workspaces=2
+  id=1 name=web  active=1 occupied=1
+  id=2 name=chat active=0 occupied=0
+windows=1
+  id=6 ws=web app=vivaldi-stable @1928,47 out=DP-2
+```
+
+## 接入（4 处）
+
+1. `src/compositors/compositor_detect.h`：
+   ```cpp
+   inline bool isVidow() { return std::getenv("VIDOW_SOCKET") != nullptr; }
+   ```
+
+2. 把 `vidow_workspace_backend.{h,cpp}` 放进 `src/compositors/vidow/`。
+
+3. `meson.build` 的源列表加 `'src/compositors/vidow/vidow_workspace_backend.cpp'`。
+
+4. `CompositorRuntimeRegistry` 里注册（照 niri / hyprland 那套）：
+   ```cpp
+   if (compositors::isVidow()) {
+     auto backend = std::make_unique<vidow::VidowWorkspaceBackend>();
+     if (backend->available()) {
+       registry.setWorkspaceBackend(std::move(backend));
+     }
+   }
+   ```
+
+## 已知限制
+
+`outputNameFor(wl_output*)` 现在返回空（= 不限输出）。要按屏过滤时接上
+`WaylandConnection` 的 `wl_output → 名字` 映射即可（一处函数体）。
