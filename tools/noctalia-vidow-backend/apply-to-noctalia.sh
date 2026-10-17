@@ -85,6 +85,45 @@ if "vidow_workspace_backend.h" not in s:
     w.write_text(s); print("⑤ wayland_workspaces.cpp ✓")
 else:
     print("⑤ wayland_workspaces.cpp 已经改过")
+
+# ⑥ 让 Vidow 成为 active backend（不然 tryFallback 里 ext-workspace 先赢，
+#    我们的 backend 挂了却永远不被选中）
+hh = tree / "src/wayland/wayland_workspaces.h"
+s = hh.read_text()
+if "m_vidowBackend" not in s:
+    anchor = "  WorkspaceBackend* m_kwinBackend = nullptr;"
+    assert anchor in s, "wayland_workspaces.h 的成员锚点变了"
+    s = s.replace(anchor, anchor + "\n  WorkspaceBackend* m_vidowBackend = nullptr;", 1)
+    hh.write_text(s); print("⑥ wayland_workspaces.h 成员 ✓")
+else:
+    print("⑥ wayland_workspaces.h 已经改过")
+
+w = tree / "src/wayland/wayland_workspaces.cpp"
+s = w.read_text()
+if "m_vidowBackend = " not in s:
+    anchor = "  if (vidowBackend->available()) {\n    m_backends.push_back(std::move(vidowBackend));\n  }"
+    assert anchor in s, "vidowBackend 构造段变了"
+    s = s.replace(anchor,
+        "  m_vidowBackend = vidowBackend.get();\n"
+        "  if (vidowBackend->available()) {\n"
+        "    m_backends.push_back(std::move(vidowBackend));\n"
+        "  }", 1)
+    # initialize() 里加 case
+    anchor2 = "  case compositors::CompositorKind::Mango:"
+    assert anchor2 in s, "initialize() 的 switch 锚点变了"
+    s = s.replace(anchor2,
+        "  case compositors::CompositorKind::Vidow:\n"
+        "    // vidow 自己那套（IPC）比 ext-workspace 知道得多：ext-workspace 只有\n"
+        "    // 工作区列表，没有「哪个窗口在哪块工作区」，dock 的 smart_auto_hide\n"
+        "    // 就永远认为活动工作区是空的。\n"
+        "    if (m_vidowBackend != nullptr && m_vidowBackend->isAvailable()) {\n"
+        "      setActiveBackend(m_vidowBackend);\n"
+        "      return;\n"
+        "    }\n"
+        "    break;\n" + anchor2, 1)
+    w.write_text(s); print("⑥ initialize() 加 Vidow case ✓")
+else:
+    print("⑥ initialize() 已经改过")
 PY
 
 echo "五处改完。下一步：cd $TREE && meson setup build && ninja -C build"
