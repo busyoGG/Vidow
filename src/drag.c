@@ -1422,6 +1422,8 @@ void vidow_pan_motion(struct vidow_server *server) {
 	}
 	/* 往右拖 = 视图往左滑（手指拖纸的直觉，和触控板手势一致）。 */
 	pan_output->viewport_x = pan_base - (server->cursor->x - pan_cursor_x);
+	wlr_log(WLR_DEBUG, "pan: motion cursor=%.0f viewport_x=%.0f",
+		server->cursor->x, pan_output->viewport_x);
 	vidow_arrange(server);
 }
 

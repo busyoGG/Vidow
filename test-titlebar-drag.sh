@@ -92,6 +92,12 @@ else:
     g = w.get("float_geometry") or w.get("geometry")
     print("%d %d %d %d" % (g["x"], g["y"], g["width"], g["height"]))'
 }
+viewport() { # -> 这块屏的 viewport_x（平移量）
+	./build/vidowmsg state 2>/dev/null | python3 -c '
+import sys, json
+o = json.load(sys.stdin)["outputs"][0]
+print("%.1f" % o.get("viewport_x", 0.0))'
+}
 count() { # <探针日志里的关键字> -> 行数
 	grep -ac "$1" "$PLOG" 2>/dev/null || true
 }
@@ -187,6 +193,7 @@ else
 fi
 
 mark "② 松手：客户端必须收到松开（修之前一条都没有）"
+VP_BEFORE=$(viewport)
 
 act "pointer-button left release" 0.5
 if wait_log "$PLOG" "release button=" 3; then
@@ -200,22 +207,23 @@ else
 	fail "松手后落点跑了：$FX,$FY（期望 ≈$WANT_X,$WANT_Y）"
 fi
 
-mark "③ 松手后指针交还给客户端（光标移出去再移回来）"
+mark "③ 拖标题栏 = 平移视图（窗口不动）"
 
-M_BEFORE=$(count "motion at")
-# ⚠️ 必须用**平移之后**的窗口位置：拖标题栏平移了整条列带，窗口的屏幕 x 已经
-# 变了（这正是本功能在起作用），拿原来的 GX 去移光标会移到空白上 —— 那时
-# 「客户端收不到 motion」是测试写错了，不是合成器的问题。
-read -r CGX CGY CGW CGH <<< "$(geom_of)"
-act "pointer-motion $((CGX + CGW + 200)) $((CGY + CGH / 2))" 0.5
-act "pointer-motion $((CGX + CGW / 2)) $((CGY + CGH / 2))" 0.6
-M_AFTER=$(count "motion at")
-if [ "$M_AFTER" -gt "$M_BEFORE" ]; then
-	pass "移回来之后客户端收得到指针位置（$((M_AFTER - M_BEFORE)) 条 motion）"
+# 用户点名的行为：按住标题栏拖 → 视图平移、窗口不动。判据两条：
+#   ① viewport_x（视口偏移）变了 —— 视图真的平移了
+#   ② 窗口的**布局** geometry.x 没变 —— 窗口本身没被拖走
+VP_AFTER=$(viewport)
+read -r PGX PGY PGW PGH <<< "$(geom_of)"
+if python3 -c "import sys; sys.exit(0 if abs(float('$VP_AFTER') - float('$VP_BEFORE')) > 20 else 1)"; then
+	pass "视图平移了（viewport_x $VP_BEFORE → $VP_AFTER）"
 else
-	fail "松手之后客户端一条指针位置都收不到"
+	fail "视图没平移（viewport_x 还是 $VP_AFTER，拖之前 $VP_BEFORE）"
 fi
-
+if [ "$PGX" = "$GX" ] && [ "$PGY" = "$GY" ]; then
+	pass "窗口布局位置没被拖走（还是 $PGX,$PGY）"
+else
+	fail "窗口自己被拖走了（$GX,$GY → $PGX,$PGY）"
+fi
 mark "④ 反向对照：Mod+左键拖拽（按下被合成器吃掉的那条路）"
 
 read -r GX GY GW GH <<< "$(geom_of)"
