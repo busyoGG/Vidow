@@ -1,3 +1,4 @@
+#include <unistd.h>
 #include "server.h"
 #include "env.h"
 #include "hooks.h"
@@ -414,6 +415,20 @@ int main(int argc, char *argv[]) {
 		return 0;
 	}
 
+	/* VIDOW_LOG_FILE：把日志同时写一份到文件。
+	 *
+	 * 为什么要这个：SDDM 启动会话时把 stderr 丢进 /dev/null（journalctl
+	 * _COMM=vidow 是空的），而「渲染统计: … fps | 模糊 …ms/帧 | 提交 …ms/帧」
+	 * 那行是判断卡顿的唯一直接证据 —— 没有它就只能在猜。 */
+	const char *log_file = getenv("VIDOW_LOG_FILE");
+	if (log_file != NULL && log_file[0] != '\0') {
+		FILE *lf = fopen(log_file, "a");
+		if (lf != NULL) {
+			dup2(fileno(lf), STDERR_FILENO);
+			dup2(fileno(lf), STDOUT_FILENO);
+			setvbuf(lf, NULL, _IOLBF, 0);
+		}
+	}
 	wlr_log_init(log_level_from_env(), NULL);
 
 	struct vidow_server server = {0};
