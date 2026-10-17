@@ -11,6 +11,23 @@
 
 #include <nlohmann/json.hpp>
 
+/* 日志：在 noctalia 树里用它的 Logger（写 ~/.cache/noctalia/noctalia.log），
+ * 单独编译测试时退回 stderr。 */
+#if defined(__has_include)
+#if __has_include("core/log.h")
+#include "core/log.h"
+#define VIDOW_BACKEND_HAVE_NOCTALIA_LOG 1
+#endif
+#endif
+#ifdef VIDOW_BACKEND_HAVE_NOCTALIA_LOG
+namespace {
+  constexpr Logger kLog("vidow-backend");
+}
+#define VB_LOG(...) kLog.info(__VA_ARGS__)
+#else
+#define VB_LOG(...) std::fprintf(stderr, __VA_ARGS__)
+#endif
+
 namespace compositors::vidow {
 
 namespace {
@@ -123,8 +140,8 @@ VidowWorkspaceBackend::VidowWorkspaceBackend() {
   if (path != nullptr && path[0] != '\0') {
     m_socketPath = path;
   }
-  std::fprintf(stderr, "[vidow-backend] ctor VIDOW_SOCKET=%s -> available=%d\n",
-      path != nullptr ? path : "(未设)", (int)available());
+  VB_LOG("ctor VIDOW_SOCKET={} -> available={}",
+      path != nullptr ? path : "(未设)", available());
 }
 
 VidowWorkspaceBackend::~VidowWorkspaceBackend() = default;
@@ -179,8 +196,7 @@ std::vector<Workspace> VidowWorkspaceBackend::forOutput(wl_output* output) const
   }
   const std::string wantOutput = outputNameFor(output);
 
-  std::fprintf(stderr, "[vidow-backend] state: 顶层 workspaces=%zu 条\n",
-      doc["workspaces"].size());
+  VB_LOG("state: 顶层 workspaces={} 条", doc["workspaces"].size());
   for (const auto& ws : doc["workspaces"]) {
     if (bool_or_false(ws, "special")) {
       continue; // 特殊工作区（scratchpad 那类）不进 dock 的工作区列表
@@ -200,12 +216,11 @@ std::vector<Workspace> VidowWorkspaceBackend::forOutput(wl_output* output) const
       w.occupied = !ws["windows"].empty();
     }
     w.urgent = false;
-    std::fprintf(stderr,
-        "[vidow-backend]   ws id=%s idx=%u active=%d occupied=%d out=%s\n",
-        w.id.c_str(), w.index, (int)w.active, (int)w.occupied, wsOutput.c_str());
+    VB_LOG("  ws id={} idx={} active={} occupied={} out={}",
+        w.id, w.index, w.active, w.occupied, wsOutput);
     result.push_back(std::move(w));
   }
-  std::fprintf(stderr, "[vidow-backend] forOutput -> %zu 个工作区\n", result.size());
+  VB_LOG("forOutput -> {} 个工作区", result.size());
   return result;
 }
 
@@ -252,11 +267,10 @@ std::vector<WorkspaceWindow> VidowWorkspaceBackend::workspaceWindows(wl_output* 
       w.y = static_cast<std::int32_t>(int_or_zero(win["geometry"], "y"));
     }
     w.outputName = outName;
-    std::fprintf(stderr, "[vidow-backend]   win id=%s key=%s app=%s\n",
-        w.windowId.c_str(), w.workspaceKey.c_str(), w.appId.c_str());
+    VB_LOG("  win id={} key={} app={}", w.windowId, w.workspaceKey, w.appId);
     result.push_back(std::move(w));
   }
-  std::fprintf(stderr, "[vidow-backend] workspaceWindows -> %zu 个\n", result.size());
+  VB_LOG("workspaceWindows -> {} 个", result.size());
   return result;
 }
 
