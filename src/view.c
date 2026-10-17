@@ -5786,6 +5786,20 @@ static void view_commit(struct wl_listener *listener, void *data) {
 	(void)data;
 	struct vidow_view *view = wl_container_of(listener, view, commit);
 
+	/* **排帧**。这是 X11 和 Wayland 共用的交帧入口，而 vidow 是按需渲染
+	 * （vidow_output_schedule_frame）—— 不在这里要一帧，客户端交上来的新内容
+	 * 就要等下一次别的什么原因触发渲染才上屏。
+	 *
+	 * 用户报的「Electron / Chromium 应用还是卡」就是这个：Wayland 客户端那条路
+	 * 由 view_surface_commit 补上了，但 X11（XWayland 上的 vivaldi / discord /
+	 * telegram / Element）走的是这个 view_commit，一直没人排帧。
+	 * 放在最前面：后面的记账不影响「有新内容」这个事实。 */
+	if (view->server != NULL && view->output != NULL &&
+			!view->server->locked) {
+		vidow_output_schedule_frame(view->server, view->output,
+			"客户端交帧");
+	}
+
 	/* 客户端交帧了 —— X11 那边顺手对一下 _NET_WM_STATE（属性那条路不发信号，
 	 * 见 view_sync_x11_fullscreen）。 */
 	view_sync_x11_fullscreen(view);
