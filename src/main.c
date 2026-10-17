@@ -11,6 +11,9 @@
 #include <string.h>
 
 #include <wayland-server-core.h>
+#include <wlr/types/wlr_linux_drm_syncobj_v1.h>
+#include <wlr/types/wlr_presentation_time.h>
+#include <wlr/render/wlr_renderer.h>
 #include <wlr/types/wlr_export_dmabuf_v1.h>
 #include <wlr/types/wlr_fractional_scale_v1.h>
 #include <wlr/types/wlr_idle_inhibit_v1.h>
@@ -504,6 +507,32 @@ int main(int argc, char *argv[]) {
 		return 1;
 	}
 	wlr_renderer_init_wl_display(server.renderer, server.display);
+
+	/* **显式同步**（wp_linux_drm_syncobj_v1）。
+	 *
+	 * 缺这个协议时 GPU 客户端（Chromium / Electron 全家）只能退回隐式同步：
+	 * 合成器拿到 buffer 后要等驱动层面的 fence，帧就可能卡在 GPU 上。实测
+	 * vidow 广播的 42 个 global 里没有它，而 shm 客户端（tools/frames.c）完全
+	 * 不受影响 —— 和用户报的「Electron 明显、其他看不出来」对得上。
+	 *
+	 * 建不起来（软件渲染 / headless / 驱动不支持）就跳过：协议缺失只会退回
+	 * 隐式同步，不会坏。 */
+	{
+		int drm_fd = wlr_renderer_get_drm_fd(server.renderer);
+		if (drm_fd >= 0) {
+			if (wlr_linux_drm_syncobj_manager_v1_create(server.display, 1,
+					drm_fd) == NULL) {
+				wlr_log(WLR_INFO, "显式同步没建起来：GPU 客户端继续走隐式同步");
+			}
+		}
+	}
+
+	/* **帧呈现时刻反馈**（wp_presentation）。Chromium 用它校正自己的帧时序；
+	 * 缺了就只能靠 wl_surface.frame 估算。 */
+	if (wlr_presentation_create(server.display, server.backend, 1) == NULL) {
+		wlr_log(WLR_INFO, "wp_presentation 没建起来");
+	}
+
 	vidow_shader_init(&server);
 
 	/* Async shell commands for the config: pipe + the display's own event
