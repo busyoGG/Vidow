@@ -373,18 +373,12 @@ void vidow_exec_detached(const char *script) {
 		sigset_t empty;
 		sigemptyset(&empty);
 		sigprocmask(SIG_SETMASK, &empty, NULL);
-		/* ② 继承来的 fd 全关掉（vidow 的 DRM fd / Wayland socket / epoll /
-		 * 客户端缓冲）。撒手的进程不该攥着合成器的 fd —— 有应用会因此判定
-		 * 「我在某个会话里」而行为异常，也会拖住 socket 的释放。
-		 * close_range 没有就用 close 循环兜底。 */
-#if defined(__linux__) && defined(SYS_close_range)
-		if (syscall(SYS_close_range, 3U, ~0U, 0U) != 0)
-#endif
-		{
-			for (int fd = 3; fd < 1024; fd++) {
-				close(fd);
-			}
-		}
+		/* ② 继承来的 fd 全关掉 —— **已撤回**。
+		 *
+		 * 用户实测：撤前 Electron / Chromium 自启动「起了个空框没内容」、有的
+		 * 干脆不启动。它们和别的应用的区别正是要拿继承来的 fd（zygote 的
+		 * fd 传递 / GPU 进程那一套），一律关掉就废了。信号屏蔽字那半（①）
+		 * 留着 —— 那才是「卡死」的根因，且不影响 fd。 */
 		execl("/bin/sh", "sh", "-c", script, (char *)NULL);
 		_exit(127);
 	}
