@@ -15,6 +15,7 @@
 
 #include "compositors/workspace_backend.h"
 
+#include <chrono>
 #include <string>
 #include <vector>
 
@@ -58,6 +59,9 @@ private:
   [[nodiscard]] std::string outputNameFor(wl_output* output) const;
 
   std::string m_socketPath;
+  // queryState() 的 50ms 缓存（见 .cpp 里的注释）。
+  mutable std::string m_stateCache;
+  mutable std::chrono::steady_clock::time_point m_stateStamp{};
   ChangeCallback m_changeCallback;
 };
 

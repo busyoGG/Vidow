@@ -1,8 +1,10 @@
 #include "vidow_workspace_backend.h"
 
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -34,6 +36,15 @@ namespace {
       close(fd);
       return {};
     }
+    // **必须有超时**：vidow 的 IPC 回完 JSON 不关连接（它是个长连接服务），
+    // 裸 read() 会一直阻塞 —— 实测把 noctalia 主线程卡死在
+    // unix_stream_read_generic，初始化走不完，连自己的 Wayland socket 都建不
+    // 出来（症状：「noctalia is already running」但其实没起来）。
+    struct timeval tv{};
+    tv.tv_sec = 0;
+    tv.tv_usec = 250000;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
     std::string line = cmd + "\n";
     if (write(fd, line.data(), line.size()) < 0) {
       close(fd);
@@ -44,9 +55,13 @@ namespace {
     for (;;) {
       ssize_t n = read(fd, buf, sizeof(buf));
       if (n <= 0) {
-        break;
+        break; // EOF 或超时（超时也算「回复读完了」）
       }
       out.append(buf, static_cast<std::size_t>(n));
+      // 一行 JSON 读完了就不等连接关闭。
+      if (out.find('\n') != std::string::npos) {
+        break;
+      }
     }
     close(fd);
     return out;
@@ -68,7 +83,17 @@ void VidowWorkspaceBackend::setChangeCallback(ChangeCallback callback) {
 }
 
 std::string VidowWorkspaceBackend::queryState() const {
-  return vidowQuery(m_socketPath, "state");
+  // **缓存**：dock / bar 每帧都会问工作区，每次一个 unix socket 往返（哪怕有
+  // 超时）也会把帧时间拖长。50ms 的窗口足够跟上切换（人眼级别），又不会让
+  // 每帧都进内核。
+  const auto now = std::chrono::steady_clock::now();
+  if (!m_stateCache.empty() &&
+      now - m_stateStamp < std::chrono::milliseconds(50)) {
+    return m_stateCache;
+  }
+  m_stateCache = vidowQuery(m_socketPath, "state");
+  m_stateStamp = now;
+  return m_stateCache;
 }
 
 std::string VidowWorkspaceBackend::outputNameFor(wl_output* output) const {
