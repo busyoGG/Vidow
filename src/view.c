@@ -5,6 +5,7 @@
 #include <stdlib.h>
 
 #include <wlr/types/wlr_buffer.h>
+#include <wlr/types/wlr_fractional_scale_v1.h>
 #include <wlr/util/log.h>
 
 /* gap 的算法都在 server.h 里（vidow_gap_side / vidow_gap_inner）：统一值 gaps
@@ -1343,7 +1344,14 @@ static void pin_scale_surface(struct wlr_surface *surface, int sx, int sy,
 		void *data) {
 	(void)sx;
 	(void)sy;
-	wlr_surface_set_preferred_buffer_scale(surface, *(const int32_t *)data);
+	int32_t want = *(const int32_t *)data;
+	wlr_surface_set_preferred_buffer_scale(surface, want);
+	/* **fractional-scale 那条也要发**。Chromium / Electron / 新版 GTK 优先听
+	 * wp_fractional_scale_v1.preferred_scale，它比 wl_surface.preferred_buffer_scale
+	 * 优先 —— 只发后者的话它们按「上一次进过的输出」的倍率画：窗口从 DP-2（2x）
+	 * 搬到 DP-3（1x）之后仍然画 2x，像素多 4 倍（实测 Element 2304x2560 铺在
+	 * 949x1025 上）。这是「所有应用都卡」的真根因。 */
+	wlr_fractional_scale_v1_notify_scale(surface, (double)want);
 }
 
 /* 客户端按几倍渲染：**钉在它自己那块屏的倍率上**（view_scale）。子表面一起钉
@@ -1371,6 +1379,7 @@ static void view_pin_scale(struct vidow_view *view) {
 	}
 	view->pref_scale = want;
 	wlr_surface_set_preferred_buffer_scale(surface, want);
+	wlr_fractional_scale_v1_notify_scale(surface, (double)want);
 	wlr_surface_for_each_surface(surface, pin_scale_surface, &want);
 	/* 带上窗口编号（IPC 那个 id）：钉是在**第一次摆放**时发生的，那会儿标题往往
 	 * 还没来 —— 日志按编号认人更稳（测试也按编号找这一行）。 */
