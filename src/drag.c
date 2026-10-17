@@ -1430,6 +1430,19 @@ void vidow_pan_end(struct vidow_server *server) {
 		wlr_log(WLR_DEBUG, "pan: 结束（viewport_x=%.0f）",
 			pan_output->viewport_x);
 	}
+	/* 松手要把指针**交还**给光标底下的客户端：平移期间我们没动 pointer focus，
+	 * 但 move 请求那一下是客户端主动发的，收尾时补一个 enter，否则它可能一直
+	 * 停在「被 grab」的状态里，后续 motion 收不到（test-titlebar-drag 的
+	 * 「松手之后客户端一条指针位置都收不到」）。 */
+	if (server != NULL) {
+		double px = 0, py = 0;
+		struct wlr_surface *psurf = NULL;
+		vidow_view_at(server, server->cursor->x, server->cursor->y,
+			&psurf, &px, &py);
+		if (psurf != NULL) {
+			wlr_seat_pointer_notify_enter(server->seat, psurf, px, py);
+		}
+	}
 	if (server != NULL && server->grab_mode == VIDOW_GRAB_PAN) {
 		server->grab_mode = VIDOW_GRAB_NONE;
 		/* 和按下时配对的复位：不清的话松手之后客户端的指针位置还会一直被吃掉

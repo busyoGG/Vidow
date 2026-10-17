@@ -203,8 +203,12 @@ fi
 mark "③ 松手后指针交还给客户端（光标移出去再移回来）"
 
 M_BEFORE=$(count "motion at")
-act "pointer-motion $((GX + 100 + 250)) $((GY + 120))" 0.5
-act "pointer-motion $((GX + 100)) $((GY + 120))" 0.6
+# ⚠️ 必须用**平移之后**的窗口位置：拖标题栏平移了整条列带，窗口的屏幕 x 已经
+# 变了（这正是本功能在起作用），拿原来的 GX 去移光标会移到空白上 —— 那时
+# 「客户端收不到 motion」是测试写错了，不是合成器的问题。
+read -r CGX CGY CGW CGH <<< "$(geom_of)"
+act "pointer-motion $((CGX + CGW + 200)) $((CGY + CGH / 2))" 0.5
+act "pointer-motion $((CGX + CGW / 2)) $((CGY + CGH / 2))" 0.6
 M_AFTER=$(count "motion at")
 if [ "$M_AFTER" -gt "$M_BEFORE" ]; then
 	pass "移回来之后客户端收得到指针位置（$((M_AFTER - M_BEFORE)) 条 motion）"
