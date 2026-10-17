@@ -18,8 +18,30 @@
  * 拖慢每一帧。回落：用第一块输出。
  */
 static struct wlr_output *view_default_output(struct vidow_server *server) {
+	/* ① 鼠标在哪块屏，新窗口就落哪块屏（用户要的：跟随鼠标）。
+	 * 这是唯一「用户现在正看着哪块屏」的真实信号 —— 焦点窗口可能在另一块屏上，
+	 * 但用户的眼睛跟着鼠标。 */
+	if (server->cursor != NULL) {
+		struct wlr_output *under = wlr_output_layout_output_at(
+			server->output_layout, server->cursor->x, server->cursor->y);
+		if (under != NULL) {
+			return under;
+		}
+	}
+	/* ② 鼠标不在任何输出上（刚启动 / 布局外）：用焦点屏。 */
 	if (server->focused_output != NULL) {
 		return server->focused_output;
+	}
+	/* ③ 连焦点都没有（sddm 直接起 vidow，还没人动过鼠标）：主屏 → 第一块屏。 */
+	if (server->config.primary_output != NULL) {
+		struct vidow_output *o;
+		wl_list_for_each(o, &server->outputs, link) {
+			if (o->wlr_output->name[0] != '\0' &&
+					strcmp(o->wlr_output->name,
+						server->config.primary_output) == 0) {
+				return o->wlr_output;
+			}
+		}
 	}
 	struct vidow_output *o;
 	wl_list_for_each(o, &server->outputs, link) {
