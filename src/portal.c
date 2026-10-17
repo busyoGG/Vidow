@@ -194,6 +194,11 @@ void vidow_portal_view_activated(struct vidow_view *view, bool activated) {
 	}
 	view->portal_activated = activated;
 	wlr_foreign_toplevel_handle_v1_set_activated(view->ftm_handle, activated);
+	/* 同步全屏状态：dock / 任务栏（noctalia 这类）靠它判断「当前是不是被占满」，
+	 * 从而决定自动隐藏。以前只同步 activated，这两个字段永远是 false ——
+	 * 用户报的「noctalia 无法判断当前是否窗口占满工作区，dock 无法自动隐藏」。 */
+	wlr_foreign_toplevel_handle_v1_set_fullscreen(view->ftm_handle,
+		view->fullscreen);
 }
 
 void vidow_portal_view_new(struct vidow_view *view) {

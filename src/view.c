@@ -3020,6 +3020,19 @@ static void arrange_columns(struct wl_list *shown,
 		 * 规矩只有这里知道。 */
 		bool col_full = column_has_fullscreen(col);
 		col->screen_x = col_full ? fx : x;
+		/* 列宽占满整块工作区 = dock 眼里的「最大化」（vidow 没有单独的
+		 * maximize 概念，niri 也是拿整列宽度当的）。同步给 foreign-toplevel，
+		 * 否则 dock 永远以为没占满、不自动隐藏。 */
+		{
+			struct vidow_view *mv;
+			wl_list_for_each(mv, &col->views, column_link) {
+				if (mv->ftm_handle != NULL) {
+					wlr_foreign_toplevel_handle_v1_set_maximized(
+						mv->ftm_handle,
+						col_full || col->width_fraction >= 0.999);
+				}
+			}
+		}
 		col->slot_width = col_full ? work->width : col->width;
 
 		int n = 0;
