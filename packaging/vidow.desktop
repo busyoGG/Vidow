@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=vidow
+Comment=scrolling tiling Wayland compositor
+Exec=/usr/local/bin/vidow
+Type=Application
+DesktopNames=Vidow

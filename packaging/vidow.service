@@ -1,0 +1,35 @@
+# vidow 作为默认桌面自启动（tty1，不需要 display manager）
+#
+#   sudo install -Dm644 packaging/vidow.service /etc/systemd/system/vidow.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl set-default graphical.target
+#   sudo systemctl enable vidow.service
+#
+# 关键点：
+#   PAMName=login —— 合成器必须拿到一个**已登录的会话**才拿得到 seat（DRM + 输入设备），
+#     不写这条启动会报 "Failed to open /dev/dri/card0: Permission denied" 或者
+#     找不到输入设备。这一条就是「自启动合成器」和「自启动普通程序」的分水岭。
+#   TTYPath / StandardInput=tty —— 跟 run.sh 在裸 tty 上起是同一个环境
+#     （vidow 在 tty 上默认走 DRM 后端）。
+#   User / 不用 User= 也行 —— 见下面的 User 行，改成你自己的用户名。
+[Unit]
+Description=vidow (Wayland compositor)
+After=systemd-user-sessions.service
+Conflicts=getty@tty1.service
+After=getty@tty1.service
+
+[Service]
+User=busyo
+PAMName=login
+TTYPath=/dev/tty1
+StandardInput=tty
+# 直接起二进制：portal 那摊（import-environment / 重启 xdg-desktop-portal /
+# 同步 vidow-portals.conf）vidow 自己会做，见 src/portalconf.c。
+# 想连带「收残留客户端 / 报 coredump」就用 run.sh（开发期用）：
+#   ExecStart=/home/busyo/Dev/Vidow/run.sh
+ExecStart=/usr/local/bin/vidow
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical.target
