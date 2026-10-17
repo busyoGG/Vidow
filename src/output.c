@@ -1378,6 +1378,26 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 
 	wl_list_insert(&server->outputs, &output->link);
 
+	/* 把指针摆到主屏中心（只在它「还没被用过」时做一次）。
+	 *
+	 * 原来指针一直停在布局原点 (0,0) —— 主屏在右边时用户看到的是「鼠标从最
+	 * 左边冒出来」。判据用 cursor->x/y 都是 0（没人动过），所以主屏晚于别的屏
+	 * 出现也能补上；之后指针归用户，热插拔不再拽它。 */
+	if (server->cursor != NULL && server->cursor->x == 0.0 &&
+			server->cursor->y == 0.0) {
+		bool is_primary = server->config.primary_output != NULL &&
+			strcmp(wlr_output->name, server->config.primary_output) == 0;
+		if (is_primary || server->config.primary_output == NULL) {
+			struct wlr_box box;
+			wlr_output_layout_get_box(server->output_layout, wlr_output,
+				&box);
+			wlr_cursor_warp(server->cursor, NULL,
+				box.x + box.width / 2.0, box.y + box.height / 2.0);
+			wlr_log(WLR_INFO, "指针: 摆到 %s 中心 (%d,%d)", wlr_output->name,
+				box.x + box.width / 2, box.y + box.height / 2);
+		}
+	}
+
 	wlr_xcursor_manager_load(server->cursor_mgr, wlr_output->scale);
 	wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "left_ptr");
 
