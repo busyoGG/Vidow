@@ -45,7 +45,10 @@ namespace {
     tv.tv_usec = 250000;
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-    std::string line = cmd + "\n";
+    // vidow 的 IPC 是 JSON 行协议：请求 {"cmd":"<命令>"}\n，应答
+    // {"ok":true,"result":…}。发裸命令名会收到
+    // {"ok":false,"error":"第 1 个字符：认不出来的值"}。
+    std::string line = "{\"cmd\":\"" + cmd + "\"}\n";
     if (write(fd, line.data(), line.size()) < 0) {
       close(fd);
       return {};
@@ -58,13 +61,58 @@ namespace {
         break; // EOF 或超时（超时也算「回复读完了」）
       }
       out.append(buf, static_cast<std::size_t>(n));
-      // 一行 JSON 读完了就不等连接关闭。
-      if (out.find('\n') != std::string::npos) {
+      /* vidow 回的是**多行** JSON（缩进过的），所以不能「读到换行就停」——
+       * 那样只会拿到第一行，parse 失败，工作区/窗口全空（实测 workspaces=0
+       * windows=0，dock 因此永远认为活动工作区是空的）。按花括号配平判断。 */
+      int depth = 0;
+      bool started = false;
+      for (char ch : out) {
+        if (ch == '{' || ch == '[') {
+          ++depth;
+          started = true;
+        } else if (ch == '}' || ch == ']') {
+          --depth;
+        }
+      }
+      if (started && depth <= 0) {
         break;
       }
     }
     close(fd);
     return out;
+  }
+
+  // vidow 的 JSON 里名字这类字段可能是 **null**（动态工作区没名字），而
+  // nlohmann 的 value("name", "") 遇到 null 会抛 type_error.306（实测直接
+  // 把进程干掉）。统一用这个取值器。
+  std::string str_or_empty(const nlohmann::json& obj, const char* key) {
+    if (!obj.is_object() || !obj.contains(key)) {
+      return {};
+    }
+    const auto& v = obj[key];
+    return v.is_string() ? v.get<std::string>() : std::string{};
+  }
+
+  long long int_or_zero(const nlohmann::json& obj, const char* key) {
+    if (!obj.is_object() || !obj.contains(key)) {
+      return 0;
+    }
+    const auto& v = obj[key];
+    if (v.is_number_integer()) {
+      return v.get<long long>();
+    }
+    if (v.is_number()) {
+      return static_cast<long long>(v.get<double>());
+    }
+    return 0;
+  }
+
+  bool bool_or_false(const nlohmann::json& obj, const char* key) {
+    if (!obj.is_object() || !obj.contains(key)) {
+      return false;
+    }
+    const auto& v = obj[key];
+    return v.is_boolean() && v.get<bool>();
   }
 
 } // namespace
@@ -114,32 +162,40 @@ std::vector<Workspace> VidowWorkspaceBackend::forOutput(wl_output* output) const
     return result;
   }
   nlohmann::json doc = nlohmann::json::parse(raw, nullptr, false);
-  if (doc.is_discarded() || !doc.contains("outputs")) {
+  if (doc.is_discarded() || !doc.is_object() || !doc.value("ok", false) ||
+      !doc.contains("result")) {
+    return result;
+  }
+  doc = doc["result"];
+
+  /* 数据在**顶层** workspaces[]，不在 outputs[].workspaces[] —— 后者只有名字
+   * （动态工作区就是 ["", ""]）。顶层每条带：id / idx / name / active /
+   * output / window_count / windows。 */
+  if (!doc.contains("workspaces") || !doc["workspaces"].is_array()) {
     return result;
   }
   const std::string wantOutput = outputNameFor(output);
 
-  // state 的形状：{"outputs":[{"name":"DP-3","workspaces":[{...}]}]}
-  uint32_t index = 0;
-  for (const auto& out : doc["outputs"]) {
-    const std::string outName = out.value("name", "");
-    if (!wantOutput.empty() && outName != wantOutput) {
+  for (const auto& ws : doc["workspaces"]) {
+    if (bool_or_false(ws, "special")) {
+      continue; // 特殊工作区（scratchpad 那类）不进 dock 的工作区列表
+    }
+    const std::string wsOutput = str_or_empty(ws, "output");
+    if (!wantOutput.empty() && wsOutput != wantOutput) {
       continue;
     }
-    if (!out.contains("workspaces")) {
-      continue;
+    Workspace w;
+    w.id = std::to_string(int_or_zero(ws, "id"));
+    w.name = str_or_empty(ws, "name");
+    w.index = static_cast<std::uint32_t>(int_or_zero(ws, "idx"));
+    w.active = bool_or_false(ws, "active");
+    // window_count 直接就是「这块工作区里有几个窗口」。
+    w.occupied = int_or_zero(ws, "window_count") > 0;
+    if (!w.occupied && ws.contains("windows") && ws["windows"].is_array()) {
+      w.occupied = !ws["windows"].empty();
     }
-    for (const auto& ws : out["workspaces"]) {
-      Workspace w;
-      w.id = std::to_string(ws.value("id", static_cast<std::uint64_t>(0)));
-      w.name = ws.value("name", "");
-      w.index = index++;
-      w.active = ws.value("active", false);
-      // occupied = 这块工作区里有窗口。vidow 的 workspaces[] 带 windows 数组。
-      w.occupied = ws.contains("windows") && !ws["windows"].empty();
-      w.urgent = false;
-      result.push_back(std::move(w));
-    }
+    w.urgent = false;
+    result.push_back(std::move(w));
   }
   return result;
 }
@@ -151,35 +207,40 @@ std::vector<WorkspaceWindow> VidowWorkspaceBackend::workspaceWindows(wl_output* 
     return result;
   }
   nlohmann::json doc = nlohmann::json::parse(raw, nullptr, false);
-  if (doc.is_discarded() || !doc.is_array()) {
+  if (doc.is_discarded() || !doc.is_object() || !doc.value("ok", false) ||
+      !doc.contains("result")) {
+    return result;
+  }
+  doc = doc["result"];
+  if (!doc.is_array()) {
     return result;
   }
   const std::string wantOutput = outputNameFor(output);
 
   for (const auto& win : doc) {
-    if (!win.value("mapped", false) || win.value("popup", false)) {
+    if (!bool_or_false(win, "mapped") || bool_or_false(win, "popup")) {
       continue;
     }
-    const std::string outName = win.value("output", "");
+    const std::string outName = str_or_empty(win, "output");
     if (!wantOutput.empty() && outName != wantOutput) {
       continue;
     }
     WorkspaceWindow w;
-    w.windowId = std::to_string(win.value("id", static_cast<std::uint64_t>(0)));
+    w.windowId = std::to_string(int_or_zero(win, "id"));
     // vidow 的 workspace 字段是工作区**名字**；空串 = 没名字的动态工作区，
     // 用 id 兜底（和 workspaces[] 的 id 对齐）。
-    w.workspaceKey = win.value("workspace", "");
+    w.workspaceKey = str_or_empty(win, "workspace");
     if (w.workspaceKey.empty() && win.contains("workspace_id") &&
         win["workspace_id"].is_number()) {
       // 动态工作区没有名字，vidow 给一个稳定编号（和 workspaces[] 的 id 一致）。
       // noctalia 的 workspaceKeyMatchesAssignment() 见到空串直接 false。
-      w.workspaceKey = std::to_string(win["workspace_id"].get<long long>());
+      w.workspaceKey = std::to_string(int_or_zero(win, "workspace_id"));
     }
-    w.appId = win.value("app_id", "");
-    w.title = win.value("title", "");
+    w.appId = str_or_empty(win, "app_id");
+    w.title = str_or_empty(win, "title");
     if (win.contains("geometry") && win["geometry"].is_object()) {
-      w.x = win["geometry"].value("x", 0);
-      w.y = win["geometry"].value("y", 0);
+      w.x = static_cast<std::int32_t>(int_or_zero(win["geometry"], "x"));
+      w.y = static_cast<std::int32_t>(int_or_zero(win["geometry"], "y"));
     }
     w.outputName = outName;
     result.push_back(std::move(w));
@@ -223,7 +284,9 @@ void VidowWorkspaceBackend::activate(const std::string& id) {
     return;
   }
   // vidowmsg focus-workspace 认序号 / 名字；id 是稳定编号，两种都试。
-  vidowQuery(m_socketPath, "focus-workspace " + id);
+  (void)id; // 见下：activate 需要带参数，等接入时补
+  // TODO: 请求形状是 {"cmd":"focus-workspace","name":<id>}，
+  // 参数键名以 vidow 的 ipc.c 为准（先不动，避免发错请求）。
   if (m_changeCallback) {
     m_changeCallback();
   }
