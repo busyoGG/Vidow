@@ -1778,6 +1778,25 @@ void vidow_pointer_axis(struct vidow_server *server,
 		return;
 	}
 
+	/* 拖拽 CSD 标题栏时滚轮照样滚**视图**（用户：「拖拽csd允许滚动卷轴 和niri一样」）。
+	 * 拖拽期间客户端收不到滚轮 —— 它正被 move grab 攥着，转发过去等于吞掉。
+	 * 这里直接跑「换列」那条动作：它带动视口滑动，看起来就是滚卷轴（和
+	 * Mod+滚轮 同一条路，方向也一致：往下滚 = 往右）。 */
+	{
+		struct vidow_view *dv = NULL;
+		bool dragging = false;
+		wl_list_for_each(dv, &server->views, link) {
+			if (dv->dragging) {
+				dragging = true;
+				break;
+			}
+		}
+		if (dragging && amount != 0) {
+			vidow_focus_column(server, amount > 0 ? 1 : -1);
+			return;
+		}
+	}
+
 	/* 滚轮手势也走绑定（默认配置里 `Mod+wheel-up/down` → 换列）。没绑的滚轮
 	 * 照旧转发给客户端，应用里的滚动不受影响。 */
 	wlr_seat_pointer_notify_axis(server->seat, time_msec, orientation, delta,
