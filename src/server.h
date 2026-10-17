@@ -1485,6 +1485,10 @@ struct vidow_view {
 	/* 上次客户端交帧的单调时间（ns）。用来量「客户端多久交一帧」—— 卡顿如果
 	 * 出在客户端侧（vidow 这边 128fps 也不慢），这个数会明显大于帧周期。 */
 	int64_t last_commit_ns;
+	int64_t commit_n;        /* 本窗口交帧次数 */
+	int64_t commit_ns_sum;   /* 本窗口交帧间隔累计（ns） */
+	int64_t commit_ns_max;   /* 本窗口最坏间隔（ns） */
+	int64_t commit_report_ns; /* 上次打统计的时刻（0 = 还没开始） */
 	/* X11：客户端最后一次 configure 请求的尺寸（X 像素，0 = 没请求过）。
 	 * 客户端常常在 map 之前就发这个请求，那时候它自己的窗口还是 1x1、我们也
 	 * 还不知道它是个对话框 —— 记下来，等尺寸真的要用的时候再取。 */

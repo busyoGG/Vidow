@@ -5825,11 +5825,29 @@ static void view_commit(struct wl_listener *listener, void *data) {
 	if (view->server->trace_timer != NULL) {
 		int64_t now_ns = vidow_now_ns();
 		if (view->last_commit_ns != 0 && view->mapped) {
-			double ms = (double)(now_ns - view->last_commit_ns) / 1e6;
-			if (ms > 30.0) { /* 只记慢的，限速：每 150ms 最多一行由 trace_timer 控制 */
-				wlr_log(WLR_INFO, "交帧间隔 %s: %.0fms（客户端多久交一帧）",
+			/* **累计**每 2 秒打一次：交帧次数 / 平均间隔 / 最坏间隔。
+			 * 只记 >30ms 的那些算不出帧率（快的被滤掉了），分不清「空闲」和
+			 * 「真的卡」。累计器不设阈值，所以能直接算出这个窗口的真实 fps。 */
+			int64_t d = now_ns - view->last_commit_ns;
+			view->commit_n++;
+			view->commit_ns_sum += d;
+			if (d > view->commit_ns_max) {
+				view->commit_ns_max = d;
+			}
+			if (view->commit_report_ns == 0) {
+				view->commit_report_ns = now_ns;
+			} else if (now_ns - view->commit_report_ns >= 2000 * 1000000LL) {
+				double span = (double)(now_ns - view->commit_report_ns) / 1e9;
+				wlr_log(WLR_INFO,
+					"交帧统计 %s: %.1f fps（%lld 帧 / %.1fs，均 %.0fms，最坏 %.0fms）",
 					vidow_view_title(view) != NULL ? vidow_view_title(view) : "(无题)",
-					ms);
+					(double)view->commit_n / span, (long long)view->commit_n,
+					span, (double)view->commit_ns_sum / 1e6 / view->commit_n,
+					(double)view->commit_ns_max / 1e6);
+				view->commit_n = 0;
+				view->commit_ns_sum = 0;
+				view->commit_ns_max = 0;
+				view->commit_report_ns = now_ns;
 			}
 		}
 		view->last_commit_ns = now_ns;
