@@ -214,6 +214,11 @@ void vidow_ipc_json_window(struct jbuf *b, struct vidow_server *server,
 	jb_kv_bool(b, "placed", view->placed);
 	jb_kv_bool(b, "popup", view->popup);
 	jb_kv_bool(b, "fullscreen", view->fullscreen);
+	/* 列宽比例（0.5 = 半屏，1.0 = 占满整块工作区）。dock / 任务栏靠它判断
+	 * 「当前工作区是不是被占满了」—— vidow 没有单独的 maximize，niri 也是拿
+	 * 整列宽度当的（见 src/view.c 里同步 foreign-toplevel 的那段）。 */
+	jb_kv_double(b, "column_width",
+		view->column != NULL ? view->column->width_fraction : 0.0);
 	/* 最小化：窗口还在原来的列里（列宽 / 顺序 / 工作区都留着），只是不占位、不显示、
 	 * 不参与焦点。任务栏 / 状态栏拿它决定画不画那个「收起来」的条目。 */
 	jb_kv_bool(b, "minimized", view->minimized);
