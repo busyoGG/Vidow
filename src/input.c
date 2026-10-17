@@ -1782,19 +1782,13 @@ void vidow_pointer_axis(struct vidow_server *server,
 	 * 拖拽期间客户端收不到滚轮 —— 它正被 move grab 攥着，转发过去等于吞掉。
 	 * 这里直接跑「换列」那条动作：它带动视口滑动，看起来就是滚卷轴（和
 	 * Mod+滚轮 同一条路，方向也一致：往下滚 = 往右）。 */
-	{
-		struct vidow_view *dv = NULL;
-		bool dragging = false;
-		wl_list_for_each(dv, &server->views, link) {
-			if (dv->dragging) {
-				dragging = true;
-				break;
-			}
-		}
-		if (dragging && amount != 0) {
-			vidow_focus_column(server, amount > 0 ? 1 : -1);
-			return;
-		}
+	/* ⚠️ 判据必须用 server->grab_mode，不能用 view->dragging：后者只有**平铺**
+	 * 拖拽（Mod+左键，drag.c）会设，而用户说的「拖拽 CSD」走的是
+	 * view_request_move() → vidow_float_begin_grab()，那条**不设**这个标志 ——
+	 * 用它判等于 CSD 那条永远进不来。 */
+	if (server->grab_mode != VIDOW_GRAB_NONE && amount != 0) {
+		vidow_focus_column(server, amount > 0 ? 1 : -1);
+		return;
 	}
 
 	/* 滚轮手势也走绑定（默认配置里 `Mod+wheel-up/down` → 换列）。没绑的滚轮
