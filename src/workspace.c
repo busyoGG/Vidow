@@ -1153,6 +1153,7 @@ bool vidow_workspace_activate(struct vidow_server *server,
 		}
 	}
 	ws->active = true;
+	vidow_extworkspace_sync(server);
 	if (out != NULL) {
 		out->viewport_x = ws->viewport_x;
 	}

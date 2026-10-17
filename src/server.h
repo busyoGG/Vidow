@@ -35,6 +35,12 @@
 #include <wlr/types/wlr_primary_selection_v1.h>
 #include <wlr/types/wlr_relative_pointer_v1.h>
 #include <wlr/types/wlr_scene.h>
+
+/* ext-workspace-v1（src/extworkspace.c）：把工作区 / 输出状态推给 shell。
+ * noctalia 的 dock 自动隐藏靠它判断「活动工作区空不空」。 */
+void vidow_extworkspace_init(struct vidow_server *server);
+void vidow_extworkspace_finish(struct vidow_server *server);
+void vidow_extworkspace_sync(struct vidow_server *server);
 #include <wlr/types/wlr_server_decoration.h>
 #include <wlr/types/wlr_screencopy_v1.h>
 #include <wlr/types/wlr_ext_image_copy_capture_v1.h>
@@ -2262,6 +2268,8 @@ struct vidow_server {
 	struct wl_list layers;    /* vidow_layer_surface.link */
 	struct wl_list columns;   /* vidow_column.link（所有列的并集，顺序 = 工作区顺序） */
 	struct wl_list workspaces; /* vidow_workspace.link */
+	/* ext-workspace-v1 的服务端状态（src/extworkspace.c）。NULL = 没提供。 */
+	struct extws *extworkspace;
 	struct wl_list keybinds;   /* vidow_keybind.link */
 	struct wl_list gestures;   /* vidow_gesture.link（触控板手势） */
 	struct wl_list rules;      /* vidow_rule.link（窗口规则） */

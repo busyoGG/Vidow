@@ -180,9 +180,10 @@ sources = files(
   'src/capture.c',
   'src/jelly.c',
   'src/screencopy.c',
+  'src/extworkspace.c',
   'src/screencast.c',
   'src/wincapture.c',
-) + [layer_shell_header, bgeffect_header, xa_server_header,
+) + [layer_shell_header, bgeffect_header, xa_server_header, extws_server_header, extws_code,
      eics_server_header, sc_server_header, zkde_server_header,
      xkg_server_header]
 

@@ -238,6 +238,8 @@ static void idle_new_inhibitor(struct wl_listener *listener, void *data) {
 
 static void idle_init(struct vidow_server *server) {
 	/* 两个 global。建不出来就当没这个协议：vidow 其余部分不依赖它们。 */
+	/* ext-workspace-v1：shell（noctalia 的 dock 等）靠它看工作区。 */
+	vidow_extworkspace_init(server);
 	server->idle_notifier = wlr_idle_notifier_v1_create(server->display);
 	server->idle_inhibit_mgr = wlr_idle_inhibit_v1_create(server->display);
 	if (server->idle_notifier == NULL) {
@@ -255,6 +257,7 @@ static void idle_init(struct vidow_server *server) {
 }
 
 static void server_finish(struct vidow_server *server) {
+	vidow_extworkspace_finish(server);
 	if (server->session != NULL) {
 		/* 会话销毁时会断言「没人还挂在我的 events.active 上」（和退出时那条
 		 * xdg_shell 断言同一类，见文件头的说明）。 */
