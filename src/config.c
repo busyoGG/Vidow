@@ -513,6 +513,11 @@ static const struct entry entries[] = {
 		"always | DP-2: gaps=8\" —— `|` 分屏、`输出名:` 起一组、`;` 分数项、"
 		"`键=值`（能写上面那几个全局布局键）。也可以写成 "
 		"vidow.output{ name=\"DP-3\", layout={ gaps=20 } }" },
+	{ "honor_maximize_request", K_BOOL, OFF(honor_maximize_request),
+		SZ(honor_maximize_request), 18,
+		"客户端请求最大化（xdg_toplevel.request_maximize）时要不要兑现。默认 "
+		"false = 不响应 —— Qt/KDE/Electron 应用会恢复「上次是最大化」，兑现了"
+		"就会「一开就占满整列」（用户报的）。想用客户端自己的记忆就设 true" },
 	{ "primary_output", K_STRING, OFF(primary_output), SZ(primary_output), 16,
 		"主屏（输出连接器名，如 \"DP-2\"）：指针初始位置和新窗口默认落点都用它。"
 		"空 = 布局里的第一块屏。以前这两处都按布局原点算，双屏时指针会从最左边"
@@ -2144,6 +2149,7 @@ static void defaults(struct vidow_config *cfg) {
 	cfg->output_layouts_count = 0;
 	cfg->output_layout[0] = '\0';
 	/* 按需 VRR：默认 false = 一个 VRR 相关的字段都不碰，跟改前一样。 */
+	cfg->honor_maximize_request = false;
 	cfg->vrr_on_demand = false;
 	cfg->workspace_switch_ms = 200;
 	cfg->layer_open_ms = 200;

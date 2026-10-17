@@ -5882,7 +5882,8 @@ static void view_commit(struct wl_listener *listener, void *data) {
 			 * 开窗的）：view_request_maximize 里列还没建出来（列是上一行才建的），
 			 * 只能在这儿兑现。放在 arrange 之前 —— 晚了就按「没最大化」排过一遍，
 			 * 客户端还会先收到一个 maximized=false 的初始 configure。 */
-			if (view->xdg_toplevel->requested.maximized &&
+			if (view->server->config.honor_maximize_request &&
+					view->xdg_toplevel->requested.maximized &&
 					view->column != NULL) {
 				view->maximize_granted = true;
 				vidow_column_set_maximized(view->column, true);
@@ -6139,6 +6140,14 @@ static void view_request_maximize(struct wl_listener *listener, void *data) {
 		return;
 	}
 
+	if (want && !view->server->config.honor_maximize_request) {
+		/* 配置里说不响应（默认）：协议要求每个状态请求都有应答，所以回一个
+		 * 「没最大化」，但不动列宽 —— Qt/KDE/Electron 恢复「上次是最大化」
+		 * 不会再让窗口一开就占满整列。 */
+		view->maximize_granted = false;
+		vidow_view_set_maximized(view, false);
+		return;
+	}
 	if (want) {
 		/* vidow 没有「窗口级」的最大化（列是布局的最小单位）：客户端要最大化
 		 * 就把它那条列最大化，并且记下「这次是它要的」。 */
