@@ -10,6 +10,24 @@
 /* gap 的算法都在 server.h 里（vidow_gap_side / vidow_gap_inner）：统一值 gaps
  * 管全部，单边设了就用单边的，-1 = 跟随。 */
 
+/* 新窗口该落到哪块屏。
+ *
+ * `server->focused_output` 在「还没人动过鼠标」时是 NULL —— sddm 直接起 vidow 就是
+ * 这种情况（用户报的：自启动的应用全是空框）。那时新窗口拿到 output = NULL，
+ * 永远不进 arrange、永远不发 configure、永远不交 buffer，还会作为死窗口留在场景里
+ * 拖慢每一帧。回落：用第一块输出。
+ */
+static struct wlr_output *view_default_output(struct vidow_server *server) {
+	if (server->focused_output != NULL) {
+		return server->focused_output;
+	}
+	struct vidow_output *o;
+	wl_list_for_each(o, &server->outputs, link) {
+		return o->wlr_output;
+	}
+	return NULL;
+}
+
 void vidow_place_view(struct vidow_view *view, int x, int y, int w, int h);
 /* 小窗（S5）：图标态的快照节点（定义在文件后半段的预览那一节里）。 */
 static void mini_snapshot_place(struct vidow_view *view);
@@ -6337,7 +6355,7 @@ static void x11_track_output(struct vidow_view *view) {
 	if (output != NULL) {
 		view->output = output;
 	} else if (view->output == NULL) {
-		view->output = server->focused_output;
+		view->output = view_default_output(server);
 	}
 }
 
@@ -6860,7 +6878,7 @@ void vidow_view_new_x11(struct vidow_server *server,
 	view->server = server;
 	view->kind = VIDOW_VIEW_X11;
 	view->x11 = xsurface;
-	view->output = server->focused_output;
+	view->output = view_default_output(server);
 	if (view->output == NULL && !wl_list_empty(&server->outputs)) {
 		struct vidow_output *o = wl_container_of(server->outputs.next, o, link);
 		view->output = o->wlr_output;
@@ -6954,7 +6972,7 @@ static void server_new_toplevel(struct wl_listener *listener, void *data) {
 	view->server = server;
 	view->kind = VIDOW_VIEW_XDG;
 	view->xdg_toplevel = xdg_toplevel;
-	view->output = server->focused_output;
+	view->output = view_default_output(server);
 	if (view->output == NULL && !wl_list_empty(&server->outputs)) {
 		struct vidow_output *o = wl_container_of(server->outputs.next, o, link);
 		view->output = o->wlr_output;
