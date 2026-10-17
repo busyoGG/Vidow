@@ -1374,13 +1374,20 @@ static void view_pin_scale(struct vidow_view *view) {
 	if (want < 1) {
 		want = 1;
 	}
-	if (want == view->pref_scale) {
-		return;
-	}
+	/* **每次都发，不只在变化时发**：Chromium / Electron 会重建
+	 * wp_fractional_scale_v1 对象（新 surface、新 widget），新建的那个收不到
+	 * 「上一次」的 preferred_scale，就按自己的默认（2x）画 —— 实测同一个
+	 * surface 在「声明 1 倍」和「声明 2 倍」之间反复跳，每次跳都是一次完整
+	 * 重排重画（用户报的「1/4 和 1 大小不停变化」+ 卡顿）。
+	 * 协议事件很小，每帧一个不算负担。 */
+	const bool changed = want != view->pref_scale;
 	view->pref_scale = want;
 	wlr_surface_set_preferred_buffer_scale(surface, want);
 	wlr_fractional_scale_v1_notify_scale(surface, (double)want);
 	wlr_surface_for_each_surface(surface, pin_scale_surface, &want);
+	if (!changed) {
+		return;
+	}
 	/* 带上窗口编号（IPC 那个 id）：钉是在**第一次摆放**时发生的，那会儿标题往往
 	 * 还没来 —— 日志按编号认人更稳（测试也按编号找这一行）。 */
 	wlr_log(WLR_INFO, "surface %llu %s: 钉住 preferred_buffer_scale = %d"
@@ -5808,6 +5815,9 @@ static void view_commit(struct wl_listener *listener, void *data) {
 		vidow_output_schedule_frame(view->server, view->output,
 			"客户端交帧");
 	}
+
+	/* 新 surface / 新子表面可能在 commit 时才出现：补一遍缩放钉住。 */
+	view_pin_scale(view);
 
 	/* 客户端交帧了 —— X11 那边顺手对一下 _NET_WM_STATE（属性那条路不发信号，
 	 * 见 view_sync_x11_fullscreen）。 */
