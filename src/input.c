@@ -335,8 +335,14 @@ static void server_add_keyboard(struct vidow_server *server,
 
 	/* 虚拟键盘自己会送 keymap（协议要求），别用我们的覆盖它：输入法回注的
 	 * 按键是按它自己的 keymap 发的，覆盖了就会解释成别的键（ESC 关窗口）。 */
-	struct xkb_context *context = virtual != NULL ? NULL : xkb_context_new(XKB_CONTEXT_NO_FLAGS);
-	if (context != NULL) {
+	/* 虚拟键盘（输入法回注用的）：它通常会自己送 keymap（协议要求），那就不
+	 * 动它 —— 覆盖了会把回注的键解释成别的键。但它**没送**的时候必须补一份：
+	 * 实测 fcitx5 就不送（`vidowmsg seats` 里 layout: null），空 keymap 让客户端
+	 * 翻译不出任何键，表现就是「输入法开着，一个字都打不出来，只有合成器自己
+	 * 的快捷键还能用」——用户报的就是这个。 */
+	struct xkb_context *context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+	bool need_keymap = virtual == NULL || wlr_keyboard->keymap == NULL;
+	if (context != NULL && need_keymap) {
 		struct xkb_keymap *keymap = xkb_keymap_new_from_names(context, NULL,
 			XKB_KEYMAP_COMPILE_NO_FLAGS);
 		if (keymap != NULL) {
