@@ -513,6 +513,10 @@ static const struct entry entries[] = {
 		"always | DP-2: gaps=8\" —— `|` 分屏、`输出名:` 起一组、`;` 分数项、"
 		"`键=值`（能写上面那几个全局布局键）。也可以写成 "
 		"vidow.output{ name=\"DP-3\", layout={ gaps=20 } }" },
+	{ "primary_output", K_STRING, OFF(primary_output), SZ(primary_output), 16,
+		"主屏（输出连接器名，如 \"DP-2\"）：指针初始位置和新窗口默认落点都用它。"
+		"空 = 布局里的第一块屏。以前这两处都按布局原点算，双屏时指针会从最左边"
+		"冒出来（用户报的「我主屏幕在右边」）" },
 	{ "vrr_on_demand", K_BOOL, OFF(vrr_on_demand), SZ(vrr_on_demand), 8,
 		"按需可变刷新率（niri 的 variable-refresh-rate on-demand=true）：默认 "
 		"false = 不碰 VRR。true = 这块屏「有窗口要 VRR 才提刷新率」（窗口规则写 "

@@ -1961,8 +1961,18 @@ static bool view_sliding_out(struct vidow_server *server,
  * 摆回屏里之后还停在停车位上，那个窗口就再也不出现了。 */
 bool vidow_view_should_park(struct vidow_server *server,
 		struct vidow_view *view) {
-	if (view->popup || !view->mapped || view->scene_tree == NULL) {
-		return false; /* 弹出物 / 还没上屏的：各有各的路（见 workspace.c） */
+	if (view->popup || view->scene_tree == NULL) {
+		return false; /* 弹出物：各有各的路（见 workspace.c） */
+	}
+	/* 还没上屏的（从没 commit 过 buffer）：**也 park**。
+	 *
+	 * 原来这里还有 `!view->mapped` 一条，理由是「各有各的路」—— 但没上屏的
+	 * 窗口根本没有路：它留在场景里、留在布局原点，每帧都要渲染一遍。实测一个
+	 * 会话里 41 个 view 有 40 个是这种（vivaldi 一个就开一堆子表面），全都
+	 * 在画，于是**所有应用都卡**（桌面是静态背景，不重画，所以不卡）。
+	 * 第一次 map 时 view_map 会调 vidow_view_set_parked(false) 放回来。 */
+	if (!view->mapped) {
+		return true;
 	}
 	/* 小窗（S5）：图标态 + 该窗口不保活 + 手里有最后一帧 → 真实节点停到停车位
 	 * （它不在任何输出上，客户端于是停帧），屏上由快照节点画（见

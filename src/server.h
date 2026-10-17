@@ -205,6 +205,10 @@ struct vidow_opt_double {
 };
 
 struct vidow_config {
+	/* 主屏（输出连接器名，如 "DP-2"）。空 = 布局里的第一块屏。
+	 * 指针初始位置和新窗口默认落点都用它 —— 以前两处都按布局原点算，
+	 * 双屏且主屏在右边时指针会从最左边冒出来（用户报的）。 */
+	char *primary_output;
 	/* ---- gap ----
 	 * 一个统一值管全部：`gaps = 10` → 屏幕边 10px、窗口之间也是 10px。
 	 * 要分开写就 `gaps = { top=30, left=40, inner=20 }`（或者平铺键
