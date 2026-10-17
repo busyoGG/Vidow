@@ -2017,13 +2017,15 @@ static double view_overview_alpha(struct vidow_server *server,
 	if (view->output != server->overview.output) {
 		return alpha * (1.0 - server->overview.t);
 	}
-	if (!vidow_workspace_view_visible(server, view)) {
-		return alpha * server->overview.t;
-	}
 	/* 整块落在**这一行的矩形外**：不画（alpha 0）。条带比屏宽的那些列本来就在
 	 * 矩形外（在屏幕上它们在屏幕外），而场景没有裁剪节点（见 overview.c 里
 	 * row->rect_x 那段注释）—— 不藏就直接画到隔壁显示器上（用户：「overview
 	 * 窗口太多会跨屏」）。
+	 *
+	 * ⚠️ 必须放在下面 vidow_workspace_view_visible() 那条**之前**：会溢出行的
+	 * 正是「在屏幕上被滚出视口」的列，它们在下面那条就提前 return 了 ——
+	 * 放在后面等于永远轮不到它们（实测 7 窗口跑完 OVHIDE 命中的全是停车位 /
+	 * 别的工作区的窗口，框 y 对不上行 y）。
 	 *
 	 * 只藏**整块都在外面**的：边界上那块部分溢出的照旧画（藏了会把该看见的
 	 * 一半也弄没），那点残余属于另一个小问题。 */
@@ -2037,6 +2039,9 @@ static double view_overview_alpha(struct vidow_server *server,
 				rb.x, rb.y, rb.width, rb.height);
 			return 0.0;
 		}
+	}
+	if (!vidow_workspace_view_visible(server, view)) {
+		return alpha * server->overview.t;
 	}
 	return alpha;
 }
