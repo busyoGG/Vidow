@@ -6120,7 +6120,8 @@ static void view_request_move(struct wl_listener *listener, void *data) {
 	if (view->float_mode == VIDOW_FLOAT_NONE) {
 		vidow_float_set_mode(view, VIDOW_FLOAT_FIXED);
 	}
-	vidow_float_begin_grab(server, view, false, true);
+	/* 拖标题栏 = 平移视图（用户点名的那条）；想移动浮窗用 Mod+左键。 */
+	vidow_pan_begin(server, view);
 }
 
 static void view_request_resize(struct wl_listener *listener, void *data) {
@@ -6614,7 +6615,8 @@ static void x11_request_move(struct wl_listener *listener, void *data) {
 	}
 	/* X11 的 _NET_WM_MOVERESIZE：客户端的标题栏拖拽。按下已经转给它了（X 的
 	 * 隐式抓取就是这么来的），松手也得转回去，否则它停在「按住」状态。 */
-	vidow_float_begin_grab(server, view, false, true);
+	/* 拖标题栏 = 平移视图（用户点名的那条）；想移动浮窗用 Mod+左键。 */
+	vidow_pan_begin(server, view);
 }
 
 static void x11_request_resize(struct wl_listener *listener, void *data) {

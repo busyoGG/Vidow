@@ -821,6 +821,9 @@ static void server_new_input(struct wl_listener *listener, void *data) {
 
 /* 拖着东西的时候指针事件全归 grab：平铺拖拽走 drag.c，浮动窗口走 float.c。 */
 static void pointer_grab_update(struct vidow_server *server) {
+	if (server->grab_mode == VIDOW_GRAB_PAN) {
+		vidow_pan_motion(server);
+	}
 	if (server->grab_mode == VIDOW_GRAB_TILE) {
 		vidow_tile_grab_update(server, server->cursor->x, server->cursor->y);
 		return;
@@ -1418,6 +1421,9 @@ void vidow_pointer_button(struct vidow_server *server, uint32_t button,
 			 * _NET_WM_MOVERESIZE）：按下那次是转给客户端的，松手得还给它。
 			 * 在读之前记下来 —— end_grab 会把状态清掉。 */
 			bool client_saw_press = server->grab_client_press;
+			if (server->grab_mode == VIDOW_GRAB_PAN) {
+				vidow_pan_end(server);
+			} else
 			if (server->grab_mode == VIDOW_GRAB_TILE) {
 				vidow_tile_grab_end(server);
 			} else if (server->grab_mode == VIDOW_GRAB_RESIZE_TILE) {

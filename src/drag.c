@@ -1380,3 +1380,61 @@ void vidow_tile_resize_end(struct vidow_server *server) {
 	server->grab_dirty = false;
 	wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "left_ptr");
 }
+
+/* ---------------------------------------------------------------- 平移视图
+ *
+ * 拖 CSD 标题栏 = **平移视图**，窗口不动（用户：「按住标题栏拖 → 视图平移、
+ * 窗口不动」）。视口本来就有（arrange_columns 按 output->viewport_x 算列 x），
+ * 所以这里只需要把光标位移喂进 viewport_x —— 不新建任何平移逻辑。 */
+static double pan_cursor_x;
+static double pan_base;
+static struct vidow_output *pan_output;
+
+void vidow_pan_begin(struct vidow_server *server, struct vidow_view *view) {
+	pan_output = NULL;
+	if (server == NULL || view == NULL || view->output == NULL) {
+		return;
+	}
+	struct vidow_output *o;
+	wl_list_for_each(o, &server->outputs, link) {
+		if (o->wlr_output == view->output) {
+			pan_output = o;
+			break;
+		}
+	}
+	if (pan_output == NULL) {
+		return;
+	}
+	server->grab_mode = VIDOW_GRAB_PAN;
+	server->grab_view = NULL;
+	/* 这条和老的浮动抓取一样：按下是**转给客户端**的（它才发的 move 请求），
+	 * 所以松手也必须转回去 —— 不然客户端以为左键一直按着，拖完再动鼠标窗口
+	 * 还会跟着走，下一次点击被当成「按下」。 */
+	server->grab_client_press = true;
+	pan_cursor_x = server->cursor->x;
+	pan_base = pan_output->viewport_x;
+	wlr_log(WLR_DEBUG, "pan: 开始（viewport_x=%.0f）", pan_base);
+}
+
+void vidow_pan_motion(struct vidow_server *server) {
+	if (pan_output == NULL || server == NULL) {
+		return;
+	}
+	/* 往右拖 = 视图往左滑（手指拖纸的直觉，和触控板手势一致）。 */
+	pan_output->viewport_x = pan_base - (server->cursor->x - pan_cursor_x);
+	vidow_arrange(server);
+}
+
+void vidow_pan_end(struct vidow_server *server) {
+	if (pan_output != NULL) {
+		wlr_log(WLR_DEBUG, "pan: 结束（viewport_x=%.0f）",
+			pan_output->viewport_x);
+	}
+	if (server != NULL && server->grab_mode == VIDOW_GRAB_PAN) {
+		server->grab_mode = VIDOW_GRAB_NONE;
+		/* 和按下时配对的复位：不清的话松手之后客户端的指针位置还会一直被吃掉
+		 * （test-titlebar-drag 的「松手之后客户端一条指针位置都收不到」）。 */
+		server->grab_client_press = false;
+	}
+	pan_output = NULL;
+}

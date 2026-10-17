@@ -1248,6 +1248,8 @@ enum vidow_grab_mode {
 	/* 平铺窗口的 Mod+右键拖拽（src/drag.c）：改这一列的宽度（列宽的右边缘跟着
 	 * 光标走）。vidow 的平铺尺寸模型里没有「单个窗口的高度」，所以只横向。 */
 	VIDOW_GRAB_RESIZE_TILE,
+	/* 拖 CSD 标题栏 = 平移视图（窗口不动），见 drag.c 的 vidow_pan_* */
+	VIDOW_GRAB_PAN,
 };
 
 /* niri-style column: a vertical stack of windows, columns are laid out left
@@ -3784,6 +3786,11 @@ struct wlr_output *vidow_view_display_output(const struct vidow_view *view);
  * 在藏起来的工作区上，焦点就落在一个看不见的窗口上（看起来像「点了没反应」）。 */
 void vidow_view_activate(struct vidow_view *view);
 void vidow_focus_column(struct vidow_server *server, int direction);
+
+/* 拖 CSD 标题栏 = 平移视图（窗口不动）：复用 output->viewport_x 那个视口。 */
+void vidow_pan_begin(struct vidow_server *server, struct vidow_view *view);
+void vidow_pan_motion(struct vidow_server *server);
+void vidow_pan_end(struct vidow_server *server);
 void vidow_focus_window(struct vidow_server *server, int direction);
 void vidow_move_column(struct vidow_server *server, int direction);
 /* 和相邻列里同层的那个窗口换个位置（swap-window 动作）。 */

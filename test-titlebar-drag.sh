@@ -160,10 +160,10 @@ if wait_log "$PLOG" "begin_move_drag 已发" 3; then
 else
 	fail "客户端没发 move 请求（begin_move_drag）"
 fi
-if wait_log "$LOG" "grab move: movedrag" 3; then
-	pass "合成器起了 grab（grab move: movedrag）"
+if wait_log "$LOG" "pan: 开始" 3; then
+	pass "合成器接住了（拖标题栏 = 平移视图，pan: 开始）"
 else
-	fail "合成器没起 grab —— 客户端发起的拖拽没被接住"
+	fail "合成器没接住 —— 客户端发起的拖拽没人处理"
 fi
 
 N1=$(wc -l < "$LOG")
