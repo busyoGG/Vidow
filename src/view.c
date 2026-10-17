@@ -5819,6 +5819,22 @@ static void view_commit(struct wl_listener *listener, void *data) {
 	/* 新 surface / 新子表面可能在 commit 时才出现：补一遍缩放钉住。 */
 	view_pin_scale(view);
 
+	/* **交帧间隔**（VIDOW_TRACE_FRAMES=1）：vidow 自己 128fps 也不慢的时候，
+	 * 卡顿只能在客户端侧 —— 这个数会直接显示「它多久交一帧」。144Hz 应该
+	 * ~7ms，60Hz ~16ms；上百毫秒就是客户端被饿着或者自己卡住。 */
+	if (view->server->trace_timer != NULL) {
+		int64_t now_ns = vidow_now_ns();
+		if (view->last_commit_ns != 0 && view->mapped) {
+			double ms = (double)(now_ns - view->last_commit_ns) / 1e6;
+			if (ms > 30.0) { /* 只记慢的，限速：每 150ms 最多一行由 trace_timer 控制 */
+				wlr_log(WLR_INFO, "交帧间隔 %s: %.0fms（客户端多久交一帧）",
+					vidow_view_title(view) != NULL ? vidow_view_title(view) : "(无题)",
+					ms);
+			}
+		}
+		view->last_commit_ns = now_ns;
+	}
+
 	/* 客户端交帧了 —— X11 那边顺手对一下 _NET_WM_STATE（属性那条路不发信号，
 	 * 见 view_sync_x11_fullscreen）。 */
 	view_sync_x11_fullscreen(view);
