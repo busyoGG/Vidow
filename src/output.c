@@ -42,6 +42,17 @@ static const char *stall_output_name(void) {
 void vidow_output_render(struct vidow_output *output) {
 	struct vidow_server *server = output->server;
 
+	/* **关着的屏不画**。少了这条，`output-power off` 之后看门狗 / 动画定时器
+	 * 还在每帧调进来，wlr_scene_output_commit() 去给一块没开的屏建交换链 ——
+	 * 失败后 wlroots 每帧刷一行
+	 *   Swapchain for output 'DP-3' failed test
+	 * 实测两屏都关掉之后刷了上千行，而且把 DRM 后端拖进坏状态：之后按键唤醒
+	 * （key_press_enables_dpms）只开回来一块屏，另一块的 commit 直接失败。
+	 * 关着的屏本来就不该产生帧。 */
+	if (!output->wlr_output->enabled) {
+		return;
+	}
+
 	/* 出帧了：看门狗按这个时刻给自己限速（见 watchdog_interval_ns）。放在最前面，
 	 * 中途哪条早退都不影响「这一帧确实画过了」。 */
 	output->last_render_ns = vidow_now_ns();
