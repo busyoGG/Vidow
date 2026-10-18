@@ -6022,6 +6022,21 @@ static void view_commit(struct wl_listener *listener, void *data) {
 		double client_scale = surface->current.width > 0 ?
 			(double)surface->current.buffer_width /
 				(double)surface->current.width : 1.0;
+		/* **倍率自愈**：客户端按的倍率比我们钉的高，说明它收到过别的屏的
+		 * preferred_buffer_scale —— 典型路径是窗口压在屏边界上（x=1917，
+		 * 隔壁屏从 1920 开始）、而 view->output 短暂失效导致裁切关掉，表面
+		 * 整块画到了隔壁 2 倍屏上，wlroots 给这个表面发了 enter + 2 倍；等它
+		 * 回到自己那块 1 倍屏时，Chromium 不会自己切回来，于是内部页面一直
+		 * 按 2 倍排版（用户报的「浏览器内部页面还是会大小变化」）。
+		 *
+		 * 这里只在**缓冲尺寸刚变**（客户端的倍率选择刚刚发生）且比我们要的
+		 * 高时清掉 pref_scale、下一帧强制重发一次。放在这个 if 里面是有意的：
+		 * 天然限流，不会每帧跟客户端对着发（那正是之前 Electron 每 6~12ms
+		 * 跳一次的原因）。 */
+		if (view->pref_scale > 0 && client_scale > (double)view->pref_scale + 0.01) {
+			view->pref_scale = 0;
+			view_pin_scale(view);
+		}
 		view->logged_scale = (int)lround(client_scale);
 		wlr_log(WLR_INFO, "surface %s: 缓冲 %dx%d 声明 %d 倍 -> 逻辑 %dx%d"
 			"（输出 %.2fx，设备像素 %dx%d）",
