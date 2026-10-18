@@ -877,6 +877,9 @@ static struct vidow_view *mini_box_view_at(struct vidow_server *server,
 	return NULL;
 }
 
+/* 定义在下面（裁剪那段）；命中测试要用它挡掉「裁掉了但还能点到」的窗口。 */
+static bool view_clip_box(struct vidow_view *view, struct wlr_box *out);
+
 struct vidow_view *vidow_view_at(struct vidow_server *server,
 		double lx, double ly, struct wlr_surface **surface,
 		double *sx, double *sy) {
@@ -917,6 +920,27 @@ struct vidow_view *vidow_view_at(struct vidow_server *server,
 			/* X11 的缓冲区被我们按 xwayland_scale 倍声明过：场景坐标比
 			 * 客户端自己的坐标空间小，命中坐标要乘回去才是 surface 局部
 			 * 坐标（否则只有左上角 1/scale 那块能点中）。 */
+			/* **裁剪框也要管命中测试**。
+			 *
+			 * view_clip_box() 把窗口裁到自己那块屏里（场景图是全局坐标的，
+			 * 不裁就会画到隔壁显示器上），但 wlr_scene_node_at() 完全不看
+			 * 我们的裁剪框 —— 于是「滚到视口右边的窗口」会落在隔壁屏的坐标
+			 * 范围里：屏幕上（自己那块屏）看不见，却在隔壁屏那个位置能点、
+			 * 能拖边框、能抢焦点（用户实测：「在 DP-3 的应用虽然在 DP-2 看
+			 * 不见，但有概率在 DP-2 某个位置能控制尺寸和点击跳转焦点」）。
+			 *
+			 * 这里按同一份判据再挡一次：命中的点不在裁剪框里就不算命中。
+			 */
+			struct wlr_box clip = {0};
+			if (view_clip_box(tag->view, &clip)) {
+				const double px = lx;
+				const double py = ly;
+				if (px < clip.x || py < clip.y ||
+						px >= clip.x + clip.width ||
+						py >= clip.y + clip.height) {
+					return NULL;
+				}
+			}
 			double hit = vidow_view_hit_scale(tag->view);
 			if (hit != 1.0) {
 				*sx *= hit;
