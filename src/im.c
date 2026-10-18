@@ -290,8 +290,15 @@ static void im_commit(struct wl_listener *listener, void *data) {
 	}
 	struct vidow_text_input *ti = active_text_input(server);
 	if (ti == NULL) {
-		/* 没有输入框在等：告诉它这次白说了，别攒着 */
-		wlr_input_method_v2_send_unavailable(method);
+		/* 没有输入框在等：告诉它这次白说了，别攒着。
+		 *
+		 * **只在输入法还活跃时发**：wlroots 的 wlr_input_method_v2_send_unavailable()
+		 * 里第一行就是 assert(input_method->active)。Proton 游戏全屏抢键盘会让
+		 * 输入法失活，这时客户端还送过来一次 commit，我们再发 unavailable 就是
+		 * 一次 SIGABRT（实测 2026-10-18 23:49:51 崩过一次，栈顶正是这里）。 */
+		if (method->active) {
+			wlr_input_method_v2_send_unavailable(method);
+		}
 		return;
 	}
 	struct wlr_text_input_v3 *input = ti->input;
@@ -409,9 +416,12 @@ static void server_new_input_method(struct wl_listener *listener, void *data) {
 	struct vidow_im *im = &server->im;
 
 	if (im->method != NULL) {
-		/* 一个就够：后来的直接劝退 */
+		/* 一个就够：后来的直接劝退。同样要先看 active（新连上来的默认不活跃，
+		 * 直接发会踩 wlroots 那个 assert）。 */
 		wlr_log(WLR_INFO, "another input method tried to connect, refusing");
-		wlr_input_method_v2_send_unavailable(method);
+		if (method->active) {
+			wlr_input_method_v2_send_unavailable(method);
+		}
 		return;
 	}
 	im->method = method;
