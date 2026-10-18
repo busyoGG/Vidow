@@ -1635,6 +1635,10 @@ struct vidow_layer_surface {
 	uint32_t layer;
 	/* 图层规则算出来的作用（rule.c 填）。 */
 	struct vidow_rule_eff rule_eff;
+	/* 上一次 layer 模糊没画成的**原因**（fx.c 的 layer_blur_frame 填）：
+	 * 0 = 正常画了。只在原因变化时打一行日志 —— 这个函数每帧都跑，
+	 * 不打限流就是刷屏。 */
+	int blur_fail;
 	/* 图层规则的 exe / cmdline：和窗口那边一样，按 pid 抓一次就缓存。 */
 	int probe_pid;
 	char probe_exe[128];

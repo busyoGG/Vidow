@@ -2049,6 +2049,9 @@ static void layer_bd_drop(struct vidow_layer_surface *ls) {
 
 static bool layer_blur_wanted(struct vidow_server *server,
 		struct vidow_layer_surface *ls);
+/* 没画成的原因出口（定义在下面，layer_blur_wanted 也要用）。 */
+static bool layer_blur_bail(struct vidow_layer_surface *ls, int reason,
+		const char *what);
 /* 抓底衬时要不要把这个 layer surface 自己藏起来（见下面的定义）。 */
 static bool layer_blur_frame(struct vidow_server *server,
 		struct vidow_output *output, struct vidow_layer_surface *ls);
@@ -3549,18 +3552,26 @@ static bool layer_blur_visible(struct vidow_layer_surface *ls) {
 static bool layer_blur_wanted(struct vidow_server *server,
 		struct vidow_layer_surface *ls) {
 	if (!server->shader_ok || !server->config.blur_enabled) {
-		return false;
+		return layer_blur_bail(ls, 10, "全局模糊关了 / 着色器没就绪");
 	}
 	/* 图层规则 blur = false：这块 layer 底下不垫模糊（全局开关仍然是总闸）。 */
 	if (ls->rule_eff.set[VRA_BLUR] && !ls->rule_eff.val[VRA_BLUR].b) {
-		return false;
+		return layer_blur_bail(ls, 11, "图层规则 blur = false");
 	}
 	/* 壁纸自己（background 层）不模糊：模糊的底衬里就有它，垫一层等于画重。 */
 	if (ls->layer == ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND) {
-		return false;
+		return layer_blur_bail(ls, 12, "这是 background 层（壁纸自己）");
 	}
-	return ls->geom.width > 0 && ls->geom.height > 0 && ls->scene != NULL &&
-		layer_blur_visible(ls);
+	if (!(ls->geom.width > 0 && ls->geom.height > 0)) {
+		return layer_blur_bail(ls, 13, "几何还是 0（没提交过 / 还没摆）");
+	}
+	if (ls->scene == NULL) {
+		return layer_blur_bail(ls, 1, "没有场景节点");
+	}
+	if (!layer_blur_visible(ls)) {
+		return layer_blur_bail(ls, 14, "整块不透明（缓冲没有 alpha，或 opaque region 盖满整块）");
+	}
+	return true;
 }
 
 /* 抓一块「这个 layer 盖住的东西」，含窗口。
@@ -3690,12 +3701,29 @@ static bool layer_region_build(struct vidow_server *server,
 	return true;
 }
 
+/* 没画成的出口：记下原因，只在**原因变了**时打一行（每帧都跑，不限流会刷屏）。
+ * 排查「某块屏上的 layer 没有模糊」时，这一行直接说是哪一步挡住的。 */
+static bool layer_blur_bail(struct vidow_layer_surface *ls, int reason,
+		const char *what) {
+	if (ls->blur_fail != reason) {
+		ls->blur_fail = reason;
+		wlr_log(WLR_INFO, "layer 模糊没画: %s（namespace=%s 输出=%s）",
+			what,
+			ls->layer_surface != NULL && ls->layer_surface->namespace != NULL ?
+				ls->layer_surface->namespace : "?",
+			ls->output != NULL && ls->output->wlr_output != NULL &&
+				ls->output->wlr_output->name != NULL ?
+				ls->output->wlr_output->name : "?");
+	}
+	return false;
+}
+
 static bool layer_blur_frame(struct vidow_server *server,
 		struct vidow_output *output, struct vidow_layer_surface *ls) {
 	struct vidow_fx_target *fx = &ls->fx;
 
 	if (ls->scene == NULL) {
-		return false;
+		return layer_blur_bail(ls, 1, "没有场景节点");
 	}
 
 	/* 恒等映射：layer 的元素就是整块缓冲，没有「窗口几何」那层偏移（窗口那一
@@ -3710,7 +3738,9 @@ static bool layer_blur_frame(struct vidow_server *server,
 	 * overlay 层底下有窗口，得自己抓一小块（见 layer_region_build）。 */
 	bool with_windows = ls->layer != ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM;
 	if (with_windows ? output->backdrop_tex == NULL : output->blur_tex == NULL) {
-		return false;
+		return layer_blur_bail(ls, 2, with_windows ?
+			"这块屏的共享底衬（backdrop_tex）还没建" :
+			"这块屏的壁纸底衬（blur_tex）还没建");
 	}
 	double scale = output->wlr_output->scale;
 	if (!(scale > 0.0)) {
@@ -3720,7 +3750,7 @@ static bool layer_blur_frame(struct vidow_server *server,
 	int px_w = (int)lround((double)logical_w * scale);
 	int px_h = (int)lround((double)logical_h * scale);
 	if (px_w < 1 || px_h < 1 || px_w > MAX_TARGET_PX || px_h > MAX_TARGET_PX) {
-		return false;
+		return layer_blur_bail(ls, 3, "设备像素尺寸越界");
 	}
 
 	if (fx->node == NULL) {
@@ -3745,7 +3775,7 @@ static bool layer_blur_frame(struct vidow_server *server,
 			fx->buf[i] = vidow_alloc_target(server, px_w, px_h);
 			if (fx->buf[i] == NULL) {
 				drop_targets(fx);
-				return false;
+				return layer_blur_bail(ls, 5, "分配离屏目标失败");
 			}
 		}
 		fx->w = px_w;
@@ -3777,7 +3807,8 @@ static bool layer_blur_frame(struct vidow_server *server,
 			fabs(fx->blur_set.offset - server->config.blur_offset) < 1e-6;
 		if (!fresh && !layer_region_build(server, output, ls, rx, ry, px_w,
 				px_h, levels)) {
-			return false; /* 抓不出来就留着上一帧那张，别闪 */
+			/* 抓不出来就留着上一帧那张，别闪 */
+			return layer_blur_bail(ls, 4, "私有底衬抓不出来");
 		}
 		blur_assign(fx, fx->blur_own_tex, false, fx->blur_own_id,
 			&(struct wlr_box){ .x = rx, .y = ry,
@@ -3797,6 +3828,9 @@ static bool layer_blur_frame(struct vidow_server *server,
 			ls->bd_gen_layer = 0;
 		}
 		blur_assign(fx, output->blur_tex, false, output->blur_id, NULL);
+	}
+	if (ls->blur_fail != 0) {
+		ls->blur_fail = 0; /* 又能画了：下次出问题要重新报 */
 	}
 	if (fx->blur_drawn == fx->blur_ver) {
 		return true; /* 已经画的就是这一版 */
