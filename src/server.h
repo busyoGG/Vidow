@@ -2494,6 +2494,10 @@ struct vidow_server {
 	/* 最小化的先后（「放回最近收起来的那个」按它挑，见 view.c） */
 	uint64_t next_minimize_seq;
 
+	/* 指针现在压在哪个窗口上（focus_follows_mouse 用）。
+	 * 焦点只在这一格「从别的窗口换过来」时才跟着走 —— 键盘刚把焦点切走、指针
+	 * 还停在同一窗口里的时候，挪一下鼠标不该把焦点抢回来。 */
+	struct vidow_view *hovered_view;
 	struct vidow_view *focused;
 	/* 上一次拿着焦点的**列**（center_focused_column = "on-overflow" 要用：
 	 * 「焦点列和上一个焦点列能不能一起完整放进视口」是居中与否的判据，见

@@ -877,6 +877,12 @@ static void focus_follows_mouse(struct vidow_server *server,
 	if (server->locked) {
 		return;
 	}
+	/* 记下「指针现在压着谁」，并拿到「上一次压着谁」。
+	 * 焦点只在这一格**从别的窗口换过来**时才跟着走 —— 键盘刚把焦点切到 B、
+	 * 指针还停在 A 里的时候，在 A 里挪一下不该把焦点抢回 A（用户报的
+	 * 「窗口焦点移动后…否则会和焦点切换有冲突」）。离开再回来 = 变了，才跟。 */
+	struct vidow_view *prev_hover = server->hovered_view;
+	server->hovered_view = hit;
 	/* 小窗（S2）：迷你 / 图标**不跟**（和锁屏那条同一个位置、同一个形状）。
 	 * 它们不接键盘，鼠标扫过屏幕边缘时不该把焦点从正在打字的窗口上拽走。 */
 	if (hit != NULL && (hit->mini == VIDOW_MINI_MINI ||
@@ -890,6 +896,10 @@ static void focus_follows_mouse(struct vidow_server *server,
 	}
 	if (!server->config.focus_follows_mouse || hit == NULL ||
 			hit == server->focused) {
+		return;
+	}
+	/* 指针没离开过这个窗口（上一次压着的也是它）：不跟。 */
+	if (hit == prev_hover) {
 		return;
 	}
 	const char *limit = server->config.focus_follows_mouse_max_scroll_amount;

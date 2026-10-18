@@ -6099,6 +6099,11 @@ static void view_destroy(struct wl_listener *listener, void *data) {
 	struct vidow_server *server = view->server;
 	struct wlr_output *output = view->output;
 
+	/* 悬停记录会变成悬空指针。 */
+	if (server->hovered_view == view) {
+		server->hovered_view = NULL;
+	}
+
 	/* 事件要带标题，而标题是客户端的资源、销毁信号来的时候已经收走了 ——
 	 * 用 map / 改标题时记下的快照（见 vidow_view_note_names）。 */
 	vidow_ipc_emit_window_closed(server, view->id,
