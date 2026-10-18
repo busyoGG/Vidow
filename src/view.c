@@ -1352,30 +1352,36 @@ struct wlr_output *vidow_view_display_output(const struct vidow_view *view) {
  *
  * 平铺窗口不这么算：它的 geom 里含着滚动视口的偏移，滚出视口之后「画在哪块屏上」
  * 会翻到隔壁那块去（见 vidow_view_owner_output）。 */
-static double view_scale(const struct vidow_view *view) {
-	/* **按窗口挂载的工作区所属的那块屏算倍率**，不是按它此刻画在哪儿。
-	 *
-	 * 几何框靠不住：窗口贴着屏边界（比如 x=1917，隔壁屏从 1920 开始）、或者
-	 * 摆放动画里扫过隔壁屏时，view->output 会短暂失效 / 指到隔壁屏上，倍率
-	 * 就被钉成隔壁屏的值。Chromium 收到 preferred_buffer_scale=2 之后不会
-	 * 自己切回 1，内部页面（工具栏、设置页）就永远按 2 倍排版 —— 用户报的
-	 * 「浏览器内部页面还是会大小变化」。
-	 *
-	 * 工作区的归属是稳定的：只有真的把窗口搬到别的屏（换工作区、拖过去）才
-	 * 变，动画和贴边都不影响。 */
-	struct wlr_output *out = NULL;
-	/* 拖拽中是唯一的例外：窗口正被往另一块屏上搬，得按「落点那块屏」算，
-	 * 否则落到 2 倍屏上时还是 1 倍的缓冲，整块窗口是放大出来的、糊
-	 * （test-mixdpi 的「拖拽中离屏缓冲还是 2 倍」就是钉这个）。 */
+/* **窗口属于哪块屏 —— 唯一出口**。
+ *
+ * 按「窗口挂载的工作区」算，不是按它此刻画在哪儿。几何框靠不住：窗口贴着屏
+ * 边界（比如 x=1917，隔壁屏从 1920 开始）、或者摆放动画里扫过隔壁屏时，
+ * view->output 会短暂失效 / 指到隔壁屏上 —— 倍率被钉成隔壁屏的值（Chromium
+ * 收到 2 倍后不会自己切回 1，内部页面一直按 2 倍排版），裁切也会因为拿不到
+ * 屏框而整块放行（表面画到隔壁屏上，wlroots 再发一次 enter + 2 倍，两边对着
+ * 跳，实测 15ms 一轮）。
+ *
+ * 工作区的归属只有真的换屏（换工作区 / 拖过去）才变，动画和贴边都不影响。
+ * 倍率、裁切都从这里取，别再各写一套。
+ *
+ * **拖拽中是唯一的例外**：窗口正被往另一块屏上搬，得按落点那块屏算，否则
+ * 落到 2 倍屏上时还是 1 倍缓冲、整块是放大出来的（test-mixdpi 钉这条）。 */
+static struct wlr_output *view_home_output(const struct vidow_view *view) {
 	if (!view->dragging && view->ws != NULL && view->ws->output != NULL) {
-		out = view->ws->output;
+		return view->ws->output;
 	}
-	if (out == NULL) {
-		out = vidow_view_display_output(view);
-	}
+	struct wlr_output *out = vidow_view_display_output(view);
 	if (out == NULL) {
 		out = view->output;
 	}
+	if (out == NULL && view->ws != NULL) {
+		out = view->ws->output;
+	}
+	return out;
+}
+
+static double view_scale(const struct vidow_view *view) {
+	struct wlr_output *out = view_home_output(view);
 	if (out == NULL) {
 		return 1.0;
 	}
@@ -1556,8 +1562,17 @@ static bool view_clip_box(struct vidow_view *view, struct wlr_box *out) {
 	if (vidow_view_should_park(server, view)) {
 		return false;
 	}
+	/* **屏框拿不到时不能直接放行**：放行 = 整块画到隔壁屏上，wlroots 会给
+	 * 这个表面发 enter + 隔壁屏的 preferred_buffer_scale，Chromium 收到 2 倍
+	 * 之后就在 1/2 倍之间反复切（实测 15ms 一轮，内部页面一直重排 —— 用户
+	 * 报的「浏览器还是会一直变化内容大小」）。view->output 在切工作区 / 摆放
+	 * 动画里会短暂失效，这时改用工作区所属的那块屏 —— 和 view_scale 用的是
+	 * 同一个归属，稳定。 */
+	struct wlr_output *clip_out = view_home_output(view);
 	struct wlr_box box = {0};
-	wlr_output_layout_get_box(server->output_layout, view->output, &box);
+	if (clip_out != NULL) {
+		wlr_output_layout_get_box(server->output_layout, clip_out, &box);
+	}
 	if (box.width < 1 || box.height < 1) {
 		return false;
 	}
@@ -6041,21 +6056,6 @@ static void view_commit(struct wl_listener *listener, void *data) {
 		double client_scale = surface->current.width > 0 ?
 			(double)surface->current.buffer_width /
 				(double)surface->current.width : 1.0;
-		/* **倍率自愈**：客户端按的倍率比我们钉的高，说明它收到过别的屏的
-		 * preferred_buffer_scale —— 典型路径是窗口压在屏边界上（x=1917，
-		 * 隔壁屏从 1920 开始）、而 view->output 短暂失效导致裁切关掉，表面
-		 * 整块画到了隔壁 2 倍屏上，wlroots 给这个表面发了 enter + 2 倍；等它
-		 * 回到自己那块 1 倍屏时，Chromium 不会自己切回来，于是内部页面一直
-		 * 按 2 倍排版（用户报的「浏览器内部页面还是会大小变化」）。
-		 *
-		 * 这里只在**缓冲尺寸刚变**（客户端的倍率选择刚刚发生）且比我们要的
-		 * 高时清掉 pref_scale、下一帧强制重发一次。放在这个 if 里面是有意的：
-		 * 天然限流，不会每帧跟客户端对着发（那正是之前 Electron 每 6~12ms
-		 * 跳一次的原因）。 */
-		if (view->pref_scale > 0 && client_scale > (double)view->pref_scale + 0.01) {
-			view->pref_scale = 0;
-			view_pin_scale(view);
-		}
 		view->logged_scale = (int)lround(client_scale);
 		wlr_log(WLR_INFO, "surface %s: 缓冲 %dx%d 声明 %d 倍 -> 逻辑 %dx%d"
 			"（输出 %.2fx，设备像素 %dx%d）",
