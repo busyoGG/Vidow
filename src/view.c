@@ -1353,7 +1353,26 @@ struct wlr_output *vidow_view_display_output(const struct vidow_view *view) {
  * 平铺窗口不这么算：它的 geom 里含着滚动视口的偏移，滚出视口之后「画在哪块屏上」
  * 会翻到隔壁那块去（见 vidow_view_owner_output）。 */
 static double view_scale(const struct vidow_view *view) {
-	struct wlr_output *out = vidow_view_display_output(view);
+	/* **按窗口挂载的工作区所属的那块屏算倍率**，不是按它此刻画在哪儿。
+	 *
+	 * 几何框靠不住：窗口贴着屏边界（比如 x=1917，隔壁屏从 1920 开始）、或者
+	 * 摆放动画里扫过隔壁屏时，view->output 会短暂失效 / 指到隔壁屏上，倍率
+	 * 就被钉成隔壁屏的值。Chromium 收到 preferred_buffer_scale=2 之后不会
+	 * 自己切回 1，内部页面（工具栏、设置页）就永远按 2 倍排版 —— 用户报的
+	 * 「浏览器内部页面还是会大小变化」。
+	 *
+	 * 工作区的归属是稳定的：只有真的把窗口搬到别的屏（换工作区、拖过去）才
+	 * 变，动画和贴边都不影响。 */
+	struct wlr_output *out = NULL;
+	/* 拖拽中是唯一的例外：窗口正被往另一块屏上搬，得按「落点那块屏」算，
+	 * 否则落到 2 倍屏上时还是 1 倍的缓冲，整块窗口是放大出来的、糊
+	 * （test-mixdpi 的「拖拽中离屏缓冲还是 2 倍」就是钉这个）。 */
+	if (!view->dragging && view->ws != NULL && view->ws->output != NULL) {
+		out = view->ws->output;
+	}
+	if (out == NULL) {
+		out = vidow_view_display_output(view);
+	}
 	if (out == NULL) {
 		out = view->output;
 	}
