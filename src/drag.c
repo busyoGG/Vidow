@@ -20,9 +20,11 @@
  * 每帧都做一遍既贵又容易把焦点抖掉；视觉上窗口本来就跟着光标走（场景是全局的），
  * 所以「跨过去」这件事松手时一次做完就够了。
  *
- * 一处故意跟 niri 不一样：niri 一开始拖就把那个窗口从布局里摘走（后面的列当场
- * 并拢），vidow 让它那条列的空位**留着**（松手才重排）。所以预览块是按「屏幕上
- * 现在看得见的这些位置」画的，被拖窗口原来那个空位在拖动期间还看得见。 */
+ * 和 niri 一样：光标走够 16px（`INTERACTIVE_MOVE_START_THRESHOLD`）才把窗口从
+ * 布局里摘走（`view->drag_detached`，见 view.c 的 view_shows），后面的列当场
+ * 并拢；松手才插回去。所以预览块按「剩下的这些列」算，被拖窗口原来那个空位在
+ * 拖动期间**不留**。同时按 niri 把被拖的平铺窗口降到 75% 不透明度，并锁住视口，
+ * 避免摘列后条带跳一下。 */
 #include "server.h"
 #include "ipc.h"
 #include "workspace.h"
@@ -159,11 +161,11 @@ static void insert_pos_at(struct vidow_server *server,
 	 * niri 的 column_xs 就是这样，左右两边的缝都算：光标在哪条列的右半边时，
 	 * 最近的那条缝是它右边那条列的左边缘（= 插到它们两个中间）。
 	 *
-	 * 被拖的那条列算不算「光标落在哪条列上」：算。它那条列的空位在 vidow 里还
-	 * 留在条带上（niri 会当场并拢，vidow 松手才重排），所以落在自己那个空位上
-	 * 就是「放回原处」或者「在自己这条列里挪个上下位置」—— 该按自己这条列的缝
-	 * 来判。它自己也在「谁在谁边上」的名单里（还有别的窗口时 niri 里它也还在
-	 * 布局里），但 index 照样按「剩下的那些」数。 */
+	 * 被拖的那条列算不算「光标落在哪条列上」：列里还有别的窗口时算（它还在
+	 * 条带上，只是被拖的那个不占位），落在上面就是「放回原处」或者「在自己
+	 * 这条列里挪个上下位置」；列里只剩被拖的一个时那条列已经并拢（slot_width
+	 * 为 0），不在 containing 名单里，落点就是新开一列。index 一律按「剩下的
+	 * 那些」数。 */
 	int m = 0;      /* 剩下的列有几条 */
 	int i = 0;      /* 这一条在「剩下的那些」里的序号 */
 	bool first_seen = false, last_seen = false;
@@ -195,6 +197,17 @@ static void insert_pos_at(struct vidow_server *server,
 			last_seen = true;
 		}
 		if (!mine) {
+			/* 右边那条缝也算：以前只拿“每条列的左边缘”当缝，光标在
+			 * 一列右半边时最近的是**下一条列**的左边缘；只有一条列时
+			 * 要越过 last_right + inner 才算右边。左边只要越过
+			 * first_l，右边却要越过整列宽 —— 所以右边难触发得多。
+			 * 把每条列自己的右边缘（+inner）也当候选，左右就对称了。 */
+			int right = l + c->slot_width + inner;
+			int rd = right > px ? right - px : px - right;
+			if (rd < closest_d) {
+				closest_d = rd;
+				closest_i = i + 1;
+			}
 			m++;
 			i++;
 		}
@@ -370,6 +383,21 @@ static void raise_node(struct wlr_scene_node *node) {
 		return;
 	}
 	wlr_scene_node_raise_to_top(node);
+}
+
+/* 松手 / 取消：把拖动期间「从布局里摘走」和 75% 透明度这两件事收回来。
+ * 调用前 insert_pos_at() 必须已经算完 —— 它要看的是并拢后的布局。 */
+static void drag_restore_view(struct vidow_view *view) {
+	if (view == NULL) {
+		return;
+	}
+	view->drag_detached = false;
+	view->anim_alpha = 1.0;
+	view->dragging = false;
+	view->anim_off_x = 0.0;
+	view->anim_off_y = 0.0;
+	/* 不在这里 apply：松手后窗口该从**拖到的位置**补间到落点。现在
+	 * 把 anim_off 清零再 apply 会先跳回旧 geom 一帧，下一帧才开始补间。 */
 }
 
 void vidow_insert_hint_hide(struct vidow_server *server) {
@@ -895,6 +923,40 @@ bool vidow_mini_ui_init(struct vidow_server *server) {
 	return true;
 }
 
+/* 光标走够 niri 的 16px 阈值：这时才真的开始拖 —— 摘出布局、降到 75%
+ * 不透明度、锁视口、起果冻、摆落点预览。 */
+static void tile_drag_activate(struct vidow_server *server,
+		struct vidow_view *view) {
+	view->drag_detached = true;
+	/* 有模糊的窗口拖拽时保持不透明：装饰图里已经烘进了模糊，再把整块图按
+	 * 0.75 和屏幕后面的**未模糊**场景混合，模糊就被冲淡成“几乎透明的雾”。
+	 * 普通浮窗拖动没有这一步降透明度，所以它的果冻 + 模糊是正常的。 */
+	view->anim_alpha = vidow_view_blur_wanted(view) ? 1.0 : 0.75;
+	/* niri 拖动期间锁住视口：摘掉窗口后条带变短，别让 arrange 顺手把
+	 * 焦点列滚回可见区（用户会看到「一按下去整条带跳一下」）。视口交给
+	 * 拖拽自己，贴边自动滚仍然从当前值接着推。 */
+	struct wlr_output *wo = view->output != NULL ? view->output :
+		(view->column != NULL ? view->column->output : NULL);
+	struct vidow_output *out = vidow_output_lookup(server, wo);
+	if (out != NULL && !out->drag_scroll) {
+		out->drag_scroll = true;
+		out->drag_viewport = out->viewport_x;
+	}
+	vidow_arrange(server);
+	vidow_view_apply_anim(view);
+	/* 果冻：把窗口现在显示的装饰结果挂到弹簧网格上。做不了就算了（装饰关着
+	 * 之类），拖动照旧。 */
+	/* 果冻照旧：普通浮窗已经证明「模糊 + 形变」可以共存。拖拽这里变雾是
+	 * 另一条原因（见 tile_drag_activate 里对 anim_alpha 的处理），不能靠
+	 * 关果冻来掩盖。 */
+	vidow_jelly_begin(view);
+	/* 落点预览块：起拖就摆出来（按现在这个抓点算），层级收一次口（块在所有窗口
+	 * 之上、被拖的这个之下，见 vidow_insert_hint_update）。小窗（S4）的落点区
+	 * 先算 —— 它亮着的话插入提示块要收掉。 */
+	vidow_mini_drop_zone_update(server);
+	vidow_insert_hint_update(server);
+}
+
 void vidow_tile_grab_begin(struct vidow_server *server,
 		struct vidow_view *view) {
 	/* 会话锁（S3）：锁定期间不进拖拽 —— 拖的是被藏起来的窗口，而且拖拽
@@ -918,9 +980,11 @@ void vidow_tile_grab_begin(struct vidow_server *server,
 	server->grab_dirty = false;
 	server->grab_last_box = vidow_view_screen_box(view);
 	view->dragging = true;
-	/* 果冻：把窗口现在显示的装饰结果挂到弹簧网格上。做不了就算了（装饰关着
-	 * 之类），拖动照旧。 */
-	vidow_jelly_begin(view);
+	/* niri 的起拖阈值：按下先只记起点，走够 16px 才摘列 / 降透明度 /
+	 * 起果冻。没走够就松手只是一次点击，布局不该闪一下。 */
+	view->drag_detached = false;
+	view->drag_start_cx = server->cursor->x;
+	view->drag_start_cy = server->cursor->y;
 	/* 光标在窗口里的相对位置：拖动时窗口保持这个「抓点」在光标下。 */
 	view->drag_dx = (int)(server->cursor->x - view->geom.x);
 	view->drag_dy = (int)(server->cursor->y - view->geom.y);
@@ -932,11 +996,6 @@ void vidow_tile_grab_begin(struct vidow_server *server,
 	if (view != server->focused) {
 		vidow_focus_view(view);
 	}
-	/* 落点预览块：起拖就摆出来（按现在这个抓点算），层级收一次口（块在所有窗口
-	 * 之上、被拖的这个之下，见 vidow_insert_hint_update）。小窗（S4）的落点区
-	 * 先算 —— 它亮着的话插入提示块要收掉。 */
-	vidow_mini_drop_zone_update(server);
-	vidow_insert_hint_update(server);
 	wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "grabbing");
 	wlr_log(WLR_INFO, "grab tile: %s（%s 上第 %d 块工作区）",
 		vidow_view_title(view) != NULL ? vidow_view_title(view) : "?",
@@ -958,6 +1017,19 @@ void vidow_tile_grab_update(struct vidow_server *server, double lx, double ly) {
 	/* 只改「画在哪」：布局（geom）一个字都不动，所以别的窗口不会跟着抖。 */
 	view->anim_off_x = (lx - view->drag_dx) - view->geom.x;
 	view->anim_off_y = (ly - view->drag_dy) - view->geom.y;
+	/* niri 的 INTERACTIVE_MOVE_START_THRESHOLD = 16px（256 px²）：走够
+	 * 才真的摘列 / 降透明度；之前窗口只做一点跟手（布局不动）。 */
+	if (!view->drag_detached) {
+		double ddx = lx - view->drag_start_cx;
+		double ddy = ly - view->drag_start_cy;
+		if (ddx * ddx + ddy * ddy < 256.0) {
+			vidow_view_apply_anim_place(view);
+			vidow_output_schedule_frame(server, view->output,
+				"拖动阈值内");
+			return;
+		}
+		tile_drag_activate(server, view);
+	}
 	/* 真正重画 / 记损伤推迟到这一帧要出帧之前（见 output.c 里那段）：指针比刷新
 	 * 快的时候一帧会来好几个移动事件，中间那些位置屏幕上从来没出现过 —— 以前
 	 * 每个事件都重画一遍这个窗口的装饰（整块窗口那么大的离屏渲染），实测每个事件
@@ -1137,12 +1209,21 @@ void vidow_tile_grab_end(struct vidow_server *server) {
 	/* 松手：解掉抓点，网格自己晃回去（位置照旧归下面的布局逻辑管）。
 	 * 放在所有提前返回之前 —— 不管这条路走不走得通，果冻都得收手。 */
 	vidow_jelly_release(view);
-	if (view == NULL || view->column == NULL) {
+	if (view == NULL) {
 		return;
 	}
-	view->dragging = false;
-	view->anim_off_x = 0.0;
-	view->anim_off_y = 0.0;
+	/* 没走够 16px 阈值：只是一次点击。布局没动过，把跟手的那点偏移收掉
+	 * 就完事，别去算落点 / 插列（niri 这时候也什么都不做）。 */
+	if (!view->drag_detached) {
+		drag_restore_view(view);
+		vidow_arrange(server);
+		return;
+	}
+	if (view->column == NULL) {
+		drag_restore_view(view);
+		vidow_arrange(server);
+		return;
+	}
 
 	/* 小窗（S4）主入口：松手时光标落在**落点区**里 → 变成迷你小窗（用户点名的
 	 * 那条「拖到右上角松手 = 迷你小窗」，不是自由小窗）。
@@ -1154,6 +1235,7 @@ void vidow_tile_grab_end(struct vidow_server *server) {
 		wlr_log(WLR_INFO, "mini: 拖拽落进落点区 → %s 变迷你小窗",
 			vidow_view_title(view) != NULL ?
 				vidow_view_title(view) : "?");
+		drag_restore_view(view);
 		vidow_mini_set_state(view, VIDOW_MINI_MINI);
 		return;
 	}
@@ -1162,12 +1244,16 @@ void vidow_tile_grab_end(struct vidow_server *server) {
 	struct vidow_workspace *target = shown_workspace(server, output);
 	if (target == NULL || view->ws == NULL) {
 		/* 拖到没有屏的地方：原样放回去。 */
+		drag_restore_view(view);
 		vidow_arrange(server);
 		return;
 	}
 	struct vidow_column *col = view->column;
 	struct insert_pos pos;
+	/* 落点按「窗口已经摘走」的布局算（niri 就是这样）。算完再恢复，
+	 * 下面的插入函数才看得到 view->column 里原来的上下顺序。 */
 	insert_pos_at(server, target, output, view, &pos);
+	drag_restore_view(view);
 	int from_idx = vidow_workspace_index(view->ws);
 
 	if (pos.into_column) {

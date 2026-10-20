@@ -486,12 +486,12 @@ end
 
 | 项 | 说明 |
 | --- | --- |
-| 匹配方式 | 字符串字段都是 **POSIX 扩展正则**（`regcomp(REG_EXTENDED \| REG_ICASE)`），**不锚定** = 找到就算命中 —— 所以普通字符串写进去就是原来的「子串、大小写不敏感」。含元字符（`. * + ? [ ] ( ) { } \| ^ $ \`）的串要转义：`title = "v1\\.0"`；整条规则写 `literal = true` 退回纯子串匹配。字段前面加 `!` = 取反（`title = "!^预览"` = 不是预览窗口），要匹配字面的 `!` 就写 `\\!` |
+| 匹配方式 | 字符串字段都是 **POSIX 扩展正则**（`regcomp(REG_EXTENDED \| REG_ICASE)`），**不锚定** = 找到就算命中 —— 所以普通字符串写进去就是原来的「子串、大小写不敏感」。含元字符（`. * + ? [ ] ( ) { } \| ^ $ \`）的串要转义：`title = "v1\\.0"`；整条规则写 `literal = true` 退回纯子串匹配。字段前面加 `!` = 取反（`title = "!^预览"` = 不是预览窗口），要匹配字面的 `!` 就写 `\\!`。**Lua 风格的 `%` 转义也认**：`app_id = "^org%.kde%.kate$"` 等价于 `"^org\\.kde\\.kate$"`；`%%` 是字面 `%`，`%` 后面跟字母数字（`%d` 这类）原样按字面匹配 |
 | 匹配字段（窗口） | `app_id`（Wayland 的 app_id / X11 的 WM_CLASS class 段）、`title`、`class`、`instance`、`role`、`initial_app_id`、`initial_title`、`initial_class`、`initial_instance`（上屏那一刻的名字 —— 浏览器、终端会改标题，认「刚开的那一屏」用它）、`on_output`（现在在哪块屏）、`on_workspace`（现在在哪块工作区） |
 | 匹配字段（窗口和图层都认） | `pid`、`exe`、`cmdline` —— 从 `/proc/<pid>/…` 读，没有 `app_id` 可认的老程序、包一层启动脚本的，按进程认（`exe` 是 `/proc/<pid>/exe` 的最后一段，flatpak 那种是 `bwrap`，用 `cmdline` 更准） |
 | 匹配字段（图层） | `namespace`（waybar / mako / notifications …）、`layer`（`background` / `bottom` / `top` / `overlay`）—— 写了这两个里任何一个就是**图层规则**。窗口字段和图层字段写进同一条规则 = 这条谁也不匹配（不静默失效，日志和 `vidowmsg rules` 都看得见） |
 | 匹配字段（状态） | `is_` 开头的是「现在是不是这样」：`is_xwayland`、`is_popup`（菜单 / 提示这类弹出物）、`is_floating`、`is_fullscreen`、`is_maximized`（所在列整列最大化）、`is_minimized`、`is_fixed_size`（客户端声明了固定尺寸，微信登录窗那种）。写成 `true` / `false`（不写 = 不管它），比的是**判定那一刻**的状态 —— 判定发生在建窗口、标题 / class 变化、重载规则这三处 |
-| 作用（一直在） | `force_render`、`hz`、`focus_on_open`、`focus_on_activate`、`honor_invalid_serial`、`x11_scale`、`capture`、`capture_mosaic`、`anim`（`false` = 不做开合动画，窗口 / 图层都认）、`open_ms` / `close_ms`（开合动画时长，毫秒，覆盖 `window_open_ms` / `layer_open_ms` 那一对全局键；`0` = 不做这个动画） |
+| 作用（一直在） | `force_render`、`hz`、`focus_on_open`、`focus_on_activate`、`fake_focus`、`honor_invalid_serial`、`x11_scale`、`capture`、`capture_mosaic`、`anim`（`false` = 不做开合动画，窗口 / 图层都认）、`open_ms` / `close_ms`（开合动画时长，毫秒，覆盖 `window_open_ms` / `layer_open_ms` 那一对全局键；`0` = 不做这个动画） |
 | 作用（外观） | `decor`（`false` = 不画装饰）、`opacity`、`corner_radius`、`border_width`、`border_color`、`border_color_focus`、`shadow_radius`、`shadow_color`、`shadow_offset_x`、`shadow_offset_y`、`noise`、`blur`（`false` = 它背后不模糊，`true` = 平铺窗口也模糊）、`blur_xray`。没写的用全局配置；**全局开关（`decor_enabled` / `blur_enabled`）是总闸**，规则只能收窄不能突破。`vidowmsg windows` 的 `look` 那一块就是「这个窗口现在长什么样」—— 规则有没有生效看它，不用量像素 |
 | 作用（开窗时兑现一次） | `float`（`true` 强制浮动 / `false` 强制平铺）、`workspace`（具名工作区，没有就建 / `special:名字` / 序号）、`output`（开在哪块屏）、`width` / `height`（浮动窗口开多大）、`center`、`fullscreen`、`maximize`、`minimize`、`column_width`（这个窗口新开的列有多宽）。**重载规则不搬已经开着的窗口，也不改它们的尺寸** —— 「开出来什么样」和「现在什么样」是两回事 |
 | 覆盖顺序 | 按配置里的先后逐条套用，**后面的覆盖前面的**；一条规则只动它写了的字段，谁都没写的字段用默认值 |
@@ -718,15 +718,20 @@ vidow.rule{ app_id = "令牌不灵的应用", honor_invalid_serial = true }
 
 -- 一条规则可以同时管几件事，跟 force_render / hz 写在一条里也行
 vidow.rule{ app_id = "mpv", force_render = true, hz = 30, focus_on_open = false }
+
+-- 一失焦就暂停 / 收 UI 的程序：让它一直以为焦点还在（只伪装 xdg activated /
+-- X11 focused，键盘焦点和任务栏仍然是真实的）
+vidow.rule{ app_id = "some-game", fake_focus = true }
 ```
 
 | 项 | 说明 |
 | --- | --- |
 | `focus_on_open` | 这个应用**开新窗口**时把焦点给它吗（默认 `true`）。写 `false` 之后新窗口不抢键盘；**但当前一个焦点窗口都没有时还是会给它**（否则没人收键盘） |
 | `focus_on_activate` | 别人**请求激活**它（点通知、任务栏按钮、portal 顶窗口、X11 的 `_NET_ACTIVE_WINDOW`）时理不理（默认 `true`） |
+| `fake_focus` | 焦点移走时也不给客户端发 deactivated，让它一直以为自己是激活的（默认 `false`）。只伪装 **xdg_toplevel activated / X11 focused**；键盘焦点、合成器焦点、任务栏都还是真的，不会抢别人的输入 |
 | `honor_invalid_serial` | 它的激活请求**即使令牌里的 serial 校验不过**也照样理（默认 `false`）—— 全局开关的**按应用**版本，见「serial 校验不过的请求」那节 |
 | 查回来 | `vidow.rules()` 里 `focus_on_open` / `focus_on_activate` 没写就是 `nil` —— 「这条规则没管它」和「管了、给了默认值」是两回事 |
-| 一条规则至少写一个作用 | `force_render` / `hz` / `focus_on_open` / `focus_on_activate` / `honor_invalid_serial`，都不写会在配置那一行报错 |
+| 一条规则至少写一个作用 | `force_render` / `hz` / `focus_on_open` / `focus_on_activate` / `fake_focus` / `honor_invalid_serial`，都不写会在配置那一行报错 |
 
 ### 激活 = 先把窗口端出来，再给焦点
 
@@ -934,6 +939,7 @@ VIDOW_TEST_RENDERER=gles2 ./test-screencast.sh
 ./test-mixdpi.sh                     # 跨屏拖窗口：拖着的那段就按对面那块屏的倍率烘（全 headless，7 项断言）
 ./test-vt.sh                         # tty 的 VT 切换（Ctrl+Alt+F1..F12 / switch-vt 动作）（全 headless，11 项断言）
 ./test-focus.sh                      # 焦点规则 + 激活请求（全 headless，60 项断言）
+./test-click-focus.sh                # 点另一块屏的空区域：键盘焦点跟着过去（4 项，见 256）
 ./test-ipc.sh                        # IPC：状态输出 / 命令 / 事件 / 多屏（全 headless，162 项断言）
 ./test-hooks.sh                      # 事件钩子（config.lua 的 vidow.on）：命令钩子 / Lua 钩子 / "*" / 自定义事件 / 摘钩子 / 出错不连累别人（全 headless，29 项断言）
 ./test-events.sh                     # 事件的丰富度：keybind / ipc-action / window-activated / 拖拽 / 屏开关 / X11 起来 / 输入设备插拔 / 配置出错（全 headless，28 项断言）
@@ -1338,6 +1344,69 @@ X11 没有 per-window 的缓冲区缩放，所以：
    - 低 DPI 的屏（`s < S`）：落屏像素 = `逻辑 × s` < 缓冲区 → **缩小，不糊**
    - 两块屏上的物理尺寸一样（逻辑尺寸一样，而 scale ∝ ppi）
 4. 命中坐标按同一比例换回来：`局部 = (布局坐标 - 窗口原点) × S`，点哪儿就是哪儿。
+257. **输入法抢键盘后，按住修饰键只认第一次：Mod+滚轮 / Mod+左键第二轮就失效**（用户报「mod 长按只能消费一次的 bug 回归了」「修饰键都有这个问题」）。
+
+     - 根因：`input.c` 的指针绑定用 `wlr_seat_get_keyboard()` 拿 seat 上那把键盘，
+       再读它的 xkb 修饰键。fcitx5 一启动就 `grab_keyboard`，seat 上换成它的虚拟
+       键盘；物理键盘的修饰键只经 `wlr_seat_keyboard_notify_modifiers()` 发出去，
+       虚拟键盘自己的 `xkb_state` 不会变 —— 读设备永远是「没按 Mod」，于是第一下
+       滚轮之后就不认了。a3d4dc9 只补了「通知」，没改这里的取值。
+     - 修：新增 `pointer_modifiers()`：优先找一把**物理键盘**（`virtual == NULL`
+       且不是 `inject`）读它的 xkb 状态；纯 headless / 只有注入时退回 seat 键盘。
+       按钮、滚轮、overview 里滚轮三处都走它。
+     - Ctrl+Space 不触发是另一件事：配置写的是裸脚本路径
+       `vidow.bind("Ctrl+space", "~/文档/…/fcitx5-input-switcher.sh")`，动作解析
+       只认 `spawn <命令>`，裸路径被当成「不认识的动作」。已改成
+       `spawn ~/文档/…/fcitx5-input-switcher.sh`，实测切换 `keyboard-us → rime`。
+     - 判据：`test-input-inject` 54 / `test-drag` 10 / `test-keyboard-grab` 30 /
+       `test-click-focus` 4 / `test-ws-dynamic` 9 全过。`test-mini` 的 S3
+       「自由小窗拖出屏边」仍有 1 项失败（盒子右边缘停在 2550），与本条无关，
+       另查。
+
+256. **点另一块屏的空区域，键盘焦点不跟过去：在 4K 上乱点，动的却是左边窗口**（用户报「4k 那边随便点就能影响到左边」）。
+
+     - 根因：pointer button 只更新 `server->focused_output`，`server->focused` 还停在
+       上一块屏的窗口上。之后 `close-window` / `focus-column` 这些键位取的是
+       `server->focused`，于是「在右屏点一下、按快捷键，关的是左屏那个窗口」。
+     - 修：新增 `vidow_workspace_focus_output()`（`workspace.c`）：换
+       `focused_output`，再把焦点交给那块屏活动工作区记住的窗口（没有就第一列 /
+       第一个浮窗；再没有就清空）。`input.c` 的 button 路径在
+       `view == NULL && surface == NULL` 时调它；点窗口 / layer 的路径不变。
+     - 判据：`test-click-focus.sh` 4 项 —— 焦点先给左屏 w1，点右屏空区变 w2，
+       点左屏空区变回 w1，日志无 assert。`test-focus` 60 / `test-workspace` 58 /
+       `test-drag` 10 / `test-rules` 127 全过。
+
+255. **规则里的 `%` 转义静默失效：Vivaldi 没落到 DP-2，窗口开在 DP-3 上、列却画进 DP-2**（用户报「DP-2 上的窗口操作全变成 DP-3 的」）。
+
+     - 根因：2765aee 把规则匹配换成了 POSIX ERE，但配置沿用的是 Lua 风格
+       `^org%.kde%.kate$`。ERE 里 `%` 不是转义符，`%.` 变成「字面 % + 任意字符」，
+       整条规则**静默不命中**。用户 `output=DP-2` 的 Vivaldi 规则被吃掉，窗口按
+       `view_default_output()` 落在当时的焦点屏 DP-3；DP-3 的列向右延伸，画进了
+       DP-2 的坐标区，看起来像「窗口在 DP-2」，点击 / 焦点却按 DP-3 算。
+     - 修：`rule_pattern_to_ere()` 编译前把 `%x`（x 非字母数字）翻成 `\x`，
+       `%%` 翻成字面 `%`；`%d` 这类字母数字组合原样保留。`m->pat` 仍存原文，
+       `vidowmsg rules` 读回来不变。
+     - 顺带：`view_map()` 里新窗口的工作区改成按 `view->output`（创建时按光标选的）
+       取 `vidow_workspace_shown_for()`，不再用可能停在上一块屏的全局焦点；
+       `view_ensure_column()` 的兜底同理。
+     - `test-rules.sh` 新增 `cmdline = "bluewin%.py"` 用例；127 项全过。
+       `test-workspace` / `test-outputpos` / `test-mixdpi` / `test-drag-insert` 也全过。
+
+254. **窗口拖拽 / 插入的视觉和 niri 对齐**（用户报「应该和 niri 同步」）。
+
+     - 起拖：光标走够 niri 的 16px 阈值后，`view->drag_detached` 让 `view_shows()` 返回假，
+       被拖的平铺窗口从布局摘走，后面的列并拢；落点预览按「剩下的这些列」算。只打标记、
+       不动物理链表，松手插回去时原来的上下顺序还在。没走够就松手只是一次点击，布局不闪。
+     - 被拖的平铺窗口降到 **75% 不透明度**（niri 的 `INTERACTIVE_MOVE_ALPHA`），松手恢复；
+       拖动期间视口锁在当前值（`output->drag_scroll/drag_viewport`），摘列后条带变短也不会
+       让焦点列把视口拽回去。
+     - 松手插回 / 取消 / 变迷你：`drag_restore_view()` 清标记和透明度；插入函数看得到原来的
+       列链表，`insert_pos_at()` 看的是并拢后的布局。落点动画从**拖到的位置**补间，不先跳回
+       旧 geom 一帧。
+     - `test-drag-insert.sh` 的期望跟着改成「摘走后的布局」：w1 插 w2 列、w2 从 w1 列取出来、
+       落进 w1 列第 2 位；贴边自动滚的条带变短后视口仍能自己滚到头。30 项全过；
+       `test-drag.sh` / `test-drag-follow.sh` / `test-drag-stall.sh` 照旧过。
+
 253. **静止时窗口背后的模糊底衬「啪」一下换挡：采样 UV 认的是「正在渲染的那块屏」，不是贴图代表的那块屏**
 
      - 现象（用户）：`blur_all=true, blur_xray=false`，窗口背后**只有壁纸**、屏幕上什么都没动，
@@ -1466,7 +1535,7 @@ X11 窗口走的是**同一条装饰管线**：同一个圆角/边框/阴影着�
 | --- | --- | --- |
 | 装饰（边框/圆角/阴影/噪点） | 有 | 没有（连装饰离屏缓冲都不建） |
 | 开关动画 / shader / 移动补间 | 有 | 没有（`window_*_ms` 调多少都一样） |
-| 模糊 backdrop | 浮动窗口有 | 没有 |
+| 模糊 backdrop | 浮动窗口有 | 半透明时有（不透明的不垫：一个像素都透不出来） |
 | 位置 | 布局算（平铺）/ 居中（浮动） | 客户端给的屏幕绝对坐标 ÷ 全局缩放 |
 | 尺寸 | 布局给，或客户端声明 | 客户端说多少是多少（不夹工作区） |
 | 层级 | `layer_toplevels` | 自己的 `layer_popups`（在所有托管窗口之上） |
@@ -2839,7 +2908,8 @@ grim 两张图**内圈逐像素一样**；差的只有最外 1px（3996 个像�
 
 局限：mask 取的是 surface 的**主**缓冲，不含子表面 —— 一个用子表面画内容的层，那部分
 会被剔掉（要精确得像 niri 那样把整棵子树离屏渲一张 alpha 纹理）。输入法候选框
-（`layer_im`）vidow 现在根本没有模糊，所以那边没有可剔的东西。
+（`layer_im`）和弹出物（xdg_popup / X11 菜单）现在也走同一套模糊（见 fx.c 的
+`popup_blur_frame`），所以那边同样按主缓冲 alpha 剔除。
 
 **底衬不做剔除**（曾经有，撤了）：原来在最后一趟上升里按底衬的 alpha 做过一次
 `step` 遮罩（那个程序叫 `kawase_final`），现在整个撤掉 —— 剔除是用来约束**范围**的，
@@ -3805,16 +3875,18 @@ scene buffer 合成，所以 shader 可以任意改写几何（缩放、挤压�
   的（全屏那列占一整屏、整列最小化的宽度是 0 这些规矩只有 arrange 知道），窗口的 `geom`
   就是现在这一块 —— 落点这里不重算条带数学。
 
-### 三处故意跟 niri 不一样
+### 和 niri 对齐的拖动视觉
 
-1. **被拖窗口原来的空位在拖动期间留着**。niri 一按下去就把那个窗口从布局里摘走（后面的列
-   当场并拢），vidow 松手才重排 —— 所以预览块是按「屏幕上现在看得见的这些位置」画的，
-   那个空位在拖动期间还看得见（`test-drag-insert.sh` 里「卡片」那条断言量的就是这件事）。
-2. **「插进一条列」时那个空位在拖动期间留着**（见上一条），落点预览是按「现在看得见的
-   这些位置」画的。另外**跨屏 / 跨工作区**那条路搬的还是整条列（同屏内落在缝上 / 空白处
-   时只搬被拖的那个窗口，和 niri 一样）—— 要整条列换位置用 `move-column left|right`。
-3. **预览块画在被拖窗口之上还是之下**：vidow 把被拖的那个画在预览块之上（niri 的移动窗口
-   也在提示块之上），层级靠拖动时抬两次收口（`raise_node()`，已经对了就一个节点都不碰）。
+1. **走够 16px 才把窗口从布局里摘走**（niri 的 `INTERACTIVE_MOVE_START_THRESHOLD`）：
+   `view->drag_detached` 让 `view_shows()` 返回假，后面的列当场并拢；落点预览按「剩下的
+   这些列」算，被拖窗口原来的空位在拖动期间**不留**。没走够就松手只是一次点击，布局不闪。
+   松手才插回去，原来的上下顺序还在（只打标记，不动物理链表）。
+2. **被拖的平铺窗口降到 75% 不透明度**（niri 的 `INTERACTIVE_MOVE_ALPHA`），松手恢复；
+   拖动期间视口锁在当前值，摘列后条带变短也不会让焦点列把视口拽回去。
+3. **预览块画在被拖窗口之下**：被拖的那个抬到预览块之上（niri 的移动窗口也在提示块之上），
+   层级靠拖动时抬两次收口（`raise_node()`，已经对了就一个节点都不碰）。
+4. **跨屏 / 跨工作区**那条路搬的还是整条列（同屏内落在缝上 / 空白处时只搬被拖的那个窗口，
+   和 niri 一样）—— 要整条列换位置用 `move-column left|right`。
 
 颜色是**预乘**的：`wlr_scene_rect` 的颜色直接进渲染通道的预乘混合，所以 rgb 得先乘 alpha
 （不乘的话叠在亮色窗口上会变成加法 —— 实测叠在纯红上量到 `(255,200,127)`，乘过之后是 niri
@@ -3839,13 +3911,23 @@ jelly_strength = 1.0    -- 形变倍率：0.5 收敛些，0 完全不弯（只�
 wlroots 的场景节点只会把一块缓冲整块贴上去：一张贴图、一个矩形，没法弯。所以果冻不用
 窗口本来的那个节点，而是：
 
-1. 拿窗口**现在显示的那块装饰离屏图**（就是 fx 节点正在显示的那块缓冲，带边框/圆角/
-   模糊/阴影）当源；
+1. 拿窗口**现在显示的那块装饰离屏图**（fx 节点正在显示的缓冲，带边框/圆角/阴影）当源。
+   果冻期间 `vidow_fx_frame` 把 `look.blur` 关掉，所以这张源里**不烘模糊**；
 2. 把它按网格**一格一格**贴进一块自己的缓冲，每格的落点由弹簧状态算出来；
-3. 用一个场景节点显示这块缓冲，同时把窗口本来的装饰节点透明度压成 0（`fx->jelly`，
+3. 模糊单独一层：同一份网格，内容 UV 跟着网格走，模糊 UV 按顶点**当前屏幕坐标**
+   映射到 blur 贴图 —— 形变只拉内容，背景不被网格拉长；
+4. 用一个场景节点显示这块缓冲，同时把窗口本来的装饰节点透明度压成 0（`fx->jelly`，
    跟抓帧遮挡一样是标志位 —— `vidow_fx_frame` 每帧都会把透明度写回去）。
 
 源和结果都是同一块缓冲里切出来的，所以交接时**内容一模一样**，看不到接缝。
+
+模糊那一层用 `mesh_blur` 着色器一遍合成：`content + blur * (1 - content.a)`，和装饰
+着色器最后那条公式一致；内容不透明的地方看不到模糊，半透明的地方透出的是**屏幕上
+那块背景**，不是被果冻拉长的旧图。模糊还按**窗口本身的区域**裁一刀：内容 UV 里的矩形 + 客户端表面的 alpha。
+果冻期间投影仍烘在窗口内容图里，和窗口共用同一张网格，**形状完全跟着窗口弯**，
+并且位于窗口下面；模糊只按内容矩形 + 客户端表面 alpha 裁，投影不进模糊。`test-jelly.sh` 有一段专门拿「底下四象限、上面
+半透明」的窗口往左拖：左半边的红色必须在，右边才是绿的 —— 采样若跟着窗口走，左边
+也会是绿色。
 
 ### 弹簧：抓点钉死，「该落后多少」按行号算
 
@@ -3935,9 +4017,11 @@ o''  = -ω²·(o_i - d_i) - c·o_i'   弹簧把偏移拉向 d_i
 
 ```bash
 ./test-jelly.sh      # 起手/形变（梯度只看行号）/交接/开关/2 倍屏不跑位/半透明底衬对位，
-                     # 判据是截图里的像素；另有两段：**左边缘逐行步进**（网格是三角形拼的、
+                     # 判据是截图里的像素；另有三段：**左边缘逐行步进**（网格是三角形拼的、
                      # 相邻行最多差 1px —— 一格一块矩形时是一段一段跳的 3px）、
-                     # **抓底衬不许混进被拖窗口自己**（两份底衬 dump 各只许一种颜色）
+                     # **抓底衬不许混进被拖窗口自己**（按 dump 的 owner 判，绿色自己的
+                     # 底衬里不许有绿色；品红底衬里可以带绿色的屏幕空间模糊）、
+                     # **模糊按屏幕坐标采样**（四象限底图 + 半透明薄纱，拖到左红右绿）
 ./test-geometry.sh   # 窗口几何比表面大（chromium 改大小的中间态）：框不动、内容铺满
 ```
 

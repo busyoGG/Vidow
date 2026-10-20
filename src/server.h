@@ -20,6 +20,7 @@
 #include <wlr/render/wlr_renderer.h>
 #include <wlr/types/wlr_compositor.h>
 #include <wlr/types/wlr_cursor.h>
+#include <wlr/types/wlr_cursor_shape_v1.h>
 #include <wlr/types/wlr_data_device.h>
 #include <wlr/types/wlr_input_device.h>
 #include <wlr/types/wlr_input_method_v2.h>
@@ -274,9 +275,26 @@ struct vidow_config {
 	/* 切工作区的过渡时长（0 = 直接换，不动画）。旧的推开、新的从另一边进来，
 	 * 见 workspace.c 的 slide_start。 */
 	int workspace_switch_ms;
+	/* 切工作区的缓动；和全局 easing 分开，别的布局动画不受影响。 */
+	struct vidow_ease workspace_easing;
+	struct vidow_ease column_width_easing;
 	int layer_open_ms;
 	int layer_close_ms;
+	struct vidow_ease layer_open_easing;
+	struct vidow_ease layer_close_easing;
 	struct vidow_ease easing;
+	/* 动画两大概括：window / layer 的组默认值。具体动画的字段仍然
+	 * 单独存在（下面那些），组里的 ms/easing 在配置解析时统一铺到它们
+	 * 上面；没写的具体项保留原默认值。 */
+	int window_anim_ms;
+	struct vidow_ease window_anim_easing;
+	int layer_anim_ms;
+	struct vidow_ease layer_anim_easing;
+
+	/* 普通布局重排（开/关窗、换列、滚动）里每个窗口位移补间的曲线。
+	 * 和 workspace_easing 分开：工作区过渡是整条带子，普通布局是各窗口
+	 * 自己的补间。默认 out_cubic，和原来一致。 */
+	struct vidow_ease window_move_easing;
 
 	double open_alpha_from; /* opacity at t=0 while opening */
 	int open_slide_px;      /* slide-in distance while opening */
@@ -342,6 +360,12 @@ struct vidow_config {
 	/* 透明度剔除（见 fx.c 的 decor_fragment_src）：元素**自己**的 alpha 低于这个
 	 * 就不糊。管的是模糊的**范围**（哪儿该糊），不碰糊出来的像素 —— 底衬不做剔除。 */
 	double blur_alpha_min;
+	/* 弹出物（xdg_popup / 菜单 / 输入法候选框）背后的模糊单独开关。
+	 * 默认开；关掉之后 popup 后面就是透的（不画底衬，也不分配离屏目标）。 */
+	bool popup_blur_enabled;
+	/* 弹出物模糊的透明度剔除阈值（0 = 用各自动的默认值：普通菜单 1/255、
+	 * 输入法候选框 0.35）。> 0 时统一用它 —— 半透明菜单体边缘太糊就调高。 */
+	double popup_blur_alpha_min;
 	double blur_offset;    /* kawase tap scale */
 
 	bool shader_enabled;
@@ -725,20 +749,36 @@ struct vidow_mesh_prog {
 	int u_texture, u_size;
 };
 
+/* 果冻的「内容 + 屏幕空间模糊」一遍合成：内容 UV 跟形变网格走，模糊 UV 按
+ * 顶点当前屏幕坐标算。片元就是 content + blur * (1 - content.a)，和装饰着色器
+ * 最后那条合成公式一致。 */
+struct vidow_mesh_blur_prog {
+	unsigned int program;
+	int u_texture, u_blur, u_size, u_blur_strength;
+	int u_src_size, u_content_off, u_content_size, u_radius, u_corner_n;
+	int u_mask, u_mask_on, u_mask_map, u_mask_min;
+	int u_shadow, u_shadow_off, u_shadow_size, u_shadow_offset;
+	int u_shadow_radius, u_shadow_color, u_shadow_on;
+};
+
 /* The built-in decoration program: rounded corners, border, drop shadow,
  * blurred backdrop and grain. */
 struct vidow_decor_prog {
 	unsigned int program;
 	int u_texture, u_blur, u_size, u_target_size, u_content_off, u_content_alpha;
 	int u_radius, u_corner_n, u_border_width, u_border_color, u_shadow_color;
-	int u_shadow_offset, u_shadow_radius, u_opacity, u_noise, u_alpha;
+	int u_shadow_offset, u_shadow_radius, u_shadow_only, u_opacity, u_noise,
+		u_alpha;
 	int u_origin, u_output_size, u_flip_y;
+	int u_blur_scale, u_blur_bias;
 	int u_blur_strength;
 	int u_blur_region, u_blur_region_on;
 	/* 内容贴图在装饰矩形里的采样映射（见 fx.c 的 decor_fragment_src）。 */
 	int u_tex_map;
 	/* 元素自己的 alpha（「透明度剔除」，见 fx.c 的 decor_fragment_src）。 */
 	int u_mask, u_mask_on, u_mask_min;
+	/* mask 的采样映射（见 struct vidow_fx_target 的 mask_*）。 */
+	int u_mask_map;
 };
 
 /* One kawase pyramid. The compositor keeps a shared one for the wallpaper
@@ -856,6 +896,10 @@ struct vidow_fx_target {
 	/* 动画缩放，围绕窗口中心（1.0 = 原尺寸）。缩放只作用在场景节点上，离屏
 	 * 缓冲照旧按原尺寸画 —— 为了几个百分点的过冲每帧重分配一块缓冲不值。 */
 	double anim_scale;
+	/* 模糊 UV 的缩放补偿（见 fx.c 的 vidow_fx_frame）。默认 1 / 0，只有
+	 * 开窗动画缩放时非零；别的 fx 目标（layer / popup / 抓帧）不用。 */
+	float blur_scale_x, blur_scale_y;
+	float blur_bias_x, blur_bias_y;
 	/* animation pass, only used when a shader is configured */
 	struct wlr_buffer *anim_buf[2];
 	int anim_index;
@@ -954,6 +998,12 @@ struct vidow_fx_target {
 	 * tex_scale。窗口几何比表面小一圈时（客户端 CSD 留白），内容就按这份偏移
 	 * 采；没留白时 0 / 1（layer 底衬、X11 永远是这个）。 */
 	float tex_off_x, tex_off_y, tex_scale_x, tex_scale_y;
+	/* mask 贴图在元素局部坐标里的采样映射（归一化）。默认 0 / 1；xdg popup
+	 * 只糊窗口体（去掉 CSD 阴影）时，mask 要采表面缓冲里 geometry 那一块。 */
+	float mask_off_x, mask_off_y, mask_scale_x, mask_scale_y;
+	/* mask 的透明度阈值；0 = 用全局 blur_alpha_min。弹出物会设成 1/255，
+	 * 只剔掉 alpha 恰好为 0 的透明留白（见 fx.c 的 popup_blur_frame）。 */
+	float mask_min;
 
 	/* 只画「背后的模糊」：layer surface 的底衬用它。内容和阴影/边框/圆角/噪点
 	 * 全部关掉，输出就是一层模糊，垫在 layer surface 自己的节点下面。 */
@@ -1272,11 +1322,8 @@ struct vidow_column {
 	uint64_t id;            /* IPC 用的稳定编号（见 vidow_view.id） */
 	struct wl_list views;   /* vidow_view.column_link, top to bottom */
 	struct vidow_server *server;
-	struct vidow_workspace *ws; /* 属于哪块工作区 */
-	struct wlr_output *output; /* 现在摆在哪块屏上（拔线后可能先借别的屏） */
-	/* 归属哪块屏（热插拔记忆）。output 是「住哪」，home 是「属于哪」——
-	 * 屏拔了就借别的屏住，home 不动；屏回来时按 home 认领回去。 */
-	struct vidow_output_memory *home;
+	struct vidow_workspace *ws; /* 属于哪块工作区（唯一归属） */
+	struct wlr_output *output; /* 现在摆在哪块屏上（由 ws->output 同步） */
 
 	double width_fraction; /* of the usable width */
 	/* 列宽过渡（见 view.c 的 vidow_column_set_width）：补间在跑的时候，**这一帧
@@ -1342,6 +1389,11 @@ struct vidow_view {
 	struct wl_list column_link; /* vidow_column.views, top to bottom */
 	struct wl_list ws_link;     /* 浮窗专属：挂在工作区的 views 上（进列了就不挂） */
 	struct vidow_column *column;
+	/* 被并进**别的**列之前，它自己那条列的宽度。拖出来 / expel 的时候用它
+	 * 恢复原宽 —— 并进一条宽 1.0 的列再拖出来，不该把 1.0 带走。
+	 * set = false 时没有可恢复的值，按当前列宽走。 */
+	double column_width_home;
+	bool column_width_home_set;
 	/* 属于哪块工作区（浮窗 map 时定下，列的窗口跟着列走）。工作区藏起来的时候
 	 * 窗口还活着，只是场景节点被关掉。 */
 	struct vidow_workspace *ws;
@@ -1350,10 +1402,10 @@ struct vidow_view {
 	struct wlr_xdg_toplevel *xdg_toplevel;   /* kind == XDG 时有效 */
 	struct wlr_xwayland_surface *x11;        /* kind == X11 时有效 */
 	struct wlr_scene_tree *scene_tree;
-	struct wlr_output *output; /* 现在摆在哪块屏上 */
-	/* 归属哪块屏（热插拔记忆）：平铺窗口跟着所在列的 home，浮动窗口是自己的。
-	 * 屏拔了先借别的屏住，屏回来时按 home 挪回去。 */
-	struct vidow_output_memory *home;
+	struct wlr_output *output; /* 现在摆在哪块屏上（由 ws->output 同步） */
+	/* 表面当前进的是哪块输出。enter/leave 自己管（见 view_sync_surface_outputs），
+	 * 变了才重发。 */
+	struct wlr_output *surface_output;
 	/* 浮动窗口「相对自己那块屏原点」的偏移。布局会随着拔插重新摆（拔掉左边那块，
 	 * 右边那块可能从 x=1280 挪到 x=0），所以只记绝对坐标会被搬错一次屏。 */
 	int home_dx, home_dy;
@@ -1426,6 +1478,9 @@ struct vidow_view {
 	 * Wayland 的 xdg_popup：不装饰、不跑 shader、不做开关动画、不参与布局
 	 * （位置尺寸由客户端给死），也不改「谁是焦点窗口」。 */
 	bool popup;
+	/* 1x1 辅助 toplevel（剪贴板 helper）：需要短暂拿键盘才能 set_selection，
+	 * 但关闭后焦点要还给之前那个窗口。 */
+	bool focus_helper;
 	/* 视口外强制渲染：窗口滚出画面（或所在工作区被藏起来）时照样给它补帧回调，
 	 * 客户端不会停帧 —— 录屏 / 窗口预览 / 切回来看到的就是新画面而不是冻住的一张。
 	 *   force_render       —— 窗口规则给的（config.lua 的 vidow.rule）
@@ -1438,6 +1493,10 @@ struct vidow_view {
 	 * 这两条就是给那种窗口留的开关。 */
 	bool focus_on_open;
 	bool focus_on_activate;
+	/* 窗口规则 fake_focus：焦点移走时也不给客户端发 deactivated，让它一直以为
+	 * 自己还激活（给一失焦就暂停 / 收 UI 的程序用）。只伪装客户端看到的
+	 * activated 状态；键盘焦点、合成器焦点、任务栏都还是真的。 */
+	bool fake_focus;
 	/* 这个窗口要 VRR（窗口规则 vrr = true，niri 的 variable-refresh-rate）：它
 	 * 显示在「按需 VRR」的屏上时把那块屏的刷新率提上去（见 output.c 的
 	 * vidow_output_vrr_on_demand_update）。默认 false = 不提，跟以前一样。 */
@@ -1525,6 +1584,13 @@ struct vidow_view {
 	double anim_alpha;              /* 0..1, applied to every buffer */
 	double anim_scale;              /* 动画缩放，围绕窗口中心；1.0 = 原尺寸 */
 	bool dragging;                  /* 正被鼠标拖着（位置归 drag.c 管） */
+	/* niri 的 interactive move：一按下去就把窗口从布局里摘走（后面的列
+	 * 当场并拢），松手才插回去。这里不物理摘链表，只让布局/焦点判据跳过
+	 * 它（见 view.c 的 view_shows），拖动结束再清掉。 */
+	bool drag_detached;
+	/* niri 的起拖阈值：光标从按下点走够 16 逻辑像素（256 px²）才真的
+	 * 把窗口摘出布局 / 降透明度。没走够就松手 = 一次点击，布局不该闪。 */
+	double drag_start_cx, drag_start_cy;
 	int drag_dx, drag_dy;           /* 抓点在窗口里的位置 */
 	double anim_from_x, anim_from_y; /* move tween start offsets */
 	bool placed;                     /* laid out at least once */
@@ -1540,6 +1606,9 @@ struct vidow_view {
 
 	/* floating */
 	enum vidow_float_mode float_mode;
+	/* 浮窗记账挂在哪块工作区（NULL = 还没记）：ws->floats 的 +1/-1 只在
+	 * vidow_workspace_track() 里动，靠这个指针保证同一块工作区只记一次。 */
+	struct vidow_workspace *floats_ws;
 	/* IPC 的 set-window-size 要的尺寸（0 = 没要过）。客户端下一次提交要是还带
 	 * 旧尺寸，不能把「我让它多大」改回去 —— 一个迟到的提交会把这条命令吃掉
 	 * （踩过：改完尺寸，客户端先为别的原因提交一次旧尺寸，float_geom 就被它
@@ -1614,10 +1683,60 @@ struct vidow_view {
 	/* wlroots 不判断状态是否真的变了，重复 set_activated 会白刷一遍客户端 */
 	bool portal_activated;
 	bool portal_entered;
+	/* foreign-toplevel 的 output_enter/leave 跟着窗口真正落的那块屏走：
+	 * 只记 bool 的话窗口从 DP-2 拖到 DP-3 之后，Noctalia 的 activeToplevelOutput()
+	 * 还指着旧屏 —— 工作区上的活动应用图标就挂错屏 / 挂错工作区。 */
+	struct wlr_output *portal_output;
 	struct wl_listener ftm_request_activate;
 	struct wl_listener ftm_request_close;
 	struct wl_listener ftm_request_fullscreen;
 	struct wl_listener ftm_request_minimize;
+
+	/* X11 弹出物背后的模糊（见 struct vidow_popup_blur）；普通窗口是 NULL。 */
+	struct vidow_popup_blur *popup_blur;
+};
+
+/* --------------------------------------------------------- 弹出物的模糊 */
+
+/* 弹出物（窗口的 xdg_popup / X11 菜单提示 / 输入法候选框）背后的模糊。
+ *
+ * 和 layer surface 那条路是同一套（见 fx.c 的 layer_blur_frame）：在弹出物
+ * 自己的场景树里垫一个只画模糊的节点（blur_only），底衬按它那一小块区域抓
+ * —— 基座从共享底衬上 1:1 拷一块，再把窗口 / 别的弹出物画上去；抓的时候
+ * 弹出物自己藏着（不然模糊里会浮出它自己的影子）。节点是它的孩子，弹出物
+ * 移动 / 改尺寸时自动跟着走（输入法候选框那条路节点挂在 layer_im 上，位置
+ * 每帧按绝对坐标摆）。
+ *
+ * 谁建：view.c 的 vidow_popup_scene_create（Wayland xdg_popup）、view.c 的
+ * x11_attach_surface / x11_refresh_popup（X11 菜单）、im.c 的 im_new_popup
+ * （输入法候选框）。生命周期各自管：xdg 那条挂在 surface 的 destroy 上，
+ * X11 / 候选框在拆场景节点 / 表面时显式收。 */
+struct vidow_popup_blur {
+	struct wl_list link; /* vidow_server.popup_blurs */
+	struct vidow_server *server;
+	/* 模糊节点挂在哪棵树上，坐标也从这棵树取（xdg / X11 是弹出物自己的树，
+	 * 候选框是 layer_im —— 那时节点位置要按绝对坐标摆）。 */
+	struct wlr_scene_tree *tree;
+	/* 抓底衬时要藏起来的节点（弹出物自己的树 / 表面节点）。 */
+	struct wlr_scene_node *hide;
+	struct wlr_surface *surface; /* 尺寸 + 透明度剔除用的缓冲 */
+	struct vidow_view *view;     /* X11 弹出物视图（尺寸从它来）；其余 NULL */
+	const char *tag;             /* 日志用（"xdg" / "x11" / "im"） */
+
+	struct vidow_fx_target fx;
+	/* 抓来的那块区域底衬（跟 layer 的 bd 一个套路）。 */
+	int bd_w, bd_h, bd_x, bd_y;
+	struct vidow_output *bd_output; /* 这份底衬是从哪块屏抓的 */
+	uint64_t bd_gen_scene, bd_gen_layer;
+	int blur_fail;       /* 上一次没画成的原因（只在变了时打日志） */
+	bool capture_hidden; /* 抓的时候把自己藏起来了（回填时用） */
+	/* 上一帧的几何：位置 / 尺寸变了要重烘（候选框那条路节点不跟着表面走）。 */
+	int last_x, last_y, last_w, last_h;
+
+	struct wl_listener owner_destroy; /* 宿主对象销毁：自己摘掉 */
+	struct wl_listener node_destroy;  /* 模糊节点跟着场景树没了 */
+	struct wl_listener commit;        /* 内容变了：重烘（mask / 圆角） */
+	bool owner_destroy_added, node_destroy_added, commit_added;
 };
 
 /* ----------------------------------------------------------- layer shell */
@@ -1633,6 +1752,8 @@ struct vidow_layer_surface {
 	 * 屏回来时再挪回去。 */
 	struct vidow_output_memory *home;
 	uint32_t layer;
+	/* 上次钉给客户端的 buffer scale（见 layer.c 的 layer_pin_scale）。0 = 还没发。 */
+	int pref_scale;
 	/* 图层规则算出来的作用（rule.c 填）。 */
 	struct vidow_rule_eff rule_eff;
 	/* 上一次 layer 模糊没画成的**原因**（fx.c 的 layer_blur_frame 填）：
@@ -1752,6 +1873,8 @@ struct vidow_im_popup {
 	struct vidow_server *server;
 	struct wlr_input_popup_surface_v2 *popup;
 	struct wlr_scene_surface *scene;
+	/* 候选框背后的模糊（见 struct vidow_popup_blur）。 */
+	struct vidow_popup_blur *blur;
 
 	struct wl_listener commit;
 	struct wl_listener destroy;
@@ -2067,6 +2190,8 @@ struct vidow_popup_scene {
  * 留点余量给以后换字模）。建节点时超了会当场报错，不悄悄少画。 */
 #define VIDOW_MINI_TOOLBAR_GLYPH_MAX 20
 
+struct wlr_cursor_shape_manager_v1;
+
 struct vidow_server {
 	struct wl_display *display;
 	struct wlr_backend *backend;
@@ -2210,6 +2335,10 @@ struct vidow_server {
 
 	struct wlr_cursor *cursor;
 	struct wlr_xcursor_manager *cursor_mgr;
+	/* wp_cursor_shape_manager_v1（光标形状协议）：layer / GTK 客户端用它换形状，
+	 * 不实现的话指针永远停在默认箭头。 */
+	struct wlr_cursor_shape_manager_v1 *cursor_shape_mgr;
+	struct wl_listener cursor_shape_request;
 	struct vidow_cursor_fx *cursor_fx; /* 摇晃放大（cursorfx.c），可能为 NULL */
 	struct wlr_seat *seat;
 
@@ -2243,6 +2372,7 @@ struct vidow_server {
 	struct vidow_decor_prog decor;
 	struct vidow_gl_prog kawase_down, kawase_up;
 	struct vidow_mesh_prog mesh;
+	struct vidow_mesh_blur_prog mesh_blur;
 	struct wlr_texture *empty_tex; /* 1x1 transparent, for disabled samplers */
 	uint64_t blur_serial;          /* hands out blur texture identities */
 
@@ -2276,6 +2406,9 @@ struct vidow_server {
 	/* 活着的 Wayland 弹出物的场景树（vidow_popup_scene.link）：嵌套弹出物要
 	 * 靠它找到父弹出物的树，见 view.c 的 server_new_popup。 */
 	struct wl_list popup_scenes;
+	/* 活着的弹出物模糊目标（struct vidow_popup_blur.link）：窗口的 xdg_popup /
+	 * X11 菜单 / 输入法候选框各一条，见 fx.c 的 vidow_popup_blur_register。 */
+	struct wl_list popup_blurs;
 	struct wl_list keyboards; /* vidow_keyboard.link */
 	/* 注入用的键盘（IPC 的 send-key / type-text）。wlroots 没有公开的「造一个
 	 * 键盘」接口，键盘组能给出一个干净的 wlr_keyboard（自带 keymap 和
@@ -2333,6 +2466,15 @@ struct vidow_server {
 	struct wl_listener request_cursor;
 	struct wl_listener request_set_selection;
 	struct wl_listener request_set_primary_selection;
+	/* 拖拽（wl_data_device.start_drag）：wlroots 只把请求抛上来，起不起、
+	 * 图标画在哪由合成器定。不接这条，应用内拖拽（选文字拖、拖文件、拖标签）
+	 * 全部没反应。 */
+	struct wl_listener request_start_drag;
+	struct wl_listener start_drag;
+	struct wl_listener drag_destroy;
+	struct wl_listener drag_motion;
+	struct wlr_scene_tree *drag_icon;
+	struct wlr_drag *drag;
 
 	/* interactive move/resize grab */
 	enum vidow_grab_mode grab_mode;
@@ -2509,6 +2651,10 @@ struct vidow_server {
 	 * 会清掉，别拿着野指针。 */
 	struct vidow_column *last_focused_col;
 	struct vidow_layer_surface *keyboard_layer; /* exclusive layer grab */
+	/* 抢键盘之前那个窗口：layer 关掉之后要还给它。不记这一份的话，
+	 * 截图 / 通知这类 layer 一关，焦点会落到「当时恰好是 focused 的那个」
+	 * —— 用户报的「截图完成焦点弹到下一个窗口」。 */
+	struct vidow_view *focus_before_layer;
 	struct wlr_output *focused_output;
 	/* 上一次切过去的那块工作区（workspace_auto_back_and_forth 要用）：只记
 	 * 「键位动作切过去的」那一次，见 keybind.c 的 action_workspace_switch。 */
@@ -2609,8 +2755,6 @@ int vidow_output_wake_disabled(struct vidow_server *server);
 /* toggle-touchpad 动作：把触控板整体关掉 / 打开（见 input.c）。why 收一句人话
  * （成功 / 失败的原因），给 IPC 和日志用。 */
 bool vidow_input_toggle_touchpad(struct vidow_server *server, const char **why);
-/* 光标现在藏着吗（cursorfx.c）。 */
-bool vidow_cursor_fx_is_hidden(const struct vidow_server *server);
 bool vidow_view_init(struct vidow_server *server);
 /* xdg_popup 的 unconstrain 只能在 popup 自己第一次 commit 之后做（wlroots 里
  * schedule_configure 有 assert(surface->initialized)），见 view.c 的注释。 */
@@ -2645,8 +2789,6 @@ bool vidow_bgeffect_init(struct vidow_server *server);
 
 /* ------------------------------------------------------------ input method */
 
-/* 输入法抢了键盘（keyboard grab）时，按键要直接喂给它，不能再发给 seat。 */
-bool vidow_im_grabbed(struct vidow_server *server);
 /* 键盘换了（插拔 / 虚拟键盘上下线）：有 grab 就同步给输入法。 */
 void vidow_im_set_keyboard(struct vidow_server *server, struct wlr_keyboard *kb);
 /* 这个键盘的按键该不该喂给输入法：抢到键盘了就该，但输入法自己用虚拟键盘
@@ -2661,9 +2803,7 @@ void vidow_im_focus(struct vidow_server *server, struct wlr_surface *surface);
 
 /* 输入法抓着键盘时的按键出口（见 im.c 的 active_grab）：抓着就发给它，否则
  * 调用方走 seat。以前 grab 只存不用，fcitx5 一抓键盘所有按键就丢了。 */
-bool vidow_im_grab_active(void);
 void vidow_im_grab_send_key(uint32_t time_msec, uint32_t keycode, bool pressed);
-void vidow_im_grab_send_modifiers(struct wlr_keyboard_modifiers *mods);
 
 /* 把键盘焦点按到某个表面上。**surface 可能是 NULL**（Xwayland 的窗口刚建出来 /
  * 表面刚销毁但窗口还在 —— wine 那些游戏起来时会来回好几趟），所以统一从这里走：
@@ -2869,6 +3009,22 @@ bool vidow_fx_begin(struct vidow_server *server, struct vidow_fx_target *fx,
  * x, y（渲染目标物理像素）, u, v（源贴图归一化）。 */
 bool vidow_fx_draw_mesh(struct vidow_server *server, struct wlr_buffer *dst,
 	int w, int h, struct wlr_texture *src, const float *verts, int n_verts);
+/* 果冻专用：verts 每项 6 个 float [x, y, u_content, v_content, u_blur,
+ * v_blur]；片元把内容叠在模糊上（content + blur * (1 - content.a)）。 */
+bool vidow_fx_render_shadow(struct vidow_server *server,
+	struct wlr_buffer *dst, struct vidow_fx_target *fx,
+	const struct vidow_look *look);
+bool vidow_fx_draw_mesh_blur(struct vidow_server *server,
+	struct wlr_buffer *dst, int w, int h, struct wlr_texture *content,
+	struct wlr_texture *blur, float blur_strength, const float *verts,
+	int n_verts, int content_off_x, int content_off_y, int content_w,
+	int content_h, int src_w, int src_h, float radius, float corner_n,
+	struct wlr_texture *mask, float mask_ox, float mask_oy,
+	float mask_sx, float mask_sy, float mask_min,
+	struct wlr_texture *shadow_tex,
+	int shadow_off_x, int shadow_off_y, int shadow_w, int shadow_h,
+	float shadow_dx, float shadow_dy, float shadow_radius,
+	const float shadow_color[4], bool shadow_on);
 
 /* eff = 这个目标的规则作用（rule.c 的 vidow_rule_eff，NULL = 没规则）。
  * fullscreen = 这是不是一块全屏窗口：全屏不画服务端装饰（边框 / 圆角 / 阴影 /
@@ -2926,6 +3082,7 @@ void vidow_fx_release(struct vidow_fx_target *fx);
  * 该显示的像素就是客户端缓冲自己（全屏 + 装饰参数全零）。判据宁严不宽 —— 漏判
  * 只是没省下那两笔 GPU，误判会让画面变样（CSD 留白、半透明、模糊底衬都会在直通
  * 里露出来）。见 view.c 的 view_scanout_switch。 */
+bool vidow_view_blur_wanted(struct vidow_view *view);
 bool vidow_view_scanout_ok(struct vidow_view *view);
 void vidow_fx_flush(struct vidow_server *server);
 bool vidow_fx_set_shader(struct vidow_server *server,
@@ -2935,6 +3092,16 @@ int vidow_fx_pad(struct vidow_server *server);
 /* layer surface 背后的模糊：位置/尺寸变了要作废重画（见 fx.c）。 */
 void vidow_layer_blur_invalidate(struct vidow_layer_surface *ls);
 void vidow_layer_blur_release(struct vidow_layer_surface *ls);
+/* 弹出物（xdg_popup / X11 菜单 / 输入法候选框）背后的模糊（fx.c）。
+ * owner_destroy 非空时挂在那个信号上自己摘掉；destroy_node 告诉卸载时
+ * 场景节点归不归我们销毁（xdg 的树归 wlroots，X11 / 候选框归我们）。 */
+struct vidow_popup_blur *vidow_popup_blur_register(struct vidow_server *server,
+	struct wlr_scene_tree *tree, struct wlr_scene_node *hide,
+	struct wlr_surface *surface, struct vidow_view *view, const char *tag,
+	struct wl_signal *owner_destroy);
+void vidow_popup_blur_unregister(struct vidow_popup_blur *pb,
+	bool destroy_node);
+void vidow_popup_blur_invalidate(struct vidow_popup_blur *pb);
 void vidow_blur_update(struct vidow_output *output);
 /* Mark the cached backdrops stale. layers = true for a change to the wallpaper
  * or a background/bottom layer surface; false for anything that only moves or
@@ -3328,6 +3495,8 @@ bool vidow_screencast_stream_stats(const struct vidow_screencast_stream *stream,
  * 别的照常）。 */
 struct vidow_screencast *vidow_screencast_create(struct wl_display *display,
 		struct vidow_server *server);
+/* 退出前拆掉 zkde_screencast global、PipeWire 状态和剩下的流。 */
+void vidow_screencast_finish(struct vidow_server *server);
 /* 这一路流给客户端一个失败原因。协议里没有 error code，failed 事件才是客户端
  * 认的报错方式（回完它，客户端会 close 掉这一路）。 */
 void vidow_screencast_stream_fail(struct vidow_screencast_stream *stream,
@@ -3367,6 +3536,13 @@ void vidow_capturemask_release(struct vidow_server *server);
  * 里；放不下会被降级成软光标，所以倍数先按硬件上限夹。 */
 /* 建状态 + 定时器（input_init 里调一次）。失败只是没这个功能，不影响别的。 */
 void vidow_cursor_fx_init(struct vidow_server *server);
+/* wp_cursor_shape_manager_v1：建全局 + 监听客户端的 set_shape。 */
+void vidow_cursor_shape_init(struct vidow_server *server);
+/* 客户端通过 cursor-shape-v1 换了主题光标（layer / GTK 菜单等）。 */
+void vidow_cursor_fx_set_cursor_name(struct vidow_server *server,
+		const char *name);
+/* 退出前收掉放大图 / 监听器 / 定时器和状态本身。 */
+void vidow_cursor_fx_finish(struct vidow_server *server);
 /* 每次指针移动后调（真实鼠标、测试注入、IPC 注入都走这里）。 */
 void vidow_cursor_fx_motion(struct vidow_server *server);
 /* 手动放大一次（IPC 的 cursor-shake）。why 里是拒绝的原因。 */
@@ -3483,6 +3659,8 @@ void vidow_view_set_fullscreen(struct vidow_view *view, bool fullscreen);
 void vidow_view_set_maximized(struct vidow_view *view, bool maximized);
 /* 退出全屏（最小化 / 变浮窗这类「整屏状态跟它冲突」的操作先走这一步）。why 进日志。 */
 void vidow_view_unfullscreen(struct vidow_view *view, const char *why);
+/* 每帧对一遍 X11 的 _NET_WM_STATE（退出全屏但不再交帧的游戏，见 view.c）。 */
+void vidow_views_sync_x11_fullscreen(struct vidow_server *server);
 void vidow_view_set_tiled(struct vidow_view *view, bool tiled);
 void vidow_view_close(struct vidow_view *view);
 /* 把当前标题 / app_id 记一份（事件用，见 vidow_view.last_title）。 */
@@ -3508,7 +3686,6 @@ bool vidow_view_fixed_size_hint(const struct vidow_view *view, int *w, int *h);
 /* 这个窗口的 X11 缩放桥（整数倍）：逐窗口规则 x11_scale 优先，没写就用全局
  * xwayland_scale。X11 的「缓冲区像素 → 逻辑坐标」处处按它除（见 view.c）。 */
 int vidow_view_x11_scale_int(const struct vidow_view *view);
-bool vidow_view_x11_scale_overridden(const struct vidow_view *view);
 void vidow_view_open_anim(struct vidow_view *view);
 /* 可见窗口在源缓冲里的位置/尺寸（客户端 CSD 留白就跑这儿出去，见 struct
  * vidow_fx_geo）：装饰、模糊区域、输入法候选框都拿它定位。 */
@@ -3647,6 +3824,8 @@ void vidow_overview_scroll(struct vidow_server *server, int steps);
 /* 台账（谁最近用过）和切换器都在 mru.c。 */
 int64_t vidow_mru_now_ns(void);
 bool vidow_mru_init(struct vidow_server *server);
+/* 退出前收掉卡片缓冲 / 场景树 / 定时器和两个数组。 */
+void vidow_mru_finish(struct vidow_server *server);
 /* 焦点换人了：记账。过了 debounce 才算「用过」（见 mru.c）。 */
 void vidow_mru_note_focus(struct vidow_server *server, struct vidow_view *view);
 /* 往窗口里打字了：明确使用，debounce 立刻结束。 */
@@ -3782,6 +3961,9 @@ void vidow_float_grab_update(struct vidow_server *server, double lx,
 		double ly);
 void vidow_float_end_grab(struct vidow_server *server);
 void vidow_arrange_layers(struct vidow_server *server);
+/* 全屏窗口亮着的时候，把这块屏上「占着 exclusive zone 的 top 层」（状态栏）
+ * 藏掉：不然它看不见、却还挡着一条输入死区。退出全屏再放回来。 */
+void vidow_layers_update_fullscreen(struct vidow_server *server);
 /* 桌面底色（background_color）落到场景里：颜色 + 整个布局的包围盒。配置重载、
  * 输出变化、启动时各调一次（幂等）。 */
 void vidow_background_apply(struct vidow_server *server);
@@ -3913,6 +4095,7 @@ void vidow_portal_view_title(struct vidow_view *view);
 void vidow_portal_view_parent(struct vidow_view *view);
 /* 上屏 / 下屏：窗口列表靠它判断这个窗口在不在某个输出上。 */
 void vidow_portal_view_mapped(struct vidow_view *view, bool mapped);
+void vidow_portal_view_output(struct vidow_view *view);
 /* 焦点变了。view 可以是 NULL（焦点落到了 layer surface 或没有窗口）。 */
 void vidow_portal_view_activated(struct vidow_view *view, bool activated);
 

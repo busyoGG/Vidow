@@ -573,6 +573,8 @@ static void pull_destroy(struct vidow_clip_pull *pull) {
 /* 一次拉取结束：拿到字节就算这个类型有了；一个字节都没拿到（客户端不给 / 超时）
  * 就把这个类型标成「拿不到」—— 不能让它一直挂着 incomplete，否则 X11 那边来问的
  * 请求会白等 5 秒（踩过：日志里「数据还没取全，先攥着」，5 秒后只能回「没有」）。 */
+static void derive_uri_list(struct vidow_clip_selection *sel);
+
 static void pull_finish(struct vidow_clip_pull *pull, const char *why) {
 	struct vidow_clip_selection *sel = pull->sel;
 	struct vidow_clip_mime *m = sel_find(sel, pull->mime);
@@ -589,6 +591,7 @@ static void pull_finish(struct vidow_clip_pull *pull, const char *why) {
 	/* 最后一个类型也拉完了：这份内容齐了，记一条历史。中途的快照会存下半截内容，
 	 * 所以只在 pulls 空了以后记。 */
 	if (wl_list_empty(&sel->pulls)) {
+		derive_uri_list(sel);
 		history_push(sel);
 	}
 	sel_flush_waiters(sel);
@@ -886,6 +889,9 @@ static void fetch_next(struct vidow_clip_selection *sel) {
 		}
 	}
 	staging_commit(sel);
+	/* X11 源也可能只给 x-special/gnome-copied-files（QQ 图片就是这条），
+	 * 同样派生 text/uri-list，否则 Wayland 目标只要 uri-list 就粘不出来。 */
+	derive_uri_list(sel);
 	/* X11 来的这一份现在成了当前内容：记一条历史（见下面的 history_push）。 */
 	history_push(sel);
 	sel->from_x11 = true;
@@ -2041,6 +2047,10 @@ static struct vidow_clip_hist_entry *hist_snapshot(
 		dst->mime = strdup(src->mime);
 		dst->data = malloc(src->len);
 		if (dst->mime == NULL || dst->data == NULL) {
+			/* dst 还没算进 e->nmimes，hist_entry_free() 看不到它，
+			 * 得先把这一格自己清掉。 */
+			free(dst->mime);
+			free(dst->data);
 			hist_entry_free(e);
 			return NULL;
 		}
@@ -2274,6 +2284,57 @@ static void sb_add(struct clip_strbuf *sb, const char *data, size_t len) {
 static void sb_add_str(struct clip_strbuf *sb, const char *s) {
 	sb_add(sb, s, strlen(s));
 }
+
+/* QQ / GNOME 文件复制只给 x-special/gnome-copied-files（"copy\nfile://..."），
+ * 不给 text/uri-list。目标程序（文件管理器、部分聊天窗口）只问 uri-list 时
+ * 就会「明明有 URL 却粘不出来」。这里从 gnome 那份派生一份标准 uri-list：
+ * 去掉 copy/cut 头，LF 换成 RFC 2483 的 CRLF。已有 uri-list 就不覆盖。 */
+static void derive_uri_list(struct vidow_clip_selection *sel) {
+	struct vidow_clip_mime *gnome =
+		sel_find(sel, "x-special/gnome-copied-files");
+	if (gnome == NULL || !gnome->complete || gnome->data == NULL ||
+			gnome->len == 0) {
+		return;
+	}
+	if (sel_find(sel, "text/uri-list") != NULL) {
+		return;
+	}
+	const char *p = (const char *)gnome->data;
+	const char *end = p + gnome->len;
+	/* 第一行是 copy / cut，跳过 */
+	const char *nl = memchr(p, '\n', (size_t)(end - p));
+	if (nl != NULL) {
+		p = nl + 1;
+	}
+	struct clip_strbuf out = {0};
+	sb_add_str(&out, "");
+	while (p < end) {
+		const char *line_end = memchr(p, '\n', (size_t)(end - p));
+		if (line_end == NULL) {
+			line_end = end;
+		}
+		const char *line = p;
+		size_t len = (size_t)(line_end - p);
+		if (len > 0 && line[len - 1] == '\r') {
+			len--;
+		}
+		if (len > 0 && line[0] != '#') {
+			sb_add(&out, line, len);
+			sb_add_str(&out, "\r\n");
+		}
+		p = line_end < end ? line_end + 1 : end;
+	}
+	if (out.buf == NULL) {
+		return;
+	}
+	struct vidow_clip_mime *m = sel_add(sel, "text/uri-list", XCB_ATOM_NONE);
+	if (m != NULL) {
+		mime_append(m, out.buf, out.len, clip_max(sel->server));
+		m->complete = true;
+	}
+	free(out.buf);
+}
+
 
 /* 路径 -> file:// URI。按 RFC 3986 只留 unreserved 和 '/'，其余百分号转义
  * （中文路径、空格、# 都在这里过一遍）。 */

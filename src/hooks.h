@@ -40,12 +40,9 @@ int vidow_hook_add_lua(struct vidow_server *server, const char *event,
 		void *lua_state, int lua_ref);
 bool vidow_hook_remove(struct vidow_server *server, int id);
 
-/* 有钩子吗（事件发射前的快速通道）/ 某个事件有没有人听 / 现存的钩子数。 */
-bool vidow_hooks_any(const struct vidow_server *server);
+/* 某个事件有没有人听 / 有多少条钩子会收到它（IPC 的 emit 命令报出去）。 */
 bool vidow_hooks_wanted(const struct vidow_server *server, const char *event);
-/* 有多少条钩子会收到这个事件（IPC 的 emit 命令报出去）。 */
 int vidow_hooks_matching(const struct vidow_server *server, const char *event);
-int vidow_hooks_count(const struct vidow_server *server);
 
 /* 派发一个事件：json 是事件信封的完整 JSON（一行，带结尾换行，和给 IPC 订阅者
  * 的那条一模一样）。**只入队**，真正执行在事件循环的 idle 里 —— 钩子里能做的事
@@ -58,7 +55,5 @@ void vidow_hooks_json(struct jbuf *b, struct vidow_server *server);
 
 /* 全部事件名（IPC {"cmd":"events"}、README、测试用）。返回个数，名字写进 *out。 */
 size_t vidow_event_names(const char *const **out);
-/* 这个名字是个事件吗（自定义事件 —— IPC 的 emit 命令 —— 不在名单里）。 */
-bool vidow_event_known(const char *event);
 
 #endif /* VIDOW_HOOKS_H */

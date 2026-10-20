@@ -161,6 +161,45 @@ static void json_anim(struct jbuf *b, struct vidow_anim *anim) {
 
 /* --------------------------------------------------------------- 窗口 */
 
+/* 「真正的 toplevel」：bar / 任务栏只该看见这些。
+ *
+ * 排除：
+ *   - xdg_popup（菜单 / tooltip / 输入法候选框那类，view->popup）；
+ *   - 还没上屏的（mapped = false；Steam 的 CEF 辅助表面经常挂在这里）；
+ *   - X11 的 override-redirect / 菜单 / tooltip / utility / dock 类型
+ *     （Steam 的弹出表面大多落在这几类，它们不是窗口）。
+ * 保留 DIALOG：文件选择框、设置对话框是真正的顶层窗口，任务栏该显示。
+ */
+static bool window_is_toplevel(const struct vidow_view *view) {
+	if (view == NULL || view->popup || !view->mapped || view->focus_helper) {
+		return false;
+	}
+	if (view->kind != VIDOW_VIEW_X11 || view->x11 == NULL) {
+		return true;
+	}
+	if (view->x11->override_redirect) {
+		return false;
+	}
+	static const enum wlr_xwayland_net_wm_window_type skip[] = {
+		WLR_XWAYLAND_NET_WM_WINDOW_TYPE_UTILITY,
+		WLR_XWAYLAND_NET_WM_WINDOW_TYPE_MENU,
+		WLR_XWAYLAND_NET_WM_WINDOW_TYPE_DROPDOWN_MENU,
+		WLR_XWAYLAND_NET_WM_WINDOW_TYPE_POPUP_MENU,
+		WLR_XWAYLAND_NET_WM_WINDOW_TYPE_TOOLTIP,
+		WLR_XWAYLAND_NET_WM_WINDOW_TYPE_COMBO,
+		WLR_XWAYLAND_NET_WM_WINDOW_TYPE_DND,
+		WLR_XWAYLAND_NET_WM_WINDOW_TYPE_NOTIFICATION,
+		WLR_XWAYLAND_NET_WM_WINDOW_TYPE_DOCK,
+		WLR_XWAYLAND_NET_WM_WINDOW_TYPE_DESKTOP,
+	};
+	for (size_t i = 0; i < sizeof(skip) / sizeof(skip[0]); ++i) {
+		if (wlr_xwayland_surface_has_window_type(view->x11, skip[i])) {
+			return false;
+		}
+	}
+	return true;
+}
+
 void vidow_ipc_json_column(struct jbuf *b, struct vidow_server *server,
 		struct vidow_column *col) {
 	(void)server;
@@ -176,7 +215,6 @@ void vidow_ipc_json_column(struct jbuf *b, struct vidow_server *server,
 	jb_kv_int(b, "offset", col->offset);
 	jb_kv_str(b, "workspace", col->ws != NULL ? col->ws->name : NULL);
 	jb_kv_str(b, "output", col->output != NULL ? col->output->name : NULL);
-	jb_kv_str(b, "home", col->home != NULL ? col->home->key : NULL);
 	int index = 0;
 	if (col->ws != NULL) {
 		struct vidow_column *other;
@@ -192,7 +230,9 @@ void vidow_ipc_json_column(struct jbuf *b, struct vidow_server *server,
 	jb_arr(b);
 	struct vidow_view *view;
 	wl_list_for_each(view, &col->views, column_link) {
-		jb_uint(b, view->id);
+		if (window_is_toplevel(view)) {
+			jb_uint(b, view->id);
+		}
 	}
 	jb_arr_end(b);
 	jb_obj_end(b);
@@ -228,7 +268,6 @@ void vidow_ipc_json_window(struct jbuf *b, struct vidow_server *server,
 	jb_kv_bool(b, "visible", view->scene_tree != NULL &&
 		view->scene_tree->node.enabled && !view->scene_parked);
 	jb_kv_str(b, "output", view->output != NULL ? view->output->name : NULL);
-	jb_kv_str(b, "home", view->home != NULL ? view->home->key : NULL);
 	jb_kv_str(b, "workspace", view->ws != NULL ? view->ws->name : NULL);
 	/* 稳定编号。`workspace` 是**名字**，动态工作区没名字就是空串 —— 而
 	 * noctalia 的 workspaceKeyMatchesAssignment() 见到空串直接 return false，
@@ -336,6 +375,7 @@ void vidow_ipc_json_window(struct jbuf *b, struct vidow_server *server,
 	jb_obj(b);
 	jb_kv_bool(b, "focus_on_open", view->focus_on_open);
 	jb_kv_bool(b, "focus_on_activate", view->focus_on_activate);
+	jb_kv_bool(b, "fake_focus", view->fake_focus);
 	jb_kv_bool(b, "honor_invalid_serial", view->honor_invalid_serial);
 	/* 抓帧遮挡 / X11 缩放桥也是规则给的（见 rule.c）：屏幕上、抓帧里各是什么样
 	 * 只看得出「现在」，自检脚本要的是「规则有没有套上」。 */
@@ -432,6 +472,9 @@ void vidow_ipc_json_windows(struct jbuf *b, struct vidow_server *server) {
 	jb_arr(b);
 	struct vidow_view *view;
 	wl_list_for_each(view, &server->views, link) {
+		if (!window_is_toplevel(view)) {
+			continue;
+		}
 		vidow_ipc_json_window(b, server, view);
 	}
 	jb_arr_end(b);
@@ -461,7 +504,28 @@ void vidow_ipc_json_workspace(struct jbuf *b, struct vidow_server *server,
 	jb_kv_str(b, "home", ws->home != NULL ? ws->home->key : NULL);
 	jb_kv_double(b, "viewport_x", ws->viewport_x);
 	jb_kv_int(b, "floats", ws->floats);
-	jb_kv_int(b, "window_count", vidow_workspace_view_count(ws));
+	{
+		int n = 0;
+		struct vidow_column *c;
+		wl_list_for_each(c, &ws->columns, link) {
+			struct vidow_view *v;
+			wl_list_for_each(v, &c->views, column_link) {
+				if (window_is_toplevel(v)) {
+					n++;
+				}
+			}
+		}
+		if (!ws->special) {
+			struct vidow_view *v;
+			wl_list_for_each(v, &server->views, link) {
+				if (v->ws == ws && v->column == NULL &&
+						window_is_toplevel(v)) {
+					n++;
+				}
+			}
+		}
+		jb_kv_int(b, "window_count", n);
+	}
 	jb_key(b, "focused_window");
 	if (view_alive(server, ws->focused)) {
 		jb_uint(b, ws->focused->id);
@@ -480,14 +544,17 @@ void vidow_ipc_json_workspace(struct jbuf *b, struct vidow_server *server,
 	wl_list_for_each(col, &ws->columns, link) {
 		struct vidow_view *view;
 		wl_list_for_each(view, &col->views, column_link) {
-			jb_uint(b, view->id);
+			if (window_is_toplevel(view)) {
+				jb_uint(b, view->id);
+			}
 		}
 	}
 	if (!ws->special) {
 		/* 浮窗不进列：单独数一遍（挂在 ws_link 上）。 */
 		struct vidow_view *view;
 		wl_list_for_each(view, &server->views, link) {
-			if (view->ws == ws && view->column == NULL) {
+			if (view->ws == ws && view->column == NULL &&
+					window_is_toplevel(view)) {
 				jb_uint(b, view->id);
 			}
 		}
@@ -635,7 +702,7 @@ void vidow_ipc_json_output(struct jbuf *b, struct vidow_server *server,
 	jb_arr(b);
 	struct vidow_view *view;
 	wl_list_for_each(view, &server->views, link) {
-		if (view->output == o) {
+		if (view->output == o && window_is_toplevel(view)) {
 			jb_uint(b, view->id);
 		}
 	}

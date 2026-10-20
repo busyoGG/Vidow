@@ -120,7 +120,35 @@ w = next((w for w in json.load(sys.stdin)
 print("true" if w and w.get("visible") else "false")' "$1"
 }
 count() { grep -ac "$1" "$LOG" 2>/dev/null || true; }
+# 窗口 / 列 / 工作区这条链的住址必须一致：滚出视口只该改 geom，不该改归属。
+# 返回 "out=... col=... ws=..."；列没了就是 col=-。
+chain() { # chain <标题>
+	./build/vidowmsg windows 2>/dev/null | python3 -c '
+import sys, json
+w = next((w for w in json.load(sys.stdin)
+          if w.get("title") == sys.argv[1]), None)
+if w is None:
+    print("missing")
+else:
+    col = w.get("column") or {}
+    print("out=%s col=%s ws=%s" % (w.get("output"), col.get("output"),
+                                   w.get("workspace_id")))' "$1"
+}
+chain_ok() { # chain_ok <标题> <滚动前的链> -> 0 = 窗口/列/工作区没漂
+	local c out col
+	c=$(chain "$1")
+	out=${c#*out=}; out=${out%% *}
+	col=${c#*col=}; col=${col%% *}
+	# 窗口和它那条列的住址必须一致；滚动只该改 geom，不该改这两个字段。
+	if [ "$out" != "$col" ] || [ "$c" != "$2" ]; then
+		printf 'chain mismatch: got [%s] want [%s]\n' "$c" "$2" >&2
+		return 1
+	fi
+	return 0
+}
 
+CHAIN1=$(chain cull-1)
+CHAIN3=$(chain cull-3)
 mark "1) 三列装不下：最左那列滚出左边 → 藏起"
 echo "      $(place 1)"
 echo "      $(place 3)"
@@ -128,6 +156,9 @@ echo "      $(place 3)"
 	fail "cull-1 还留在场景里（$(place 1)）"
 [ "$(vis 1)" = false ] && pass "cull-1 报 visible=false（停到屏外）" ||
 	fail "cull-1 还报 visible=true"
+[ "$(chain cull-1)" != "missing" ] && chain_ok cull-1 "$CHAIN1" &&
+	pass "cull-1 滚出视口后归属没变（$(chain cull-1)）" ||
+	fail "cull-1 滚出视口后归属变了：$(chain cull-1)（滚动前 $CHAIN1）"
 [ "$(vis 3)" = true ] && pass "cull-3 显示着（焦点在它身上，视口滚到了右边）" ||
 	fail "cull-3 当下的 visible=$(vis 3)"
 
@@ -162,6 +193,10 @@ PY
 	fail "cull-3 还在场景里 —— 它的坐标落进隔壁屏，会串屏"
 [ "$(shown 1)" -ge 1 ] && pass "cull-1 重新显示（焦点回到它身上）" ||
 	fail "cull-1 没被放回来"
+
+[ "$(chain cull-3)" != "missing" ] && chain_ok cull-3 "$CHAIN3" &&
+	pass "cull-3 越界时归属没变（$(chain cull-3)）" ||
+	fail "cull-3 越界时归属变了：$(chain cull-3)（滚动前 $CHAIN3）"
 
 mark "3) 再滚回右边：第三列显示、第一列又藏起"
 n1=$(count "workspace: cull-3 显示")
@@ -465,7 +500,19 @@ echo "      静止窗口在视口外抓 3 秒：$(grep -a 'buffer_size' "$RUNDIR
 	fail "静止窗口滚到视口外只有 ${ff:-0} 帧 —— 客户端要的那一帧被丢了（修之前是 1 帧）"
 kill "$BLUE_PID" 2>/dev/null
 
-mark "7) 没崩、没断言"
+mark "7) 主动搬屏：窗口和列的住址跟着工作区走"
+./build/vidowmsg move-window-to-output HEADLESS-1 --title cull-1 >/dev/null 2>&1
+sleep 0.8
+C=$(chain cull-1)
+echo "      $C"
+case "$C" in
+*"out=HEADLESS-1 col=HEADLESS-1"*)
+	pass "搬到 HEADLESS-1 后窗口 / 列都在 HEADLESS-1 上" ;;
+*)
+	fail "搬屏后住址没跟上：$C" ;;
+esac
+
+mark "8) 没崩、没断言"
 pgrep -x vidow >/dev/null && pass "合成器还活着" || fail "合成器挂了"
 grep -aq "Assertion" "$LOG" && fail "日志里有 assert" || pass "日志里没有 assert"
 

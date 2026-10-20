@@ -49,15 +49,15 @@
  *
  * 三个数一起把门槛抬高（用户报的「太容易触发」）：正常用鼠标定位时来回甩两下
  * 很常见，但甩不了这么久、也甩不了这么多次。 */
-#define SHAKE_WINDOW_MS 500
-#define SHAKE_MIN_TRAVEL 16.0
+#define SHAKE_WINDOW_MS 400
+#define SHAKE_MIN_TRAVEL 24.0
 /* 一段（同方向连续走的路）超过这么远 = 这是在**真移动**指针，不是原地晃 →
  * 整串作废、从头数。用户报「晃动鼠标放大太容易触发」的根就在这儿：正常用鼠标
  * 时来回甩几下，每段都是几十上百像素、换向也快，照样凑够换向次数 —— 光调大
  * SHAKE_FLIPS 是治标（幅度量级不同，拿「每段走多远」一刀切开最直接）。
  * 真晃的每段是 20~50 逻辑像素这个量级。 */
-#define SHAKE_FLIPS 5
-#define SHAKE_MIN_SPAN_MS 250
+#define SHAKE_FLIPS 6
+#define SHAKE_MIN_SPAN_MS 220
 /* 两次换向之间超过这么久就算「这一串断了」，从头数 —— 顺手甩两下之后过一会儿
  * 再动一下，不该和甩的那两下拼成一次「摇晃」。 */
 #define SHAKE_GAP_MS 300
@@ -113,6 +113,8 @@ struct vidow_cursor_fx {
 
 	/* 当前光标图（还原用）：客户端 surface 或主题 xcursor（surface == NULL） */
 	struct wlr_surface *surface;
+	/* cursor-shape-v1 给的主题光标名（surface == NULL 时用它还原；默认 left_ptr） */
+	char shape[64];
 	int32_t hx, hy;
 	struct wl_listener surface_destroy;
 
@@ -226,6 +228,11 @@ static struct wlr_buffer *scale_texture(struct vidow_server *server,
 
 /* --------------------------------------------------------------- 还原 */
 
+/* 还原主题光标：cursor-shape-v1 可能设的不是 left_ptr（文本 I 字 / 手型 / 缩放箭头）。 */
+static const char *fx_cursor_name(const struct vidow_cursor_fx *fx) {
+	return fx != NULL && fx->shape[0] != '\0' ? fx->shape : "left_ptr";
+}
+
 static void drop_images(struct vidow_cursor_fx *fx) {
 	if (fx->big != NULL) {
 		wlr_buffer_drop(fx->big);
@@ -249,7 +256,8 @@ static void shake_restore(struct vidow_server *server) {
 	if (fx->surface != NULL) {
 		wlr_cursor_set_surface(server->cursor, fx->surface, fx->hx, fx->hy);
 	} else {
-		wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "left_ptr");
+		wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr,
+			fx_cursor_name(fx));
 	}
 	drop_images(fx);
 	wlr_log(WLR_DEBUG, "摇晃: 光标还原（%.2fx 收起）", fx->factor);
@@ -683,14 +691,9 @@ void vidow_cursor_fx_set_hidden(struct vidow_server *server, bool hidden) {
 	if (fx->surface != NULL) {
 		wlr_cursor_set_surface(server->cursor, fx->surface, fx->hx, fx->hy);
 	} else {
-		wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "left_ptr");
+		wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr,
+			fx_cursor_name(fx));
 	}
-}
-
-/* 光标现在藏着吗（input.c 的定时器 / 状态用）。 */
-bool vidow_cursor_fx_is_hidden(const struct vidow_server *server) {
-	struct vidow_cursor_fx *fx = server->cursor_fx;
-	return fx != NULL && fx->hidden;
 }
 
 /* 把放大图的**源**换成「光标图当前那张」，并照现在的倍数重画一遍。
@@ -747,6 +750,31 @@ void vidow_cursor_fx_cursor_changed(struct vidow_server *server) {
 	wl_event_source_timer_update(fx->timer, SHAKE_TICK_MS);
 }
 
+/* 客户端通过 cursor-shape-v1 换了主题光标（layer / GTK 菜单 / 文本输入框等）。
+ * 有客户端 surface 的时候 surface 优先（协议：set_cursor 的 surface 比 shape 新）；
+ * 没有 surface 才把主题光标名记下来并立刻设上去。 */
+void vidow_cursor_fx_set_cursor_name(struct vidow_server *server,
+		const char *name) {
+	if (name == NULL || name[0] == '\0') {
+		name = "left_ptr";
+	}
+	struct vidow_cursor_fx *fx = server->cursor_fx;
+	if (fx != NULL) {
+		snprintf(fx->shape, sizeof(fx->shape), "%s", name);
+		if (fx->hidden) {
+			return;
+		}
+		if (fx->surface != NULL) {
+			/* 客户端自己给了 surface：形状请求不该把那张图顶掉。 */
+			return;
+		}
+	}
+	wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, name);
+	if (fx != NULL && fx->active) {
+		vidow_cursor_fx_cursor_changed(server);
+	}
+}
+
 /* 指针底下没窗口：该显示主题默认箭头。放大期间**不碰真图**（碰了就把放大图顶
  * 掉、放大白做了），只记住「还原时该给什么」。不过光标**形状**换了（原来是
  * 客户端给的光标图、现在是主题箭头）也得跟着换放大图，不然鼠标底下那个大光标
@@ -769,7 +797,8 @@ void vidow_cursor_fx_default_cursor(struct vidow_server *server) {
 			return;
 		}
 	}
-	wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "left_ptr");
+	wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr,
+		fx_cursor_name(fx));
 }
 
 /* --------------------------------------------------------------- 状态 / 初始化 */
@@ -820,4 +849,19 @@ void vidow_cursor_fx_init(struct vidow_server *server) {
 		return;
 	}
 	server->cursor_fx = fx;
+}
+
+void vidow_cursor_fx_finish(struct vidow_server *server) {
+	struct vidow_cursor_fx *fx = server->cursor_fx;
+	if (fx == NULL) {
+		return;
+	}
+	server->cursor_fx = NULL;
+	forget_surface(fx);
+	drop_images(fx);
+	if (fx->timer != NULL) {
+		wl_event_source_remove(fx->timer);
+		fx->timer = NULL;
+	}
+	free(fx);
 }

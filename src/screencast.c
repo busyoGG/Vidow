@@ -373,6 +373,33 @@ struct vidow_sc_pw *vidow_sc_pw_create(struct vidow_screencast *sc,
 	return pw;
 }
 
+static void vidow_sc_pw_destroy(struct vidow_sc_pw *pw) {
+	if (pw == NULL) {
+		return;
+	}
+	if (pw->tick != NULL) {
+		wl_event_source_remove(pw->tick);
+		pw->tick = NULL;
+	}
+	if (pw->source != NULL) {
+		wl_event_source_remove(pw->source);
+		pw->source = NULL;
+	}
+	if (pw->core != NULL) {
+		pw_core_disconnect(pw->core);
+		pw->core = NULL;
+	}
+	if (pw->context != NULL) {
+		pw_context_destroy(pw->context);
+		pw->context = NULL;
+	}
+	if (pw->loop != NULL) {
+		pw_loop_destroy(pw->loop);
+		pw->loop = NULL;
+	}
+	free(pw);
+}
+
 /* ------------------------------------------------------------ 流的事件 */
 
 static uint64_t serial_for_node(struct vidow_sc_pw *pw, uint32_t node) {
@@ -1964,4 +1991,25 @@ struct vidow_screencast *vidow_screencast_create(struct wl_display *display,
 	wlr_log(WLR_INFO, "screencast: zkde_screencast_unstable_v1 就绪"
 		"（xdg-desktop-portal-kde 的录屏靠它）");
 	return sc;
+}
+
+void vidow_screencast_finish(struct vidow_server *server) {
+	struct vidow_screencast *sc = server->screencast;
+	if (sc == NULL) {
+		return;
+	}
+	server->screencast = NULL;
+	/* 正常路径下客户端已经先销毁、streams 是空的；这里兜底清掉还挂着的流，
+	 * 避免 pw 状态先释放后它们再回头碰。 */
+	struct vidow_screencast_stream *stream, *tmp;
+	wl_list_for_each_safe(stream, tmp, &sc->streams, link) {
+		stream_destroy(stream);
+	}
+	if (sc->global != NULL) {
+		wl_global_destroy(sc->global);
+		sc->global = NULL;
+	}
+	vidow_sc_pw_destroy(sc->pw);
+	sc->pw = NULL;
+	free(sc);
 }

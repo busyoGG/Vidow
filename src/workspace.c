@@ -482,6 +482,9 @@ static void ws_destroy(struct vidow_server *server,
 		if (view->ws == ws) {
 			view->ws = NULL;
 		}
+		if (view->floats_ws == ws) {
+			view->floats_ws = NULL;
+		}
 	}
 	/* 正被某个过渡推着（理论上去不到：空的才收，空的也不起过渡 —— 留一手）：
 	 * 先把那条过渡收干净，别留一个指向 free 掉的工作区的指针。 */
@@ -740,7 +743,12 @@ bool vidow_workspace_view_visible(struct vidow_server *server,
 	if (view->mini != VIDOW_MINI_NONE) {
 		return view->output != NULL;
 	}
-	struct wlr_output *output = view->output;
+	/* 「这块窗口住哪块屏」：工作区说在哪就在哪。view->output 是住址，热插拔 /
+	 * 规则搬屏的中间态里会短暂分叉；可见性按它判的话，窗口在新屏上不显示、
+	 * 在旧屏上又因为工作区不对而不显示，两边都没有。 */
+	struct wlr_output *output =
+		view->ws != NULL && view->ws->output != NULL ?
+		view->ws->output : view->output;
 	if (output == NULL) {
 		return false;
 	}
@@ -780,6 +788,46 @@ static struct vidow_output *output_of(struct vidow_server *server,
 
 static bool node_enabled(struct wlr_scene_tree *tree) {
 	return tree != NULL && tree->node.enabled;
+}
+
+/* 把「窗口 / 列住哪块屏」对齐到「它所在的工作区住哪块屏」。
+ *
+ * 唯一真值是 ws->output：工作区在屏上，窗口在工作区里，所以窗口就在那块屏上。
+ * view->output / col->output 只是缓存下来的住址，切工作区、规则搬屏、热插拔、
+ * 拖动跨屏都会短暂改到一半；只要有一处没跟上，滚动越界时「按几何框算归属」的
+ * 那条路就会把窗口算到隔壁屏的工作区里。每次 arrange 收口时对齐一遍，任何路径
+ * 都不需要自己记得同步。
+ *
+ * 例外：小窗（mini）是**屏级对象**，view->ws 是 NULL，它自己就是最终住址；
+ * 弹窗不进布局，位置由客户端给死，也不动。 */
+void vidow_workspace_sync_outputs(struct vidow_server *server) {
+	if (server == NULL) {
+		return;
+	}
+	struct vidow_workspace *ws;
+	wl_list_for_each(ws, &server->workspaces, link) {
+		struct vidow_column *col;
+		wl_list_for_each(col, &ws->columns, link) {
+			if (ws->output != NULL && col->output != ws->output) {
+				col->output = ws->output;
+			}
+			struct vidow_view *view;
+			wl_list_for_each(view, &col->views, column_link) {
+				if (ws->output != NULL && view->output != ws->output) {
+					view->output = ws->output;
+				}
+			}
+		}
+	}
+	struct vidow_view *view;
+	wl_list_for_each(view, &server->views, link) {
+		if (view->popup || view->ws == NULL || view->mini != VIDOW_MINI_NONE) {
+			continue;
+		}
+		if (view->ws->output != NULL && view->output != view->ws->output) {
+			view->output = view->ws->output;
+		}
+	}
 }
 
 int vidow_workspace_apply_visibility(struct vidow_server *server) {
@@ -902,6 +950,20 @@ static void focus_workspace(struct vidow_server *server,
 	vidow_arrange(server);
 }
 
+bool vidow_workspace_focus_output(struct vidow_server *server,
+		struct wlr_output *output) {
+	if (server == NULL || output == NULL) {
+		return false;
+	}
+	struct vidow_workspace *ws = vidow_workspace_active_for(server, output);
+	if (ws == NULL) {
+		return false;
+	}
+	server->focused_output = output;
+	focus_workspace(server, ws);
+	return true;
+}
+
 static void ws_adopt_column(struct vidow_workspace *target,
 		struct vidow_column *col) {
 	if (col->ws != NULL && col->ws != target) {
@@ -914,7 +976,12 @@ static void ws_adopt_column(struct vidow_workspace *target,
 	wl_list_for_each(view, &col->views, column_link) {
 		view->ws = target;
 	}
-	if (target->output != NULL && col->output != target->output) {
+	/* **无条件**同步（包括 col->output 已经等于 target->output 的情况）：
+	 * 列里的窗口可能有个别 view->output 落在别的屏上（规则搬屏 / 热插拔的
+	 * 中间态），只看列自己的 output 会漏掉它们，之后 view_home_output 和
+	 * vidow_view_in_output_box 一个按工作区、一个按住址，裁切和停车位就会
+	 * 各算各的。 */
+	if (target->output != NULL) {
 		column_set_output(col, target->output);
 	}
 }
@@ -959,21 +1026,66 @@ struct ws_slide {
 	double from0, to0;
 };
 
+/* 过渡期间旧工作区压在新工作区上面：新工作区只能从旧工作区让出来的
+ * 下方露出来，不能反过来先盖住旧工作区。 */
+static void slide_raise_from(struct vidow_server *server,
+		struct vidow_output *output) {
+	if (server == NULL || output == NULL || output->slide_from == NULL) {
+		return;
+	}
+	struct vidow_view *view;
+	wl_list_for_each(view, &server->views, link) {
+		/* 旧工作区在过渡里**不算可见**（vidow_workspace_view_visible 只认
+		 * 当前工作区），所以这里不能拿它当判据 —— 用它的话整个函数永远
+		 * 不抬任何节点，新工作区（focus 后还会再被 restack 抬一次）就压在
+		 * 旧工作区上面：滑动时看到的是新窗口盖着旧窗口，而不是旧工作区把
+		 * 新的从下面拉进来。 */
+		if (view->ws == output->slide_from && view->scene_tree != NULL &&
+				view->mapped && !view->minimized && !view->popup) {
+			wlr_scene_node_raise_to_top(&view->scene_tree->node);
+		}
+	}
+}
+
+/* focus / restack 会改节点的层级：每次 arrange 之后把过渡里正滑走的旧工作区
+ * 重新抬到上面（见 slide_raise_from）。没有过渡时这是一次空遍历。 */
+void vidow_workspace_slide_raise(struct vidow_server *server) {
+	if (server == NULL) {
+		return;
+	}
+	struct vidow_output *output;
+	wl_list_for_each(output, &server->outputs, link) {
+		slide_raise_from(server, output);
+	}
+}
+
 static void slide_update(void *data, double t, double linear) {
-	(void)linear;
+	(void)t;
 	struct ws_slide *sl = data;
 	if (sl->from == NULL || sl->to == NULL || sl->output == NULL) {
 		return;
 	}
-	double off = (double)sl->height * t;
-	double from_to = sl->dir > 0 ? -off : off;
-	double to_to = sl->dir > 0 ? (double)sl->height - off
-				   : off - (double)sl->height;
-	/* 从**起手那一刻的位置**插值（正常起手时 from0/to0 都是 0，和以前逐字节
-	 * 等价；只有快速连切接手上一条没滑完的进度时它们才非 0）。 */
-	sl->from->slide_y = sl->from0 + (from_to - sl->from0) * t;
-	sl->to->slide_y = sl->to0 + (to_to - sl->to0) * t;
+	/* 两块工作区当成一条连续的带子一起走：旧工作区底边和新工作区顶边
+	 * 始终贴在一起，中间不露背景。旧工作区在场景里压在新工作区上面
+	 * （slide_raise_from），所以看起来是旧工作区把新的从下面拉进来，
+	 * 而不是新的先盖住旧的。 */
+	double from_end = sl->dir > 0 ? -(double)sl->height
+				      : (double)sl->height;
+	double to_start = sl->dir > 0 ? (double)sl->height
+				      : -(double)sl->height;
+	double p = linear;
+	if (p < 0.0) {
+		p = 0.0;
+	} else if (p > 1.0) {
+		p = 1.0;
+	}
+	double k = vidow_ease_value(&sl->server->config.workspace_easing, p);
+	double from_y = sl->from0 + (from_end - sl->from0) * k;
+	double to_y = to_start + (0.0 - to_start) * k;
+	sl->from->slide_y = from_y;
+	sl->to->slide_y = to_y;
 	vidow_arrange(sl->server);
+	slide_raise_from(sl->server, sl->output);
 	vidow_output_schedule_frame(sl->server, sl->output->wlr_output,
 		"切工作区过渡");
 }
@@ -1059,13 +1171,17 @@ static void slide_start(struct vidow_server *server, struct vidow_output *output
 	sl->dir = vidow_workspace_index(to) > vidow_workspace_index(from) ? 1 : -1;
 	sl->from0 = from0;
 	sl->to0 = to0;
+	/* 第一帧 tick 之前就把新工作区放到旧工作区下面，别让它先在屏上闪一帧。 */
+	to->slide_y = sl->dir > 0 ? (double)height : -(double)height;
 
 	output->slide_from = from;
 	server->workspace_slide_n++;
 	sl->anim = vidow_anim_start(server, "切工作区",
-		server->config.workspace_switch_ms, server->config.easing,
-		slide_update, slide_done, sl);
+		server->config.workspace_switch_ms, (struct vidow_ease){
+			.kind = VIDOW_EASE_LINEAR,
+		}, slide_update, slide_done, sl);
 	if (sl->anim == NULL) {
+		to->slide_y = 0.0;
 		output->slide_from = NULL;
 		server->workspace_slide_n--;
 		free(sl);
@@ -1178,6 +1294,7 @@ bool vidow_workspace_activate(struct vidow_server *server,
 
 	focus_workspace(server, ws);
 	vidow_arrange(server);
+	vidow_workspace_slide_raise(server);
 	vidow_ipc_emit_workspace(server, "workspace-activated", ws);
 	/* 刚离开的那块要是空的、没名字的、又在栈中间 —— 收掉（niri：切走就消失）。 */
 	vidow_workspace_cleanup(server);
@@ -1303,9 +1420,22 @@ static void ws_move_tail(struct vidow_server *server, struct vidow_view *view,
  * 整列搬过去（列是工作区的东西）。 */
 bool vidow_workspace_move_view(struct vidow_server *server,
 		struct vidow_view *view, struct vidow_workspace *target) {
-	if (server == NULL || view == NULL || target == NULL ||
-			target == view->ws) {
+	if (server == NULL || view == NULL || target == NULL) {
 		return false;
+	}
+	/* 已经在这块工作区上：不搬列，但**住址要归位**。规则先 workspace 后
+	 * output 时会走到这儿（output 规则解析出的活动工作区正好就是 view->ws），
+	 * 直接返回 false 的话调用方当成「搬不过去」报错，而 view->output 还停在
+	 * 创建时那块屏上 —— 归属和住址就此分叉。 */
+	if (target == view->ws) {
+		if (target->output != NULL) {
+			if (view->column != NULL) {
+				column_set_output(view->column, target->output);
+			} else {
+				view->output = target->output;
+			}
+		}
+		return true;
 	}
 
 	struct vidow_workspace *source = view->ws;
@@ -1510,16 +1640,41 @@ void vidow_workspace_output_added(struct vidow_server *server,
 
 void vidow_workspace_track(struct vidow_workspace *ws,
 		struct vidow_view *view, bool enter) {
-	if (ws == NULL || view == NULL || view->column != NULL) {
+	if (view == NULL) {
+		return;
+	}
+	if (!enter) {
+		/* 摘账以「记在哪块工作区」为准，不信调用方传来的 ws：窗口搬家 /
+		 * 工作区被收掉时那个参数可能已经过期。 */
+		struct vidow_workspace *old = view->floats_ws;
+		if (old == NULL) {
+			return;
+		}
+		view->floats_ws = NULL;
+		if (old->floats > 0) {
+			old->floats--;
+		}
+		return;
+	}
+	if (view->column != NULL) {
 		return; /* 列里的窗口不算浮窗 */
 	}
-	ws->floats += enter ? 1 : -1;
-	if (enter && !ws->special && ws->output != NULL) {
+	if (ws == NULL || view->floats_ws == ws) {
+		return; /* 没工作区可记 / 已经记在这块上了 */
+	}
+	/* 搬到另一块工作区：先把旧账摘掉，再记新的。 */
+	struct vidow_workspace *old = view->floats_ws;
+	if (old != NULL) {
+		view->floats_ws = NULL;
+		if (old->floats > 0) {
+			old->floats--;
+		}
+	}
+	view->floats_ws = ws;
+	ws->floats++;
+	if (!ws->special && ws->output != NULL) {
 		/* 浮窗落在栈底那块空的上了：底下再补一块（记完账再判「空不空」） */
 		vidow_workspace_ensure_bottom(ws->server, ws->output);
-	}
-	if (ws->floats < 0) {
-		ws->floats = 0;
 	}
 }
 
@@ -1532,10 +1687,6 @@ void vidow_workspace_note_focus(struct vidow_workspace *ws,
 
 const char *vidow_workspace_name(const struct vidow_workspace *ws) {
 	return ws != NULL ? ws->name : "";
-}
-
-bool vidow_workspace_is_special(const struct vidow_workspace *ws) {
-	return ws != NULL && ws->special;
 }
 
 bool vidow_workspace_is_active(const struct vidow_workspace *ws) {

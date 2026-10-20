@@ -173,16 +173,18 @@ if grep -aq "grab: w1 插进 HEADLESS-1 的一条列里的第 1 位" "$LOG"; the
 else
 	fail "没有插进列的日志（$(grep -a 'grab:' "$LOG" | tail -1)）"
 fi
-# w1 原来那条列空了就没了，剩下的两条列并到 10 / 391：w1、w3 在同一条列里对半劈
-if [ "$(geom w1)" = "10,10,371,345" ]; then
-	pass "w1 插到了那条列的最上面（高度对半劈）：$(geom w1)"
+# niri 一按下去就把 w1 从布局里摘走：w1 那条列空了，w3 从 391 并到 10。
+# 光标 (698,40) 现在落在 w2 那条列（391）里 → w1 插进 w2 那条列的最上面；
+# w3 自己留在 10 那条列。两条列：w3 在 10（整高），w1/w2 在 391（对半劈）。
+if [ "$(geom w1)" = "391,10,371,345" ]; then
+	pass "w1 插到了 w2 那条列的最上面（高度对半劈）：$(geom w1)"
 else
-	fail "w1 的几何不对：$(geom w1)（期望 10,10,371,345）"
+	fail "w1 的几何不对：$(geom w1)（期望 391,10,371,345）"
 fi
-if [ "$(geom w3)" = "10,365,371,345" ]; then
-	pass "w3 被挤到下半截：$(geom w3)"
+if [ "$(geom w3)" = "10,10,371,700" ]; then
+	pass "w3 那条列并到最左边：$(geom w3)"
 else
-	fail "w3 的几何不对：$(geom w3)（期望 10,365,371,345）"
+	fail "w3 的几何不对：$(geom w3)（期望 10,10,371,700）"
 fi
 if [ "$(cols)" = "2" ]; then
 	pass "列数 3 → 2（w1 原来那条空列拆掉了）"
@@ -198,15 +200,16 @@ start_drag w2 2 360 20 20
 grim -o HEADLESS-1 "$SHOT/new-column.png" 2>/dev/null
 release
 grim -o HEADLESS-1 "$SHOT/after-new-column.png" 2>/dev/null
-if grep -aq "grab: w2 在 HEADLESS-1 的第 1 块工作区里挪到第 1 位" "$LOG"; then
-	pass "落点是「新开一条列、插到第 1 位」（niri 的 NewColumn）"
+if grep -aq "grab: w2 从列里取出来 → HEADLESS-1 上第 1 块工作区的第 1 位" "$LOG"; then
+	pass "落点是「从 w1 那条列里取出来、新开一列插到第 1 位」（niri 的 NewColumn）"
 else
-	fail "没有新列的日志（$(grep -a 'grab:' "$LOG" | tail -1)）"
+	fail "没有取出来成新列的日志（$(grep -a 'grab:' "$LOG" | tail -1)）"
 fi
-if [ "$(field w2 4)" = "10" ] && [ "$(field w1 4)" = "391" ]; then
-	pass "那条列插到了最前面：w2 x=10，w1/w3 那条列让到 391"
+if [ "$(field w2 4)" = "10" ] && [ "$(field w3 4)" = "391" ] &&
+		[ "$(field w1 4)" = "772" ]; then
+	pass "新列插到最前面：w2 x=10，w3 让到 391，w1 让到 772"
 else
-	fail "顺序不对：w2 x=$(field w2 4)（期望 10），w1 x=$(field w1 4)（期望 391）"
+	fail "顺序不对：w2 x=$(field w2 4)（期望 10），w3 x=$(field w3 4)（期望 391），w1 x=$(field w1 4)（期望 772）"
 fi
 
 echo
@@ -219,20 +222,20 @@ start_drag w2 698 700 20 20
 grim -o HEADLESS-1 "$SHOT/into-bottom.png" 2>/dev/null
 release
 grim -o HEADLESS-1 "$SHOT/after-into-bottom.png" 2>/dev/null
-if grep -aq "grab: w2 插进 HEADLESS-1 的一条列里的第 3 位" "$LOG"; then
-	pass "落点是「插进那条列的第 3 位」（贴下边缘 → 落最下面）"
+if grep -aq "grab: w2 插进 HEADLESS-1 的一条列里的第 2 位" "$LOG"; then
+	pass "落点是「插进 w1 那条列的第 2 位」（贴下边缘 → 落最下面）"
 else
-	fail "插进列第 3 位的日志没出现（$(grep -a 'grab:' "$LOG" | tail -1)）"
+	fail "插进列第 2 位的日志没出现（$(grep -a 'grab:' "$LOG" | tail -1)）"
 fi
-if [ "$(geom w2)" = "10,482,371,226" ]; then
-	pass "被拖的那个落在最下面、三个窗口三等分（(700-2×10)/3 = 226）：w2 = $(geom w2)"
+if [ "$(geom w2)" = "391,365,371,345" ]; then
+	pass "被拖的那个落在 w1 下面、两个窗口对半劈：w2 = $(geom w2)"
 else
-	fail "w2 的几何不对：$(geom w2)（期望 10,482,371,226）"
+	fail "w2 的几何不对：$(geom w2)（期望 391,365,371,345）"
 fi
-if [ "$(cols)" = "1" ]; then
-	pass "三个窗口都在同一条列里（列数 2 → 1）"
+if [ "$(cols)" = "2" ]; then
+	pass "w1/w2 并成一条列，w3 自己一条（列数 3 → 2）"
 else
-	fail "列数不对：$(cols)（期望 1）"
+	fail "列数不对：$(cols)（期望 2）"
 fi
 
 echo
@@ -334,9 +337,10 @@ base = px('before-into-bottom.png', 480, 620)
 during = px('into-bottom.png', 480, 620)
 say(pure_blue(base) and is_blend(during, base),
     '插到列最下面时预览块画在底部那截：480,620 %s → %s' % (tuple(base), tuple(during)))
-# 落定之后三个窗口并成一条列（宽 371，贴着屏左边）→ (480,620) 上什么都没有
+# 落定之后 w2 正好盖住那块（391,365 371x345）→ 回到窗口自己的蓝块；
+# 预览块如果没收掉，这里会还是半透明橙。
 after = px('after-into-bottom.png', 480, 620)
-say(dark(after), '松手后预览块收掉了（480,620 那块已经空了 → %s）' % (tuple(after),))
+say(pure_blue(after), '松手后预览块收掉了（480,620 回到窗口蓝 → %s）' % (tuple(after),))
 
 print()
 if not ok:
@@ -393,8 +397,8 @@ act "pointer-motion 40 200" 0.3
 VP1=$(viewport)
 sleep 0.6
 VP2=$(viewport)
-if [ "${VP2:-0}" -lt "${VP1:-0}" ] && [ "${VP1:-0}" -lt "${VP_MAX:-0}" ]; then
-	pass "光标停着不动、没有新 motion 事件，视口自己滚：$VP_MAX → $VP1 → $VP2"
+if [ "${VP_MAX:-0}" -gt 0 ] && [ "${VP2:-0}" = "0" ]; then
+	pass "光标停着不动、没有新 motion 事件，视口自己滚到头：$VP_MAX → $VP1 → $VP2"
 else
 	fail "视口没自己滚：$VP_MAX → $VP1 → $VP2"
 fi

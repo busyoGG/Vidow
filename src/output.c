@@ -131,10 +131,21 @@ void vidow_output_render(struct vidow_output *output) {
 	 * 光标离开边缘或者松手。 */
 	vidow_tile_drag_scroll_step(server);
 
-	/* 临时探针（VIDOW_RENDER_STATS=1）：每帧各阶段耗时 + 贴图导入/重建次数 */
+	/* 先把动画推进到**这一帧**的位置，再抓底衬。
+	 *
+	 * 顺序反了就是「模糊慢半拍」：vidow_blur_update() 按上一帧的 anim_off
+	 * 抓的区域，渲染却用这一帧的新位置，窗口动一下、底衬就落后一帧 —— 看起来
+	 * 像背景跟着窗口一起弹。所有依赖 anim_off 的东西（区域原点、UV）必须和
+	 * 这一帧画出来的位置同一个时刻。 */
 	int64_t st_t0 = vidow_now_ns();
-	vidow_blur_update(output);
+	vidow_anim_tick(server);
+	/* 拖窗口的果冻：积分弹簧、把弯了的窗口重画一遍（见 jelly.c）。 */
+	vidow_jelly_tick(server, vidow_now_ns());
 	int64_t st_t1 = vidow_now_ns();
+
+	/* 临时探针（VIDOW_RENDER_STATS=1）：每帧各阶段耗时 + 贴图导入/重建次数 */
+	vidow_blur_update(output);
+	int64_t st_t2 = vidow_now_ns();
 
 	/* A blurred decoration is only redrawn when this frame's backdrop differs
 	 * from the one already baked into its buffer. On a still screen nothing
@@ -145,13 +156,6 @@ void vidow_output_render(struct vidow_output *output) {
 			vidow_view_apply_anim(view);
 		}
 	}
-
-	/* Progress comes from CLOCK_MONOTONIC, so a slow frame skips ahead
-	 * instead of stretching the animation. */
-	int64_t st_t2 = vidow_now_ns();
-	vidow_anim_tick(server);
-	/* 拖窗口的果冻：积分弹簧、把弯了的窗口重画一遍（见 jelly.c）。 */
-	vidow_jelly_tick(server, vidow_now_ns());
 	int64_t st_t3 = vidow_now_ns();
 
 	/* 屏幕这一帧就是屏幕这一帧：抓帧是 vidow 自己另外渲染的一遍（capture.c /
@@ -163,9 +167,9 @@ void vidow_output_render(struct vidow_output *output) {
 	wlr_scene_output_commit(output->scene_output, NULL);
 	int64_t st_t4 = vidow_now_ns();
 	if (render_stats_on()) {
-		vidow_stats.blur_ns += st_t1 - st_t0;
-		vidow_stats.decor_ns += st_t2 - st_t1;
-		vidow_stats.jelly_ns += st_t3 - st_t2;
+		vidow_stats.jelly_ns += st_t1 - st_t0;
+		vidow_stats.blur_ns += st_t2 - st_t1;
+		vidow_stats.decor_ns += st_t3 - st_t2;
 		vidow_stats.commit_ns += st_t4 - st_t3;
 		vidow_stats.frames++;
 		static int64_t win_ns = 0;
@@ -488,6 +492,9 @@ static void output_frame(struct wl_listener *listener, void *data) {
 			(output->frame_gap_ns * 3 + gap_ns) / 4 : gap_ns;
 	}
 	output->last_frame_ns = now_ns;
+	/* X11 游戏退出全屏可能只改属性、不再交帧：每帧对一遍，别让状态栏一直
+	 * 被当成「还在全屏底下」藏着。 */
+	vidow_views_sync_x11_fullscreen(server);
 	vidow_output_render(output);
 
 	/* An animating node usually damages the scene, but not always (a pure

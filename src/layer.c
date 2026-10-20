@@ -5,7 +5,76 @@
 #include <stdlib.h>
 
 #include <wlr/types/wlr_buffer.h>
+#include <wlr/types/wlr_fractional_scale_v1.h>
 #include <wlr/util/log.h>
+
+struct layer_scale_ctx {
+	int32_t want;
+};
+
+static void layer_pin_scale_surface(struct wlr_surface *surface, int sx, int sy,
+		void *data) {
+	(void)sx;
+	(void)sy;
+	struct layer_scale_ctx *ctx = data;
+	if (surface->WLR_PRIVATE.preferred_buffer_scale == ctx->want) {
+		return;
+	}
+	wlr_surface_set_preferred_buffer_scale(surface, ctx->want);
+	wlr_fractional_scale_v1_notify_scale(surface, (double)ctx->want);
+}
+
+/* layer surface 也要按它所在那块屏的倍率画。wlroots 的 scene layer 只负责
+ * enter / leave，不会替我们钉 preferred_buffer_scale；2x 屏上状态栏 / 菜单
+ * 于是按 1x 的缓冲铺满整块，屏幕上就是「分辨率糊了」。和 view_pin_scale 一样
+ * 只在值变化时发，避免客户端每帧重算。 */
+static void layer_pin_popup_scale(struct vidow_layer_surface *ls,
+		struct wlr_xdg_popup *popup) {
+	if (ls == NULL || popup == NULL || popup->base == NULL ||
+			popup->base->surface == NULL || ls->output == NULL) {
+		return;
+	}
+	double scale = ls->output->wlr_output->scale;
+	if (!(scale > 0.0)) {
+		scale = 1.0;
+	}
+	int32_t want = (int32_t)lround(scale);
+	if (want < 1) {
+		want = 1;
+	}
+	struct wlr_surface *surface = popup->base->surface;
+	wlr_surface_set_preferred_buffer_scale(surface, want);
+	wlr_fractional_scale_v1_notify_scale(surface, (double)want);
+	struct layer_scale_ctx ctx = { .want = want };
+	wlr_surface_for_each_surface(surface, layer_pin_scale_surface, &ctx);
+}
+
+static void layer_pin_scale(struct vidow_layer_surface *ls) {
+	if (ls == NULL || ls->layer_surface == NULL ||
+			ls->layer_surface->surface == NULL || ls->output == NULL) {
+		return;
+	}
+	double scale = ls->output->wlr_output->scale;
+	if (!(scale > 0.0)) {
+		scale = 1.0;
+	}
+	int32_t want = (int32_t)lround(scale);
+	if (want < 1) {
+		want = 1;
+	}
+	if (ls->pref_scale == want) {
+		return;
+	}
+	ls->pref_scale = want;
+	struct wlr_surface *surface = ls->layer_surface->surface;
+	wlr_surface_set_preferred_buffer_scale(surface, want);
+	wlr_fractional_scale_v1_notify_scale(surface, (double)want);
+	struct layer_scale_ctx ctx = { .want = want };
+	wlr_surface_for_each_surface(surface, layer_pin_scale_surface, &ctx);
+	wlr_log(WLR_INFO, "layer %s: 钉住 preferred_buffer_scale = %d",
+		ls->layer_surface->namespace != NULL ?
+			ls->layer_surface->namespace : "?", want);
+}
 
 static struct wlr_scene_tree *layer_tree(struct vidow_server *server,
 		uint32_t layer) {
@@ -93,6 +162,44 @@ static void layer_apply_anim(struct vidow_layer_surface *ls) {
 	}
 }
 
+/* 全屏窗口底下那条「看不见但还在吃输入」的状态栏：layer 节点关掉，
+ * 场景命中测试就不会再落它头上。只动 top 层且 exclusive_zone > 0 的
+ * （状态栏 / dock 那类占位的）；通知、截图 overlay（exclusive_zone = -1）
+ * 照旧显示。 */
+void vidow_layers_update_fullscreen(struct vidow_server *server) {
+	if (server == NULL) {
+		return;
+	}
+	struct vidow_output *output;
+	wl_list_for_each(output, &server->outputs, link) {
+		bool full = false;
+		struct vidow_view *view;
+		wl_list_for_each(view, &server->views, link) {
+			if (view->popup || !view->fullscreen || !view->mapped ||
+					view->scene_parked) {
+				continue;
+			}
+			struct wlr_output *want = view->ws != NULL &&
+				view->ws->output != NULL ? view->ws->output : view->output;
+			if (want == output->wlr_output &&
+					vidow_workspace_view_visible(server, view)) {
+				full = true;
+				break;
+			}
+		}
+		struct vidow_layer_surface *ls;
+		wl_list_for_each(ls, &server->layers, link) {
+			if (ls->output != output ||
+					ls->layer != ZWLR_LAYER_SHELL_V1_LAYER_TOP ||
+					ls->scene == NULL ||
+					ls->layer_surface->current.exclusive_zone <= 0) {
+				continue;
+			}
+			wlr_scene_node_set_enabled(&ls->scene->tree->node, !full);
+		}
+	}
+}
+
 /* Position every layer surface and recompute each output's usable area.
  * Called whenever the set of layer surfaces changes.
  *
@@ -127,6 +234,7 @@ void vidow_arrange_layers(struct vidow_server *server) {
 				if (!ls->layer_surface->initialized) {
 					continue;
 				}
+				layer_pin_scale(ls);
 				wlr_log(WLR_DEBUG, "configure layer %s layer=%u",
 					ls->layer_surface->namespace ?: "?", layer);
 				/* configure() writes the node position itself; clear our
@@ -168,6 +276,9 @@ static void layer_focus(struct vidow_layer_surface *ls) {
 	struct wlr_seat *seat = server->seat;
 	struct wlr_keyboard *kb = wlr_seat_get_keyboard(seat);
 
+	if (server->keyboard_layer == NULL) {
+		server->focus_before_layer = server->focused;
+	}
 	server->keyboard_layer = ls;
 	if (kb != NULL) {
 		wlr_seat_keyboard_notify_enter(seat, ls->layer_surface->surface,
@@ -187,8 +298,13 @@ static void layer_unfocus(struct vidow_layer_surface *ls) {
 	}
 	server->keyboard_layer = NULL;
 
-	/* Hand the keyboard back to the last focused toplevel, if any. */
-	struct vidow_view *view = server->focused;
+	/* Hand the keyboard back to the toplevel that had it before this layer
+	 * grabbed it. 不能直接用 server->focused：layer 活着期间它可能已经被
+	 * 别处改过（点通知 / 客户端 activate），那样截图一关焦点就跑到下一个
+	 * 窗口去了。 */
+	struct vidow_view *view = server->focus_before_layer != NULL ?
+		server->focus_before_layer : server->focused;
+	server->focus_before_layer = NULL;
 	if (view != NULL) {
 		wlr_seat_keyboard_notify_clear_focus(server->seat);
 		vidow_focus_view(view);
@@ -269,10 +385,34 @@ static void layer_anim_done(void *data, bool cancelled) {
 	layer_apply_anim(ls);
 }
 
+/* 有些 layer 不该有开合动画：截图 overlay 自己弹一下纯属碍事，通知也是
+ * 「来就来了」，回弹反而像窗口。规则里显式写了 anim / open_ms / close_ms
+ * 的以规则为准（用户明确要动就动）。 */
+static bool layer_anim_skip(const struct vidow_layer_surface *ls) {
+	const char *ns = ls->layer_surface->namespace;
+	if (ns == NULL) {
+		return false;
+	}
+	if (strncmp(ns, "vshot", 5) == 0) {
+		return true;
+	}
+	if (strstr(ns, "notif") != NULL ||
+			strcmp(ns, "mako") == 0 || strcmp(ns, "dunst") == 0 ||
+			strcmp(ns, "fnott") == 0 || strcmp(ns, "swaync") == 0) {
+		return true;
+	}
+	return false;
+}
+
 static void layer_open_anim(struct vidow_layer_surface *ls) {
 	struct vidow_config *cfg = &ls->server->config;
 	struct vidow_rule_anim anim;
 	vidow_rule_anim(cfg, &ls->rule_eff, true, &anim);
+	if (layer_anim_skip(ls) &&
+			!ls->rule_eff.set[VRA_ANIM] &&
+			!ls->rule_eff.set[VRA_OPEN_MS]) {
+		anim.open_ms = 0;
+	}
 	/* 图层规则 anim = false / open_ms = 0：不滑也不淡，直接到位（时长 0 会让
 	 * vidow_anim_start 返回 NULL，下面那段就是「瞬间到位」）。 */
 	if (anim.open_ms <= 0) {
@@ -299,7 +439,7 @@ static void layer_open_anim(struct vidow_layer_surface *ls) {
 
 	vidow_anim_cancel(ls->anim);
 	ls->anim = vidow_anim_start(ls->server, "layer-open", anim.open_ms,
-		cfg->easing, layer_anim_update, layer_anim_done, ls);
+		cfg->layer_open_easing, layer_anim_update, layer_anim_done, ls);
 	if (ls->anim == NULL) {
 		ls->anim_off_x = 0.0;
 		ls->anim_off_y = 0.0;
@@ -313,6 +453,11 @@ static void layer_snapshot_close(struct vidow_layer_surface *ls) {
 	struct vidow_config *cfg = &server->config;
 	struct vidow_rule_anim anim;
 	vidow_rule_anim(cfg, &ls->rule_eff, true, &anim);
+	if (layer_anim_skip(ls) &&
+			!ls->rule_eff.set[VRA_ANIM] &&
+			!ls->rule_eff.set[VRA_CLOSE_MS]) {
+		anim.close_ms = 0;
+	}
 	if (ls->last_buffer == NULL || anim.close_ms <= 0 ||
 			ls->geom.width <= 0 || ls->geom.height <= 0) {
 		/* 「怎么没有关闭动画」在窗口那条路上是收到过的反馈（见 view.c），图层
@@ -346,8 +491,9 @@ static void layer_snapshot_close(struct vidow_layer_surface *ls) {
 		dy * slide, false /* 不套窗口装饰：layer 自己就是内容 */, NULL,
 		ls->output != NULL && ls->output->wlr_output != NULL ?
 			(double)ls->output->wlr_output->scale : 1.0,
-		/* layer 的关闭沿用全局 easing、也不缩放：状态栏「缩着淡出」很怪。 */
-		cfg->easing, 1.0, &ls->rule_eff, false /* layer 没有「全屏」这回事 */);
+		/* layer 的关闭用 layer_close_easing、也不缩放：状态栏「缩着淡出」很怪。 */
+		cfg->layer_close_easing, 1.0, &ls->rule_eff,
+		false /* layer 没有「全屏」这回事 */);
 }
 
 /* --------------------------------------------------------------- events */
@@ -361,6 +507,7 @@ static void layer_surface_map(struct wl_listener *listener, void *data) {
 		ls->layer_surface->namespace != NULL ? ls->layer_surface->namespace : "?",
 		ls->layer, ls->layer_surface->current.exclusive_zone,
 		ls->layer_surface->current.keyboard_interactive);
+	layer_pin_scale(ls);
 
 	if (ls->layer_surface->current.keyboard_interactive !=
 			ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE) {
@@ -402,6 +549,7 @@ static void layer_surface_commit(struct wl_listener *listener, void *data) {
 	struct vidow_layer_surface *ls = wl_container_of(listener, ls, commit);
 	struct vidow_server *server = ls->server;
 
+	layer_pin_scale(ls);
 	/* The first configure must reflect the state the client just committed
 	 * (anchor, exclusive zone, desired size). */
 	if (ls->layer_surface->initial_commit) {
@@ -422,6 +570,13 @@ static void layer_surface_commit(struct wl_listener *listener, void *data) {
 	if (ls->layer <= ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM) {
 		vidow_backdrop_damage(server, true);
 	}
+
+	/* 这块 layer 自己的内容刚交了新帧：它背后的模糊拿它的缓冲当 mask
+	 * （fx.c 的 layer_blur_frame），不重画就一直是上一版的 alpha / 形状。
+	 * 典型现场：状态栏弹出菜单时透明区域变了，底下的模糊还按旧 mask 剔，
+	 * 看着就是「层的内容动了、模糊没跟上」。底衬是否重抓仍由 gen / damage
+	 * 判断，这里只作废已画的那一版（重画一次，不重抓底衬）。 */
+	vidow_layer_blur_invalidate(ls);
 }
 
 static void layer_surface_destroy(struct wl_listener *listener, void *data) {
@@ -493,6 +648,7 @@ static void layer_surface_new_popup(struct wl_listener *listener, void *data) {
 	 * vidow_popup_scene_create 里，跟窗口那条路共用（漏了这里就是子菜单错位，
 	 * 见 server.h 的说明）。 */
 	vidow_popup_scene_create(server, ls->scene->tree, popup);
+	layer_pin_popup_scale(ls, popup);
 
 	struct wlr_box box = {0};
 	vidow_popup_box_to_layer_space(server, ls, &box);

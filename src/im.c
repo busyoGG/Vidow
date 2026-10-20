@@ -75,10 +75,19 @@ static void im_set_active(struct vidow_server *server, bool active) {
 
 static void im_popup_clear(struct vidow_im_popup *popup) {
 	if (popup->popup == NULL) {
+		if (popup->blur != NULL) {
+			vidow_popup_blur_unregister(popup->blur, true);
+			popup->blur = NULL;
+		}
 		return;
 	}
 	wl_list_remove(&popup->commit.link);
 	wl_list_remove(&popup->destroy.link);
+	/* 模糊节点挂在 layer_im 上，不跟着候选框的表面节点走：先自己收掉。 */
+	if (popup->blur != NULL) {
+		vidow_popup_blur_unregister(popup->blur, true);
+		popup->blur = NULL;
+	}
 	if (popup->scene != NULL) {
 		wlr_scene_node_destroy(&popup->scene->buffer->node);
 	}
@@ -110,6 +119,10 @@ static void im_popup_update(struct vidow_server *server) {
 	int px = vx + view->fx_dx + rect.x;
 	int py = vy + view->fx_dy + rect.y + rect.height;
 	wlr_scene_node_set_position(&popup->scene->buffer->node, px, py);
+	/* 候选框挪了：背后那块模糊的采样坐标 / 区域跟着变，下一帧重画。 */
+	if (popup->blur != NULL) {
+		vidow_popup_blur_invalidate(popup->blur);
+	}
 	/* 输入法只认候选框自己的坐标系：给它相对候选框左上角的光标矩形 */
 	struct wlr_box rel = {
 		.x = -rect.x,
@@ -274,9 +287,16 @@ static void im_new_popup(struct wl_listener *listener, void *data) {
 	wl_signal_add(&surface->surface->events.commit, &popup->commit);
 	popup->destroy.notify = im_popup_destroy;
 	wl_signal_add(&surface->events.destroy, &popup->destroy);
+	/* 候选框背后的模糊：节点挂在 layer_im 上，垫在候选框表面下面（位置每帧
+	 * 按绝对坐标摆，见 im_popup_update）。 */
+	popup->blur = vidow_popup_blur_register(server, server->layer_im,
+		&popup->scene->buffer->node, surface->surface, NULL, "im", NULL);
 	wlr_log(WLR_DEBUG, "input method popup surface");
 	im_popup_update(server);
 }
+
+static void im_detach_method(struct vidow_im *im,
+		struct wlr_input_method_v2 *method);
 
 /* 输入法回话：把 preedit / commit / 删除请求转给客户端输入框。 */
 static void im_commit(struct wl_listener *listener, void *data) {
@@ -296,9 +316,12 @@ static void im_commit(struct wl_listener *listener, void *data) {
 		 * 里第一行就是 assert(input_method->active)。Proton 游戏全屏抢键盘会让
 		 * 输入法失活，这时客户端还送过来一次 commit，我们再发 unavailable 就是
 		 * 一次 SIGABRT（实测 2026-10-18 23:49:51 崩过一次，栈顶正是这里）。 */
-		if (method->active) {
-			wlr_input_method_v2_send_unavailable(method);
-		}
+		/* 这里**绝不能** send_unavailable：那会在 commit 信号的回调里
+		 * 把 method 自己销毁掉（input_method_destroy 还要断言各条
+		 * listener 已经摘干净），实测 2026-10-20 00:35 就是这么崩的
+		 * （SIGABRT，栈顶 input_method_destroy 的 commit.listener_list
+		 * 断言）。没有输入框就静默丢掉这一次 commit，输入法还在，
+		 * 下一个输入框聚焦时会重新 activate。 */
 		return;
 	}
 	struct wlr_text_input_v3 *input = ti->input;
@@ -332,22 +355,12 @@ static void im_grab_destroy(struct wl_listener *listener, void *data);
  * 用了」）。这里存一份静态指针，键 / 修饰键的出口在 input.c 里查它。 */
 static struct wlr_input_method_keyboard_grab_v2 *active_grab;
 
-bool vidow_im_grab_active(void) {
-	return active_grab != NULL;
-}
-
 void vidow_im_grab_send_key(uint32_t time_msec, uint32_t keycode, bool pressed) {
 	if (active_grab == NULL) {
 		return;
 	}
 	wlr_input_method_keyboard_grab_v2_send_key(active_grab, time_msec, keycode,
 		pressed ? WL_KEYBOARD_KEY_STATE_PRESSED : WL_KEYBOARD_KEY_STATE_RELEASED);
-}
-
-void vidow_im_grab_send_modifiers(struct wlr_keyboard_modifiers *mods) {
-	if (active_grab != NULL && mods != NULL) {
-		wlr_input_method_keyboard_grab_v2_send_modifiers(active_grab, mods);
-	}
 }
 
 static void im_grab_keyboard(struct wl_listener *listener, void *data) {
@@ -389,12 +402,18 @@ static void im_grab_destroy(struct wl_listener *listener, void *data) {
 	wlr_log(WLR_DEBUG, "input method released the keyboard");
 }
 
-static void im_destroy(struct wl_listener *listener, void *data) {
-	(void)data;
-	struct vidow_im *im = wl_container_of(listener, im, destroy);
-	struct vidow_server *server = im->server;
-
-	im_popup_clear(&server->im_popup);
+/* 把一个 method 从 im 上摘干净（监听器全部摘掉、候选框收掉）。
+ *
+ * 必须在 wlr_input_method_v2_send_unavailable() **之前**调：wlroots 的
+ * input_method_destroy() 会断言 commit / new_popup / grab_keyboard / destroy
+ * 四条 listener_list 都为空，而我们的 listener 不摘就还在上面 —— 那就是
+ * SIGABRT。 */
+static void im_detach_method(struct vidow_im *im,
+		struct wlr_input_method_v2 *method) {
+	if (im == NULL || method == NULL || im->method != method) {
+		return;
+	}
+	im_popup_clear(&im->server->im_popup);
 	if (im->grab != NULL) {
 		wl_list_remove(&im->grab_destroy.link);
 		im->grab = NULL;
@@ -404,8 +423,18 @@ static void im_destroy(struct wl_listener *listener, void *data) {
 	wl_list_remove(&im->new_popup.link);
 	wl_list_remove(&im->grab_keyboard.link);
 	wl_list_remove(&im->destroy.link);
+	wl_list_init(&im->commit.link);
+	wl_list_init(&im->new_popup.link);
+	wl_list_init(&im->grab_keyboard.link);
+	wl_list_init(&im->destroy.link);
 	im->method = NULL;
 	im->active = false;
+}
+
+static void im_destroy(struct wl_listener *listener, void *data) {
+	(void)data;
+	struct vidow_im *im = wl_container_of(listener, im, destroy);
+	im_detach_method(im, im->method);
 	wlr_log(WLR_INFO, "input method disconnected");
 }
 
@@ -416,12 +445,13 @@ static void server_new_input_method(struct wl_listener *listener, void *data) {
 	struct vidow_im *im = &server->im;
 
 	if (im->method != NULL) {
-		/* 一个就够：后来的直接劝退。同样要先看 active（新连上来的默认不活跃，
-		 * 直接发会踩 wlroots 那个 assert）。 */
+		/* 一个就够：后来的直接拒绝。
+		 *
+		 * 这里**不发 send_unavailable**：wlroots 0.20 在输入法重连这条路上
+		 * 会在 send_unavailable 里 assert（实测 2026-10-20 00:35 的 core，
+		 * 栈顶正是 wlr_input_method_v2_send_unavailable）。第二个输入法
+		 * 本来就不该接管，静默拒绝即可；发 unavailable 只是礼貌，不值得崩。 */
 		wlr_log(WLR_INFO, "another input method tried to connect, refusing");
-		if (method->active) {
-			wlr_input_method_v2_send_unavailable(method);
-		}
 		return;
 	}
 	im->method = method;
@@ -441,10 +471,6 @@ static void server_new_input_method(struct wl_listener *listener, void *data) {
 }
 
 /* ------------------------------------------------------------------- api */
-
-bool vidow_im_grabbed(struct vidow_server *server) {
-	return server->im.grab != NULL;
-}
 
 bool vidow_im_owns_keyboard(struct vidow_server *server,
 		struct vidow_keyboard *kb) {

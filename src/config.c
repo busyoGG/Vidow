@@ -221,9 +221,25 @@ static const struct entry entries[] = {
 		"模糊强度倍数" },
 	{ "blur_alpha_min",  K_DOUBLE, OFF(blur_alpha_min),  SZ(blur_alpha_min), 2,
 		"窗口内容透明度低于这个值的地方不参与模糊（省 GPU）" },
+	{ "popup_blur_enabled", K_BOOL, OFF(popup_blur_enabled),
+		SZ(popup_blur_enabled), 2,
+		"弹出物（菜单 / tooltip / 输入法候选框）背后的模糊开关" },
+	{ "popup_blur_alpha_min", K_DOUBLE, OFF(popup_blur_alpha_min),
+		SZ(popup_blur_alpha_min), 2,
+		"弹出物模糊的透明度剔除阈值（0 = 菜单 1/255、输入法 0.35）" },
 	{ "blur_offset",     K_DOUBLE, OFF(blur_offset),     SZ(blur_offset), 2,
 		"模糊采样偏移，越大越散" },
 
+	/* window / layer 两大概括的组默认值。只由 window = { ms=…, easing=… }
+	 * 或 layer = { ms=…, easing=… } 写；解析时铺到下面那些具体键上。 */
+	{ "window_anim_ms",  K_INT,    OFF(window_anim_ms),  SZ(window_anim_ms), 3,
+		"window 组统一时长（铺到打开/关闭/移动/工作区/列宽；0 = 不动画）" },
+	{ "window_anim_easing", K_EASING, OFF(window_anim_easing), SZ(window_anim_easing), 3,
+		"window 组统一曲线（铺到打开/关闭/移动/工作区/列宽）" },
+	{ "layer_anim_ms",   K_INT,    OFF(layer_anim_ms),   SZ(layer_anim_ms), 3,
+		"layer 组统一时长（铺到出现/消失）" },
+	{ "layer_anim_easing", K_EASING, OFF(layer_anim_easing), SZ(layer_anim_easing), 3,
+		"layer 组统一曲线（铺到出现/消失）" },
 	{ "window_open_ms",  K_INT,    OFF(window_open_ms),  SZ(window_open_ms), 3,
 		"窗口打开动画时长（毫秒，0 = 不动画）" },
 	{ "window_close_ms", K_INT,    OFF(window_close_ms), SZ(window_close_ms), 3,
@@ -233,12 +249,22 @@ static const struct entry entries[] = {
 	{ "column_width_ms", K_INT,    OFF(column_width_ms), SZ(column_width_ms), 3,
 		"列宽变化的过渡时长（cycle-column-width / 列最大化 / IPC 改宽；0 = 直接"
 		"到位。拖动改宽不补间 —— 那个必须跟手）" },
+	{ "column_width_easing", K_EASING, OFF(column_width_easing), SZ(column_width_easing), 3,
+		"列宽变化的缓动曲线（默认 out_cubic）" },
 	{ "workspace_switch_ms", K_INT, OFF(workspace_switch_ms), SZ(workspace_switch_ms), 3,
 		"切工作区的过渡时长（旧的推开、新的从另一边进来；0 = 直接换）" },
+	{ "workspace_easing", K_EASING, OFF(workspace_easing), SZ(workspace_easing), 3,
+		"切工作区的缓动曲线（默认 out_cubic；out_back 会回弹）" },
+	{ "window_move_easing", K_EASING, OFF(window_move_easing), SZ(window_move_easing), 3,
+		"普通布局重排的位移补间曲线（默认 out_cubic；out_back 会回弹）" },
 	{ "layer_open_ms",   K_INT,    OFF(layer_open_ms),   SZ(layer_open_ms), 3,
 		"layer-shell（状态栏、通知、挂件）出现的动画时长" },
 	{ "layer_close_ms",  K_INT,    OFF(layer_close_ms),  SZ(layer_close_ms), 3,
 		"layer-shell 消失的动画时长" },
+	{ "layer_open_easing", K_EASING, OFF(layer_open_easing), SZ(layer_open_easing), 3,
+		"layer-shell 出现动画的曲线（默认 out_cubic）" },
+	{ "layer_close_easing", K_EASING, OFF(layer_close_easing), SZ(layer_close_easing), 3,
+		"layer-shell 消失动画的曲线（默认 out_cubic）" },
 	{ "easing",          K_EASING, OFF(easing),          SZ(easing), 3,
 		"缓动曲线：linear / out_cubic / out_quint / in_out_cubic / out_back / "
 		"out_elastic，也可以自己给一条三次贝塞尔 \"bezier 0.05 0.9 0.1 1.08\""
@@ -718,6 +744,8 @@ static const struct group_field blur_fields[] = {
 	{ "levels",    "blur_levels" },
 	{ "strength",  "blur_strength" },
 	{ "alpha_min", "blur_alpha_min" },
+	{ "popup_enabled", "popup_blur_enabled" },
+	{ "popup_alpha_min", "popup_blur_alpha_min" },
 	{ "offset",    "blur_offset" },
 };
 static const struct group_field anim_fields[] = {
@@ -738,6 +766,31 @@ static const struct group_field anim_fields[] = {
 	{ "close_scale_to", "close_scale_to" },
 	{ "jelly",          "jelly" },
 	{ "jelly_strength", "jelly_strength" },
+};
+/* 动画的两大类：window（里面再分 workspace / move / open / close /
+ * column_width）和 layer。组里的 ms/easing 是这一大类的统一默认值，
+ * 具体项写在同一个表里就覆盖它。平铺键仍然能用（老配置 / IPC / 测试）。 */
+static const struct group_field window_fields[] = {
+	{ "ms",                 "window_anim_ms" },
+	{ "easing",             "window_anim_easing" },
+	{ "open_ms",            "window_open_ms" },
+	{ "open_easing",        "open_easing" },
+	{ "close_ms",           "window_close_ms" },
+	{ "close_easing",       "close_easing" },
+	{ "move_ms",            "window_move_ms" },
+	{ "move_easing",        "window_move_easing" },
+	{ "workspace_ms",       "workspace_switch_ms" },
+	{ "workspace_easing",   "workspace_easing" },
+	{ "column_width_ms",    "column_width_ms" },
+	{ "column_width_easing", "column_width_easing" },
+};
+static const struct group_field layer_fields[] = {
+	{ "ms",           "layer_anim_ms" },
+	{ "easing",       "layer_anim_easing" },
+	{ "open_ms",      "layer_open_ms" },
+	{ "open_easing",  "layer_open_easing" },
+	{ "close_ms",     "layer_close_ms" },
+	{ "close_easing", "layer_close_easing" },
 };
 static const struct group_field shader_fields[] = {
 	{ "enabled", "shader_enabled" },
@@ -829,6 +882,8 @@ static const struct group groups[] = {
 	GROUP("shadow",    NULL,             shadow_fields),
 	GROUP("blur",      "blur_enabled",   blur_fields),
 	GROUP("anim",      NULL,             anim_fields),
+	GROUP("window",    NULL,             window_fields),
+	GROUP("layer",     NULL,             layer_fields),
 	GROUP("shader",    "shader_enabled", shader_fields),
 	GROUP("clipboard", "clipboard",      clipboard_fields),
 	GROUP("ipc",       "ipc",            ipc_fields),
@@ -1158,10 +1213,13 @@ static bool parse_easing(const char *value, struct vidow_ease *out) {
  * 顺手把幅度反解成 ease() 要用的常数（每帧反解一次太亏，见 anim.c）。
  * 改完三个 easing 键、改完 back_overshoot 都要过一遍（见 apply()）。 */
 static void sync_easings(struct vidow_config *cfg) {
-	struct vidow_ease *all[3] = {
-		&cfg->easing, &cfg->open_easing, &cfg->close_easing,
+	struct vidow_ease *all[10] = {
+		&cfg->easing, &cfg->workspace_easing, &cfg->window_move_easing,
+		&cfg->open_easing, &cfg->close_easing, &cfg->window_anim_easing,
+		&cfg->layer_anim_easing, &cfg->layer_open_easing,
+		&cfg->layer_close_easing, &cfg->column_width_easing,
 	};
-	for (int i = 0; i < 3; i++) {
+	for (int i = 0; i < 10; i++) {
 		struct vidow_ease *e = all[i];
 		if (e->kind != VIDOW_EASE_OUT_BACK) {
 			continue;
@@ -1933,9 +1991,43 @@ static bool apply_one(struct vidow_config *cfg, const char *key,
 /* 一个键的赋值。三条写路径（config.lua / VIDOW_<键> / IPC set-config）最后都落
  * 到这儿，所以「改完通知谁」挂在这一层，一处盖全（见 vidow_config_observe）。
  * 值不合法（返回 false）就不通知 —— 那种情况配置其实没变。 */
+/* window = { ms=…, easing=… } / layer = { ms=…, easing=… } 的组默认值：
+ * 铺到具体键上。具体项在同一个表里按 window_fields / layer_fields 的顺序
+ * 后写，所以会覆盖这里。 */
+static void anim_group_propagate(struct vidow_config *cfg, const char *key) {
+	if (strcmp(key, "window_anim_ms") == 0) {
+		cfg->window_open_ms = cfg->window_anim_ms;
+		cfg->window_close_ms = cfg->window_anim_ms;
+		cfg->window_move_ms = cfg->window_anim_ms;
+		cfg->workspace_switch_ms = cfg->window_anim_ms;
+		cfg->column_width_ms = cfg->window_anim_ms;
+		return;
+	}
+	if (strcmp(key, "window_anim_easing") == 0) {
+		cfg->open_easing = cfg->window_anim_easing;
+		cfg->close_easing = cfg->window_anim_easing;
+		cfg->window_move_easing = cfg->window_anim_easing;
+		cfg->workspace_easing = cfg->window_anim_easing;
+		cfg->column_width_easing = cfg->window_anim_easing;
+		sync_easings(cfg);
+		return;
+	}
+	if (strcmp(key, "layer_anim_ms") == 0) {
+		cfg->layer_open_ms = cfg->layer_anim_ms;
+		cfg->layer_close_ms = cfg->layer_anim_ms;
+		return;
+	}
+	if (strcmp(key, "layer_anim_easing") == 0) {
+		cfg->layer_open_easing = cfg->layer_anim_easing;
+		cfg->layer_close_easing = cfg->layer_anim_easing;
+		sync_easings(cfg);
+	}
+}
+
 static bool apply(struct vidow_config *cfg, const char *key, const char *value) {
 	bool ok = apply_one(cfg, key, value);
 	if (ok) {
+		anim_group_propagate(cfg, key);
 		config_notify(cfg, key);
 	}
 	return ok;
@@ -2154,7 +2246,16 @@ static void defaults(struct vidow_config *cfg) {
 	cfg->workspace_switch_ms = 200;
 	cfg->layer_open_ms = 200;
 	cfg->layer_close_ms = 150;
+	cfg->window_anim_ms = 0;
+	cfg->layer_anim_ms = 0;
 	ease_set(&cfg->easing, VIDOW_EASE_OUT_CUBIC);
+	ease_set(&cfg->workspace_easing, VIDOW_EASE_OUT_CUBIC);
+	ease_set(&cfg->window_move_easing, VIDOW_EASE_OUT_CUBIC);
+	ease_set(&cfg->window_anim_easing, VIDOW_EASE_OUT_CUBIC);
+	ease_set(&cfg->layer_anim_easing, VIDOW_EASE_OUT_CUBIC);
+	ease_set(&cfg->layer_open_easing, VIDOW_EASE_OUT_CUBIC);
+	ease_set(&cfg->layer_close_easing, VIDOW_EASE_OUT_CUBIC);
+	ease_set(&cfg->column_width_easing, VIDOW_EASE_OUT_CUBIC);
 	/* out_back 的回弹幅度：0.10 = 冲过终点 10%，就是原来写死那个常数的样子。
 	 * 曲线自己带幅度的（"out_back 0.2"）不看这个值（见 sync_easings）。 */
 	cfg->back_overshoot = 0.10;
@@ -2258,6 +2359,8 @@ static void defaults(struct vidow_config *cfg) {
 	cfg->blur_levels = 3;
 	cfg->blur_strength = 1.0;
 	cfg->blur_alpha_min = 0.15;
+	cfg->popup_blur_enabled = true;
+	cfg->popup_blur_alpha_min = 0.0; /* 0 = 用各自默认值 */
 	cfg->blur_offset = 1.5;
 
 	cfg->shader_enabled = true;
@@ -2563,7 +2666,7 @@ static const struct {
 	{ 0, "gaps" },
 	{ 1, "decor" }, { 1, "border" }, { 1, "shadow" },
 	{ 2, "blur" },
-	{ 3, "anim" },
+	{ 3, "window" }, { 3, "layer" },
 	{ 4, "shader" },
 	{ 6, "clipboard" },
 	{ 7, "ipc" },
@@ -2974,6 +3077,9 @@ static void print_keys_lua(FILE *f) {
 "--     focus_on_open = false      它开窗的时候不抢焦点（Electron 系那种看不见的\n"
 "--                                辅助窗口会开个窗口把自己顶上来）\n"
 "--     focus_on_activate = false  别人请求激活它（点通知 / 任务栏按钮）时不理\n"
+"--     fake_focus = true          焦点移走时也让客户端以为它还激活（xdg activated /\n"
+"--                                X11 focused）。给那种一失焦就暂停 / 收 UI 的程序用；\n"
+"--                                键盘焦点和任务栏仍是真实的，不抢别人的输入。\n"
 "--     honor_invalid_serial = true  它的激活请求即使令牌 serial 校验不过也照样理\n"
 "--     x11_scale = 1              X11 缩放桥：1 = 这个客户端没按 GDK_SCALE 画，\n"
 "--                                缓冲区不除（只对 X11 窗口有意义）\n"

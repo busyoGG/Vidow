@@ -118,6 +118,7 @@ enum vidow_rule_act {
 	VRA_HZ,                /* 补帧频率（0 = 不限） */
 	VRA_FOCUS_ON_OPEN,     /* 它开新窗口时抢不抢焦点 */
 	VRA_FOCUS_ON_ACTIVATE, /* 别人请求激活它时理不理 */
+	VRA_FAKE_FOCUS,        /* 焦点移走也让客户端以为它还激活 */
 	VRA_HONOR_INVALID_SERIAL, /* 令牌 serial 校验不过也理 */
 	VRA_X11_SCALE,         /* X11 缩放桥（1 = 不除） */
 	VRA_CAPTURE,           /* off / hide / mosaic */

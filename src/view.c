@@ -61,6 +61,9 @@ static void view_ensure_column(struct vidow_server *server,
 void vidow_view_leave_column(struct vidow_view *view);
 /* X11：按窗口的绝对坐标把它归到某块输出上（弹出物可以开在另一块屏上）。 */
 static void x11_track_output(struct vidow_view *view);
+/* 这块屏的归属记忆（定义在文件后半段的热插拔那一节）。 */
+static struct vidow_output_memory *home_of(struct vidow_server *server,
+		struct wlr_output *wlr_output);
 
 /* 把一个窗口放回平铺布局（浮动 → 平铺那次重判走这里，见 float.c 的
  * vidow_float_set_mode）。
@@ -386,12 +389,6 @@ int vidow_view_x11_scale_int(const struct vidow_view *view) {
 	return n > 0 ? n : 1;
 }
 
-/* 这个窗口是不是被逐窗口规则改了缩放桥（用来在日志里说清楚为什么它和别的
- * X11 窗口不一样大）。 */
-bool vidow_view_x11_scale_overridden(const struct vidow_view *view) {
-	return view->x11_scale > 0.0;
-}
-
 /* X 像素 -> 逻辑坐标。C 的整数除法是向零取整，屏幕左边/上边（负坐标）会算偏
  * 一格，弹出物定位要向下取整。 */
 static int x11_floor_div(int value, int scale) {
@@ -533,6 +530,12 @@ void vidow_view_set_activated(struct vidow_view *view, bool activated) {
 	if (!vidow_view_configure_ready(view)) {
 		return;
 	}
+	/* 窗口规则 fake_focus：客户端看到的一直是 activated，焦点移走时那条
+	 * deactivated 在这里被吃掉。键盘焦点 / server->focused / 任务栏不受影响
+	 * —— 伪装只到客户端这一层。 */
+	if (view->fake_focus) {
+		activated = true;
+	}
 	if (view->kind == VIDOW_VIEW_X11) {
 		wlr_xwayland_surface_activate(view->x11, activated);
 		return;
@@ -595,6 +598,22 @@ static void view_sync_x11_fullscreen(struct vidow_view *view) {
 	if (view->x11->fullscreen != view->fullscreen) {
 		view_apply_fullscreen(view, view->x11->fullscreen,
 			"X11 的 _NET_WM_STATE 属性变了");
+	}
+}
+
+/* 每帧开头对一遍 X11 的 _NET_WM_STATE。
+ *
+ * 只靠 view_commit 那条路不够：Proton / wine 的游戏退出全屏时可能只是改 X
+ * 属性、之后不再交新帧；没有新的 commit，view->fullscreen 就一直是 true，
+ * 状态栏（top + exclusive_zone）被 vidow_layers_update_fullscreen 永久关着 ——
+ * 游戏退出了，bar 却再也回不来。 */
+void vidow_views_sync_x11_fullscreen(struct vidow_server *server) {
+	if (server == NULL) {
+		return;
+	}
+	struct vidow_view *view;
+	wl_list_for_each(view, &server->views, link) {
+		view_sync_x11_fullscreen(view);
 	}
 }
 
@@ -965,7 +984,8 @@ static bool column_has_views(struct vidow_column *col) {
  * 注意别把它当成「藏起来的工作区」那种不可见：那边是整列都不在条带上，这边列还在，
  * 只是这条列可能空着。所以下面这些判据是「还占着位置」而不是「场景节点开着」。 */
 static bool view_shows(const struct vidow_view *view) {
-	return view != NULL && !view->minimized;
+	return view != NULL && !view->minimized && !view->drag_detached &&
+		!view->focus_helper;
 }
 
 /* 列里第一个「还占着位置」的窗口（焦点落点用）。 */
@@ -1110,7 +1130,6 @@ static void view_ensure_column(struct vidow_server *server,
 	col->server = server;
 	col->id = ++server->next_column_id;
 	col->output = view->output;
-	col->home = view->home;
 	/* 列宽：窗口规则写了 column_width 就用它（这个窗口新开的列有多宽），
 	 * 没写用配置里的 default_column_width（默认 0.5，就是原来写死的那个
 	 * DEFAULT_COLUMN_WIDTH —— 见 configs/20-layout.lua）。新列不做过渡
@@ -1128,7 +1147,9 @@ static void view_ensure_column(struct vidow_server *server,
 	 * 见 view_map），没有就落到这块屏的活动工作区上。 */
 	struct vidow_workspace *ws = view->ws;
 	if (ws == NULL) {
-		ws = vidow_workspace_active(server);
+		ws = view->output != NULL ?
+			vidow_workspace_active_for(server, view->output) :
+			vidow_workspace_active(server);
 		if (ws == NULL) {
 			/* **一块屏都没有**（嵌套会话的外层窗口关了 / 最后一块屏拔了）：
 			 * 这时候没有「当前工作区」这回事，但窗口照样会 map —— XWayland
@@ -1136,7 +1157,8 @@ static void view_ensure_column(struct vidow_server *server,
 			 * 就是这条：原来这里直接解引用 NULL，SEGV 在 view_map 里）。
 			 * 安置到一块现在没屏的工作区上：屏回来的时候那块工作区会被认领
 			 * 回去（vidow_workspace_adopt_homeless），窗口跟着一起回来。 */
-			ws = vidow_workspace_homeless(server, view->home);
+			ws = vidow_workspace_homeless(server,
+				home_of(server, view->output));
 			if (ws == NULL) {
 				ws = vidow_workspace_create(server, NULL, NULL);
 			}
@@ -1233,13 +1255,18 @@ static struct wlr_scene_surface *find_scene_surface(struct wlr_scene_node *node,
  * 于是「画在哪块屏上」的答案变成隔壁那块 —— 倍率、模糊底衬、窗口录屏的取景框都
  * 跟着错（越界的那一块本来就被裁掉了、压根不画，隔壁那块屏跟这个窗口没关系）。 */
 struct wlr_output *vidow_view_owner_output(const struct vidow_view *view) {
-	if (view->popup || view->float_mode != VIDOW_FLOAT_NONE) {
+	/* 唯一真值：窗口属于工作区，工作区属于屏。浮窗也一样（它只是不占列宽，
+	 * 不是「不属于工作区」）。弹窗 / 小窗没有工作区，各自按自己的位置算。 */
+	if (view->popup || view->mini != VIDOW_MINI_NONE) {
 		return NULL;
 	}
-	if (view->column == NULL) {
-		return NULL;
+	if (view->ws != NULL && view->ws->output != NULL) {
+		return view->ws->output;
 	}
-	return view->column->output;
+	if (view->column != NULL) {
+		return view->column->output;
+	}
+	return NULL;
 }
 
 static bool view_clip_box(struct vidow_view *view, struct wlr_box *out);
@@ -1289,6 +1316,16 @@ static void view_visible_box(const struct vidow_view *view, struct wlr_box *out)
 struct wlr_output *vidow_view_display_output(const struct vidow_view *view) {
 	if (!view->mapped) {
 		return NULL;
+	}
+	/* 有工作区的窗口：显示归属直接取链路（窗口 -> 工作区 -> 屏）。不再按
+	 * 几何框找「看得见的那块」—— 窗口跨在屏边界上时，几何框会在两块屏之间
+	 * 来回翻，倍率跟着 1/2 反复切（wlr_scene_surface 也按可见面积发
+	 * preferred_buffer_scale，两边对着跳）。 */
+	if (!view->popup && view->mini == VIDOW_MINI_NONE) {
+		struct wlr_output *chain = vidow_view_owner_output(view);
+		if (chain != NULL) {
+			return chain;
+		}
 	}
 	/* 判据是「**看得见**的那一块现在画在哪块屏上」：
 	 *   - 平铺窗口滚出视口时，几何框里含着滚动视口的偏移、会跨到隔壁屏的布局范围
@@ -1367,17 +1404,21 @@ struct wlr_output *vidow_view_display_output(const struct vidow_view *view) {
  * **拖拽中是唯一的例外**：窗口正被往另一块屏上搬，得按落点那块屏算，否则
  * 落到 2 倍屏上时还是 1 倍缓冲、整块是放大出来的（test-mixdpi 钉这条）。 */
 static struct wlr_output *view_home_output(const struct vidow_view *view) {
-	if (!view->dragging && view->ws != NULL && view->ws->output != NULL) {
+	/* 窗口 -> 工作区 -> 屏。拖动中也不破例：窗口还没换工作区，就还在原来
+	 * 那块屏上；松手换了工作区，倍率才跟着换。 */
+	if (view->popup || view->mini != VIDOW_MINI_NONE) {
+		struct wlr_output *out = vidow_view_display_output(view);
+		if (out != NULL) {
+			return out;
+		}
+	}
+	if (view->ws != NULL && view->ws->output != NULL) {
 		return view->ws->output;
 	}
-	struct wlr_output *out = vidow_view_display_output(view);
-	if (out == NULL) {
-		out = view->output;
+	if (view->output != NULL) {
+		return view->output;
 	}
-	if (out == NULL && view->ws != NULL) {
-		out = view->ws->output;
-	}
-	return out;
+	return vidow_view_display_output(view);
 }
 
 static double view_scale(const struct vidow_view *view) {
@@ -1389,18 +1430,30 @@ static double view_scale(const struct vidow_view *view) {
 	return scale > 0.0 ? scale : 1.0;
 }
 
+struct pin_scale_ctx {
+	int32_t want;
+};
+
 static void pin_scale_surface(struct wlr_surface *surface, int sx, int sy,
 		void *data) {
 	(void)sx;
 	(void)sy;
-	int32_t want = *(const int32_t *)data;
-	wlr_surface_set_preferred_buffer_scale(surface, want);
+	struct pin_scale_ctx *ctx = data;
+	/* 值没变就一个事件都不发。以前每次 commit / 每帧 arrange 都发一遍：
+	 * wlr_surface_set_preferred_buffer_scale 自己会去重，但
+	 * wlr_fractional_scale_v1_notify_scale 不会 —— Electron / GTK 每收一次
+	 * 就重算一次缓冲，surface 在 1x/2x 之间来回跳，屏幕上就是界面大小一直
+	 * 微微抖动（layer / 2x 那条也是同一类）。 */
+	if (surface->WLR_PRIVATE.preferred_buffer_scale == ctx->want) {
+		return;
+	}
+	wlr_surface_set_preferred_buffer_scale(surface, ctx->want);
 	/* **fractional-scale 那条也要发**。Chromium / Electron / 新版 GTK 优先听
 	 * wp_fractional_scale_v1.preferred_scale，它比 wl_surface.preferred_buffer_scale
 	 * 优先 —— 只发后者的话它们按「上一次进过的输出」的倍率画：窗口从 DP-2（2x）
 	 * 搬到 DP-3（1x）之后仍然画 2x，像素多 4 倍（实测 Element 2304x2560 铺在
 	 * 949x1025 上）。这是「所有应用都卡」的真根因。 */
-	wlr_fractional_scale_v1_notify_scale(surface, (double)want);
+	wlr_fractional_scale_v1_notify_scale(surface, (double)ctx->want);
 }
 
 /* 客户端按几倍渲染：**钉在它自己那块屏的倍率上**（view_scale）。子表面一起钉
@@ -1417,6 +1470,13 @@ static void pin_scale_surface(struct wlr_surface *surface, int sx, int sy,
 static void view_pin_scale(struct vidow_view *view) {
 	struct wlr_surface *surface = vidow_view_surface(view);
 	if (surface == NULL) {
+		return;
+	}
+	/* X11 的缩放桥走 _XWAYLAND_GLOBAL_OUTPUT_SCALE，Xwayland 自己已经把
+	 * 缓冲按那个倍数放大了；再发一遍 preferred_buffer_scale / fractional
+	 * scale 会让它在这个倍数上**再乘一次**（2x 屏上变成 4x，用户报的
+	 * 「Xwayland 窗口太大」）。X11 只发 enter / leave，不发倍率。 */
+	if (view->kind == VIDOW_VIEW_X11) {
 		return;
 	}
 	int32_t want = (int32_t)lround(view_scale(view));
@@ -1436,20 +1496,82 @@ static void view_pin_scale(struct vidow_view *view) {
 	 * wlr_fractional_scale_v1_notify_scale 都不去重，客户端每收一次事件就可能
 	 * 重新分配缓冲 —— 实测 Electron 的 surface 每 6~12ms 在「声明 1 倍」和
 	 * 「声明 2 倍」之间跳，正好等于每次 commit 的间隔。 */
-	if (want == view->pref_scale) {
+	/* 根表面值变了才发协议事件；子表面仍然每帧走一遍（很便宜），这样
+	 * 晚创建的子表面也能拿到当前倍率。值没变的表面在 pin_scale_surface
+	 * 里直接跳过 —— 客户端不会每帧重算缓冲（见那里的注释）。 */
+	bool changed = view->pref_scale != want;
+	if (changed) {
+		view->pref_scale = want;
+		wlr_surface_set_preferred_buffer_scale(surface, want);
+		wlr_fractional_scale_v1_notify_scale(surface, (double)want);
+	}
+	struct pin_scale_ctx ctx = { .want = want };
+	wlr_surface_for_each_surface(surface, pin_scale_surface, &ctx);
+	if (changed) {
+		/* 带上窗口编号（IPC 那个 id）：钉是在**第一次摆放**时发生的，那会儿
+		 * 标题往往还没来 —— 日志按编号认人更稳（测试也按编号找这一行）。 */
+		wlr_log(WLR_INFO, "surface %llu %s: 钉住 preferred_buffer_scale = %d"
+			"（它那块屏的缩放，滚出视口 / 停到屏外也不跟着变）",
+			(unsigned long long)view->id,
+			vidow_view_title(view) != NULL ? vidow_view_title(view) : "(无题)",
+			want);
+	}
+}
+
+/* 表面进哪块输出：**只进它工作区那块**，别的全退掉，并且只发这一块的倍率。
+ *
+ * wlr_scene_surface 的 outputs_update 监听按「节点可见面积」发 enter +
+ * preferred scale。节点跨在屏边界上时，隔壁 2 倍屏会赢；它只在输出几何变化
+ * 时重算，我们 set_clip 改了也不重算 —— 补一次 leave 会被下一帧 enter 覆盖，
+ * 客户端就在 1/2 倍之间反复重画。Hyprland / niri 都是自己按 monitor 发 enter
+ * 和 fractional scale，不交给场景；这里照做（建表面时摘掉那个监听，见
+ * view_takeover_surface_scale）。 */
+static void view_surface_enter_one(struct wlr_surface *surface,
+		int sx, int sy, void *data) {
+	(void)sx;
+	(void)sy;
+	struct wlr_output *keep = data;
+	struct wlr_surface_output *so, *tmp;
+	wl_list_for_each_safe(so, tmp, &surface->current_outputs, link) {
+		if (so->output != keep) {
+			wlr_surface_send_leave(surface, so->output);
+		}
+	}
+	wlr_surface_send_enter(surface, keep);
+}
+
+static void view_sync_surface_outputs(struct vidow_view *view) {
+	if (view->popup || !view->mapped) {
+		return; /* 弹窗 / 还没上屏：各自由场景和自己的输出管 */
+	}
+	struct wlr_surface *surface = vidow_view_surface(view);
+	if (surface == NULL) {
 		return;
 	}
-	view->pref_scale = want;
-	wlr_surface_set_preferred_buffer_scale(surface, want);
-	wlr_fractional_scale_v1_notify_scale(surface, (double)want);
-	wlr_surface_for_each_surface(surface, pin_scale_surface, &want);
-	/* 带上窗口编号（IPC 那个 id）：钉是在**第一次摆放**时发生的，那会儿标题往往
-	 * 还没来 —— 日志按编号认人更稳（测试也按编号找这一行）。 */
-	wlr_log(WLR_INFO, "surface %llu %s: 钉住 preferred_buffer_scale = %d"
-		"（它那块屏的缩放，滚出视口 / 停到屏外也不跟着变）",
-		(unsigned long long)view->id,
-		vidow_view_title(view) != NULL ? vidow_view_title(view) : "(无题)",
-		want);
+	struct wlr_output *owner = vidow_view_owner_output(view);
+	if (owner == NULL && view->mini != VIDOW_MINI_NONE) {
+		owner = view->output; /* 小窗是屏级对象：没有工作区，按自己的 output */
+	}
+	if (owner == NULL || owner == view->surface_output) {
+		vidow_portal_view_output(view);
+		return;
+	}
+	view->surface_output = owner;
+	wlr_surface_for_each_surface(surface, view_surface_enter_one, owner);
+	view->pref_scale = 0;
+	view_pin_scale(view);
+	vidow_portal_view_output(view);
+}
+
+/* 摘掉场景那条「按可见面积发 enter + preferred scale」的监听。link 重新
+ * 初始化成自环：wlr_scene_surface 销毁时无条件 wl_list_remove，自环上删自己
+ * 是安全的（不会碰到已摘掉的邻居）。 */
+static void view_takeover_surface_scale(struct vidow_view *view) {
+	if (view->scene_surface == NULL) {
+		return;
+	}
+	wl_list_remove(&view->scene_surface->WLR_PRIVATE.outputs_update.link);
+	wl_list_init(&view->scene_surface->WLR_PRIVATE.outputs_update.link);
 }
 
 /* Redraw the view at its animated position/opacity. The tiled geometry itself
@@ -1490,12 +1612,21 @@ static void pump_surface(struct wlr_surface *surface, int sx, int sy, void *data
  * 一个刚 map 的窗口藏没了。 */
 bool vidow_view_in_output_box(struct vidow_server *server,
 		const struct vidow_view *view) {
-	if (view->output == NULL || view->geom.width <= 0 ||
+	/* 平铺窗口按**它那条列挂在哪块屏**判（跟滚动视口无关），浮动 / 弹窗
+	 * 没有归属、按住址判。和 view_clip_box / view_home_output 同一个来源 ——
+	 * 以前这里只读 view->output，热插拔 / 规则搬屏的中间态里它可能还指着
+	 * 旧屏，于是停车位按旧屏算、裁剪按新屏算，窗口在视口外的那一帧被画到
+	 * 隔壁显示器上。 */
+	struct wlr_output *out = vidow_view_owner_output(view);
+	if (out == NULL) {
+		out = view->output;
+	}
+	if (out == NULL || view->geom.width <= 0 ||
 			view->geom.height <= 0) {
 		return true;
 	}
 	struct wlr_box box = {0};
-	wlr_output_layout_get_box(server->output_layout, view->output, &box);
+	wlr_output_layout_get_box(server->output_layout, out, &box);
 	if (box.width < 1 || box.height < 1) {
 		return true;
 	}
@@ -1544,9 +1675,11 @@ static bool view_clip_box(struct vidow_view *view, struct wlr_box *out) {
 		*out = mbox;
 		return true;
 	}
-	if (!view->mapped || view->float_mode != VIDOW_FLOAT_NONE ||
-			view->dragging || vidow_overview_active(server) ||
-			view->output == NULL ||
+	/* 有工作区的窗口一律裁到自己那块屏：浮窗 / 正在拖的窗口也不例外 ——
+	 * 「窗口只在自己的工作区显示」是硬约束。小窗和弹窗在上面 / 后面各自
+	 * 走自己的路。 */
+	if (!view->mapped || view->popup ||
+			vidow_overview_active(server) ||
 			view->geom.width <= 0 || view->geom.height <= 0) {
 		return false;
 	}
@@ -1569,10 +1702,11 @@ static bool view_clip_box(struct vidow_view *view, struct wlr_box *out) {
 	 * 动画里会短暂失效，这时改用工作区所属的那块屏 —— 和 view_scale 用的是
 	 * 同一个归属，稳定。 */
 	struct wlr_output *clip_out = view_home_output(view);
-	struct wlr_box box = {0};
-	if (clip_out != NULL) {
-		wlr_output_layout_get_box(server->output_layout, clip_out, &box);
+	if (clip_out == NULL) {
+		return false; /* 连归属屏都没有：没地方可裁 */
 	}
+	struct wlr_box box = {0};
+	wlr_output_layout_get_box(server->output_layout, clip_out, &box);
 	if (box.width < 1 || box.height < 1) {
 		return false;
 	}
@@ -1615,20 +1749,19 @@ static struct wlr_scene_node *view_surface_tree_node(const struct vidow_view *vi
  * （它自己就是这么维护这个字段的），抄完再补回去。裁着的时候每来一次 commit
  * 抄一遍 —— 客户端改 viewport（chromium 那类）之后不用等裁剪自己变。 */
 static void view_snapshot_content_box(struct vidow_view *view) {
-	struct wlr_scene_buffer *sb = view->scene_surface != NULL ?
-		view->scene_surface->buffer : NULL;
-	if (sb == NULL) {
+	struct wlr_surface *surface = vidow_view_surface(view);
+	if (surface == NULL) {
 		return;
 	}
-	struct wlr_scene_node *node = view_surface_tree_node(view);
-	bool reclip = node != NULL && view->fx.clip_local.width > 0;
-	if (reclip) {
-		wlr_scene_subsurface_tree_set_clip(node, NULL);
-	}
-	view->fx.content_box = sb->src_box;
-	if (reclip) {
-		wlr_scene_subsurface_tree_set_clip(node, &view->fx.clip_local);
-	}
+	/* **直接问 surface**，别再「先解裁剪 → 读 src_box → 再裁回去」。
+	 *
+	 * 解裁剪那一瞬间，场景节点的可见区域从「裁剩下的 4px」变回整块 949px：
+	 * 它跨在隔壁那块 2 倍屏上，wlr_scene 立刻给表面发 enter + 2 倍；裁回去
+	 * 又发 leave + 1 倍。客户端每 commit 一次就走一轮，屏幕上就是倍率 1/2
+	 * 反复跳（实测 8ms 一轮）。wlr_surface_get_buffer_source_box() 读的是
+	 * 客户端声明的 viewport / 缓冲，跟场景节点裁没裁无关 —— 要的就是这份
+	 * 「没裁过」的有效区。 */
+	wlr_surface_get_buffer_source_box(surface, &view->fx.content_box);
 }
 
 /* 缩放节点的越界裁剪（S3 修）：把表面那份内容节点裁成「这一帧落在屏里那一块」。
@@ -1699,7 +1832,7 @@ static bool view_scaled_crop(struct vidow_view *view, const struct wlr_box *clip
 	return true;
 }
 
-void vidow_view_apply_clip(struct vidow_view *view) {
+static void view_apply_clip_impl(struct vidow_view *view) {
 	if (view == NULL) {
 		return;
 	}
@@ -1805,10 +1938,24 @@ void vidow_view_apply_clip(struct vidow_view *view) {
 		/* 表面局部坐标（逻辑单位，wlroots 自己乘缓冲倍率）。原点取**这一帧
 		 * 画在哪儿**（几何 + 动画偏移）：表面树挂在那个位置上，减布局目标
 		 * 位置的话，滚动动画里裁出来的那块会跟着偏移。位置变了就得重调一次
-		 * —— 这个函数每帧都跑（重烘那一帧开头），别只按 clip_on 判断。 */
+		 * —— 这个函数每帧都跑（重烘那一帧开头），别只按 clip_on 判断。
+		 *
+		 * ⚠️ 必须**先和窗口自己的框求交**，再减 at：直接把整块屏框
+		 * （box = 0,0 1280x720）减 at 会得到负数 x / 屏宽的宽（例如窗口在
+		 * x=1000 时 local = -1000,0 1280x720），wlroots 拿它当 dst 尺寸，
+		 * 表面就被摆到屏原点、宽 1280 —— 逻辑坐标上等于把窗口铺满整块屏，
+		 * 右缘正好压在隔壁屏上，隔壁屏就 enter + 2 倍。用户报的「窗口超出
+		 * 屏幕就碰到隔壁显示器的工作区、缩放反复跳」就是这一条。 */
+		struct wlr_box visible;
+		if (!wlr_box_intersection(&visible, &box, &at)) {
+			/* 一点交集都没有：停车位那条路会把它挪走，这里别留半块。 */
+			view->fx.clip_local = (struct wlr_box){0};
+			wlr_scene_subsurface_tree_set_clip(node, NULL);
+			return;
+		}
 		struct wlr_box local = {
-			.x = box.x - at.x, .y = box.y - at.y,
-			.width = box.width, .height = box.height,
+			.x = visible.x - at.x, .y = visible.y - at.y,
+			.width = visible.width, .height = visible.height,
 		};
 		if (!wlr_box_equal(&local, &view->fx.clip_local)) {
 			/* 下刀之前先抄一份没裁过的有效区（撤销上一刀 → wlroots 重算
@@ -1816,11 +1963,44 @@ void vidow_view_apply_clip(struct vidow_view *view) {
 			view_snapshot_content_box(view);
 			view->fx.clip_local = local;
 			wlr_scene_subsurface_tree_set_clip(node, &local);
+
 		}
 	} else if (view->fx.clip_local.width > 0) {
 		view->fx.clip_local = (struct wlr_box){0};
 		wlr_scene_subsurface_tree_set_clip(node, NULL);
 	}
+}
+
+/* 裁剪状态一变，**强制**再钉一次客户端的 buffer_scale。
+ *
+ * wlroots 的 wlr_scene_surface 只在输出几何变化时重算「进了哪些输出」；我们
+ * 用 set_clip 把节点缩到屏里，它不重算，之前因为跨到隔壁 2 倍屏而收到的 enter
+ * 和 2 倍 preferred scale 就一直留着（客户端每 commit 一次都按 2 倍交，屏幕上
+ * 1/2 反复跳）。裁剪改完主动发一次当前归属屏的倍率，把客户端拉回来。
+ *
+ * pref_scale 先清 0：view_pin_scale 平时只在值变化时发，这里要的就是「没变也
+ * 再发一次」。 */
+/* 让这个表面（和它的子表面）退出**不属于它工作区**的输出。
+ *
+ * wlroots 的 wlr_scene_surface 只在输出几何变化时重算「进了哪些输出」；我们用
+ * set_clip 把节点缩进屏里，它不重算 —— 之前跨到隔壁 2 倍屏收到的 enter 一直留着，
+ * 客户端就按 2 倍画（wlr_surface 的 preferred scale 取 current_outputs 里最大的）。
+ * niri 也是自己管 enter/leave（workspace.rs 的 enter_output_for_window /
+ * output_leave），不交给场景。 */
+void vidow_view_apply_clip(struct vidow_view *view) {
+	if (view == NULL) {
+		return;
+	}
+	bool was_on = view->fx.clip_on;
+	struct wlr_box was_clip = view->fx.clip;
+	view_apply_clip_impl(view);
+	bool clip_changed = view->fx.clip_on != was_on ||
+		!wlr_box_equal(&view->fx.clip, &was_clip);
+	if (clip_changed) {
+		view->pref_scale = 0;
+	}
+	view_sync_surface_outputs(view);
+	view_pin_scale(view);
 }
 
 /* 这个窗口现在画得到吗：所在工作区显示着 **而且** 它的矩形和这块屏有交集。
@@ -2043,12 +2223,20 @@ static void view_capture_holds_clear(struct vidow_view *view) {
  * null」就是这个坑）。 */
 static bool view_sliding_out(struct vidow_server *server,
 		const struct vidow_view *view) {
-	if (view->ws == NULL || view->output == NULL) {
+	if (view->ws == NULL) {
+		return false;
+	}
+	/* 找**工作区住的那块屏**，不是 view->output 这个住址：热插拔 / 规则搬屏
+	 * 的中间态里两者会短暂分叉，按住址找会漏掉正在滑走的那块，过渡里旧的
+	 * 窗口突然消失。 */
+	struct wlr_output *want = view->ws->output != NULL ?
+		view->ws->output : view->output;
+	if (want == NULL) {
 		return false;
 	}
 	struct vidow_output *output;
 	wl_list_for_each(output, &server->outputs, link) {
-		if (output->wlr_output == view->output) {
+		if (output->wlr_output == want) {
 			return output->slide_from == view->ws;
 		}
 	}
@@ -2094,10 +2282,25 @@ bool vidow_view_should_park(struct vidow_server *server,
 			return true; /* 最小化 / 工作区被藏起来：也不画 */
 		}
 	}
-	if (view->float_mode != VIDOW_FLOAT_NONE || view->dragging ||
-			vidow_overview_active(server)) {
-		return false; /* 浮窗、正被拖的窗口本来就允许跨屏；overview 全缩进画面 */
+	if (vidow_overview_active(server)) {
+		return false; /* overview 全缩进画面 */
 	}
+	/* 浮窗 / **正被拖的**窗口允许跨屏，照旧画。
+	 *
+	 * 为什么要放行：拖拽的时候窗口就是该跟着光标走到隔壁屏上 —— 用户
+	 * 2026-10-20 的原话「拖拽窗口的时候应该允许显示在另一个屏幕」。不放行的
+	 * 话几何框一越过屏边界就整块停到停车位，屏上表现为「拖到边上窗口就没了」，
+	 * 跨屏拖动直接抄作不出来。
+	 *
+	 * 「正在拖」的两个来源都得认：平铺窗口拖拽走 drag.c（view->dragging），
+	 * 浮窗拖动 / 列宽拖动走 input.c 那条抓取（server->grab_view）。只看前者
+	 * 漏掉浮窗，只看后者漏掉还没起拖阈值的平铺窗口。 */
+	if (view->float_mode != VIDOW_FLOAT_NONE || view->dragging ||
+			server->grab_view == view) {
+		return false;
+	}
+	/* 其余窗口（有工作区的）只在自己的屏里画：越界就停到停车位，别让几何框
+	 * 落进隔壁屏的坐标范围（否则场景图是全局坐标，会画到隔壁显示器上）。 */
 	return !vidow_view_in_output_box(server, view);
 }
 
@@ -2288,6 +2491,8 @@ static void view_anim_place(struct vidow_view *view) {
 	if (view->scene_tree == NULL) {
 		return;
 	}
+	/* 表面进哪块输出：换工作区 / 换屏 / 刚 map，都在这里跟过去。 */
+	view_sync_surface_outputs(view);
 
 	/* overview 里：位置走「工作区局部 -> 屏幕」变换（每块工作区一行，见
 	 * overview.c），内容尺寸乘上缩放；不在这块屏上 / 不在现在这块工作区里的
@@ -2903,6 +3108,9 @@ void vidow_place_view(struct vidow_view *view, int x, int y, int w, int h) {
 
 	struct vidow_config *cfg = &view->server->config;
 	bool moved = view->geom.x != x || view->geom.y != y;
+	/* 横向和纵向分开记：过渡期间只有**纵向**是过渡推出来的（下面那条
+	 * workspace_slide_n 的判据要用），换焦点把列滚回可见区那一下动的是横向。 */
+	bool x_moved = view->geom.x != x;
 	bool resized = view->geom.width != w || view->geom.height != h;
 
 	/* 「现在画在哪」必须在覆盖 geom 之前取：覆盖之后再拿 geom 算补间起点，
@@ -3046,7 +3254,18 @@ void vidow_place_view(struct vidow_view *view, int x, int y, int w, int h) {
 	 * 每帧重起一次位移补间的话它们会一直吊在过渡后面（和上面列宽那条一个道理），
 	 * 看着就是「工作区滑过去了、窗口还在原地飘」。过渡期间直接落位，整块工作区
 	 * 刚性跟着曲线走。 */
-	if (view->server->workspace_slide_n > 0) {
+	if (view->server->workspace_slide_n > 0 && !x_moved) {
+		/* 纵向位移是过渡本身推出来的：这里照旧直接落位（上一帧刚起的那条
+		 * 补间不掐的话它会一直吊在过渡后面）。
+		 *
+		 * **但手里要是有横向补间（切完工作区立刻换焦点 → 把焦点列滚回
+		 * 可见区），别掐它**：以前这里一律 cancel + 偏移清零，那一下横向
+		 * 就变成瞬移。补间留着，纵向起点按 0 走（纵向归过渡）。 */
+		if (view->anim_move != NULL) {
+			view->anim_from_y = 0.0;
+			vidow_view_apply_anim(view);
+			return;
+		}
 		vidow_anim_cancel(view->anim_move);
 		view->anim_move = NULL;
 		view->anim_off_x = 0.0;
@@ -3070,8 +3289,13 @@ void vidow_place_view(struct vidow_view *view, int x, int y, int w, int h) {
 	view->anim_from_y = (double)(drawn_y - y);
 	vidow_anim_cancel(view->anim_move);
 	view->anim_move = vidow_anim_start(view->server, "move",
-		cfg->window_move_ms, cfg->easing, view_move_update, view_move_done, view);
+		cfg->window_move_ms, cfg->window_move_easing,
+		view_move_update, view_move_done, view);
 	if (view->anim_move != NULL) {
+		/* 切工作区的过渡里：纵向归过渡（起点 0），横向照常补间。 */
+		if (view->server->workspace_slide_n > 0) {
+			view->anim_from_y = 0.0;
+		}
 		wlr_log(WLR_DEBUG, "move tween %s: %d,%d -> %d,%d（%dms）",
 			vidow_view_title(view) != NULL ? vidow_view_title(view) : "?",
 			drawn_x, drawn_y, x, y, cfg->window_move_ms);
@@ -3289,6 +3513,10 @@ static void output_arrange(struct vidow_server *server,
 		 * 自然合拢 —— 最小化的窗口自己还在列里，放回来就照旧。 */
 		if (!column_has_shown_views(col)) {
 			col->width = 0;
+			/* slot_width 是 arrange_columns 写的；整列不占位时也得清零，
+			 * 否则拖动找落点还会把这条空列当成条带上的一条缝（被拖窗口
+			 * 已经 drag_detached，列里可能就剩它一个）。 */
+			col->slot_width = 0;
 			col->offset = cursor;
 			continue;
 		}
@@ -3392,6 +3620,10 @@ static void output_arrange(struct vidow_server *server,
 
 void vidow_arrange(struct vidow_server *server) {
 	struct vidow_output *output;
+	/* 先把住址对齐一遍：窗口 / 列住哪块屏只能由它们所在的工作区说了算。
+	 * 切工作区、规则搬屏、热插拔、拖动跨屏都会改到一半，漏一处就会让滚动
+	 * 越界的窗口按几何框算到隔壁屏的工作区里。 */
+	vidow_workspace_sync_outputs(server);
 	/* 桌面底色跟着输出布局走（拔线 / 改位置 / 改分辨率都会走到这儿）。 */
 	vidow_background_apply(server);
 	/* Moving windows changes what is behind every other window.
@@ -3417,6 +3649,9 @@ void vidow_arrange(struct vidow_server *server) {
 	 * 立刻从场景里摘掉，不然它的坐标落进隔壁屏的框里，就画到隔壁显示器上了
 	 * （见 vidow_view_in_output_box）。 */
 	vidow_workspace_apply_visibility(server);
+	/* 全屏的时候把占位的 top layer（状态栏）藏掉：它看不见了，但输入命中
+	 * 还认它，屏边上就留一条点不动的死区；退出全屏再放回来。 */
+	vidow_layers_update_fullscreen(server);
 
 	/* 摆完了收口一次层级：新窗口是「挂到最后」建出来的（在场景树里就是最上面），
 	 * 浮窗得重新压回平铺之上；浮 ⇄ 平铺切换、全屏进出也都在这一趟里摆正（见
@@ -3549,6 +3784,10 @@ static void columns_migrate(struct vidow_server *server,
 		col->output = to;
 		struct vidow_view *view;
 		wl_list_for_each(view, &col->views, column_link) {
+			/* 窗口跟着列走：工作区指针也要改。只改 output 的话 view->ws 还
+			 * 指着搬走前那块工作区 —— 可见性按 ws 判，窗口在新屏上永远不显示，
+			 * 而 IPC / overview 又按 output 说它在新屏，两边对不上。 */
+			view->ws = target;
 			view->output = to;
 			(*out_views)++;
 		}
@@ -3608,7 +3847,9 @@ void vidow_view_output_gone(struct vidow_server *server,
 		if (view->column != NULL) {
 			continue; /* 列里的窗口跟着列走过了 */
 		}
-		if (view->output != dead && view->home != memory) {
+		struct vidow_output_memory *home = view->ws != NULL ?
+			view->ws->home : home_of(server, view->output);
+		if (view->output != dead && home != memory) {
 			continue;
 		}
 		bool movable = !view->popup &&
@@ -3645,7 +3886,12 @@ void vidow_view_output_added(struct vidow_server *server,
 	size_t floats = 0;
 	struct vidow_view *view;
 	wl_list_for_each(view, &server->views, link) {
-		if (view->column != NULL || view->popup || view->home != memory) {
+		if (view->column != NULL || view->popup) {
+			continue;
+		}
+		struct vidow_output_memory *home = view->ws != NULL ?
+			view->ws->home : home_of(server, view->output);
+		if (home != memory) {
 			continue;
 		}
 		bool movable = view->float_mode != VIDOW_FLOAT_FOLLOW && view->placed;
@@ -3956,11 +4202,21 @@ void vidow_focus_view(struct vidow_view *view) {
 	}
 	/* 工作区记着「离开时焦点是谁」，换回来的时候要还原。 */
 	vidow_workspace_note_focus(view->ws, view);
-	if (view->output != NULL) {
-		server->focused_output = view->output;
+	/* 焦点屏跟着**归属**走（工作区住哪块屏），不是 view->output 那个住址：
+	 * 两者在切工作区 / 热插拔 / 规则搬屏的中间态里可能短暂分叉，按住址走会
+	 * 把 focused_output 带到隔壁屏上 —— 之后的空点击、新窗口、切工作区全按
+	 * 错的屏算。工作区归属只有真的换屏才变，和 view_home_output 同一个判据。 */
+	struct wlr_output *focus_out =
+		view->ws != NULL && view->ws->output != NULL ?
+		view->ws->output : view->output;
+	if (focus_out != NULL) {
+		server->focused_output = focus_out;
 	}
 
 	vidow_arrange(server);
+	/* 换焦点会 restack 一次，把新工作区的窗口抬到旧工作区上面；过渡里
+	 * 旧工作区得重新压回去，否则滑动过程里看到的是新窗口盖住旧工作区。 */
+	vidow_workspace_slide_raise(server);
 
 	if (previous != view) {
 		vidow_ipc_emit_focus(server, view);
@@ -5152,6 +5408,16 @@ bool vidow_view_insert_into_column(struct vidow_view *view,
 	if (old == target) {
 		wl_list_remove(&view->column_link);
 	} else {
+		/* 记住「并进别人列之前」自己的列宽：再拖出来时恢复它，而不是把
+		 * 目标列的宽度带走。已经在别的列里（home 已记）就不覆盖。 */
+		if (old != NULL && !view->column_width_home_set) {
+			view->column_width_home = old->width_fraction;
+			view->column_width_home_set = true;
+			wlr_log(WLR_INFO, "column: %s 并进别的列，记住原列宽 %.2f",
+				vidow_view_title(view) != NULL ?
+					vidow_view_title(view) : "?",
+				view->column_width_home);
+		}
 		vidow_view_leave_column(view);
 	}
 
@@ -5226,9 +5492,12 @@ struct vidow_column *vidow_view_expel_new_column(struct vidow_view *view,
 	ncol->server = server;
 	ncol->id = ++server->next_column_id;
 	ncol->output = col->output;
-	ncol->home = col->home;
 	ncol->ws = col->ws;
-	ncol->width_fraction = col->width_fraction;
+	/* 取出来时优先恢复「并进这条列之前」自己的宽度；没有记录才继承当前列宽
+	 * （直接 expel 一个本来就在这条列里的窗口走这一支）。 */
+	ncol->width_fraction = view->column_width_home_set ?
+		view->column_width_home : col->width_fraction;
+	view->column_width_home_set = false;
 	/* 新列继承的是**目标**宽度（原列正过渡到一半也照目标给），新列自己不过渡。 */
 	ncol->width_shown = ncol->width_fraction;
 	wl_list_init(&ncol->views);
@@ -5302,6 +5571,30 @@ static int column_shown_index(struct vidow_view *view) {
 	return -1;
 }
 
+/* 换位置（vidow_swap_window）之前，这个窗口**要求**自己那格多宽。
+ *
+ * 换位置是「窗口搬进对方那一格」，宽度跟着窗口走，所以目标宽度得按窗口自己的
+ * 来源重算，不能直接沿用格子里原先那个数。来源优先级和建列时一致（见
+ * column_new_for 与 insert_into_column）：
+ *   ① 窗口规则写了 column_width —— 最强，按 app_id / title 匹配的那个；
+ *   ② 这个窗口「并进别的列之前」记住的原列宽（column_width_home）；
+ *   ③ 都没有 → 维持这一格现在的宽度（返回 fallback）。
+ * 列最大化（maximized）的格子不进这条判断：它的宽度是 1.0 撑满，换人进来
+ * 还是撑满，vidow_column_set_width 会把 maximized 状态自己接上。 */
+static double view_swap_width(const struct vidow_view *view,
+		const struct vidow_column *fallback) {
+	if (view == NULL) {
+		return fallback != NULL ? fallback->width_fraction : 0.5;
+	}
+	if (view->rule_eff.set[VRA_COLUMN_WIDTH]) {
+		return view->rule_eff.val[VRA_COLUMN_WIDTH].d;
+	}
+	if (view->column_width_home_set) {
+		return view->column_width_home;
+	}
+	return fallback != NULL ? fallback->width_fraction : 0.5;
+}
+
 /* 和相邻那列里的窗口**换个位置**（niri 那种 swap）：两个窗口各自住进对方那一格，
  * 焦点跟着自己走 —— 列里只有一个窗口时（常见情况）就是两条列的内容对调。
  *
@@ -5350,6 +5643,17 @@ bool vidow_swap_window(struct vidow_server *server, int direction) {
 		wl_list_insert(a_prev, &mate->column_link);
 		view->column = other;
 		mate->column = col;
+		/* 宽度跟着**窗口**走（README 的语义：「两个窗口各自住进对方那一格」，
+		 * 焦点也跟着窗口）。只换 wl_list 指针不够 —— 两条列的 width_fraction
+		 * 各是各的，换完窗口就继承了**对方格子的宽度**，屏上看起来正是
+		 * 「半宽窗口和全宽窗口交换时连宽度都交换了」（用户 2026-10-20 报的）。
+		 *
+		 * 两个值都得在换列**之前**算：换完 col / other 里住的是新住户，
+		 * 再问「这一格原来多宽」就问不到了。 */
+		double vw = view_swap_width(view, col);
+		double mw = view_swap_width(mate, other);
+		vidow_column_set_width(col, mw, false);
+		vidow_column_set_width(other, vw, false);
 		vidow_arrange(server);
 		return true;
 	}
@@ -5447,7 +5751,8 @@ void vidow_column_set_width(struct vidow_column *col, double fraction, bool anim
 	col->anim_from = from;
 	col->anim_to = fraction;
 	col->anim_width = vidow_anim_start(server, "column-width", ms,
-		server->config.easing, column_width_update, column_width_done, col);
+		server->config.column_width_easing, column_width_update,
+		column_width_done, col);
 	if (col->anim_width == NULL) {
 		/* 分配失败：别把宽度卡在中间，直接到位。 */
 		col->width_shown = fraction;
@@ -5612,11 +5917,37 @@ static void view_map(struct wl_listener *listener, void *data) {
 	vidow_rule_apply(server, view);
 	/* X11 的窗口可能「状态比表面先到」：全屏那条属性在这儿先兑现一次。 */
 	view_sync_x11_fullscreen(view);
+
+	/* 1x1 辅助 toplevel（QQ / Electron 拉起的 wl-clipboard）：它只是要一个
+	 * 能 set_selection 的键盘 serial，不是给人看的窗口。
+	 *
+	 * 不放进布局、不进工作区、不开场景节点，也不改 server->focused ——
+	 * 只把键盘焦点临时指过去。否则它会占一列 / 参与滚动，焦点在它和原窗口
+	 * 之间来回切，用户看到的就是「粘一次，窗口动一下」。 */
+	struct wlr_surface *helper_surface = vidow_view_surface(view);
+	if (!view->popup && helper_surface != NULL &&
+			helper_surface->current.width <= 1 &&
+			helper_surface->current.height <= 1) {
+		view->focus_helper = true;
+		wlr_scene_node_set_enabled(&view->scene_tree->node, false);
+		vidow_seat_focus_surface(server->seat, helper_surface);
+		vidow_im_focus(server, helper_surface);
+		wlr_log(WLR_INFO, "map: %s 是 1x1 辅助窗口，只借键盘，不进布局",
+			vidow_view_title(view) != NULL ? vidow_view_title(view) : "(无题)");
+		return;
+	}
+
 	/* 落进现在显示着的那块工作区：新窗口跟着走，不偷偷开在藏起来的工作区里。
 	 * 列的窗口在 view_ensure_column 里落工作区；浮窗落在这里。 */
 	if (!view->popup) {
 		if (view->column != NULL && view->column->ws != NULL) {
 			view->ws = view->column->ws;
+		} else if (view->output != NULL) {
+			/* 新窗口落**光标那块屏**现在显示着的工作区，不是「全局焦点屏」
+			 * 的那块。view->output 在创建时就是按光标选的（view_default_output），
+			 * 而 server->focused_output 可能还停在上一块屏上（点空区域 / 切
+			 * 工作区之后没跟上）—— 那会让窗口开在 A 屏、操作却按 B 屏算。 */
+			view->ws = vidow_workspace_shown_for(server, view->output);
 		} else {
 			view->ws = vidow_workspace_shown(server);
 		}
@@ -5685,6 +6016,12 @@ static void view_map(struct wl_listener *listener, void *data) {
 	} else {
 		vidow_focus_view(view);
 	}
+	/* fake_focus 的窗口如果这次没拿到真焦点（focus_on_open = false，或者
+	 * 前面已经有焦点窗口），上面那次规则套用时可能还没 configure 好。上屏
+	 * 之后再补一次 activated(true)，别让它一出生就是未激活。 */
+	if (view->fake_focus && server->focused != view) {
+		vidow_view_set_activated(view, true);
+	}
 
 	/* Everything above placed the window where it belongs; now play the
 	 * opening effect on top of that final position. */
@@ -5707,6 +6044,17 @@ static void view_unmap(struct wl_listener *listener, void *data) {
 	 * （m_scale = std::nullopt）同一个意思。 */
 	view->pref_scale = 0;
 	vidow_portal_view_mapped(view, false);
+	if (view->focus_helper) {
+		/* 辅助窗口走了：键盘还给原来的焦点窗口。它从来没进过 server->focused，
+		 * 所以不能走下面的 focus_after_close（那会把焦点算到“下一个”）。 */
+		view->focus_helper = false;
+		struct wlr_surface *back = server->focused != NULL ?
+			vidow_view_surface(server->focused) : NULL;
+		vidow_seat_focus_surface(server->seat, back);
+		vidow_im_focus(server, back);
+		wlr_scene_node_set_enabled(&view->scene_tree->node, false);
+		return;
+	}
 	if (!view->popup && view->float_mode != VIDOW_FLOAT_NONE) {
 		/* 浮窗离开工作区。 */
 		vidow_workspace_track(view->ws, view, false);
@@ -5883,6 +6231,11 @@ static void view_commit(struct wl_listener *listener, void *data) {
 			!view->server->locked) {
 		vidow_output_schedule_frame(view->server, view->output,
 			"客户端交帧");
+	}
+	/* X11 弹出物：内容换了（圆角 / 自带阴影的 alpha 可能跟着变），背后那张
+	 * 模糊按新 mask 重烘一遍。 */
+	if (view->popup && view->popup_blur != NULL) {
+		vidow_popup_blur_invalidate(view->popup_blur);
 	}
 
 	/* **交帧间隔**（VIDOW_TRACE_FRAMES=1）：vidow 自己 128fps 也不慢的时候，
@@ -6137,6 +6490,9 @@ static void view_destroy(struct wl_listener *listener, void *data) {
 	if (server->hovered_view == view) {
 		server->hovered_view = NULL;
 	}
+	if (server->focus_before_layer == view) {
+		server->focus_before_layer = NULL;
+	}
 
 	/* 事件要带标题，而标题是客户端的资源、销毁信号来的时候已经收走了 ——
 	 * 用 map / 改标题时记下的快照（见 vidow_view_note_names）。 */
@@ -6212,6 +6568,14 @@ static void view_destroy(struct wl_listener *listener, void *data) {
 		vidow_mini_preview_hide(server);
 	}
 
+	if (view->focus_helper) {
+		/* 辅助窗口销毁：键盘还给 server->focused（它没进过焦点链）。 */
+		view->focus_helper = false;
+		struct wlr_surface *back = server->focused != NULL ?
+			vidow_view_surface(server->focused) : NULL;
+		vidow_seat_focus_surface(server->seat, back);
+		vidow_im_focus(server, back);
+	}
 	bool was_focused = server->focused == view;
 	/* 邻居要在摘列（和 free(view)）之前找（见 focus_after_close）。 */
 	struct vidow_view *next = was_focused ?
@@ -6220,6 +6584,10 @@ static void view_destroy(struct wl_listener *listener, void *data) {
 		server->focused = NULL;
 	}
 	vidow_view_leave_column(view);
+	/* 浮窗直接 destroy（没走 unmap）时也要把 ws->floats 的账摘掉。 */
+	if (!view->popup && view->float_mode != VIDOW_FLOAT_NONE) {
+		vidow_workspace_track(view->ws, view, false);
+	}
 	vidow_workspace_cleanup(server);
 
 	free(view);
@@ -6619,6 +6987,17 @@ static void x11_refresh_popup(struct vidow_view *view) {
 	}
 	view->popup = popup;
 	if (view->scene_tree != NULL) {
+		/* 改判成弹出物 / 变回普通窗口：背后的模糊跟着换。场景树留着（只换
+		 * 父节点），所以模糊节点得我们自己销毁。 */
+		if (popup && view->popup_blur == NULL && view->x11 != NULL &&
+				view->x11->surface != NULL) {
+			view->popup_blur = vidow_popup_blur_register(view->server,
+				view->scene_tree, &view->scene_tree->node,
+				view->x11->surface, view, "x11", NULL);
+		} else if (!popup && view->popup_blur != NULL) {
+			vidow_popup_blur_unregister(view->popup_blur, true);
+			view->popup_blur = NULL;
+		}
 		wlr_scene_node_reparent(&view->scene_tree->node, popup ?
 			view->server->layer_popups : view->server->layer_toplevels);
 		view_swap_decor(view);
@@ -6653,6 +7032,7 @@ static void x11_attach_surface(struct vidow_view *view) {
 
 	view->scene_surface = wlr_scene_surface_create(view->scene_tree,
 		view->x11->surface);
+	view_takeover_surface_scale(view);
 	if (view->scene_surface == NULL) {
 		wlr_log(WLR_ERROR, "x11: 建不出场景表面");
 		return;
@@ -6668,6 +7048,14 @@ static void x11_attach_surface(struct vidow_view *view) {
 	view->popup = x11_is_popup(view->x11);
 	vidow_view_x11_scale(view);
 
+	/* 弹出物背后的模糊：节点垫在它自己的场景树底下。表面 / 场景节点拆掉的
+	 * 时候由 x11_drop_surface 显式收（树归我们，节点也归我们）。 */
+	if (view->popup && view->popup_blur == NULL) {
+		view->popup_blur = vidow_popup_blur_register(server,
+			view->scene_tree, &view->scene_tree->node,
+			view->x11->surface, view, "x11", NULL);
+	}
+
 	/* 表面在我们建 view 之前就已经 map 了：Xwayland 启动那一下事件是成批到的
 	 * （xwm 先把窗口 map 掉，再给我们 new_surface），map 信号早就过去了 ——
 	 * 不补这一下，这个 view 的场景 node 就一直停在 disabled：画面里没有它、
@@ -6682,6 +7070,10 @@ static void x11_attach_surface(struct vidow_view *view) {
 /* wayland surface 没了（窗口 withdrawn）但 X11 窗口还在：view 留着，下次
  * associate 重新建场景节点。 */
 static void x11_drop_surface(struct vidow_view *view) {
+	if (view->popup_blur != NULL) {
+		vidow_popup_blur_unregister(view->popup_blur, true);
+		view->popup_blur = NULL;
+	}
 	if (view->scene_tree == NULL) {
 		return;
 	}
@@ -7087,7 +7479,6 @@ void vidow_view_new_x11(struct vidow_server *server,
 	view->focus_on_open = true;
 	view->focus_on_activate = true;
 	view->honor_invalid_serial = false;
-	view->home = home_of(server, view->output);
 	view->id = ++server->next_view_id;
 	wl_list_init(&view->ws_link);
 	wl_list_init(&view->capture_sources);
@@ -7178,7 +7569,6 @@ static void server_new_toplevel(struct wl_listener *listener, void *data) {
 	view->focus_on_open = true;
 	view->focus_on_activate = true;
 	view->honor_invalid_serial = false;
-	view->home = home_of(server, view->output);
 	view->id = ++server->next_view_id;
 	wl_list_init(&view->ws_link);
 	wl_list_init(&view->capture_sources);
@@ -7197,6 +7587,7 @@ static void server_new_toplevel(struct wl_listener *listener, void *data) {
 	/* wlr_scene_xdg_surface_create() returns a tree holding the surface. */
 	view->scene_surface = find_scene_surface(&view->scene_tree->node,
 		xdg_toplevel->base->surface);
+	view_takeover_surface_scale(view);
 	if (view->scene_surface == NULL) {
 		wlr_log(WLR_ERROR, "no scene surface for toplevel %s",
 			vidow_view_title(view) != NULL ? vidow_view_title(view) : "?");
@@ -7411,14 +7802,33 @@ struct wlr_scene_tree *vidow_popup_scene_create(struct vidow_server *server,
 		}
 	}
 
-	struct wlr_scene_tree *tree = wlr_scene_xdg_surface_create(parent,
-		popup->base);
+	/* 同一个 xdg_popup 可能被两条路各建一次：挂在 layer 表面上的弹出物，
+	 * xdg_shell 的 new_popup 先以 parent = NULL 到达（这时归 server_new_popup，
+	 * 先挂在 layer_toplevels 这棵全局树里），随后 layer_shell 的 new_popup
+	 * 才把 parent 补上并再走一次这里。以前第二次会再建一棵树 —— 同一个
+	 * surface 两个场景节点：菜单在**两块屏上各出现一份**，其中一份坐标还是
+	 * 全局的。已经有树就只把它挪到正确的父树里，不再新建。 */
+	struct wlr_scene_tree *tree =
+		popup_scene_tree_for(server, popup->base->surface);
+	if (tree != NULL) {
+		if (tree->node.parent != parent) {
+			wlr_scene_node_reparent(&tree->node, parent);
+		}
+		return tree;
+	}
+	tree = wlr_scene_xdg_surface_create(parent, popup->base);
 	if (tree == NULL) {
 		return NULL;
 	}
 	/* 登记自己：下一级菜单要按 surface 找到这棵树（一级的登记也没白记 ——
 	 * 客户端可以再弹一个 popup，链就是这么接下去的）。 */
 	popup_scene_register(server, popup->base->surface, tree);
+	/* 弹出物背后的模糊（fx.c 的 vidow_popup_blur_register）：节点垫在这棵树
+	 * 底下，弹出物移动 / 改尺寸时自动跟着走。树归 wlroots，销毁时它顺手把
+	 * 模糊节点一起收（见 popup_blur_node_destroy）。 */
+	vidow_popup_blur_register(server, tree, &tree->node,
+		popup->base->surface, NULL, "xdg",
+		&popup->base->surface->events.destroy);
 	/* 每个弹出物挂一条「它自己 commit 了什么」的日志（一行一条，弹出物本来
 	 * 就不常 commit）。「弹窗不显示」这类问题全卡在这一步上，光看场景树看不
 	 * 出是客户端没交帧还是我们没画：

@@ -161,25 +161,49 @@ void vidow_portal_view_parent(struct vidow_view *view) {
 		parent != NULL ? parent->ftm_handle : NULL);
 }
 
+/* 窗口换屏（拖到另一块显示器 / 工作区被搬走）时，foreign-toplevel 的
+ * output_enter/leave 也必须跟着换。Noctalia 的 activeToplevelOutput() 就是读
+ * 这个集合来判「当前活动窗口在哪块屏」；不换的话活动应用图标会挂到旧屏的
+ * 工作区上。 */
+void vidow_portal_view_output(struct vidow_view *view) {
+	if (view == NULL || view->ftm_handle == NULL) {
+		return;
+	}
+	struct wlr_output *want = view->mapped ? vidow_view_owner_output(view) : NULL;
+	if (want == NULL) {
+		want = view->output;
+	}
+	if (view->portal_output == want) {
+		return;
+	}
+	if (view->portal_output != NULL && view->portal_entered) {
+		wlr_foreign_toplevel_handle_v1_output_leave(view->ftm_handle,
+			view->portal_output);
+		view->portal_entered = false;
+	}
+	view->portal_output = want;
+	if (want != NULL) {
+		wlr_foreign_toplevel_handle_v1_output_enter(view->ftm_handle, want);
+		view->portal_entered = true;
+	}
+}
+
 void vidow_portal_view_mapped(struct vidow_view *view, bool mapped) {
 	if (view->ftm_handle == NULL) {
 		return;
 	}
 
 	if (mapped) {
-		if (view->output != NULL && !view->portal_entered) {
-			wlr_foreign_toplevel_handle_v1_output_enter(view->ftm_handle,
-				view->output);
-			view->portal_entered = true;
-		}
+		vidow_portal_view_output(view);
 		return;
 	}
 
-	if (view->output != NULL && view->portal_entered) {
+	if (view->portal_output != NULL && view->portal_entered) {
 		wlr_foreign_toplevel_handle_v1_output_leave(view->ftm_handle,
-			view->output);
+			view->portal_output);
 		view->portal_entered = false;
 	}
+	view->portal_output = NULL;
 	/* 窗口下了屏就不再是"当前窗口"。焦点转移不一定经过这里（最后一个窗口
 	 * 关掉时没有下一个窗口来接手），所以显式收一次。 */
 	vidow_portal_view_activated(view, false);
@@ -189,6 +213,9 @@ void vidow_portal_view_activated(struct vidow_view *view, bool activated) {
 	if (view == NULL || view->ftm_handle == NULL) {
 		return;
 	}
+	/* 焦点落到它身上时顺手把 output 集合校正一次：拖过屏再点回来这条路上，
+	 * 不一定有人调 mapped。 */
+	vidow_portal_view_output(view);
 	if (view->portal_activated == activated) {
 		return;
 	}

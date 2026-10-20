@@ -312,6 +312,21 @@ static void server_finish(struct vidow_server *server) {
 	wl_list_remove(&server->request_cursor.link);
 	wl_list_remove(&server->request_set_selection.link);
 	wl_list_remove(&server->request_set_primary_selection.link);
+	/* cursor-shape manager 是 display 管的：它销毁时断言
+	 * request_set_shape.listener_list 为空（不做就是退出 SIGABRT）。 */
+	if (server->cursor_shape_mgr != NULL) {
+		wl_list_remove(&server->cursor_shape_request.link);
+		server->cursor_shape_mgr = NULL;
+	}
+	/* 拖拽：seat 销毁时断言这两条信号上没人挂着（wlr_seat_destroy 的
+	 * request_start_drag.listener_list）。不摘就是退出时 SIGABRT。 */
+	wl_list_remove(&server->request_start_drag.link);
+	wl_list_remove(&server->start_drag.link);
+	if (server->drag != NULL) {
+		wl_list_remove(&server->drag_destroy.link);
+		wl_list_remove(&server->drag_motion.link);
+		server->drag = NULL;
+	}
 	/* 会话锁：manager 销毁时断言「没人还挂在我的 events.new_lock 上」（和上面
 	 * xdg_shell 那条同一类）。锁对象自己在 destroy 回调里已经把三个监听器摘了。 */
 	if (server->session_lock_mgr != NULL) {
@@ -438,6 +453,7 @@ int main(int argc, char *argv[]) {
 	wl_list_init(&server.outputs);
 	wl_list_init(&server.views);
 	wl_list_init(&server.popup_scenes);
+	wl_list_init(&server.popup_blurs);
 	wl_list_init(&server.keyboards);
 	wl_list_init(&server.layers);
 	wl_list_init(&server.columns);
@@ -647,6 +663,7 @@ int main(int argc, char *argv[]) {
 	wlr_cursor_set_xcursor(server.cursor, server.cursor_mgr, "left_ptr");
 
 	server.seat = wlr_seat_create(server.display, "seat0");
+	vidow_cursor_shape_init(&server);
 
 	if (!vidow_output_init(&server) || !vidow_input_init(&server) ||
 			!vidow_pointer_constraint_init(&server) ||
@@ -732,13 +749,17 @@ int main(int argc, char *argv[]) {
 	vidow_input_finish(&server);
 	vidow_ipc_finish(&server);
 	vidow_clipboard_finish(&server);
+	vidow_output_conf_clear(&server);
 	server_finish(&server);
+	vidow_mru_finish(&server);
+	vidow_cursor_fx_finish(&server);
 	vidow_script_finish(&server);
 	vidow_hooks_finish(&server);
 	/* 改过的环境变量（vidow.env）还回原样：别把调用方的 shell 环境改脏 */
 	vidow_env_finish(&server);
 	vidow_exec_cancel_all(&server);
 	wl_display_destroy_clients(server.display);
+	vidow_screencast_finish(&server);
 	wl_display_destroy(server.display);
 	return 0;
 }

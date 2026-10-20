@@ -85,32 +85,50 @@ static bool value_as_text(lua_State *L, int index, char *buf, size_t size) {
 static int expand_group(lua_State *L, struct vidow_config *cfg,
 		const char *group, int table_index) {
 	table_index = lua_absindex(L, table_index);
-	lua_pushnil(L);
-	while (lua_next(L, table_index) != 0) {
-		/* 键在 -2、值在 -1 */
-		if (lua_type(L, -2) != LUA_TSTRING) {
-			return luaL_error(L, "%s = {…}: 项名得是字符串", group);
+	/* 按族定义顺序处理，不按 Lua 表的遍历顺序：window 组里的 ms/easing
+	 * 是统一默认值，必须先铺到具体键，后面的 open/move/workspace 才能覆盖。
+	 * Lua 的 table 遍历顺序不保证，按 lua_next 写会变成「谁先谁赢」。 */
+	const char *field_names[32];
+	size_t field_count = vidow_config_group_fields(group, field_names, 32);
+	for (size_t i = 0; i < field_count; i++) {
+		const char *field_name = field_names[i];
+		const char *field_key = vidow_config_group_field(group, field_name);
+		if (field_key == NULL) {
+			continue;
 		}
-		const char *field = lua_tostring(L, -2);
-		const char *flat = vidow_config_group_field(group, field);
-		if (flat == NULL) {
-			const char *names[16];
-			size_t n = vidow_config_group_fields(group, names, 16);
-			char list[192] = "";
-			for (size_t i = 0; i < n; i++) {
-				snprintf(list + strlen(list), sizeof(list) - strlen(list),
-					"%s%s", i > 0 ? " / " : "", names[i]);
-			}
-			return luaL_error(L, "%s = {…}: 没有 '%s' 这一项（能写：%s）",
-				group, field, list);
+		lua_getfield(L, table_index, field_name);
+		if (lua_isnil(L, -1)) {
+			lua_pop(L, 1);
+			continue;
 		}
 		char buf[256];
 		if (!value_as_text(L, -1, buf, sizeof(buf))) {
 			return luaL_error(L, "%s = { %s = … }: 不能用 %s 当配置值",
-				group, field, lua_typename(L, lua_type(L, -1)));
+				group, field_name, lua_typename(L, lua_type(L, -1)));
 		}
-		if (!vidow_config_set(cfg, flat, buf)) {
-			return luaL_error(L, "%s = '%s' is not a valid value", flat, buf);
+		if (!vidow_config_set(cfg, field_key, buf)) {
+			return luaL_error(L, "%s = '%s' is not a valid value",
+				field_key, buf);
+		}
+		lua_pop(L, 1);
+	}
+	/* 拼错项要报错，不能静默变成普通全局。 */
+	lua_pushnil(L);
+	while (lua_next(L, table_index) != 0) {
+		if (lua_type(L, -2) != LUA_TSTRING) {
+			return luaL_error(L, "%s = {…}: 项名得是字符串", group);
+		}
+		const char *field = lua_tostring(L, -2);
+		if (vidow_config_group_field(group, field) == NULL) {
+			const char *names[16];
+			size_t n = vidow_config_group_fields(group, names, 16);
+			char list[192] = "";
+			for (size_t j = 0; j < n; j++) {
+				snprintf(list + strlen(list), sizeof(list) - strlen(list),
+					"%s%s", j > 0 ? " / " : "", names[j]);
+			}
+			return luaL_error(L, "%s = {…}: 没有 '%s' 这一项（能写：%s）",
+				group, field, list);
 		}
 		lua_pop(L, 1);
 	}

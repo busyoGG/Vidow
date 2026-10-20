@@ -1277,7 +1277,49 @@ void vidow_pointer_motion(struct vidow_server *server, uint32_t time_msec) {
 	} else {
 		/* 主题默认箭头；摇晃放大期间只记状态、不碰真图（见 cursorfx.c）。 */
 		vidow_cursor_fx_default_cursor(server);
-		wlr_seat_pointer_notify_clear_focus(server->seat);
+		/* **有键按着的时候不许清焦点**：那是 Wayland 的隐式抓取（implicit
+		 * grab）—— 按下的那一刻起，指针事件就该一直送给按下时那个表面，直到
+		 * 松手为止，哪怕光标已经跑到窗口外面。
+		 *
+		 * 用户报的「窗口内拖拽选文本，鼠标移到窗口外选择就停住；移回窗口再松手
+		 * 选择还在跟着鼠标走」就是这里断的。实测事件序列（客户端收到的）：
+		 *   PRESS (140,73) / MOTION (290,73)        窗口内，正常
+		 *   MOTION (490,653) / MOTION (550,653)     光标在窗口外，还在送 —— 对
+		 *   MOTION (590,73) / LEAVE (590,73)        移回来时这里清了焦点
+		 *   松手 → 客户端 **一条 RELEASE 都没收到**
+		 * 清了焦点之后 leave 已经发出，客户端认为指针早就走了；而 release 又被
+		 * 合成器自己吞掉（notify_button 只送给 focused_surface，那时是 NULL），
+		 * 于是客户端一直以为按钮还按着 —— 「释放鼠标选择还在跟随」正是这个。
+		 *
+		 * server->seat->pointer_state.button_count 是 wlroots 自己维护的按下
+		 * 计数（notify_button 里加减），拿它判「现在是不是抓着」最准，不用自己
+		 * 再记一份状态。 */
+		if (server->seat->pointer_state.button_count == 0) {
+			wlr_seat_pointer_notify_clear_focus(server->seat);
+		} else {
+			/* 仍在抓取：motion 要送给抓取者，坐标得是**相对那个表面**的。
+			 *
+			 * sx/sy 这里是 0（vidow_view_at 没算 —— 光标根本不在任何窗口上），
+			 * 直接送 0 会让抓取中的客户端以为指针一动不动：文本选择、拖动这类
+			 * 操作正是靠 motion 的位移推进的，停在 0 就等于「选择卡住不动」。
+			 *
+			 * 换算：场景是全局坐标，减掉抓取窗口的场景节点原点就是它的局部
+			 * 坐标（和 wlr_scene_node_at 一个算法，只是不做框内裁剪 —— 光标
+			 * 现在就在框外，这正是要允许的）。拿不到节点就退回 0,0：至少
+			 * release 能送到，不会留下「一直按着」的坏状态。 */
+			double gx = 0, gy = 0;
+			struct wlr_surface *grabbed =
+				server->seat->pointer_state.focused_surface;
+			struct vidow_view *gv = vidow_view_from_surface(server, grabbed);
+			if (gv != NULL && gv->scene_tree != NULL) {
+				int nx = 0, ny = 0;
+				if (wlr_scene_node_coords(&gv->scene_tree->node, &nx, &ny)) {
+					gx = server->cursor->x - (double)nx;
+					gy = server->cursor->y - (double)ny;
+				}
+			}
+			wlr_seat_pointer_notify_motion(server->seat, time_msec, gx, gy);
+		}
 	}
 }
 
@@ -1371,6 +1413,33 @@ static void server_cursor_button(struct wl_listener *listener, void *data) {
 	vidow_pointer_button(server, event->button,
 		event->state == WL_POINTER_BUTTON_STATE_PRESSED, event->time_msec,
 		false);
+}
+
+/* 合成器自己的指针绑定（Mod+左键 / Mod+滚轮）要看的修饰键。
+ *
+ * **不能读 seat 上那个键盘设备**：输入法（fcitx5 一启动就会抢）抢走键盘之后，
+ * seat 上的键盘换成它的虚拟键盘，物理键盘的修饰键只经
+ * wlr_seat_keyboard_notify_modifiers() 发给客户端 —— 虚拟键盘自己的 xkb_state
+ * 不会跟着变，读它就永远拿到「没按 Mod」。现象就是「按住 Mod 滚一次之后就不
+ * 认了，得松开重按」（用户报的，a3d4dc9 修过一次，但那条只补了通知、没改这里
+ * 的取值）。
+ *
+ * 所以直接找一把**物理键盘**（virtual == NULL、也不是我们自己的注入键盘）读
+ * 它的 xkb 状态；没有物理键盘
+ * （纯 headless / 只有注入）时退回 seat 上那把，再没有就是 0。 */
+static uint32_t pointer_modifiers(struct vidow_server *server) {
+	uint32_t mods = 0;
+	struct vidow_keyboard *kb;
+	wl_list_for_each(kb, &server->keyboards, link) {
+		if (kb->virtual == NULL && !kb->inject) {
+			mods |= wlr_keyboard_get_modifiers(kb->wlr_keyboard);
+		}
+	}
+	if (mods != 0) {
+		return mods;
+	}
+	struct wlr_keyboard *seat_kb = wlr_seat_get_keyboard(server->seat);
+	return seat_kb != NULL ? wlr_keyboard_get_modifiers(seat_kb) : 0;
 }
 
 /* 指针按下 / 松开。测试注入（VIDOW_TEST_ACTION 里的 pointer-button）也走这里，
@@ -1551,8 +1620,7 @@ void vidow_pointer_button(struct vidow_server *server, uint32_t button,
 
 	/* 绑定表（`vidow.bind("Mod+mouse-left", …)`）：鼠标按键和键盘键同一张表、
 	 * 同一套动作。按下 / 松开都要问 —— 「松开才触发」的绑定靠松开那一下收尾。 */
-	struct wlr_keyboard *kb = wlr_seat_get_keyboard(server->seat);
-	uint32_t mods = kb != NULL ? wlr_keyboard_get_modifiers(kb) : 0;
+	uint32_t mods = pointer_modifiers(server);
 	if (force_mod) {
 		/* 测试注入「假装按着 Mod」（见 server.h）：测试环境里没有真键盘，
 		 * 而拖动这类手势要求按着 Mod —— 绑定的匹配照样按真修饰键走。 */
@@ -1600,7 +1668,16 @@ void vidow_pointer_button(struct vidow_server *server, uint32_t button,
 	wlr_seat_pointer_notify_button(server->seat, time_msec, button,
 		WL_POINTER_BUTTON_STATE_PRESSED);
 
-	if (view != NULL && view != server->focused) {
+	/* 点在空区域（没有窗口、也没有 layer surface）：键盘焦点跟着光标换到
+	 * 这块屏的活动工作区上。只改 focused_output 不够 —— server->focused
+	 * 还停在上一块屏的窗口上，之后的键位（close-window / focus-column …）
+	 * 会继续作用在那边，用户看到的就是「在 4K 上随便点，动的却是左边」。
+	 * niri 的 focus_output 在它那套每屏一份焦点里等价于这一句。 */
+	struct wlr_output *click_output = wlr_output_layout_output_at(
+		server->output_layout, server->cursor->x, server->cursor->y);
+	if (view == NULL && surface == NULL && click_output != NULL) {
+		vidow_workspace_focus_output(server, click_output);
+	} else if (view != NULL && view != server->focused) {
 		vidow_focus_view(view);
 	} else if (view != NULL) {
 		/* 已经拿着键盘的那个也要抬一下：浮窗之间靠点击换层级，而它可能正被
@@ -1737,8 +1814,7 @@ void vidow_pointer_axis(struct vidow_server *server,
 		 * 把整段滚轮直接交给列表滚动、从不问绑定表，于是 overview 里
 		 * Mod+滚轮什么都不做（用户报的「overview状态下还是无法通过mod+滚轮
 		 * 移动窗口焦点」）。没命中绑定才轮到列表滚动。 */
-		struct wlr_keyboard *kb0 = wlr_seat_get_keyboard(server->seat);
-		uint32_t mods0 = kb0 != NULL ? wlr_keyboard_get_modifiers(kb0) : 0;
+		uint32_t mods0 = pointer_modifiers(server);
 		if (vidow_keybind_wheel(server, orientation, amount, mods0,
 				vidow_shortcuts_inhibited(server))) {
 			return;
@@ -1808,9 +1884,10 @@ void vidow_pointer_axis(struct vidow_server *server,
 		}
 	}
 
-	/* 绑定表（`vidow.bind("Mod+wheel-up", …)`）：一个方向一条，和键盘同一套动作。 */
-	struct wlr_keyboard *kb = wlr_seat_get_keyboard(server->seat);
-	uint32_t mods = kb != NULL ? wlr_keyboard_get_modifiers(kb) : 0;
+	/* 绑定表（`vidow.bind("Mod+wheel-up", …)`）：一个方向一条，和键盘同一套动作。
+	 * 修饰键走 pointer_modifiers()（原因见它上面那段：输入法抢键盘后 seat 上
+	 * 那把是虚拟键盘，修饰键不在它身上）。 */
+	uint32_t mods = pointer_modifiers(server);
 	if (vidow_keybind_wheel(server, orientation, amount, mods,
 			vidow_shortcuts_inhibited(server))) {
 		return;
@@ -1830,6 +1907,45 @@ static void server_cursor_frame(struct wl_listener *listener, void *data) {
 }
 
 /* ------------------------------------------------------------------ seat */
+
+/* wp_cursor_shape_manager_v1：GTK / Qt / layer 客户端用「形状名」换光标
+ * （文本 I 字、手型、缩放箭头），不再自己传 surface。没有这个全局时它们只能
+ * 停在默认箭头 —— 用户报的「光标形状在 layer 上不会变化」就是这条。 */
+static void cursor_shape_request(struct wl_listener *listener, void *data) {
+	struct vidow_server *server =
+		wl_container_of(listener, server, cursor_shape_request);
+	struct wlr_cursor_shape_manager_v1_request_set_shape_event *event = data;
+	/* 和 request_set_cursor 一样：只认当前指针焦点那个 seat client，
+	 * 背景客户端不能在指针不在它上面时改全局光标。 */
+	struct wlr_seat_client *focused =
+		server->seat->pointer_state.focused_client;
+	if (focused != event->seat_client) {
+		return;
+	}
+	if (event->device_type !=
+			WLR_CURSOR_SHAPE_MANAGER_V1_DEVICE_TYPE_POINTER) {
+		return; /* 数位笔形状暂不接管：vidow 光标平面只跟鼠标 */
+	}
+	const char *name = wlr_cursor_shape_v1_name(event->shape);
+	if (name == NULL) {
+		return;
+	}
+	wlr_log(WLR_DEBUG, "cursor-shape: %s", name);
+	vidow_cursor_fx_set_cursor_name(server, name);
+}
+
+void vidow_cursor_shape_init(struct vidow_server *server) {
+	server->cursor_shape_mgr =
+		wlr_cursor_shape_manager_v1_create(server->display, 1);
+	if (server->cursor_shape_mgr == NULL) {
+		wlr_log(WLR_INFO,
+			"cursor-shape: 全局建不出来（客户端只能用 set_cursor surface）");
+		return;
+	}
+	server->cursor_shape_request.notify = cursor_shape_request;
+	wl_signal_add(&server->cursor_shape_mgr->events.request_set_shape,
+		&server->cursor_shape_request);
+}
 
 static void server_request_cursor(struct wl_listener *listener, void *data) {
 	struct vidow_server *server = wl_container_of(listener, server, request_cursor);
@@ -1864,6 +1980,64 @@ static void server_request_set_primary_selection(struct wl_listener *listener,
 	struct wlr_seat_request_set_primary_selection_event *event = data;
 
 	wlr_seat_set_primary_selection(server->seat, event->source, event->serial);
+}
+
+/* --------------------------------------------------------------- 拖拽 */
+
+static void server_drag_destroy(struct wl_listener *listener, void *data) {
+	(void)data;
+	struct vidow_server *server =
+		wl_container_of(listener, server, drag_destroy);
+	if (server->drag_icon != NULL) {
+		wlr_scene_node_destroy(&server->drag_icon->node);
+		server->drag_icon = NULL;
+	}
+	wl_list_remove(&server->drag_destroy.link);
+	wl_list_remove(&server->drag_motion.link);
+	wl_list_init(&server->drag_destroy.link);
+	wl_list_init(&server->drag_motion.link);
+	server->drag = NULL;
+}
+
+static void server_drag_motion(struct wl_listener *listener, void *data) {
+	(void)data;
+	struct vidow_server *server =
+		wl_container_of(listener, server, drag_motion);
+	if (server->drag_icon == NULL) {
+		return;
+	}
+	/* 图标跟着光标走（和别的合成器一样，图标左上角就在光标位置）。 */
+	wlr_scene_node_set_position(&server->drag_icon->node,
+		(int)lround(server->cursor->x), (int)lround(server->cursor->y));
+}
+
+static void server_start_drag(struct wl_listener *listener, void *data) {
+	struct vidow_server *server =
+		wl_container_of(listener, server, start_drag);
+	struct wlr_drag *drag = data;
+	server->drag = drag;
+	if (drag->icon != NULL) {
+		server->drag_icon = wlr_scene_drag_icon_create(server->layer_top,
+			drag->icon);
+		if (server->drag_icon != NULL) {
+			wlr_scene_node_set_position(&server->drag_icon->node,
+				(int)lround(server->cursor->x),
+				(int)lround(server->cursor->y));
+		}
+	}
+	server->drag_destroy.notify = server_drag_destroy;
+	wl_signal_add(&drag->events.destroy, &server->drag_destroy);
+	server->drag_motion.notify = server_drag_motion;
+	wl_signal_add(&drag->events.motion, &server->drag_motion);
+}
+
+static void server_request_start_drag(struct wl_listener *listener, void *data) {
+	struct vidow_server *server =
+		wl_container_of(listener, server, request_start_drag);
+	struct wlr_seat_request_start_drag_event *event = data;
+	/* 指针拖拽：起隐式键盘 + 指针 grab，后面的 motion / drop 都由 wlroots
+	 * 的 data_device 实现转发给目标客户端。 */
+	wlr_seat_start_pointer_drag(server->seat, event->drag, event->serial);
 }
 
 /* wlrctl and other test tools drive the pointer through this protocol. */
@@ -1962,6 +2136,13 @@ bool vidow_input_init(struct vidow_server *server) {
 		server_request_set_primary_selection;
 	wl_signal_add(&server->seat->events.request_set_primary_selection,
 		&server->request_set_primary_selection);
+	server->request_start_drag.notify = server_request_start_drag;
+	wl_signal_add(&server->seat->events.request_start_drag,
+		&server->request_start_drag);
+	server->start_drag.notify = server_start_drag;
+	wl_signal_add(&server->seat->events.start_drag, &server->start_drag);
+	wl_list_init(&server->drag_destroy.link);
+	wl_list_init(&server->drag_motion.link);
 
 	/* 注入键盘（IPC 的 send-key / type-text）。建不起来只是那几个命令不能用，
 	 * 不该拖垮整个输入初始化。 */

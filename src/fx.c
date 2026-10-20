@@ -194,6 +194,7 @@ static const char *decor_fragment_src =
 	"uniform vec4 u_shadow_color;\n" /* premultiplied */
 	"uniform vec2 u_shadow_offset;\n"
 	"uniform float u_shadow_radius;\n"
+	"uniform float u_shadow_only;\n"
 	"uniform float u_opacity;\n"
 	/* 内容那一项的额外乘子：窗口抓帧那条路把它设成 0 —— 内容由场景里那个
 	 * 镜像节点画，这张图里只要底衬 / 画框，但**透明度剔除还得按内容自己的
@@ -204,6 +205,10 @@ static const char *decor_fragment_src =
 	"uniform float u_time;\n"
 	"uniform vec2 u_origin;\n"
 	"uniform vec2 u_output_size;\n"
+	/* 动画缩放补偿：节点按 anim_scale 缩放整块装饰缓冲时，模糊采样坐标
+	 * 也要按同一倍率展开，否则背景跟着窗口一起放大 / 回弹。 */
+	"uniform vec2 u_blur_scale;\n"
+	"uniform vec2 u_blur_bias;\n"
 	"uniform float u_flip_y;\n"
 	"uniform float u_blur_strength;\n"
 	/* ext-background-effect：客户端指定的模糊区域（窗口局部坐标）。
@@ -220,6 +225,7 @@ static const char *decor_fragment_src =
 	"uniform sampler2D u_mask;\n"
 	"uniform float u_mask_on;\n"
 	"uniform float u_mask_min;\n"
+	"uniform vec4 u_mask_map;\n"
 	"varying vec2 v_uv;\n"
 	"\n"
 	"float sd_round_box(vec2 p, vec2 half_size, float r, float n) {\n"
@@ -269,8 +275,12 @@ static const char *decor_fragment_src =
 	/* Only outside the window: otherwise the shadow shows through a
 	 * translucent window instead of staying behind it. */
 	"	vec4 shadow = u_shadow_color * sa * (1.0 - inside);\n"
+	"	if (u_shadow_only > 0.5) {\n"
+	"		gl_FragColor = shadow * u_alpha;\n"
+	"		return;\n"
+	"	}\n"
 	"\n"
-	"	vec2 o = (u_origin - u_content_off + p) / u_output_size;\n"
+	"	vec2 o = (u_origin - u_content_off + p * u_blur_scale + u_blur_bias) / u_output_size;\n"
 	"	vec4 blurred = texture2D(u_blur, clamp(o, 0.0, 1.0));\n"
 	/* 元素自己的 alpha（「透明度剔除」）：模糊只画在元素真的有内容的地方 —— 透明
 	 * 内边距、圆角外面、弹窗自带的半透明阴影边都不再透出一圈模糊。窗口 / 弹窗那条
@@ -280,7 +290,8 @@ static const char *decor_fragment_src =
 	"	float elem_a = u_mask_on > 0.5 ?\n"
 	/* mask 是元素**自己**那张缓冲，采样坐标用元素局部（恒等映射）：窗口那层
 	 * CSD 留白偏移只属于内容贴图，不能带到 mask 上，否则剔除会看错地方。 */
-	"		texture2D(u_mask, cuv).a : texture2D(u_texture, uv).a;\n"
+	"		texture2D(u_mask, clamp(u_mask_map.xy + cuv * u_mask_map.zw,\n"
+	"			0.0, 1.0)).a : texture2D(u_texture, uv).a;\n"
 	"	float cover = 1.0;\n"
 	"	if (u_blur_region_on > 0.5) {\n"
 	"		vec2 lo = u_blur_region.xy;\n"
@@ -393,6 +404,97 @@ static const char *mesh_fragment_src =
 	"	gl_FragColor = texture2D(u_texture, v_uv);\n"
 	"}\n";
 
+/* 果冻的模糊层：a_uv 还是内容 UV（跟着网格形变），a_buv 是**顶点当前屏幕
+ * 坐标**映射到 blur 贴图的 UV（不跟网格拉长）。片元按装饰着色器最后那条
+ * 公式把内容叠在模糊上：content + blur * (1 - content.a)。一遍画完，不再
+ * 需要先画模糊层再画内容层。 */
+static const char *mesh_blur_vertex_src =
+	"attribute vec2 a_pos;\n"
+	"attribute vec2 a_uv;\n"
+	"attribute vec2 a_buv;\n"
+	"uniform vec2 u_size;\n"
+	"varying vec2 v_uv;\n"
+	"varying vec2 v_buv;\n"
+	"varying vec2 v_local;\n"
+	"void main() {\n"
+	"	v_uv = a_uv;\n"
+	"	v_buv = a_buv;\n"
+	"	v_local = a_pos;\n"
+	"	gl_Position = vec4(a_pos / u_size * 2.0 - 1.0, 0.0, 1.0);\n"
+	"}\n";
+
+static const char *mesh_blur_fragment_src =
+	"precision mediump float;\n"
+	"uniform sampler2D u_texture;\n"
+	"uniform sampler2D u_blur;\n"
+	"uniform float u_blur_strength;\n"
+	/* 窗口可见矩形（目标像素）和圆角：模糊只画在窗口**里面**，阴影 /
+	 * 圆角外面的那圈留白不采模糊 —— 否则投影会被底下的模糊染上一层。 */
+	"uniform vec2 u_src_size;\n"
+	"uniform vec2 u_content_off;\n"
+	"uniform vec2 u_content_size;\n"
+	"uniform float u_radius;\n"
+	"uniform float u_corner_n;\n"
+	/* 静态投影：按窗口底座矩形算，不跟着果冻网格形变。 */
+	"uniform sampler2D u_shadow;\n"
+	"uniform vec2 u_shadow_off;\n"
+	"uniform vec2 u_shadow_size;\n"
+	"uniform vec2 u_shadow_offset;\n"
+	"uniform float u_shadow_radius;\n"
+	"uniform vec4 u_shadow_color;\n"
+	"uniform float u_shadow_on;\n"
+	/* 窗口本身的区域：客户端表面贴图的 alpha。投影 / 阴影不在客户端表面里，
+	 * 所以这一刀比按矩形裁更准。 */
+	"uniform sampler2D u_mask;\n"
+	"uniform float u_mask_on;\n"
+	"uniform vec4 u_mask_map;\n"
+	"uniform float u_mask_min;\n"
+	"varying vec2 v_uv;\n"
+	"varying vec2 v_buv;\n"
+	"varying vec2 v_local;\n"
+	"float sd_round_box(vec2 p, vec2 half_size, float r, float n) {\n"
+	"	vec2 q = abs(p) - half_size + r;\n"
+	"	vec2 c = max(q, 0.0);\n"
+	"	float d;\n"
+	"	float k;\n"
+	"	if (n > 2.001) {\n"
+	"		float s = pow(c.x, n) + pow(c.y, n);\n"
+	"		d = pow(s, 1.0 / n);\n"
+	"		float den = length(vec2(pow(c.x, n - 1.0), pow(c.y, n - 1.0)));\n"
+	"		k = den > 1e-4 ? pow(s, (n - 1.0) / n) / den : 1.0;\n"
+	"	} else {\n"
+	"		d = length(c);\n"
+	"		k = 1.0;\n"
+	"	}\n"
+	"	return (d - r) * k + min(max(q.x, q.y), 0.0);\n"
+	"}\n"
+	"void main() {\n"
+	"	vec4 content = texture2D(u_texture, v_uv);\n"
+	"	vec4 blurred = texture2D(u_blur, v_buv) * u_blur_strength;\n"
+	"	vec2 p = v_uv * u_src_size;\n"
+	"	vec2 cuv = (p - u_content_off) / u_content_size;\n"
+	/* 窗口矩形之外（投影 / 圆角留白）直接不画模糊；矩形里面再按客户端
+	 * 表面的 alpha 剔掉透明区域。 */
+	"	float in_rect = step(0.0, cuv.x) * step(cuv.x, 1.0) *\n"
+	"		step(0.0, cuv.y) * step(cuv.y, 1.0);\n"
+	"	vec2 muv = clamp(u_mask_map.xy + clamp(cuv, 0.0, 1.0) * u_mask_map.zw,\n"
+	"		0.0, 1.0);\n"
+	"	float mask_a = texture2D(u_mask, muv).a;\n"
+	"	float inside = in_rect * mix(1.0, step(u_mask_min, mask_a), u_mask_on);\n"
+	/* 静态投影：按底座矩形（目标坐标）算，不跟果冻网格形变。 */
+	"	vec2 sh = v_local - u_shadow_off - u_shadow_size * 0.5;\n"
+	"	float sr = min(u_radius, min(u_shadow_size.x, u_shadow_size.y) * 0.5);\n"
+	"	float sd = sd_round_box(sh - u_shadow_offset,\n"
+	"		u_shadow_size * 0.5, sr, u_corner_n);\n"
+	"	float sa = 1.0 - smoothstep(-1.0, u_shadow_radius, sd);\n"
+	"	float window = 1.0 - smoothstep(-1.0, 1.0,\n"
+	"		sd_round_box(sh, u_shadow_size * 0.5, sr, u_corner_n));\n"
+	"	vec4 shadow = u_shadow_color * sa * (1.0 - window) * u_shadow_on;\n"
+	"	vec4 out_px = content + blurred * (1.0 - content.a) * inside;\n"
+	"	out_px = shadow + out_px * (1.0 - shadow.a);\n"
+	"	gl_FragColor = out_px;\n"
+	"}\n";
+
 /* --------------------------------------------------------- program build */
 
 static bool link_program_full(unsigned int *out, const char *vert_src,
@@ -440,6 +542,33 @@ static void load_mesh_program(struct vidow_server *server) {
 	m->program = prog;
 	m->u_texture = glGetUniformLocation(prog, "u_texture");
 	m->u_size = glGetUniformLocation(prog, "u_size");
+
+	struct vidow_mesh_blur_prog *b = &server->mesh_blur;
+	prog = 0;
+	if (link_program_full(&prog, mesh_blur_vertex_src, mesh_blur_fragment_src,
+			"mesh-blur")) {
+		b->program = prog;
+		b->u_texture = glGetUniformLocation(prog, "u_texture");
+		b->u_blur = glGetUniformLocation(prog, "u_blur");
+		b->u_size = glGetUniformLocation(prog, "u_size");
+		b->u_blur_strength = glGetUniformLocation(prog, "u_blur_strength");
+		b->u_src_size = glGetUniformLocation(prog, "u_src_size");
+		b->u_content_off = glGetUniformLocation(prog, "u_content_off");
+		b->u_content_size = glGetUniformLocation(prog, "u_content_size");
+		b->u_radius = glGetUniformLocation(prog, "u_radius");
+		b->u_corner_n = glGetUniformLocation(prog, "u_corner_n");
+		b->u_shadow = glGetUniformLocation(prog, "u_shadow");
+		b->u_shadow_off = glGetUniformLocation(prog, "u_shadow_off");
+		b->u_shadow_size = glGetUniformLocation(prog, "u_shadow_size");
+		b->u_shadow_offset = glGetUniformLocation(prog, "u_shadow_offset");
+		b->u_shadow_radius = glGetUniformLocation(prog, "u_shadow_radius");
+		b->u_shadow_color = glGetUniformLocation(prog, "u_shadow_color");
+		b->u_shadow_on = glGetUniformLocation(prog, "u_shadow_on");
+		b->u_mask = glGetUniformLocation(prog, "u_mask");
+		b->u_mask_on = glGetUniformLocation(prog, "u_mask_on");
+		b->u_mask_map = glGetUniformLocation(prog, "u_mask_map");
+		b->u_mask_min = glGetUniformLocation(prog, "u_mask_min");
+	}
 }
 
 static void load_decor_program(struct vidow_server *server) {
@@ -462,12 +591,15 @@ static void load_decor_program(struct vidow_server *server) {
 	LOC(u_shadow_color, "u_shadow_color");
 	LOC(u_shadow_offset, "u_shadow_offset");
 	LOC(u_shadow_radius, "u_shadow_radius");
+	LOC(u_shadow_only, "u_shadow_only");
 	LOC(u_opacity, "u_opacity");
 	LOC(u_content_alpha, "u_content_alpha");
 	LOC(u_noise, "u_noise");
 	LOC(u_alpha, "u_alpha");
 	LOC(u_origin, "u_origin");
 	LOC(u_output_size, "u_output_size");
+	LOC(u_blur_scale, "u_blur_scale");
+	LOC(u_blur_bias, "u_blur_bias");
 	LOC(u_flip_y, "u_flip_y");
 	LOC(u_blur_strength, "u_blur_strength");
 	LOC(u_blur_region, "u_blur_region");
@@ -476,6 +608,7 @@ static void load_decor_program(struct vidow_server *server) {
 	LOC(u_mask, "u_mask");
 	LOC(u_mask_on, "u_mask_on");
 	LOC(u_mask_min, "u_mask_min");
+	LOC(u_mask_map, "u_mask_map");
 #undef LOC
 }
 
@@ -866,6 +999,108 @@ static void draw_quad(unsigned int program) {
 /* 把一张贴图按任意三角形网格画进 dst：每项 4 个 float，[x, y, u, v]。
  * x/y 是渲染目标里的物理像素坐标（小数直接进光栅器，别自己取整 —— 取整就是
  * 那条锯齿边），u/v 是源贴图的归一化坐标。顶点按 GL_TRIANGLES 顺序给。 */
+bool vidow_fx_draw_mesh_blur(struct vidow_server *server,
+		struct wlr_buffer *dst, int w, int h, struct wlr_texture *content,
+		struct wlr_texture *blur, float blur_strength, const float *verts,
+		int n_verts, int content_off_x, int content_off_y, int content_w,
+		int content_h, int src_w, int src_h, float radius, float corner_n,
+		struct wlr_texture *mask, float mask_ox, float mask_oy,
+		float mask_sx, float mask_sy, float mask_min,
+		struct wlr_texture *shadow_tex,
+		int shadow_off_x, int shadow_off_y, int shadow_w, int shadow_h,
+		float shadow_dx, float shadow_dy, float shadow_radius,
+		const float shadow_color[4], bool shadow_on) {
+	struct vidow_mesh_blur_prog *m = &server->mesh_blur;
+	if (m->program == 0 || content == NULL || blur == NULL || verts == NULL ||
+			n_verts < 3) {
+		return false;
+	}
+	struct wlr_gles2_texture_attribs ca;
+	struct wlr_gles2_texture_attribs ba;
+	wlr_gles2_texture_get_attribs(content, &ca);
+	wlr_gles2_texture_get_attribs(blur, &ba);
+
+	struct wlr_egl *egl = NULL;
+	if (begin_pass(server, dst, w, h, &egl) == 0) {
+		return false;
+	}
+	glUseProgram(m->program);
+	bind_tex(0, ca.target, ca.tex);
+	bind_tex(1, ba.target, ba.tex);
+	glUniform1i(m->u_texture, 0);
+	glUniform1i(m->u_blur, 1);
+	glUniform1i(m->u_mask, 2);
+	glUniform1i(m->u_shadow, 3);
+	glActiveTexture(GL_TEXTURE2);
+	if (mask != NULL) {
+		struct wlr_gles2_texture_attribs ma;
+		wlr_gles2_texture_get_attribs(mask, &ma);
+		glBindTexture(ma.target, ma.tex);
+		glUniform1f(m->u_mask_on, 1.0f);
+	} else {
+		glBindTexture(GL_TEXTURE_2D, 0);
+		glUniform1f(m->u_mask_on, 0.0f);
+	}
+	glActiveTexture(GL_TEXTURE3);
+	if (shadow_on && shadow_tex != NULL) {
+		struct wlr_gles2_texture_attribs sa;
+		wlr_gles2_texture_get_attribs(shadow_tex, &sa);
+		glBindTexture(sa.target, sa.tex);
+	} else {
+		glBindTexture(GL_TEXTURE_2D, 0);
+	}
+	glActiveTexture(GL_TEXTURE0);
+	glUniform1f(m->u_blur_strength, blur_strength);
+	glUniform2f(m->u_size, (float)w, (float)h);
+	glUniform2f(m->u_src_size, (float)src_w, (float)src_h);
+	glUniform2f(m->u_content_off, (float)content_off_x,
+		(float)content_off_y);
+	glUniform2f(m->u_content_size, (float)content_w, (float)content_h);
+	glUniform1f(m->u_radius, radius);
+	glUniform1f(m->u_corner_n, corner_n);
+	glUniform4f(m->u_mask_map, mask_ox, mask_oy, mask_sx, mask_sy);
+	glUniform1f(m->u_mask_min, mask_min);
+	glUniform2f(m->u_shadow_off, (float)shadow_off_x, (float)shadow_off_y);
+	glUniform2f(m->u_shadow_size, (float)shadow_w, (float)shadow_h);
+	glUniform2f(m->u_shadow_offset, shadow_dx, shadow_dy);
+	glUniform1f(m->u_shadow_radius, shadow_radius);
+	glUniform4f(m->u_shadow_color, shadow_color[0], shadow_color[1],
+		shadow_color[2], shadow_color[3]);
+	glUniform1f(m->u_shadow_on, shadow_on ? 1.0f : 0.0f);
+
+	GLint ap = glGetAttribLocation(m->program, "a_pos");
+	GLint au = glGetAttribLocation(m->program, "a_uv");
+	GLint ab = glGetAttribLocation(m->program, "a_buv");
+	const GLsizei stride = sizeof(float) * 6;
+	if (ap >= 0) {
+		glVertexAttribPointer(ap, 2, GL_FLOAT, GL_FALSE, stride, verts);
+		glEnableVertexAttribArray(ap);
+	}
+	if (au >= 0) {
+		glVertexAttribPointer(au, 2, GL_FLOAT, GL_FALSE, stride, verts + 2);
+		glEnableVertexAttribArray(au);
+	}
+	if (ab >= 0) {
+		glVertexAttribPointer(ab, 2, GL_FLOAT, GL_FALSE, stride, verts + 4);
+		glEnableVertexAttribArray(ab);
+	}
+	/* 片元自己已经按预乘 alpha 合成好，直接覆盖写。 */
+	glDisable(GL_BLEND);
+	glDrawArrays(GL_TRIANGLES, 0, n_verts);
+	if (ap >= 0) {
+		glDisableVertexAttribArray(ap);
+	}
+	if (au >= 0) {
+		glDisableVertexAttribArray(au);
+	}
+	if (ab >= 0) {
+		glDisableVertexAttribArray(ab);
+	}
+	glUseProgram(0);
+	end_pass(egl);
+	return true;
+}
+
 bool vidow_fx_draw_mesh(struct vidow_server *server, struct wlr_buffer *dst,
 		int w, int h, struct wlr_texture *src, const float *verts,
 		int n_verts) {
@@ -1186,6 +1421,16 @@ static void blur_note_damage(struct vidow_server *server,
 	struct vidow_layer_surface *ls;
 	wl_list_for_each(ls, &server->layers, link) {
 		dmg_add(&ls->fx.pending_damage, box);
+	}
+	/* 弹出物背后的模糊也要跟着过期：菜单 / 候选框底下的窗口一动，它自己
+	 * 那一块底衬就旧了。弹出物自己交帧时（skip == 它的 view）不记 —— 抓的
+	 * 时候它本来就藏着。 */
+	struct vidow_popup_blur *pb;
+	wl_list_for_each(pb, &server->popup_blurs, link) {
+		if (skip != NULL && pb->view == skip) {
+			continue;
+		}
+		dmg_add(&pb->fx.pending_damage, box);
 	}
 }
 
@@ -1536,6 +1781,8 @@ struct backdrop_ctx {
 	/* 只要这块目标区域（设备像素，目标缓冲的坐标系）。抓整屏时是 0（不管），抓
 	 * layer 背后那一小块时，落在外面的 buffer 连贴图都不用建。 */
 	int clip_x, clip_y, clip_w, clip_h;
+	/* 抓私有底衬时明确跳过这个窗口自己的节点（即使节点开关有漏网）。 */
+	struct vidow_view *skip;
 };
 
 /* 局部更新要求「只画一块」这件事对每个要抓的 buffer 都成立：转过的客户端缓冲
@@ -1555,6 +1802,22 @@ static void backdrop_iter(struct wlr_scene_buffer *sb, int sx, int sy,
 		void *data) {
 	struct backdrop_ctx *ctx = data;
 	if (sb->buffer == NULL) {
+		return;
+	}
+	bool skip_self = false;
+	if (ctx->skip != NULL && ctx->skip->scene_tree != NULL) {
+		for (struct wlr_scene_node *n = &sb->node; n != NULL;
+				n = n->parent != NULL ? &n->parent->node : NULL) {
+			if (n == &ctx->skip->scene_tree->node) {
+				skip_self = true;
+				break;
+			}
+		}
+	}
+	if (ctx->skip != NULL && (skip_self ||
+			sb == ctx->skip->fx.node ||
+			(ctx->skip->scene_surface != NULL &&
+			 sb == ctx->skip->scene_surface->buffer))) {
 		return;
 	}
 	/* 节点尺寸优先用场景给的目标尺寸（逻辑像素）；客户端缓冲自己带倍率的
@@ -1737,6 +2000,14 @@ static bool view_wants_blur_ever(struct vidow_view *view) {
 	}
 	/* 客户端自己开口要的（ext-background-effect），blur_all 关着也得给 */
 	return view->fx.blur_region_on;
+}
+
+/* 给 drag.c 用：这个窗口会不会有模糊底衬。拖拽时模糊窗口保持 alpha 1.0 ——
+ * 降到 0.75 会让烘好的模糊和未模糊的场景混成「一层雾」（用户报过）。
+ * 判据不能只看 fx.blur_tex：刚 map / 刚换屏时那张贴图可能还没分配，浮窗
+ * 拖动正好会踩到，所以按配置 / 规则算。 */
+bool vidow_view_blur_wanted(struct vidow_view *view) {
+	return view != NULL && view->fx.active && view_wants_blur_ever(view);
 }
 
 /* 这笔模糊看得见吗 —— 看不见就别算（整屏 Kawase 金字塔 + 私有底衬抓取 +
@@ -2047,1081 +2318,23 @@ static void layer_bd_drop(struct vidow_layer_surface *ls) {
 	ls->bd_gen_layer = 0;
 }
 
+
+
+static void decor_draw(struct vidow_server *server,
+		struct vidow_fx_target *fx, struct wlr_buffer *dst,
+		struct wlr_texture *src, struct wlr_texture *mask,
+		const float border[4], int ox, int oy,
+		double alpha, double scale, const struct vidow_look *look);
+static bool anim_draw(struct vidow_server *server,
+		struct vidow_fx_target *fx, struct wlr_buffer *dst,
+		struct wlr_texture *src, int ox, int oy, double alpha, double scale);
+
 static bool layer_blur_wanted(struct vidow_server *server,
 		struct vidow_layer_surface *ls);
 /* 没画成的原因出口（定义在下面，layer_blur_wanted 也要用）。 */
 static bool layer_blur_bail(struct vidow_layer_surface *ls, int reason,
 		const char *what);
 /* 抓底衬时要不要把这个 layer surface 自己藏起来（见下面的定义）。 */
-static bool layer_blur_frame(struct vidow_server *server,
-		struct vidow_output *output, struct vidow_layer_surface *ls);
-static void layer_blur_capture_visible(struct vidow_server *server, bool on);
-/* overview 里那张糊掉的壁纸（整屏，垫在压暗遮罩下面）。 */
-static void vidow_overview_blur_frame(struct vidow_server *server,
-		struct vidow_output *output);
-
-static int blur_levels_for(struct vidow_server *server, int w, int h) {
-	int levels = server->config.blur_levels;
-	if (levels < 2) {
-		levels = 2;
-	}
-	if (levels > MAX_BLUR_LEVELS) {
-		levels = MAX_BLUR_LEVELS;
-	}
-	while (levels > 2 && ((w >> levels) < 4 || (h >> levels) < 4)) {
-		levels--;
-	}
-	return levels;
-}
-
-static void shared_blur_drop(struct vidow_output *output) {
-	/* 这两张贴图现在归别人管：blur_tex 是金字塔 up[0] 那张常驻贴图（blur_set_drop
-	 * 收），backdrop_tex 跟着底衬缓冲走（blur_drop 收）。这里只把指针放下，
-	 * 顺手把共享金字塔收掉。 */
-	output->blur_tex = NULL;
-	output->backdrop_tex = NULL;
-	blur_set_drop(&output->blur_set);
-	output->blur_id = 0;
-	output->blur_gen = 0;
-	output->blur_levels = 0;
-}
-
-/* Capture the scene with every toplevel hidden and run the kawase chain on it.
- * The result depends only on the wallpaper and the layer surfaces, so it stays
- * valid across client repaints, window moves and viewport scrolling. */
-static bool shared_blur_rebuild(struct vidow_server *server,
-		struct vidow_output *output, int w, int h, int levels) {
-	struct vidow_view *view;
-	struct vidow_closing *closing;
-
-	wl_list_for_each(view, &server->views, link) {
-		view_set_capture_visible(view, false);
-	}
-	wl_list_for_each(closing, &server->closing, link) {
-		if (closing->fx.node != NULL) {
-			wlr_scene_node_set_enabled(&closing->fx.node->node, false);
-		}
-	}
-	/* layer 的模糊节点也得藏：bottom 层的那个就在被抓的场景里，不藏就是
-	 * 「模糊结果里混进上一帧的模糊」。 */
-	layer_blur_capture_visible(server, false);
-	bool ok = backdrop_render(server, output, w, h);
-	layer_blur_capture_visible(server, true);
-	wl_list_for_each(view, &server->views, link) {
-		view_set_capture_visible(view, true);
-	}
-	wl_list_for_each(closing, &server->closing, link) {
-		if (closing->fx.node != NULL) {
-			wlr_scene_node_set_enabled(&closing->fx.node->node, true);
-		}
-	}
-	if (!ok) {
-		return false;
-	}
-
-	/* 底衬贴图（backdrop_tex）跟着底衬缓冲一起建、一起收（见 vidow_blur_update），
-	 * 金字塔的贴图跟着金字塔缓冲走（见 blur_set_alloc）：这里一张都不用导入，
-	 * blur_tex 就是 up[0] 那张常驻贴图。 */
-	if (!blur_set_alloc(server, &output->blur_set, w, h, levels)) {
-		return false;
-	}
-	blur_chain(server, &output->blur_set, output->backdrop_tex, w, h);
-	output->blur_tex = output->blur_set.up_tex[0];
-	if (output->blur_tex == NULL) {
-		return false;
-	}
-	static int dumped = 0;
-	if (dumped < blur_dump_limit()) {
-		dump_buffer(server, output->backdrop, w, h, "vidow-bd", dumped);
-		if (output->blur_set.up[0] != NULL) {
-			dump_buffer(server, output->blur_set.up[0], w >> 1, h >> 1,
-				"vidow-blur", dumped);
-		}
-		dumped++;
-	}
-	vidow_stats.shared++;
-	output->blur_id = server->blur_serial++;
-	output->blur_gen = server->gen_layer;
-	output->blur_levels = levels;
-	output->blur_offset = server->config.blur_offset;
-	wlr_log(WLR_DEBUG, "blur: shared rebuild %dx%d levels=%d offset=%.2f", w, h,
-		levels, output->blur_offset);
-	return true;
-}
-
-/* 私有底衬那块区域按这个格对齐（设备像素）：窗口在格子里挪动时区域一个字都不
- * 变，缓存才真的能命中 —— 否则拖窗口时区域每帧跟着平移，每帧都得重抓。 */
-#define VIDOW_BLUR_REGION_GRID 128
-
-/* 链条采样到底能摸到多远（原始像素）：降采样每一趟的抽样半径是 blur_offset 个
- * **源** texel，源每降一级尺寸减半，换算回原图每级翻倍（offset * (2^levels - 1)）；
- * 往上那几趟同理，只是从第 2 级起（offset * (2^(levels+1) - 4)）。两者相加就是
- * offset * (3 * 2^levels - 5)。区域要在窗口外面留出这么一圈，不然窗口边缘附近的
- * 模糊值是被区域边界 clamp 出来的（看着就是边上发暗）。 */
-static int blur_reach_px(struct vidow_server *server, int levels) {
-	double off = server->config.blur_offset;
-	if (!(off > 0.0)) {
-		off = 0.0;
-	}
-	if (levels < 2) {
-		levels = 2;
-	}
-	double span = 3.0 * (double)(1u << levels) - 5.0;
-	int reach = (int)ceil(off * span) + 8;
-	return reach < 16 ? 16 : reach;
-}
-
-/* 这块窗口的私有底衬区域（设备像素，相对这块屏的原点）。levels 出参是这块区域
- * 该用几级金字塔 —— 跟整屏那套**同一个数**：级数决定模糊半径（物理像素），各算
- * 各的话小窗口会比大窗口糊得轻。 */
-static bool view_region_rect(struct vidow_server *server,
-		struct vidow_output *output, struct vidow_view *view,
-		int *rx, int *ry, int *rw, int *rh, int *levels) {
-	double scale = output->wlr_output->scale;
-	if (!(scale > 0.0)) {
-		scale = 1.0;
-	}
-	int pad = vidow_fx_pad(server);
-	struct wlr_box box = vidow_view_screen_box(view);
-	int lv = blur_levels_for(server, server->output_w, server->output_h);
-	int margin = blur_reach_px(server, lv);
-	/* 装饰矩形 = 可见窗口 ± pad（逻辑单位），再往外放一圈模糊半径。 */
-	int left = (int)lround((double)(box.x - pad) * scale) - server->output_x - margin;
-	int top = (int)lround((double)(box.y - pad) * scale) - server->output_y - margin;
-	int span_w = (int)lround((double)(box.width + 2 * pad) * scale) + 2 * margin;
-	int span_h = (int)lround((double)(box.height + 2 * pad) * scale) + 2 * margin;
-	const int grid = VIDOW_BLUR_REGION_GRID;
-	/* 原点对齐到网格（见上面那个宏）：窗口在格子里挪动时区域一个字都不变。 */
-	int gx1 = (int)floor((double)left / grid) * grid;
-	int gy1 = (int)floor((double)top / grid) * grid;
-	/* 尺寸**只跟窗口自己的大小有关，跟位置无关**（多留一格给「窗口在格子里挪
-	 * 动」）：拖窗口时区域整体平移，缓冲尺寸不变 —— 金字塔那几块缓冲才能一直
-	 * 复用（尺寸一变就得整批重建 + 重新导入贴图，那正是上一版修掉的卡顿）。 */
-	int size_w = (int)ceil((double)(span_w + grid) / grid) * grid;
-	int size_h = (int)ceil((double)(span_h + grid) / grid) * grid;
-	if (size_w < 1 || size_h < 1 || size_w > MAX_TARGET_PX ||
-			size_h > MAX_TARGET_PX) {
-		return false;
-	}
-	/* 原点再夹一下，让整块区域留在屏内：屏外没有像素可抓（那就是透明的），
-	 * 贴边窗口的边缘会被链条混进黑。夹的是原点、不是尺寸 —— 尺寸照样只跟窗口
-	 * 大小有关，缓冲不会因为窗口移动而重建。窗口比屏幕还大的极端情况下夹不住，
-	 * 那圈就还是透明的（layer 那一路一直是这个行为）。 */
-	int max_x = server->output_w - size_w;
-	int max_y = server->output_h - size_h;
-	if (max_x < 0) {
-		max_x = 0;
-	}
-	if (max_y < 0) {
-		max_y = 0;
-	}
-	if (gx1 < 0) {
-		gx1 = 0;
-	} else if (gx1 > max_x) {
-		gx1 = max_x;
-	}
-	if (gy1 < 0) {
-		gy1 = 0;
-	} else if (gy1 > max_y) {
-		gy1 = max_y;
-	}
-	*rx = gx1;
-	*ry = gy1;
-	*rw = size_w;
-	*rh = size_h;
-	*levels = lv;
-	return true;
-}
-
-/* 「只重跑受损那一小块」的开关：默认开。设了 VIDOW_BLUR_NO_PARTIAL 就整块重跑；
- * VIDOW_BLUR_NO_PARTIAL_FILE 指的文件一出现也整块重跑（跑着跑着切过去，用来比对
- * 「同一个场景、同一个客户端、同一个进程」下局部和整块的输出 —— 见
- * test-blurpartial.sh）。都只给 A/B 比对用。
- *
- * 两个 getenv 各只问一次（每次重抓都要问一遍：一帧里四五个元素重抓就是十来次；
- * getenv 在 profile 里比我们自己的模糊代码还显眼）。**文件存在性每次都看** ——
- * test-blurpartial.sh 就是跑着跑着把文件建出来切过去的。 */
-static bool blur_no_partial(void) {
-	static int on = -1;
-	static int file_read = 0;
-	static const char *file = NULL;
-	if (on < 0) {
-		on = getenv("VIDOW_BLUR_NO_PARTIAL") != NULL ? 1 : 0;
-	}
-	if (!file_read) {
-		file = getenv("VIDOW_BLUR_NO_PARTIAL_FILE");
-		file_read = 1;
-	}
-	if (on != 0) {
-		return true;
-	}
-	return file != NULL && access(file, F_OK) == 0;
-}
-
-/* 这次重抓**只需要动**的那一块（区域局部设备像素）：攒下来的损伤盒子跟区域相交
- * 的那部分的并集（往外放 2 像素，抵掉逻辑->设备的取整）。返回 false = 用不上，
- * 调用方整块重跑：
- *   - 一笔都没相交（不该走到这儿，防御）；
- *   - 损伤盖住了区域的一大半（>= 60%）：局部省不了多少，整块重跑还简单些。 */
-static bool region_update_rect(struct vidow_output *output,
-		struct vidow_view *view,
-		int rx, int ry, int rw, int rh, struct wlr_box *out) {
-	double scale = output->wlr_output->scale;
-	if (!(scale > 0.0)) {
-		scale = 1.0;
-	}
-	const struct vidow_dmg_set *set = &view->fx.pending_damage;
-	struct wlr_box u = {0};
-	for (int i = 0; i < set->n; i++) {
-		const struct wlr_box *b = &set->box[i];
-		/* 布局逻辑坐标 -> 这块屏的设备像素（减去这块屏的布局原点）-> 区域局部 */
-		double lx = (double)(b->x - output->box.x) * scale;
-		double ly = (double)(b->y - output->box.y) * scale;
-		double hx = (double)(b->x + b->width - output->box.x) * scale;
-		double hy = (double)(b->y + b->height - output->box.y) * scale;
-		struct wlr_box one = {
-			.x = (int)floor(lx) - rx - 2,
-			.y = (int)floor(ly) - ry - 2,
-			.width = (int)ceil(hx) - (int)floor(lx) + 4,
-			.height = (int)ceil(hy) - (int)floor(ly) + 4,
-		};
-		blur_box_add(&u, &one);
-	}
-	if (u.width <= 0 || u.height <= 0) {
-		return false;
-	}
-	bool clip_ok = true;
-	wlr_scene_node_for_each_buffer(&view->server->layer_toplevels->node,
-		backdrop_clip_check, &clip_ok);
-	if (!clip_ok) {
-		return false;
-	}
-	int x1 = u.x < 0 ? 0 : u.x;
-	int y1 = u.y < 0 ? 0 : u.y;
-	int x2 = u.x + u.width > rw ? rw : u.x + u.width;
-	int y2 = u.y + u.height > rh ? rh : u.y + u.height;
-	if (x2 <= x1 || y2 <= y1) {
-		return false;
-	}
-	if ((int64_t)(x2 - x1) * (y2 - y1) * 10 >= (int64_t)rw * rh * 6) {
-		return false; /* 盖住大半了：整块重跑 */
-	}
-	*out = (struct wlr_box){
-		.x = x1, .y = y1, .width = x2 - x1, .height = y2 - y1,
-	};
-	return true;
-}
-
-/* 抓「世界减掉这个窗口」，只抓它自己那一小块区域，然后跑一遍链条。
- *
- * 基座是共享底衬（壁纸 + background / bottom 层）里对应的那一块，1:1 拷过来，
- * 别的窗口再画上去 —— 这就是「模糊里得有窗口」；而这个窗口自己在抓的时候是藏起来
- * 的（它不该出现在自己的底衬里）。以前这里是整屏重画一遍（连壁纸一起），每帧每块
- * 重叠的窗口都要来一次；现在代价只跟这块区域的面积成正比。 */
-static bool view_region_build(struct vidow_server *server,
-		struct vidow_output *output, struct vidow_view *view,
-		int rx, int ry, int rw, int rh, int levels,
-		const struct wlr_box *partial) {
-	double scale = output->wlr_output->scale;
-	if (!(scale > 0.0)) {
-		scale = 1.0;
-	}
-
-	/* partial != NULL：只有这块（**区域局部设备像素**）的像素内容变了，其余保持
-	 * 上一版 —— 抓也只抓这一块、链条也只重跑这一块（见 blur_chain_rect）。
-	 * partial == NULL：整块重跑（第一次 / 形状变了 / 损伤盖满整块）。 */
-	int px = 0, py = 0, pw = rw, ph = rh;
-	if (partial != NULL) {
-		px = partial->x < 0 ? 0 : partial->x;
-		py = partial->y < 0 ? 0 : partial->y;
-		int px2 = partial->x + partial->width;
-		int py2 = partial->y + partial->height;
-		if (px2 > rw) {
-			px2 = rw;
-		}
-		if (py2 > rh) {
-			py2 = rh;
-		}
-		if (px2 <= px || py2 <= py) {
-			return false;
-		}
-		pw = px2 - px;
-		ph = py2 - py;
-	}
-
-	int x1 = rx < 0 ? 0 : rx, y1 = ry < 0 ? 0 : ry;
-	int x2 = rx + rw, y2 = ry + rh;
-	if (x2 > server->output_w) {
-		x2 = server->output_w;
-	}
-	if (y2 > server->output_h) {
-		y2 = server->output_h;
-	}
-	if (x2 <= x1 || y2 <= y1) {
-		return false; /* 整块在屏外，没东西可抓 */
-	}
-	if (partial != NULL) {
-		/* 要抓的那一块也得夹进屏内（区域原点可能被夹过，右/下边可能是屏外）。 */
-		int cx1 = rx + px, cy1 = ry + py;
-		int cx2 = cx1 + pw, cy2 = cy1 + ph;
-		if (cx1 < x1) {
-			cx1 = x1;
-		}
-		if (cy1 < y1) {
-			cy1 = y1;
-		}
-		if (cx2 > x2) {
-			cx2 = x2;
-		}
-		if (cy2 > y2) {
-			cy2 = y2;
-		}
-		if (cx2 <= cx1 || cy2 <= cy1) {
-			return false;
-		}
-		px = cx1 - rx;
-		py = cy1 - ry;
-		pw = cx2 - cx1;
-		ph = cy2 - cy1;
-	}
-
-	struct vidow_fx_target *fx = &view->fx;
-	/* 这一版是被哪一块损伤触发的（只给下面那行日志用：pending_damage 这里就要
-	 * 清掉了）。修「客户端只动了一小块，整片模糊却重抓」时，看的就是这个数。 */
-	struct wlr_box dmg = dmg_bounds(&fx->pending_damage);
-	if (fx->own_bd == NULL || fx->own_bd_w != rw || fx->own_bd_h != rh) {
-		own_bd_drop(fx);
-		fx->own_bd = vidow_alloc_target(server, rw, rh);
-		if (fx->own_bd == NULL) {
-			return false;
-		}
-		fx->own_bd_tex = stat_tex_new(
-			wlr_texture_from_buffer(server->renderer, fx->own_bd));
-		if (fx->own_bd_tex == NULL) {
-			own_bd_drop(fx);
-			return false;
-		}
-		fx->own_bd_w = rw;
-		fx->own_bd_h = rh;
-	}
-
-	struct wlr_render_pass *pass = wlr_renderer_begin_buffer_pass(
-		server->renderer, fx->own_bd, NULL);
-	if (pass == NULL) {
-		return false;
-	}
-	struct wlr_render_rect_options clear = {
-		.box = { .x = px, .y = py, .width = pw, .height = ph },
-		.color = { .r = 0.0f, .g = 0.0f, .b = 0.0f, .a = 0.0f },
-		.blend_mode = WLR_RENDER_BLEND_MODE_NONE,
-	};
-	wlr_render_pass_add_rect(pass, &clear);
-
-	/* 基座：共享底衬（壁纸 + background / bottom 层）里对应的那一块，1:1 捞过来
-	 * （不插值、不混合 —— 这块缓冲刚清成全透明，直接覆盖写最便宜）。源框必须
-	 * 夹在底衬里面：wlroots 的 render pass 会断言源框越界（伸到屏外的那圈只能
-	 * 留透明，所以 view_region_rect 把区域原点夹在屏内）。 */
-	int bx1 = rx + px, by1 = ry + py;
-	if (bx1 < x1) {
-		bx1 = x1;
-	}
-	if (by1 < y1) {
-		by1 = y1;
-	}
-	int bx2 = bx1 + pw, by2 = by1 + ph;
-	if (bx2 > x2) {
-		bx2 = x2;
-	}
-	if (by2 > y2) {
-		by2 = y2;
-	}
-	float one = 1.0f;
-	struct wlr_render_texture_options base = {
-		.texture = output->backdrop_tex,
-		.src_box = {
-			.x = (float)bx1, .y = (float)by1,
-			.width = (float)(bx2 - bx1), .height = (float)(by2 - by1),
-		},
-		.dst_box = {
-			.x = (float)(bx1 - rx), .y = (float)(by1 - ry),
-			.width = (float)(bx2 - bx1), .height = (float)(by2 - by1),
-		},
-		.alpha = &one,
-		.transform = WL_OUTPUT_TRANSFORM_NORMAL,
-		.filter_mode = WLR_SCALE_FILTER_NEAREST,
-		.blend_mode = WLR_RENDER_BLEND_MODE_NONE,
-	};
-	wlr_render_pass_add_texture(pass, &base);
-
-	/* 窗口画在基座上：这个窗口自己藏起来，别的照画。只画 toplevels —— 弹出物那
-	 * 一层在窗口**上面**，不该进窗口的底衬（共享底衬那趟也是这么做的）。 */
-	view_set_capture_visible(view, false);
-	layer_blur_capture_visible(server, false);
-	struct backdrop_ctx ctx = {
-		.pass = pass,
-		.server = server,
-		.scale = scale,
-		.ox = server->output_x + rx,
-		.oy = server->output_y + ry,
-		/* 只画要抓的那一块（partial 时就是损伤那一小块）：底衬别的像素一个都
-		 * 不碰，其余部分还是上一版的内容。 */
-		.clip_x = bx1 - rx,
-		.clip_y = by1 - ry,
-		.clip_w = bx2 - bx1,
-		.clip_h = by2 - by1,
-	};
-	wlr_scene_node_for_each_buffer(&server->layer_toplevels->node, backdrop_iter,
-		&ctx);
-	layer_blur_capture_visible(server, true);
-	view_set_capture_visible(view, true);
-	if (!wlr_render_pass_submit(pass)) {
-		return false;
-	}
-
-	vidow_stats.own++;
-	dmg_clear(&fx->pending_damage); /* 这一版的账已经算清了 */
-	blur_own_drop(fx);
-	if (!blur_set_alloc(server, &fx->blur_set, rw, rh, levels)) {
-		return false;
-	}
-	if (partial != NULL) {
-		blur_chain_rect(server, &fx->blur_set, fx->own_bd_tex, rw, rh,
-			&(struct wlr_box){ .x = px, .y = py,
-				.width = pw, .height = ph },
-			blur_reach_px(server, levels));
-	} else {
-		blur_chain(server, &fx->blur_set, fx->own_bd_tex, rw, rh);
-	}
-	fx->blur_own_tex = fx->blur_set.up_tex[0];
-	if (fx->blur_own_tex == NULL) {
-		return false;
-	}
-	/* 缓存键是「世界减掉这个窗口」的代次（见 vidow_backdrop_damage_view）。 */
-	fx->blur_set.gen = server->gen_scene - view->self_gen;
-	fx->blur_set.valid = true;
-	fx->blur_own_id = server->blur_serial++;
-	/* 这块区域本身（blur_tex_x/y/w/h）不在这儿登记：它跟着贴图一起由
-	 * blur_assign() 换（见那里的注释），一处管一处，免得两边不一致。 */
-
-	static int dumped = 0;
-	if (dumped < blur_dump_limit()) {
-		dump_buffer(server, fx->own_bd, rw, rh, "vidow-bd", dumped);
-		if (fx->blur_set.up[0] != NULL && rw > 1 && rh > 1) {
-			dump_buffer(server, fx->blur_set.up[0], rw >> 1, rh >> 1,
-				"vidow-blur", dumped);
-		}
-		dumped++;
-	}
-	wlr_log(WLR_DEBUG, "blur: own region %s %dx%d at %d,%d levels=%d"
-		"（损伤 %dx%d at %d,%d，%s %dx%d）",
-		vidow_view_title(view) != NULL ? vidow_view_title(view) : "?",
-		rw, rh, rx, ry, levels,
-		dmg.width, dmg.height, dmg.x, dmg.y,
-		partial != NULL ? "局部重跑" : "整块重跑", pw, ph);
-	return true;
-}
-
-/* Free everything this output owns. Called when the output goes away or its
- * size/scale changes.
- *
- * 借出去的贴图也在这里销毁（共享的那份是所有不重叠窗口一起用的），所以每个借过它
- * 的窗口都必须松手：热插拔把窗口挪到另一块屏时，紧接着就会重摆 + 重画，手里要是
- * 还攥着已经销毁的贴图，GLES2 那边直接是 `wlr_texture_is_gles2` 断言崩溃。
- * 下一帧 blur_update() 会把该借的重新借回来，所以这里清空不丢东西。 */
-void vidow_blur_output_finish(struct vidow_output *output) {
-	shared_blur_drop(output);
-	blur_drop(output);
-
-	struct vidow_view *view;
-	wl_list_for_each(view, &output->server->views, link) {
-		if (view->fx.blur_owned) {
-			continue; /* 自己的那份跟这块屏无关 */
-		}
-		blur_assign(&view->fx, NULL, false, 0, NULL);
-	}
-}
-
-/* 这块窗口的私有模糊底衬归哪块屏：它现在**画在**哪块屏上（跨屏拖动时布局归属还没
- * 换，人已经在对面那块屏上了）；看不见任何屏就退回归属那块。和装饰离屏缓冲的倍率
- * （view.c 的 view_scale）用同一个判据 —— 倍率和区域必须落在同一块屏的坐标系里。 */
-static struct wlr_output *view_blur_owner(struct vidow_view *view) {
-	struct wlr_output *out = vidow_view_display_output(view);
-	return out != NULL ? out : view->output;
-}
-
-/* Called once per frame before anything is drawn, so the decorations can
- * sample this frame's backdrop. Everything is cached: a frame where nothing
- * moved behind a window touches no GPU buffer at all. */
-void vidow_blur_update(struct vidow_output *output) {
-	struct vidow_server *server = output->server;
-	struct vidow_view *view;
-
-	int w = output->wlr_output->width, h = output->wlr_output->height;
-	bool usable = server->shader_ok && server->config.blur_enabled && w > 0 &&
-		h > 0 && w <= MAX_TARGET_PX && h <= MAX_TARGET_PX;
-	if (!usable) {
-		wl_list_for_each(view, &server->views, link) {
-			if (view_blur_owner(view) != output->wlr_output) {
-				continue; /* 别的屏上的窗口归那一趟收 */
-			}
-			blur_target_release(&view->fx);
-		}
-		struct vidow_layer_surface *off;
-		wl_list_for_each(off, &server->layers, link) {
-			vidow_layer_blur_release(off);
-		}
-		shared_blur_drop(output);
-		blur_drop(output);
-		return;
-	}
-
-	int levels = blur_levels_for(server, w, h);
-
-	if (output->backdrop == NULL || output->backdrop_w != w ||
-			output->backdrop_h != h) {
-		blur_drop(output);
-		shared_blur_drop(output); /* the pyramid is sized for the old output */
-		output->backdrop = vidow_alloc_target(server, w, h);
-		if (output->backdrop == NULL) {
-			return;
-		}
-		/* 未模糊的底衬也留一张贴图：被窗口遮住的 layer surface 拿它当自己那一
-		 * 小块区域底衬的基座（比每次重抓一遍壁纸便宜太多，见 layer_region_build）。
-		 * 贴图是包的缓冲，不包像素 —— 底衬每帧重画也不影响它，建一次就够。 */
-		output->backdrop_tex = stat_tex_new(
-			wlr_texture_from_buffer(server->renderer, output->backdrop));
-		if (output->backdrop_tex == NULL) {
-			blur_drop(output);
-			return;
-		}
-		output->backdrop_w = w;
-		output->backdrop_h = h;
-	}
-
-	/* 缓存键必须把所有影响这张贴图的参数都算上：级数、采样步长。
-	 * 漏了 blur_offset 的时候，运行时改它看着「没反应」—— 贴图是旧参数算的，谁也
-	 * 没让它重算。（blur_alpha_min 原来也在这儿，现在它只进装饰着色器、不进金字塔，
-	 * 改它由 blur_mask_min_changed() 直接让帧循环重画。） */
-	bool shared_ok = output->blur_tex != NULL &&
-		output->blur_gen == server->gen_layer &&
-		output->blur_levels == levels &&
-		fabs(output->blur_offset - server->config.blur_offset) < 1e-6 &&
-		output->blur_set.w == w && output->blur_set.h == h;
-	if (!shared_ok) {
-		shared_ok = shared_blur_rebuild(server, output, w, h, levels);
-	}
-
-	wl_list_for_each(view, &server->views, link) {
-		/* 私有底衬是「**这块屏**上的这一块区域」，别的屏上的窗口不归这一趟管。
-		 *
-		 * 少了这一句，两块屏会轮流给同一个窗口建金字塔：每块屏都按自己的
-		 * scale / 尺寸算区域（1 倍屏把 280x380 的窗口算成 640x768，2 倍屏算成
-		 * 896x1152），而金字塔是挂在窗口身上的（view->fx.blur_set），于是两趟
-		 * 每帧互相把对方的缓冲丢掉重建 —— 一次十几块 GBM 缓冲（最大那块
-		 * 2304x2560 = 23 MB），拖窗口时每秒几千次分配，屏幕上一顿一顿的。
-		 * 顺带也修了「区域和贴图归哪块屏」：以前最后写进 fx 的是哪一趟算的
-		 * 就归谁，跨屏的窗口可能采到另一块屏的底衬。
-		 *
-		 * 归属判据和装饰离屏缓冲的倍率是**同一个**（view_blur_owner ——
-		 * 「窗口现在画在哪块屏上」）：两个地方各算各的话，拖到对面那块屏上时
-		 * 倍率对不上，模糊贴图的采样坐标就落错地方（那块区域是按底衬这块屏的
-		 * 设备像素记的）。 */
-		if (view_blur_owner(view) != output->wlr_output) {
-			continue;
-		}
-		/* 这张贴图代表的是**这块屏**的视野：尺寸和布局原点跟着贴图一起记在 fx
-		 * 上（见 server.h 那组 blur_out_*）。采样只认这一组，不现场读
-		 * server->output_*：重烘那趟会给别的屏上的窗口也烘一次，那一刻的
-		 * server->output_w 是那块屏的，按它算 UV 就是「只取中间一块铺满整窗」。 */
-		view->fx.blur_out_w = output->wlr_output->width;
-		view->fx.blur_out_h = output->wlr_output->height;
-		view->fx.blur_out_x = server->output_x;
-		view->fx.blur_out_y = server->output_y;
-		if (!view_wants_blur(view) || view->fx.node == NULL) {
-			if (view->fx.blur_own_tex != NULL) {
-				blur_own_drop(&view->fx);
-			}
-			own_bd_drop(&view->fx); /* 这块屏上不再需要私有底衬了 */
-			blur_assign(&view->fx, NULL, false, 0, NULL);
-			continue;
-		}
-
-		blur_mask_min_changed(&view->fx, server->config.blur_alpha_min);
-
-		struct vidow_look look;
-		vidow_view_look(&server->config, &view->rule_eff,
-			view->fullscreen, &look);
-		if (look.blur_xray || !view_overlaps_other(view)) {
-			/* Tiled and non-overlapping floating windows all share the
-			 * wallpaper backdrop: one capture and one chain for all of them.
-			 * Only drop a private pyramid if there really is one, otherwise
-			 * the identity would change every frame and force a redraw.
-			 *
-			 * blur_xray 也走这条路：重叠时照样用整屏那份（壁纸 + layer 那层），
-			 * 忽略别的窗口 —— 糊的是壁纸而不是压着的那个窗口（Hyprland 的
-			 * blur:xray 同款）。私有底衬一块不建：重叠场景每帧的趟数从
-			 * N×(1+2·级数−1) 掉到 ~3，那块显存也全免。 */
-			if (view->fx.blur_own_tex != NULL) {
-				blur_own_drop(&view->fx);
-			}
-			own_bd_drop(&view->fx); /* 不再重叠：私有底衬那块区域可以还了 */
-			blur_assign(&view->fx, output->blur_tex, false, output->blur_id, NULL);
-			continue;
-		}
-
-		if (!shared_ok) {
-			blur_assign(&view->fx, NULL, false, 0, NULL);
-			continue;
-		}
-
-		int rx, ry, rw, rh, rlevels;
-		if (!view_region_rect(server, output, view, &rx, &ry, &rw, &rh,
-				&rlevels)) {
-			blur_assign(&view->fx, NULL, false, 0, NULL);
-			continue;
-		}
-		/* 抓的时候这个窗口是藏起来的，所以它自己的位置和内容都不进这张图：
-		 * 世界代次只是粗筛，真正的判据是「这次损伤有没有碰到我这一块」—— 别的
-		 * 窗口在屏幕另一头重画（视频 / 浏览器每帧都在交帧）不该让我重抓。
-		 * 区域本身已经把模糊半径算进去了（见 view_region_rect）。 */
-		double oscale = output->wlr_output->scale;
-		if (!(oscale > 0.0)) {
-			oscale = 1.0;
-		}
-		struct wlr_box region_logical = {
-			.x = output->box.x + (int)floor((double)rx / oscale),
-			.y = output->box.y + (int)floor((double)ry / oscale),
-			.width = (int)ceil((double)rw / oscale) + 1,
-			.height = (int)ceil((double)rh / oscale) + 1,
-		};
-		bool key_changed =
-			view->fx.blur_set.gen != server->gen_scene - view->self_gen;
-		bool touched = key_changed &&
-			blur_damage_hits(&view->fx, &region_logical);
-		/* 形状（区域位置尺寸 / 级数 / 半径）没变：那张金字塔就是上一版的，可以
-		 * 只更新受损的那一块（见 view_region_build 的 partial）。 */
-		bool shape_ok = view->fx.blur_set.valid &&
-			view->fx.blur_own_tex != NULL &&
-			view->fx.blur_set.w == rw && view->fx.blur_set.h == rh &&
-			view->fx.blur_set.levels == rlevels &&
-			fabs(view->fx.blur_set.offset - server->config.blur_offset) < 1e-6 &&
-			view->fx.blur_tex_x == rx && view->fx.blur_tex_y == ry &&
-			view->fx.blur_tex_w == rw && view->fx.blur_tex_h == rh &&
-			view->fx.own_bd != NULL && view->fx.own_bd_w == rw &&
-			view->fx.own_bd_h == rh;
-		bool fresh = shape_ok && !touched;
-		if (!fresh) {
-			struct wlr_box upd;
-			bool partial = shape_ok && !blur_no_partial() &&
-				region_update_rect(output, view, rx, ry, rw, rh, &upd);
-			if (!view_region_build(server, output, view, rx, ry, rw, rh,
-					rlevels, partial ? &upd : NULL)) {
-				blur_assign(&view->fx, NULL, false, 0, NULL);
-				continue;
-			}
-		}
-		/* owned = false：这张贴图归 view->fx.blur_set（blur_set_drop 收），
-		 * 这里只是指过去采样。区域跟着一起报（见 blur_assign）。 */
-		blur_assign(&view->fx, view->fx.blur_own_tex, false,
-			view->fx.blur_own_id,
-			&(struct wlr_box){ .x = rx, .y = ry, .width = rw, .height = rh });
-	}
-
-	/* layer surface 背后的模糊（状态栏 / 面板那层）。bottom 层用共享的那份底衬
-	 * （壁纸 + background 层），一次抓取都不用；top / overlay 层底下有窗口，各
-	 * 自抓自己那一小块（见 layer_region_build）。 */
-	struct vidow_layer_surface *ls;
-	wl_list_for_each(ls, &server->layers, link) {
-		if (ls->output != output) {
-			continue;
-		}
-		if (!layer_blur_wanted(server, ls)) {
-			vidow_layer_blur_release(ls);
-			continue;
-		}
-		/* overview 里 top / overlay 那几棵树整体被关掉了，这层模糊没人看得见：
-		 * 别每帧白抓一份（overview 的动画每帧都在动世界代次）。 */
-		if (vidow_overview_active(server) &&
-				ls->layer != ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM) {
-			continue;
-		}
-		/* 这一帧画不出来（两个目标都还在飞 / 底衬还没建好）就留着上一帧的
-		 * 节点：别一帧有、一帧没有地闪。 */
-		(void)layer_blur_frame(server, output, ls);
-	}
-
-	/* overview：整屏一张糊掉的壁纸（niri 那样），垫在压暗遮罩下面。 */
-	vidow_overview_blur_frame(server, output);
-}
-
-/* ------------------------------------------------------------------- draw */
-
-/* 装饰那一趟的几何（全部是**渲染目标像素**口径）。屏幕那条路（decor_draw）和
- * 窗口抓帧那条路（vidow_fx_capture_decor）只有这一份不一样，uniform 那几十行
- * 共用同一段代码 —— 两处各写一遍必然走散，某处忘了乘 scale 就是「录出来跟屏上
- * 长得不一样」。
- *
- * off_x/off_y：内容（窗口可见区）左上角在渲染目标里的位置。屏幕那条路是内边距
- * px_pad（内容居中），窗口抓帧那条路是窗口在取景框里的位置（抓帧框常常就是窗口
- * 本身，于是是 0）。
- * origin_x / origin_y 与 out_size_x / out_size_y：内容左上角在**底衬贴图**里的
- * 像素坐标，以及那张贴图的尺寸。
- * 装饰着色器按它算模糊采样的 UV（见 decor_fragment_src 的 u_origin /
- * u_output_size）。 */
-struct decor_geo {
-	int dst_w, dst_h;
-	int content_w, content_h;
-	float off_x, off_y;
-	float origin_x, origin_y;
-	float out_size_x, out_size_y;
-	/* 内容那一项的乘子：屏幕那条路是 1，窗口抓帧那条路是 0（内容由场景节点
-	 * 画，这张图里只要底衬 / 画框，但剔除仍按内容 alpha 走）。 */
-	float content_alpha;
-};
-
-static void decor_pass(struct vidow_server *server,
-		struct vidow_fx_target *fx, struct wlr_buffer *dst,
-		const struct decor_geo *g,
-		struct wlr_texture *src, struct wlr_texture *mask,
-		const float border[4], double alpha, double scale,
-		const struct vidow_look *look) {
-	struct vidow_decor_prog *d = &server->decor;
-	struct vidow_config *cfg = &server->config;
-
-	struct wlr_gles2_texture_attribs sa;
-	wlr_gles2_texture_get_attribs(src, &sa);
-
-	struct wlr_egl *egl = NULL;
-	if (begin_pass(server, dst, g->dst_w, g->dst_h, &egl) == 0) {
-		return;
-	}
-
-	glUseProgram(d->program);
-	bind_tex(0, sa.target, sa.tex);
-	glUniform1i(d->u_texture, 0);
-
-	struct wlr_texture *blur = fx->blur_tex != NULL ?
-		fx->blur_tex : server->empty_tex;
-	if (blur != NULL) {
-		struct wlr_gles2_texture_attribs ba;
-		wlr_gles2_texture_get_attribs(blur, &ba);
-		bind_tex(1, ba.target, ba.tex);
-	}
-	glUniform1i(d->u_blur, 1);
-
-	/* 元素自己的内容（透明度剔除用）。mask == NULL 时用 u_texture 那张内容贴图
-	 * （窗口 / 弹窗：内容贴图就是元素自己）；layer surface 的模糊底衬不画内容，
-	 * 调用方把 layer 自己的缓冲当 mask 递进来。采样器不能空着，配上 empty_tex
-	 * 也无所谓：u_mask_on = 0 时着色器根本不采它。 */
-	struct wlr_texture *mtex = mask != NULL ? mask : server->empty_tex;
-	struct wlr_gles2_texture_attribs ma;
-	wlr_gles2_texture_get_attribs(mtex, &ma);
-	bind_tex(2, ma.target, ma.tex);
-	glUniform1i(d->u_mask, 2);
-	glUniform1f(d->u_mask_on, mask != NULL ? 1.0f : 0.0f);
-	/* 阈值：客户端用 ext-background-effect 自己要了区域就不按元素 alpha 剔 ——
-	 * 那块区域就是它画出来的边界（niri 的 need_ignore_alpha 同一个判断）。layer
-	 * 底衬拿不到元素内容时也不能剔，不然整块模糊都没了。0 = step(0, a) 恒为 1，
-	 * 也就是不剔。 */
-	float mask_min = (float)cfg->blur_alpha_min;
-	if (fx->blur_region_on || (mask == NULL && fx->blur_only)) {
-		mask_min = 0.0f;
-	}
-	glUniform1f(d->u_mask_min, mask_min);
-
-	/* 着色器全程在「渲染目标的物理像素」里算：配置里的圆角、边框、阴影都是
-	 * 逻辑单位，乘上倍率才是像素。 */
-	glUniform2f(d->u_size, (float)g->content_w, (float)g->content_h);
-	glUniform2f(d->u_target_size, (float)g->dst_w, (float)g->dst_h);
-	glUniform2f(d->u_content_off, g->off_x, g->off_y);
-	glUniform1f(d->u_radius, (float)(look->corner_radius * scale));
-	/* 圆角的形状指数：2 = 圆弧、4 = 超椭圆。夹一道（配置 / 环境变量 / IPC /
-	 * 窗口规则四条路都夹过，这里只是「进着色器的值一定是合法的」）。 */
-	glUniform1f(d->u_corner_n, (float)vidow_corner_n_clamp(look->corner_n));
-	glUniform1f(d->u_border_width, (float)(look->border_width * scale));
-	/* The decoration shader works in premultiplied alpha; the config keeps
-	 * straight values so a script can read them back. */
-	float border_pm[4] = { border[0] * border[3], border[1] * border[3],
-		border[2] * border[3], border[3] };
-	float shadow_pm[4] = { look->shadow_color[0] * look->shadow_color[3],
-		look->shadow_color[1] * look->shadow_color[3],
-		look->shadow_color[2] * look->shadow_color[3],
-		look->shadow_color[3] };
-	glUniform4fv(d->u_border_color, 1, border_pm);
-	glUniform4fv(d->u_shadow_color, 1, shadow_pm);
-	glUniform2f(d->u_shadow_offset, (float)(look->shadow_offset_x * scale),
-		(float)(look->shadow_offset_y * scale));
-	glUniform1f(d->u_shadow_radius, (float)(look->shadow_radius * scale));
-	glUniform1f(d->u_opacity, (float)look->opacity);
-	glUniform1f(d->u_content_alpha, g->content_alpha);
-	glUniform1f(d->u_noise, (float)look->noise);
-	glUniform1f(d->u_alpha, (float)alpha);
-	glUniform1f(glGetUniformLocation(d->program, "u_time"),
-		(float)(vidow_now_ns() % 1000000000000LL) / 1e9f);
-	/* 窗口在输出上的位置（物理像素，输出原点已减掉）：散景贴图是按输出分辨
-	 * 率抓的，采样坐标必须落在这块屏自己的坐标系里。被模糊的 layer surface
-	 * 那张贴图只盖住它自己那一小块区域（fx->blur_tex_*），坐标就再减掉区域
-	 * 原点、除数也换成区域尺寸 —— 不减就是整块错位。
-	 *
-	 * 那块屏是哪一块，认**跟着这张贴图一起记的** blur_out_*（见 server.h）：
-	 * 重烘会落在别的屏正在渲染的那一帧上（output.c 帧循环那趟不看归属），
-	 * 现场读 server->output_* 拿到的是那块屏的尺寸/原点 —— 整屏底衬只取中间
-	 * 一块铺满整窗，看着就是「静止时底衬啪一下换挡」（中心放大 + 变糊）。 */
-	/* 底衬采样的映射：全部由调用方算好（屏幕那条路按窗口在输出上的位置算，
-	 * 窗口抓帧那条路按取景框算）—— 两边共用这一份 uniform，别在这儿现场读
-	 * 全局量（跨屏底衬采样的坑，见 server.h 的 blur_out_*）。 */
-	glUniform2f(d->u_origin, g->origin_x, g->origin_y);
-	glUniform2f(d->u_output_size, g->out_size_x, g->out_size_y);
-	glUniform1f(d->u_flip_y, cfg->shader_flip_y ? 1.0f : 0.0f);
-	/* 模糊那层要不要叠：除了「有贴图」（fx->blur_tex）和全局开关（fx->blur），
-	 * 还得看**这一次渲染自己的 look** —— 预览（缩略图）那一趟在
-	 * vidow_fx_frame 里把 look.blur 关掉，于是预览里不叠模糊（见那里的注释）。 */
-	float strength = fx->blur && fx->blur_tex != NULL && look->blur ?
-		(float)cfg->blur_strength : 0.0f;
-	glUniform1f(d->u_blur_strength, strength);
-	/* 客户端用 ext-background-effect 指定了区域就只模糊那块 */
-	glUniform1f(d->u_blur_region_on, fx->blur_region_on ? 1.0f : 0.0f);
-	/* 区域是 surface 局部坐标（逻辑），着色器在物理像素里比对。 */
-	glUniform4f(d->u_blur_region, (float)(fx->blur_region[0] * scale),
-		(float)(fx->blur_region[1] * scale),
-		(float)(fx->blur_region[2] * scale),
-		(float)(fx->blur_region[3] * scale));
-	/* 内容贴图里哪一块是可见窗口（归一化）。没留白的元素是 0 / 1 —— layer 底衬、
-	 * X11、以及不自己画装饰的客户端都走这一支，和以前逐像素一样。 */
-	glUniform4f(d->u_tex_map, fx->tex_off_x, fx->tex_off_y,
-		fx->tex_scale_x, fx->tex_scale_y);
-
-	if (fx->blur_only) {
-		/* 只要那一层模糊：内容、阴影、边框、圆角、噪点全关（layer surface 的
-		 * 底衬用；内容由 wlroots 自己的场景节点画在上面）。 */
-		glUniform1f(d->u_radius, 0.0f);
-		glUniform1f(d->u_border_width, 0.0f);
-		glUniform4f(d->u_border_color, 0.0f, 0.0f, 0.0f, 0.0f);
-		glUniform4f(d->u_shadow_color, 0.0f, 0.0f, 0.0f, 0.0f);
-		glUniform1f(d->u_noise, 0.0f);
-	}
-
-	draw_quad(d->program);
-	glUseProgram(0);
-	end_pass(egl);
-}
-
-/* 屏幕那条路：几何从 fx（离屏缓冲 + 窗口在输出上的位置）来。 */
-static void decor_draw(struct vidow_server *server,
-		struct vidow_fx_target *fx, struct wlr_buffer *dst,
-		struct wlr_texture *src, struct wlr_texture *mask,
-		const float border[4], int ox, int oy,
-		double alpha, double scale, const struct vidow_look *look) {
-	/* 窗口在输出上的位置（物理像素，输出原点已减掉）：散景贴图是按输出分辨
-	 * 率抓的，采样坐标必须落在这块屏自己的坐标系里。被模糊的 layer surface
-	 * 那张贴图只盖住它自己那一小块区域（fx->blur_tex_*），坐标就再减掉区域
-	 * 原点、除数也换成区域尺寸 —— 不减就是整块错位。
-	 *
-	 * 那块屏是哪一块，认**跟着这张贴图一起记的** blur_out_*（见 server.h）：
-	 * 重烘会落在别的屏正在渲染的那一帧上（output.c 帧循环那趟不看归属），
-	 * 现场读 server->output_* 拿到的是那块屏的尺寸/原点 —— 整屏底衬只取中间
-	 * 一块铺满整窗，看着就是「静止时底衬啪一下换挡」（中心放大 + 变糊）。 */
-	int out_x = fx->blur_out_w > 0 ? fx->blur_out_x : server->output_x;
-	int out_y = fx->blur_out_h > 0 ? fx->blur_out_y : server->output_y;
-	int out_w = fx->blur_out_w > 0 ? fx->blur_out_w : server->output_w;
-	int out_h = fx->blur_out_h > 0 ? fx->blur_out_h : server->output_h;
-	struct decor_geo g = {
-		.dst_w = fx->w, .dst_h = fx->h,
-		.content_w = fx->content_w, .content_h = fx->content_h,
-		.off_x = (float)fx->px_pad, .off_y = (float)fx->px_pad,
-		.origin_x = (float)((int)lround((double)ox * scale) - out_x -
-			fx->blur_tex_x),
-		.origin_y = (float)((int)lround((double)oy * scale) - out_y -
-			fx->blur_tex_y),
-		.out_size_x = (float)(fx->blur_tex_w > 0 ? fx->blur_tex_w : out_w),
-		.out_size_y = (float)(fx->blur_tex_w > 0 ? fx->blur_tex_h : out_h),
-		.content_alpha = 1.0f,
-	};
-	decor_pass(server, fx, dst, &g, src, mask, border, alpha, scale, look);
-}
-
-/* 窗口抓帧那条路（wincapture.c）：把「窗口内容」按屏上的样子合成出来 —— 模糊底衬
- * + 圆角 + 边框 + 投影 + 颗粒，和屏幕上**同一个着色器、同一遍**（不是另写一套）。
- *
- * 和屏幕那条路的差别只有几何：
- *   - 渲染目标是**取景框**（这一帧的流），不是窗口的离屏缓冲，内容摆在哪由调用方
- *     给（content_x/y）；
- *   - 底衬采样按「内容左上角的布局坐标 × 取景框缩放」算：取景框的缩放常常和那块
- *     屏的缩放不是一回事（窗口等比缩进流里），所以先按布局坐标换算到那块屏的设备
- *     像素，再乘目标像素/底衬像素那个比值（k）。取景框就是窗口本身时 k = 1，
- *     公式跟屏幕那条路逐项一致。
- *
- * 取景框比窗口大（窗口缩进流、四周留黑）时，装饰只画在窗口那块；外面的留黑由
- * 调用方保证（这一趟不动那儿的像素）。 */
-/* 客户端缓冲 → 贴图（借来那张或自己建一张）。窗口抓帧那条路要拿它当「元素
- * 内容」贴图（采样映射 + 透明度剔除），和屏幕上那条路共用这一份。owned 非空时
- * 告诉调用方要不要自己销毁。 */
-struct wlr_texture *vidow_fx_client_texture(struct vidow_server *server,
-		struct wlr_buffer *buffer, bool *owned) {
-	if (server == NULL || buffer == NULL) {
-		return NULL;
-	}
-	bool own = true;
-	struct wlr_texture *tex = client_texture(server->renderer, buffer, &own);
-	if (owned != NULL) {
-		*owned = own;
-	}
-	return tex;
-}
-
-bool vidow_fx_capture_decor(struct vidow_server *server,
-		const struct vidow_capture_decor *c) {
-	if (server == NULL || c == NULL || c->dst == NULL || c->look == NULL ||
-			c->dst_w <= 0 || c->dst_h <= 0 || server->decor.program == 0) {
-		return false;
-	}
-	double frame_scale = c->frame_scale > 0.0 ? c->frame_scale : 1.0;
-	double out_scale = c->out_scale > 0.0 ? c->out_scale : frame_scale;
-	/* 目标像素 / 底衬像素。两者一样时（窗口源那条路就是这样：出图尺寸 =
-	 * 窗口逻辑尺寸 × 那块屏的缩放）下面这两行就是屏幕那条路的公式。 */
-	double k = frame_scale / out_scale;
-	int bw = c->blur_w > 0 ? c->blur_w : c->out_w;
-	int bh = c->blur_h > 0 ? c->blur_h : c->out_h;
-	if (bw <= 0 || bh <= 0) {
-		bw = 1;
-		bh = 1;
-	}
-
-	/* fx 只用来告诉 decor_pass「底衬是哪张、内容贴图怎么采」：几何全在 g 里。
-	 * 模糊只有「底衬那一趟」画（edge 那趟画的是画框，叠在内容上面，再糊一次
-	 * 就是错的）。 */
-	struct vidow_fx_target fx = {0};
-	fx.blur_tex = c->blur;
-	fx.blur = !c->edge && c->blur != NULL;
-	fx.tex_off_x = c->tex_u0;
-	fx.tex_off_y = c->tex_v0;
-	fx.tex_scale_x = c->tex_du;
-	fx.tex_scale_y = c->tex_dv;
-
-	struct decor_geo g = {
-		.dst_w = c->dst_w, .dst_h = c->dst_h,
-		.content_w = c->content_w, .content_h = c->content_h,
-		.off_x = (float)c->content_x, .off_y = (float)c->content_y,
-		.origin_x = (float)(((double)c->content_layout_x - (double)c->out_x) *
-			frame_scale - (double)c->blur_x * k),
-		.origin_y = (float)(((double)c->content_layout_y - (double)c->out_y) *
-			frame_scale - (double)c->blur_y * k),
-		.out_size_x = (float)((double)bw * k),
-		.out_size_y = (float)((double)bh * k),
-		/* 内容不画进这张图（由场景里那个镜像节点画），但 u_texture 照样得
-		 * 采 —— 透明度剔除按它的 alpha 走（和屏上同一条判据）。 */
-		.content_alpha = 0.0f,
-	};
-
-	decor_pass(server, &fx, c->dst, &g,
-		c->content != NULL ? c->content : server->empty_tex, NULL,
-		c->border, 1.0, frame_scale, c->look);
-	return true;
-}
-
-static bool anim_draw(struct vidow_server *server,
-		struct vidow_fx_target *fx, struct wlr_buffer *dst,
-		struct wlr_texture *src, int ox, int oy, double alpha, double scale) {
-	struct vidow_shader *sh = fx->shader;
-	struct wlr_gles2_texture_attribs sa;
-	wlr_gles2_texture_get_attribs(src, &sa);
-
-	struct wlr_egl *egl = NULL;
-	if (begin_pass(server, dst, fx->w, fx->h, &egl) == 0) {
-		return false;
-	}
-
-	glUseProgram(sh->program);
-	bind_tex(0, sa.target, sa.tex);
-	glUniform1i(sh->u_texture, 0);
-	/* 过冲的曲线（out_elastic / out_back）让 t 稍微越过 1：几何量过冲是我
-	 * 们要的，着色器的 u_progress 不是 —— 它的契约是 0..1，> 1 的进度会让
-	 * zoom 这类 shader 采到贴图外面去。这里夹住。 */
-	double progress = fx->progress;
-	if (!(progress > 0.0)) {
-		progress = 0.0;
-	} else if (progress > 1.0) {
-		progress = 1.0;
-	}
-	glUniform1f(sh->u_progress, (float)progress);
-	glUniform1i(sh->u_phase, (int)fx->phase);
-	glUniform2f(sh->u_size, (float)fx->w, (float)fx->h);
-	glUniform2f(glGetUniformLocation(sh->program, "u_target_size"),
-		(float)fx->w, (float)fx->h);
-	glUniform2f(sh->u_origin,
-		(float)((int)lround((double)ox * scale) - server->output_x),
-		(float)((int)lround((double)oy * scale) - server->output_y));
-	glUniform2f(sh->u_output_size, (float)server->output_w,
-		(float)server->output_h);
-	glUniform1f(sh->u_alpha, (float)alpha);
-	glUniform1f(sh->u_time, (float)(vidow_now_ns() - fx->start_ns) / 1e9f);
-	glUniform1f(sh->u_flip_y, server->config.shader_flip_y ? 1.0f : 0.0f);
-
-	draw_quad(sh->program);
-	glUseProgram(0);
-	end_pass(egl);
-	return true;
-}
-
-/* -------------------------------------------------------------- debugging */
-
-/* ------------------------------------------------------------- public API */
-
-bool vidow_fx_set_shader(struct vidow_server *server,
-		struct vidow_fx_target *fx, const char *name,
-		enum vidow_shader_phase phase) {
-	struct vidow_shader *sh = vidow_shader_get(server, name);
-	if (sh == NULL) {
-		return false;
-	}
-	fx->shader = sh;
-	fx->phase = phase;
-	fx->progress = 0.0;
-	fx->start_ns = vidow_now_ns();
-	return true;
-}
-
-/* 装饰画面是一个普通的 scene buffer，而普通 buffer 默认「接受输入」。它盖在
- * 客户端自己的 surface 节点上面，于是会把所有点击都吃掉 —— 窗口就点不着了。
- * 返回 false 让场景的命中测试继续往下走，落到客户端表面上。 */
-static bool fx_node_rejects_input(struct wlr_scene_buffer *buffer, double *sx,
-		double *sy) {
-	(void)buffer;
-	(void)sx;
-	(void)sy;
-	return false;
-}
-
-bool vidow_fx_begin(struct vidow_server *server, struct vidow_fx_target *fx,
-		struct wlr_scene_tree *parent, const char *shader_name) {
-	bool decorated = server->config.decor_enabled && server->decor.program != 0;
-	bool animated = shader_name != NULL && shader_name[0] != '\0';
-	if (!decorated && !animated) {
-		return false;
-	}
-	if (fx->node == NULL) {
-		fx->node = wlr_scene_buffer_create(parent, NULL);
-		if (fx->node == NULL) {
-			return false;
-		}
-		fx->node->point_accepts_input = fx_node_rejects_input;
-	}
-	wlr_scene_node_raise_to_top(&fx->node->node);
-	wlr_scene_node_set_enabled(&fx->node->node, true);
-	fx->active = true;
-	fx->blur = server->config.blur_enabled;
-	/* 默认恒等：内容贴图就是整块元素。窗口那一路每帧按窗口几何覆盖它。 */
-	fx->tex_off_x = 0.0f;
-	fx->tex_off_y = 0.0f;
-	fx->tex_scale_x = 1.0f;
-	fx->tex_scale_y = 1.0f;
-	fx->anim_scale = 1.0;
-	if (animated) {
-		vidow_fx_set_shader(server, fx, shader_name, VIDOW_SHADER_OPEN);
-	}
-	return true;
-}
-
 bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 		struct wlr_scene_buffer *src, const struct vidow_fx_geo *geo,
 		int x, int y, int ox, int oy,
@@ -3153,6 +2366,17 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 	if (ov < 0.98) {
 		look.blur = false;
 	}
+	/* 果冻期间内容图里**不烘模糊**：模糊由 jelly.c 的网格单独一层按屏幕坐标
+	 * 采样，跟着形状弯但不被拉长。贴图还没建好时保留烘进去的那一版，别让窗口
+	 * 在起手第一帧突然没模糊。 */
+	if (fx->jelly && fx->blur && fx->blur_tex != NULL &&
+			!fx->blur_region_on && look.blur) {
+		look.blur = false;
+	}
+	/* 果冻期间投影单独画（jelly.c 的 shadow 节点），内容图里不烘投影：
+	 * 投影跟着网格拉伸就会变成「描边外面一圈模糊」。 */
+	/* 果冻期间投影仍然烘在内容图里：它和窗口共用同一张网格，形状完全
+	 * 跟着窗口弯；模糊由 jelly 网格单独一层按窗口区域裁，不会把投影圈进去。 */
 	if (geo == NULL || geo->w <= 0 || geo->h <= 0) {
 		return false;
 	}
@@ -3195,6 +2419,22 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 	}
 	if (!ensure_targets(server, fx, cw, ch, scale, out_scale)) {
 		return false;
+	}
+	/* 开窗动画的缩放只作用在场景节点上（离屏缓冲照旧原尺寸烘）。模糊已经
+	 * 烘在缓冲里，节点一缩，背景也跟着缩 —— 看起来是「桌面背景在弹」。
+	 * 把采样坐标按同一倍率展开：p 是缓冲像素，节点把缓冲映射到屏幕时乘了
+	 * anim_scale，所以模糊 UV 里的 p 也乘 anim_scale，再补上中心缩放的
+	 * 平移量。静止时 scale=1 / bias=0，一个像素都不变。 */
+	double blur_as = fx->anim_scale > 0.0 ? fx->anim_scale : 1.0;
+	fx->blur_scale_x = (float)blur_as;
+	fx->blur_scale_y = (float)blur_as;
+	fx->blur_bias_x = 0.0f;
+	fx->blur_bias_y = 0.0f;
+	if (fabs(blur_as - 1.0) > 1e-4) {
+		fx->blur_bias_x = (float)((1.0 - blur_as) *
+			((double)fx->px_pad + (double)fx->w * 0.5));
+		fx->blur_bias_y = (float)((1.0 - blur_as) *
+			((double)fx->px_pad + (double)fx->h * 0.5));
 	}
 
 	bool tex_owned = true;
@@ -3580,6 +2820,7 @@ static bool layer_blur_wanted(struct vidow_server *server,
  * 1:1 拷一块过来，再把窗口画上去 —— 壁纸那么大的贴图不用每帧重新上传，代价跟区域
  * 面积成正比而不是整屏。区域外没有像素可抓，所以只抓屏内那一块（缓冲仍按整块
  * layer 分配，屏内那块画在自己的偏移上），采样坐标由 fx->blur_tex_* 负责对齐。 */
+
 static bool layer_region_build(struct vidow_server *server,
 		struct vidow_output *output, struct vidow_layer_surface *ls,
 		int rx, int ry, int rw, int rh, int levels) {
@@ -3703,6 +2944,7 @@ static bool layer_region_build(struct vidow_server *server,
 
 /* 没画成的出口：记下原因，只在**原因变了**时打一行（每帧都跑，不限流会刷屏）。
  * 排查「某块屏上的 layer 没有模糊」时，这一行直接说是哪一步挡住的。 */
+
 static bool layer_blur_bail(struct vidow_layer_surface *ls, int reason,
 		const char *what) {
 	if (ls->blur_fail != reason) {
@@ -3716,6 +2958,1171 @@ static bool layer_blur_bail(struct vidow_layer_surface *ls, int reason,
 				ls->output->wlr_output->name : "?");
 	}
 	return false;
+}
+
+
+static bool layer_blur_frame(struct vidow_server *server,
+		struct vidow_output *output, struct vidow_layer_surface *ls);
+static void layer_blur_capture_visible(struct vidow_server *server, bool on);
+/* 弹出物背后的模糊（窗口的 xdg_popup / X11 菜单 / 输入法候选框）。 */
+static void popup_blur_frame(struct vidow_server *server,
+		struct vidow_output *output, struct vidow_popup_blur *pb);
+static void popup_blur_release(struct vidow_popup_blur *pb);
+static struct vidow_output *popup_blur_owner(struct vidow_popup_blur *pb);
+static void popup_blur_node_destroy(struct wl_listener *listener, void *data);
+static void popup_blur_owner_destroy(struct wl_listener *listener, void *data);
+/* overview 里那张糊掉的壁纸（整屏，垫在压暗遮罩下面）。 */
+static void vidow_overview_blur_frame(struct vidow_server *server,
+		struct vidow_output *output);
+
+static int blur_levels_for(struct vidow_server *server, int w, int h) {
+	int levels = server->config.blur_levels;
+	if (levels < 2) {
+		levels = 2;
+	}
+	if (levels > MAX_BLUR_LEVELS) {
+		levels = MAX_BLUR_LEVELS;
+	}
+	while (levels > 2 && ((w >> levels) < 4 || (h >> levels) < 4)) {
+		levels--;
+	}
+	return levels;
+}
+
+static void shared_blur_drop(struct vidow_output *output) {
+	/* 这两张贴图现在归别人管：blur_tex 是金字塔 up[0] 那张常驻贴图（blur_set_drop
+	 * 收），backdrop_tex 跟着底衬缓冲走（blur_drop 收）。这里只把指针放下，
+	 * 顺手把共享金字塔收掉。 */
+	output->blur_tex = NULL;
+	output->backdrop_tex = NULL;
+	blur_set_drop(&output->blur_set);
+	output->blur_id = 0;
+	output->blur_gen = 0;
+	output->blur_levels = 0;
+}
+
+/* Capture the scene with every toplevel hidden and run the kawase chain on it.
+ * The result depends only on the wallpaper and the layer surfaces, so it stays
+ * valid across client repaints, window moves and viewport scrolling. */
+static bool shared_blur_rebuild(struct vidow_server *server,
+		struct vidow_output *output, int w, int h, int levels) {
+	struct vidow_view *view;
+	struct vidow_closing *closing;
+
+	wl_list_for_each(view, &server->views, link) {
+		view_set_capture_visible(view, false);
+	}
+	wl_list_for_each(closing, &server->closing, link) {
+		if (closing->fx.node != NULL) {
+			wlr_scene_node_set_enabled(&closing->fx.node->node, false);
+		}
+	}
+	/* layer 的模糊节点也得藏：bottom 层的那个就在被抓的场景里，不藏就是
+	 * 「模糊结果里混进上一帧的模糊」。 */
+	layer_blur_capture_visible(server, false);
+	bool ok = backdrop_render(server, output, w, h);
+	layer_blur_capture_visible(server, true);
+	wl_list_for_each(view, &server->views, link) {
+		view_set_capture_visible(view, true);
+	}
+	wl_list_for_each(closing, &server->closing, link) {
+		if (closing->fx.node != NULL) {
+			wlr_scene_node_set_enabled(&closing->fx.node->node, true);
+		}
+	}
+	if (!ok) {
+		return false;
+	}
+
+	/* 底衬贴图（backdrop_tex）跟着底衬缓冲一起建、一起收（见 vidow_blur_update），
+	 * 金字塔的贴图跟着金字塔缓冲走（见 blur_set_alloc）：这里一张都不用导入，
+	 * blur_tex 就是 up[0] 那张常驻贴图。 */
+	/* blur_set_alloc() 在形状变化时会先 blur_set_drop()，旧的 up[0] 贴图
+	 * 随之销毁；output->blur_tex 还指着它。这里先把指针放下，分配失败时
+	 * 后面就不会拿一张已释放的贴图去采样。 */
+	output->blur_tex = NULL;
+	output->blur_id = 0;
+	output->blur_gen = 0;
+	output->blur_levels = 0;
+	if (!blur_set_alloc(server, &output->blur_set, w, h, levels)) {
+		return false;
+	}
+	blur_chain(server, &output->blur_set, output->backdrop_tex, w, h);
+	output->blur_tex = output->blur_set.up_tex[0];
+	if (output->blur_tex == NULL) {
+		return false;
+	}
+	static int dumped = 0;
+	if (dumped < blur_dump_limit()) {
+		dump_buffer(server, output->backdrop, w, h, "vidow-bd", dumped);
+		if (output->blur_set.up[0] != NULL) {
+			dump_buffer(server, output->blur_set.up[0], w >> 1, h >> 1,
+				"vidow-blur", dumped);
+		}
+		dumped++;
+	}
+	vidow_stats.shared++;
+	output->blur_id = server->blur_serial++;
+	output->blur_gen = server->gen_layer;
+	output->blur_levels = levels;
+	output->blur_offset = server->config.blur_offset;
+	wlr_log(WLR_DEBUG, "blur: shared rebuild %dx%d levels=%d offset=%.2f", w, h,
+		levels, output->blur_offset);
+	return true;
+}
+
+/* 私有底衬那块区域按这个格对齐（设备像素）：窗口在格子里挪动时区域一个字都不
+ * 变，缓存才真的能命中 —— 否则拖窗口时区域每帧跟着平移，每帧都得重抓。 */
+#define VIDOW_BLUR_REGION_GRID 128
+
+/* 链条采样到底能摸到多远（原始像素）：降采样每一趟的抽样半径是 blur_offset 个
+ * **源** texel，源每降一级尺寸减半，换算回原图每级翻倍（offset * (2^levels - 1)）；
+ * 往上那几趟同理，只是从第 2 级起（offset * (2^(levels+1) - 4)）。两者相加就是
+ * offset * (3 * 2^levels - 5)。区域要在窗口外面留出这么一圈，不然窗口边缘附近的
+ * 模糊值是被区域边界 clamp 出来的（看着就是边上发暗）。 */
+static int blur_reach_px(struct vidow_server *server, int levels) {
+	double off = server->config.blur_offset;
+	if (!(off > 0.0)) {
+		off = 0.0;
+	}
+	if (levels < 2) {
+		levels = 2;
+	}
+	double span = 3.0 * (double)(1u << levels) - 5.0;
+	int reach = (int)ceil(off * span) + 8;
+	return reach < 16 ? 16 : reach;
+}
+
+/* 这块窗口的私有底衬区域（设备像素，相对这块屏的原点）。levels 出参是这块区域
+ * 该用几级金字塔 —— 跟整屏那套**同一个数**：级数决定模糊半径（物理像素），各算
+ * 各的话小窗口会比大窗口糊得轻。 */
+static bool view_region_rect(struct vidow_server *server,
+		struct vidow_output *output, struct vidow_view *view,
+		int *rx, int *ry, int *rw, int *rh, int *levels) {
+	double scale = output->wlr_output->scale;
+	if (!(scale > 0.0)) {
+		scale = 1.0;
+	}
+	int pad = vidow_fx_pad(server);
+	struct wlr_box box = vidow_view_screen_box(view);
+	int lv = blur_levels_for(server, server->output_w, server->output_h);
+	int margin = blur_reach_px(server, lv);
+	/* 装饰矩形 = 可见窗口 ± pad（逻辑单位），再往外放一圈模糊半径。 */
+	int left = (int)lround((double)(box.x - pad) * scale) - server->output_x - margin;
+	int top = (int)lround((double)(box.y - pad) * scale) - server->output_y - margin;
+	int span_w = (int)lround((double)(box.width + 2 * pad) * scale) + 2 * margin;
+	int span_h = (int)lround((double)(box.height + 2 * pad) * scale) + 2 * margin;
+	const int grid = VIDOW_BLUR_REGION_GRID;
+	/* 原点对齐到网格（见上面那个宏）：窗口在格子里挪动时区域一个字都不变。 */
+	int gx1 = (int)floor((double)left / grid) * grid;
+	int gy1 = (int)floor((double)top / grid) * grid;
+	/* 尺寸**只跟窗口自己的大小有关，跟位置无关**（多留一格给「窗口在格子里挪
+	 * 动」）：拖窗口时区域整体平移，缓冲尺寸不变 —— 金字塔那几块缓冲才能一直
+	 * 复用（尺寸一变就得整批重建 + 重新导入贴图，那正是上一版修掉的卡顿）。 */
+	int size_w = (int)ceil((double)(span_w + grid) / grid) * grid;
+	int size_h = (int)ceil((double)(span_h + grid) / grid) * grid;
+	if (size_w < 1 || size_h < 1 || size_w > MAX_TARGET_PX ||
+			size_h > MAX_TARGET_PX) {
+		return false;
+	}
+	/* 原点再夹一下，让整块区域留在屏内：屏外没有像素可抓（那就是透明的），
+	 * 贴边窗口的边缘会被链条混进黑。夹的是原点、不是尺寸 —— 尺寸照样只跟窗口
+	 * 大小有关，缓冲不会因为窗口移动而重建。窗口比屏幕还大的极端情况下夹不住，
+	 * 那圈就还是透明的（layer 那一路一直是这个行为）。 */
+	int max_x = server->output_w - size_w;
+	int max_y = server->output_h - size_h;
+	if (max_x < 0) {
+		max_x = 0;
+	}
+	if (max_y < 0) {
+		max_y = 0;
+	}
+	if (gx1 < 0) {
+		gx1 = 0;
+	} else if (gx1 > max_x) {
+		gx1 = max_x;
+	}
+	if (gy1 < 0) {
+		gy1 = 0;
+	} else if (gy1 > max_y) {
+		gy1 = max_y;
+	}
+	*rx = gx1;
+	*ry = gy1;
+	*rw = size_w;
+	*rh = size_h;
+	*levels = lv;
+	return true;
+}
+
+/* 「只重跑受损那一小块」的开关：默认开。设了 VIDOW_BLUR_NO_PARTIAL 就整块重跑；
+ * VIDOW_BLUR_NO_PARTIAL_FILE 指的文件一出现也整块重跑（跑着跑着切过去，用来比对
+ * 「同一个场景、同一个客户端、同一个进程」下局部和整块的输出 —— 见
+ * test-blurpartial.sh）。都只给 A/B 比对用。
+ *
+ * 两个 getenv 各只问一次（每次重抓都要问一遍：一帧里四五个元素重抓就是十来次；
+ * getenv 在 profile 里比我们自己的模糊代码还显眼）。**文件存在性每次都看** ——
+ * test-blurpartial.sh 就是跑着跑着把文件建出来切过去的。 */
+static bool blur_no_partial(void) {
+	static int on = -1;
+	static int file_read = 0;
+	static const char *file = NULL;
+	if (on < 0) {
+		on = getenv("VIDOW_BLUR_NO_PARTIAL") != NULL ? 1 : 0;
+	}
+	if (!file_read) {
+		file = getenv("VIDOW_BLUR_NO_PARTIAL_FILE");
+		file_read = 1;
+	}
+	if (on != 0) {
+		return true;
+	}
+	return file != NULL && access(file, F_OK) == 0;
+}
+
+/* 这次重抓**只需要动**的那一块（区域局部设备像素）：攒下来的损伤盒子跟区域相交
+ * 的那部分的并集（往外放 2 像素，抵掉逻辑->设备的取整）。返回 false = 用不上，
+ * 调用方整块重跑：
+ *   - 一笔都没相交（不该走到这儿，防御）；
+ *   - 损伤盖住了区域的一大半（>= 60%）：局部省不了多少，整块重跑还简单些。 */
+static bool region_update_rect(struct vidow_output *output,
+		struct vidow_view *view,
+		int rx, int ry, int rw, int rh, struct wlr_box *out) {
+	double scale = output->wlr_output->scale;
+	if (!(scale > 0.0)) {
+		scale = 1.0;
+	}
+	const struct vidow_dmg_set *set = &view->fx.pending_damage;
+	struct wlr_box u = {0};
+	for (int i = 0; i < set->n; i++) {
+		const struct wlr_box *b = &set->box[i];
+		/* 布局逻辑坐标 -> 这块屏的设备像素（减去这块屏的布局原点）-> 区域局部 */
+		double lx = (double)(b->x - output->box.x) * scale;
+		double ly = (double)(b->y - output->box.y) * scale;
+		double hx = (double)(b->x + b->width - output->box.x) * scale;
+		double hy = (double)(b->y + b->height - output->box.y) * scale;
+		struct wlr_box one = {
+			.x = (int)floor(lx) - rx - 2,
+			.y = (int)floor(ly) - ry - 2,
+			.width = (int)ceil(hx) - (int)floor(lx) + 4,
+			.height = (int)ceil(hy) - (int)floor(ly) + 4,
+		};
+		blur_box_add(&u, &one);
+	}
+	if (u.width <= 0 || u.height <= 0) {
+		return false;
+	}
+	bool clip_ok = true;
+	wlr_scene_node_for_each_buffer(&view->server->layer_toplevels->node,
+		backdrop_clip_check, &clip_ok);
+	if (!clip_ok) {
+		return false;
+	}
+	int x1 = u.x < 0 ? 0 : u.x;
+	int y1 = u.y < 0 ? 0 : u.y;
+	int x2 = u.x + u.width > rw ? rw : u.x + u.width;
+	int y2 = u.y + u.height > rh ? rh : u.y + u.height;
+	if (x2 <= x1 || y2 <= y1) {
+		return false;
+	}
+	if ((int64_t)(x2 - x1) * (y2 - y1) * 10 >= (int64_t)rw * rh * 6) {
+		return false; /* 盖住大半了：整块重跑 */
+	}
+	*out = (struct wlr_box){
+		.x = x1, .y = y1, .width = x2 - x1, .height = y2 - y1,
+	};
+	return true;
+}
+
+/* 抓「世界减掉这个窗口」，只抓它自己那一小块区域，然后跑一遍链条。
+ *
+ * 基座是共享底衬（壁纸 + background / bottom 层）里对应的那一块，1:1 拷过来，
+ * 别的窗口再画上去 —— 这就是「模糊里得有窗口」；而这个窗口自己在抓的时候是藏起来
+ * 的（它不该出现在自己的底衬里）。以前这里是整屏重画一遍（连壁纸一起），每帧每块
+ * 重叠的窗口都要来一次；现在代价只跟这块区域的面积成正比。 */
+static bool view_region_build(struct vidow_server *server,
+		struct vidow_output *output, struct vidow_view *view,
+		int rx, int ry, int rw, int rh, int levels,
+		const struct wlr_box *partial) {
+	double scale = output->wlr_output->scale;
+	if (!(scale > 0.0)) {
+		scale = 1.0;
+	}
+
+	/* partial != NULL：只有这块（**区域局部设备像素**）的像素内容变了，其余保持
+	 * 上一版 —— 抓也只抓这一块、链条也只重跑这一块（见 blur_chain_rect）。
+	 * partial == NULL：整块重跑（第一次 / 形状变了 / 损伤盖满整块）。 */
+	int px = 0, py = 0, pw = rw, ph = rh;
+	if (partial != NULL) {
+		px = partial->x < 0 ? 0 : partial->x;
+		py = partial->y < 0 ? 0 : partial->y;
+		int px2 = partial->x + partial->width;
+		int py2 = partial->y + partial->height;
+		if (px2 > rw) {
+			px2 = rw;
+		}
+		if (py2 > rh) {
+			py2 = rh;
+		}
+		if (px2 <= px || py2 <= py) {
+			return false;
+		}
+		pw = px2 - px;
+		ph = py2 - py;
+	}
+
+	int x1 = rx < 0 ? 0 : rx, y1 = ry < 0 ? 0 : ry;
+	int x2 = rx + rw, y2 = ry + rh;
+	if (x2 > server->output_w) {
+		x2 = server->output_w;
+	}
+	if (y2 > server->output_h) {
+		y2 = server->output_h;
+	}
+	if (x2 <= x1 || y2 <= y1) {
+		return false; /* 整块在屏外，没东西可抓 */
+	}
+	if (partial != NULL) {
+		/* 要抓的那一块也得夹进屏内（区域原点可能被夹过，右/下边可能是屏外）。 */
+		int cx1 = rx + px, cy1 = ry + py;
+		int cx2 = cx1 + pw, cy2 = cy1 + ph;
+		if (cx1 < x1) {
+			cx1 = x1;
+		}
+		if (cy1 < y1) {
+			cy1 = y1;
+		}
+		if (cx2 > x2) {
+			cx2 = x2;
+		}
+		if (cy2 > y2) {
+			cy2 = y2;
+		}
+		if (cx2 <= cx1 || cy2 <= cy1) {
+			return false;
+		}
+		px = cx1 - rx;
+		py = cy1 - ry;
+		pw = cx2 - cx1;
+		ph = cy2 - cy1;
+	}
+
+	struct vidow_fx_target *fx = &view->fx;
+	/* 这一版是被哪一块损伤触发的（只给下面那行日志用：pending_damage 这里就要
+	 * 清掉了）。修「客户端只动了一小块，整片模糊却重抓」时，看的就是这个数。 */
+	struct wlr_box dmg = dmg_bounds(&fx->pending_damage);
+	if (fx->own_bd == NULL || fx->own_bd_w != rw || fx->own_bd_h != rh) {
+		own_bd_drop(fx);
+		fx->own_bd = vidow_alloc_target(server, rw, rh);
+		if (fx->own_bd == NULL) {
+			return false;
+		}
+		fx->own_bd_tex = stat_tex_new(
+			wlr_texture_from_buffer(server->renderer, fx->own_bd));
+		if (fx->own_bd_tex == NULL) {
+			own_bd_drop(fx);
+			return false;
+		}
+		fx->own_bd_w = rw;
+		fx->own_bd_h = rh;
+	}
+
+	struct wlr_render_pass *pass = wlr_renderer_begin_buffer_pass(
+		server->renderer, fx->own_bd, NULL);
+	if (pass == NULL) {
+		return false;
+	}
+	struct wlr_render_rect_options clear = {
+		.box = { .x = px, .y = py, .width = pw, .height = ph },
+		.color = { .r = 0.0f, .g = 0.0f, .b = 0.0f, .a = 0.0f },
+		.blend_mode = WLR_RENDER_BLEND_MODE_NONE,
+	};
+	wlr_render_pass_add_rect(pass, &clear);
+
+	/* 基座：共享底衬（壁纸 + background / bottom 层）里对应的那一块，1:1 捞过来
+	 * （不插值、不混合 —— 这块缓冲刚清成全透明，直接覆盖写最便宜）。源框必须
+	 * 夹在底衬里面：wlroots 的 render pass 会断言源框越界（伸到屏外的那圈只能
+	 * 留透明，所以 view_region_rect 把区域原点夹在屏内）。 */
+	int bx1 = rx + px, by1 = ry + py;
+	if (bx1 < x1) {
+		bx1 = x1;
+	}
+	if (by1 < y1) {
+		by1 = y1;
+	}
+	int bx2 = bx1 + pw, by2 = by1 + ph;
+	if (bx2 > x2) {
+		bx2 = x2;
+	}
+	if (by2 > y2) {
+		by2 = y2;
+	}
+	float one = 1.0f;
+	struct wlr_render_texture_options base = {
+		.texture = output->backdrop_tex,
+		.src_box = {
+			.x = (float)bx1, .y = (float)by1,
+			.width = (float)(bx2 - bx1), .height = (float)(by2 - by1),
+		},
+		.dst_box = {
+			.x = (float)(bx1 - rx), .y = (float)(by1 - ry),
+			.width = (float)(bx2 - bx1), .height = (float)(by2 - by1),
+		},
+		.alpha = &one,
+		.transform = WL_OUTPUT_TRANSFORM_NORMAL,
+		.filter_mode = WLR_SCALE_FILTER_NEAREST,
+		.blend_mode = WLR_RENDER_BLEND_MODE_NONE,
+	};
+	wlr_render_pass_add_texture(pass, &base);
+
+	/* 窗口画在基座上：这个窗口自己藏起来，别的照画。只画 toplevels —— 弹出物那
+	 * 一层在窗口**上面**，不该进窗口的底衬（共享底衬那趟也是这么做的）。 */
+	/* 私有底衬抓的是「世界减掉这个窗口」：整棵窗口树一起关，比只关装饰 /
+	 * 果冻节点更硬 —— 客户端表面、阴影、任何漏网的子节点都不会混进来。 */
+	bool tree_on = view->scene_tree != NULL &&
+		view->scene_tree->node.enabled;
+	if (tree_on) {
+		wlr_scene_node_set_enabled(&view->scene_tree->node, false);
+	}
+	view_set_capture_visible(view, false);
+	layer_blur_capture_visible(server, false);
+	struct backdrop_ctx ctx = {
+		.pass = pass,
+		.server = server,
+		.scale = scale,
+		.ox = server->output_x + rx,
+		.oy = server->output_y + ry,
+		/* 只画要抓的那一块（partial 时就是损伤那一小块）：底衬别的像素一个都
+		 * 不碰，其余部分还是上一版的内容。 */
+		.clip_x = bx1 - rx,
+		.clip_y = by1 - ry,
+		.clip_w = bx2 - bx1,
+		.clip_h = by2 - by1,
+		.skip = view,
+	};
+	wlr_scene_node_for_each_buffer(&server->layer_toplevels->node, backdrop_iter,
+		&ctx);
+	layer_blur_capture_visible(server, true);
+	view_set_capture_visible(view, true);
+	if (view->scene_tree != NULL) {
+		/* 恢复抓之前的状态，而不是一律 true：隐藏工作区里的窗口本来就是
+		 * 关着的，抓完不能把它点亮。 */
+		wlr_scene_node_set_enabled(&view->scene_tree->node, tree_on);
+	}
+	if (!wlr_render_pass_submit(pass)) {
+		return false;
+	}
+
+	vidow_stats.own++;
+	dmg_clear(&fx->pending_damage); /* 这一版的账已经算清了 */
+	blur_own_drop(fx);
+	if (!blur_set_alloc(server, &fx->blur_set, rw, rh, levels)) {
+		return false;
+	}
+	if (partial != NULL) {
+		blur_chain_rect(server, &fx->blur_set, fx->own_bd_tex, rw, rh,
+			&(struct wlr_box){ .x = px, .y = py,
+				.width = pw, .height = ph },
+			blur_reach_px(server, levels));
+	} else {
+		blur_chain(server, &fx->blur_set, fx->own_bd_tex, rw, rh);
+	}
+	fx->blur_own_tex = fx->blur_set.up_tex[0];
+	if (fx->blur_own_tex == NULL) {
+		return false;
+	}
+	/* 缓存键是「世界减掉这个窗口」的代次（见 vidow_backdrop_damage_view）。 */
+	fx->blur_set.gen = server->gen_scene - view->self_gen;
+	fx->blur_set.valid = true;
+	fx->blur_own_id = server->blur_serial++;
+	/* 这块区域本身（blur_tex_x/y/w/h）不在这儿登记：它跟着贴图一起由
+	 * blur_assign() 换（见那里的注释），一处管一处，免得两边不一致。 */
+
+	static int dumped = 0;
+	if (dumped < blur_dump_limit()) {
+		dump_buffer(server, fx->own_bd, rw, rh, "vidow-bd", dumped);
+		/* 测试要知道这份底衬是谁的：文件名保持 vidow-bd-<n>（别的测试按它
+		 * 排序取最后一份），owner 单独一个 sidecar，不碰 .txt 的格式。 */
+		char opath[128];
+		snprintf(opath, sizeof(opath), "/tmp/vidow-bd-%d.owner", dumped);
+		FILE *of = fopen(opath, "w");
+		if (of != NULL) {
+			fprintf(of, "%s\n", vidow_view_title(view) != NULL ?
+				vidow_view_title(view) : "?");
+			fclose(of);
+		}
+		if (fx->blur_set.up[0] != NULL && rw > 1 && rh > 1) {
+			dump_buffer(server, fx->blur_set.up[0], rw >> 1, rh >> 1,
+				"vidow-blur", dumped);
+		}
+		dumped++;
+	}
+	wlr_log(WLR_DEBUG, "blur: own region %s %dx%d at %d,%d levels=%d"
+		"（损伤 %dx%d at %d,%d，%s %dx%d）",
+		vidow_view_title(view) != NULL ? vidow_view_title(view) : "?",
+		rw, rh, rx, ry, levels,
+		dmg.width, dmg.height, dmg.x, dmg.y,
+		partial != NULL ? "局部重跑" : "整块重跑", pw, ph);
+	return true;
+}
+
+/* Free everything this output owns. Called when the output goes away or its
+ * size/scale changes.
+ *
+ * 借出去的贴图也在这里销毁（共享的那份是所有不重叠窗口一起用的），所以每个借过它
+ * 的窗口都必须松手：热插拔把窗口挪到另一块屏时，紧接着就会重摆 + 重画，手里要是
+ * 还攥着已经销毁的贴图，GLES2 那边直接是 `wlr_texture_is_gles2` 断言崩溃。
+ * 下一帧 blur_update() 会把该借的重新借回来，所以这里清空不丢东西。 */
+void vidow_blur_output_finish(struct vidow_output *output) {
+	shared_blur_drop(output);
+	blur_drop(output);
+
+	struct vidow_view *view;
+	wl_list_for_each(view, &output->server->views, link) {
+		if (view->fx.blur_owned) {
+			continue; /* 自己的那份跟这块屏无关 */
+		}
+		blur_assign(&view->fx, NULL, false, 0, NULL);
+	}
+}
+
+/* 这块窗口的私有模糊底衬归哪块屏：它现在**画在**哪块屏上（跨屏拖动时布局归属还没
+ * 换，人已经在对面那块屏上了）；看不见任何屏就退回归属那块。和装饰离屏缓冲的倍率
+ * （view.c 的 view_scale）用同一个判据 —— 倍率和区域必须落在同一块屏的坐标系里。 */
+static struct wlr_output *view_blur_owner(struct vidow_view *view) {
+	struct wlr_output *out = vidow_view_display_output(view);
+	return out != NULL ? out : view->output;
+}
+
+/* Called once per frame before anything is drawn, so the decorations can
+ * sample this frame's backdrop. Everything is cached: a frame where nothing
+ * moved behind a window touches no GPU buffer at all. */
+void vidow_blur_update(struct vidow_output *output) {
+	struct vidow_server *server = output->server;
+	struct vidow_view *view;
+
+	int w = output->wlr_output->width, h = output->wlr_output->height;
+	bool usable = server->shader_ok && server->config.blur_enabled && w > 0 &&
+		h > 0 && w <= MAX_TARGET_PX && h <= MAX_TARGET_PX;
+	if (!usable) {
+		wl_list_for_each(view, &server->views, link) {
+			if (view_blur_owner(view) != output->wlr_output) {
+				continue; /* 别的屏上的窗口归那一趟收 */
+			}
+			blur_target_release(&view->fx);
+		}
+		struct vidow_layer_surface *off;
+		wl_list_for_each(off, &server->layers, link) {
+			vidow_layer_blur_release(off);
+		}
+		struct vidow_popup_blur *pb;
+		wl_list_for_each(pb, &server->popup_blurs, link) {
+			struct vidow_output *owner = popup_blur_owner(pb);
+			if (owner == output || owner == NULL) {
+				popup_blur_release(pb);
+			}
+		}
+		shared_blur_drop(output);
+		blur_drop(output);
+		return;
+	}
+
+	int levels = blur_levels_for(server, w, h);
+
+	if (output->backdrop == NULL || output->backdrop_w != w ||
+			output->backdrop_h != h) {
+		blur_drop(output);
+		shared_blur_drop(output); /* the pyramid is sized for the old output */
+		output->backdrop = vidow_alloc_target(server, w, h);
+		if (output->backdrop == NULL) {
+			return;
+		}
+		/* 未模糊的底衬也留一张贴图：被窗口遮住的 layer surface 拿它当自己那一
+		 * 小块区域底衬的基座（比每次重抓一遍壁纸便宜太多，见 layer_region_build）。
+		 * 贴图是包的缓冲，不包像素 —— 底衬每帧重画也不影响它，建一次就够。 */
+		output->backdrop_tex = stat_tex_new(
+			wlr_texture_from_buffer(server->renderer, output->backdrop));
+		if (output->backdrop_tex == NULL) {
+			blur_drop(output);
+			return;
+		}
+		output->backdrop_w = w;
+		output->backdrop_h = h;
+	}
+
+	/* 缓存键必须把所有影响这张贴图的参数都算上：级数、采样步长。
+	 * 漏了 blur_offset 的时候，运行时改它看着「没反应」—— 贴图是旧参数算的，谁也
+	 * 没让它重算。（blur_alpha_min 原来也在这儿，现在它只进装饰着色器、不进金字塔，
+	 * 改它由 blur_mask_min_changed() 直接让帧循环重画。） */
+	bool shared_ok = output->blur_tex != NULL &&
+		output->blur_gen == server->gen_layer &&
+		output->blur_levels == levels &&
+		fabs(output->blur_offset - server->config.blur_offset) < 1e-6 &&
+		output->blur_set.w == w && output->blur_set.h == h;
+	if (!shared_ok) {
+		shared_ok = shared_blur_rebuild(server, output, w, h, levels);
+	}
+
+	wl_list_for_each(view, &server->views, link) {
+		/* 私有底衬是「**这块屏**上的这一块区域」，别的屏上的窗口不归这一趟管。
+		 *
+		 * 少了这一句，两块屏会轮流给同一个窗口建金字塔：每块屏都按自己的
+		 * scale / 尺寸算区域（1 倍屏把 280x380 的窗口算成 640x768，2 倍屏算成
+		 * 896x1152），而金字塔是挂在窗口身上的（view->fx.blur_set），于是两趟
+		 * 每帧互相把对方的缓冲丢掉重建 —— 一次十几块 GBM 缓冲（最大那块
+		 * 2304x2560 = 23 MB），拖窗口时每秒几千次分配，屏幕上一顿一顿的。
+		 * 顺带也修了「区域和贴图归哪块屏」：以前最后写进 fx 的是哪一趟算的
+		 * 就归谁，跨屏的窗口可能采到另一块屏的底衬。
+		 *
+		 * 归属判据和装饰离屏缓冲的倍率是**同一个**（view_blur_owner ——
+		 * 「窗口现在画在哪块屏上」）：两个地方各算各的话，拖到对面那块屏上时
+		 * 倍率对不上，模糊贴图的采样坐标就落错地方（那块区域是按底衬这块屏的
+		 * 设备像素记的）。 */
+		if (view_blur_owner(view) != output->wlr_output) {
+			continue;
+		}
+		/* 这张贴图代表的是**这块屏**的视野：尺寸和布局原点跟着贴图一起记在 fx
+		 * 上（见 server.h 那组 blur_out_*）。采样只认这一组，不现场读
+		 * server->output_*：重烘那趟会给别的屏上的窗口也烘一次，那一刻的
+		 * server->output_w 是那块屏的，按它算 UV 就是「只取中间一块铺满整窗」。 */
+		view->fx.blur_out_w = output->wlr_output->width;
+		view->fx.blur_out_h = output->wlr_output->height;
+		view->fx.blur_out_x = server->output_x;
+		view->fx.blur_out_y = server->output_y;
+		if (!view_wants_blur(view) || view->fx.node == NULL) {
+			if (view->fx.blur_own_tex != NULL) {
+				blur_own_drop(&view->fx);
+			}
+			own_bd_drop(&view->fx); /* 这块屏上不再需要私有底衬了 */
+			blur_assign(&view->fx, NULL, false, 0, NULL);
+			continue;
+		}
+
+		blur_mask_min_changed(&view->fx, server->config.blur_alpha_min);
+
+		struct vidow_look look;
+		vidow_view_look(&server->config, &view->rule_eff,
+			view->fullscreen, &look);
+		if (look.blur_xray || !view_overlaps_other(view)) {
+			/* Tiled and non-overlapping floating windows all share the
+			 * wallpaper backdrop: one capture and one chain for all of them.
+			 * Only drop a private pyramid if there really is one, otherwise
+			 * the identity would change every frame and force a redraw.
+			 *
+			 * blur_xray 也走这条路：重叠时照样用整屏那份（壁纸 + layer 那层），
+			 * 忽略别的窗口 —— 糊的是壁纸而不是压着的那个窗口（Hyprland 的
+			 * blur:xray 同款）。私有底衬一块不建：重叠场景每帧的趟数从
+			 * N×(1+2·级数−1) 掉到 ~3，那块显存也全免。 */
+			if (view->fx.blur_own_tex != NULL) {
+				blur_own_drop(&view->fx);
+			}
+			own_bd_drop(&view->fx); /* 不再重叠：私有底衬那块区域可以还了 */
+			blur_assign(&view->fx, output->blur_tex, false, output->blur_id, NULL);
+			continue;
+		}
+
+		if (!shared_ok) {
+			blur_assign(&view->fx, NULL, false, 0, NULL);
+			continue;
+		}
+
+		int rx, ry, rw, rh, rlevels;
+		if (!view_region_rect(server, output, view, &rx, &ry, &rw, &rh,
+				&rlevels)) {
+			blur_assign(&view->fx, NULL, false, 0, NULL);
+			continue;
+		}
+		/* 抓的时候这个窗口是藏起来的，所以它自己的位置和内容都不进这张图：
+		 * 世界代次只是粗筛，真正的判据是「这次损伤有没有碰到我这一块」—— 别的
+		 * 窗口在屏幕另一头重画（视频 / 浏览器每帧都在交帧）不该让我重抓。
+		 * 区域本身已经把模糊半径算进去了（见 view_region_rect）。 */
+		double oscale = output->wlr_output->scale;
+		if (!(oscale > 0.0)) {
+			oscale = 1.0;
+		}
+		struct wlr_box region_logical = {
+			.x = output->box.x + (int)floor((double)rx / oscale),
+			.y = output->box.y + (int)floor((double)ry / oscale),
+			.width = (int)ceil((double)rw / oscale) + 1,
+			.height = (int)ceil((double)rh / oscale) + 1,
+		};
+		bool key_changed =
+			view->fx.blur_set.gen != server->gen_scene - view->self_gen;
+		bool touched = key_changed &&
+			blur_damage_hits(&view->fx, &region_logical);
+		/* 形状（区域位置尺寸 / 级数 / 半径）没变：那张金字塔就是上一版的，可以
+		 * 只更新受损的那一块（见 view_region_build 的 partial）。 */
+		bool shape_ok = view->fx.blur_set.valid &&
+			view->fx.blur_own_tex != NULL &&
+			view->fx.blur_set.w == rw && view->fx.blur_set.h == rh &&
+			view->fx.blur_set.levels == rlevels &&
+			fabs(view->fx.blur_set.offset - server->config.blur_offset) < 1e-6 &&
+			view->fx.blur_tex_x == rx && view->fx.blur_tex_y == ry &&
+			view->fx.blur_tex_w == rw && view->fx.blur_tex_h == rh &&
+			view->fx.own_bd != NULL && view->fx.own_bd_w == rw &&
+			view->fx.own_bd_h == rh;
+		bool fresh = shape_ok && !touched;
+		if (!fresh) {
+			struct wlr_box upd;
+			bool partial = shape_ok && !blur_no_partial() &&
+				region_update_rect(output, view, rx, ry, rw, rh, &upd);
+			if (!view_region_build(server, output, view, rx, ry, rw, rh,
+					rlevels, partial ? &upd : NULL)) {
+				blur_assign(&view->fx, NULL, false, 0, NULL);
+				continue;
+			}
+		}
+		/* owned = false：这张贴图归 view->fx.blur_set（blur_set_drop 收），
+		 * 这里只是指过去采样。区域跟着一起报（见 blur_assign）。 */
+		blur_assign(&view->fx, view->fx.blur_own_tex, false,
+			view->fx.blur_own_id,
+			&(struct wlr_box){ .x = rx, .y = ry, .width = rw, .height = rh });
+	}
+
+	/* layer surface 背后的模糊（状态栏 / 面板那层）。bottom 层用共享的那份底衬
+	 * （壁纸 + background 层），一次抓取都不用；top / overlay 层底下有窗口，各
+	 * 自抓自己那一小块（见 layer_region_build）。 */
+	struct vidow_layer_surface *ls;
+	wl_list_for_each(ls, &server->layers, link) {
+		if (ls->output != output) {
+			continue;
+		}
+		if (!layer_blur_wanted(server, ls)) {
+			vidow_layer_blur_release(ls);
+			continue;
+		}
+		/* overview 里 top / overlay 那几棵树整体被关掉了，这层模糊没人看得见：
+		 * 别每帧白抓一份（overview 的动画每帧都在动世界代次）。 */
+		if (vidow_overview_active(server) &&
+				ls->layer != ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM) {
+			continue;
+		}
+		/* 这一帧画不出来（两个目标都还在飞 / 底衬还没建好）就留着上一帧的
+		 * 节点：别一帧有、一帧没有地闪。 */
+		(void)layer_blur_frame(server, output, ls);
+	}
+
+	/* 弹出物背后的模糊（xdg_popup / X11 菜单 / 输入法候选框）：跟 layer 那条
+	 * 路同一套，每块屏只管「中心落在自己身上」的那些。 */
+	struct vidow_popup_blur *pb;
+	wl_list_for_each(pb, &server->popup_blurs, link) {
+		popup_blur_frame(server, output, pb);
+	}
+
+	/* overview：整屏一张糊掉的壁纸（niri 那样），垫在压暗遮罩下面。 */
+	vidow_overview_blur_frame(server, output);
+}
+
+/* ------------------------------------------------------------------- draw */
+
+/* 装饰那一趟的几何（全部是**渲染目标像素**口径）。屏幕那条路（decor_draw）和
+ * 窗口抓帧那条路（vidow_fx_capture_decor）只有这一份不一样，uniform 那几十行
+ * 共用同一段代码 —— 两处各写一遍必然走散，某处忘了乘 scale 就是「录出来跟屏上
+ * 长得不一样」。
+ *
+ * off_x/off_y：内容（窗口可见区）左上角在渲染目标里的位置。屏幕那条路是内边距
+ * px_pad（内容居中），窗口抓帧那条路是窗口在取景框里的位置（抓帧框常常就是窗口
+ * 本身，于是是 0）。
+ * origin_x / origin_y 与 out_size_x / out_size_y：内容左上角在**底衬贴图**里的
+ * 像素坐标，以及那张贴图的尺寸。
+ * 装饰着色器按它算模糊采样的 UV（见 decor_fragment_src 的 u_origin /
+ * u_output_size）。 */
+struct decor_geo {
+	int dst_w, dst_h;
+	int content_w, content_h;
+	float off_x, off_y;
+	float origin_x, origin_y;
+	float out_size_x, out_size_y;
+	/* 内容那一项的乘子：屏幕那条路是 1，窗口抓帧那条路是 0（内容由场景节点
+	 * 画，这张图里只要底衬 / 画框，但剔除仍按内容 alpha 走）。 */
+	float content_alpha;
+};
+
+
+static void decor_pass(struct vidow_server *server,
+		struct vidow_fx_target *fx, struct wlr_buffer *dst,
+		const struct decor_geo *g,
+		struct wlr_texture *src, struct wlr_texture *mask,
+		const float border[4], double alpha, double scale,
+		const struct vidow_look *look, bool shadow_only) {
+	struct vidow_decor_prog *d = &server->decor;
+	struct vidow_config *cfg = &server->config;
+
+	struct wlr_gles2_texture_attribs sa;
+	wlr_gles2_texture_get_attribs(src, &sa);
+
+	struct wlr_egl *egl = NULL;
+	if (begin_pass(server, dst, g->dst_w, g->dst_h, &egl) == 0) {
+		return;
+	}
+
+	glUseProgram(d->program);
+	glUniform1f(d->u_shadow_only, shadow_only ? 1.0f : 0.0f);
+	bind_tex(0, sa.target, sa.tex);
+	glUniform1i(d->u_texture, 0);
+
+	struct wlr_texture *blur = fx->blur_tex != NULL ?
+		fx->blur_tex : server->empty_tex;
+	if (blur != NULL) {
+		struct wlr_gles2_texture_attribs ba;
+		wlr_gles2_texture_get_attribs(blur, &ba);
+		bind_tex(1, ba.target, ba.tex);
+	}
+	glUniform1i(d->u_blur, 1);
+
+	/* 元素自己的内容（透明度剔除用）。mask == NULL 时用 u_texture 那张内容贴图
+	 * （窗口 / 弹窗：内容贴图就是元素自己）；layer surface 的模糊底衬不画内容，
+	 * 调用方把 layer 自己的缓冲当 mask 递进来。采样器不能空着，配上 empty_tex
+	 * 也无所谓：u_mask_on = 0 时着色器根本不采它。 */
+	struct wlr_texture *mtex = mask != NULL ? mask : server->empty_tex;
+	struct wlr_gles2_texture_attribs ma;
+	wlr_gles2_texture_get_attribs(mtex, &ma);
+	bind_tex(2, ma.target, ma.tex);
+	glUniform1i(d->u_mask, 2);
+	glUniform1f(d->u_mask_on, mask != NULL ? 1.0f : 0.0f);
+	/* 阈值：客户端用 ext-background-effect 自己要了区域就不按元素 alpha 剔 ——
+	 * 那块区域就是它画出来的边界（niri 的 need_ignore_alpha 同一个判断）。layer
+	 * 底衬拿不到元素内容时也不能剔，不然整块模糊都没了。0 = step(0, a) 恒为 1，
+	 * 也就是不剔。 */
+	float mask_min = fx->mask_min > 0.0f ?
+		fx->mask_min : (float)cfg->blur_alpha_min;
+	if (fx->blur_region_on || (mask == NULL && fx->blur_only)) {
+		mask_min = 0.0f;
+	}
+	glUniform1f(d->u_mask_min, mask_min);
+	/* mask 的采样映射：默认恒等；xdg popup 只糊窗口体时采表面缓冲里的
+	 * geometry 子矩形（见 popup_blur_frame）。 */
+	float mask_ox = fx->mask_scale_x > 0.0f ? fx->mask_off_x : 0.0f;
+	float mask_oy = fx->mask_scale_y > 0.0f ? fx->mask_off_y : 0.0f;
+	float mask_sx = fx->mask_scale_x > 0.0f ? fx->mask_scale_x : 1.0f;
+	float mask_sy = fx->mask_scale_y > 0.0f ? fx->mask_scale_y : 1.0f;
+	glUniform4f(d->u_mask_map, mask_ox, mask_oy, mask_sx, mask_sy);
+
+	/* 着色器全程在「渲染目标的物理像素」里算：配置里的圆角、边框、阴影都是
+	 * 逻辑单位，乘上倍率才是像素。 */
+	glUniform2f(d->u_size, (float)g->content_w, (float)g->content_h);
+	glUniform2f(d->u_target_size, (float)g->dst_w, (float)g->dst_h);
+	glUniform2f(d->u_content_off, g->off_x, g->off_y);
+	glUniform1f(d->u_radius, (float)(look->corner_radius * scale));
+	/* 圆角的形状指数：2 = 圆弧、4 = 超椭圆。夹一道（配置 / 环境变量 / IPC /
+	 * 窗口规则四条路都夹过，这里只是「进着色器的值一定是合法的」）。 */
+	glUniform1f(d->u_corner_n, (float)vidow_corner_n_clamp(look->corner_n));
+	glUniform1f(d->u_border_width, (float)(look->border_width * scale));
+	/* The decoration shader works in premultiplied alpha; the config keeps
+	 * straight values so a script can read them back. */
+	float border_pm[4] = { border[0] * border[3], border[1] * border[3],
+		border[2] * border[3], border[3] };
+	float shadow_pm[4] = { look->shadow_color[0] * look->shadow_color[3],
+		look->shadow_color[1] * look->shadow_color[3],
+		look->shadow_color[2] * look->shadow_color[3],
+		look->shadow_color[3] };
+	glUniform4fv(d->u_border_color, 1, border_pm);
+	glUniform4fv(d->u_shadow_color, 1, shadow_pm);
+	glUniform2f(d->u_shadow_offset, (float)(look->shadow_offset_x * scale),
+		(float)(look->shadow_offset_y * scale));
+	glUniform1f(d->u_shadow_radius, (float)(look->shadow_radius * scale));
+	glUniform1f(d->u_opacity, (float)look->opacity);
+	glUniform1f(d->u_content_alpha, g->content_alpha);
+	glUniform1f(d->u_noise, (float)look->noise);
+	glUniform1f(d->u_alpha, (float)alpha);
+	glUniform1f(glGetUniformLocation(d->program, "u_time"),
+		(float)(vidow_now_ns() % 1000000000000LL) / 1e9f);
+	/* 窗口在输出上的位置（物理像素，输出原点已减掉）：散景贴图是按输出分辨
+	 * 率抓的，采样坐标必须落在这块屏自己的坐标系里。被模糊的 layer surface
+	 * 那张贴图只盖住它自己那一小块区域（fx->blur_tex_*），坐标就再减掉区域
+	 * 原点、除数也换成区域尺寸 —— 不减就是整块错位。
+	 *
+	 * 那块屏是哪一块，认**跟着这张贴图一起记的** blur_out_*（见 server.h）：
+	 * 重烘会落在别的屏正在渲染的那一帧上（output.c 帧循环那趟不看归属），
+	 * 现场读 server->output_* 拿到的是那块屏的尺寸/原点 —— 整屏底衬只取中间
+	 * 一块铺满整窗，看着就是「静止时底衬啪一下换挡」（中心放大 + 变糊）。 */
+	/* 底衬采样的映射：全部由调用方算好（屏幕那条路按窗口在输出上的位置算，
+	 * 窗口抓帧那条路按取景框算）—— 两边共用这一份 uniform，别在这儿现场读
+	 * 全局量（跨屏底衬采样的坑，见 server.h 的 blur_out_*）。 */
+	glUniform2f(d->u_origin, g->origin_x, g->origin_y);
+	glUniform2f(d->u_output_size, g->out_size_x, g->out_size_y);
+	float bsx = fx->blur_scale_x > 0.0f ? fx->blur_scale_x : 1.0f;
+	float bsy = fx->blur_scale_y > 0.0f ? fx->blur_scale_y : 1.0f;
+	glUniform2f(d->u_blur_scale, bsx, bsy);
+	glUniform2f(d->u_blur_bias, fx->blur_bias_x, fx->blur_bias_y);
+	glUniform1f(d->u_flip_y, cfg->shader_flip_y ? 1.0f : 0.0f);
+	/* 模糊那层要不要叠：除了「有贴图」（fx->blur_tex）和全局开关（fx->blur），
+	 * 还得看**这一次渲染自己的 look** —— 预览（缩略图）那一趟在
+	 * vidow_fx_frame 里把 look.blur 关掉，于是预览里不叠模糊（见那里的注释）。 */
+	float strength = fx->blur && fx->blur_tex != NULL && look->blur ?
+		(float)cfg->blur_strength : 0.0f;
+	glUniform1f(d->u_blur_strength, strength);
+	/* 客户端用 ext-background-effect 指定了区域就只模糊那块 */
+	glUniform1f(d->u_blur_region_on, fx->blur_region_on ? 1.0f : 0.0f);
+	/* 区域是 surface 局部坐标（逻辑），着色器在物理像素里比对。 */
+	glUniform4f(d->u_blur_region, (float)(fx->blur_region[0] * scale),
+		(float)(fx->blur_region[1] * scale),
+		(float)(fx->blur_region[2] * scale),
+		(float)(fx->blur_region[3] * scale));
+	/* 内容贴图里哪一块是可见窗口（归一化）。没留白的元素是 0 / 1 —— layer 底衬、
+	 * X11、以及不自己画装饰的客户端都走这一支，和以前逐像素一样。 */
+	glUniform4f(d->u_tex_map, fx->tex_off_x, fx->tex_off_y,
+		fx->tex_scale_x, fx->tex_scale_y);
+
+	if (fx->blur_only) {
+		/* 只要那一层模糊：内容、阴影、边框、圆角、噪点全关（layer surface 的
+		 * 底衬用；内容由 wlroots 自己的场景节点画在上面）。 */
+		glUniform1f(d->u_radius, 0.0f);
+		glUniform1f(d->u_border_width, 0.0f);
+		glUniform4f(d->u_border_color, 0.0f, 0.0f, 0.0f, 0.0f);
+		glUniform4f(d->u_shadow_color, 0.0f, 0.0f, 0.0f, 0.0f);
+		glUniform1f(d->u_noise, 0.0f);
+	}
+
+	draw_quad(d->program);
+	glUseProgram(0);
+	end_pass(egl);
+}
+
+/* 屏幕那条路：几何从 fx（离屏缓冲 + 窗口在输出上的位置）来。 */
+/* 只画投影：果冻把窗口内容拉弯时，投影不能跟着拉长（否则就是用户看到的
+ * 「描边外面一圈模糊」）。投影单独烘一张、挂在果冻节点下面，保持原形状。 */
+bool vidow_fx_render_shadow(struct vidow_server *server,
+		struct wlr_buffer *dst, struct vidow_fx_target *fx,
+		const struct vidow_look *look) {
+	if (server == NULL || dst == NULL || fx == NULL || look == NULL ||
+			server->decor.program == 0) {
+		return false;
+	}
+	struct decor_geo g = {
+		.dst_w = fx->w, .dst_h = fx->h,
+		.content_w = fx->content_w, .content_h = fx->content_h,
+		.off_x = (float)fx->px_pad, .off_y = (float)fx->px_pad,
+		.origin_x = 0.0f, .origin_y = 0.0f,
+		.out_size_x = 1.0f, .out_size_y = 1.0f,
+		.content_alpha = 1.0f,
+	};
+	const float no_border[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+	decor_pass(server, fx, dst, &g, server->empty_tex, NULL, no_border,
+		1.0, fx->scale, look, true);
+	return true;
+}
+
+static void decor_draw(struct vidow_server *server,
+		struct vidow_fx_target *fx, struct wlr_buffer *dst,
+		struct wlr_texture *src, struct wlr_texture *mask,
+		const float border[4], int ox, int oy,
+		double alpha, double scale, const struct vidow_look *look) {
+	/* 窗口在输出上的位置（物理像素，输出原点已减掉）：散景贴图是按输出分辨
+	 * 率抓的，采样坐标必须落在这块屏自己的坐标系里。被模糊的 layer surface
+	 * 那张贴图只盖住它自己那一小块区域（fx->blur_tex_*），坐标就再减掉区域
+	 * 原点、除数也换成区域尺寸 —— 不减就是整块错位。
+	 *
+	 * 那块屏是哪一块，认**跟着这张贴图一起记的** blur_out_*（见 server.h）：
+	 * 重烘会落在别的屏正在渲染的那一帧上（output.c 帧循环那趟不看归属），
+	 * 现场读 server->output_* 拿到的是那块屏的尺寸/原点 —— 整屏底衬只取中间
+	 * 一块铺满整窗，看着就是「静止时底衬啪一下换挡」（中心放大 + 变糊）。 */
+	int out_x = fx->blur_out_w > 0 ? fx->blur_out_x : server->output_x;
+	int out_y = fx->blur_out_h > 0 ? fx->blur_out_y : server->output_y;
+	int out_w = fx->blur_out_w > 0 ? fx->blur_out_w : server->output_w;
+	int out_h = fx->blur_out_h > 0 ? fx->blur_out_h : server->output_h;
+	struct decor_geo g = {
+		.dst_w = fx->w, .dst_h = fx->h,
+		.content_w = fx->content_w, .content_h = fx->content_h,
+		.off_x = (float)fx->px_pad, .off_y = (float)fx->px_pad,
+		.origin_x = (float)((int)lround((double)ox * scale) - out_x -
+			fx->blur_tex_x),
+		.origin_y = (float)((int)lround((double)oy * scale) - out_y -
+			fx->blur_tex_y),
+		.out_size_x = (float)(fx->blur_tex_w > 0 ? fx->blur_tex_w : out_w),
+		.out_size_y = (float)(fx->blur_tex_w > 0 ? fx->blur_tex_h : out_h),
+		.content_alpha = 1.0f,
+	};
+	decor_pass(server, fx, dst, &g, src, mask, border, alpha, scale, look,
+		false);
+}
+
+/* 窗口抓帧那条路（wincapture.c）：把「窗口内容」按屏上的样子合成出来 —— 模糊底衬
+ * + 圆角 + 边框 + 投影 + 颗粒，和屏幕上**同一个着色器、同一遍**（不是另写一套）。
+ *
+ * 和屏幕那条路的差别只有几何：
+ *   - 渲染目标是**取景框**（这一帧的流），不是窗口的离屏缓冲，内容摆在哪由调用方
+ *     给（content_x/y）；
+ *   - 底衬采样按「内容左上角的布局坐标 × 取景框缩放」算：取景框的缩放常常和那块
+ *     屏的缩放不是一回事（窗口等比缩进流里），所以先按布局坐标换算到那块屏的设备
+ *     像素，再乘目标像素/底衬像素那个比值（k）。取景框就是窗口本身时 k = 1，
+ *     公式跟屏幕那条路逐项一致。
+ *
+ * 取景框比窗口大（窗口缩进流、四周留黑）时，装饰只画在窗口那块；外面的留黑由
+ * 调用方保证（这一趟不动那儿的像素）。 */
+/* 客户端缓冲 → 贴图（借来那张或自己建一张）。窗口抓帧那条路要拿它当「元素
+ * 内容」贴图（采样映射 + 透明度剔除），和屏幕上那条路共用这一份。owned 非空时
+ * 告诉调用方要不要自己销毁。 */
+struct wlr_texture *vidow_fx_client_texture(struct vidow_server *server,
+		struct wlr_buffer *buffer, bool *owned) {
+	if (server == NULL || buffer == NULL) {
+		return NULL;
+	}
+	bool own = true;
+	struct wlr_texture *tex = client_texture(server->renderer, buffer, &own);
+	if (owned != NULL) {
+		*owned = own;
+	}
+	return tex;
+}
+
+bool vidow_fx_capture_decor(struct vidow_server *server,
+		const struct vidow_capture_decor *c) {
+	if (server == NULL || c == NULL || c->dst == NULL || c->look == NULL ||
+			c->dst_w <= 0 || c->dst_h <= 0 || server->decor.program == 0) {
+		return false;
+	}
+	double frame_scale = c->frame_scale > 0.0 ? c->frame_scale : 1.0;
+	double out_scale = c->out_scale > 0.0 ? c->out_scale : frame_scale;
+	/* 目标像素 / 底衬像素。两者一样时（窗口源那条路就是这样：出图尺寸 =
+	 * 窗口逻辑尺寸 × 那块屏的缩放）下面这两行就是屏幕那条路的公式。 */
+	double k = frame_scale / out_scale;
+	int bw = c->blur_w > 0 ? c->blur_w : c->out_w;
+	int bh = c->blur_h > 0 ? c->blur_h : c->out_h;
+	if (bw <= 0 || bh <= 0) {
+		bw = 1;
+		bh = 1;
+	}
+
+	/* fx 只用来告诉 decor_pass「底衬是哪张、内容贴图怎么采」：几何全在 g 里。
+	 * 模糊只有「底衬那一趟」画（edge 那趟画的是画框，叠在内容上面，再糊一次
+	 * 就是错的）。 */
+	struct vidow_fx_target fx = {0};
+	fx.blur_tex = c->blur;
+	fx.blur = !c->edge && c->blur != NULL;
+	fx.tex_off_x = c->tex_u0;
+	fx.tex_off_y = c->tex_v0;
+	fx.tex_scale_x = c->tex_du;
+	fx.tex_scale_y = c->tex_dv;
+
+	struct decor_geo g = {
+		.dst_w = c->dst_w, .dst_h = c->dst_h,
+		.content_w = c->content_w, .content_h = c->content_h,
+		.off_x = (float)c->content_x, .off_y = (float)c->content_y,
+		.origin_x = (float)(((double)c->content_layout_x - (double)c->out_x) *
+			frame_scale - (double)c->blur_x * k),
+		.origin_y = (float)(((double)c->content_layout_y - (double)c->out_y) *
+			frame_scale - (double)c->blur_y * k),
+		.out_size_x = (float)((double)bw * k),
+		.out_size_y = (float)((double)bh * k),
+		/* 内容不画进这张图（由场景里那个镜像节点画），但 u_texture 照样得
+		 * 采 —— 透明度剔除按它的 alpha 走（和屏上同一条判据）。 */
+		.content_alpha = 0.0f,
+	};
+
+	decor_pass(server, &fx, c->dst, &g,
+		c->content != NULL ? c->content : server->empty_tex, NULL,
+		c->border, 1.0, frame_scale, c->look, false);
+	return true;
+}
+
+static bool anim_draw(struct vidow_server *server,
+		struct vidow_fx_target *fx, struct wlr_buffer *dst,
+		struct wlr_texture *src, int ox, int oy, double alpha, double scale) {
+	struct vidow_shader *sh = fx->shader;
+	struct wlr_gles2_texture_attribs sa;
+	wlr_gles2_texture_get_attribs(src, &sa);
+
+	struct wlr_egl *egl = NULL;
+	if (begin_pass(server, dst, fx->w, fx->h, &egl) == 0) {
+		return false;
+	}
+
+	glUseProgram(sh->program);
+	bind_tex(0, sa.target, sa.tex);
+	glUniform1i(sh->u_texture, 0);
+	/* 过冲的曲线（out_elastic / out_back）让 t 稍微越过 1：几何量过冲是我
+	 * 们要的，着色器的 u_progress 不是 —— 它的契约是 0..1，> 1 的进度会让
+	 * zoom 这类 shader 采到贴图外面去。这里夹住。 */
+	double progress = fx->progress;
+	if (!(progress > 0.0)) {
+		progress = 0.0;
+	} else if (progress > 1.0) {
+		progress = 1.0;
+	}
+	glUniform1f(sh->u_progress, (float)progress);
+	glUniform1i(sh->u_phase, (int)fx->phase);
+	glUniform2f(sh->u_size, (float)fx->w, (float)fx->h);
+	glUniform2f(glGetUniformLocation(sh->program, "u_target_size"),
+		(float)fx->w, (float)fx->h);
+	glUniform2f(sh->u_origin,
+		(float)((int)lround((double)ox * scale) - server->output_x),
+		(float)((int)lround((double)oy * scale) - server->output_y));
+	glUniform2f(sh->u_output_size, (float)server->output_w,
+		(float)server->output_h);
+	glUniform1f(sh->u_alpha, (float)alpha);
+	glUniform1f(sh->u_time, (float)(vidow_now_ns() - fx->start_ns) / 1e9f);
+	glUniform1f(sh->u_flip_y, server->config.shader_flip_y ? 1.0f : 0.0f);
+
+	draw_quad(sh->program);
+	glUseProgram(0);
+	end_pass(egl);
+	return true;
+}
+
+/* -------------------------------------------------------------- debugging */
+
+/* ------------------------------------------------------------- public API */
+
+bool vidow_fx_set_shader(struct vidow_server *server,
+		struct vidow_fx_target *fx, const char *name,
+		enum vidow_shader_phase phase) {
+	struct vidow_shader *sh = vidow_shader_get(server, name);
+	if (sh == NULL) {
+		return false;
+	}
+	fx->shader = sh;
+	fx->phase = phase;
+	fx->progress = 0.0;
+	fx->start_ns = vidow_now_ns();
+	return true;
+}
+
+/* 装饰画面是一个普通的 scene buffer，而普通 buffer 默认「接受输入」。它盖在
+ * 客户端自己的 surface 节点上面，于是会把所有点击都吃掉 —— 窗口就点不着了。
+ * 返回 false 让场景的命中测试继续往下走，落到客户端表面上。 */
+static bool fx_node_rejects_input(struct wlr_scene_buffer *buffer, double *sx,
+		double *sy) {
+	(void)buffer;
+	(void)sx;
+	(void)sy;
+	return false;
+}
+
+bool vidow_fx_begin(struct vidow_server *server, struct vidow_fx_target *fx,
+		struct wlr_scene_tree *parent, const char *shader_name) {
+	bool decorated = server->config.decor_enabled && server->decor.program != 0;
+	bool animated = shader_name != NULL && shader_name[0] != '\0';
+	if (!decorated && !animated) {
+		return false;
+	}
+	if (fx->node == NULL) {
+		fx->node = wlr_scene_buffer_create(parent, NULL);
+		if (fx->node == NULL) {
+			return false;
+		}
+		fx->node->point_accepts_input = fx_node_rejects_input;
+	}
+	wlr_scene_node_raise_to_top(&fx->node->node);
+	wlr_scene_node_set_enabled(&fx->node->node, true);
+	fx->active = true;
+	fx->blur = server->config.blur_enabled;
+	/* 默认恒等：内容贴图就是整块元素。窗口那一路每帧按窗口几何覆盖它。 */
+	fx->tex_off_x = 0.0f;
+	fx->tex_off_y = 0.0f;
+	fx->tex_scale_x = 1.0f;
+	fx->tex_scale_y = 1.0f;
+	/* mask 默认恒等：没有几何偏移。 */
+	fx->mask_off_x = 0.0f;
+	fx->mask_off_y = 0.0f;
+	fx->mask_scale_x = 1.0f;
+	fx->mask_scale_y = 1.0f;
+	fx->mask_min = 0.0f;
+	fx->anim_scale = 1.0;
+	if (animated) {
+		vidow_fx_set_shader(server, fx, shader_name, VIDOW_SHADER_OPEN);
+	}
+	return true;
 }
 
 static bool layer_blur_frame(struct vidow_server *server,
@@ -3733,6 +4140,11 @@ static bool layer_blur_frame(struct vidow_server *server,
 	fx->tex_off_y = 0.0f;
 	fx->tex_scale_x = 1.0f;
 	fx->tex_scale_y = 1.0f;
+	fx->mask_off_x = 0.0f;
+	fx->mask_off_y = 0.0f;
+	fx->mask_scale_x = 1.0f;
+	fx->mask_scale_y = 1.0f;
+	fx->mask_min = 0.0f;
 	blur_mask_min_changed(fx, server->config.blur_alpha_min);
 	/* bottom 层先于窗口画，它底下没有窗口：共享的那张底衬就是它要的全部。top /
 	 * overlay 层底下有窗口，得自己抓一小块（见 layer_region_build）。 */
@@ -3819,14 +4231,9 @@ static bool layer_blur_frame(struct vidow_server *server,
 		if (fx->blur_own_tex != NULL) {
 			blur_own_drop(fx);
 		}
-		if (ls->bd != NULL) {
-			wlr_buffer_drop(ls->bd);
-			ls->bd = NULL;
-			ls->bd_w = 0;
-			ls->bd_h = 0;
-			ls->bd_gen_scene = 0;
-			ls->bd_gen_layer = 0;
-		}
+		/* 缓冲和包着它的贴图要一起收：只 drop buffer 会把 ls->bd_tex
+		 * 留成一张悬空贴图（layer 从 top/overlay 切到 bottom 时漏的就是它）。 */
+		layer_bd_drop(ls);
 		blur_assign(fx, output->blur_tex, false, output->blur_id, NULL);
 	}
 	if (ls->blur_fail != 0) {
@@ -3888,6 +4295,710 @@ static bool layer_blur_frame(struct vidow_server *server,
 
 	fx->blur_drawn = fx->blur_ver;
 	return true;
+}
+
+/* ------------------------------------------------------- 弹出物的背景模糊 */
+
+/* 窗口的 xdg_popup / X11 菜单提示 / 输入法候选框背后的模糊。
+ *
+ * 抄的是上面 layer_blur_frame 的做法：在弹出物自己的场景树里垫一个只画模糊的
+ * 节点（blur_only），底衬按它自己那一小块区域重抓 —— 基座从共享底衬上 1:1
+ * 拷一块，窗口 / 别的弹出物再画上去。区别只有几何来源：
+ *   - xdg / X11 的节点挂在弹出物自己的树上，相对坐标恒等 0,0；
+ *   - 输入法候选框挂在 layer_im 上，位置每帧按绝对坐标摆。
+ * 抓底衬时把弹出物自己藏起来（pb->hide），否则模糊里会浮出它自己的影子。 */
+
+static bool popup_blur_geom(struct vidow_popup_blur *pb, int *x, int *y,
+		int *w, int *h) {
+	if (pb->tree == NULL || pb->hide == NULL || pb->surface == NULL) {
+		return false;
+	}
+	if (!wlr_scene_node_coords(pb->hide, x, y)) {
+		return false;
+	}
+	if (pb->view != NULL) {
+		struct wlr_box g = vidow_view_geometry(pb->view);
+		*w = g.width;
+		*h = g.height;
+	} else {
+		/* GTK 的 xdg geometry 不一定等于看得见的窗口体（CSD 阴影 / 主题
+		 * 不同都会让 6,5 这种偏移对不上）。输入区域是客户端自己声明的
+		 * 「可点的窗口体」，GTK 菜单实测就是 6,5 157x203，比 geometry 更
+		 * 可信；拿它当模糊范围，客户端换主题也不会偏。 */
+		pixman_box32_t *ir = pixman_region32_extents(
+			&pb->surface->input_region);
+		if (ir != NULL && ir->x2 > ir->x1 && ir->y2 > ir->y1) {
+			*x += ir->x1;
+			*y += ir->y1;
+			*w = ir->x2 - ir->x1;
+			*h = ir->y2 - ir->y1;
+		} else {
+			*w = pb->surface->current.width;
+			*h = pb->surface->current.height;
+		}
+	}
+	if (*w <= 0 || *h <= 0) {
+		/* 还没 commit 过 / 几何还没算出来：退回表面尺寸。 */
+		*w = pb->surface->current.width;
+		*h = pb->surface->current.height;
+	}
+	return *w > 0 && *h > 0;
+}
+
+/* 这块弹出物现在归哪块屏管（中心点落在谁身上）。NULL = 整块在屏外。 */
+static struct vidow_output *popup_blur_owner(struct vidow_popup_blur *pb) {
+	int x, y, w, h;
+	if (!popup_blur_geom(pb, &x, &y, &w, &h)) {
+		return NULL;
+	}
+	struct wlr_output *wo = wlr_output_layout_output_at(
+		pb->server->output_layout, x + w / 2, y + h / 2);
+	if (wo == NULL) {
+		return NULL;
+	}
+	return vidow_output_lookup(pb->server, wo);
+}
+
+/* 内容整块不透明（格式里没 alpha）时，底下的模糊一个像素都透不出来 —— 跟
+ * layer_blur_visible 同一个判据，只是弹出物没有规则 / 动画要额外看。 */
+static bool popup_blur_visible(struct vidow_popup_blur *pb) {
+	if (pb->view != NULL &&
+			(pb->view->mask_opacity || pb->view->anim_alpha < 1.0)) {
+		return true;
+	}
+	if (pb->surface->buffer == NULL) {
+		return true; /* 让 wanted 去报「还没缓冲」 */
+	}
+	return !wlr_buffer_is_opaque(&pb->surface->buffer->base);
+}
+
+static bool popup_blur_bail(struct vidow_popup_blur *pb, int reason,
+		const char *what) {
+	if (pb->blur_fail != reason) {
+		pb->blur_fail = reason;
+		wlr_log(WLR_INFO, "弹出物模糊没画: %s（%s）", what,
+			pb->tag != NULL ? pb->tag : "?");
+	}
+	return false;
+}
+
+static bool popup_blur_wanted(struct vidow_server *server,
+		struct vidow_popup_blur *pb) {
+	if (!server->shader_ok || !server->config.blur_enabled) {
+		return popup_blur_bail(pb, 10, "全局模糊关了 / 着色器没就绪");
+	}
+	if (!server->config.popup_blur_enabled) {
+		return popup_blur_bail(pb, 12, "popup_blur_enabled = false");
+	}
+	if (pb->tree == NULL || pb->hide == NULL || pb->surface == NULL) {
+		return popup_blur_bail(pb, 1, "场景 / 表面已经没了");
+	}
+	if (!pb->hide->enabled) {
+		return popup_blur_bail(pb, 2,
+			"弹出物节点关着（没映射 / 在 overview 里 / 工作区藏起来了）");
+	}
+	if (pb->surface->buffer == NULL) {
+		return popup_blur_bail(pb, 3, "表面还没有缓冲");
+	}
+	if (!popup_blur_visible(pb)) {
+		return popup_blur_bail(pb, 4, "整块不透明（缓冲没有 alpha）");
+	}
+	return true;
+}
+
+/* 抓底衬时把弹出物自己藏起来。只藏「本来开着」的，回填时也别把本来就该藏着
+ * 的东西点亮（跟 layer_blur_capture_visible 一个规矩）。 */
+static void popup_blur_hide(struct vidow_popup_blur *pb, bool hide) {
+	if (hide) {
+		if (pb->hide != NULL && pb->hide->enabled) {
+			wlr_scene_node_set_enabled(pb->hide, false);
+			pb->capture_hidden = true;
+		}
+	} else if (pb->capture_hidden) {
+		pb->capture_hidden = false;
+		if (pb->hide != NULL) {
+			wlr_scene_node_set_enabled(pb->hide, true);
+		}
+	}
+}
+
+/* 这块弹出物该用多大一块区域抓底衬（设备像素，相对输出原点）。跟
+ * view_region_rect 同一套：往外放一圈模糊半径、原点对齐网格、尺寸只跟弹出物
+ * 大小有关（移动时缓冲不重建），再夹在屏内。 */
+static bool popup_region_rect(struct vidow_server *server,
+		struct vidow_output *output, int x, int y, int w, int h,
+		int *rx, int *ry, int *rw, int *rh, int *levels) {
+	double scale = output->wlr_output->scale;
+	if (!(scale > 0.0)) {
+		scale = 1.0;
+	}
+	int lv = blur_levels_for(server, server->output_w, server->output_h);
+	int margin = blur_reach_px(server, lv);
+	int left = (int)lround((double)x * scale) - server->output_x - margin;
+	int top = (int)lround((double)y * scale) - server->output_y - margin;
+	int span_w = (int)lround((double)w * scale) + 2 * margin;
+	int span_h = (int)lround((double)h * scale) + 2 * margin;
+	const int grid = VIDOW_BLUR_REGION_GRID;
+	int gx1 = (int)floor((double)left / grid) * grid;
+	int gy1 = (int)floor((double)top / grid) * grid;
+	int size_w = (int)ceil((double)(span_w + grid) / grid) * grid;
+	int size_h = (int)ceil((double)(span_h + grid) / grid) * grid;
+	if (size_w < 1 || size_h < 1 || size_w > MAX_TARGET_PX ||
+			size_h > MAX_TARGET_PX) {
+		return false;
+	}
+	int max_x = server->output_w - size_w;
+	int max_y = server->output_h - size_h;
+	if (max_x < 0) {
+		max_x = 0;
+	}
+	if (max_y < 0) {
+		max_y = 0;
+	}
+	if (gx1 < 0) {
+		gx1 = 0;
+	} else if (gx1 > max_x) {
+		gx1 = max_x;
+	}
+	if (gy1 < 0) {
+		gy1 = 0;
+	} else if (gy1 > max_y) {
+		gy1 = max_y;
+	}
+	*rx = gx1;
+	*ry = gy1;
+	*rw = size_w;
+	*rh = size_h;
+	*levels = lv;
+	return true;
+}
+
+/* 抓「弹出物盖住的那一块」：基座从共享底衬上 1:1 拷一块（壁纸 + background /
+ * bottom 层），再把窗口 / 别的弹出物 / top / overlay 层画上去。跟
+ * layer_region_build 的区别只有一处：抓的时候藏起来的是弹出物自己。 */
+static bool popup_region_build(struct vidow_server *server,
+		struct vidow_output *output, struct vidow_popup_blur *pb,
+		int rx, int ry, int rw, int rh, int levels) {
+	double scale = output->wlr_output->scale;
+	if (!(scale > 0.0)) {
+		scale = 1.0;
+	}
+	int x1 = rx < 0 ? 0 : rx, y1 = ry < 0 ? 0 : ry;
+	int x2 = rx + rw, y2 = ry + rh;
+	if (x2 > server->output_w) {
+		x2 = server->output_w;
+	}
+	if (y2 > server->output_h) {
+		y2 = server->output_h;
+	}
+	if (x2 <= x1 || y2 <= y1) {
+		return false; /* 整块在屏外，没东西可抓 */
+	}
+	if (output->backdrop_tex == NULL) {
+		return false;
+	}
+
+	if (pb->fx.own_bd == NULL || pb->fx.own_bd_w != rw ||
+			pb->fx.own_bd_h != rh) {
+		own_bd_drop(&pb->fx);
+		pb->fx.own_bd = vidow_alloc_target(server, rw, rh);
+		if (pb->fx.own_bd == NULL) {
+			return false;
+		}
+		pb->fx.own_bd_tex = stat_tex_new(
+			wlr_texture_from_buffer(server->renderer, pb->fx.own_bd));
+		if (pb->fx.own_bd_tex == NULL) {
+			own_bd_drop(&pb->fx);
+			return false;
+		}
+		pb->fx.own_bd_w = rw;
+		pb->fx.own_bd_h = rh;
+	}
+
+	struct wlr_render_pass *pass = wlr_renderer_begin_buffer_pass(
+		server->renderer, pb->fx.own_bd, NULL);
+	if (pass == NULL) {
+		return false;
+	}
+	struct wlr_render_rect_options clear = {
+		.box = { .x = 0, .y = 0, .width = rw, .height = rh },
+		.color = { .r = 0.0f, .g = 0.0f, .b = 0.0f, .a = 0.0f },
+		.blend_mode = WLR_RENDER_BLEND_MODE_NONE,
+	};
+	wlr_render_pass_add_rect(pass, &clear);
+
+	/* 基座：共享底衬里对应的那一块，1:1 捞过来（别插值）。 */
+	float one = 1.0f;
+	struct wlr_render_texture_options base = {
+		.texture = output->backdrop_tex,
+		.src_box = {
+			.x = (float)x1, .y = (float)y1,
+			.width = (float)(x2 - x1), .height = (float)(y2 - y1),
+		},
+		.dst_box = {
+			.x = x1 - rx, .y = y1 - ry,
+			.width = x2 - x1, .height = y2 - y1,
+		},
+		.alpha = &one,
+		.transform = WL_OUTPUT_TRANSFORM_NORMAL,
+		.filter_mode = WLR_SCALE_FILTER_NEAREST,
+		.blend_mode = WLR_RENDER_BLEND_MODE_PREMULTIPLIED,
+	};
+	wlr_render_pass_add_texture(pass, &base);
+
+	/* 弹出物自己不能进自己的底衬。 */
+	popup_blur_hide(pb, true);
+	struct backdrop_ctx ctx = {
+		.pass = pass,
+		.server = server,
+		.scale = scale,
+		.ox = (int)lround((double)output->box.x * scale) + x1,
+		.oy = (int)lround((double)output->box.y * scale) + y1,
+		.clip_x = x1 - rx,
+		.clip_y = y1 - ry,
+		.clip_w = x2 - x1,
+		.clip_h = y2 - y1,
+	};
+	/* 只抓**弹出物底下**的那几层。弹出物可能挂在窗口那层（layer_popups），
+	 * 也可能挂在某块 layer surface 的树里（状态栏菜单，跟着 layer_top /
+	 * overlay 走）；挂在 bottom 层的弹出物底下就是共享底衬，一层都不用补抓。
+	 * 多抓上面的层会把「其实盖在弹出物上面」的东西画进它的底衬 —— 半透明的
+	 * 上面那层一透，就能看见本不该在背后的内容。 */
+	bool under_bottom = false, under_top = false, under_overlay = false;
+	bool under_im = false;
+	struct wlr_scene_node *branch = NULL;
+	for (struct wlr_scene_node *n = &pb->tree->node; n != NULL;
+			n = n->parent != NULL ? &n->parent->node : NULL) {
+		if (n == &server->layer_bottom->node ||
+				n == &server->layer_background->node) {
+			under_bottom = true;
+			break;
+		}
+		if (n == &server->layer_top->node) {
+			under_top = true;
+		}
+		if (n == &server->layer_overlay->node) {
+			under_overlay = true;
+		}
+		if (n == &server->layer_im->node) {
+			under_im = true;
+		}
+		branch = n;
+	}
+	struct wlr_scene_tree *trees[4];
+	size_t ntrees = 0;
+	if (under_bottom) {
+		/* bottom / background 层的弹出物：共享底衬里那块 layer surface 可能
+		 * 因为「它自己也要模糊」被藏起来了（见 layer_blur_capture_visible），
+		 * 所以只补抓它这一支（父表面 + 弹出物，弹出物已经藏着）。 */
+		struct wlr_scene_tree *bt =
+			branch != NULL ? wlr_scene_tree_from_node(branch) : NULL;
+		if (bt != NULL) {
+			trees[ntrees++] = bt;
+		}
+	} else {
+		trees[ntrees++] = server->layer_toplevels;
+		trees[ntrees++] = server->layer_popups;
+		if (under_top || under_overlay || under_im) {
+			trees[ntrees++] = server->layer_top;
+		}
+		if (under_overlay || under_im) {
+			trees[ntrees++] = server->layer_overlay;
+		}
+	}
+	for (size_t i = 0; i < ntrees; i++) {
+		if (trees[i] != NULL) {
+			wlr_scene_node_for_each_buffer(&trees[i]->node,
+				backdrop_iter, &ctx);
+		}
+	}
+	popup_blur_hide(pb, false);
+	if (!wlr_render_pass_submit(pass)) {
+		return false;
+	}
+
+	dmg_clear(&pb->fx.pending_damage); /* 这一版的账已经算清了 */
+	/* 旧贴图裹着的缓冲马上要被金字塔复用。 */
+	blur_own_drop(&pb->fx);
+	if (!blur_set_alloc(server, &pb->fx.blur_set, rw, rh, levels)) {
+		return false;
+	}
+	blur_chain(server, &pb->fx.blur_set, pb->fx.own_bd_tex, rw, rh);
+	pb->fx.blur_own_tex = pb->fx.blur_set.up_tex[0];
+	if (pb->fx.blur_own_tex == NULL) {
+		return false;
+	}
+	pb->fx.blur_set.valid = true;
+	pb->fx.blur_own_id = server->blur_serial++;
+	pb->bd_x = rx;
+	pb->bd_y = ry;
+	pb->bd_w = rw;
+	pb->bd_h = rh;
+	pb->bd_output = output;
+	pb->bd_gen_scene = server->gen_scene;
+	pb->bd_gen_layer = server->gen_layer;
+	wlr_log(WLR_DEBUG, "blur: popup region %s %dx%d at %d,%d levels=%d",
+		pb->tag != NULL ? pb->tag : "?", rw, rh, rx, ry, levels);
+	return true;
+}
+
+/* 把模糊资源还掉，但保留注册项和场景节点（下一帧还要用）。 */
+static void popup_blur_release(struct vidow_popup_blur *pb) {
+	if (pb == NULL) {
+		return;
+	}
+	/* 上一次抓底衬要是半路退出（正常路径都会回填），这里兜底把弹出物放出来。 */
+	popup_blur_hide(pb, false);
+	if (pb->fx.node != NULL) {
+		/* 只在真的有东西的时候碰节点：这个函数每帧都会被叫（弹出物整块
+		 * 不透明 / 还没缓冲时），反复 set_buffer(NULL) 会一直报损伤。 */
+		if (pb->fx.node->node.enabled) {
+			wlr_scene_node_set_enabled(&pb->fx.node->node, false);
+		}
+		if (pb->fx.node->buffer != NULL) {
+			wlr_scene_buffer_set_buffer(pb->fx.node, NULL);
+		}
+	}
+	blur_target_release(&pb->fx);
+	drop_targets(&pb->fx);
+	pb->fx.blur_drawn = 0;
+	pb->bd_w = 0;
+	pb->bd_h = 0;
+	pb->bd_x = 0;
+	pb->bd_y = 0;
+	pb->bd_output = NULL;
+	pb->bd_gen_scene = 0;
+	pb->bd_gen_layer = 0;
+}
+
+static void popup_blur_frame(struct vidow_server *server,
+		struct vidow_output *output, struct vidow_popup_blur *pb) {
+	struct vidow_fx_target *fx = &pb->fx;
+
+	if (!popup_blur_wanted(server, pb)) {
+		if (fx->node != NULL && fx->node->node.enabled) {
+			wlr_scene_node_set_enabled(&fx->node->node, false);
+		}
+		popup_blur_release(pb);
+		return;
+	}
+
+	int x, y, w, h;
+	if (!popup_blur_geom(pb, &x, &y, &w, &h)) {
+		popup_blur_bail(pb, 5, "几何还是 0 / 节点不在场景里");
+		if (fx->node != NULL && fx->node->node.enabled) {
+			wlr_scene_node_set_enabled(&fx->node->node, false);
+		}
+		return;
+	}
+	/* 归别的屏那一趟管：别在这儿建 / 拆缓冲（两块屏会互相把对方的金字塔丢掉）。 */
+	struct vidow_output *owner = popup_blur_owner(pb);
+	if (owner != output) {
+		if (owner == NULL) {
+			if (fx->node != NULL && fx->node->node.enabled) {
+				wlr_scene_node_set_enabled(&fx->node->node, false);
+			}
+			popup_blur_release(pb);
+		}
+		return;
+	}
+	if (output->backdrop_tex == NULL) {
+		popup_blur_bail(pb, 6, "这块屏的共享底衬还没建");
+		return;
+	}
+
+	double scale = output->wlr_output->scale;
+	if (!(scale > 0.0)) {
+		scale = 1.0;
+	}
+	int px_w = (int)lround((double)w * scale);
+	int px_h = (int)lround((double)h * scale);
+	if (px_w < 1 || px_h < 1 || px_w > MAX_TARGET_PX ||
+			px_h > MAX_TARGET_PX) {
+		popup_blur_bail(pb, 7, "设备像素尺寸越界");
+		return;
+	}
+
+	if (fx->node == NULL) {
+		fx->node = wlr_scene_buffer_create(pb->tree, NULL);
+		if (fx->node == NULL) {
+			return;
+		}
+		fx->node->point_accepts_input = fx_node_rejects_input;
+		/* 垫在弹出物表面（和它的子菜单）下面。 */
+		wlr_scene_node_lower_to_bottom(&fx->node->node);
+		pb->node_destroy.notify = popup_blur_node_destroy;
+		wl_signal_add(&fx->node->node.events.destroy, &pb->node_destroy);
+		pb->node_destroy_added = true;
+	}
+	fx->blur_only = true;
+	fx->active = true;
+	fx->blur = true;
+	fx->tex_off_x = 0.0f;
+	fx->tex_off_y = 0.0f;
+	fx->tex_scale_x = 1.0f;
+	fx->tex_scale_y = 1.0f;
+	/* mask 默认整张表面；xdg popup 用输入区域（窗口体）当 mask 范围，
+	 * 把 CSD 阴影剔掉。阈值 0.35 是给半透明菜单体留的余量（GTK 菜单体
+	 * alpha ≈ 0.45），比全局 0.15 更不容易把阴影/圆角过渡糊进去。 */
+	fx->mask_off_x = 0.0f;
+	fx->mask_off_y = 0.0f;
+	fx->mask_scale_x = 1.0f;
+	fx->mask_scale_y = 1.0f;
+	fx->mask_min = 1.0f / 255.0f;
+	/* 配置里给了统一阈值就用它（0 = 保持各自动的默认值：普通菜单只剔
+	 * alpha=0，输入法候选框 0.35）。 */
+	if (server->config.popup_blur_alpha_min > 0.0) {
+		fx->mask_min = (float)server->config.popup_blur_alpha_min;
+		if (fx->mask_min > 1.0f) {
+			fx->mask_min = 1.0f;
+		}
+	}
+	if (pb->view == NULL) {
+		int sw = pb->surface->current.width;
+		int sh = pb->surface->current.height;
+		pixman_box32_t *ir = pixman_region32_extents(
+			&pb->surface->input_region);
+		if (sw > 0 && sh > 0 && ir != NULL && ir->x2 > ir->x1 &&
+				ir->y2 > ir->y1) {
+			fx->mask_off_x = (float)ir->x1 / (float)sw;
+			fx->mask_off_y = (float)ir->y1 / (float)sh;
+			fx->mask_scale_x = (float)(ir->x2 - ir->x1) / (float)sw;
+			fx->mask_scale_y = (float)(ir->y2 - ir->y1) / (float)sh;
+			if (server->config.popup_blur_alpha_min <= 0.0) {
+				fx->mask_min = 0.35f;
+			}
+		}
+	}
+	blur_mask_min_changed(fx, fx->mask_min);
+
+	/* 节点相对 tree 的坐标：xdg / X11 的树原点就是弹出物原点（0,0）；候选框
+	 * 挂在 layer_im 上，得按绝对坐标摆。 */
+	int tx = 0, ty = 0;
+	if (wlr_scene_node_coords(&pb->tree->node, &tx, &ty)) {
+		wlr_scene_node_set_position(&fx->node->node, x - tx, y - ty);
+	}
+
+	if (fx->buf[0] == NULL || fx->w != px_w || fx->h != px_h ||
+			fabs(fx->scale - scale) > 1e-3) {
+		drop_targets(fx);
+		for (int i = 0; i < 2; i++) {
+			fx->buf[i] = vidow_alloc_target(server, px_w, px_h);
+			if (fx->buf[i] == NULL) {
+				drop_targets(fx);
+				popup_blur_bail(pb, 8, "分配离屏目标失败");
+				return;
+			}
+		}
+		fx->w = px_w;
+		fx->h = px_h;
+		fx->content_w = px_w;
+		fx->content_h = px_h;
+		fx->px_pad = 0;
+		fx->dst_w = w;
+		fx->dst_h = h;
+		fx->scale = scale;
+		fx->blur_drawn = 0;
+	}
+
+	/* 位置 / 尺寸变了：模糊的采样坐标跟着变，节点也得重画。 */
+	if (pb->last_x != x || pb->last_y != y || pb->last_w != w ||
+			pb->last_h != h) {
+		pb->last_x = x;
+		pb->last_y = y;
+		pb->last_w = w;
+		pb->last_h = h;
+		fx->blur_ver++;
+	}
+
+	int rx, ry, rw, rh, levels;
+	if (!popup_region_rect(server, output, x, y, w, h,
+			&rx, &ry, &rw, &rh, &levels)) {
+		popup_blur_bail(pb, 9, "区域尺寸越界");
+		return;
+	}
+
+	struct wlr_box region_logical = {
+		.x = output->box.x + (int)floor((double)rx / scale),
+		.y = output->box.y + (int)floor((double)ry / scale),
+		.width = (int)ceil((double)rw / scale) + 1,
+		.height = (int)ceil((double)rh / scale) + 1,
+	};
+	bool key_changed = pb->bd_gen_scene != server->gen_scene;
+	bool touched = key_changed && blur_damage_hits(fx, &region_logical);
+	bool fresh = fx->own_bd != NULL && fx->blur_own_tex != NULL && !touched &&
+		pb->bd_output == output &&
+		pb->bd_w == rw && pb->bd_h == rh && pb->bd_x == rx &&
+		pb->bd_y == ry && pb->bd_gen_layer == server->gen_layer &&
+		fx->blur_set.w == rw && fx->blur_set.h == rh &&
+		fx->blur_set.levels == levels &&
+		fabs(fx->blur_set.offset - server->config.blur_offset) < 1e-6;
+	if (!fresh && !popup_region_build(server, output, pb, rx, ry, rw, rh,
+			levels)) {
+		(void)popup_blur_bail(pb, 11, "私有底衬抓不出来");
+		return; /* 抓不出来就留着上一帧那张，别闪 */
+	}
+	blur_assign(fx, fx->blur_own_tex, false, fx->blur_own_id,
+		&(struct wlr_box){ .x = rx, .y = ry,
+			.width = rw, .height = rh });
+	fx->blur_out_w = output->wlr_output->width;
+	fx->blur_out_h = output->wlr_output->height;
+	fx->blur_out_x = server->output_x;
+	fx->blur_out_y = server->output_y;
+	if (pb->blur_fail != 0) {
+		pb->blur_fail = 0;
+	}
+
+	if (fx->blur_drawn == fx->blur_ver) {
+		/* 透明度每帧都对齐：抓帧遮挡（mask_opacity）可能在两帧之间变，不能
+		 * 因为「模糊图没变」就把一块不透明的模糊留在截屏里。 */
+		wlr_scene_buffer_set_opacity(fx->node,
+			(pb->view != NULL && pb->view->mask_opacity) ? 0.0f : 1.0f);
+		wlr_scene_node_set_enabled(&fx->node->node, true);
+		return; /* 已经画的就是这一版 */
+	}
+
+	struct wlr_buffer *target = pick_free(fx->buf);
+	if (target == NULL) {
+		return;
+	}
+	/* 元素自己的 alpha 当剔除 mask：模糊只画在弹出物真有内容的地方（圆角
+	 * 外面 / 自带的透明阴影边不再透出一圈模糊）。 */
+	struct wlr_texture *mask = NULL;
+	struct wlr_client_buffer *cbuf = pb->surface->buffer;
+	if (cbuf != NULL) {
+		mask = wlr_texture_from_buffer(server->renderer,
+			render_source(&cbuf->base));
+	}
+	static const float no_border[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+	struct vidow_look look = {0};
+	look.opacity = 1.0;
+	look.blur = true;
+	look.decor = false;
+	decor_draw(server, fx, target, server->empty_tex, mask, no_border,
+		x, y, 1.0, scale, &look);
+	if (mask != NULL) {
+		wlr_texture_destroy(mask);
+	}
+
+	wlr_scene_buffer_set_dest_size(fx->node, w, h);
+	wlr_scene_buffer_set_opacity(fx->node,
+		(pb->view != NULL && pb->view->mask_opacity) ? 0.0f : 1.0f);
+	pixman_region32_t damage;
+	pixman_region32_init_rect(&damage, 0, 0, w, h);
+	wlr_scene_buffer_set_buffer_with_damage(fx->node, target, &damage);
+	pixman_region32_fini(&damage);
+	wlr_scene_node_set_enabled(&fx->node->node, true);
+	fx->blur_drawn = fx->blur_ver;
+}
+
+/* 节点跟着场景树一起没了（xdg popup 的树 / X11 的表面树销毁）：把注册项摘掉，
+ * 别再拿着一个已经释放的指针。 */
+static void popup_blur_node_destroy(struct wl_listener *listener, void *data) {
+	(void)data;
+	struct vidow_popup_blur *pb =
+		wl_container_of(listener, pb, node_destroy);
+	pb->node_destroy_added = false;
+	wl_list_remove(&pb->node_destroy.link);
+	pb->fx.node = NULL;
+	vidow_popup_blur_unregister(pb, false);
+}
+
+static void popup_blur_owner_destroy(struct wl_listener *listener, void *data) {
+	(void)data;
+	struct vidow_popup_blur *pb =
+		wl_container_of(listener, pb, owner_destroy);
+	pb->owner_destroy_added = false;
+	wl_list_remove(&pb->owner_destroy.link);
+	vidow_popup_blur_unregister(pb, false);
+}
+
+static void popup_blur_commit(struct wl_listener *listener, void *data) {
+	(void)data;
+	struct vidow_popup_blur *pb = wl_container_of(listener, pb, commit);
+	vidow_popup_blur_invalidate(pb);
+}
+
+struct vidow_popup_blur *vidow_popup_blur_register(struct vidow_server *server,
+		struct wlr_scene_tree *tree, struct wlr_scene_node *hide,
+		struct wlr_surface *surface, struct vidow_view *view, const char *tag,
+		struct wl_signal *owner_destroy) {
+	if (server == NULL || tree == NULL || hide == NULL || surface == NULL) {
+		return NULL;
+	}
+	struct vidow_popup_blur *pb = calloc(1, sizeof(*pb));
+	if (pb == NULL) {
+		return NULL;
+	}
+	pb->server = server;
+	pb->tree = tree;
+	pb->hide = hide;
+	pb->surface = surface;
+	pb->view = view;
+	pb->tag = tag != NULL ? tag : "?";
+	pb->last_w = -1; /* 第一帧一定重画 */
+	pb->last_h = -1;
+	wl_list_insert(&server->popup_blurs, &pb->link);
+	if (owner_destroy != NULL) {
+		pb->owner_destroy.notify = popup_blur_owner_destroy;
+		wl_signal_add(owner_destroy, &pb->owner_destroy);
+		pb->owner_destroy_added = true;
+	}
+	pb->commit.notify = popup_blur_commit;
+	wl_signal_add(&surface->events.commit, &pb->commit);
+	pb->commit_added = true;
+	wlr_log(WLR_DEBUG, "popup blur: 登记 %s", pb->tag);
+	return pb;
+}
+
+void vidow_popup_blur_unregister(struct vidow_popup_blur *pb,
+		bool destroy_node) {
+	if (pb == NULL) {
+		return;
+	}
+	/* 先把宿主手里的指针摘掉：节点 / 表面先没的时候，宿主之后还会拿它来用。 */
+	if (pb->view != NULL && pb->view->popup_blur == pb) {
+		pb->view->popup_blur = NULL;
+	}
+	if (pb->server != NULL && pb->server->im_popup.blur == pb) {
+		pb->server->im_popup.blur = NULL;
+	}
+	if (pb->commit_added) {
+		wl_list_remove(&pb->commit.link);
+		pb->commit_added = false;
+	}
+	if (pb->owner_destroy_added) {
+		wl_list_remove(&pb->owner_destroy.link);
+		pb->owner_destroy_added = false;
+	}
+	if (pb->node_destroy_added) {
+		wl_list_remove(&pb->node_destroy.link);
+		pb->node_destroy_added = false;
+	}
+	if (pb->fx.node != NULL) {
+		if (destroy_node) {
+			wlr_scene_node_destroy(&pb->fx.node->node);
+		} else {
+			/* 节点归场景树（xdg popup）：只放资源，别碰它 —— 树可能正跟着
+			 * 表面一起拆。 */
+			pb->fx.node = NULL;
+		}
+	}
+	vidow_fx_release(&pb->fx);
+	wl_list_remove(&pb->link);
+	free(pb);
+}
+
+void vidow_popup_blur_invalidate(struct vidow_popup_blur *pb) {
+	if (pb == NULL) {
+		return;
+	}
+	pb->fx.blur_ver++;
+	struct vidow_output *out = popup_blur_owner(pb);
+	if (out != NULL) {
+		vidow_output_schedule_frame(pb->server, out->wlr_output,
+			"弹出物模糊失效");
+	}
 }
 
 /* overview 里那张糊掉的壁纸。
@@ -4040,7 +5151,8 @@ void vidow_layer_blur_invalidate(struct vidow_layer_surface *ls) {
 }
 
 void vidow_layer_blur_release(struct vidow_layer_surface *ls) {
-	if (ls->fx.node == NULL && ls->fx.buf[0] == NULL && ls->bd == NULL) {
+	if (ls->fx.node == NULL && ls->fx.buf[0] == NULL &&
+			ls->bd == NULL && ls->bd_tex == NULL) {
 		return;
 	}
 	if (ls->fx.node != NULL) {

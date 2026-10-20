@@ -572,8 +572,11 @@ static void paint_mosaic_one(struct vidow_capture *cap, struct wlr_scene_buffer 
 		if (small == NULL) {
 			return;
 		}
-		/* 自己拿一把锁：allocator 给的是没锁的缓冲，下次重建时要 unlock。 */
+		/* 自己拿一把锁：allocator 给的是没锁的缓冲，下次重建时要 unlock。
+		 * allocator 返回的是 producer 引用；只 lock 不 drop 的话这份引用会一直
+		 * 挂着，每次 mosaic 尺寸变化就漏一块 GPU 缓冲。 */
 		cap->mosaic = wlr_buffer_lock(small);
+		wlr_buffer_drop(small);
 		cap->mosaic_w = bw;
 		cap->mosaic_h = bh;
 	}

@@ -326,6 +326,7 @@ case_state "pid 匹配"                     hide "vidow.rule{ pid = $BLUE_PID, c
 case_state "pid 不匹配"                   off  'vidow.rule{ pid = 1, capture = "hide" }'
 case_state "exe 匹配（python3）"          hide 'vidow.rule{ exe = "^python3", capture = "hide" }'
 case_state "cmdline 匹配"                 hide 'vidow.rule{ cmdline = "bluewin\\.py", capture = "hide" }'
+case_state "Lua 风格 %. 也认"              hide 'vidow.rule{ cmdline = "bluewin%.py", capture = "hide" }'
 case_state "cmdline 不匹配"               off  'vidow.rule{ cmdline = "^nope", capture = "hide" }'
 case_state "is_xwayland = false 命中"        hide 'vidow.rule{ is_xwayland = false, capture = "hide" }'
 case_state "is_xwayland = true 不命中"       off  'vidow.rule{ is_xwayland = true, capture = "hide" }'

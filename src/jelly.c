@@ -87,7 +87,10 @@ struct vidow_jelly {
 
 	int cols, rows;      /* 格子数 */
 	int nx, ny;          /* 节点数 = cols + 1 / rows + 1 */
-	float *verts;        /* 网格顶点：[x, y, u, v] × rows*cols*6，见 jelly_render */
+	float *verts;        /* 内容顶点：[x, y, u, v] × rows*cols*6 */
+	/* 模糊顶点：[x, y, u_content, v_content, u_blur, v_blur] × rows*cols*6。
+	 * 位置和内容层共用，内容 UV 共用；只有 blur UV 是按屏幕坐标另算的。 */
+	float *blur_verts;
 	float *ox, *oy;      /* 每个节点的偏移（逻辑像素） */
 	float *vx, *vy;      /* 每个节点的速度 */
 	float *lx, *ly;      /* 每个节点的「滞后位置」（跟底座跟得慢的那个版本） */
@@ -112,6 +115,14 @@ struct vidow_jelly {
 	/* 客户端上一帧提交的表面缓冲：换了就说明内容变了，得让 fx 那条管线重画
 	 * 一次（松手之后没有指针事件，没人去催它，果冻会一直采样旧图）。 */
 	struct wlr_buffer *src_surface_buffer;
+	/* 客户端表面贴图：模糊遮罩用它的 alpha（窗口本身哪里真的存在），
+	 * 投影不在客户端表面里，所以阴影不会被圈进模糊。 */
+	struct wlr_buffer *mask_buf;
+	struct wlr_texture *mask_tex;
+	bool mask_owned;
+	/* 果冻期间单独的投影：装饰管线原样烘一张，不参与形变。 */
+	struct wlr_buffer *shadow_buf;
+	struct wlr_texture *shadow_tex;
 	double base_x, base_y;   /* 上一帧底座（场景树）位置 */
 	int64_t last_ns;
 	int64_t release_ns;      /* 松手时刻，0 = 还在拖 */
@@ -210,6 +221,24 @@ static void jelly_free(struct vidow_jelly *jelly) {
 			vidow_view_apply_anim(view);
 		}
 	}
+	if (jelly->mask_owned && jelly->mask_tex != NULL) {
+		wlr_texture_destroy(jelly->mask_tex);
+	}
+	jelly->mask_tex = NULL;
+	if (jelly->mask_buf != NULL) {
+		wlr_buffer_unlock(jelly->mask_buf);
+		jelly->mask_buf = NULL;
+	}
+	if (jelly->shadow_tex != NULL) {
+		wlr_texture_destroy(jelly->shadow_tex);
+		jelly->shadow_tex = NULL;
+	}
+	if (jelly->shadow_buf != NULL) {
+		wlr_buffer_drop(jelly->shadow_buf);
+		jelly->shadow_buf = NULL;
+	}
+	free(jelly->verts);
+	free(jelly->blur_verts);
 	free(jelly->ox);
 	free(jelly->oy);
 	free(jelly->vx);
@@ -321,6 +350,8 @@ bool vidow_jelly_begin(struct vidow_view *view) {
 	size_t n = (size_t)jelly->nx * (size_t)jelly->ny;
 	jelly->verts = calloc((size_t)jelly->rows * (size_t)jelly->cols * 24,
 		sizeof(float));
+	jelly->blur_verts = calloc((size_t)jelly->rows * (size_t)jelly->cols * 36,
+		sizeof(float));
 	jelly->ox = calloc(n, sizeof(float));
 	jelly->oy = calloc(n, sizeof(float));
 	jelly->vx = calloc(n, sizeof(float));
@@ -334,7 +365,7 @@ bool vidow_jelly_begin(struct vidow_view *view) {
 		jelly->target[i] = vidow_alloc_target(server, jelly->buf_w,
 			jelly->buf_h);
 	}
-	if (jelly->verts == NULL ||
+	if (jelly->verts == NULL || jelly->blur_verts == NULL ||
 			jelly->ox == NULL || jelly->oy == NULL || jelly->vx == NULL ||
 			jelly->vy == NULL || jelly->gw2 == NULL || jelly->gcc == NULL ||
 			jelly->gtau == NULL || jelly->lx == NULL || jelly->ly == NULL ||
@@ -346,6 +377,8 @@ bool vidow_jelly_begin(struct vidow_view *view) {
 		jelly_free(jelly);
 		return false;
 	}
+
+
 
 	jelly->node = wlr_scene_buffer_create(view->scene_tree, NULL);
 	if (jelly->node == NULL) {
@@ -516,36 +549,153 @@ static void jelly_render(struct vidow_jelly *jelly) {
 	}
 
 	/* 网格：每格两个三角形，顶点是**相邻格共用**的那几个（节点坐标不取整，
-	 * 直接给小数）—— 相邻格边界严丝合缝，既不会留缝也不会重叠。 */
+	 * 直接给小数）—— 相邻格边界严丝合缝，既不会留缝也不会重叠。
+	 *
+	 * 同一份网格同时算两套 UV：
+	 *   内容 UV  = 源缓冲里的位置（跟着网格形变，窗口内容照常弯）；
+	 *   模糊 UV  = 顶点**当前屏幕坐标**映射到 blur 贴图（背景不被网格拉长）。
+	 * 屏幕坐标 = 果冻节点在布局里的逻辑坐标 × 输出倍率 + 顶点在目标缓冲里的
+	 * 物理像素偏移；再减掉输出原点 / 私有底衬区域原点。 */
+	struct vidow_fx_target *fx = &jelly->view->fx;
+	/* 只在「这个窗口确实该有模糊」时才走屏幕空间那一层：规则关掉模糊 /
+	 * 客户端只要一块区域（ext-background-effect）时退回烘进内容图的那一版，
+	 * 别把整窗都糊上。 */
+	bool blur_ok = fx->blur && fx->blur_tex != NULL &&
+		jelly->blur_verts != NULL && !fx->blur_region_on &&
+		vidow_view_blur_wanted(jelly->view);
+	int out_x = fx->blur_out_w > 0 ? fx->blur_out_x : server->output_x;
+	int out_y = fx->blur_out_h > 0 ? fx->blur_out_y : server->output_y;
+	int out_w = fx->blur_out_w > 0 ? fx->blur_out_w : server->output_w;
+	int out_h = fx->blur_out_h > 0 ? fx->blur_out_h : server->output_h;
+	int bw = fx->blur_tex_w > 0 ? fx->blur_tex_w : out_w;
+	int bh = fx->blur_tex_h > 0 ? fx->blur_tex_h : out_h;
+	if (bw < 1) bw = 1;
+	if (bh < 1) bh = 1;
+	int node_x = 0, node_y = 0;
+	if (blur_ok) {
+		wlr_scene_node_coords(&jelly->node->node, &node_x, &node_y);
+	}
+	double s = jelly->scale > 0.0 ? jelly->scale : 1.0;
 	int n = 0;
 	for (int i = 0; i < jelly->rows; i++) {
 		for (int j = 0; j < jelly->cols; j++) {
-			float x0 = (float)jelly_node_xf(jelly, i, j);
-			float x1 = (float)jelly_node_xf(jelly, i, j + 1);
-			float x2 = (float)jelly_node_xf(jelly, i + 1, j);
-			float x3 = (float)jelly_node_xf(jelly, i + 1, j + 1);
-			float y0 = (float)jelly_node_yf(jelly, i, j);
-			float y1 = (float)jelly_node_yf(jelly, i, j + 1);
-			float y2 = (float)jelly_node_yf(jelly, i + 1, j);
-			float y3 = (float)jelly_node_yf(jelly, i + 1, j + 1);
+			float xs[6] = {
+				(float)jelly_node_xf(jelly, i, j),
+				(float)jelly_node_xf(jelly, i, j + 1),
+				(float)jelly_node_xf(jelly, i + 1, j),
+				(float)jelly_node_xf(jelly, i, j + 1),
+				(float)jelly_node_xf(jelly, i + 1, j + 1),
+				(float)jelly_node_xf(jelly, i + 1, j),
+			};
+			float ys[6] = {
+				(float)jelly_node_yf(jelly, i, j),
+				(float)jelly_node_yf(jelly, i, j + 1),
+				(float)jelly_node_yf(jelly, i + 1, j),
+				(float)jelly_node_yf(jelly, i, j + 1),
+				(float)jelly_node_yf(jelly, i + 1, j + 1),
+				(float)jelly_node_yf(jelly, i + 1, j),
+			};
 			float u0 = (float)j / (float)jelly->cols;
 			float u1 = (float)(j + 1) / (float)jelly->cols;
 			float v0 = (float)i / (float)jelly->rows;
 			float v1 = (float)(i + 1) / (float)jelly->rows;
-			float *w = jelly->verts + (size_t)n * 4;
-			/* 左下三角 (x0,y0)-(x1,y1)-(x2,y2) */
-			w[0] = x0;  w[1] = y0;  w[2] = u0; w[3] = v0;
-			w[4] = x1;  w[5] = y1;  w[6] = u1; w[7] = v0;
-			w[8] = x2;  w[9] = y2;  w[10] = u0; w[11] = v1;
-			/* 右上三角 (x1,y1)-(x3,y3)-(x2,y2) */
-			w[12] = x1; w[13] = y1; w[14] = u1; w[15] = v0;
-			w[16] = x3; w[17] = y3; w[18] = u1; w[19] = v1;
-			w[20] = x2; w[21] = y2; w[22] = u0; w[23] = v1;
+			float us[6] = { u0, u1, u0, u1, u1, u0 };
+			float vs[6] = { v0, v0, v1, v0, v1, v1 };
+			for (int k = 0; k < 6; k++) {
+				float *w = jelly->verts + (size_t)(n + k) * 4;
+				w[0] = xs[k];
+				w[1] = ys[k];
+				w[2] = us[k];
+				w[3] = vs[k];
+				if (blur_ok) {
+					float sx = (float)((double)node_x * s) + xs[k];
+					float sy = (float)((double)node_y * s) + ys[k];
+					float *b = jelly->blur_verts + (size_t)(n + k) * 6;
+					b[0] = xs[k];
+					b[1] = ys[k];
+					b[2] = us[k];
+					b[3] = vs[k];
+					b[4] = (sx - (float)out_x -
+						(float)fx->blur_tex_x) / (float)bw;
+					b[5] = (sy - (float)out_y -
+						(float)fx->blur_tex_y) / (float)bh;
+				}
+			}
 			n += 6;
 		}
 	}
-	bool ok = vidow_fx_draw_mesh(server, target, jelly->buf_w, jelly->buf_h,
-		tex, jelly->verts, n);
+	bool ok = false;
+	if (blur_ok) {
+		/* 模糊只画在窗口可见矩形（含圆角）里面：投影 / 圆角外那圈留白
+		 * 不采模糊，否则阴影会被底下的底衬染糊。 */
+		struct vidow_look look;
+		vidow_view_look(&server->config, &jelly->view->rule_eff,
+			jelly->view->fullscreen, &look);
+		struct wlr_buffer *mb = jelly->view->scene_surface != NULL &&
+			jelly->view->scene_surface->buffer != NULL ?
+			jelly->view->scene_surface->buffer->buffer : NULL;
+		/* mask 可能借的是 wlr_client_buffer 的缓存贴图：客户端每 commit 一次
+		 * dmabuf，贴图会换一张（buffer 指针却可能不变）。只比较 mask_buf 会
+		 * 把旧贴图留成悬空指针，下一帧传给 GLES2 就是
+		 * `wlr_texture_is_gles2()` 断言 / SIGABRT。 */
+		struct wlr_client_buffer *mask_client =
+			mb != NULL ? wlr_client_buffer_get(mb) : NULL;
+		bool mask_changed = mb != jelly->mask_buf;
+		if (!mask_changed && mask_client != NULL) {
+			if (mask_client->texture != NULL) {
+				mask_changed = mask_client->texture != jelly->mask_tex;
+			} else if (!jelly->mask_owned && jelly->mask_tex != NULL) {
+				/* 借来的贴图没了：下一帧换成自己建的那张（或者 NULL）。 */
+				mask_changed = true;
+			}
+		}
+		if (mask_changed) {
+			if (jelly->mask_owned && jelly->mask_tex != NULL) {
+				wlr_texture_destroy(jelly->mask_tex);
+			}
+			/* 锁住这份 mask：旧 buffer 一旦被释放，地址可能被新 buffer 复用，
+			 * 光比较 mask_buf 指针会把「新 buffer 的旧地址」当成同一份。 */
+			if (mb != jelly->mask_buf) {
+				if (jelly->mask_buf != NULL) {
+					wlr_buffer_unlock(jelly->mask_buf);
+				}
+				jelly->mask_buf = mb != NULL ? wlr_buffer_lock(mb) : NULL;
+			}
+			jelly->mask_tex = vidow_fx_client_texture(server, mb,
+				&jelly->mask_owned);
+		}
+		/* 目标缓冲比 fx 缓冲四周多一圈 JELLY_MARGIN，窗口矩形在目标
+		 * 坐标里要加上这圈留白；漏了它模糊就会偏进阴影 / 圆角外面。 */
+		/* 遮罩用**内容 UV**（源缓冲坐标），不用形变后的目标坐标：果冻把
+		 * 网格拉弯时窗口形状跟着弯，但投影永远在内容矩形外面，按源坐标
+		 * 裁就不会把阴影圈进模糊里。 */
+		float shadow_pm[4] = {
+			look.shadow_color[0] * look.shadow_color[3],
+			look.shadow_color[1] * look.shadow_color[3],
+			look.shadow_color[2] * look.shadow_color[3],
+			look.shadow_color[3],
+		};
+
+		ok = vidow_fx_draw_mesh_blur(server, target, jelly->buf_w,
+			jelly->buf_h, tex, fx->blur_tex,
+			(float)server->config.blur_strength, jelly->blur_verts, n,
+			fx->px_pad, fx->px_pad, fx->content_w, fx->content_h,
+			fx->w, fx->h, (float)(look.corner_radius * s),
+			(float)vidow_corner_n_clamp(look.corner_n),
+			jelly->mask_tex, fx->tex_off_x, fx->tex_off_y,
+			fx->tex_scale_x, fx->tex_scale_y, 1.0f / 255.0f,
+			jelly->shadow_tex,
+			(int)jelly->margin_px + fx->px_pad,
+			(int)jelly->margin_px + fx->px_pad,
+			fx->content_w, fx->content_h,
+			(float)(look.shadow_offset_x * s),
+			(float)(look.shadow_offset_y * s),
+			(float)(look.shadow_radius * s), shadow_pm, false);
+	}
+	if (!ok) {
+		ok = vidow_fx_draw_mesh(server, target, jelly->buf_w, jelly->buf_h,
+			tex, jelly->verts, n);
+	}
 	wlr_texture_destroy(tex);
 	if (!ok) {
 		return;

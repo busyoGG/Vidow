@@ -91,30 +91,10 @@ size_t vidow_event_names(const char *const **out) {
 	return sizeof(event_names) / sizeof(event_names[0]);
 }
 
-bool vidow_event_known(const char *event) {
-	if (event == NULL) {
-		return false;
-	}
-	for (size_t i = 0; i < sizeof(event_names) / sizeof(event_names[0]); i++) {
-		if (strcmp(event_names[i], event) == 0) {
-			return true;
-		}
-	}
-	return false;
-}
-
 /* ------------------------------------------------------------- 注册表 */
 
 static bool event_matches(const struct vidow_hook *h, const char *event) {
 	return strcmp(h->event, "*") == 0 || strcmp(h->event, event) == 0;
-}
-
-bool vidow_hooks_any(const struct vidow_server *server) {
-	return server != NULL && server->hook_count > 0;
-}
-
-int vidow_hooks_count(const struct vidow_server *server) {
-	return server == NULL ? 0 : server->hook_count;
 }
 
 /* 有多少条钩子会收到这个事件（IPC 的 emit 命令回给调用方看）。 */

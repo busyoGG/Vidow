@@ -18,10 +18,12 @@
 #  10) 半透明 + 模糊的窗口：拖起来连模糊底衬一起画在对的位置（跑位的话模糊的
 #      内容也跟着偏，看着就是「背景错位」）
 #  11) 拖着**透明**窗口抓模糊底衬时，底衬里不许混进这个窗口自己上一帧的形变图：
-#      故意不放壁纸、只放两个重叠窗口（底下那个品红不透明、上面那个半透明绿），
-#      每份底衬 dump 只许有一种颜色 —— 两种都有就是自己混进去了（屏幕上「背景里
-#      错位的竖线 / 重影、模糊看着像没了」）
-#  12) 日志里没有 assert / abort
+#      故意不放壁纸、只放两个重叠窗口（底下那个品红不透明、上面那个半透明绿）。
+#      绿色是被拖的那个：它自己的底衬 dump 里不许有绿色（自己混进去了）；
+#      品红的底衬里可以同时有品红和绿色 —— 绿色现在会带一层屏幕空间模糊，
+#      那层模糊里就有品红（dump 的 owner 写在 /tmp/vidow-bd-<n>.owner 里）
+#  12) 模糊采样屏幕坐标（四象限 + 半透明薄纱）
+#  13) 日志里没有 assert / abort
 #
 # 用法：./test-jelly.sh   （VIDOW_TEST_KEEP=1 保留运行目录）
 # 注意：别和别的测试**并行**跑 —— 收尾按 cmdline 杀 pattern.py / wall.py。
@@ -168,7 +170,8 @@ from PIL import Image
 im = Image.open(sys.argv[1]).convert("RGB")
 W, H = im.size
 px = im.load()
-ys = [y for y in range(H) if any(px[x, y] != (0, 0, 0) for x in range(W))]
+bg = px[0, 0]
+ys = [y for y in range(H) if any(px[x, y] != bg for x in range(W))]
 if not ys:
     print("none")
     sys.exit()
@@ -176,7 +179,7 @@ y0, y1 = min(ys), max(ys)
 out = []
 for frac in (0.05, 0.5, 0.95):
     y = int(y0 + (y1 - y0) * frac)
-    row = [x for x in range(W) if px[x, y] != (0, 0, 0)]
+    row = [x for x in range(W) if px[x, y] != bg]
     out.append(row[0] if row else -1)
 print("%d %d %d" % (out[0], out[1], out[2]))
 PY
@@ -193,7 +196,8 @@ from PIL import Image
 im = Image.open(sys.argv[1]).convert("RGB")
 W, H = im.size
 px = im.load()
-ys = [y for y in range(H) if any(px[x, y] != (0, 0, 0) for x in range(W))]
+bg = px[0, 0]
+ys = [y for y in range(H) if any(px[x, y] != bg for x in range(W))]
 if not ys:
     print("none")
     sys.exit()
@@ -201,7 +205,7 @@ y0, y1 = min(ys), max(ys)
 out = []
 for frac in (0.05, 0.5, 0.95):
     y = int(y0 + (y1 - y0) * frac)
-    row = [x for x in range(W) if px[x, y] != (0, 0, 0)]
+    row = [x for x in range(W) if px[x, y] != bg]
     out.append(row[-1] if row else -1)
 print("%d %d %d" % (out[0], out[1], out[2]))
 PY
@@ -215,7 +219,8 @@ from PIL import Image
 im = Image.open(sys.argv[1]).convert("RGB")
 W, H = im.size
 px = im.load()
-xs = [x for y in range(0, H, 4) for x in range(W) if px[x, y] != (0, 0, 0)]
+bg = px[0, 0]
+xs = [x for y in range(0, H, 4) for x in range(W) if px[x, y] != bg]
 print(0 if not xs else max(xs) - min(xs) + 1)
 PY
 }
@@ -232,9 +237,10 @@ from PIL import Image
 im = Image.open(sys.argv[1]).convert("RGB")
 W, H = im.size
 px = im.load()
+bg = px[0, 0]
 rows = []
 for y in range(H):
-    row = [x for x in range(W) if px[x, y] != (0, 0, 0)]
+    row = [x for x in range(W) if px[x, y] != bg]
     if row:
         rows.append((y, row[0]))
 if len(rows) < 100:
@@ -706,7 +712,7 @@ read -r WX WY WW WH FLOAT <<<"$(win_geom green)"
 if [ "$WW" -lt 200 ]; then
 	fail "半透明窗口没起来（$WX $WY $WW $WH）"
 else
-	rm -f /tmp/vidow-bd-*.raw /tmp/vidow-bd-*.txt
+	rm -f /tmp/vidow-bd-*.raw /tmp/vidow-bd-*.txt /tmp/vidow-bd-*.owner
 	CX=$((WX + WW / 2))
 	CY=$((WY + 8))
 	act "pointer-motion $CX $CY"
@@ -717,11 +723,14 @@ else
 	sleep 0.3
 	act "pointer-button left release mod"
 	sleep 1.0
-	read -r MIXED GREENONLY MAGONLY EMPTY NDUMP <<<"$(python3 - <<'PY'
+	read -r SELF_MIXED SELF_GREEN GREEN_MAG UNDER_GREEN UNDER_MAG NDUMP <<<"$(python3 - <<'PY'
 import glob
 import numpy as np
 
-mixed = mag = green = empty = 0
+# 底衬 dump 的 owner 写在 sidecar 里（/tmp/vidow-bd-<n>.owner）。绿色是
+# **被拖的那个**：它自己的底衬里不该有绿色（自己混进去了）；绿色底衬里该有
+# 品红（底下那个窗口），品红底衬里该有绿色（被拖窗口，可能已经带着模糊）。
+self_mixed = self_green = green_mag = under_green = under_mag = 0
 files = sorted(glob.glob("/tmp/vidow-bd-*.raw"))
 for path in files:
     base = path[:-4]
@@ -731,18 +740,27 @@ for path in files:
         a = np.frombuffer(open(path, "rb").read(), dtype=np.uint8).reshape(h, w, 4)
     except Exception:
         continue
+    try:
+        owner = open(base + ".owner").read().strip()
+    except Exception:
+        owner = "?"
     R, G, B = a[:, :, 2].astype(int), a[:, :, 1].astype(int), a[:, :, 0].astype(int)
     g = int(((G > 60) & (G > R + 30) & (G > B + 30)).sum())
     m = int(((R > 60) & (B > 60) & (G < 60)).sum())
-    if g and m:
-        mixed += 1
-    elif g:
-        green += 1
-    elif m:
-        mag += 1
-    else:
-        empty += 1
-print("%d %d %d %d %d" % (mixed, green, mag, empty, len(files)))
+    if owner == "green":
+        if g:
+            self_green += 1
+        if g and m:
+            self_mixed += 1
+        if m:
+            green_mag += 1
+    elif owner == "under":
+        if g:
+            under_green += 1
+        if m:
+            under_mag += 1
+print("%d %d %d %d %d %d" % (self_mixed, self_green, green_mag,
+                             under_green, under_mag, len(files)))
 PY
 )"
 	if grep -aq "jelly: green 起手" "$LOG" && grep -aq "blur: own region" "$LOG"; then
@@ -750,21 +768,79 @@ PY
 	else
 		fail "果冻或底衬抓取没跑（$NDUMP 份 dump），这条测不到东西"
 	fi
-	if [ "$MIXED" = "0" ]; then
-		pass "每份底衬里只有一种颜色：混进自己的 0 份（别的窗口 $GREENONLY+$MAGONLY 份，空 $EMPTY 份）"
+	if [ "$SELF_MIXED" = "0" ] && [ "$SELF_GREEN" = "0" ]; then
+		pass "绿色自己的底衬里没有它自己（$NDUMP 份里 0 份混进自己）"
 	else
-		fail "$MIXED 份底衬里同时有自己和别的窗口 —— 被拖窗口的形变图混进底衬了"
+		fail "$SELF_MIXED 份绿色底衬里混进了它自己（$SELF_GREEN 份带绿）—— 被拖窗口的形变图混进底衬了"
 	fi
-	if [ "$GREENONLY" -ge 1 ] && [ "$MAGONLY" -ge 1 ]; then
-		pass "两个窗口都各自抓过一份底衬（品红 $MAGONLY / 绿 $GREENONLY）"
+	if [ "$GREEN_MAG" -ge 1 ] && [ "$UNDER_GREEN" -ge 1 ]; then
+		pass "两个窗口都抓到了：绿色底衬里有品红 $GREEN_MAG 份，品红底衬里有绿色 $UNDER_GREEN 份（品红那份可带模糊）"
 	else
-		fail "没抓到两种窗口的底衬（品红 $MAGONLY / 绿 $GREENONLY）—— 判据立不住"
+		fail "没抓到两种窗口的底衬（绿底衬带品红 $GREEN_MAG / 品红底衬带绿 $UNDER_GREEN）—— 判据立不住"
 	fi
 fi
 unset VIDOW_BLUR_DUMP
 stop_vidow
 
-# ---------------------------------------------------------------- 12) 日志
+# ------------------------------------- 12) 模糊采样的是屏幕上的背景
+mark "果冻模糊采样的是屏幕上的背景，不是跟着窗口拉长的旧图"
+stop_vidow
+start_vidow "" "blur_enabled = true"
+# 底下 pattern.py 四象限（左上红、右上绿），上面一张半透明绿薄纱。薄纱从
+# 四象限边界**右边**往左拖，拖完左半压住红、右半压住绿：
+#   - 模糊按屏幕坐标采：窗口左边透出红，R-G > 0；
+#   - 模糊跟着窗口内容走（旧实现）：左边仍是绿，R-G < 0。
+python3 ./tools/pattern.py under >/dev/null 2>&1 &
+CLIENT_PIDS="$CLIENT_PIDS $!"
+sleep 1.2
+python3 ./tools/sheet.py green 0.1 0.9 0.2 0.4 >/dev/null 2>&1 &
+CLIENT_PIDS="$CLIENT_PIDS $!"
+sleep 1.5
+./build/vidowmsg set-window-position --title green 450 150 >/dev/null 2>&1
+sleep 0.6
+read -r WX WY WW WH FLOAT <<<"$(win_geom green)"
+if [ "$WW" -lt 200 ] || [ "$FLOAT" != "1" ]; then
+	fail "薄纱窗口没起来 / 不是浮动（$WX $WY $WW $WH float=$FLOAT）"
+else
+	CX=$((WX + WW / 2))
+	CY=$((WY + 20))
+	act "pointer-motion $CX $CY" 0.2
+	act "pointer-button left press mod" 0.35
+	for i in 1 2 3 4; do
+		act "pointer-motion $((CX - i * 50)) $CY" 0.12
+	done
+	grim "$RUNDIR/blur-space.png" 2>/dev/null
+	act "pointer-button left release mod" 0.2
+	sleep 0.8
+	read -r LEFT RIGHT <<<"$(python3 - "$RUNDIR/blur-space.png" <<'PY'
+import sys
+from PIL import Image
+
+im = Image.open(sys.argv[1]).convert("RGB")
+
+
+def patch(x, y):
+    vals = [im.getpixel((x + dx, y + dy))
+            for dx in range(-2, 3) for dy in range(-2, 3)]
+    r = sum(v[0] for v in vals) / len(vals)
+    g = sum(v[1] for v in vals) / len(vals)
+    return r - g
+
+
+# pattern.py 的窗口占满第一列（10..635），四象限边界在 x≈322；薄纱拖到
+# 250..650，y=200 在它上半部分。280 在红区、380 在绿区。
+print("%.1f %.1f" % (patch(280, 200), patch(380, 200)))
+PY
+)"
+	if python3 -c "import sys; sys.exit(0 if $LEFT > 20 and $RIGHT < -20 else 1)"; then
+		pass "左边透出红、右边透出绿（R-G：280=$LEFT，380=$RIGHT）—— 背景按屏幕坐标采样"
+	else
+		fail "左边没透出红 / 右边没透出绿（R-G：280=$LEFT，380=$RIGHT）—— 模糊跟着窗口内容走了"
+	fi
+fi
+stop_vidow
+
+# ---------------------------------------------------------------- 13) 日志
 mark "日志里没有 assert / abort"
 if grep -aqE "assert|abort|Assertion" "$LOG"; then
 	fail "日志里有 assert / abort：$(grep -aE 'assert|abort|Assertion' "$LOG" | head -2)"

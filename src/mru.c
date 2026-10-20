@@ -149,7 +149,8 @@ void vidow_mru_forget(struct vidow_server *server, struct vidow_view *view) {
 
 /* 「能出现在切换器里」的窗口：上屏了、不是弹出物、没被最小化。 */
 static bool mru_listable(const struct vidow_view *view) {
-	return view->mapped && !view->popup && !view->minimized;
+	return view->mapped && !view->popup && !view->minimized &&
+		!view->focus_helper;
 }
 
 /* 这次要列的范围（mru_scope，绑定能逐次覆盖）：
@@ -586,6 +587,7 @@ struct vidow_mru_card {
 };
 
 static void mru_card_hide(struct vidow_mru_card *card, bool free_buf);
+static void mru_card_destroy(struct vidow_mru_card *card);
 
 static void mru_buf_destroy(struct wlr_buffer *buffer) {
 	struct vidow_mru_buf *b = wl_container_of(buffer, b, base);
@@ -791,6 +793,7 @@ static struct vidow_mru_card *mru_card_get(struct vidow_server *server, int i) {
 		ok = ok && card->ring_e[k] != NULL;
 	}
 	if (!ok) {
+		mru_card_destroy(card);
 		return NULL;
 	}
 	/* 预览走装饰管线（和屏幕上那扇窗口同一条）：圆角 / 边框 / 阴影 / 模糊都照
@@ -1087,6 +1090,38 @@ static void mru_card_hide(struct vidow_mru_card *card, bool free_buf) {
 	}
 	card->px = 0;
 	card->bw = -1;
+}
+
+/* 卡片连同它的场景节点一起收掉（建到一半失败 / 退出时用）。 */
+static void mru_card_destroy(struct vidow_mru_card *card) {
+	if (card == NULL) {
+		return;
+	}
+	mru_card_hide(card, true);
+	if (card->fx.node != NULL) {
+		wlr_scene_node_destroy(&card->fx.node->node);
+		card->fx.node = NULL;
+	}
+	if (card->thumb != NULL) {
+		wlr_scene_node_destroy(&card->thumb->node);
+	}
+	for (int k = 0; k < 4; k++) {
+		if (card->fill_c[k] != NULL) {
+			wlr_scene_node_destroy(&card->fill_c[k]->node);
+		}
+		if (card->ring_c[k] != NULL) {
+			wlr_scene_node_destroy(&card->ring_c[k]->node);
+		}
+		if (card->ring_e[k] != NULL) {
+			wlr_scene_node_destroy(&card->ring_e[k]->node);
+		}
+	}
+	for (int k = 0; k < 3; k++) {
+		if (card->fill_e[k] != NULL) {
+			wlr_scene_node_destroy(&card->fill_e[k]->node);
+		}
+	}
+	free(card);
 }
 
 /* 全部收起（面板关了）。 */
@@ -1587,12 +1622,14 @@ bool vidow_mru_init(struct vidow_server *server) {
 	mru->order = calloc(MRU_MAX, sizeof(mru->order[0]));
 	mru->slot = calloc(MRU_MAX, sizeof(mru->slot[0]));
 	if (mru->order == NULL || mru->slot == NULL) {
+		vidow_mru_finish(server);
 		return false;
 	}
 	struct wl_event_loop *loop = wl_display_get_event_loop(server->display);
 	mru->timer = wl_event_loop_add_timer(loop, mru_debounce_fire, server);
 	mru->open_timer = wl_event_loop_add_timer(loop, mru_open_timer_fire, server);
 	if (mru->timer == NULL || mru->open_timer == NULL) {
+		vidow_mru_finish(server);
 		return false;
 	}
 	/* 切换器是**浮层**：它不改窗口的排版、不搬窗口、不缩放窗口（niri 的窗口切换
@@ -1600,13 +1637,52 @@ bool vidow_mru_init(struct vidow_server *server) {
 	 * 之上的一层：场景树按创建顺序叠（先建的在下），这里是最后建的，就在最上面。 */
 	mru->tree = wlr_scene_tree_create(&server->scene->tree);
 	if (mru->tree == NULL) {
+		vidow_mru_finish(server);
 		return false;
 	}
 	mru->backdrop = wlr_scene_rect_create(mru->tree, 1, 1,
 		(float[4]){ 0.0f, 0.0f, 0.0f, 0.0f });
 	if (mru->backdrop == NULL) {
+		vidow_mru_finish(server);
 		return false;
 	}
 	wlr_scene_node_set_enabled(&mru->backdrop->node, false);
 	return true;
+}
+
+void vidow_mru_finish(struct vidow_server *server) {
+	struct vidow_mru *mru = &server->mru;
+	if (mru->timer != NULL) {
+		wl_event_source_remove(mru->timer);
+		mru->timer = NULL;
+	}
+	if (mru->open_timer != NULL) {
+		wl_event_source_remove(mru->open_timer);
+		mru->open_timer = NULL;
+	}
+	/* 先把卡片上我们自己持有的 buffer 放掉，再拆场景树（节点归树管）。 */
+	mru_cards_hide(server, true);
+	if (mru->tree != NULL) {
+		wlr_scene_node_destroy(&mru->tree->node);
+		mru->tree = NULL;
+	}
+	mru->backdrop = NULL;
+	if (mru->card != NULL) {
+		for (int i = 0; i < MRU_MAX; i++) {
+			free(mru->card[i]);
+		}
+		free(mru->card);
+		mru->card = NULL;
+	}
+	free(mru->order);
+	mru->order = NULL;
+	free(mru->slot);
+	mru->slot = NULL;
+	mru->card_n = 0;
+	mru->slot_n = 0;
+	mru->pending = NULL;
+	mru->selected = NULL;
+	mru->original = NULL;
+	mru->output = NULL;
+	mru->hover = NULL;
 }

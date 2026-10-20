@@ -279,7 +279,14 @@ for w in ws:
         break
 ' "$TARGET")
 	PIN=$(grep -a "surface ${WID:-?} .*: 钉住 preferred_buffer_scale" "$LOG" 2>/dev/null | tail -1)
-	PIN_BAD=$(grep -a "surface ${WID:-?} .*: 钉住 preferred_buffer_scale = 1" "$LOG" 2>/dev/null | tail -1)
+	# 只看「钉到 2 倍之后」还有没有再翻回 1：窗口 map 时先在光标那块 1 倍屏上
+	# 出现、随后被 move-window-to-output 搬到 2 倍屏，那一版 1 是当时的真归属，
+	# 不是滚出视口后又跟着隔壁屏变。
+	PIN_LINE=$(grep -an "surface ${WID:-?} .*: 钉住 preferred_buffer_scale = 2" "$LOG" 2>/dev/null | tail -1 | cut -d: -f1)
+	PIN_BAD=""
+	if [ -n "${PIN_LINE:-}" ]; then
+		PIN_BAD=$(tail -n +$((PIN_LINE + 1)) "$LOG" 2>/dev/null | grep -a "surface ${WID:-?} .*: 钉住 preferred_buffer_scale = 1" | tail -1)
+	fi
 	if echo "${PIN:-}" | grep -q "= 2"; then
 		pass "钉住了 2 倍（$(echo "$PIN" | sed 's/.*钉住/钉住/' | cut -c1-40)…）"
 	else

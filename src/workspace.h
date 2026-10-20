@@ -113,6 +113,8 @@ bool vidow_workspace_activate(struct vidow_server *server,
 /* 把正跑的切工作区过渡收干净（到位、不滑动）。overview 打开时用：它按每块
  * 工作区自己的几何算缩略图，正滑着的那块会摆歪。 */
 void vidow_workspace_slide_cancel(struct vidow_server *server);
+/* arrange / restack 之后调：把过渡里正滑走的旧工作区重新抬到新工作区上面。 */
+void vidow_workspace_slide_raise(struct vidow_server *server);
 
 /* 开关特殊工作区（跟随当前聚焦的屏）。再调一次 = 关掉。 */
 bool vidow_workspace_toggle_special(struct vidow_server *server,
@@ -164,10 +166,11 @@ bool vidow_workspace_view_visible(struct vidow_server *server,
 /* 把所有视图的场景节点按可见性对齐一遍（切工作区 / 特殊工作区开关后调）。
  * 返回新变成可见的视图数。 */
 int vidow_workspace_apply_visibility(struct vidow_server *server);
+/* 把窗口 / 列的住址对齐到它们所在工作区的屏（见 workspace.c 的说明）。 */
+void vidow_workspace_sync_outputs(struct vidow_server *server);
 
 /* 给配置语言用：名字、是否特殊、是否激活、有几个窗口。 */
 const char *vidow_workspace_name(const struct vidow_workspace *ws);
-bool vidow_workspace_is_special(const struct vidow_workspace *ws);
 bool vidow_workspace_is_active(const struct vidow_workspace *ws);
 bool vidow_workspace_is_visible(const struct vidow_workspace *ws);
 int vidow_workspace_view_count(const struct vidow_workspace *ws);
@@ -201,6 +204,12 @@ bool vidow_workspace_focus_index(struct vidow_server *server,
 bool vidow_workspace_focus_step(struct vidow_server *server, int direction);
 /* 回到上一块工作区（focus-workspace-previous）。 */
 bool vidow_workspace_focus_previous(struct vidow_server *server);
+/* 把键盘焦点交到这块屏现在亮着的工作区（点空区域 / 点另一块屏时用）：
+ * focused_output 跟着换，焦点窗口换成那块工作区记住的那个（没有就第一列 /
+ * 第一个浮窗；再没有就清空）。niri 的 focus_output 在它那套「每屏一份焦点」
+ * 里就是这一件事。 */
+bool vidow_workspace_focus_output(struct vidow_server *server,
+		struct wlr_output *output);
 /* 整块工作区在它那块屏上上/下移一位（niri 的 move-workspace-up/down）。 */
 bool vidow_workspace_move_step(struct vidow_server *server,
 		struct vidow_workspace *ws, int direction);

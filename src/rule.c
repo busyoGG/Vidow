@@ -80,6 +80,9 @@ const struct vidow_rule_field vidow_rule_fields[] = {
 		"它开新窗口时抢不抢焦点（默认 true）" },
 	{ "focus_on_activate", RK_ACT_BOOL, VRA_FOCUS_ON_ACTIVATE, VIDOW_RULE_WINDOW,
 		"别人请求激活它时理不理（默认 true）" },
+	{ "fake_focus", RK_ACT_BOOL, VRA_FAKE_FOCUS, VIDOW_RULE_WINDOW,
+		"焦点移走时也让客户端以为它还处于激活状态（xdg activated / X11 "
+		"focused）—— 给那种一失焦就暂停 / 收 UI 的程序用" },
 	{ "honor_invalid_serial", RK_ACT_BOOL, VRA_HONOR_INVALID_SERIAL,
 		VIDOW_RULE_WINDOW,
 		"它的激活请求即使令牌 serial 校验不过也照样理（默认 false）" },
@@ -679,6 +682,42 @@ static void log_rule(const struct vidow_rule *rule) {
 	wlr_log(WLR_INFO, "rule: %s%s", match, rule->literal ? " [literal]" : "");
 }
 
+/* 配置里的模式串有一半是照 Lua 的写法写的（`^org%.kde%.kate$`），而这里
+ * 编译的是 POSIX 扩展正则 —— 那边 `%` 不是转义符，`%.` 会去找字面的
+ * 「% + 任意字符」，整条规则就静默不命中了（用户配置里的 output / app_id
+ * 规则大量这么写，表现为「窗口没落到指定的屏」）。
+ *
+ * 这里把 Lua 风格的那几种转义翻成 ERE：`%x`（x 不是字母数字）→ `\x`，
+ * `%%` → 字面 `%`；`%` 后面跟字母数字的（Lua 的 %d / %a 类）原样留着 ——
+ * ERE 没有对应写法，翻了反而会变成别的意思。末尾落单的 `%` 也原样留着。
+ * 只用于编译，m->pat 里保存的仍是用户写的原文（vidowmsg rules 读回来
+ * 还是原样）。 */
+static void rule_pattern_to_ere(const char *pat, char *out, size_t cap) {
+	size_t o = 0;
+	for (size_t i = 0; pat[i] != '\0' && o + 2 < cap; i++) {
+		if (pat[i] != '%') {
+			out[o++] = pat[i];
+			continue;
+		}
+		char next = pat[i + 1];
+		if (next == '\0') {
+			out[o++] = '%';
+		} else if (next == '%') {
+			out[o++] = '%';
+			i++;
+		} else if ((next >= 'a' && next <= 'z') ||
+				(next >= 'A' && next <= 'Z') ||
+				(next >= '0' && next <= '9')) {
+			out[o++] = '%';
+		} else {
+			out[o++] = '\\';
+			out[o++] = next;
+			i++;
+		}
+	}
+	out[o] = '\0';
+}
+
 bool vidow_rule_commit(struct vidow_server *server, struct vidow_rule *rule,
 		char *err, size_t errlen) {
 	if (server == NULL || rule == NULL) {
@@ -762,7 +801,9 @@ bool vidow_rule_commit(struct vidow_server *server, struct vidow_rule *rule,
 		if (m->pat[0] == '\0' || rule->literal) {
 			continue;
 		}
-		int rc = regcomp(&m->re, m->pat, REG_EXTENDED | REG_ICASE | REG_NOSUB);
+		char ere[VIDOW_RULE_PAT];
+		rule_pattern_to_ere(m->pat, ere, sizeof(ere));
+		int rc = regcomp(&m->re, ere, REG_EXTENDED | REG_ICASE | REG_NOSUB);
 		if (rc != 0) {
 			char why[128];
 			regerror(rc, &m->re, why, sizeof(why));
@@ -1049,6 +1090,7 @@ static void apply_view(struct vidow_server *server, struct vidow_view *view,
 	int hz = server->config.force_render_hz;
 	bool focus_on_open = true;
 	bool focus_on_activate = true;
+	bool fake_focus = false;
 	/* 这个的默认值是 false（不理）：规则没写就是不理。 */
 	bool honor_invalid_serial = false;
 	/* X11 缩放桥：0 = 跟随全局 xwayland_scale（规则没写就是这个）。 */
@@ -1074,6 +1116,9 @@ static void apply_view(struct vidow_server *server, struct vidow_view *view,
 	if (eff->set[VRA_FOCUS_ON_ACTIVATE]) {
 		focus_on_activate = eff->val[VRA_FOCUS_ON_ACTIVATE].b;
 	}
+	if (eff->set[VRA_FAKE_FOCUS]) {
+		fake_focus = eff->val[VRA_FAKE_FOCUS].b;
+	}
 	if (eff->set[VRA_HONOR_INVALID_SERIAL]) {
 		honor_invalid_serial = eff->val[VRA_HONOR_INVALID_SERIAL].b;
 	}
@@ -1098,6 +1143,24 @@ static void apply_view(struct vidow_server *server, struct vidow_view *view,
 	view->focus_on_open = focus_on_open;
 	view->focus_on_activate = focus_on_activate;
 	view->honor_invalid_serial = honor_invalid_serial;
+	if (view->fake_focus != fake_focus) {
+		view->fake_focus = fake_focus;
+		wlr_log(WLR_INFO, "rule: %s 伪装焦点 %s（%s）",
+			vidow_view_title(view) != NULL ?
+				vidow_view_title(view) : "(无题)",
+			fake_focus ? "开" : "关",
+			fake_focus ? "焦点移走也不给客户端发 deactivated" :
+				"恢复按真实焦点发 activated");
+	}
+	/* 规则一改（重载 / 第一次套用）就按新值给客户端对齐一次：
+	 *   fake_focus 开 → 即使现在没焦点也发 activated(true)；
+	 *   fake_focus 关 → 不是当前焦点就发 activated(false)，把伪装撤掉。
+	 * 还没 configure 好的窗口由 view_map 里那次调用补上。 */
+	if (view->fake_focus) {
+		vidow_view_set_activated(view, true);
+	} else if (server->focused != view) {
+		vidow_view_set_activated(view, false);
+	}
 
 	/* 要 VRR：规则改了立刻对一遍账（按需 VRR 的屏上，这个窗口在不在 = 刷新率
 	 * 提不提上去）。窗口还没上屏（output == NULL）时那次调用什么也不做。 */
@@ -1308,7 +1371,6 @@ void vidow_rule_placement(struct vidow_server *server, struct vidow_view *view) 
 	const struct vidow_rule_eff *eff = &view->rule_eff;
 	const char *title = vidow_view_title(view) != NULL ?
 		vidow_view_title(view) : "(无题)";
-
 	if (eff->set[VRA_WORKSPACE]) {
 		const char *name = eff->val[VRA_WORKSPACE].s;
 		struct vidow_workspace *ws = rule_workspace(server, view, name);

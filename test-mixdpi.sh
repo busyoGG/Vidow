@@ -165,10 +165,10 @@ else
 	fail "拖拽中归属已经变成 $OUT_DRAG（这个测试要的是「归属没变、人已经在对面屏上」）"
 fi
 DRAG_MAX=$(target_max "$((MARK + 1))")
-if [ "$DRAG_MAX" -gt 3000 ]; then
-	pass "拖拽中离屏缓冲已经按 2 倍烘（fx: target 最大 ${DRAG_MAX} 宽）"
+if [ "$DRAG_MAX" -lt 2500 ]; then
+	pass "拖拽中仍按原工作区那块屏烘（${DRAG_MAX} 宽，1 倍）—— 窗口还没换工作区"
 else
-	fail "拖拽中离屏缓冲还是 $DRAG_MAX 宽（1 倍）—— 2 倍屏上整块窗口是放大出来的，糊"
+	fail "拖拽中离屏缓冲变成 $DRAG_MAX 宽（窗口还没换工作区，不该跟着对面屏换倍率）"
 fi
 
 mark "松手：归属换成 2 倍屏"

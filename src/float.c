@@ -80,6 +80,11 @@ void vidow_float_set_mode(struct vidow_view *view,
 		view->float_mode, mode);
 
 	if (mode == VIDOW_FLOAT_NONE) {
+		/* 浮窗变回平铺：先把工作区的浮窗账摘掉（否则一块只剩浮窗账的工作区
+		 * 永远收不掉，ws_has_something 也会误以为还有东西）。 */
+		if (!view->popup) {
+			vidow_workspace_track(view->ws, view, false);
+		}
 		view->float_mode = VIDOW_FLOAT_NONE;
 		view->parent = NULL;
 		memset(&view->float_geom, 0, sizeof(view->float_geom));
@@ -121,12 +126,27 @@ void vidow_float_set_mode(struct vidow_view *view,
 				view->float_geom.y = work.y + (work.height - view->float_geom.height) / 2;
 			}
 		}
+		/* 夹回来之后必须把 home_dx/home_dy 一起刷新。上面那两行只改了
+		 * float_geom，偏移还是「平铺时那一列」的旧值；下一次 arrange 的
+		 * float_place_recursive() 又按旧偏移摆回去 —— 夹了等于没夹。
+		 * 微信登录窗就是这么整块停在屏幕右边缘外（x=1917，屏宽 1920）：
+		 * mapped / visible 都是 true，用户却看不到窗口。 */
+		if (out_box.width > 0) {
+			view->home_dx = view->float_geom.x - out_box.x;
+			view->home_dy = view->float_geom.y - out_box.y;
+		}
 	} else {
 		memset(&view->float_geom, 0, sizeof(view->float_geom));
 	}
 
 	view->float_mode = mode;
 	vidow_view_leave_layout(view);
+	/* 平铺 -> 浮动（含规则在 map 之前就设好的那条）：记上工作区的浮窗账。
+	 * 必须在 vidow_view_leave_layout() **之后**：vidow_workspace_track() 看到
+	 * view->column 还在就直接返回（列里的窗口不算浮窗），记账就漏了。 */
+	if (!view->popup) {
+		vidow_workspace_track(view->ws, view, true);
+	}
 
 	if (mode == VIDOW_FLOAT_FOLLOW) {
 		view->parent = resolve_parent(server, vidow_view_parent_surface(view));
@@ -149,6 +169,23 @@ void vidow_float_set_mode(struct vidow_view *view,
 	 * arrange 里的收口只保证「浮动在平铺之上」，组内的先后得在这里点一下。 */
 	vidow_restack(server, view);
 	vidow_ipc_emit_window(server, "window-floating-changed", view);
+}
+
+/* 自动识别成“固定尺寸对话框”时，把它摆到工作区正中。以前这里沿用了
+ * view->geom（平铺时那一列的左上角），所以登录窗 / 对话框一浮起来就贴在
+ * 左上；客户端是 xdg，根本不能自己请求绝对坐标。 */
+static void float_center_detected_dialog(struct vidow_view *view) {
+	if (view == NULL || view->popup || !view->mapped ||
+			view->float_mode != VIDOW_FLOAT_FIXED) {
+		return;
+	}
+	int w = 0, h = 0;
+	if (!vidow_view_fixed_size_hint(view, &w, &h) || w <= 1 || h <= 1) {
+		return;
+	}
+	view->float_geom.width = w;
+	view->float_geom.height = h;
+	vidow_float_center(view);
 }
 
 void vidow_float_update_mode(struct vidow_view *view) {
@@ -179,12 +216,19 @@ void vidow_float_update_mode(struct vidow_view *view) {
 	}
 	/* 窗口规则说了算（float = true / false）：自动识别让位。尺寸提示晚到
 	 * （dialogs 在第一次 configure 之后才发 min/max）的时候也不能把它推翻。 */
+	bool was_none = view->float_mode == VIDOW_FLOAT_NONE;
 	if (view->rule_eff.set[VRA_FLOAT]) {
 		vidow_float_set_mode(view, view->rule_eff.val[VRA_FLOAT].b ?
 			VIDOW_FLOAT_FIXED : VIDOW_FLOAT_NONE);
+		if (was_none) {
+			float_center_detected_dialog(view);
+		}
 		return;
 	}
 	vidow_float_set_mode(view, detect_mode(view));
+	if (was_none) {
+		float_center_detected_dialog(view);
+	}
 }
 
 /* ------------------------------------------- 运行时改浮动窗口（IPC 用）
@@ -418,7 +462,8 @@ void vidow_float_on_commit(struct vidow_view *view) {
 	vidow_arrange(view->server);
 }
 
-static void float_place_recursive(struct vidow_view *view, int depth) {
+static void float_place_recursive(struct vidow_view *view, int depth,
+		int slide_y) {
 	if (depth > FLOAT_MAX_DEPTH) {
 		return;
 	}
@@ -427,7 +472,7 @@ static void float_place_recursive(struct vidow_view *view, int depth) {
 		if (view->parent != NULL) {
 			if (view->parent->float_mode != VIDOW_FLOAT_NONE) {
 				/* make sure the parent has its current box first */
-				float_place_recursive(view->parent, depth + 1);
+				float_place_recursive(view->parent, depth + 1, slide_y);
 			}
 			if (view->float_geom.width > 0 && view->float_geom.height > 0) {
 				vidow_place_view(view,
@@ -474,7 +519,8 @@ static void float_place_recursive(struct vidow_view *view, int depth) {
 			view->float_geom.x = box.x + view->home_dx;
 			view->float_geom.y = box.y + view->home_dy;
 		}
-		vidow_place_view(view, view->float_geom.x, view->float_geom.y,
+		vidow_place_view(view, view->float_geom.x,
+			view->float_geom.y + slide_y,
 			view->float_geom.width, view->float_geom.height);
 		if (box.width > 0) {
 			view->home_dx = view->float_geom.x - box.x;
@@ -485,6 +531,8 @@ static void float_place_recursive(struct vidow_view *view, int depth) {
 
 void vidow_float_place_all(struct vidow_server *server,
 		struct vidow_output *output) {
+	struct vidow_workspace *shown =
+		vidow_workspace_shown_for(server, output->wlr_output);
 	struct vidow_view *view;
 	wl_list_for_each(view, &server->views, link) {
 		if (view->float_mode == VIDOW_FLOAT_NONE) {
@@ -498,12 +546,24 @@ void vidow_float_place_all(struct vidow_server *server,
 		if (view->output != output->wlr_output) {
 			continue;
 		}
+		/* 正被推开的那块工作区里的浮窗也要摆：它和列里的窗口一样，过渡期间
+		 * 还画在屏上，得跟着 slide_y 一起滑走。只问可见性会把它跳过，于是它
+		 * 停在原地，直到过渡结束、工作区藏起来才消失 —— 用户报的「浮动窗口
+		 * 不跟随工作区移动」。 */
+		bool sliding_out = output->slide_from != NULL &&
+			view->ws == output->slide_from;
 		/* 藏起来的工作区（或者正常屏上的特殊工作区）里的浮窗不摆：它的场景
 		 * 节点是关着的，摆了也看不见，还会把「这块屏摆过什么」的账算乱。 */
-		if (!vidow_workspace_view_visible(server, view)) {
+		if (!sliding_out && !vidow_workspace_view_visible(server, view)) {
 			continue;
 		}
-		float_place_recursive(view, 0);
+		int slide_y = 0;
+		if (sliding_out) {
+			slide_y = (int)lround(output->slide_from->slide_y);
+		} else if (shown != NULL && view->ws == shown) {
+			slide_y = (int)lround(shown->slide_y);
+		}
+		float_place_recursive(view, 0, slide_y);
 	}
 }
 
@@ -684,7 +744,7 @@ void vidow_mini_drag_to_output(struct vidow_server *server,
 	double bx = lx - (server->grab_x - (double)server->grab_geom.x);
 	double by = ly - (server->grab_y - (double)server->grab_geom.y);
 	/* allow_over = false：换屏那一刻**贴新屏边缘**（「从右边进新屏就贴新屏的
-	 * 左边缘」）—— 这正是「能拖到另一块屏」的手感，别放开成半挂屏外。 */
+	 * 左边缘」）—— 这正是「能拖到另一块屏幕」的手感，别放开成半挂屏外。 */
 	vidow_mini_anchor_from(view, work, w, h, bx, by, false);
 	vidow_mini_move_to_output(server, view, to);
 }
