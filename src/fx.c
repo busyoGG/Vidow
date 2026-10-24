@@ -1340,7 +1340,21 @@ static struct wlr_texture *client_scene_texture(struct vidow_server *server,
 			!client_buffer_wait(server, scene_buffer)) {
 		return NULL;
 	}
-	return client_texture(server->renderer, scene_buffer->buffer, owned);
+	struct wlr_client_buffer *client =
+		wlr_client_buffer_get(scene_buffer->buffer);
+	struct wlr_texture *texture =
+		client_texture(server->renderer, scene_buffer->buffer, owned);
+	if (getenv("VIDOW_FX_TRACE_TEXTURE") != NULL) {
+		wlr_log(WLR_INFO,
+			"fx-texture: sb=%p buffer=%p client=%p source=%p client_tex=%p "
+			"selected=%p size=%dx%d owned=%d",
+			(void *)scene_buffer, (void *)scene_buffer->buffer,
+			(void *)client, client != NULL ? (void *)client->source : NULL,
+			client != NULL ? (void *)client->texture : NULL,
+			(void *)texture, scene_buffer->buffer->width,
+			scene_buffer->buffer->height, owned != NULL ? *owned : -1);
+	}
+	return texture;
 }
 
 /* VIDOW_FX_DUMP=N writes the first N rendered targets to /tmp so the effect
