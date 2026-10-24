@@ -1523,6 +1523,14 @@ struct vidow_view {
 	bool pending_activate;
 	struct wl_list capture_sources; /* vidow_capture_hold.link */
 	bool render_pumping;
+	/* 补帧判定的迟滞（见 view.c 的 vidow_view_render_pump）：连续多少帧
+	 * 「看不上屏」才真的开始补。view_on_screen() 依赖 view->geom / 工作区，
+	 * arrange 期间这些值会逐帧变化，把它当瞬时真值会让 render_pumping 每帧
+	 * 来回翻（实测 85 次/秒），每次翻转都喂客户端一帧 frame_done —— 全屏游戏
+	 * 因此被反复唤醒重画，GPU 功耗异常。0 = 还没确认过。
+	 * pump_hidden_frames 是「连续看不上屏」的帧数，pump_shown_frames 是反过来的。 */
+	int pump_hidden_frames;
+	int pump_shown_frames;
 	/* 抓帧遮挡（窗口规则 capture，机制见 capturemask.c）：有人在截图 / 录屏时，
 	 * 把它在场景里的透明度压成 0 —— 屏幕上照旧、抓到的帧里没有它。
 	 * 不用 node->enabled：场景的命中测试会跳过关掉的节点，窗口就点不着了（输入和

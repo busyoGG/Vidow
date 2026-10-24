@@ -2003,6 +2003,12 @@ void vidow_view_apply_clip(struct vidow_view *view) {
 	view_pin_scale(view);
 }
 
+/* 补帧判定的迟滞帧数（见 vidow_view_render_pump 里的说明）。
+ * view_on_screen() 依赖 view->geom / 工作区可见性，arrange 期间这些值会逐帧
+ * 变化；把它当瞬时真值会让 render_pumping 每帧来回翻，每翻一次喂客户端一帧
+ * frame_done。连续这么多帧结论一致才承认状态变化。 */
+#define PUMP_HYSTERESIS 3
+
 /* 这个窗口现在画得到吗：所在工作区显示着 **而且** 它的矩形和这块屏有交集。
  * 画得到就不该补帧（wlr_scene 已经给过回调了，再补一次会让客户端多画一遍）。 */
 static bool view_on_screen(struct vidow_server *server,
@@ -2059,6 +2065,8 @@ void vidow_view_render_pump(struct vidow_server *server,
 				(view->mini != VIDOW_MINI_NONE &&
 					!vidow_mini_uses_snapshot(view)));
 		if (!want) {
+			view->pump_hidden_frames = 0;
+			view->pump_shown_frames = 0;
 			if (view->render_pumping) {
 				view->render_pumping = false;
 				wlr_log(WLR_DEBUG, "强制渲染: %s 停（不再需要）",
@@ -2067,14 +2075,42 @@ void vidow_view_render_pump(struct vidow_server *server,
 			}
 			continue;
 		}
+
+		/* **先问「它是不是已经画在画面上了」**，再谈补帧。
+		 *
+		 * 这条顺序是有意义的：补帧本来是给「滚出视口 / 工作区被藏起来 / 最小化」
+		 * 的窗口续命的，已经画在画面上的窗口由场景那边正常发 frame_done，根本
+		 * 不该走这条路。老代码把 force_render 放在前面先放行，再在这里补一句
+		 * 「在屏上就停」—— 等于每帧先进来再把 render_pumping 清掉，只要上面
+		 * 的判定有任何抖动（arrange 期间 view->geom / 工作区会逐帧变），
+		 * 状态就跟着每帧翻一次，翻一次喂客户端一帧 frame_done：全屏游戏被反复
+		 * 唤醒重画，GPU 功耗异常（实测 85 次/秒的状态翻转）。
+		 *
+		 * 所以这里加**迟滞**：连续 PUMP_HYSTERESIS 帧「看不上屏」才真的开始补，
+		 * 连续同样多帧「看得上屏」才停。抖动幅度小于这个窗口时状态不再翻转，
+		 * 真实的状态变化（切工作区 / 最小化）只晚这几帧，用户感知不到。 */
 		if (view_on_screen(server, output, view)) {
-			if (view->render_pumping) {
+			view->pump_hidden_frames = 0;
+			if (view->pump_shown_frames < PUMP_HYSTERESIS) {
+				view->pump_shown_frames++;
+			}
+			if (view->render_pumping &&
+					view->pump_shown_frames >= PUMP_HYSTERESIS) {
 				view->render_pumping = false;
 				wlr_log(WLR_DEBUG, "强制渲染: %s 停（它已经画在画面上）",
 					vidow_view_title(view) != NULL ?
 						vidow_view_title(view) : "(无题)");
 			}
+			/* 还在迟滞窗口里（刚被判定为在屏上，但还没连续够帧数）：不补帧，
+			 * 也不改状态 —— 等下一次判定。 */
 			continue;
+		}
+		view->pump_shown_frames = 0;
+		if (view->pump_hidden_frames < PUMP_HYSTERESIS) {
+			view->pump_hidden_frames++;
+		}
+		if (view->pump_hidden_frames < PUMP_HYSTERESIS) {
+			continue; /* 刚看不上屏，还没连续够：先不动 */
 		}
 
 		/* 节流（逐窗口，规则 / 全局配置说了算；0 = 不限）。还没到点的记下最早
