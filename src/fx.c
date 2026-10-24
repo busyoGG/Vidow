@@ -3551,6 +3551,14 @@ void vidow_blur_update(struct vidow_output *output) {
 		}
 		struct vidow_layer_surface *off;
 		wl_list_for_each(off, &server->layers, link) {
+			/* 只收**这块屏**的：上面的 width/height 是 per-output 的，
+			 * 一块屏尺寸越界（超过 MAX_TARGET_PX）不代表别的屏也不能画。
+			 * 不筛的话，那块超尺寸的屏一帧就能把另一块屏上正常工作的
+			 * layer 模糊节点销毁掉，而另一块屏的 usable 是 true、根本不会
+			 * 走到这个分支来重建 —— 那块屏的模糊就此消失。 */
+			if (off->output != output) {
+				continue;
+			}
 			vidow_layer_blur_release(off);
 		}
 		struct vidow_popup_blur *pb;
