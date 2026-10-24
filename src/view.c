@@ -7730,11 +7730,12 @@ static void x11_drop_surface(struct vidow_view *view) {
 	/* Dissociation can bypass the XWayland unmap signal. Do the helper-window
 	 * focus cleanup here as well, otherwise the next association keeps the
 	 * stale focus_helper gate and can never replay its map edge. */
-	if (server->focus_borrowed_from == view) {
-		server->focus_borrowed_from = NULL;
+	struct vidow_view *borrowed_owner = server->focus_borrowed_from;
+	if (borrowed_owner == view) {
+		borrowed_owner = NULL;
 	}
 	if (view->focus_helper) {
-		struct vidow_view *owner = server->focus_borrowed_from;
+		struct vidow_view *owner = borrowed_owner;
 		server->focus_borrowed_from = NULL;
 		view->focus_helper = false;
 		if (owner != NULL && (!owner->mapped ||
