@@ -6271,7 +6271,10 @@ static void view_reconsider_map(struct vidow_view *view);
 static bool x11_is_popup(const struct wlr_xwayland_surface *x);
 static void x11_trace_view(const char *event, struct vidow_view *view,
 		struct wlr_surface *surface);
-static void x11_replay_map_if_xmapped(struct vidow_view *view);
+static bool x11_window_is_viewable(struct vidow_server *server,
+		const struct wlr_xwayland_surface *x);
+static void x11_replay_map_if_xmapped(struct vidow_view *view,
+		bool trust_x_viewable);
 static void view_map(struct wl_listener *listener, void *data) {
 	(void)data;
 	struct vidow_view *view = wl_container_of(listener, view, map);
@@ -6751,7 +6754,7 @@ static void view_commit(struct wl_listener *listener, void *data) {
 	 *
 	 * 判据只看 wlroots 记住的 mapped：它和 commit 是同一条事件流里的状态，
 	 * 不会比客户端实际状态超前，所以不会把真正想藏起来的窗口拉出来。 */
-	x11_replay_map_if_xmapped(view);
+	x11_replay_map_if_xmapped(view, false);
 
 	/* **排帧**。这是 X11 和 Wayland 共用的交帧入口，而 vidow 是按需渲染
 	 * （vidow_output_schedule_frame）—— 不在这里要一帧，客户端交上来的新内容
@@ -7625,11 +7628,22 @@ static bool x11_window_is_viewable(struct vidow_server *server,
 
 /* Replay the X11 map edge when wlroots mapped the surface without a new
  * commit. This is event-driven and idempotent per association. */
-static void x11_replay_map_if_xmapped(struct vidow_view *view) {
+static void x11_replay_map_if_xmapped(struct vidow_view *view,
+		bool trust_x_viewable) {
 	if (view == NULL || view->kind != VIDOW_VIEW_X11 || view->mapped ||
 			view->x11_map_replayed || view->focus_helper || view->popup ||
 			view->x11 == NULL || view->x11->surface == NULL ||
-			!view->x11->surface->mapped || view->scene_tree == NULL) {
+			view->scene_tree == NULL) {
+		return;
+	}
+	/* During normal wlroots map/commit handling, the surface flag is authoritative.
+	 * Association is different: XWayland can already have an IsViewable window
+	 * while the wlroots surface has not observed the map edge yet. */
+	bool mapped = view->x11->surface->mapped;
+	if (!mapped && trust_x_viewable) {
+		mapped = x11_window_is_viewable(view->server, view->x11);
+	}
+	if (!mapped) {
 		return;
 	}
 	view->x11_map_replayed = true;
@@ -7685,7 +7699,7 @@ static void x11_attach_surface(struct vidow_view *view) {
 	/* A new association gets one chance to replay a map that happened before
 	 * the scene surface was attached. */
 	view->x11_map_replayed = false;
-	x11_replay_map_if_xmapped(view);
+	x11_replay_map_if_xmapped(view, true);
 
 	/* Xwayland can associate an already-painted surface after its last commit.
 	 * wlr_scene_surface_create() installs the commit listener, but there may be
@@ -7769,7 +7783,7 @@ static void x11_associate(struct wl_listener *listener, void *data) {
 	if (view->x11 != NULL && view->x11->window_id != XCB_WINDOW_NONE) {
 		struct wlr_xwayland_surface *xs = view->x11;
 		if (!view->mapped && x11_window_is_viewable(view->server, xs)) {
-			x11_replay_map_if_xmapped(view);
+			x11_replay_map_if_xmapped(view, true);
 		}
 	}
 }
@@ -7787,7 +7801,7 @@ static void x11_map_request(struct wl_listener *listener, void *data) {
 	if (view->x11 != NULL && view->x11->surface != NULL &&
 			view->x11->surface->mapped && view->scene_tree != NULL &&
 			!view->mapped) {
-			x11_replay_map_if_xmapped(view);
+			x11_replay_map_if_xmapped(view, false);
 	}
 }
 
