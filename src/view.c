@@ -7714,6 +7714,7 @@ static void x11_attach_surface(struct vidow_view *view) {
 /* wayland surface 没了（窗口 withdrawn）但 X11 窗口还在：view 留着，下次
  * associate 重新建场景节点。 */
 static void x11_drop_surface(struct vidow_view *view) {
+	struct vidow_server *server = view->server;
 	x11_trace_view("drop", view, NULL);
 	/* A wlroots X11 surface can be dissociated and associated again without the
 	 * X window being destroyed (Chromium/CEF does this while rebuilding widgets).
@@ -7726,6 +7727,27 @@ static void x11_drop_surface(struct vidow_view *view) {
 	vidow_anim_cancel(view->mini_anim);
 	view->mini_anim = NULL;
 	vidow_fx_release(&view->fx);
+	/* Dissociation can bypass the XWayland unmap signal. Do the helper-window
+	 * focus cleanup here as well, otherwise the next association keeps the
+	 * stale focus_helper gate and can never replay its map edge. */
+	if (server->focus_borrowed_from == view) {
+		server->focus_borrowed_from = NULL;
+	}
+	if (view->focus_helper) {
+		struct vidow_view *owner = server->focus_borrowed_from;
+		server->focus_borrowed_from = NULL;
+		view->focus_helper = false;
+		if (owner != NULL && (!owner->mapped ||
+				vidow_view_surface(owner) == NULL)) {
+			owner = server->focused;
+		} else if (owner == NULL) {
+			owner = server->focused;
+		}
+		struct wlr_surface *back = owner != NULL ?
+			vidow_view_surface(owner) : NULL;
+		vidow_seat_focus_surface(server->seat, back);
+		vidow_im_focus(server, back);
+	}
 	if (view->popup_blur != NULL) {
 		vidow_popup_blur_unregister(view->popup_blur, true);
 		view->popup_blur = NULL;
