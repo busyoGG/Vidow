@@ -336,6 +336,10 @@ static const struct entry entries[] = {
 		"pointer-scroll / send-key / type-text）：等于「谁连上 socket 谁就能"
 		"操控整个桌面」。默认开，每次注入都打一条 info 日志" },
 
+	{ "capture_fps",     K_INT,    OFF(capture_fps),     SZ(capture_fps), 7,
+		"抓帧兜底的节奏（Hz）。屏幕静止时没有输出提交，录屏 / 远程控制全靠它"
+		"按这个频率催帧。默认 60；0 = 关掉兜底（只靠后端自己提交出帧）" },
+
 	{ "scale",           K_STRING, OFF(scale),           SZ(scale), 8,
 		"所有输出的默认缩放：auto = 按 EDID 的 ppi 推，也可以写死 \"1\" / \"1.5\""
 		"；单块屏点名用 vidow.output{ name = …, scale = … }" },
@@ -346,6 +350,8 @@ static const struct entry entries[] = {
 		"XWayland 的缩放：auto = 所有输出里最大的那个" },
 	{ "xwayland_env",    K_BOOL,   OFF(xwayland_env),    SZ(xwayland_env), 9,
 		"给客户端设 XDG_SESSION_TYPE 这类 X11 环境变量" },
+	{ "logical_uniform", K_BOOL,   OFF(logical_uniform),  SZ(logical_uniform), 8,
+		"所有屏的逻辑分辨率对齐到最大那块（1080p 屏被虚拟放大/超采样）" },
 
 	{ "activation_token_timeout", K_INT, OFF(activation_token_timeout),
 		SZ(activation_token_timeout), 10,
@@ -373,6 +379,12 @@ static const struct entry entries[] = {
 		"--systemd）：xdg-desktop-portal、systemd 服务和桌面文件激活的程序才"
 		"连得上 vidow" },
 
+	{ "cursor_theme",   K_STRING, OFF(cursor_theme),  SZ(cursor_theme), 12,
+		"光标主题（xcursor 主题名）。空 = 先看 XCURSOR_THEME、再 gsettings、"
+		"最后 Adwaita。改了立刻生效（运行中重建 cursor manager）" },
+	{ "cursor_size",    K_INT,    OFF(cursor_size),   SZ(cursor_size), 12,
+		"光标逻辑尺寸（24 = 常规，2 倍屏上自动翻倍）。0 = 先看 XCURSOR_SIZE、"
+		"再 gsettings、最后 24。改了立刻生效；vidowmsg cursor-size N 也能改" },
 	{ "cursor_shake",    K_BOOL,   OFF(cursor_shake),    SZ(cursor_shake), 12,
 		"摇晃指针就放大一下（快速来回晃几下，指针变大一会儿，好找）" },
 	{ "cursor_shake_scale", K_DOUBLE, OFF(cursor_shake_scale),
@@ -437,6 +449,11 @@ static const struct entry entries[] = {
 	{ "mru_backdrop_alpha", K_DOUBLE, OFF(mru_backdrop_alpha),
 		SZ(mru_backdrop_alpha), 14,
 		"切换器后面那层压暗的浓度（0 = 不压暗）" },
+	{ "mru_open_ms",     K_INT,    OFF(mru_open_ms),     SZ(mru_open_ms), 14,
+		"面板显形 / 收起时的过渡时长（毫秒）：卡片按 t 从 92% 长到原位、"
+		"压暗跟着淡入，0 = 不做过渡（瞬间摆上去）" },
+	{ "mru_close_ms",    K_INT,    OFF(mru_close_ms),    SZ(mru_close_ms), 14,
+		"收起的过渡时长（毫秒），含义同 mru_open_ms；0 = 关掉时瞬间消失" },
 	{ "mru_card_padding", K_INT, OFF(mru_card_padding),
 		SZ(mru_card_padding), 14,
 		"每一项背后那张卡片比预览大多少（逻辑像素）：预览到卡片边缘那圈。比 "
@@ -829,6 +846,8 @@ static const struct group_field mru_fields[] = {
 	{ "max_height",        "mru_max_height" },
 	{ "min_scale",         "mru_min_scale" },
 	{ "backdrop_alpha",    "mru_backdrop_alpha" },
+	{ "open_ms",           "mru_open_ms" },
+	{ "close_ms",          "mru_close_ms" },
 	{ "card_padding",      "mru_card_padding" },
 	{ "card_radius",       "mru_card_radius" },
 	{ "card_color",        "mru_card_color" },
@@ -2114,6 +2133,7 @@ static void defaults(struct vidow_config *cfg) {
 	 * pointer-scroll / send-key / type-text），自动化靠它动手。socket 是 0600，
 	 * 只有本用户能连，而且每次注入都打一条 info 日志留痕；要收紧就写 false。 */
 	cfg->input_injection = true;
+	cfg->capture_fps = 60;
 	/* 摇晃找光标默认开：快速来回晃几下指针就放大一会儿，好找。放大是换一张更大
 	 * 的光标图，走硬件光标那条路（不进渲染通道 = 不进截图），所以倍数会先按硬件
 	 * 上限夹一下（见 cursorfx.c）。 */
@@ -2135,6 +2155,8 @@ static void defaults(struct vidow_config *cfg) {
 	cfg->mru_max_height = 480;
 	cfg->mru_min_scale = 0.05;
 	cfg->mru_backdrop_alpha = 0.6;   /* 半透明：桌面还看得见 */
+	cfg->mru_open_ms = 120;          /* 显形：短，别挡着「切完就能用」 */
+	cfg->mru_close_ms = 90;          /* 收起更快一点：走的时候不该拖 */
 	/* 卡片样式照 portal 的选择器（深色那套调色板）：底 #2f3336 压一点透明度、
 	 * 描边 #3b4045；强调色默认取 KDE Breeze 蓝 #3daee9 —— 和 portal 用同一个
 	 * 强调色（portal 那边读 kdeglobals，这里没法读，就按默认值来）。 */
@@ -2182,6 +2204,9 @@ static void defaults(struct vidow_config *cfg) {
 
 	cfg->cursor_shake = true;
 	cfg->cursor_shake_scale = 2.0;
+	/* 0 / 空 = 没指定，走环境变量 → gsettings → 缺省那条老路。 */
+	cfg->cursor_size = 0;
+	cfg->cursor_theme[0] = '\0';
 	/* 焦点跟随光标 / 键盘换焦点带光标：默认**都不开**（上面 memset 已经给
 	 * false + 空串），这就是 niri 的默认行为 —— niri 的默认配置里这两个节点
 	 * 也是注释着的。空串的含义照 niri 的「不写子项」：max-scroll-amount 留空

@@ -241,7 +241,14 @@ size_t vidow_mru_collect(struct vidow_server *server, const char *app_id_filter,
 /* ------------------------------------------------------- 切换器的清单 */
 
 static bool mru_showing(const struct vidow_server *server) {
-	return server->mru.shown;
+	/* 收起的淡出期间 shown 已经是 false，但浮层还要画 —— 判据是「有东西要画
+	 * 且 t > 0」。mru->output 在收尾之前一直留着（见 mru_close_finish）。 */
+	const struct vidow_mru *mru = &server->mru;
+	if (mru->shown) {
+		return true;
+	}
+	return mru->anim != NULL && mru->closing && mru->t > 0.0 &&
+		mru->output != NULL;
 }
 
 bool vidow_mru_active(const struct vidow_server *server) {
@@ -1163,6 +1170,65 @@ static void mru_card_style(const struct vidow_server *server,
 }
 
 /* 每项背后那张卡片 + 压暗的背景。 */
+static void mru_scene_apply(struct vidow_server *server);
+static void mru_close_finish(struct vidow_server *server);
+
+/* 进 / 出的过渡：t 从 from 走到 to，每帧重画浮层。
+ *
+ * 只推 mru->t，别在这里改布局 —— 目标几何由 mru_layout 定，动画只决定
+ * 「这一刻画成什么样」（mru_scene_apply 按 t 插值卡片的位移 / 缩放 / 透明度）。 */
+static void mru_anim_update(void *data, double t, double linear) {
+	struct vidow_server *server = data;
+	struct vidow_mru *mru = &server->mru;
+	(void)t;          /* 位移 / 透明度都用单调那条，别用过冲的 */
+	mru->t = linear;
+	mru_scene_apply(server);
+}
+
+static void mru_anim_done(void *data, bool cancelled) {
+	struct vidow_server *server = data;
+	struct vidow_mru *mru = &server->mru;
+	bool was_closing = mru->closing;
+	mru->anim = NULL;
+	if (!cancelled) {
+		mru->t = was_closing ? 0.0 : 1.0;
+	}
+	if (was_closing) {
+		/* 淡完了才真的把台账和节点收掉：不清的话最后那一帧的卡片会挂在
+		 * 屏上，清早了又没东西可画（见 mru_close_finish 的说明）。 */
+		mru->t = 0.0;
+		mru_close_finish(server);
+		return;
+	}
+	mru_scene_apply(server);
+	vidow_backdrop_damage(server, false);
+}
+
+static void mru_anim_start(struct vidow_server *server, bool closing) {
+	struct vidow_mru *mru = &server->mru;
+	struct vidow_config *cfg = &server->config;
+	if (mru->anim != NULL) {
+		vidow_anim_cancel(mru->anim);
+		mru->anim = NULL;
+	}
+	mru->closing = closing;
+	int ms = closing ? cfg->mru_close_ms : cfg->mru_open_ms;
+	if (ms <= 0) {
+		/* 动画关掉（或没配）：直接到位，和以前一样。 */
+		mru->t = closing ? 0.0 : 1.0;
+		mru_scene_apply(server);
+		if (closing) {
+			mru_cards_hide(server, true);
+			vidow_backdrop_damage(server, false);
+		}
+		return;
+	}
+	mru->anim = vidow_anim_start(server,
+		closing ? "mru-close" : "mru-open", ms,
+		(struct vidow_ease){ .kind = VIDOW_EASE_OUT_CUBIC },
+		mru_anim_update, mru_anim_done, server);
+}
+
 static void mru_scene_apply(struct vidow_server *server) {
 	struct vidow_mru *mru = &server->mru;
 	struct vidow_config *cfg = &server->config;
@@ -1188,6 +1254,15 @@ static void mru_scene_apply(struct vidow_server *server) {
 	if (alpha > 1.0f) {
 		alpha = 1.0f;
 	}
+	/* 压暗跟着 t 淡入淡出 —— 面板整块跳出来最刺眼的就是这层。 */
+	double t = mru->t;
+	if (t < 0.0) {
+		t = 0.0;
+	}
+	if (t > 1.0) {
+		t = 1.0;
+	}
+	alpha *= (float)t;
 	wlr_scene_rect_set_color(mru->backdrop,
 		(float[4]){ 0.02f * alpha, 0.02f * alpha, 0.03f * alpha, alpha });
 	wlr_scene_rect_set_size(mru->backdrop, box.width, box.height);
@@ -1209,12 +1284,39 @@ static void mru_scene_apply(struct vidow_server *server) {
 		if (card == NULL) {
 			continue;
 		}
+		/* 过渡里每张卡片从「自己中心缩小 8% 一点」长到原位（t=1 时 1:1）。
+		 * 缩放以卡片中心为锚，卡片本身的位置不动 —— 用户要的是「移动过程中
+		 * 也要过渡」，不是卡片乱窜。 */
+		double grow = 0.92 + 0.08 * t;
+		int cw = (int)lround((double)slot->cw * grow);
+		int ch = (int)lround((double)slot->ch * grow);
+		if (cw < 1) {
+			cw = 1;
+		}
+		if (ch < 1) {
+			ch = 1;
+		}
+		int cx = slot->cx + (slot->cw - cw) / 2;
+		int cy = slot->cy + (slot->ch - ch) / 2;
 		float fill[4], ring[4];
 		int bw = 0;
 		mru_card_style(server, slot->view, fill, ring, &bw);
-		struct wlr_box at = { slot->cx, slot->cy, slot->cw, slot->ch };
+		struct wlr_box at = { cx, cy, cw, ch };
 		mru_card_place(server, card, &at, fill, ring, bw);
-		struct wlr_box thumb = { slot->x, slot->y, slot->w, slot->h };
+		/* 缩略图跟着卡片一起缩放（它以卡片中心为锚长出来）。 */
+		int tw = (int)lround((double)slot->w * grow);
+		int th = (int)lround((double)slot->h * grow);
+		if (tw < 1) {
+			tw = 1;
+		}
+		if (th < 1) {
+			th = 1;
+		}
+		struct wlr_box thumb = {
+			slot->x + (slot->w - tw) / 2,
+			slot->y + (slot->h - th) / 2,
+			tw, th,
+		};
 		mru_card_thumb(server, card, slot->view, &thumb, slot->zoom);
 	}
 	/* 上一轮排了、这一轮没排到的（窗口少了 / 清单短了）也收起来。 */
@@ -1272,9 +1374,12 @@ static int mru_open_timer_fire(void *data) {
 		return 0;
 	}
 	mru->shown = true;
-	wlr_log(WLR_INFO, "mru: 面板显形（按住 %dms 之后）",
-		server->config.mru_open_delay_ms);
+	/* 从 0 开始长出来（t 只让浮层从「缩小 + 无压暗」过渡到到位）。 */
+	mru->t = 0.0;
+	wlr_log(WLR_INFO, "mru: 面板显形（按住 %dms 之后，过渡 %dms）",
+		server->config.mru_open_delay_ms, server->config.mru_open_ms);
 	mru_refresh(server);
+	mru_anim_start(server, false);
 	mru_log_state(server, "显示");
 	vidow_ipc_emit_note(server, "mru-shown");
 	return 0;
@@ -1487,6 +1592,23 @@ void vidow_mru_step_clamp(struct vidow_server *server, int dir) {
 	wlr_log(WLR_INFO, "mru: 方向键 → #%d %s", idx, mru_name(mru->selected));
 }
 
+/* 关闭的动画跑完之前，浮层还要照原样画着 —— 所以「真正收尾」拆成两步：
+ * mru_close() 只把键盘状态交回去、启动淡出；mru_close_finish() 才清台账。
+ * 不拆的话 mru->output / slot_n 一清，mru_scene_apply 立刻走「没在显示」那条，
+ * 淡出压根看不到一帧。 */
+static void mru_close_finish(struct vidow_server *server) {
+	struct vidow_mru *mru = &server->mru;
+	mru->slot_n = 0;
+	mru->n = 0;
+	mru->scroll = 0.0;
+	mru->selected = NULL;
+	mru->hover = NULL;
+	mru->output = NULL;
+	mru_scene_apply(server);
+	mru_cards_hide(server, true);
+	vidow_backdrop_damage(server, false);
+}
+
 /* 关掉（画面恢复）。commit = true 时先把焦点给选中的那个。 */
 static void mru_close(struct vidow_server *server, bool commit) {
 	struct vidow_mru *mru = &server->mru;
@@ -1494,19 +1616,19 @@ static void mru_close(struct vidow_server *server, bool commit) {
 		return;
 	}
 	struct vidow_view *target = commit ? mru->selected : NULL;
+	bool was_shown = mru->shown;
 	mru->on = false;
 	mru->shown = false;
-	mru->slot_n = 0;
-	mru->n = 0;
-	mru->scroll = 0.0;
-	mru->selected = NULL;
-	mru->hover = NULL;
-	mru->output = NULL;
 	if (mru->open_timer != NULL) {
 		wl_event_source_timer_update(mru->open_timer, 0);
 	}
-	mru_scene_apply(server);
-	vidow_backdrop_damage(server, false);
+	if (was_shown && server->config.mru_close_ms > 0) {
+		/* 面板真的显形过：淡出。台账（slot_n / output）留到动画结束再清，
+		 * 否则这一帧就没东西可画了。 */
+		mru_anim_start(server, true);
+	} else {
+		mru_close_finish(server);
+	}
 	if (target != NULL && target->mapped && !target->minimized) {
 		/* 明确选中 = 明确使用：直接落账，不等 debounce。目标是迷你 / 图标态
 		 * 的小窗时先摊成自由小窗再给焦点 —— 它们在切换器里列着（这是想要的），

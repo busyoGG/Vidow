@@ -548,6 +548,9 @@ struct vidow_config {
 	int mru_max_height;
 	double mru_min_scale;
 	double mru_backdrop_alpha;
+	/* 显形 / 收起的过渡时长（毫秒）。0 = 不做过渡，瞬间到位。 */
+	int mru_open_ms;
+	int mru_close_ms;
 	int mru_card_padding;
 	int mru_card_radius;
 	float mru_card_color[4];
@@ -836,6 +839,17 @@ struct vidow_mru {
 	int total_w, total_h;           /* 整条清单占多大（日志 / 断言用） */
 	struct wlr_scene_tree *tree;    /* 浮层：压暗 + 卡片 + 缩略图，压在窗口之上 */
 	struct wlr_scene_rect *backdrop; /* 压暗背景 */
+	/* 进 / 出的过渡进度（0 = 完全没显形，1 = 摆到位）。跟 overview 的 ov->t
+	 * 同一个意思、同一套用法：mru_scene_apply 按 t 插值卡片的位置 / 缩放 /
+	 * 透明度，vidow_anim_tick 每帧推。
+	 *
+	 * 以前这里是**瞬时的**：open_delay 一到就把面板整块摆上去、关掉时整块撤掉，
+	 * 画面上一帧之间跳过去（用户：「MRU 需要过渡动画」「移动的过程中也要过渡」）。
+	 * t 只影响**画出来什么样**，不影响 mru_layout 算出来的目标几何 —— 布局
+	 * 仍然是瞬时的，动画只是把「从哪儿来 / 往哪儿去」补出来。 */
+	double t;
+	struct vidow_anim *anim;        /* 推 t 的那条 */
+	bool closing;                   /* 这条动画在往 0 走（关）还是往 1 走（开） */
 	/* 每项背后那张卡片（超椭圆圆角的底 + 描边，见 mru.c）。节点按需建、建了留着
 	 * 复用；圆角是按覆盖率算出来的小图（wlr_scene_rect 画不出圆角），尺寸或样式
 	 * 变了才重画。 */
