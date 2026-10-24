@@ -1,6 +1,5 @@
 #include <unistd.h>
 #include <sys/resource.h>
-#include <sys/wait.h>
 #include "server.h"
 #include "env.h"
 #include "hooks.h"
@@ -111,6 +110,13 @@ static int terminate_signal(int signo, void *data) {
 	wlr_log(WLR_INFO, "收到退出信号，收尾");
 	wl_display_terminate(server->display);
 	return 0;
+}
+
+/* Keep terminal-generated interrupts from killing the compositor. This is a
+ * caught disposition rather than SIG_IGN, so clients spawned by Vidow reset
+ * SIGINT/SIGQUIT to their normal defaults across exec. */
+static void ignore_terminal_signal(int signo) {
+	(void)signo;
 }
 
 /* 会话从「切走了」回到「回来了」：VT 切回来（Ctrl+Alt+F3 再切回来）时，屏幕上的
@@ -705,55 +711,23 @@ int main(int argc, char *argv[]) {
 	 * 那种跑法下 vidow 和终端里那个 shell 在**同一个前台进程组**，终端一按
 	 * Ctrl+C 就把 SIGINT 发给整组，vidow 收到默认动作当场退出。
 	 *
-	 * 修法不是忽略信号（那样 dbg.sh 里「按 Ctrl+C 退出」也跟着失效，调试
-	 * 时只能 ps 找 pid 再 kill），而是**把自己从终端的前台进程组里摘出去**：
-	 * 见下面 setsid() 那一段。
+	 * 修法是显式忽略 SIGINT / SIGQUIT。Vidow 仍留在原来的 logind session，
+	 * 不会破坏 DRM/libinput 的设备接管；退出使用 SIGTERM（pkill / systemctl stop）。
 	 */
-	/* 把自己摘出终端的前台进程组。
-	 *
-	 * 只用终端自己起的会话才有意义（systemd 起的 vidow 早就是独立 session）。
-	 *
-	 * 判据：`tcgetpgrp(STDIN_FILENO)` 和我们的 pgid 相等 = 终端会把 Ctrl+C
-	 * 发给这一组（我们就在里面）。
-	 *
-	 * 为什么不直接在自己身上 setsid()：POSIX 规定「已经是进程组的组长就不能
-	 * 再 setsid」，而 shell 起前台任务时恰好让子进程当组长 —— 正好是我们要处理
-	 * 的这个情况，直接调必然 EPERM。所以先 fork、让子进程（不是组长）去
-	 * setsid，父进程原地等它、把退出码原样带出去（dbg.sh 依赖这个：它拿
-	 * vidow 的退出码判崩没崩）。
-	 *
-	 * 摘出去之后：终端按 Ctrl+C 打不到我们了（不再同组）；而 kill -INT <pid>
-	 * 仍然能退 —— SIGINT 的默认动作还在，只是不再被终端整组广播打到。 */
-	if (isatty(STDIN_FILENO) && tcgetpgrp(STDIN_FILENO) == getpgrp()) {
-		pid_t pid = fork();
-		if (pid == 0) {
-			/* 子进程：不是组长，可以 setsid。失败就照原样继续跑（只是
-			 * 还有可能被 Ctrl+C 打到，比直接不启动强）。 */
-			if (setsid() < 0) {
-				wlr_log(WLR_ERROR, "setsid 失败（继续跑，Ctrl+C 仍会退）");
-			}
-		} else if (pid > 0) {
-			/* 父进程：等子进程退，把它的退出码原样返回。 */
-			int status = 0;
-			while (waitpid(pid, &status, 0) < 0) {
-				if (errno != EINTR) {
-					return 1;
-				}
-			}
-			if (WIFEXITED(status)) {
-				return WEXITSTATUS(status);
-			}
-			if (WIFSIGNALED(status)) {
-				raise(WTERMSIG(status));
-				return 128 + WTERMSIG(status);
-			}
-			return 1;
-		} else {
-			/* fork 自己失败：不致命，照原样继续跑。 */
-			wlr_log(WLR_ERROR, "fork 失败，跳过 setsid（Ctrl+C 仍会退）");
-		}
+	/* Terminal-generated SIGINT/SIGQUIT goes to the whole foreground process
+	 * group. Catch it so Ctrl+C interrupts vshell's foreground job without
+	 * terminating Vidow. A caught disposition is reset by exec, unlike
+	 * SIG_IGN, so clients spawned by Vidow keep their normal Ctrl+C behavior. */
+	struct sigaction ign;
+	memset(&ign, 0, sizeof(ign));
+	ign.sa_handler = ignore_terminal_signal;
+	ign.sa_flags = SA_RESTART;
+	sigemptyset(&ign.sa_mask);
+	if (sigaction(SIGINT, &ign, NULL) != 0 ||
+			sigaction(SIGQUIT, &ign, NULL) != 0) {
+		wlr_log(WLR_ERROR, "failed to ignore SIGINT/SIGQUIT: %s",
+			strerror(errno));
 	}
-
 
 	int signals[] = { SIGTERM };
 	for (size_t i = 0; i < sizeof(signals) / sizeof(signals[0]); i++) {
