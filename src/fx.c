@@ -4255,12 +4255,26 @@ static bool layer_blur_frame(struct vidow_server *server,
 			fx->blur_set.w == px_w && fx->blur_set.h == px_h &&
 			fx->blur_set.levels == levels &&
 			fabs(fx->blur_set.offset - server->config.blur_offset) < 1e-6;
-		if (!fresh && !layer_region_build(server, output, ls, rx, ry, px_w,
-				px_h, levels)) {
-			/* 抓不出来就留着上一帧那张，别闪 */
-			return layer_blur_bail(ls, 4, "私有底衬抓不出来");
+		if (!fresh) {
+			if (!layer_region_build(server, output, ls, rx, ry, px_w,
+					px_h, levels)) {
+				/* 抓不出来就留着上一帧那张，别闪 */
+				return layer_blur_bail(ls, 4, "私有底衬抓不出来");
+			}
+			/* **底衬重抓了 = 内容变了，必须重画这一版。**
+			 *
+			 * 别指望下面的 blur_assign() 顺手把 blur_ver 推上去：它只在
+			 * 「贴图 / id / 区域」变了时才 ++，而重抓底衬恰恰不换这两样
+			 * （同一张 blur_own_tex、同一块区域，只是里面的像素是新的）。
+			 * 不在这儿显式 ++ 的话，后面 blur_drawn == blur_ver 立刻成立、
+			 * 直接 return true —— 底下窗口 / 壁纸变了，layer 背后的模糊还是
+			 * 旧的那一张（用户报的「layer 的 blur 好像很容易不更新」）。
+			 *
+			 * 窗口那条路没这个问题：view_region_build 走完，blur_assign
+			 * 拿到的是新的 blur_own_id（每次重抓都换号），自然会 ++。 */
+			fx->blur_ver++;
 		}
-		blur_assign(fx, fx->blur_own_tex, false, fx->blur_own_id,
+		blur_assign(fx, NULL, fx->blur_own_tex, false, fx->blur_own_id,
 			&(struct wlr_box){ .x = rx, .y = ry,
 				.width = px_w, .height = px_h });
 	} else {
