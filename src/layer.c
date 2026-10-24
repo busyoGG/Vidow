@@ -568,14 +568,21 @@ static void layer_surface_commit(struct wl_listener *listener, void *data) {
 	/* A repaint of the wallpaper or a bottom bar changes the backdrop of
 	 * every window; the upper layers are not part of it. */
 	if (ls->layer <= ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM) {
-		vidow_backdrop_damage(server, true);
+		if (ls->output != NULL) {
+			vidow_backdrop_damage_output(ls->output);
+		} else {
+			vidow_backdrop_damage(server, true);
+		}
 	}
 
 	/* 这块 layer 自己的内容刚交了新帧：它背后的模糊拿它的缓冲当 mask
 	 * （fx.c 的 layer_blur_frame），不重画就一直是上一版的 alpha / 形状。
 	 * 典型现场：状态栏弹出菜单时透明区域变了，底下的模糊还按旧 mask 剔，
-	 * 看着就是「层的内容动了、模糊没跟上」。底衬是否重抓仍由 gen / damage
-	 * 判断，这里只作废已画的那一版（重画一次，不重抓底衬）。 */
+	 * 看着就是「层的内容动了、模糊没跟上」。
+	 *
+	 * 这里只推 blur_ver（「已画的那一版作废」）。底衬要不要重抓是另一件事，
+	 * 由 fx.c 的 fresh 判据自己决定（世界代次 + 损伤盒子 + 区域尺寸 + 级数），
+	 * 跟这次 invalidate 无关 —— blur_ver 不在 fresh 的任何一项里。 */
 	vidow_layer_blur_invalidate(ls);
 }
 
