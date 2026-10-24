@@ -2350,29 +2350,14 @@ static double view_overview_alpha(struct vidow_server *server,
 	if (view->output != server->overview.output) {
 		return alpha * (1.0 - server->overview.t);
 	}
-	/* 整块落在**这一行的矩形外**：不画（alpha 0）。条带比屏宽的那些列本来就在
-	 * 矩形外（在屏幕上它们在屏幕外），而场景没有裁剪节点（见 overview.c 里
-	 * row->rect_x 那段注释）—— 不藏就直接画到隔壁显示器上（用户：「overview
-	 * 窗口太多会跨屏」）。
+	/* overview 里**不做整体隐藏**：溢出工作区的部分由 fx.c 的 ov_clip 裁掉
+	 * （它把这块窗口裁到「这一行的矩形」，也就是屏幕上可见的那一块）。
 	 *
-	 * ⚠️ 必须放在下面 vidow_workspace_view_visible() 那条**之前**：会溢出行的
-	 * 正是「在屏幕上被滚出视口」的列，它们在下面那条就提前 return 了 ——
-	 * 放在后面等于永远轮不到它们（实测 7 窗口跑完 OVHIDE 命中的全是停车位 /
-	 * 别的工作区的窗口，框 y 对不上行 y）。
-	 *
-	 * 只藏**整块都在外面**的：边界上那块部分溢出的照旧画（藏了会把该看见的
-	 * 一半也弄没），那点残余属于另一个小问题。 */
-	struct wlr_box vb = {0}, rb = {0};
-	if (vidow_overview_view_box(server, view, &vb, &rb)) {
-		struct wlr_box inter;
-		if (!wlr_box_intersection(&inter, &vb, &rb)) {
-			wlr_log(WLR_ERROR,
-				"OVHIDE view %p 框 %d,%d %dx%d 行 %d,%d %dx%d",
-				(void *)view, vb.x, vb.y, vb.width, vb.height,
-				rb.x, rb.y, rb.width, rb.height);
-			return 0.0;
-		}
-	}
+	 * 这里以前有一段「整块落在行矩形外就 alpha = 0」的隐藏，是 fx.c 还没有
+	 * ov_clip 时用来挡「overview 窗口太多会跨屏」的。现在裁剪已经有了，那层
+	 * 隐藏就成了多余而且有害的：判据（行矩形）和裁剪框（整块屏）不是同一个
+	 * 东西，落在行间隙里、本来该被**裁一半**显示的窗口被整个藏掉了 ——
+	 * 用户要的是「所有窗口都显示，超出的部分由显示器裁」。 */
 	if (!vidow_workspace_view_visible(server, view)) {
 		return alpha * server->overview.t;
 	}

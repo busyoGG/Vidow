@@ -2568,22 +2568,55 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 	struct wlr_box ov_clip_box = {0};
 	if (fx->view != NULL && vidow_overview_active(fx->view->server) &&
 			fx->view->mini == VIDOW_MINI_NONE && fx->view->mapped) {
-		struct vidow_overview *ov = &fx->view->server->overview;
-		if (ov->output != NULL && ov->out_w > 0 && ov->out_h > 0) {
-			ov_clip_box = (struct wlr_box){.x = ov->out_x,
-				.y = ov->out_y, .width = ov->out_w,
-				.height = ov->out_h};
+		/* 裁到**这一行的矩形**（不是整块屏）：overview 把每块工作区画成一块缩小
+		 * 的屏，行与行之间有间隙，条带比行宽的那些列在屏幕上本来就在屏外。
+		 * 裁到行矩形 = 「所有窗口都显示，超出的部分被显示器裁掉」。
+		 *
+		 * 以前这里裁的是 ov->out_×（整块屏），而 view.c 另有一层「整块落在行外
+		 * 就 alpha=0」的整体隐藏；两套边界不一致，落在行间隙里、本该只露出半截
+		 * 的窗口被整个藏掉了。现在隐藏撤了，裁剪边界收成行矩形，两者合一。
+		 *
+		 * vidow_overview_view_box() 只读场景节点、不写行状态，可以在这儿调。 */
+		struct wlr_box vb = {0};
+		if (vidow_overview_view_box(fx->view->server, fx->view, &vb,
+				&ov_clip_box)) {
 			ov_clip = true;
+		} else {
+			struct vidow_overview *ov = &fx->view->server->overview;
+			if (ov->output != NULL && ov->out_w > 0 && ov->out_h > 0) {
+				/* 查不到行（窗口还没摆进 overview）：退回整块屏，
+				 * 至少别画到隔壁显示器上。 */
+				ov_clip_box = (struct wlr_box){.x = ov->out_x,
+					.y = ov->out_y, .width = ov->out_w,
+					.height = ov->out_h};
+				ov_clip = true;
+			}
 		}
 	}
-	if (fx->clip_on || ov_clip) {
+	if (instance != NULL || fx->clip_on || ov_clip) {
 		/* fx->clip 是**布局坐标**里的那块屏；这个节点的位置是相对父树的
 		 * （父树就是窗口的场景树，摆在窗口的位置上）—— 减掉父树的原点才
 		 * 在同一个坐标系里。 */
 		struct wlr_box clip = ov_clip ? ov_clip_box : fx->clip;
-		if (fx->node->node.parent != NULL) {
-			clip.x -= fx->node->node.parent->node.x;
-			clip.y -= fx->node->node.parent->node.y;
+		if (instance != NULL && !ov_clip) {
+			struct wlr_box output_clip;
+			wlr_output_layout_get_box(server->output_layout, instance->out,
+				&output_clip);
+			/* A per-output bake must not expand the view's workspace clip.
+			 * Only an actively dragged view may span output instances. */
+			bool dragging = fx->view != NULL &&
+				(fx->view->dragging || server->grab_view == fx->view);
+			if (fx->clip_on && !dragging) {
+				struct wlr_box visible = {0};
+				wlr_box_intersection(&visible, &clip, &output_clip);
+				clip = visible;
+			} else {
+				clip = output_clip;
+			}
+		}
+		if (node->node.parent != NULL) {
+			clip.x -= node->node.parent->node.x;
+			clip.y -= node->node.parent->node.y;
 		}
 		struct wlr_box node_box = {.x = node_x, .y = node_y,
 			.width = dst_w, .height = dst_h};
