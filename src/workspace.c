@@ -976,6 +976,21 @@ static void ws_adopt_column(struct vidow_workspace *target,
 	wl_list_for_each(view, &col->views, column_link) {
 		view->ws = target;
 	}
+	/* **offset / width 清零**：这两个是 arrange_columns() 按「列在工作区条带
+	 * 里排第几个」算的，搬过来之后它在新工作区里的位置还不知道。不清的话它
+	 * 带着**原工作区**的偏移量过来 —— 而 arrange 只处理当前显示的那块工作区
+	 * （output_shown_columns），目标工作区没显示时这条列永远不会被重算：
+	 *
+	 *   原工作区 4 列：col1 @0、col2 @954、col3 @1908、col4 @3817
+	 *   把 col2 搬到空工作区 ws3 → ws3 唯一的列 offset 还是 954
+	 *   切到 ws3 → 窗口摆在 work.x + 954，屏幕外的位置，点不到
+	 *              （用户报的「2x 屏右边点不到」）
+	 *
+	 * 归零就是「条带最左」，切过去那次 arrange 会立刻算出正确值。 */
+	col->offset = 0;
+	col->width = 0;
+	col->screen_x = 0;
+	col->slot_width = 0;
 	/* **无条件**同步（包括 col->output 已经等于 target->output 的情况）：
 	 * 列里的窗口可能有个别 view->output 落在别的屏上（规则搬屏 / 热插拔的
 	 * 中间态），只看列自己的 output 会漏掉它们，之后 view_home_output 和
