@@ -7716,7 +7716,7 @@ static void x11_attach_surface(struct vidow_view *view) {
 		wlr_scene_buffer_set_buffer(view->scene_surface->buffer,
 			&view->x11->surface->buffer->base);
 	}
-	if (view->x11->surface->current.buffer != NULL) {
+	if (view->x11->surface->buffer != NULL) {
 		view_commit(&view->commit, NULL);
 	}
 
