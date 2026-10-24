@@ -4887,10 +4887,18 @@ static void popup_blur_frame(struct vidow_server *server,
 		fx->blur_set.w == rw && fx->blur_set.h == rh &&
 		fx->blur_set.levels == levels &&
 		fabs(fx->blur_set.offset - server->config.blur_offset) < 1e-6;
-	if (!fresh && !popup_region_build(server, output, pb, rx, ry, rw, rh,
-			levels)) {
-		(void)popup_blur_bail(pb, 11, "私有底衬抓不出来");
-		return; /* 抓不出来就留着上一帧那张，别闪 */
+	if (!fresh) {
+		if (!popup_region_build(server, output, pb, rx, ry, rw, rh,
+				levels)) {
+			(void)popup_blur_bail(pb, 11, "私有底衬抓不出来");
+			return; /* 抓不出来就留着上一帧那张，别闪 */
+		}
+		/* 底衬重抓了 = 内容变了，必须重画这一版。同 layer 那条路：
+		 * popup_region_build 不换 blur_own_tex / blur_own_id，blur_assign
+		 * 逐字段比对全部命中就早退、不推进 blur_ver，下面
+		 * blur_drawn == blur_ver 立刻成立 —— 弹出物背后的模糊会一直停在
+		 * 第一次画的那张上。 */
+		fx->blur_ver++;
 	}
 	blur_assign(fx, fx->blur_own_tex, false, fx->blur_own_id,
 		&(struct wlr_box){ .x = rx, .y = ry,
