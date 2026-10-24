@@ -4285,7 +4285,9 @@ static bool layer_blur_frame(struct vidow_server *server,
 		}
 		/* 缓冲和包着它的贴图要一起收：只 drop buffer 会把 ls->bd_tex
 		 * 留成一张悬空贴图（layer 从 top/overlay 切到 bottom 时漏的就是它）。 */
-		layer_bd_drop(ls);
+		if (ls->bd != NULL || ls->bd_tex != NULL) {
+			layer_bd_drop(ls);
+		}
 		blur_assign(fx, output->blur_tex, false, output->blur_id, NULL);
 	}
 	if (ls->blur_fail != 0) {
