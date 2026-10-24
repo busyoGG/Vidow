@@ -6280,6 +6280,12 @@ static void view_map(struct wl_listener *listener, void *data) {
 	struct vidow_view *view = wl_container_of(listener, view, map);
 	struct vidow_server *server = view->server;
 	x11_trace_view("map-enter", view, NULL);
+	/* XWayland reassociation may synthesize map before the real map signal
+	 * arrives. Keep the lifecycle edge idempotent: duplicate map handling would
+	 * reapply rules, focus, animations, and window-opened notifications. */
+	if (view->mapped) {
+		return;
+	}
 
 	view->mapped = true;
 	vidow_portal_view_mapped(view, true);
