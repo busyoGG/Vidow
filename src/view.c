@@ -7709,8 +7709,13 @@ static void x11_attach_surface(struct vidow_view *view) {
 
 	/* Xwayland can associate an already-painted surface after its last commit.
 	 * wlr_scene_surface_create() installs the commit listener, but there may be
-	 * no new commit after this association. Re-run the normal commit path once
-	 * so the existing current buffer is applied to the new scene surface. */
+	 * no new commit after this association. The current client buffer must be
+	 * copied into the new scene buffer explicitly; replaying view_commit() alone
+	 * only updates Vidow bookkeeping and cannot replay wlroots' old commit. */
+	if (view->x11->surface->buffer != NULL) {
+		wlr_scene_buffer_set_buffer(view->scene_surface->buffer,
+			&view->x11->surface->buffer->base);
+	}
 	if (view->x11->surface->current.buffer != NULL) {
 		view_commit(&view->commit, NULL);
 	}
