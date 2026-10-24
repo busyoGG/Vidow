@@ -3484,18 +3484,23 @@ static bool view_region_build(struct vidow_server *server,
 				vidow_view_title(view) : "?");
 			fclose(of);
 		}
-		if (fx->blur_set.up[0] != NULL && rw > 1 && rh > 1) {
-			dump_buffer(server, fx->blur_set.up[0], rw >> 1, rh >> 1,
+		if (sl->blur_set.up[0] != NULL && rw > 1 && rh > 1) {
+			dump_buffer(server, sl->blur_set.up[0], rw >> 1, rh >> 1,
 				"vidow-blur", dumped);
 		}
 		dumped++;
 	}
-	wlr_log(WLR_DEBUG, "blur: own region %s %dx%d at %d,%d levels=%d"
-		"（损伤 %dx%d at %d,%d，%s %dx%d）",
-		vidow_view_title(view) != NULL ? vidow_view_title(view) : "?",
-		rw, rh, rx, ry, levels,
-		dmg.width, dmg.height, dmg.x, dmg.y,
-		partial != NULL ? "局部重跑" : "整块重跑", pw, ph);
+	/* 这一行每次模糊重跑一行（滚动 / 动画里每帧每个窗口都可能触发）。
+	 * 日常使用不该刷，但排查「模糊重跑为什么这么频繁 / 损伤框算错」时它是
+	 * 唯一的线索 —— 用 VIDOW_BLUR_TRACE=1 开，别常驻。 */
+	if (getenv("VIDOW_BLUR_TRACE") != NULL) {
+		wlr_log(WLR_DEBUG, "blur: own region %s %dx%d at %d,%d levels=%d"
+			"（损伤 %dx%d at %d,%d，%s %dx%d）",
+			vidow_view_title(view) != NULL ? vidow_view_title(view) : "?",
+			rw, rh, rx, ry, levels,
+			dmg.width, dmg.height, dmg.x, dmg.y,
+			partial != NULL ? "局部重跑" : "整块重跑", pw, ph);
+	}
 	return true;
 }
 

@@ -2836,6 +2836,8 @@ void vidow_view_anim_bake(struct vidow_view *view) {
 			(double)geo.h * fx_ov) / 2.0);
 	}
 	int64_t bake_t0 = vidow_now_ns();
+	/* 这里以前有一行每次重烘就打的 DEBUG（node/geom/screen_box），日常使用是
+	 * 每帧 × 每个在动的窗口一行 —— 排查摆放错位时临时加回来，别常驻。 */
 	bool fx_drawn = vidow_fx_frame(view->server, &view->fx, src, &geo,
 		mini_cx, mini_cy, x, y, alpha, view->server->focused == view,
 		view->fullscreen, view_scale(view) * fx_ov, fx_ov, &view->rule_eff);
@@ -6644,7 +6646,9 @@ static void view_destroy(struct wl_listener *listener, void *data) {
 static void view_set_title(struct wl_listener *listener, void *data) {
 	(void)data;
 	struct vidow_view *view = wl_container_of(listener, view, set_title);
-	wlr_log(WLR_INFO, "title %s", vidow_view_title(view) != NULL ?
+	/* DEBUG：浏览器每换一个标签页、终端每 cd 一次都会来一行，日常日志里
+	 * 不需要。规则重判 / IPC 广播照旧（它们只在该动的窗口上动）。 */
+	wlr_log(WLR_DEBUG, "title %s", vidow_view_title(view) != NULL ?
 		vidow_view_title(view) : "(untitled)");
 	vidow_portal_view_title(view);
 	/* 规则可能按标题匹配：标题变了要重新判一遍。 */
@@ -7129,26 +7133,76 @@ static void x11_drop_surface(struct vidow_view *view) {
 	 * destroy 监听器或 addon，想挂钩子都不行）。 */
 	view->scene_surface = NULL;
 	view->scene_tree = NULL;
+	x11_trace_view("drop-done", view, NULL);
+	/* Dissociate is not X11 destruction. Keep the view/layout identity, but
+	 * force the next association to replay map and rebuild scene placement. */
+	view->mapped = false;
+	view->x11_map_replayed = false;
+	/* **强制清理缓冲缩放状态**：Steam 二次打开时，pref_scale 残留导致
+	 * 下次 map 时状态机不同步（scene_tree disabled）。和 view_unmap
+	 * 里那处重置逻辑一致（第6460行）。*/
+	view->pref_scale = 0;
+	vidow_portal_view_mapped(view, false);
 }
 
 static void x11_associate(struct wl_listener *listener, void *data) {
 	(void)data;
 	struct vidow_view *view = wl_container_of(listener, view, x11_associate);
+	x11_trace_view("associate", view, view->x11 != NULL ? view->x11->surface : NULL);
 	x11_attach_surface(view);
 	wlr_log(WLR_DEBUG, "x11: associate %s",
 		vidow_view_title(view) != NULL ? vidow_view_title(view) : "(无题)");
+
+	/* map 请求可能比这条关联先到（Steam 关掉再打开时实测就是）：
+	 *
+	 *   19.002  map_request   —— 此时 view->x11->surface 还是 NULL，
+	 *                            前置条件一条都不满足，事件就这么丢了
+	 *   19.015  attach        —— 场景树刚建好
+	 *   19.015  associate     —— 本函数
+	 *
+	 * 而 X 侧窗口从此一直是 IsViewable，不会再补发一次 map 请求 —— 画面就
+	 * 永远不上屏，`vidowmsg windows` 里也查不到它（用户报的「重开黑屏」）。
+	 *
+	 * 所以关联完再问一次 X 服务器的真实状态：窗口已经是 viewable 就直接走
+	 * 一遍 map。x11_replay_map_if_xmapped 自己按 x11_map_replayed 去重，
+	 * 重复调用是安全的。 */
+	if (view->x11 != NULL && view->x11->window_id != XCB_WINDOW_NONE) {
+		struct wlr_xwayland_surface *xs = view->x11;
+		if (!view->mapped && x11_window_is_viewable(view->server, xs)) {
+			x11_replay_map_if_xmapped(view);
+		}
+	}
 }
 
 static void x11_dissociate(struct wl_listener *listener, void *data) {
 	(void)data;
 	struct vidow_view *view = wl_container_of(listener, view, x11_dissociate);
+	x11_trace_view("dissociate", view, NULL);
 	x11_drop_surface(view);
+}
+
+static void x11_map_request(struct wl_listener *listener, void *data) {
+	(void)data;
+	struct vidow_view *view = wl_container_of(listener, view, x11_map_request);
+	if (view->x11 != NULL && view->x11->surface != NULL &&
+			view->x11->surface->mapped && view->scene_tree != NULL &&
+			!view->mapped) {
+			x11_replay_map_if_xmapped(view);
+	}
 }
 
 static void x11_set_title(struct wl_listener *listener, void *data) {
 	(void)data;
 	struct vidow_view *view = wl_container_of(listener, view, x11_set_title);
-	wlr_log(WLR_INFO, "title %s", vidow_view_title(view) != NULL ?
+	/* Xwayland can emit the first property update in the same batch as
+	 * association. If the association was already complete when this view was
+	 * created, this is the next safe point to attach the scene surface. */
+	if (view->x11 != NULL && view->scene_tree == NULL &&
+			view->x11->surface != NULL) {
+		x11_attach_surface(view);
+	}
+	/* DEBUG：同 view_set_title()，日常日志不需要每换一次标题就一行。 */
+	wlr_log(WLR_DEBUG, "title %s", vidow_view_title(view) != NULL ?
 		vidow_view_title(view) : "(无题)");
 	vidow_portal_view_title(view);
 	vidow_rule_apply(view->server, view);
