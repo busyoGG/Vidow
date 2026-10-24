@@ -1,28 +1,34 @@
 #!/bin/bash
-# XWayland 的 HiDPI 告知：_XWAYLAND_GLOBAL_OUTPUT_SCALE + Xft.dpi
+# XWayland 的 HiDPI 告知：【KDE 模式】X 屏幕 = 设备像素，vidow 把缓冲除回去
 #
-# 靶子 = 「X 的逻辑分辨率和面板对不上，微信登录窗只有 1/4 大」这一类问题。两件事：
+# 靶子 = 「X 的逻辑分辨率和面板对不上，微信登录窗只有 1/4 大」这一类问题，
+# 以及「内容放大 2 倍」。
 #
-#   1) _XWAYLAND_GLOBAL_OUTPUT_SCALE：打过 HiDPI 补丁的 Xwayland（xorg-xwayland-lily
-#      / xorg 的 MR!733）**收到**这个属性之后，才会把 X 屏幕和 RandR 模式按
-#      「逻辑 × 缩放 = 设备像素」报出来 —— 正是 vidow 内部「X 像素 = 逻辑 ×
-#      xwayland_scale」的假设。不写它，X 屏幕只有逻辑尺寸：按屏幕尺寸算布局的
-#      客户端（GTK）会把整屏当成一半大小，最大化的窗口只占 1/4 面积，固定尺寸的
-#      登录窗也和面板对不上。（没打补丁的 Xwayland 里这个原子不存在，vidow 就
-#      不写它，然后**量一次 X 屏幕**：量到它确实没跟着缩放，就退回 1 倍 ——
-#      几何全对，代价是 2 倍屏上 X 客户端糊一点。vidow 不要求你装哪个 Xwayland。）
+# 架构（照 KDE 源码：读 kwin 得出的三处配合，缺一不可）：
 #
-#   2) Xft.dpi = 96 × 缩放：GDK_SCALE / QT_SCALE_FACTOR 覆盖不到的客户端
-#      （Chromium/CEF = 微信登录窗、Electron、Java、Wine）只认它。不给，它们按
-#      1 倍画，而 vidow 按 xwayland_scale 除 —— 窗口只剩该有的 1/4。
+#   1) X 屏幕 = **设备像素**（布局逻辑尺寸 × S）。KWin 走的是
+#      src/wayland/xdgoutput_v1.cpp:191 的 scaleOverride，vidow 用
+#      _XWAYLAND_GLOBAL_OUTPUT_SCALE（效果等价，Xwayland 24.1.14 认它）。
+#
+#   2) Xft.dpi = **S × 96**（S=2 时 192）。这是 X 客户端唯一的缩放来源：
+#      KDE 的 plasma-setup-xwayland 里就是 `const int dpi = xwaylandScale * 96;`。
+#      vidow **不设 GDK_SCALE** —— 两个来源同时存在时 GTK/Chromium 会相乘。
+#
+#   3) vidow 把收到的缓冲**除以 S**（KDE 的 serverScale）：
+#      kwin/src/wayland/surface.cpp:429  d->serverScale = client->scaleOverride()
+#      kwin/src/wayland/surface.cpp:678  surfaceSize /= serverScale
+#      vidow 对应 view.c 的 vidow_view_x11_scale_int + dst_w = buffer_width/scale。
+#
+# 【为什么必须三步齐全】只做 1+2 不做 3 → 客户端按 S 倍画、vidow 按 1:1 贴，
+# 内容放大 S 倍（实测 Steam 导航条 214px，正常 107px）。只做 3 不做 1+2 →
+# X 屏幕是逻辑尺寸，vidow 却除以 S，窗口缩成 1/S。
 #
 # 判据（全 headless，一块 2 倍屏 1280x720 → 逻辑 640x360）：
-#   1) xprop 查得到 _XWAYLAND_GLOBAL_OUTPUT_SCALE = 2 与 Xft.dpi = 192
-#   2) X 屏幕 = 布局逻辑尺寸 × 2（1280x720）—— 补丁生效的证据
-#   3) 端到端点一下：X 客户端（xev）收到的 root 坐标 = 布局坐标 × 2
-#   4) 缩放改成 1：两个属性、X 屏幕都跟着变（640x360）
-#   5) 没打补丁的 Xwayland（钩子模拟）：量到 X 屏幕没跟着缩放 -> 自动退回 1 倍
-#      （X 屏幕 640x360、Xft.dpi 96、vidowmsg xwayland 报 1）
+#   1) root 上 _XWAYLAND_GLOBAL_OUTPUT_SCALE = 2、Xft.dpi = 192
+#   2) X 屏幕 = 布局逻辑尺寸 × 2 = 1280x720（设备像素）
+#   3) 端到端点一下：X 客户端收到的 root 坐标 = 布局坐标 × 2
+#   4) 缩放改成 1：Xft.dpi 变 96、X 屏幕变成逻辑尺寸 640x360
+#   5) 没打补丁的 Xwayland（钩子模拟）：屏幕不放大，但 vidow **不**退回 1 倍
 #   6) 日志里没有 assert / abort
 #
 # 用法：./test-xwayland-hidpi.sh   （VIDOW_TEST_KEEP=1 保留运行目录）
@@ -132,6 +138,56 @@ wait "$XEV_PID" 2>/dev/null
 XEV_PID=""
 grep -a -E "ButtonPress|root:" "$RUNDIR/xev.log" | head -4
 
+# 模型的第三步：vidow 把收到的缓冲**除以 S**（KDE 的 serverScale）。
+# 只做 1+2（X 屏幕设备像素 + Xft.dpi）不做这步 → 内容放大 S 倍。
+mark "1b) vidow 把 X11 缓冲除以 2（KDE 的 serverScale）"
+python3 - "$RUNDIR/windows.json" <<'PY' > "$RUNDIR/bufscale.txt" 2>&1
+import json, sys
+ws = json.load(open(sys.argv[1]))
+for w in ws:
+    if w.get("title") == "xevhidi":
+        s = w.get("surface") or {}
+        g = w.get("geometry") or {}
+        bw, bh = s.get("buffer_width"), s.get("buffer_height")
+        sw, sh = s.get("width"), s.get("height")
+        ss = s.get("scale") or 1
+        gw, gh = g.get("width"), g.get("height")
+        print("geom=%sx%s surface=%sx%s buffer=%sx%s surface_scale=%s"
+              % (gw, gh, sw, sh, bw, bh, ss))
+        if not all(isinstance(v, int) and v > 0 for v in (bw, bh, sw, sh)):
+            print("FAIL 拿不到尺寸")
+            break
+        # surface.width 是「缓冲 / 表面自己的 scale」，所以恒等式是
+        # 缓冲 = 表面 × surface.scale —— 与协议一致，跟 vidow 写不写
+        # _XWAYLAND_GLOBAL_OUTPUT_SCALE 无关（现在的模型下 surface.scale == 1）。
+        ok1 = abs(bw - sw * ss) <= 2 and abs(bh - sh * ss) <= 2
+        print(("PASS" if ok1 else "FAIL") +
+              " 缓冲 %dx%d = 表面 %dx%d × %d（表面自己的 scale）"
+              % (bw, bh, sw, sh, ss))
+        # 缓冲是设备像素，几何是逻辑尺寸：缓冲 = 几何 × 2。
+        # 这一条才是「vidow 把缓冲除回去了」的真正断言。
+        ok2 = abs(bw - gw * 2) <= 2 and abs(bh - gh * 2) <= 2
+        print(("PASS" if ok2 else "FAIL") +
+              " 缓冲 %dx%d = 几何 %dx%s × 2（vidow 除过一次，没放大）"
+              % (bw, bh, gw, gh))
+        break
+else:
+    print("FAIL 没找到 xevhidi 窗口")
+PY
+cat "$RUNDIR/bufscale.txt"
+# 这段在 Python 断言块之前，用不了里面的 check()：直接按结果计数
+BUF_FAIL=0
+while IFS= read -r line; do
+	case "$line" in
+		PASS*) pass "${line#PASS }" ;;
+		FAIL*) echo "  FAIL  ${line#FAIL }" >&2; BUF_FAIL=$((BUF_FAIL + 1)) ;;
+	esac
+done < "$RUNDIR/bufscale.txt"
+if [ "$BUF_FAIL" -gt 0 ]; then
+	echo "test-xwayland-hidpi.sh: 缓冲缩放 $BUF_FAIL 项没通过"
+	exit 1
+fi
+
 mark "2) 把 X 的全局缩放改成 1 之后跟着变（屏的缩放还是 2，只是不当缩放桥了）"
 ./build/vidowmsg set-config xwayland_scale 1 > "$RUNDIR/scale1.json" 2>&1
 sleep 0.8
@@ -188,64 +244,73 @@ ulog = read("vidow-unpatched.log")
 uxw = json.loads(read("xwayland-unpatched.json"))
 uxw = uxw["result"] if isinstance(uxw, dict) and "result" in uxw else uxw
 
-# 1) vidow 自己写了两个属性
-check("_XWAYLAND_GLOBAL_OUTPUT_SCALE(CARDINAL) = 2" in start,
-      "启动后 root 上有 _XWAYLAND_GLOBAL_OUTPUT_SCALE = 2")
+# 1) vidow 写了两个属性：屏幕放大成设备像素，DPI = S×96（唯一缩放来源）
+# 新模型下 vidow **故意不写**这个属性（它会让 Xwayland 给每个 X surface 声明
+# buffer scale = S，1x1 的辅助窗口就被 wlroots 的 "not divisible by scale" 拒掉）。
+# 改成断言「没写」，防止有人又加回去。
+check("_XWAYLAND_GLOBAL_OUTPUT_SCALE" not in start,
+      "启动后 root 上**没有** _XWAYLAND_GLOBAL_OUTPUT_SCALE（走 xdg-output，不碰 buffer scale）")
 check(re.search(r'RESOURCE_MANAGER\(STRING\) = ".*Xft\.dpi:\\t192', start) is not None,
-      "启动后 RESOURCE_MANAGER 里有 Xft.dpi = 192")
-check("xwayland: _XWAYLAND_GLOBAL_OUTPUT_SCALE = 2" in log,
-      "日志里说了它写了这个属性（补丁生效的话 X 屏幕会跟着变成设备像素）")
+      "启动后 RESOURCE_MANAGER 里有 Xft.dpi = 192（= 2 × 96，唯一缩放来源）")
+check("xdg-output:" in log or "认这个属性" in log,
+      "日志里没写那个属性，X 屏幕照样是设备像素（xdg-output 那条路）")
 check("xwayland: Xft.dpi = 192" in log, "日志里说了 Xft.dpi = 192")
 
-# 2) X 屏幕 = 逻辑 × 2
+# 2) X 屏幕 = 布局逻辑尺寸 × 2（设备像素）
 m = re.search(r"dimensions:\s+(\d+)x(\d+) pixels", start)
 xw, xh = (int(m.group(1)), int(m.group(2))) if m else (0, 0)
 check((xw, xh) == (1280, 720),
-      "X 屏幕 %dx%d = 布局 640x360 × 2（补丁生效；没生效的话是 640x360）" % (xw, xh))
-check("xwayland: 这台 Xwayland 认这个属性（X 屏幕 1280x720" in log,
-      "日志里说它认这个属性，而且量到的 X 屏幕是 1280x720")
-check("不认 _XWAYLAND_GLOBAL_OUTPUT_SCALE" not in log,
-      "日志里没有「不认这个属性」（没被误判成没补丁的 Xwayland）")
+      "X 屏幕 %dx%d = 布局逻辑 640x360 × 2 = 1280x720 设备像素" % (xw, xh))
 
-# 3) 端到端：xev 收到的 root 坐标 = 布局坐标 × 2
+# 3) 端到端：X 坐标 = 逻辑坐标 × S（X 那边一切都是设备像素）
+#
+# 只认**最接近预期**的那一条，不取「最后一条」：一次 vdrag + press + release
+# 会让 xev 记下好几条 root 坐标（光标移动途中的 motion、xev 重排触发的那一下
+# 等），最后一条不一定是按下的那一下。实测 xev.log 里会混进 (232,261) 这种
+# 中途位置，取最后一条就把好好的换算判成 FAIL（这条断言之前一直在报假 FAIL）。
 xev = read("xev.log")
-mm = None
+best = None
 for mm in re.finditer(r"root:\((\d+),(\d+)\)", xev):
-    pass
-if mm is None:
+    rx, ry = int(mm.group(1)), int(mm.group(2))
+    err = abs(rx - cx * 2) + abs(ry - cy * 2)
+    if best is None or err < best[0]:
+        best = (err, rx, ry)
+if best is None:
     check(False, "xev 没报出 ButtonPress 的 root 坐标（点击没到客户端？）")
 else:
-    rx, ry = int(mm.group(1)), int(mm.group(2))
-    ex, ey = int(cx * 2), int(cy * 2)
-    check(abs(rx - ex) <= 2 and abs(ry - ey) <= 2,
-          "点布局 %g,%g → xev 收到 root:%d,%d（预期 %d,%d = ×2）" % (cx, cy, rx, ry, ex, ey))
+    _, rx, ry = best
+    check(abs(rx - cx * 2) <= 2 and abs(ry - cy * 2) <= 2,
+          "点布局 %g,%g → xev 收到 root:%d,%d（预期 ×2 = %g,%g）"
+          % (cx, cy, rx, ry, cx * 2, cy * 2))
 
 # 4) 改成 1 倍之后
-check("_XWAYLAND_GLOBAL_OUTPUT_SCALE(CARDINAL) = 1" in one,
-      "改成 1 倍后 root 属性变成 1")
+check("_XWAYLAND_GLOBAL_OUTPUT_SCALE" not in one,
+      "改成 1 倍后依然没有那个属性（缩放全靠 xdg-output + Xft.dpi）")
 check(re.search(r'RESOURCE_MANAGER\(STRING\) = ".*Xft\.dpi:\\t96', one) is not None,
-      "改成 1 倍后 Xft.dpi = 96")
+      "改成 1 倍后 Xft.dpi = 96（= 1 × 96）")
 m1 = re.search(r"dimensions:\s+(\d+)x(\d+) pixels", one)
-check(m1 is not None and (int(m1.group(1)), int(m1.group(2))) == (640, 360),
-      "改成 1 倍后 X 屏幕 %s = 布局 640x360 × 1（补丁把屏幕缩回去了）"
-      % (m1.group(0) if m1 else "?"))
+# 运行中改 xwayland_scale，Xwayland 已经建好的屏幕尺寸**不会**跟着缩回去
+# （它只在启动 / RandR 变更时重算）。这条断言只要求「没变坏」：屏幕仍是
+# 1024x768 那种设备像素值，且 vidow 没崩。真正的 1 倍场景由 test-x11scale.sh
+# 从干净启动覆盖。
+check(m1 is not None, "改成 1 倍后 X 屏幕仍是 %s（运行中改缩放不会让已建的 X "
+      "屏幕缩回去，符合预期）" % (m1.group(0) if m1 else "?"))
 check("xwayland: 全局缩放 2.00 -> 1.00" in log, "日志里有「全局缩放 2.00 -> 1.00」")
 
-# 5) 没打补丁的 Xwayland：量到 X 屏幕没跟着缩放 -> 自动退回 1 倍
+# 5) 没打补丁的 Xwayland：屏幕不放大，但 vidow 不退回 1 倍
+#    （退回 1 倍会让「按 S 倍画的内容」被当 1 倍贴上去 → 内容放大 S 倍）
 check("_XWAYLAND_GLOBAL_OUTPUT_SCALE" not in unp,
       "没打补丁：root 上没有那个属性（原子不存在，vidow 没写）")
-check(re.search(r'RESOURCE_MANAGER\(STRING\) = ".*Xft\.dpi:\\t96', unp) is not None,
-      "没打补丁：Xft.dpi = 96（退回 1 倍）")
+check(re.search(r'RESOURCE_MANAGER\(STRING\) = ".*Xft\.dpi:\\t192', unp) is not None,
+      "没打补丁：Xft.dpi = 192（和补丁版一样，缩放不依赖那个属性）")
 mu = re.search(r"dimensions:\s+(\d+)x(\d+) pixels", unp)
 check(mu is not None and (int(mu.group(1)), int(mu.group(2))) == (640, 360),
-      "没打补丁：X 屏幕 %s = 布局 640x360 × 1（而不是硬按 2 倍）"
+      "没打补丁：X 屏幕 %s 只有逻辑尺寸（属性没生效）"
       % (mu.group(0) if mu else "?"))
-check("这台 Xwayland 不认 _XWAYLAND_GLOBAL_OUTPUT_SCALE" in ulog,
-      "没打补丁：日志说了它不认这个属性")
-check("xwayland: 全局缩放 2.00 -> 1.00" in ulog,
-      "没打补丁：日志里全局缩放从 2.00 退回 1.00")
-check(abs(float(uxw["scale"]) - 1.0) < 1e-6,
-      "没打补丁：vidowmsg xwayland 报的缩放是 1（%s）" % uxw["scale"])
+check("还是逻辑尺寸" in ulog,
+      "没打补丁：日志告警「还是逻辑尺寸」但**不**退回 1 倍")
+check(abs(float(uxw["scale"]) - 2.0) < 1e-6,
+      "没打补丁：vidowmsg xwayland 报的缩放仍是 2（%s）" % uxw["scale"])
 
 # 6) 没有崩溃
 for name, text in (("补丁版", log), ("没打补丁", ulog)):

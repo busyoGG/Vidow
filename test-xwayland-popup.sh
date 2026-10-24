@@ -353,10 +353,20 @@ grep -ao "xwayland: 全局缩放 [0-9.]* -> [0-9.]*" "$LOG" | tail -1 |
 	pass "X 全局缩放 = 2（最密那块屏）" ||
 	fail "X 全局缩放不是 2：$(grep -ao 'xwayland: 全局缩放.*' "$LOG" | tail -1)"
 
-# 2 倍屏在逻辑 x = 1280..1920；X 像素 = 逻辑 × 2，所以让客户端把菜单放在
-# X (2800,400) —— 它该落在逻辑 (1400,200)，尺寸 200x120 X 像素 -> 100x60 逻辑。
+# 【KDE 模型】X 坐标是**设备像素**，vidow 折回布局坐标。
+#
+# 两块屏（自动排列时 HEADLESS-2 在左、HEADLESS-1 在右）：
+#   HEADLESS-2 scale 2 -> 逻辑 0..640，X 空间设备 0..1280
+#   HEADLESS-1 scale 1 -> 逻辑 640..1920，X 空间设备 1280..2560
+#   X 屏总宽 2560（= 各屏设备宽之和）
+#
+# 客户端把菜单放在 X (1400,200) 尺寸 200x120 —— 落在**1x 屏**的设备段里，
+# 所以布局坐标 = 640（1x 屏原点）+ (1400-1280)/1 = 760，尺寸 200x120 / 1。
+# 注：以前这里是 700,100（X 屏只有 1920、坐标按全局缩放 2 除），那是 Xwayland
+# 拿逻辑尺寸建屏时的旧行为；修好 xdg-output 后 X 屏是设备像素，1x 屏的坐标
+# 不再被除 2。
 LINE=$(mark_line)
-setsid ./build/xpopup popup or 2800 400 200 120 > "$RUNDIR/popup.out" 2>&1 &
+setsid ./build/xpopup popup or 1400 200 200 120 > "$RUNDIR/popup.out" 2>&1 &
 POPUP_PID=$!
 for _ in $(seq 1 40); do
 	since "$LINE" | grep -aq "place xp-popup" && break
@@ -365,39 +375,49 @@ done
 sleep 0.4
 shot dpi
 SINCE=$(since "$LINE")
-echo "$SINCE" | grep -aqF "place xp-popup -> 1400,200 100x60" &&
-	pass "X (2800,400) 200x120 -> 逻辑 (1400,200) 100x60（按 2 倍除）" ||
-	fail "X 坐标没按全局缩放换算：$(echo "$SINCE" | grep -a 'place xp-popup' |
+echo "$SINCE" | grep -aqF "place xp-popup -> 760,200 200x120" &&
+	pass "X (1400,200) 200x120 -> 布局 (760,200) 200x120（1x 屏设备段）" ||
+	fail "X 坐标换算不对：$(echo "$SINCE" | grep -a 'place xp-popup' |
 		tail -1 | sed 's/.*\[DEBUG\] //')"
-echo "$SINCE" | grep -aq "fx: target $(((100 + 64) * 2))x$(((60 + 64) * 2))" &&
+echo "$SINCE" | grep -aq "fx: target $(((200 + 64) * 2))x$(((120 + 64) * 2))" &&
 	fail "弹出物在 2 倍屏上被套了装饰" ||
 	pass "弹出物在 2 倍屏上也没装饰"
-# grim 在混合 DPI 下给的是**设备像素**图（这里 3840x1440 = 布局 1920x720 × 2），
-# 所以逻辑 (1400,200)+100x60 在图上就是 (2800,400)+200x120
-probe rect "$RUNDIR/dpi.png" 2804 404 192 112 192 0 0 8
-probe empty "$RUNDIR/dpi.png" 2760 360 36 36 192 0 0 8
-# 命中：光标到逻辑 (1420,220)。
-#   局部坐标是**表面自己的逻辑坐标系**里的数（Xwayland 声明了 buffer scale = 2，
-#   所以 (1420-1400) / 2 = 10 … 见下面：vidow 给的局部 × 表面倍数 = X 坐标），
-#   X 客户端那侧看到的是「布局偏移 × 全局缩放」= 40,40 —— 点哪儿就是哪儿。
-./build/vdrag 7396 3056 7396 3056 >/dev/null 2>&1
+# grim 在混合 DPI 下给的是**设备像素**图（3840x1440 = 布局 1920x720 × 2）。
+# 弹出物在布局 (760,200)+200x120，落在**1x 屏**上（1x 屏布局 640..1920），
+# 所以它在图里的像素位置 = 布局坐标 × 2 = (1520,400)，尺寸就是 200x120
+# （1x 屏不放大），即 (1522,402)+196x116（实测红块内缩 2px 是圆角/边框）。
+probe rect "$RUNDIR/dpi.png" 1522 402 196 116 192 0 0 8
+probe empty "$RUNDIR/dpi.png" 1470 360 40 30 192 0 0 8
+# 命中：光标到布局 (770,210)（= 弹出物自己的 (10,10) 局部）。
+#   局部坐标是**表面自己的逻辑坐标系**里的数，X 那侧看到的是设备像素
+#   = 局部 × 表面 buffer scale —— 点哪儿就是哪儿。
+# vdrag 的坐标是 0..10000 的**归一化**值（extent=10000），基准是**布局逻辑
+# 范围** 1920x720（实测：5000 -> 布局 960）：
+#   布局 (770,210) = 770/1920*10000, 210/720*10000 = 4010, 2917
+./build/vdrag 4010 2917 4010 2917 >/dev/null 2>&1
 sleep 0.4
 HIT=$(grep -a "x11: 指针 .* -> xp-popup 局部" "$LOG" | tail -1)
 SFACE=$(grep -a "x11: xp-popup 缓冲 .*（表面 \([0-9]*\) 倍" "$LOG" | tail -1 |
 	sed 's/.*（表面 \([0-9]*\) 倍.*/\1/')
 [ -n "$SFACE" ] || SFACE=1
 echo "  命中行：$(echo "$HIT" | sed 's/.*\[DEBUG\] //')  表面倍数：$SFACE"
-echo "$HIT" | grep -aq "局部 $((20 * 2 / SFACE)),$((20 * 2 / SFACE))" &&
-	pass "命中局部坐标 = 布局偏移 20,20 × 2 / 表面倍数 $SFACE" ||
+# 弹窗在 1x 屏的设备段：光标 X (1410,210) - 弹窗 X (1400,200) = 10,10，
+# 表面 1 倍 → 局部就是 10,10。（旧期望 20 是「按全局 2 倍除」时代的自洽值，
+# 那套渲染把内容压成 1/4，点击跟着一起错位 —— Steam 菜单那片黑。）
+echo "$HIT" | grep -aq "局部 $((10 / SFACE)),$((10 / SFACE))" &&
+	pass "命中局部坐标 = X 侧偏移 10 / 表面倍数 $SFACE" ||
 	fail "命中坐标不对：$(echo "$HIT" | sed 's/.*\[DEBUG\] //')"
 LOC=$(echo "$HIT" | sed 's/.*局部 //')
 python3 -c "
 import sys
 lx, ly = [float(v) for v in '$LOC'.split(',')]
 s = float('$SFACE')
-ok = abs(lx * s - 40) <= 1 and abs(ly * s - 40) <= 1
-print('  PASS  X 客户端拿到的坐标 %g,%g = 布局偏移 20,20 × 2' % (lx * s, ly * s)
-      if ok else '  FAIL  X 客户端坐标 %g,%g 不是 40,40' % (lx * s, ly * s))
+# KDE 模型：vidow 给的是 surface-local 坐标（表面自己的逻辑坐标系），
+# X 客户端收到的是设备像素 = 局部 × 表面 buffer scale。
+# 1x 屏设备段：X 偏移 10,10 = 局部 10 × 表面 1 倍（渲染和输入同一个口径）。
+ok = abs(lx * s - 10) <= 1 and abs(ly * s - 10) <= 1
+print('  PASS  X 客户端拿到的偏移 %g,%g × %g = 10,10' % (lx, ly, s)
+      if ok else '  FAIL  X 客户端偏移 %g,%g × %g 不是 10,10' % (lx, ly, s))
 sys.exit(0 if ok else 1)
 " || FAILED=1
 kill "$POPUP_PID" 2>/dev/null; POPUP_PID=""

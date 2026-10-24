@@ -145,13 +145,45 @@ static struct wlr_buffer *jelly_src_buffer(struct wlr_buffer *buffer) {
 	return buffer;
 }
 
-/* 源：窗口那份带装饰的离屏图，也就是 fx 节点正在显示的缓冲。 */
-static struct wlr_buffer *jelly_source(struct vidow_jelly *jelly) {
-	struct vidow_fx_target *fx = &jelly->view->fx;
-	if (!fx->active || fx->node == NULL) {
+/* Per-output decorations replace the legacy FX node. Sample the instance
+ * actually carrying this view's pixels, never the disabled startup snapshot.
+ * Opacity is intentionally ignored: the source is hidden while jelly draws. */
+static struct wlr_scene_buffer *jelly_source_node(struct vidow_view *view,
+		double *scale) {
+	struct vidow_fx_target *fx = &view->fx;
+	if (!fx->active) {
 		return NULL;
 	}
-	return fx->node->buffer;
+	struct vidow_blur_slot *fallback = NULL;
+	for (struct vidow_blur_slot *sl = fx->blur_slot; sl; sl = sl->next) {
+		if (sl->node == NULL || !sl->node->node.enabled ||
+				sl->node->buffer == NULL || !sl->dec_valid) {
+			continue;
+		}
+		if (sl->out == view->output) {
+			*scale = sl->dec_scale;
+			return sl->node;
+		}
+		if (fallback == NULL) {
+			fallback = sl;
+		}
+	}
+	if (fallback != NULL) {
+		*scale = fallback->dec_scale;
+		return fallback->node;
+	}
+	if (fx->node != NULL && fx->node->node.enabled &&
+			fx->node->buffer != NULL) {
+		*scale = fx->scale;
+		return fx->node;
+	}
+	return NULL;
+}
+
+static struct wlr_buffer *jelly_source(struct vidow_jelly *jelly) {
+	double scale = 1.0;
+	struct wlr_scene_buffer *node = jelly_source_node(jelly->view, &scale);
+	return node != NULL ? node->buffer : NULL;
 }
 
 static int clampi(int v, int lo, int hi) {
@@ -180,6 +212,18 @@ static double jelly_node_xf(struct vidow_jelly *jelly, int row, int col) {
 	double x = jelly->margin_px + step * col +
 		(double)jelly->ox[k] * jelly->scale * jelly->strength * jelly->kill;
 	return clampd(x, 0.0, (double)jelly->buf_w);
+}
+
+/* 同一格**没形变时**的位置：只有 margin + step*index，不含 ox/oy 位移。
+ * 模糊 UV 用它 —— 底衬是屏幕上已经烘好的背景，不参与形变（见 render 里那段）。 */
+static double jelly_rest_xf(struct vidow_jelly *jelly, int col) {
+	double step = (double)jelly->src_w / (double)jelly->cols;
+	return jelly->margin_px + step * (double)col;
+}
+
+static double jelly_rest_yf(struct vidow_jelly *jelly, int row) {
+	double step = (double)jelly->src_h / (double)jelly->rows;
+	return jelly->margin_px + step * (double)row;
 }
 
 static double jelly_node_yf(struct vidow_jelly *jelly, int row, int col) {
@@ -298,10 +342,11 @@ bool vidow_jelly_begin(struct vidow_view *view) {
 	if (view->scene_tree == NULL || view->popup) {
 		return false;
 	}
-	struct vidow_fx_target *fx = &view->fx;
 	/* 果冻的源是 fx 那份带装饰的离屏图：没有它就没东西可弯（比如装饰和
 	 * shader 都关着）。 */
-	if (!fx->active || fx->node == NULL || fx->node->buffer == NULL) {
+	double source_scale = 1.0;
+	struct wlr_scene_buffer *source = jelly_source_node(view, &source_scale);
+	if (source == NULL) {
 		return false;
 	}
 	/* 入场动画还在缩放 / overview 里：这两条路上装饰节点的位置尺寸每帧都在变，
@@ -310,13 +355,13 @@ bool vidow_jelly_begin(struct vidow_view *view) {
 			fabs(vidow_overview_scale(server) - 1.0) > 0.01) {
 		return false;
 	}
-	if (fx->w < 8 || fx->h < 8) {
+	if (source->buffer->width < 8 || source->buffer->height < 8) {
 		return false;
 	}
 
 	int tx = 0, ty = 0, fx_x = 0, fx_y = 0;
 	wlr_scene_node_coords(&view->scene_tree->node, &tx, &ty);
-	wlr_scene_node_coords(&fx->node->node, &fx_x, &fx_y);
+	wlr_scene_node_coords(&source->node, &fx_x, &fx_y);
 
 	struct vidow_jelly *jelly = calloc(1, sizeof(*jelly));
 	if (jelly == NULL) {
@@ -324,9 +369,9 @@ bool vidow_jelly_begin(struct vidow_view *view) {
 	}
 	jelly->server = server;
 	jelly->view = view;
-	jelly->src_w = fx->w;
-	jelly->src_h = fx->h;
-	jelly->scale = fx->scale > 0.0 ? fx->scale : 1.0;
+	jelly->src_w = source->buffer->width;
+	jelly->src_h = source->buffer->height;
+	jelly->scale = source_scale > 0.0 ? source_scale : 1.0;
 	jelly->last_rel_x = fx_x - tx;
 	jelly->last_rel_y = fx_y - ty;
 	jelly->kill = 1.0;
@@ -571,6 +616,10 @@ static void jelly_render(struct vidow_jelly *jelly) {
 	int bh = fx->blur_tex_h > 0 ? fx->blur_tex_h : out_h;
 	if (bw < 1) bw = 1;
 	if (bh < 1) bh = 1;
+	/* 节点位置是**逻辑**像素（场景图就是逻辑像素），乘 s 换到输出的设备像素，
+	 * 才和底衬贴图（按设备像素抓）同一个口径。实测 2 倍屏：tree=486、节点
+	 * =402，差 84 正是 margin(72)+阴影(12) 的逻辑偏移 —— 说明 coords 不含
+	 * 倍率，必须乘。 */
 	int node_x = 0, node_y = 0;
 	if (blur_ok) {
 		wlr_scene_node_coords(&jelly->node->node, &node_x, &node_y);
@@ -608,8 +657,23 @@ static void jelly_render(struct vidow_jelly *jelly) {
 				w[2] = us[k];
 				w[3] = vs[k];
 				if (blur_ok) {
-					float sx = (float)((double)node_x * s) + xs[k];
-					float sy = (float)((double)node_y * s) + ys[k];
+					/* 模糊 UV 必须用**这一格没形变时的静止位置**，不能用 xs[]：
+					 * xs[] 里含形变位移（jelly_node_xf 的
+					 * `+ ox[k] * scale * strength * kill`），拿它算 UV 就等于
+					 * 让底衬跟着网格一起弯 —— 用户报的「背景跟着窗口扭曲」。
+					 *
+					 * 底衬是从**屏幕上**采的（同一帧烘好的背景），它不参与形变：
+					 * 顶点在屏幕上滑到哪，就该去采样它此刻压住的那块背景像素。
+					 * 所以位置用形变后的（w[0]/w[1]，照常弯），UV 用静止的
+					 * （margin + step*col/row，不含位移）。 */
+					/* 6 个顶点依次是：(i,j) (i,j+1) (i+1,j) (i,j+1)
+					 * (i+1,j+1) (i+1,j) —— 和上面 xs[]/ys[] 的顺序一一对应。 */
+					static const int dx6[6] = {0, 1, 0, 1, 1, 0};
+					static const int dy6[6] = {0, 0, 1, 0, 1, 1};
+					float sx = (float)((double)node_x * s) +
+						(float)jelly_rest_xf(jelly, j + dx6[k]);
+					float sy = (float)((double)node_y * s) +
+						(float)jelly_rest_yf(jelly, i + dy6[k]);
 					float *b = jelly->blur_verts + (size_t)(n + k) * 6;
 					b[0] = xs[k];
 					b[1] = ys[k];
@@ -662,6 +726,8 @@ static void jelly_render(struct vidow_jelly *jelly) {
 				jelly->mask_buf = mb != NULL ? wlr_buffer_lock(mb) : NULL;
 			}
 			jelly->mask_tex = vidow_fx_client_texture(server, mb,
+				jelly->view->scene_surface != NULL ?
+					jelly->view->scene_surface->buffer : NULL,
 				&jelly->mask_owned);
 		}
 		/* 目标缓冲比 fx 缓冲四周多一圈 JELLY_MARGIN，窗口矩形在目标
@@ -729,11 +795,13 @@ void vidow_jelly_tick(struct vidow_server *server, int64_t now_ns) {
 		if (jelly == NULL) {
 			continue;
 		}
-		struct vidow_fx_target *fx = &view->fx;
-		/* 源换了尺寸（窗口改了大小 / 输出换了倍率）：网格对不上，直接收掉。 */
-		if (!fx->active || fx->node == NULL || fx->w != jelly->src_w ||
-				fx->h != jelly->src_h ||
-				fabs(fx->scale - jelly->scale) > 1e-3) {
+		double source_scale = 1.0;
+		struct wlr_scene_buffer *source = jelly_source_node(view, &source_scale);
+		/* Validate the same instance we sample, not the last output baked. */
+		if (!view->mapped || view->scene_tree == NULL || source == NULL ||
+				source->buffer->width != jelly->src_w ||
+				source->buffer->height != jelly->src_h ||
+				fabs(source_scale - jelly->scale) > 1e-3) {
 			vidow_jelly_end(view);
 			continue;
 		}
@@ -775,7 +843,7 @@ void vidow_jelly_tick(struct vidow_server *server, int64_t now_ns) {
 		 * CSD 留白、输出倍率变化都在这里面（节点位置跟着它摆，源和结果才
 		 * 严丝合缝地叠在一起）。 */
 		int fx_x = 0, fx_y = 0;
-		wlr_scene_node_coords(&fx->node->node, &fx_x, &fx_y);
+		wlr_scene_node_coords(&source->node, &fx_x, &fx_y);
 		jelly->last_rel_x = fx_x - tx;
 		jelly->last_rel_y = fx_y - ty;
 		wlr_scene_node_set_position(&jelly->node->node,

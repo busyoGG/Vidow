@@ -43,33 +43,26 @@
 #include "json.h"
 #include "server.h"
 
-/* 约束那个表面在布局里的原点，以及「场景坐标 -> 表面局部坐标」的倍数（只有 X11
- * 不是 1，见 view.c 的 vidow_view_hit_scale）。 */
+/* 和 hover / grab 共用指定表面的实际内容节点映射。场景只有平移及轴向缩放，
+ * 采样得到独立 XY 比例及其逆映射，供 surface 局部的 hint / region 使用。 */
 static bool constraint_origin(struct vidow_server *server,
 		struct wlr_pointer_constraint_v1 *c, double *ox, double *oy,
-		double *hit) {
+		double *hit_x, double *hit_y) {
 	struct vidow_view *view = vidow_view_from_surface(server, c->surface);
-	if (view == NULL || view->scene_surface == NULL ||
-			view->scene_surface->buffer == NULL) {
+	double sx = 0, sy = 0, tx = 0, ty = 0;
+	if (!vidow_view_surface_coords(view, c->surface, 0, 0, &sx, &sy) ||
+			!vidow_view_surface_coords(view, c->surface, 1, 1, &tx, &ty)) {
 		return false;
 	}
-	/* 子表面上的约束：我们只知道顶层表面摆在哪儿，不猜（罕见，宁可不动光标，
-	 * 也别把它挪到错的地方去）。 */
-	if (wlr_surface_get_root_surface(c->surface) !=
-			vidow_view_surface(view)) {
+	*hit_x = tx - sx;
+	*hit_y = ty - sy;
+	if (!isfinite(*hit_x) || !isfinite(*hit_y) ||
+			!(*hit_x > 0.0) || !(*hit_y > 0.0)) {
 		return false;
 	}
-	int lx = 0, ly = 0;
-	if (!wlr_scene_node_coords(&view->scene_surface->buffer->node, &lx, &ly)) {
-		return false;
-	}
-	*ox = lx;
-	*oy = ly;
-	*hit = vidow_view_hit_scale(view);
-	if (!(*hit > 0.0)) {
-		*hit = 1.0;
-	}
-	return true;
+	*ox = -sx / *hit_x;
+	*oy = -sy / *hit_y;
+	return isfinite(*ox) && isfinite(*oy);
 }
 
 /* 按客户端给的 cursor_hint 把光标摆过去（hint 是表面局部坐标），并把它当成
@@ -79,12 +72,12 @@ static bool constraint_origin(struct vidow_server *server,
 static void apply_cursor_hint(struct vidow_server *server,
 		struct wlr_pointer_constraint_v1 *c,
 		const struct wlr_pointer_constraint_v1_state *state) {
-	double ox = 0, oy = 0, hit = 1.0;
-	if (!constraint_origin(server, c, &ox, &oy, &hit)) {
+	double ox = 0, oy = 0, hit_x = 1.0, hit_y = 1.0;
+	if (!constraint_origin(server, c, &ox, &oy, &hit_x, &hit_y)) {
 		return;
 	}
-	double px = ox + state->cursor_hint.x / hit;
-	double py = oy + state->cursor_hint.y / hit;
+	double px = ox + state->cursor_hint.x / hit_x;
+	double py = oy + state->cursor_hint.y / hit_y;
 	server->pointer_lock_x = px;
 	server->pointer_lock_y = py;
 	wlr_cursor_warp(server->cursor, NULL, px, py);
@@ -114,8 +107,8 @@ static void confine_warp_into_region(struct vidow_server *server) {
 	if (c == NULL || c->type != WLR_POINTER_CONSTRAINT_V1_CONFINED) {
 		return;
 	}
-	double ox = 0, oy = 0, hit = 1.0;
-	if (!constraint_origin(server, c, &ox, &oy, &hit)) {
+	double ox = 0, oy = 0, hit_x = 1.0, hit_y = 1.0;
+	if (!constraint_origin(server, c, &ox, &oy, &hit_x, &hit_y)) {
 		return;
 	}
 	int n = 0;
@@ -123,15 +116,15 @@ static void confine_warp_into_region(struct vidow_server *server) {
 	if (n == 0) {
 		return; /* 空区域：没地方可去（协议里空区域 = 一步都不许动） */
 	}
-	double sx = (server->cursor->x - ox) * hit;
-	double sy = (server->cursor->y - oy) * hit;
+	double sx = (server->cursor->x - ox) * hit_x;
+	double sy = (server->cursor->y - oy) * hit_y;
 	if (pixman_region32_contains_point(&server->confine, (int)floor(sx),
 			(int)floor(sy), NULL)) {
 		return;
 	}
 	double cx = (boxes[0].x1 + boxes[0].x2) / 2.0;
 	double cy = (boxes[0].y1 + boxes[0].y2) / 2.0;
-	wlr_cursor_warp(server->cursor, NULL, ox + cx / hit, oy + cy / hit);
+	wlr_cursor_warp(server->cursor, NULL, ox + cx / hit_x, oy + cy / hit_y);
 	server->pointer_last_x = server->cursor->x;
 	server->pointer_last_y = server->cursor->y;
 }
@@ -312,8 +305,8 @@ void vidow_pointer_constraint_motion(struct vidow_server *server,
 
 	struct wlr_pointer_constraint_v1 *c = server->active_constraint;
 	if (c != NULL) {
-		double ox = 0, oy = 0, hit = 1.0;
-		if (!constraint_origin(server, c, &ox, &oy, &hit)) {
+		double ox = 0, oy = 0, hit_x = 1.0, hit_y = 1.0;
+		if (!constraint_origin(server, c, &ox, &oy, &hit_x, &hit_y)) {
 			/* 表面还没摆进场景（刚 map）或者不是窗口：不夹，别把光标冻住。 */
 		} else if (c->type == WLR_POINTER_CONSTRAINT_V1_LOCKED) {
 			/* 钉死在激活那一刻的位置（客户端给的 cursor_hint 只用来在
@@ -326,13 +319,15 @@ void vidow_pointer_constraint_motion(struct vidow_server *server,
 				wlr_cursor_warp(server->cursor, NULL, px, py);
 			}
 		} else {
-			double sx = (x - ox) * hit;
-			double sy = (y - oy) * hit;
+			/* cursor 已经是本次终点；围栏从上次处理后的位置出发，不能
+			 * 再把本次位移加到终点上，否则会多走一步并提前撞到边界。 */
+			double sx = (server->pointer_last_x - ox) * hit_x;
+			double sy = (server->pointer_last_y - oy) * hit_y;
 			double tx = 0, ty = 0;
 			if (wlr_region_confine(&server->confine, sx, sy,
-					sx + dx * hit, sy + dy * hit, &tx, &ty)) {
-				double lx = ox + tx / hit;
-				double ly = oy + ty / hit;
+					(x - ox) * hit_x, (y - oy) * hit_y, &tx, &ty)) {
+				double lx = ox + tx / hit_x;
+				double ly = oy + ty / hit_y;
 				if (lx != x || ly != y) {
 					wlr_cursor_warp(server->cursor, NULL, lx, ly);
 				}

@@ -63,6 +63,13 @@ void vidow_float_set_mode(struct vidow_view *view,
 	view->float_want_w = 0;
 	view->float_want_h = 0;
 
+	/* X popup identity is independent of FOLLOW layout. Reused CEF widgets
+	 * can lose/change WM_TRANSIENT_FOR while staying FIXED; never keep a stale
+	 * hidden parent which would suppress the popup's entire scene tree. */
+	if (view->popup && view->kind == VIDOW_VIEW_X11) {
+		view->parent = resolve_parent(server, vidow_view_parent_surface(view));
+	}
+
 	if (mode == view->float_mode) {
 		if (mode == VIDOW_FLOAT_FOLLOW) {
 			/* the parent may have changed under us */
@@ -378,8 +385,9 @@ void vidow_float_on_commit(struct vidow_view *view) {
 		return;
 	}
 
-	/* 客户端自己要的尺寸，逻辑单位（X11 的像素在这里已经除掉了 xwayland_scale，
-	 * 否则浮动窗口在 X11 下会大一倍）。 */
+	/* 客户端自己要的尺寸，逻辑单位。X11 的 x11_want_w/h 是**设备像素**
+	 * （X 屏幕按 xwayland_scale 放大了），所以下面要除回去 —— 见 view.c 的
+	 * vidow_view_x11_scale_int 与 xwayland.c 的 KDE 模型注释。 */
 	int w = 0, h = 0;
 	vidow_view_client_size(view, &w, &h);
 	/* 1x1 不是「客户端想要 1x1」，是「还没定尺寸」：X11 的窗口生出来就是 1x1，
@@ -395,9 +403,11 @@ void vidow_float_on_commit(struct vidow_view *view) {
 			h = hh;
 		} else if (view->kind == VIDOW_VIEW_X11 && view->x11_want_w > 1 &&
 				view->x11_want_h > 1) {
-			int scale = vidow_view_x11_scale_int(view);
-			w = view->x11_want_w / scale;
-			h = view->x11_want_h / scale;
+			double lw = view->x11_want_w, lh = view->x11_want_h;
+			vidow_xwm_from_native_size(view->server, view->output,
+				lw, lh, &lw, &lh);
+			w = (int)lround(lw);
+			h = (int)lround(lh);
 		} else {
 			wlr_log(WLR_DEBUG, "float %s: 尺寸还没定（%dx%d），先不摆",
 				vidow_view_title(view) != NULL ? vidow_view_title(view) : "?",
@@ -615,6 +625,17 @@ void vidow_float_begin_grab(struct vidow_server *server,
 		struct vidow_view *view, bool resize, bool from_client) {
 	server->grab_mode = resize ? VIDOW_GRAB_RESIZE : VIDOW_GRAB_MOVE;
 	server->grab_view = view;
+	/* **拖动也要置 view->dragging**（改大小不置：尺寸一直在变，裁不裁无所谓，
+	 * 而它本来也不会把窗口拖出原屏）。
+	 *
+	 * view_clip_box() 里那道「正被拖拽的窗口不裁」的放行只认 view->dragging，
+	 * 而这个字段以前只有平铺拖拽（drag.c 的 vidow_tile_grab_begin）会置位 ——
+	 * 浮窗拖拽走的是这里，于是浮窗一拖出原屏就被整块裁掉，屏幕上看着像
+	 * 「窗口拖不走」（用户报的「X11 应用无法跨屏拖拽，松手却过去了」）。
+	 * 松手时 drag.c 那边统一清掉这个标志。 */
+	if (!resize) {
+		view->dragging = true;
+	}
 	/* 客户端自己发起的那次（见 server.h 里 grab_client_press 的说明）：按下
 	 * 已经转给它了，松手也要转给它，状态才对称。 */
 	server->grab_client_press = from_client;
@@ -921,7 +942,11 @@ void vidow_float_grab_update(struct vidow_server *server, double lx,
 	 * （1000Hz 鼠标 = 每帧 0.44ms，8000Hz = 每帧 3.5ms，全是白算的）。 */
 	server->arrange_dirty = true;
 	server->grab_ev_ns = vidow_now_ns(); /* 探针：量「事件 -> 出帧」延迟 */
-	vidow_output_schedule_frame(server, view->output, "拖浮动窗口");
+	/* **两块屏都得催**：窗口跟着光标越过屏边界之后画在对面那块屏上，它的归属
+	 * （view->output）要到松手才换 —— 只给旧屏排帧，对面那块屏自己不动，屏幕上
+	 * 就是「拖过去看不见窗口」（用户 2026-10-23 报的）。见 drag.c 的
+	 * vidow_drag_schedule_outputs。 */
+	vidow_drag_schedule_outputs(server, view, "拖浮动窗口");
 	/* 同上：浮动拖拽的落位是推迟到帧里做的，帧一停它一点都不动，所以这里
 	 * 必须保证「就算后端不给帧事件，帧也照出」（见 output.c 的 anim_watchdog）。 */
 	vidow_output_kick_watchdog(server);
@@ -943,6 +968,13 @@ void vidow_float_end_grab(struct vidow_server *server) {
 	server->grab_mode = VIDOW_GRAB_NONE;
 	server->grab_view = NULL;
 	server->grab_client_press = false;
+	/* 松手了：拉着的不再是「拖拽中」—— clip 豁免（view_clip_box 里那道
+	 * `if (view->dragging) return false;`）要在这个窗口落到新归属屏之前就
+	 * 撤销，否则松手瞬间它还按旧归属屏裁一刀。放在下面那一串提前 return
+	 * 之前，各条路径都能走到。 */
+	if (view != NULL) {
+		view->dragging = false;
+	}
 	wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "left_ptr");
 	if (view != NULL) {
 		vidow_jelly_release(view);
@@ -996,8 +1028,22 @@ void vidow_float_end_grab(struct vidow_server *server) {
 	if (under == NULL || under == view->output) {
 		return;
 	}
+	/* **搬去目标屏上「同一个序号」的工作区，不是它此刻亮着的那块**。
+	 *
+	 * 以前取的是 vidow_workspace_shown_for()（目标屏当前显示的工作区）：人在第 3
+	 * 块工作区上把窗口拖到隔壁屏，窗口就被塞进隔壁屏的第 1 块 —— 用户报的
+	 * 「跨屏之后原来屏幕的窗口跳转到第一个，应该啥都不要变才对」。工作区本身
+	 * 是有稳定编号的实体（见 workspace.h 的 ws->id），跨屏只是换挂在哪块屏上，
+	 * 序号不该跟着变。
+	 *
+	 * 目标屏上没有那么靠后的工作区时退回「它亮着的那块」：宁可落在能看见的
+	 * 地方，也不要凭空替人建一块新工作区。 */
+	int idx = vidow_workspace_index(view->ws);
 	struct vidow_workspace *target =
-		vidow_workspace_shown_for(server, under);
+		idx > 0 ? vidow_workspace_at(server, under, idx) : NULL;
+	if (target == NULL) {
+		target = vidow_workspace_shown_for(server, under);
+	}
 	if (target == NULL) {
 		return;
 	}

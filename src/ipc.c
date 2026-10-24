@@ -144,6 +144,7 @@ static void ipc_client_destroy(struct ipc_client *c) {
 	if (c->source != NULL) {
 		wl_event_source_remove(c->source);
 	}
+	vidow_fdwatch_deregister(c->fd, VIDOW_FDWATCH_IPC, c);
 	close(c->fd);
 	wl_list_remove(&c->link);
 	for (size_t i = 0; i < c->filter_n; i++) {
@@ -1749,6 +1750,116 @@ static bool cmd_reload_config(struct vidow_server *server, struct jval *req,
 	return true;
 }
 
+/* ------------------------------------------------------- 会话锁（idle 那条线的落点）
+ *
+ * 为什么不是「vidow 自己画锁屏」：ext-session-lock-v1 规定**锁屏内容由客户端画**
+ * （协议 XML:1-40 —— 合成器只提供 lock surface，谁都不许在上面画自己的东西）。
+ * 所以 vidow 能做的是「把锁屏客户端拉起来」+「报告现在锁没锁」，就这两件。
+ *
+ * 为什么要这几个命令：hypridle / swayidle 到点要跑一条命令。以前只能
+ * `hyprlock` 之类直接跑，但那样 hypridle 不知道锁成功了没，也没法在
+ * 「锁屏客户端已经崩了但屏还黑着」的时候判断状态。走 IPC 至少能拿到
+ * `{"locked":true}` 这种确定答复。
+ *
+ * 客户端从哪来：`lock_command`（配置键，默认空）。空的时候按常见顺序探测
+ * PATH。都找不到就报错说清楚缺什么 —— 本机现在一个锁屏客户端都没装，
+ * 这正是当初写 tools/locktest.c 的原因（见那里的文件头注释）。 */
+static char *lock_find_client(void) {
+	const char *cfg = getenv("VIDOW_LOCK_COMMAND");
+	if (cfg != NULL && cfg[0] != '\0') {
+		return strdup(cfg);
+	}
+	static const char *candidates[] = {
+		"hyprlock", "swaylock", "waylock", "gtklock", "i3lock",
+	};
+	for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+		char cmd[128];
+		snprintf(cmd, sizeof(cmd), "command -v %s 2>/dev/null",
+			candidates[i]);
+		FILE *f = popen(cmd, "r");
+		if (f == NULL) {
+			continue;
+		}
+		char buf[256];
+		bool ok = fgets(buf, sizeof(buf), f) != NULL && buf[0] == '/';
+		pclose(f);
+		if (ok) {
+			buf[strcspn(buf, "\n")] = '\0';
+			return strdup(buf); /* 用探测到的绝对路径 */
+		}
+	}
+	return NULL;
+}
+
+static bool cmd_lock(struct vidow_server *server, struct jval *req,
+		struct jbuf *out, char *err, size_t errlen) {
+	(void)req;
+	if (server->session_lock != NULL) {
+		/* 已经锁了：幂等，不重复拉客户端（第二个客户端拿不到锁，只会
+		 * 自己退出，白起一个进程）。 */
+		jb_obj(out);
+		jb_kv_bool(out, "locked", true);
+		jb_kv_bool(out, "already", true);
+		jb_obj_end(out);
+		return true;
+	}
+	char *client = lock_find_client();
+	if (client == NULL) {
+		snprintf(err, errlen, "没有可用的锁屏客户端：装一个（hyprlock / "
+			"swaylock / waylock / gtklock / i3lock 任一），或者设 "
+			"VIDOW_LOCK_COMMAND=<命令>");
+		return false;
+	}
+	/* daemonize：锁屏客户端得比这条 IPC 活得久。vidow_exec_detached 是
+	 * 双 fork + setsid，正好。 */
+	wlr_log(WLR_INFO, "ipc: lock → 拉起锁屏客户端 %s", client);
+	vidow_exec_detached(client);
+	free(client);
+	jb_obj(out);
+	/* 这里说 false 不是「失败了」—— 客户端刚拉起来，锁 surface 还没握手
+	 * 完（要等 ext_session_lock_v1.locked）。用 pending 区分：
+	 *   locked=true  → 已经锁上了
+	 *   pending=true → 客户端起来了，等握手 */
+	jb_kv_bool(out, "locked", false);
+	jb_kv_bool(out, "pending", true);
+	jb_obj_end(out);
+	return true;
+}
+
+static bool cmd_unlock(struct vidow_server *server, struct jval *req,
+		struct jbuf *out, char *err, size_t errlen) {
+	(void)req;
+	(void)err;
+	(void)errlen;
+	/* **故意不实现强制解锁**（和 vidowmsg 一贯的安全姿态一致，见 README
+	 * 里会话锁那节）：协议规定解锁只能由锁屏客户端发 unlock_and_destroy。
+	 * 合成器能强拆，但那就等于给了一条「不解密码也能开屏」的后门 ——
+	 * 任何拿到 IPC socket 的进程都能解锁。所以这里只报告状态，并说清楚
+	 * 怎么解锁。 */
+	bool locked = server->session_lock != NULL;
+	jb_obj(out);
+	jb_kv_bool(out, "locked", locked);
+	jb_kv_bool(out, "unlocked", !locked);
+	jb_kv_str(out, "note", locked ?
+		"锁着：解锁只能由锁屏客户端自己发 unlock_and_destroy"
+		"（故意不提供强制解锁后门）" :
+		"没锁");
+	jb_obj_end(out);
+	return true;
+}
+
+static bool cmd_lock_status(struct vidow_server *server, struct jval *req,
+		struct jbuf *out, char *err, size_t errlen) {
+	(void)req;
+	(void)err;
+	(void)errlen;
+	jb_obj(out);
+	jb_kv_bool(out, "locked", server->session_lock != NULL);
+	jb_kv_bool(out, "manager", server->session_lock_mgr != NULL);
+	jb_obj_end(out);
+	return true;
+}
+
 static bool cmd_quit(struct vidow_server *server, struct jval *req,
 		struct jbuf *out, char *err, size_t errlen) {
 	(void)req;
@@ -1776,6 +1887,40 @@ static bool cmd_cursor_shake(struct vidow_server *server, struct jval *req,
 	}
 	jb_obj(out);
 	vidow_cursor_fx_json(out, server);
+	jb_obj_end(out);
+	return true;
+}
+
+/* 光标主题 / 尺寸：cursor_theme "名字" / cursor_size N。
+ *
+ * 改完立刻重建 cursor manager（见 main.c 的 vidow_cursor_apply）—— 以前尺寸只能
+ * 在启动时从 XCURSOR_SIZE / gsettings 读一次，运行中怎么改都不动。给的是**逻辑
+ * 尺寸**，2 倍屏上自动变 2 倍。 */
+static bool cmd_cursor_apply(struct vidow_server *server, struct jval *req,
+		struct jbuf *out, char *err, size_t errlen) {
+	const char *theme = jget_str(req, "theme");
+	bool have_theme = theme != NULL && theme[0] != '\0';
+	long long n = 0;
+	bool have_size = jget_int(req, "size", &n);
+	if (!have_theme && !have_size) {
+		snprintf(err, errlen, "要 theme 或 size");
+		return false;
+	}
+	if (have_size && (n < 1 || n > 512)) {
+		snprintf(err, errlen, "size 要在 1..512 之间（给的是 %lld）", n);
+		return false;
+	}
+	if (have_theme) {
+		snprintf(server->config.cursor_theme,
+			sizeof(server->config.cursor_theme), "%s", theme);
+	}
+	if (have_size) {
+		server->config.cursor_size = (int)n;
+	}
+	vidow_cursor_apply(server);
+	jb_obj(out);
+	jb_kv_str(out, "cursor_theme", server->config.cursor_theme);
+	jb_kv_int(out, "cursor_size", server->config.cursor_size);
 	jb_obj_end(out);
 	return true;
 }
@@ -2840,8 +2985,22 @@ static bool ipc_run(struct vidow_server *server, struct ipc_client *c,
 	if (strcmp(cmd, "quit") == 0) {
 		return cmd_quit(server, req, out, err, errlen);
 	}
+	/* 会话锁（给 hypridle / swayidle 到点跑的命令用，见上面那节） */
+	if (strcmp(cmd, "lock") == 0) {
+		return cmd_lock(server, req, out, err, errlen);
+	}
+	if (strcmp(cmd, "unlock") == 0) {
+		return cmd_unlock(server, req, out, err, errlen);
+	}
+	if (strcmp(cmd, "lock_status") == 0) {
+		return cmd_lock_status(server, req, out, err, errlen);
+	}
 	if (strcmp(cmd, "move_cursor") == 0) {
 		return cmd_move_cursor(server, req, out, err, errlen);
+	}
+	if (strcmp(cmd, "cursor_size") == 0 || strcmp(cmd, "cursor_theme") == 0 ||
+			strcmp(cmd, "cursor_apply") == 0) {
+		return cmd_cursor_apply(server, req, out, err, errlen);
 	}
 	if (strcmp(cmd, "cursor_shake") == 0) {
 		return cmd_cursor_shake(server, req, out, err, errlen);
@@ -3050,9 +3209,22 @@ static bool ipc_client_read(struct ipc_client *c) {
 	return true;
 }
 
-static int ipc_client_event(int fd, uint32_t mask, void *data) {
+static int ipc_client_handle(struct ipc_client *c, uint32_t mask);
+
+/* fdwatch 版：走到这儿一定是「可读」或者「该去写完」。返回 1 = 这一拍的事办
+ * 完了（下一拍没可读的自然不会再叫）；0 不用 —— ipc 的缓冲有上限，写不完下次
+ * poll 会报 EPOLLOUT。 */
+static int ipc_client_fdw(int fd, void *data) {
 	(void)fd;
 	struct ipc_client *c = data;
+	uint32_t mask = WL_EVENT_READABLE;
+	if (c->out_sent < c->out_len) {
+		mask |= WL_EVENT_WRITABLE;
+	}
+	return ipc_client_handle(c, mask) == 0;
+}
+
+static int ipc_client_handle(struct ipc_client *c, uint32_t mask) {
 	if (mask & (WL_EVENT_HANGUP | WL_EVENT_ERROR)) {
 		ipc_client_destroy(c);
 		return 0;
@@ -3074,6 +3246,11 @@ static int ipc_client_event(int fd, uint32_t mask, void *data) {
 	return 0;
 }
 
+static int ipc_client_event(int fd, uint32_t mask, void *data) {
+	(void)fd;
+	return ipc_client_handle(data, mask);
+}
+
 static void ipc_new_client(struct vidow_server *server, int fd) {
 	size_t count = (size_t)wl_list_length(&server->ipc_clients);
 	if (count >= IPC_MAX_CLIENTS) {
@@ -3088,22 +3265,23 @@ static void ipc_new_client(struct vidow_server *server, int fd) {
 	}
 	c->server = server;
 	c->fd = fd;
-	c->source = wl_event_loop_add_fd(
-		wl_display_get_event_loop(server->display), fd, WL_EVENT_READABLE,
-		ipc_client_event, c);
-	if (c->source == NULL) {
-		close(fd);
-		free(c);
-		return;
+	/* 自唤醒 fd 不挂 add_fd（见 fdwatch.c）：监听 socket 常驻可读，挂在事件
+	 * 循环上等于每轮都自己叫醒自己。 */
+	if (!vidow_fdwatch_register(fd, VIDOW_FDWATCH_IPC, ipc_client_fdw, c)) {
+		c->source = wl_event_loop_add_fd(
+			wl_display_get_event_loop(server->display), fd,
+			WL_EVENT_READABLE, ipc_client_event, c);
+		if (c->source == NULL) {
+			vidow_fdwatch_deregister(fd, VIDOW_FDWATCH_IPC, c);
+			close(fd);
+			free(c);
+			return;
+		}
 	}
 	wl_list_insert(server->ipc_clients.prev, &c->link);
 }
 
-static int ipc_accept(int fd, uint32_t mask, void *data) {
-	struct vidow_server *server = data;
-	if (!(mask & WL_EVENT_READABLE)) {
-		return 0;
-	}
+static void ipc_serve(struct vidow_server *server, int fd) {
 	for (;;) {
 		int client = accept(fd, NULL, NULL);
 		if (client < 0) {
@@ -3117,6 +3295,22 @@ static int ipc_accept(int fd, uint32_t mask, void *data) {
 		fcntl(client, F_SETFD, fcntl(client, F_GETFD, 0) | FD_CLOEXEC);
 		ipc_new_client(server, client);
 	}
+}
+
+/* fdwatch 版（监听 socket）：可读了就把排队的连接全领走。 */
+static int ipc_listen_fdw(int fd, void *data) {
+	struct vidow_server *server = data;
+	ipc_serve(server, fd);
+	return 1;
+}
+
+/* 事件循环版（fdwatch 起不来时兜底）。 */
+static int ipc_accept(int fd, uint32_t mask, void *data) {
+	struct vidow_server *server = data;
+	if (!(mask & WL_EVENT_READABLE)) {
+		return 0;
+	}
+	ipc_serve(server, fd);
 	return 0;
 }
 
@@ -3188,6 +3382,7 @@ bool vidow_ipc_init(struct vidow_server *server) {
 	wl_list_init(&server->ipc_clients);
 	server->ipc_path[0] = '\0';
 	server->ipc_subscribers = 0;
+	server->ipc_fd = -1;
 	return vidow_ipc_apply_config(server);
 }
 
@@ -3198,11 +3393,11 @@ bool vidow_ipc_apply_config(struct vidow_server *server) {
 	char path[PATH_MAX];
 	ipc_path_build(server, path, sizeof(path));
 
-	if (server->ipc_listen != NULL && server->config.ipc &&
+	if (server->ipc_fd >= 0 && server->config.ipc &&
 			strcmp(path, server->ipc_path) == 0) {
 		return true; /* 没变 */
 	}
-	if (server->ipc_listen != NULL) {
+	if (server->ipc_fd >= 0) {
 		vidow_ipc_finish(server);
 	}
 
@@ -3249,13 +3444,19 @@ bool vidow_ipc_apply_config(struct vidow_server *server) {
 		unlink(path);
 		return false;
 	}
-	server->ipc_listen = wl_event_loop_add_fd(
-		wl_display_get_event_loop(server->display), fd, WL_EVENT_READABLE,
-		ipc_accept, server);
-	if (server->ipc_listen == NULL) {
-		close(fd);
-		unlink(path);
-		return false;
+	/* 监听 socket 常驻可读：挂 add_fd 的话每轮循环都在「有东西读」，等于
+	 * 常驻自唤醒。交给 fdwatch（见 fdwatch.c），起不来才退回事件循环。 */
+	if (!vidow_fdwatch_register(server->ipc_fd = fd, VIDOW_FDWATCH_IPC,
+			ipc_listen_fdw, server)) {
+		server->ipc_listen = wl_event_loop_add_fd(
+			wl_display_get_event_loop(server->display), fd, WL_EVENT_READABLE,
+			ipc_accept, server);
+		if (server->ipc_listen == NULL) {
+			close(fd);
+			server->ipc_fd = -1;
+			unlink(path);
+			return false;
+		}
 	}
 	snprintf(server->ipc_path, sizeof(server->ipc_path), "%s", path);
 	wlr_log(WLR_INFO, "ipc: 听 %s（一行一个 JSON 请求，客户端是 vidowmsg）",
@@ -3271,6 +3472,13 @@ void vidow_ipc_finish(struct vidow_server *server) {
 	if (server->ipc_listen != NULL) {
 		wl_event_source_remove(server->ipc_listen);
 		server->ipc_listen = NULL;
+	}
+	/* 监听 fd 的号会被下一个 socket 复用：不注销的话 fdwatch 会拿新 fd 去叫
+	 * 旧回调（旧 server 指针、旧 kind）。 */
+	vidow_fdwatch_deregister(server->ipc_fd, VIDOW_FDWATCH_IPC, server);
+	if (server->ipc_fd >= 0) {
+		close(server->ipc_fd);
+		server->ipc_fd = -1;
 	}
 	if (server->ipc_path[0] != '\0') {
 		unlink(server->ipc_path);

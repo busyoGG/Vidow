@@ -162,6 +162,9 @@ static void mask_apply(struct vidow_server *server, bool off) {
 		view->fx.masked = off;
 		view->mask_opacity = off;
 		opacity_mask(view->fx.node, &view->mask_saved_fx, off);
+		for (struct vidow_blur_slot *sl = view->fx.blur_slot; sl; sl = sl->next) {
+			opacity_mask(sl->node, &sl->mask_saved_opacity, off);
+		}
 		opacity_mask(view->scene_surface != NULL ?
 			view->scene_surface->buffer : NULL, &view->mask_saved_surf,
 			off);

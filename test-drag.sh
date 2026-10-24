@@ -132,6 +132,17 @@ act "pointer-motion $((X1 + 300)) $((Y1 + 300))"
 act "pointer-button left press mod"
 act "pointer-motion $((OTHER_ORIGIN + 400)) $((Y1 + 300))" 0.25
 act "pointer-motion $((OTHER_ORIGIN + 700)) $((Y1 + 300))" 0.25
+# **拖拽过程中**（还没松手）窗口的位置必须已经跨到对面那块屏上。
+# 以前这里不查：只验松手后的归属，于是「拖的时候被裁在自己那块屏里、
+# 屏幕上看着窗口根本不动」这个 bug 一路绿灯（用户报的跨屏拖不动）。
+XMID=$(field w1 4)
+if [ -n "$XMID" ] && [ "$XMID" -ge "$((OTHER_ORIGIN - 100))" ]; then
+	pass "拖拽中窗口已经跟着光标跨屏：x=$XMID（对面屏从 $OTHER_ORIGIN 起）"
+else
+	fail "拖拽中窗口还在原屏：x=${XMID:-?}（对面屏从 $OTHER_ORIGIN 起）"
+fi
+# 裁剪不能把正在拖的窗口裁掉：view_clip_box 对它必须放行，
+# 日志里那句「裁到自己那块屏里」不该出现在拖拽期间的这个窗口上。
 act "pointer-button left release mod" 0.6
 X2=$(field w1 4); OUT2=$(field w1 2)
 if [ "$OUT2" != "$OUT1" ]; then

@@ -18,6 +18,10 @@
  *
  * 配置文件本身是 Lua，重载是 vidow_config_reload()（和 SIGHUP 同一个入口），
  * 所以自动重载和手动重载的行为完全一致。
+ *
+ * 这里只管**登记清单**（哪些文件、哪些目录）和**去抖**；inotify fd 本身由
+ * fdwatch.c 统一轮询，可读了才回调 configwatch_poke()：有限读取事件，
+ * 只有登记文件或目录的事件才启动去抖。
  */
 /* realpath() 在 glibc 里挂在 XOPEN 那组下面（_POSIX_C_SOURCE 不够），单独要一下。
  * 放在任何 #include 之前。 */
@@ -59,8 +63,7 @@ struct watch_file {
 
 struct vidow_configwatch {
 	struct vidow_server *server;
-	int fd; /* inotify */
-	struct wl_event_source *source;
+	int fd; /* inotify（不挂事件循环，见文件头：由 fdwatch 兜着） */
 	struct wl_event_source *timer;
 	struct watch_dir dirs[WATCH_MAX_DIRS];
 	size_t ndirs;
@@ -86,10 +89,28 @@ static void path_dir(const char *path, char *buf, size_t size) {
 	*slash = '\0';
 }
 
-/* 盯住一个目录（去重）。目录不在 / 没权限都只打日志：自动重载是锦上添花。 */
+/* 两段路径指的是不是同一个目录（可能是两条不同的字符串指同一个地方：
+ * $XDG_CONFIG_HOME、/tmp 下的软链接、bind mount…）。用 (dev, ino) 判，
+ * stat 不到就当不同。 */
+static bool same_dir(const char *a, const char *b) {
+	if (strcmp(a, b) == 0) {
+		return true;
+	}
+	struct stat sa, sb;
+	if (stat(a, &sa) != 0 || stat(b, &sb) != 0) {
+		return false;
+	}
+	return sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino;
+}
+
+/* 盯住一个目录（按路径和 (dev, ino) 去重）。
+ * 目录不在 / 没权限都只打日志：自动重载是锦上添花。 */
 static bool dir_add(struct vidow_configwatch *w, const char *dir) {
 	for (size_t i = 0; i < w->ndirs; i++) {
 		if (strcmp(w->dirs[i].path, dir) == 0) {
+			return true;
+		}
+		if (same_dir(w->dirs[i].path, dir)) {
 			return true;
 		}
 	}
@@ -147,7 +168,12 @@ static void file_add(struct vidow_configwatch *w, const char *path) {
 	f->exists = snapshot(f->path, &f->seen);
 
 	char dir[PATH_MAX];
+	char reall[PATH_MAX];
 	path_dir(f->path, dir, sizeof(dir));
+	/* 目录路径也解析符号链接，与入口目录的记录保持一致。 */
+	if (realpath(dir, reall) != NULL) {
+		snprintf(dir, sizeof(dir), "%s", reall);
+	}
 	dir_add(w, dir);
 }
 
@@ -198,20 +224,66 @@ static int watch_timer(void *data) {
 	return 0;
 }
 
-static int watch_event(int fd, uint32_t mask, void *data) {
-	struct vidow_configwatch *w = data;
-
-	if (mask & WL_EVENT_READABLE) {
-		/* 排空队列：不读干净的话水平触发会一直回调。事件内容不看 —— 目录里
-		 * 别的文件（portals.conf / shaders）也会吵醒我们，stat 比对会挡住。 */
-		char buf[4096] __attribute__((aligned(__alignof__(struct inotify_event))));
-		while (read(fd, buf, sizeof(buf)) > 0) {
+/* 只接受登记目录中的目标文件；队列溢出时用 stat 全量核对。 */
+static bool event_matches(struct vidow_configwatch *w,
+		const struct inotify_event *event) {
+	if (event->mask & IN_Q_OVERFLOW) {
+		return true;
+	}
+	for (size_t i = 0; i < w->ndirs; i++) {
+		if (w->dirs[i].wd != event->wd) {
+			continue;
+		}
+		if (event->len == 0) {
+			return true; /* 登记目录自身的事件。 */
+		}
+		if (memchr(event->name, '\0', event->len) == NULL) {
+			return false;
+		}
+		for (size_t j = 0; j < w->nfiles; j++) {
+			const char *path = w->files[j].path;
+			const char *slash = strrchr(path, '/');
+			const char *name = slash != NULL ? slash + 1 : path;
+			if (strcmp(name, event->name) != 0) {
+				continue;
+			}
+			char dir[PATH_MAX];
+			path_dir(path, dir, sizeof(dir));
+			if (same_dir(dir, w->dirs[i].path)) {
+				return true;
+			}
 		}
 	}
-	if (w->timer != NULL) {
+	return false;
+}
+
+/* 每拍最多读 64 KiB，避免同目录的持续日志写入占住事件循环。
+ * 未读完的事件留给下一拍；读空或只有无关事件不能延后配置重载。 */
+static void configwatch_poke(void *data) {
+	struct vidow_configwatch *w = data;
+	char buf[4096] __attribute__((aligned(__alignof__(struct inotify_event))));
+	bool relevant = false;
+	for (size_t reads = 0; reads < 16; reads++) {
+		ssize_t len = read(w->fd, buf, sizeof(buf));
+		if (len < 0 && errno == EINTR) {
+			continue;
+		}
+		if (len <= 0) {
+			break;
+		}
+		for (size_t off = 0; off + sizeof(struct inotify_event) <= (size_t)len;) {
+			const struct inotify_event *event = (const void *)(buf + off);
+			size_t size = sizeof(*event) + event->len;
+			if (size > (size_t)len - off) {
+				break;
+			}
+			relevant |= event_matches(w, event);
+			off += size;
+		}
+	}
+	if (relevant && w->timer != NULL) {
 		wl_event_source_timer_update(w->timer, VIDOW_CONFIGWATCH_DEBOUNCE_MS);
 	}
-	return 0;
 }
 
 void vidow_configwatch_finish(struct vidow_server *server) {
@@ -220,11 +292,9 @@ void vidow_configwatch_finish(struct vidow_server *server) {
 		return;
 	}
 	server->configwatch = NULL;
+	vidow_fdwatch_deregister(w->fd, VIDOW_FDWATCH_CONFIG, w);
 	if (w->timer != NULL) {
 		wl_event_source_remove(w->timer);
-	}
-	if (w->source != NULL) {
-		wl_event_source_remove(w->source);
 	}
 	if (w->fd >= 0) {
 		close(w->fd);
@@ -249,6 +319,37 @@ void vidow_configwatch_begin(struct vidow_server *server) {
 	}
 	w->nfiles = 0;
 	file_add(w, w->main_file);
+}
+
+/* 给 IPC 用：把「现在盯着的文件清单」拷出来（是配置内容，不涉及 fd 细节）。 */
+size_t vidow_configwatch_files(struct vidow_server *server,
+		const char *const **out) {
+	static char *buf[WATCH_MAX_FILES];
+	struct vidow_configwatch *w = server != NULL ? server->configwatch : NULL;
+	if (w == NULL) {
+		*out = NULL;
+		return 0;
+	}
+	for (size_t i = 0; i < w->nfiles; i++) {
+		buf[i] = w->files[i].path;
+	}
+	*out = (const char *const *)buf;
+	return w->nfiles;
+}
+
+size_t vidow_configwatch_dirs(struct vidow_server *server,
+		const char *const **out) {
+	static char *buf[WATCH_MAX_DIRS];
+	struct vidow_configwatch *w = server != NULL ? server->configwatch : NULL;
+	if (w == NULL) {
+		*out = NULL;
+		return 0;
+	}
+	for (size_t i = 0; i < w->ndirs; i++) {
+		buf[i] = w->dirs[i].path;
+	}
+	*out = (const char *const *)buf;
+	return w->ndirs;
 }
 
 void vidow_configwatch_add(struct vidow_server *server, const char *path) {
@@ -278,6 +379,10 @@ bool vidow_configwatch_init(struct vidow_server *server) {
 	const char *file = realpath(path, resolved) != NULL ? resolved : path;
 	snprintf(w->main_file, sizeof(w->main_file), "%s", file);
 	path_dir(w->main_file, w->main_dir, sizeof(w->main_dir));
+	char reall[PATH_MAX];
+	if (realpath(w->main_dir, reall) != NULL) {
+		snprintf(w->main_dir, sizeof(w->main_dir), "%s", reall);
+	}
 
 	w->fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
 	if (w->fd < 0) {
@@ -287,19 +392,26 @@ bool vidow_configwatch_init(struct vidow_server *server) {
 		return false;
 	}
 
+	/* 从这里起，初始化失败也由 finish 回收 fd、timer 和登记项。 */
+	server->configwatch = w;
 	struct wl_event_loop *loop = wl_display_get_event_loop(server->display);
-	w->source = wl_event_loop_add_fd(loop, w->fd, WL_EVENT_READABLE,
-		watch_event, w);
 	w->timer = wl_event_loop_add_timer(loop, watch_timer, w);
-	if (w->source == NULL || w->timer == NULL) {
+	if (w->timer == NULL) {
 		wlr_log(WLR_INFO, "config.lua: 自动重载起不来，改完要手动 SIGHUP");
 		vidow_configwatch_finish(server);
 		return false;
 	}
+	/* inotify fd 可读时由 fdwatch 调用 configwatch_poke()，筛选事件后去抖。 */
+	if (!vidow_fdwatch_peek(w->fd, VIDOW_FDWATCH_CONFIG, configwatch_poke, w)) {
+		wlr_log(WLR_INFO, "config.lua: fdwatch 没起来，自动重载收不到事件"
+			"（改完要手动 SIGHUP）");
+		vidow_configwatch_finish(server);
+		return false;
+	}
 
-	/* 记下当前状态：初始化这一下不该被当成「文件变了」。 */
+	/* 记下当前状态：初始化这一下不该被当成「文件变了」。
+	 * （file_add 顺手会把入口文件所在的目录也盯上 —— inotify 是目录级的。） */
 	file_add(w, w->main_file);
-	server->configwatch = w;
 	wlr_log(WLR_INFO, "config.lua: 盯住 %s，改了就自动重载", w->main_file);
 	return true;
 }

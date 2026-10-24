@@ -22,6 +22,7 @@
  * 退出码：0 = 成功，1 = 服务端说不行（错误打到 stderr），2 = 连不上 / 超时。
  *
  * 依赖只有 POSIX socket：这个文件不引 wayland、不引 json.c（它只负责排版缩进）。 */
+#include <dirent.h>
 #include <errno.h>
 #include <poll.h>
 #include <signal.h>
@@ -73,7 +74,15 @@ static void usage(void) {
 "      output-transform 输出 normal|90|… / output-mode 输出 宽 高 [刷新率] /\n"
 "      output-position 输出 x y / output-focus 输出\n"
 "合成器：action \"工作区动作\" / set-config 键 值 / get-config 键 / reload-config /\n"
-"      toggle-overview / move-cursor x y [--relative] / cursor-shake / quit\n"
+"      toggle-overview / move-cursor x y [--relative] / cursor-shake /\n"
+"      cursor-size N / cursor-theme 名字（改光标大小 / 主题，立刻生效，不用重启）/ quit\n"
+"会话锁：lock（拉起锁屏客户端：VIDOW_LOCK_COMMAND 指定的，否则按 PATH 探测\n"
+"      hyprlock / swaylock / waylock / gtklock / i3lock 任一）/ lock-status /\n"
+"      unlock（**不能强制解锁**，只报告状态 —— 协议规定只能由锁屏客户端自己发\n"
+"      unlock_and_destroy；给后门就等于任何拿到 IPC socket 的进程都能开屏）\n"
+"      ‖ 配 idle：hypridle / swayidle 的 on-timeout 里写 vidowmsg lock\n"
+"      （它们靠 ext-idle-notify-v1，播视频的客户端靠 zwp-idle-inhibit-v1，\n"
+"      这两个 global vidow 都已导出，见 README 第 269/270 条）\n"
 "注入：move-cursor x y / pointer-button click|press|release [键] [连点数] /\n"
 "      pointer-scroll dx dy / send-key [tap|press|release] 组合键 / type-text 文字 /\n"
 "      gesture swipe-begin 3 / gesture swipe-update 3 dx dy / gesture swipe-end /\n"
@@ -206,6 +215,10 @@ static const char *positional_key(const char *cmd, int index) {
 		{ "pick-window", { "x", "y", NULL } },
 		{ "move-cursor", { "x", "y", NULL } },
 		{ "cursor-shake", { NULL } },
+		/* 光标主题 / 尺寸（逻辑尺寸，2 倍屏自动翻倍）：立刻重建 cursor
+		 * manager，不用重启 —— 以前只能靠启动时的 XCURSOR_SIZE。 */
+		{ "cursor-size", { "size", NULL } },
+		{ "cursor-theme", { "theme", NULL } },
 		{ "pointer-button", { "state", "button", "count", NULL } },
 		{ "pointer-scroll", { "dx", "dy", NULL } },
 		/* 触控板手势注入：vidowmsg gesture <kind> [fingers] [a] [b]
@@ -342,6 +355,23 @@ static bool find_socket(char *buf, size_t len) {
 			return true;
 		}
 	}
+	/* 还有 vidow-<WAYLAND_DISPLAY>.sock 这种命名（wayland-0 → vidow-wayland-0
+	 * 上面已经盖住了；别的会话名不走这套）。直接扫目录里所有 vidow-*.sock：
+	 * 合成器名字里带 pid 的那种也算。 */
+	DIR *d = opendir(runtime);
+	if (d != NULL) {
+		struct dirent *e;
+		while ((e = readdir(d)) != NULL) {
+			if (strncmp(e->d_name, "vidow-", 6) != 0 ||
+					strstr(e->d_name, ".sock") == NULL) {
+				continue;
+			}
+			snprintf(buf, len, "%s/%s", runtime, e->d_name);
+			closedir(d);
+			return true;
+		}
+		closedir(d);
+	}
 	return false;
 }
 
@@ -356,6 +386,18 @@ static bool resolve_socket(char *buf, size_t len) {
 	if (runtime != NULL && runtime[0] != '\0' && display != NULL &&
 			display[0] != '\0') {
 		snprintf(buf, len, "%s/vidow-%s.sock", runtime, display);
+		/* 合成器起在别的 runtime 目录（嵌套 / 测试）时这个路径不存在：
+		 * 退回去按 socket 文件名扫一遍，别拿着一根断线。
+		 * 实测：配置在**合成器进程里**跑 vidowmsg 时，环境里可能带着一个
+		 * 别的会话的 WAYLAND_DISPLAY，一路拼出来就是 No such file。 */
+		if (access(buf, F_OK) == 0) {
+			return true;
+		}
+		char found[512];
+		if (find_socket(found, sizeof(found))) {
+			snprintf(buf, len, "%s", found);
+			return true;
+		}
 		return true;
 	}
 	return find_socket(buf, len);

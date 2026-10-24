@@ -662,6 +662,7 @@ struct wlr_buffer *vidow_capture_grab(struct vidow_server *server,
 /* 光标抓帧源（pointer cursor session）：结构要先定义，输出源那边会用到它。 */
 struct vidow_cursor_source {
 	struct wlr_ext_image_capture_source_v1_cursor base;
+	struct vidow_server *server;
 	struct wlr_output *output;
 	struct wlr_buffer *prev_buffer;
 	bool initialized;
@@ -833,6 +834,14 @@ static void cursor_source_request_frame(struct wlr_ext_image_capture_source_v1 *
 		wlr_output_update_needs_frame(cursor->output);
 		cursor->needs_frame = true;
 	}
+	/* 光标抓帧的出帧挂在**屏幕的下一帧**上（见 cursor_source_handle_output_commit），
+	 * 而光标跑出画面 / 光标在硬件光标层时那块屏一帧都不画 —— 客户端就一直等。
+	 * 屏幕静止时由抓帧看门狗替这块屏推一帧。**必须在这里点名这块屏**：看门狗的
+	 * screencopy 那条账现在是逐屏的（只推真的有帧在等的那块），光标这条路
+	 * 没有 screencopy 帧，不记账就没人推它了。 */
+	if (cursor->server != NULL) {
+		vidow_output_capture_kick_output(cursor->server, cursor->output);
+	}
 }
 
 static void cursor_source_copy_frame(struct wlr_ext_image_capture_source_v1 *base,
@@ -905,12 +914,14 @@ static void cursor_source_handle_output_commit(struct wl_listener *listener,
 	(void)event;
 }
 
-static struct vidow_cursor_source *cursor_source_create(struct wlr_output *output) {
+static struct vidow_cursor_source *cursor_source_create(struct vidow_server *server,
+		struct wlr_output *output) {
 	struct vidow_cursor_source *cursor = calloc(1, sizeof(*cursor));
 	if (cursor == NULL) {
 		return NULL;
 	}
 	wlr_ext_image_capture_source_v1_cursor_init(&cursor->base, &cursor_source_impl);
+	cursor->server = server;
 	cursor->output = output;
 	wl_list_init(&cursor->prev_buffer_release.link);
 	cursor->output_commit.notify = cursor_source_handle_output_commit;
@@ -1057,7 +1068,7 @@ static void capture_source_get(struct vidow_capture *cap) {
 	wl_signal_add(&cap->output->events.commit, &cap->source->output_commit);
 	source_update_constraints(cap->source);
 	if (cap->cursor == NULL) {
-		cap->cursor = cursor_source_create(cap->output);
+		cap->cursor = cursor_source_create(cap->server, cap->output);
 	}
 }
 

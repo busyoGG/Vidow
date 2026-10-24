@@ -544,6 +544,23 @@ void vidow_im_focus(struct vidow_server *server, struct wlr_surface *surface) {
 		im_set_active(server, false);
 		return;
 	}
+	/* 焦点换到**另一个**输入框时，要让输入法整个重新激活一次。
+	 *
+	 * fcitx5 把「当前是中文还是英文」记在**它自己**那边，只在收到 activate
+	 * 时重置回默认态。原来这里只做 enter/leave：两个输入框之间切换时
+	 * active 一直是 true，im_set_active() 里 `im->active == active` 直接返回，
+	 * 一次 activate / deactivate 都不发 —— 于是前一个窗口里切到的中文
+	 * 被带进后一个窗口，本该是英文的输入框打出中文（用户 2026-10-21 报的
+	 * 「fcitx5 当前输入法状态会从一个窗口被带到另一个窗口」）。
+	 *
+	 * 做法：先 deactivate 再 activate，中间不进 im->active 的早退分支。
+	 * 只在「确实从一个输入框换到另一个」时做 —— 同一个 surface 重复 enter
+	 * 是常态（客户端 focus_in/out 抖动），每次都重置会把用户正在打的中文
+	 * 状态无故清掉。 */
+	struct wlr_surface *prev = active_text_input(server) != NULL ?
+		active_text_input(server)->input->focused_surface : NULL;
+	bool switching = prev != NULL && surface != NULL && prev != surface;
+
 	struct vidow_text_input *ti;
 	wl_list_for_each(ti, &server->text_inputs, link) {
 		/* 输入框属于某个客户端，那个客户端的窗口拿到焦点就 enter。注意不能
@@ -569,6 +586,15 @@ void vidow_im_focus(struct vidow_server *server, struct wlr_surface *surface) {
 		}
 	}
 	im_set_active(server, active_text_input(server) != NULL);
+	/* 换输入框：把输入法的自身状态机重置一次（见上面 switching 的说明）。
+	 * im->active 这时已经是 true，im_set_active() 会因为「状态没变」早退，
+	 * 所以这里直接发协议消息，并且把顺序摆成 deactivate -> activate。 */
+	if (switching && server->im.method != NULL) {
+		wlr_input_method_v2_send_deactivate(server->im.method);
+		wlr_input_method_v2_send_activate(server->im.method);
+		wlr_log(WLR_DEBUG, "im: 换输入框 → 重置输入法状态"
+			"（前一个 %p，新的 %p）", (void *)prev, (void *)surface);
+	}
 	im_popup_update(server);
 }
 

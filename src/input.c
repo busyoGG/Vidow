@@ -173,6 +173,53 @@ static void keyboard_key(struct wl_listener *listener, void *data) {
 	const xkb_keysym_t *syms;
 	int nsyms = xkb_state_key_get_syms(kb->wlr_keyboard->xkb_state, keycode, &syms);
 
+	/* evdev 键码直给的兜底：**keymap 里没有这个名字的键**。
+	 *
+	 * 用户 2026-10-21 报「fn 键的功能似乎无效」：他键盘驱动把 Fn+P 直接绑定成
+	 * KEY_PRINT（evdev 210）。这键在 xkb 的 keycodes/evdev 里只有个占位名
+	 * <I218>（`grep I218 /usr/share/X11/xkb/keycodes/evdev` 能看到那行注释就
+	 * 写着 `#define KEY_PRINT 210`），symbols 表里**没有任何键位绑定它** ——
+	 * 于是 xkb_state_key_get_syms() 返回 0 个 keysym，下面那个
+	 * `for (i < nsyms)` 一次都不跑，绑定永远不可能命中。
+	 *
+	 * Hyprland 那边「正常」，是因为它走 evdev 键码（XKB 只是锦上添花），压根
+	 * 不依赖 keysym。vidow 的绑定表是按 keysym 建的（这样 `vidow.bind("print")`
+	 * 才对得上），所以这里补一层：keymap 解不出来时，按 evdev 键码查我们自己的
+	 * 小表，解成一个**等价 keysym**（KEY_PRINT -> XKB_KEY_Print），后面的绑定
+	 * 匹配、裸键检查、焦点透传全都照旧走原路。
+	 *
+	 * 只补「驱动直绑、没有对应字符」的那几个键。普通字母 / 数字永远有 keysym，
+	 * 走不到这儿；真走到这儿又不在这张表里的，照旧 nsyms=0（透传给客户端）。 */
+	static const struct {
+		uint32_t evdev;
+		xkb_keysym_t sym;
+	} evdev_fallback[] = {
+		{ 99,  XKB_KEY_Print },  /* KEY_SYSRQ：标准键盘的 Print 走这个 */
+		{ 210, XKB_KEY_Print },  /* KEY_PRINT：驱动直绑用的那个（用户这把） */
+		{ 183, XKB_KEY_F13 },    /* KEY_F13：Fn+F1..F12 常被驱动映射到这 */
+		{ 184, XKB_KEY_F14 }, { 185, XKB_KEY_F15 }, { 186, XKB_KEY_F16 },
+		{ 187, XKB_KEY_F17 }, { 188, XKB_KEY_F18 }, { 189, XKB_KEY_F19 },
+		{ 190, XKB_KEY_F20 }, { 191, XKB_KEY_F21 }, { 192, XKB_KEY_F22 },
+		{ 193, XKB_KEY_F23 }, { 194, XKB_KEY_F24 },
+	};
+	xkb_keysym_t fallback_sym = XKB_KEY_NoSymbol;
+	if (nsyms <= 0) {
+		for (size_t i = 0;
+				i < sizeof(evdev_fallback) / sizeof(evdev_fallback[0]); i++) {
+			if (evdev_fallback[i].evdev == event->keycode) {
+				fallback_sym = evdev_fallback[i].sym;
+				break;
+			}
+		}
+		if (fallback_sym != XKB_KEY_NoSymbol) {
+			syms = &fallback_sym;
+			nsyms = 1;
+			wlr_log(WLR_DEBUG, "键盘: evdev %u 在 keymap 里没名字，"
+				"按内置表解成 keysym 0x%04X", event->keycode,
+				fallback_sym);
+		}
+	}
+
 
 	bool handled = false;
 	uint32_t mods = wlr_keyboard_get_modifiers(kb->wlr_keyboard);
@@ -191,6 +238,17 @@ static void keyboard_key(struct wl_listener *listener, void *data) {
 		lock_key_route(server, kb->wlr_keyboard, event->time_msec,
 			event->keycode, event->state);
 		return;
+	}
+	if (getenv("VIDOW_PROBE_KEYS") != NULL) {
+		char nb[64] = "?";
+		if (nsyms > 0) {
+			xkb_keysym_get_name(syms[0], nb, sizeof(nb));
+		}
+		wlr_log(WLR_INFO, "KEYPROBE evdev=%u syms=%d sym0=0x%04X(%s) "
+			"mods=0x%X alt=%d logo=%d bound=%d", event->keycode, nsyms,
+			nsyms > 0 ? syms[0] : 0, nb, mods,
+			!!(mods & WLR_MODIFIER_ALT), !!(mods & WLR_MODIFIER_LOGO),
+			nsyms > 0);
 	}
 	/* config.lua 里 vidow.bind() 声明的键位（动作字符串见 README 的动作表）：
 	 * 工作区切换 / 窗口与列的方向移动 / 浮动 / 全屏 / 全景 / 起命令 / 切 tty …
@@ -894,6 +952,21 @@ static void focus_follows_mouse(struct vidow_server *server,
 		 * vidow_warp_cursor_to_focus），不是用户在挪鼠标。 */
 		return;
 	}
+	/* **按着键不放的时候不跟**（隐式抓取）：拖选文本、拖窗口、拖滚动条，
+	 * 指针划到别的窗口上时焦点得留在原地。
+	 *
+	 * 少了这一条，拖拽一出原窗口就被抢走键盘焦点 —— 客户端收到
+	 * keyboard leave，选区状态断掉，松手也不再认为自己还在那次拖拽里
+	 * （用户报的「鼠标拖拽的时候不要脱离窗口焦点哪怕离开了窗口」，而且
+	 * 他开着 focus_follows_mouse，别的窗口一被划到就把焦点拽走了）。
+	 *
+	 * 判据用 vidow 自己数的 pointer_button_count，不用
+	 * seat->pointer_state.button_count：后者会被
+	 * wlr_seat_pointer_notify_enter() 里的 reset_buttons() 清零（见
+	 * server.h 里那段注释）。 */
+	if (server->pointer_button_count != 0) {
+		return;
+	}
 	if (!server->config.focus_follows_mouse || hit == NULL ||
 			hit == server->focused) {
 		return;
@@ -1214,8 +1287,8 @@ void vidow_pointer_motion(struct vidow_server *server, uint32_t time_msec) {
 		vidow_view_at(server, server->cursor->x, server->cursor->y, &surface,
 			&sx, &sy);
 
-	/* X11 窗口的命中坐标换算比较容易出错（缓冲区按 xwayland_scale 倍声明过），
-	 * 留一行调试日志：局部坐标应该是「布局坐标 - 窗口原点」的 xwayland_scale 倍。 */
+	/* X11 窗口的命中坐标要留一行调试日志：KDE 模式下 X 坐标就是逻辑坐标，
+	 * 所以局部坐标应该正好等于「布局坐标 - 窗口原点」（1:1，不乘不除）。 */
 	/* overview 里窗口都缩过了，命中坐标对不上，别把移动事件转给客户端 */
 	if (vidow_overview_active(server)) {
 		return;
@@ -1265,13 +1338,67 @@ void vidow_pointer_motion(struct vidow_server *server, uint32_t time_msec) {
 	focus_follows_mouse(server, hit);
 
 	if (hit != NULL && hit->kind == VIDOW_VIEW_X11) {
-		wlr_log(WLR_DEBUG, "x11: 指针 %.0f,%.0f -> %s 局部 %.0f,%.0f",
+		/* 诊断用：把命中判定用到的每一个数都打出来（用户报「只有一半能
+		 * 交互」，需要知道是哪一层的数不对）。 */
+		struct wlr_scene_buffer *hnode = hit->scene_surface != NULL ?
+			hit->scene_surface->buffer : NULL;
+		struct wlr_surface *hsurf = vidow_view_surface(hit);
+		wlr_log(WLR_INFO, "x11: 指针 %.0f,%.0f -> %s 局部 %.0f,%.0f"
+			"| geom %d,%d %dx%d | dst %dx%d | surf %dx%d | hit %.3f",
 			server->cursor->x, server->cursor->y,
 			vidow_view_title(hit) != NULL ? vidow_view_title(hit) : "(无题)",
-			sx, sy);
+			sx, sy,
+			hit->geom.x, hit->geom.y, hit->geom.width, hit->geom.height,
+			hnode != NULL ? hnode->dst_width : -1,
+			hnode != NULL ? hnode->dst_height : -1,
+			hsurf != NULL ? hsurf->current.width : -1,
+			hsurf != NULL ? hsurf->current.height : -1,
+			vidow_view_hit_scale(hit));
 	}
 
 	if (surface != NULL) {
+		/* **按着键的时候不许换焦点表面** —— 和下面 else 分支那条是同一个规矩的
+		 * 两半（隐式抓取）。
+		 *
+		 * 文本拖拽出窗口再拖回来，回来这一下 surface != NULL，走的就是这里：
+		 * wlr_seat_pointer_notify_enter() 一看焦点表面变了就 reset_buttons()，
+		 * 并且会把 LEAVE 发给原来那个表面 —— 客户端认为指针走了，后面的
+		 * RELEASE 它不认，选择停在半路（用户报的「拖出去就停住」）。
+		 *
+		 * 按着键时只补 motion（坐标是相对当前抓取表面的局部坐标，算法和下面
+		 * else 分支那份一样），不动焦点。 */
+		if (server->pointer_button_count != 0) {
+			struct wlr_surface *grabbed =
+				server->seat->pointer_state.focused_surface;
+			if (grabbed != NULL) {
+				double gx = 0, gy = 0;
+				bool have = false;
+				struct vidow_view *gv =
+					vidow_view_from_surface(server, grabbed);
+				if (gv != NULL) {
+					have = vidow_view_surface_coords(gv, grabbed,
+						server->cursor->x, server->cursor->y, &gx, &gy);
+				}
+				/* 抓取表面**不是窗口**（layer 客户端：slurp 的 selection、
+				 * 面板 / dock）：vidow_view_surface_coords 拿不到节点，返回
+				 * false 而 gx/gy 还停在初值 0,0 —— 直接发出去等于告诉客户端
+				 * 「指针每帧都在原点」，选区就成了「从屏幕左上角到鼠标」
+				 * 而且一拖就结束（用户报的 layer 拖拽从左上角触发）。
+				 *
+				 * 命中测试上面刚算过一份表面局部坐标（sx/sy，表面自己的坐标
+				 * 空间，layer 表面也是）：光标还在同一个表面上就照用它。 */
+				if (!have && surface == grabbed) {
+					gx = sx;
+					gy = sy;
+					have = true;
+				}
+				if (have) {
+					wlr_seat_pointer_notify_motion(server->seat,
+						time_msec, gx, gy);
+				}
+				return;
+			}
+		}
 		wlr_seat_pointer_notify_enter(server->seat, surface, sx, sy);
 		wlr_seat_pointer_notify_motion(server->seat, time_msec, sx, sy);
 	} else {
@@ -1291,10 +1418,15 @@ void vidow_pointer_motion(struct vidow_server *server, uint32_t time_msec) {
 		 * 合成器自己吞掉（notify_button 只送给 focused_surface，那时是 NULL），
 		 * 于是客户端一直以为按钮还按着 —— 「释放鼠标选择还在跟随」正是这个。
 		 *
-		 * server->seat->pointer_state.button_count 是 wlroots 自己维护的按下
-		 * 计数（notify_button 里加减），拿它判「现在是不是抓着」最准，不用自己
-		 * 再记一份状态。 */
-		if (server->seat->pointer_state.button_count == 0) {
+		 * **别用 server->seat->pointer_state.button_count 判这件事**：
+		 * wlr_seat_pointer_notify_enter() 一换焦点表面就调 reset_buttons()
+		 * 把它清 0（types/seat/wlr_seat_pointer.c:449）。文本拖拽的典型动作
+		 * 就是「拖出窗口再拖回来」—— 拖回来那一刻正是 notify_enter，计数
+		 * 已经被清了，于是这里判成「没按着」，焦点一清、RELEASE 永远送不到，
+		 * 选择停在半路（用户反复报的就是这一条，上一版拿 button_count 判，
+		 * 看着对、实际一直在漏）。改用 vidow 自己数的 pointer_button_count，
+		 * 它只由 vidow_pointer_button 的按下 / 松开加减，换焦点不影响。 */
+		if (server->pointer_button_count == 0) {
 			wlr_seat_pointer_notify_clear_focus(server->seat);
 		} else {
 			/* 仍在抓取：motion 要送给抓取者，坐标得是**相对那个表面**的。
@@ -1303,22 +1435,29 @@ void vidow_pointer_motion(struct vidow_server *server, uint32_t time_msec) {
 			 * 直接送 0 会让抓取中的客户端以为指针一动不动：文本选择、拖动这类
 			 * 操作正是靠 motion 的位移推进的，停在 0 就等于「选择卡住不动」。
 			 *
-			 * 换算：场景是全局坐标，减掉抓取窗口的场景节点原点就是它的局部
-			 * 坐标（和 wlr_scene_node_at 一个算法，只是不做框内裁剪 —— 光标
-			 * 现在就在框外，这正是要允许的）。拿不到节点就退回 0,0：至少
-			 * release 能送到，不会留下「一直按着」的坏状态。 */
+			 * 换算和 hover 共用：从抓取表面的实际内容节点原点量，按实际
+			 * XY 尺度转成表面局部坐标，不裁剪（光标在框外也要继续送）。
+			 * 拿不到节点就退回 0,0：至少 release 能送到，不会留下
+			 * 「一直按着」的坏状态。 */
 			double gx = 0, gy = 0;
+			bool have = false;
 			struct wlr_surface *grabbed =
 				server->seat->pointer_state.focused_surface;
 			struct vidow_view *gv = vidow_view_from_surface(server, grabbed);
-			if (gv != NULL && gv->scene_tree != NULL) {
-				int nx = 0, ny = 0;
-				if (wlr_scene_node_coords(&gv->scene_tree->node, &nx, &ny)) {
-					gx = server->cursor->x - (double)nx;
-					gy = server->cursor->y - (double)ny;
-				}
+			if (gv != NULL) {
+				have = vidow_view_surface_coords(gv, grabbed,
+					server->cursor->x, server->cursor->y, &gx, &gy);
 			}
-			wlr_seat_pointer_notify_motion(server->seat, time_msec, gx, gy);
+			/* 抓取表面不是窗口（layer 客户端：拖出面板 / slurp 选区又拖回来）：
+			 * 同上一条，光标还在它上面就用命中测试算出的那份局部坐标。 */
+			if (!have && grabbed != NULL && surface == grabbed) {
+				gx = sx;
+				gy = sy;
+				have = true;
+			}
+			if (have) {
+				wlr_seat_pointer_notify_motion(server->seat, time_msec, gx, gy);
+			}
 		}
 	}
 }
@@ -1446,6 +1585,14 @@ static uint32_t pointer_modifiers(struct vidow_server *server) {
  * 和真实鼠标完全同一条路。 */
 void vidow_pointer_button(struct vidow_server *server, uint32_t button,
 		bool pressed, uint32_t time_msec, bool force_mod) {
+	/* 自己记一份按键数（见 server.h 里 pointer_button_count 的注释）：放在
+	 * **所有 return 之前** —— 不管这一下被谁吃掉（lock surface / 小窗预览 /
+	 * 绑定表 / 转给客户端），物理按键状态都变了。 */
+	if (pressed) {
+		server->pointer_button_count++;
+	} else if (server->pointer_button_count > 0) {
+		server->pointer_button_count--;
+	}
 	/* 会话锁：锁定期间指针按键只给 lock surface —— 不进拖拽 grab、不过绑定表、
 	 * 不给被藏起来的窗口（方案 §2 环节 3）。 */
 	if (server->locked) {
@@ -1646,12 +1793,22 @@ void vidow_pointer_button(struct vidow_server *server, uint32_t button,
 	 * 命中坐标、以及键盘焦点给谁。 */
 	struct wlr_surface *pfocus = server->seat->pointer_state.focused_surface;
 	struct vidow_view *pfocus_view = vidow_view_from_surface(server, pfocus);
-	wlr_log(WLR_DEBUG, "点击 button %u 在 %.0f,%.0f：命中 %s（局部 %.0f,%.0f），"
+	/* 命中 / 指针焦点两行都用 INFO 打一次（2026-10-23）：layer 客户端（slurp
+	 * 框选、面板拖拽）的按下先过命中测试，门开错了就表现成「选区从左上角
+	 * 起、拖一下就结束」，而 DEBUG 级在现场日志里是关着的 —— 拿不到第一现场。
+	 * 只在按下时打，不影响每帧的日志量。 */
+	wlr_log(WLR_INFO, "点击 button %u 在 %.0f,%.0f：命中 %s（局部 %.0f,%.0f），"
 		"指针焦点在 %s", button, server->cursor->x, server->cursor->y,
 		view != NULL ? vidow_view_title(view) : "(没有窗口)", sx, sy,
 		pfocus == NULL ? "(无)" :
 			(pfocus_view != NULL ? vidow_view_title(pfocus_view) :
 				"(别的表面)"));
+	if (surface != NULL) {
+		wlr_log(WLR_INFO, "点击命中表面 namespace=%s（layer=%s）",
+			surface->role != NULL && surface->role->name != NULL ?
+				surface->role->name : "?",
+			server->grab_mode != VIDOW_GRAB_NONE ? "抓取中" : "无抓取");
+	}
 
 	/* A layer surface asking for keyboard focus (ON_DEMAND launcher) wins. */
 	if (vidow_layer_focus_surface(server, surface)) {
@@ -1959,7 +2116,7 @@ static void server_request_cursor(struct wl_listener *listener, void *data) {
 	 * —— 放大期间客户端换光标（焦点切到别的窗口就会）不再把放大缩回去。 */
 	vidow_cursor_fx_set_surface(server, event->surface, event->hotspot_x,
 		event->hotspot_y);
-	wlr_cursor_set_surface(server->cursor, event->surface, event->hotspot_x,
+	vidow_cursor_set_client_surface(server, event->surface, event->hotspot_x,
 		event->hotspot_y);
 	vidow_cursor_fx_cursor_changed(server);
 }
@@ -2568,9 +2725,26 @@ bool vidow_inject_pointer_button(struct vidow_server *server, const char *name,
 		uint32_t t = inject_now_ms() + (uint32_t)(i * 40);
 		if (mode != 2) {
 			vidow_pointer_button(server, btn, true, t, false);
+			/* **按下之后必须立刻收一个 frame**：Wayland 协议里客户端是把
+			 * 一个 frame 内的 pointer 事件当成一组来处理的，press 和
+			 * release 挤在同一帧里时，很多客户端（GTK / Qt / Xwayland）
+			 * 只认最后一次状态，等于这次点击从未发生 —— 实测表现就是
+			 * 「能移动光标，但点不动任何东西」。 */
+			wlr_seat_pointer_notify_frame(server->seat);
+			if (mode == 0) {
+				/* click 模式还要保证 release 落在不同的毫秒上 */
+				uint32_t t2 = t;
+				if (t2 <= t) {
+					t2 = t + 1;
+				}
+				vidow_pointer_button(server, btn, false, t2, false);
+			}
 		}
-		if (mode != 1) {
+		if (mode == 2) {
 			vidow_pointer_button(server, btn, false, t, false);
+		}
+		if (mode != 2) {
+			wlr_seat_pointer_notify_frame(server->seat);
 		}
 	}
 	/* 注入没有设备帧：自己收一个（同 vidow_inject_pointer_move，滚轮那条一直

@@ -36,7 +36,10 @@ static struct ext_background_effect_surface_v1 *bge;
 static struct wl_region *region;
 static int width = 640, height = 400;
 static int buf_w = 640, buf_h = 400; /* 当前缓冲尺寸（跟着 configure 走） */
+/* 默认只给中间一条横带给模糊区域 —— 那是给「区域里外对比」用的老测试。
+ * --full（或 argc<7 时显式传）改成正整窗：区域 = 0,0,宽,高。 */
 static int rx = 0, ry = 140, rw = 640, rh = 120;
+static int full_window = 0;
 
 /* ------------------------------------------------------------ shm buffer */
 
@@ -100,6 +103,15 @@ static void xdg_surface_configure(void *data, struct xdg_surface *xs,
 	xdg_surface_ack_configure(xs, serial);
 	/* 合成器给的尺寸才是最终尺寸，照它重建缓冲，免得被缩放 */
 	attach_buffer();
+	/* 整窗模糊：区域要按**实际拿到了多大**来设 —— 客户端申请的尺寸会被
+	 * 合成器按平铺布局改小（申请 900x600、实际 631x708），拿申请值设区域
+	 * 就只盖住一部分，看起来「只有一条是糊的」。 */
+	if (full_window && bge != NULL && compositor != NULL) {
+		struct wl_region *r = wl_compositor_create_region(compositor);
+		wl_region_add(r, 0, 0, width, height);
+		ext_background_effect_surface_v1_set_blur_region(bge, r);
+		wl_region_destroy(r);
+	}
 }
 
 static const struct xdg_surface_listener xdg_surface_listener = {
@@ -187,6 +199,11 @@ static const struct ext_background_effect_manager_v1_listener bge_listener = {
 };
 
 int main(int argc, char *argv[]) {
+	for (int i = 1; i < argc; i++) {
+		if (strcmp(argv[i], "--full") == 0) {
+			full_window = 1;
+		}
+	}
 	if (argc >= 7) {
 		width = atoi(argv[1]);
 		height = atoi(argv[2]);
@@ -230,7 +247,15 @@ int main(int argc, char *argv[]) {
 		surface);
 	if (getenv("BGBLUR_NO_REGION") == NULL) {
 		region = wl_compositor_create_region(compositor);
-		wl_region_add(region, rx, ry, rw, rh);
+		if (full_window) {
+			/* 整窗模糊：录屏 / 看效果时不该只剩中间一条。尺寸取这个客户端
+			 * 自己申请的（buf_w/h 要等 configure 才有值，那时已经晚了，
+			 * 所以用命令行给的 width/height）。 */
+			wl_region_add(region, 0, 0, width, height);
+			printf("bgblur: 整窗模糊区域 0,0 %dx%d\n", width, height);
+		} else {
+			wl_region_add(region, rx, ry, rw, rh);
+		}
 		ext_background_effect_surface_v1_set_blur_region(bge, region);
 		wl_region_destroy(region);
 	}

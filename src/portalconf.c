@@ -673,7 +673,25 @@ void vidow_portal_env_restore(void) {
 	set_list[0] = '\0';
 	unset_list[0] = '\0';
 	for (int i = 0; i < RESTORE_N; i++) {
-		if (restore_present[i]) {
+		bool present = restore_present[i];
+		/* 退出路上**不重启 portal**，也不按 socket 存活与否改 WAYLAND_DISPLAY
+		 * （2026-10-23 修）。原来的写法是「还原环境 + 立刻 restart
+		 * xdg-desktop-portal」，实测把后端叫死在空窗期：
+		 *
+		 *   23:33:49 vidow 退出，自己的 /run/user/1000/wayland-0 随之消失
+		 *            → 用户管理器里 WAYLAND_DISPLAY=wayland-0 还是老样子
+		 *   23:33:57 紧接着重启的 portal 起来，此刻**没有任何合成器在跑**
+		 *            Failed to create wl_display (No such file or directory)
+		 *            Could not load the Qt platform plugin "wayland"
+		 *            Could not load the Qt platform plugin "xcb" → qFatal
+		 *            → xdg-desktop-portal-kde SIGABRT（用户看到「退出就崩溃」）
+		 *
+		 * 那个 WAYLAND_DISPLAY 指向的其实是我们**自己**的 socket（名字由
+		 * wl_display_add_socket_auto 给，快照时记下的就是它），所以不是名字
+		 * 错了，是**时机**错了：正在退出的合成器不该去重启 portal。
+		 * 环境照旧还原（下一个合成器起来时 portal_env_import 会重新
+		 * import + 重启），这里只是不再自己点那把火。 */
+		if (present) {
 			char quoted[VAL_LEN + 8];
 			shell_quote(restore_value[i], quoted, sizeof(quoted));
 			append(set_list, sizeof(set_list), "%s%s=%s",
@@ -695,11 +713,11 @@ void vidow_portal_env_restore(void) {
 		append(cmd, sizeof(cmd),
 			"systemctl --user unset-environment %s 2>/dev/null; ", unset_list);
 	}
-	append(cmd, sizeof(cmd),
-		"systemctl --user restart xdg-desktop-portal 2>/dev/null");
-
-	wlr_log(WLR_INFO, "portal: 还原用户管理器环境（%s%s），重启 xdg-desktop-portal",
-		set_list, unset_list);
+	/* **不重启 portal**（见上面那段）：退出时这一下会把后端叫在空窗期上，
+	 * 它连不上任何 display，Qt 直接 qFatal。环境还原够用了 —— 下一个合成器
+	 * 起来时 portal_env_import() 自己会 import + restart。 */
+	wlr_log(WLR_INFO, "portal: 还原用户管理器环境（%s%s），不重启 portal"
+		"（交给下一个合成器）", set_list, unset_list);
 	vidow_exec_detached(cmd);
 }
 

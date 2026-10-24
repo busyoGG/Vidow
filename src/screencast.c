@@ -86,7 +86,8 @@ struct vidow_sc_pw {
 	struct pw_core *core;
 	struct spa_hook core_listener;
 	struct pw_core_events core_events;
-	struct wl_event_source *source;
+	struct wl_event_source *source; /* 只在 fdwatch 起不来时用 */
+	int loop_fd;                    /* pw loop 的 fd（fdwatch 在盯这个） */
 	/* 心跳：每 1s 给每路流催一次图。屏幕静止时没有任何输出提交，而消费者可能
 	 * 是「刚连上」的 —— 不催的话它要等到下一次画面变化才有第一帧（实测：负载
 	 * 高的时候 gst 连上来晚了，一帧都拿不到）。1Hz 的代价是静止画面上每路流
@@ -233,6 +234,16 @@ static int pw_loop_ready(int fd, uint32_t mask, void *data) {
 	return 0;
 }
 
+/* fdwatch 版（见 fdwatch.c：合成器的自唤醒 fd 不挂 add_fd）。
+ * 返回 0 = 「让我下一拍再来」：PipeWire 的 loop 不一定一轮就跑完，下一拍接着跑
+ * 一轮不花钱。 */
+static int pw_loop_fdw(int fd, void *data) {
+	(void)fd;
+	struct vidow_sc_pw *pw = data;
+	pw_loop_iterate(pw->loop, 0);
+	return 0;
+}
+
 #define VIDOW_SC_TICK_MS 1000
 
 static int pw_tick(void *data) {
@@ -331,9 +342,14 @@ struct vidow_sc_pw *vidow_sc_pw_create(struct vidow_screencast *sc,
 
 	/* loop 的 fd 交给 wl_event_loop：一条线程跑到底，不用锁，也不存在
 	 * 「从 PipeWire 线程往 Wayland 资源上写事件」这种麻烦。 */
-	pw->source = wl_event_loop_add_fd(wl_display_get_event_loop(display),
-		pw_loop_get_fd(pw->loop), WL_EVENT_READABLE, pw_loop_ready, pw);
-	if (pw->source == NULL) {
+	int loop_fd = pw_loop_get_fd(pw->loop);
+	if (!vidow_fdwatch_register(loop_fd, VIDOW_FDWATCH_CAPTURE, pw_loop_fdw,
+			pw)) {
+		pw->source = wl_event_loop_add_fd(wl_display_get_event_loop(display),
+			loop_fd, WL_EVENT_READABLE, pw_loop_ready, pw);
+	}
+	pw->loop_fd = loop_fd;
+	if (pw->source == NULL && !vidow_fdwatch_tracks(loop_fd, VIDOW_FDWATCH_CAPTURE)) {
 		pw_context_destroy(pw->context);
 		pw_loop_destroy(pw->loop);
 		free(pw);
@@ -357,7 +373,10 @@ struct vidow_sc_pw *vidow_sc_pw_create(struct vidow_screencast *sc,
 			wl_event_source_remove(pw->tick);
 			pw->tick = NULL;
 		}
-		wl_event_source_remove(pw->source);
+		vidow_fdwatch_deregister(pw->loop_fd, VIDOW_FDWATCH_CAPTURE, pw);
+		if (pw->source != NULL) {
+			wl_event_source_remove(pw->source);
+		}
 		pw_context_destroy(pw->context);
 		pw_loop_destroy(pw->loop);
 		free(pw);
@@ -381,6 +400,7 @@ static void vidow_sc_pw_destroy(struct vidow_sc_pw *pw) {
 		wl_event_source_remove(pw->tick);
 		pw->tick = NULL;
 	}
+	vidow_fdwatch_deregister(pw->loop_fd, VIDOW_FDWATCH_CAPTURE, pw);
 	if (pw->source != NULL) {
 		wl_event_source_remove(pw->source);
 		pw->source = NULL;

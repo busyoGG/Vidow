@@ -479,7 +479,8 @@ static void sel_shutdown_selection(struct vidow_clip_selection *sel) {
 }
 
 /* 把当前缓存发布到 seat 上（Wayland 客户端就能粘了）。类型表为空 = 撤掉。 */
-static void sel_publish(struct vidow_clip_selection *sel) {
+static void sel_publish_serial(struct vidow_clip_selection *sel,
+		uint32_t serial) {
 	struct vidow_server *server = sel->server;
 	if (!server->config.clipboard) {
 		return;
@@ -512,8 +513,7 @@ static void sel_publish(struct vidow_clip_selection *sel) {
 			}
 		}
 		sel->published_primary = &src->base;
-		wlr_seat_set_primary_selection(server->seat, &src->base,
-			wl_display_next_serial(server->display));
+		wlr_seat_set_primary_selection(server->seat, &src->base, serial);
 	} else {
 		struct vidow_clip_source *src = calloc(1, sizeof(*src));
 		if (src == NULL) {
@@ -532,9 +532,13 @@ static void sel_publish(struct vidow_clip_selection *sel) {
 			}
 		}
 		sel->published = &src->base;
-		wlr_seat_set_selection(server->seat, &src->base,
-			wl_display_next_serial(server->display));
+		wlr_seat_set_selection(server->seat, &src->base, serial);
 	}
+}
+
+/* Explicit new selections (X11/IPC/history) get a new ordering serial. */
+static void sel_publish(struct vidow_clip_selection *sel) {
+	sel_publish_serial(sel, wl_display_next_serial(sel->server->display));
 }
 
 /* 撤掉我们发布的那一份（seat 上的选择清空）。 */
@@ -564,6 +568,7 @@ static void pull_destroy(struct vidow_clip_pull *pull) {
 	if (pull->source != NULL) {
 		wl_event_source_remove(pull->source);
 	}
+	vidow_fdwatch_deregister(pull->fd, VIDOW_FDWATCH_CLIPBOARD, pull);
 	close(pull->fd);
 	wl_list_remove(&pull->link);
 	free(pull->mime);
@@ -620,18 +625,23 @@ static int pull_readable(int fd, uint32_t mask, void *data) {
 		}
 		if (n == 0) {
 			pull_finish(pull, "wayland-pull-done");
-			return 0;
+			return 1;
 		}
 		if (errno == EAGAIN || errno == EWOULDBLOCK) {
 			if (mask & (WL_EVENT_HANGUP | WL_EVENT_ERROR)) {
 				/* 写端关了却没读到 EOF：不常见，当完 */
 				pull_finish(pull, "wayland-pull-hup");
 			}
-			return 0;
+			return 1;
 		}
 		pull_finish(pull, "wayland-pull-error");
-		return 0;
+		return 1;
 	}
+}
+
+/* fdwatch 版：可读了就来拉一轮。返回 1 = 这一轮读完了（或者已经收摊）。 */
+static int pull_fdw(int fd, void *data) {
+	return pull_readable(fd, WL_EVENT_READABLE, data);
 }
 
 /* 给一份 Wayland 源建一条管道把数据拉过来。ds / ps 二选一。 */
@@ -656,9 +666,12 @@ static void pull_start(struct vidow_clip_selection *sel, struct wlr_data_source 
 	fcntl(fds[0], F_SETFL, O_NONBLOCK);
 	fcntl(fds[1], F_SETFD, FD_CLOEXEC);
 	wl_list_insert(&sel->pulls, &pull->link);
-	pull->source = wl_event_loop_add_fd(
-		wl_display_get_event_loop(sel->server->display), pull->fd,
-		WL_EVENT_READABLE, pull_readable, pull);
+	/* 自唤醒 fd 不挂 add_fd（见 fdwatch.c）；起不来才退回事件循环。 */
+	if (!vidow_fdwatch_register(pull->fd, VIDOW_FDWATCH_CLIPBOARD, pull_fdw, pull)) {
+		pull->source = wl_event_loop_add_fd(
+			wl_display_get_event_loop(sel->server->display), pull->fd,
+			WL_EVENT_READABLE, pull_readable, pull);
+	}
 	sel_tick_arm(sel);
 
 	if (ps != NULL) {
@@ -721,7 +734,9 @@ static void sel_handle_seat(struct vidow_clip_selection *sel) {
 		/* 客户端退出 / 显式清空：缓存还在就重新发布一遍，这样两边都还能粘 */
 		if (src == NULL) {
 			if (sel_has_data(sel)) {
-				sel_publish(sel);
+				/* Restoring the same contents must not supersede a copy request
+				 * already queued behind the old source's destroy request. */
+				sel_publish_serial(sel, seat->primary_selection_serial);
 			} else {
 				sel_unpublish(sel);
 			}
@@ -744,7 +759,8 @@ static void sel_handle_seat(struct vidow_clip_selection *sel) {
 	}
 	if (src == NULL) {
 		if (sel_has_data(sel)) {
-			sel_publish(sel);
+			/* This is persistence, not a new selection: retain its serial. */
+			sel_publish_serial(sel, seat->selection_serial);
 		} else {
 			sel_unpublish(sel);
 		}
@@ -2483,15 +2499,20 @@ bool vidow_clipboard_owns_xwindow(struct vidow_server *server,
 	if (clip->window == XCB_WINDOW_NONE || window == XCB_WINDOW_NONE) {
 		return false;
 	}
-	if ((xcb_window_t)window == clip->window) {
-		return true;
-	}
-	/* xwm 自己还有几个内部窗口（选区的 selection_window、代理窗口……），它们
-	 * 跟我们自己的窗口建在同一条连接上 —— X 资源 id 的槽位（高位）一样。
-	 * 这些窗口 xwm 也会建 surface，收进视图模型就是白占一个布局位置的幽灵
-	 * 窗口（1x1 的 selection_window 真的会进来抢一格）。客户端窗口在别的槽位上
-	 * （xwm 是第一个连上 X 的客户端，槽位 0x200000），所以按槽位判就够了。 */
-	return (window & ~(uint32_t)0x1fffff) == (clip->window & ~(uint32_t)0x1fffff);
+	/* **只认我们自己那一个窗口 id，不按槽位猜。**
+	 *
+	 * 以前这里返回 (window & ~0x1fffff) == (clip->window & ~0x1fffff)，理由是
+	 * 「xwm 的内部窗口跟我们建在同一条连接上，槽位一样；客户端都在别的槽位」。
+	 * 这条假设是错的：X 资源槽位会随着连接轮转，xwm 重连后可能拿到一个客户端
+	 * 用过的槽位。踩过的 —— Steam 这一轮的主窗口正好是 0x2000041（槽位
+	 * 0x200000，和剪贴板代理窗口同槽），于是每次开主界面都被当成内部窗口在
+	 * xwayland.c 的 handle_new_xwayland_surface 里直接丢掉，view 根本没建，
+	 * 画面上永远不出现（`vidowmsg windows` 里也没有）。
+	 *
+	 * 内部那些窗口（selection_window 之类）本来就**不映射**，交给后面的
+	 * view_map / focus_helper 逻辑处理就够了（1x1 的第一帧会被判成辅助窗口），
+	 * 不需要在入口按槽位一刀切。 */
+	return (xcb_window_t)window == clip->window;
 }
 
 bool vidow_clipboard_mime_is_text(const char *mime) {

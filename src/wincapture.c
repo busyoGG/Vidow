@@ -517,7 +517,7 @@ struct wlr_buffer *vidow_win_grab_render(struct vidow_win_grab *grab,
 	struct wlr_scene_buffer *sb = view->scene_surface != NULL ?
 		view->scene_surface->buffer : NULL;
 	struct wlr_texture *ctex = sb != NULL ? vidow_fx_client_texture(server,
-		sb->buffer, &ctex_owned) : NULL;
+		sb->buffer, sb, &ctex_owned) : NULL;
 
 	/* 可见窗口（= 画框贴着的那块）在取景框里的位置。客户端自己画装饰时（CSD）
 	 * 表面比窗口大一圈透明的留白（阴影边），贴到表面边上就是「录出来的框比屏上

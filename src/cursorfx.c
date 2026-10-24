@@ -117,6 +117,8 @@ struct vidow_cursor_fx {
 	char shape[64];
 	int32_t hx, hy;
 	struct wl_listener surface_destroy;
+	struct wl_listener surface_commit;
+	struct vidow_server *server;
 
 	/* 光标藏起来了（hide_when_typing / hide_after_inactive_ms，见下面
 	 * vidow_cursor_fx_set_hidden）：藏的时候图在 wlroots 那边是 NULL，上面那
@@ -254,7 +256,7 @@ static void shake_restore(struct vidow_server *server) {
 	fx->refresh_retry = 0;
 	wl_event_source_timer_update(fx->timer, 0);
 	if (fx->surface != NULL) {
-		wlr_cursor_set_surface(server->cursor, fx->surface, fx->hx, fx->hy);
+		vidow_cursor_set_client_surface(server, fx->surface, fx->hx, fx->hy);
 	} else {
 		wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr,
 			fx_cursor_name(fx));
@@ -620,18 +622,54 @@ void vidow_cursor_fx_motion(struct vidow_server *server) {
 
 /* --------------------------------------------------------------- 光标图跟踪 */
 
+/* X cursor images are already in the global X density's native pixels.
+ * Do not let a scale=1 Xwayland cursor surface multiply them a second time
+ * on HiDPI outputs. Keep surface commits/lifetime tracking, but present the
+ * borrowed buffer with its actual density and convert the hotspot once. */
+bool vidow_cursor_set_client_surface(struct vidow_server *server,
+		struct wlr_surface *surface, int32_t hx, int32_t hy) {
+	bool x11 = surface != NULL && server->xwayland != NULL &&
+		server->xwayland->server != NULL &&
+		wl_resource_get_client(surface->resource) == server->xwayland->server->client;
+	if (!x11) {
+		wlr_cursor_set_surface(server->cursor, surface, hx, hy);
+		return false;
+	}
+	double density = server->xwayland_scale;
+	if (!(density > 0.0)) density = 1.0;
+	struct wlr_buffer *buffer = surface->buffer != NULL ?
+		&surface->buffer->base : NULL;
+	wlr_cursor_set_buffer(server->cursor, buffer,
+		(int32_t)lround(hx / density), (int32_t)lround(hy / density),
+		(float)density);
+	return true;
+}
+
+static void client_cursor_commit(struct wl_listener *listener, void *data) {
+	(void)data;
+	struct vidow_cursor_fx *fx = wl_container_of(listener, fx, surface_commit);
+	if (!fx->hidden) {
+		vidow_cursor_set_client_surface(fx->server, fx->surface, fx->hx, fx->hy);
+		vidow_cursor_fx_cursor_changed(fx->server);
+	}
+}
+
 static void surface_gone(struct wl_listener *listener, void *data) {
 	struct vidow_cursor_fx *fx =
 		wl_container_of(listener, fx, surface_destroy);
 	(void)data;
 	wl_list_remove(&fx->surface_destroy.link);
 	wl_list_init(&fx->surface_destroy.link);
+	wl_list_remove(&fx->surface_commit.link);
+	wl_list_init(&fx->surface_commit.link);
 	fx->surface = NULL;
 }
 
 static void forget_surface(struct vidow_cursor_fx *fx) {
 	wl_list_remove(&fx->surface_destroy.link);
 	wl_list_init(&fx->surface_destroy.link);
+	wl_list_remove(&fx->surface_commit.link);
+	wl_list_init(&fx->surface_commit.link);
 	fx->surface = NULL;
 }
 
@@ -652,6 +690,11 @@ void vidow_cursor_fx_set_surface(struct vidow_server *server,
 	if (surface != NULL) {
 		fx->surface_destroy.notify = surface_gone;
 		wl_signal_add(&surface->events.destroy, &fx->surface_destroy);
+		if (server->xwayland != NULL && server->xwayland->server != NULL &&
+				wl_resource_get_client(surface->resource) == server->xwayland->server->client) {
+			fx->surface_commit.notify = client_cursor_commit;
+			wl_signal_add(&surface->events.commit, &fx->surface_commit);
+		}
 	}
 	/* 光标藏着的时候只记账、不上图：不然客户端一 set_cursor 光标又冒出来了
 	 * （隐藏是「用户没在动」这件事，不该被客户端的一个请求打断）。 */
@@ -689,7 +732,7 @@ void vidow_cursor_fx_set_hidden(struct vidow_server *server, bool hidden) {
 		return;
 	}
 	if (fx->surface != NULL) {
-		wlr_cursor_set_surface(server->cursor, fx->surface, fx->hx, fx->hy);
+		vidow_cursor_set_client_surface(server, fx->surface, fx->hx, fx->hy);
 	} else {
 		wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr,
 			fx_cursor_name(fx));
@@ -750,9 +793,9 @@ void vidow_cursor_fx_cursor_changed(struct vidow_server *server) {
 	wl_event_source_timer_update(fx->timer, SHAKE_TICK_MS);
 }
 
-/* 客户端通过 cursor-shape-v1 换了主题光标（layer / GTK 菜单 / 文本输入框等）。
- * 有客户端 surface 的时候 surface 优先（协议：set_cursor 的 surface 比 shape 新）；
- * 没有 surface 才把主题光标名记下来并立刻设上去。 */
+/* A validated cursor-shape request replaces the previous cursor, including a
+ * surface supplied by another client. Neither protocol has permanent priority:
+ * the latest accepted request wins. */
 void vidow_cursor_fx_set_cursor_name(struct vidow_server *server,
 		const char *name) {
 	if (name == NULL || name[0] == '\0') {
@@ -760,12 +803,9 @@ void vidow_cursor_fx_set_cursor_name(struct vidow_server *server,
 	}
 	struct vidow_cursor_fx *fx = server->cursor_fx;
 	if (fx != NULL) {
+		forget_surface(fx);
 		snprintf(fx->shape, sizeof(fx->shape), "%s", name);
 		if (fx->hidden) {
-			return;
-		}
-		if (fx->surface != NULL) {
-			/* 客户端自己给了 surface：形状请求不该把那张图顶掉。 */
 			return;
 		}
 	}
@@ -782,14 +822,16 @@ void vidow_cursor_fx_set_cursor_name(struct vidow_server *server,
 void vidow_cursor_fx_default_cursor(struct vidow_server *server) {
 	struct vidow_cursor_fx *fx = server->cursor_fx;
 	if (fx != NULL) {
-		bool had_surface = fx->surface != NULL;
+		bool changed = fx->surface != NULL ||
+			strcmp(fx_cursor_name(fx), "left_ptr") != 0;
 		forget_surface(fx);
+		snprintf(fx->shape, sizeof(fx->shape), "%s", "left_ptr");
 		if (fx->hidden) {
 			/* 藏着：只记住「显示回来该给主题箭头」，别现在就把图上回去。 */
 			return;
 		}
 		if (fx->active) {
-			if (had_surface) {
+			if (changed) {
 				wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr,
 					"left_ptr");
 				vidow_cursor_fx_cursor_changed(server);
@@ -802,6 +844,22 @@ void vidow_cursor_fx_default_cursor(struct vidow_server *server) {
 }
 
 /* --------------------------------------------------------------- 状态 / 初始化 */
+
+/* 光标 manager 重建之后（主题 / 尺寸热更新，见 main.c 的 vidow_cursor_apply）：
+ * 把客户端给的那张图和主题形状重新设上。客户端 surface 不经过 manager，不重设
+ * 就停在旧尺寸/旧形状上。放大期间不动（放大图由摇晃那条路自己重画）。 */
+void vidow_cursor_fx_reapply(struct vidow_server *server) {
+	struct vidow_cursor_fx *fx = server->cursor_fx;
+	if (fx == NULL || fx->active || fx->hidden) {
+		return;
+	}
+	if (fx->surface != NULL) {
+		vidow_cursor_set_client_surface(server, fx->surface, fx->hx, fx->hy);
+	} else {
+		wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr,
+			fx_cursor_name(fx));
+	}
+}
 
 void vidow_cursor_fx_json(struct jbuf *b, struct vidow_server *server) {
 	struct vidow_cursor_fx *fx = server->cursor_fx;
@@ -818,6 +876,16 @@ void vidow_cursor_fx_json(struct jbuf *b, struct vidow_server *server) {
 		snprintf(buf, sizeof(buf), "%dx%d", oc->width, oc->height);
 		jb_kv_str(b, "image", buf);
 		jb_kv_bool(b, "hardware", output->hardware_cursor == oc);
+		jb_kv_double(b, "source_x", oc->src_box.x);
+		jb_kv_double(b, "source_y", oc->src_box.y);
+		jb_kv_double(b, "source_width", oc->src_box.width);
+		jb_kv_double(b, "source_height", oc->src_box.height);
+		jb_kv_double(b, "hotspot_x", oc->hotspot_x);
+		jb_kv_double(b, "hotspot_y", oc->hotspot_y);
+		if (oc->texture != NULL) {
+			jb_kv_int(b, "texture_width", oc->texture->width);
+			jb_kv_int(b, "texture_height", oc->texture->height);
+		}
 	} else {
 		jb_kv_str(b, "image", "0x0");
 		jb_kv_bool(b, "hardware", false);
@@ -837,6 +905,8 @@ void vidow_cursor_fx_init(struct vidow_server *server) {
 		return;
 	}
 	wl_list_init(&fx->surface_destroy.link);
+	wl_list_init(&fx->surface_commit.link);
+	fx->server = server;
 	fx->last_x = server->cursor->x;
 	fx->last_y = server->cursor->y;
 	fx->have_last = true;

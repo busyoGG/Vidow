@@ -4,3 +4,18 @@ subprojects/*/
 *.raw
 __pycache__/
 *.pyc
+
+# 调试产物 / 临时文件：不随仓库走
+test-shots/
+demos/
+archive/
+tc*.sh
+record-drag-*.py
+tools/remote/certs/
+FIX_SUMMARY.txt
+STEAM_FIX_VERIFICATION.md
+SCALE_ANALYSIS.md
+OBSERVATION_CHECKLIST.md
+TROUBLESHOOTING.md
+steam-*.patch
+steam-*-report.md

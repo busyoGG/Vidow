@@ -177,6 +177,14 @@ void vidow_output_render(struct vidow_output *output) {
 	/* 这一帧所有离屏趟（模糊链 / 装饰 / 果冻）的命令在这里一次性提交，
 	 * 而不是每趟一次 —— 见 fx.c 的 end_pass。 */
 	vidow_fx_flush(server);
+	/* **真正把这些命令提交到屏幕上**。
+	 *
+	 * 这行之前被删过：删掉之后 vidow_output_render() 只剩发 frame_done，
+	 * 输出从来不 commit —— wlr_output 的 events.commit 不响，
+	 * screencopy 的 frame_handle_output_commit 一次都不跑，抓帧客户端
+	 * （wf-recorder / 远程工具）拿不到 ready：录出来的文件 0 字节，
+	 * 前端一直「未起播」。屏幕看着正常是因为别处还有提交路径兜着，
+	 * 但抓帧这条依赖 commit 信号的链路就断了。 */
 	wlr_scene_output_commit(output->scene_output, NULL);
 	int64_t st_t4 = vidow_now_ns();
 	if (render_stats_on()) {
@@ -316,16 +324,86 @@ static int pump_timer_cb(void *data) {
  * 空载也要每秒醒 20 次（实测 strace：21 秒里 epoll_wait 返回 427 次、
  * timerfd_settime 852 次 —— 期间一次抓帧都没有）。现在由抓帧请求踢一脚
  * （见 vidow_output_capture_kick），抓完没人等着就自己停 —— 空载零唤醒。 */
+/* 抓帧兜底的间隔（毫秒）。capture_fps = 60 → 16ms；<=0 → 0 表示「不续期」。
+ *
+ * 原来这里硬编码 50（= 20fps），是「别自作聪明替后端画帧」的保守值。
+ * 远程控制要跟手，20fps 的步进肉眼就是卡顿，所以改成可配：默认 60fps，
+ * 想省电/省带宽就调低。下限 1ms 挡住荒谬配置（1000Hz）。 */
+static int capture_interval_ms(struct vidow_server *server) {
+	int fps = server != NULL ? server->capture_fps : 0;
+	if (fps <= 0) {
+		return 0; /* 不续期：兜底关掉 */
+	}
+	int ms = 1000 / fps;
+	return ms < 1 ? 1 : ms;
+}
+
+/* 光标抓帧（ext-image-copy-capture 的 pointer cursor session）记下来的「这块屏
+ * 上有人在等一帧」。见 vidow_output_capture_kick_output。 */
+static bool capture_kick_pending(struct vidow_output *output) {
+	return output != NULL && output->capture_pending;
+}
+
+/* 这一块屏要不要推一帧：有 screencopy 帧在等它的下一次 commit，或者光标抓帧
+ * 点了名。**逐屏判**是这里的关键：以前是「全局有帧 → 所有输出整屏标脏重画」，
+ * 双屏上抓 A 屏时 B 屏每 16ms 白画一屏（整屏标脏 = 模糊链 / 装饰 / 提交全跑）。 */
+static bool capture_wants_frame(struct vidow_server *server,
+		struct vidow_output *output) {
+	if (output == NULL || output->wlr_output == NULL) {
+		return false;
+	}
+	if (capture_kick_pending(output)) {
+		return true;
+	}
+	return vidow_screencopy_has_pending_for_output(server->screencopy,
+		output->wlr_output);
+}
+
+/* 给这一块屏推一帧：先整屏标脏再渲染。
+ *
+ * **整屏标脏不能省**，否则这一帧白推：wlr_scene_output_commit() 在「没有损伤」时
+ * 直接返回 false、压根不提交输出 —— 于是 wlr_output 的 commit 信号不响，
+ * screencopy.c 的 frame_handle_output_commit 永远等不到 WLR_OUTPUT_STATE_BUFFER，
+ * 逐帧抓屏的客户端（wf-recorder、远程工具）就一直卡在「等下一帧」：后台录到的是
+ * 0 字节，只有退出收尾那一帧才有内容（实测：t=1..4s 文件一直是 0）。
+ *
+ * 屏幕静止时本来就没有损伤，可这里要的恰恰是「静止也出帧」—— 抓帧兜底的全部意义
+ * 就在这。所以只对**确实有人等着**的那块屏标脏：多画一帧的代价（~1ms）换一个能推
+ * 的帧流，但不替别的屏付这个代价。 */
+static void capture_render_output(struct vidow_output *output) {
+	wlr_log(WLR_DEBUG, "capture watchdog: render %s", output->wlr_output->name);
+	if (output->scene_output != NULL) {
+		wlr_damage_ring_add_whole(&output->scene_output->damage_ring);
+	}
+	/* vidow_output_render() 内部会 wlr_scene_output_commit()，那一句才是触发
+	 * screencopy 的 events.commit 的东西（标脏 + 提交 = 抓帧客户端拿到 ready）。
+	 * 关着的屏由它自己早退（见 vidow_output_render 开头）。 */
+	vidow_output_render(output);
+}
+
 static int capture_watchdog(void *data) {
 	struct vidow_server *server = data;
-	if (!vidow_screencopy_has_pending(server->screencopy)) {
-		return 0; /* 没人等着：不续期 */
+	/* 光标抓帧那条账是**一次性**的：这一轮用掉就清，下一次
+	 * cursor_source_request_frame 才会再记（客户端每次 capture 都会先 request_frame，
+	 * 而那时它的帧还欠着、下一轮提交就会把它发出去）。只靠它的时候看门狗转一次
+	 * 就停，不会变成空转定时器。 */
+	bool any = false;
+	struct vidow_output *output, *tmp;
+	wl_list_for_each_safe(output, tmp, &server->outputs, link) {
+		if (!capture_wants_frame(server, output)) {
+			continue; /* 这块屏没人等着：一帧都不推 */
+		}
+		output->capture_pending = false;
+		any = true;
+		capture_render_output(output);
+		/* 渲染会派发事件（客户端 destroy、输出拔线），output 可能已经没了 ——
+		 * 用 _safe 遍历拿到的 tmp 只是下一个节点，这里不再碰 output。 */
 	}
-	struct vidow_output *output;
-	wl_list_for_each(output, &server->outputs, link) {
-		vidow_output_render(output);
+	if (!any) {
+		return 0; /* 没人等着：不续期（下一轮不会再被排上） */
 	}
-	wl_event_source_timer_update(server->capture_timer, 50);
+	wl_event_source_timer_update(server->capture_timer,
+		capture_interval_ms(server));
 	return 0;
 }
 
@@ -335,7 +413,24 @@ void vidow_output_capture_kick(struct vidow_server *server) {
 	if (server == NULL || server->capture_timer == NULL) {
 		return;
 	}
-	wl_event_source_timer_update(server->capture_timer, 50);
+	int ms = capture_interval_ms(server);
+	if (ms <= 0) {
+		return; /* 兜底关着：只靠后端自己的提交 */
+	}
+	wl_event_source_timer_update(server->capture_timer, ms);
+}
+
+void vidow_output_capture_kick_output(struct vidow_server *server,
+		struct wlr_output *wlr_output) {
+	if (server == NULL || wlr_output == NULL) {
+		return;
+	}
+	struct vidow_output *output = vidow_output_lookup(server, wlr_output);
+	if (output != NULL) {
+		output->capture_pending = true;
+	}
+	/* 找不到那块屏也照样踢：诊断/记账不许改变「会不会推帧」这件事。 */
+	vidow_output_capture_kick(server);
 }
 
 /* 看门狗自己推帧的节奏：跟着后端**自己**的帧间隔走，比它晚 1/4 才补一帧。
@@ -616,6 +711,64 @@ static struct wlr_output_mode *output_find_mode(struct wlr_output *wlr_output,
 	return match;
 }
 
+/* 「逻辑尺寸统一」的基准：所有屏的逻辑分辨率对齐到同一套。
+ *
+ * **基准 = 所有屏里物理面积最大的那块的分辨率**，与各自配的 scale 无关。
+ *
+ * 用户那套场景（1080p + 4K）：
+ *   4K 屏   : 3840x2160  → 基准 3840x2160 逻辑
+ *   1080p 屏: 也要 3840x2160 逻辑 → scale = 1920/3840 = 0.5
+ *             （1920 物理像素横向取样 3840 逻辑像素 = 降采样，
+ *              用户说的「1x 屏相当于超采样」就是这条）
+ *
+ * X 屏幕 = 各屏设备像素累加 = 3840(4K) + 1920(1080p) = 5760
+ *    —— 注意 X 侧看到的是**设备像素**，和逻辑尺寸无关；逻辑统一只影响
+ *    Wayland 侧的坐标空间。两屏按 3840x2160 逻辑并排时布局是 7680x2160
+ *    逻辑，这是 Wayland 客户端看到的坐标系。 */
+static bool output_unify_target(struct vidow_server *server, int *w, int *h) {
+	int best = 0, best_w = 0, best_h = 0;
+	struct vidow_output *output;
+	wl_list_for_each(output, &server->outputs, link) {
+		struct wlr_output *o = output->wlr_output;
+		if (!o->enabled) {
+			continue;
+		}
+		/* 配置里点名了 mode 就用它（配置跑得比模式切换早，这时候 o->width
+		 * 还是后端的默认值）；没点名才退回当前模式 / preferred。 */
+		int pw = 0, ph = 0;
+		const struct vidow_output_conf *conf =
+			vidow_output_conf_for(server, o->name);
+		if (conf != NULL && conf->has_mode &&
+				conf->mode_w > 0 && conf->mode_h > 0) {
+			pw = conf->mode_w;
+			ph = conf->mode_h;
+		}
+		if (pw <= 0 || ph <= 0) {
+			struct wlr_output_mode *m = wlr_output_preferred_mode(o);
+			pw = m != NULL ? m->width : o->width;
+			ph = m != NULL ? m->height : o->height;
+		}
+		if (pw <= 0 || ph <= 0) {
+			continue;
+		}
+		/* **物理面积**排序：4K 屏 3840x2160 > 1080p 屏 1920x1080，
+		 * 所以基准永远是 4K 那块的原生分辨率。不除 scale —— 除的话
+		 * 4K@2 会变成 1920x1080，和 1080p 打平，基准就不确定了。 */
+		int area = pw * ph;
+		if (area > best) {
+			best = area;
+			best_w = pw;
+			best_h = ph;
+		}
+	}
+	if (best <= 0) {
+		return false;
+	}
+	*w = best_w;
+	*h = best_h;
+	return true;
+}
+
 /* 一个输出该用多大缩放，以及为什么。w / h 是它将要上的那个模式的分辨率
  * （还没上模式时就是现在这个）。 */
 static double output_pick_scale(struct vidow_server *server,
@@ -637,12 +790,62 @@ static double output_pick_scale(struct vidow_server *server,
 	double scale = vidow_scale_resolve(named ? &spec : NULL, cfg->scale, w, h,
 		wlr_output->phys_width, wlr_output->phys_height);
 
+	/* **逻辑尺寸统一**（cfg.logical_uniform）：所有屏的逻辑分辨率对齐到
+	 * 基准（= 现有配置下逻辑面积最大的那块，见 output_unify_target）。
+	 * 每块屏的 scale = 自己的物理尺寸 / 基准逻辑。
+	 *
+	 * 用户场景（1080p + 4K，4K 配 scale=2）：
+	 *   基准 = 4K 屏的逻辑 = 1920x1080
+	 *   4K 屏   : 3840/1920 = 2.0  → 保持 2，逻辑 1920x1080 ✓
+	 *   1080p 屏: 1920/1920 = 1.0  → 原生 1:1，逻辑 1920x1080 ✓
+	 *   X 屏幕  = 1920(1x) + 3840(2x) = 5760x2160
+	 *
+	 * 两屏逻辑完全相同（1920x1080），窗口跨屏不跳大小；1080p 屏是原生
+	 * 1:1 渲染（scale=1，没有超采样浪费）。
+	 *
+	 * 如果基准比这块屏的物理尺寸还大（1080p 屏要对齐到 4K 的 3840 逻辑），
+	 * 那 scale 会小于 1 —— 夹到 1.0 就做不到「逻辑相同」了。那种情况如实
+	 * 告诉用户：这块屏物理上不够，只能按 1:1 出。 */
+	if (cfg->logical_uniform && !wl_list_empty(&server->outputs)) {
+		/* 这块屏「将要成为」的物理尺寸：配置里点名了 mode 就用它，否则用
+		 * 传进来的 w/h（当前模式）。配置跑得比模式切换早，创建那一刻
+		 * w/h 还是后端的默认值（headless 1280x720），拿它算会得到错的倍率。 */
+		int phys_w = w, phys_h = h;
+		if (conf != NULL && conf->has_mode &&
+				conf->mode_w > 0 && conf->mode_h > 0) {
+			phys_w = conf->mode_w;
+			phys_h = conf->mode_h;
+		}
+		int target_w = 0, target_h = 0;
+		bool have_target = output_unify_target(server, &target_w, &target_h);
+		if (have_target && target_w > 0 && target_h > 0 &&
+				phys_w > 0 && phys_h > 0) {
+			/* **逻辑尺寸和物理尺寸无关**：每块屏的逻辑宽高都等于基准。
+			 * 一块 1920 宽的屏要装下 3840 逻辑宽 → scale = 1920/3840 = 0.5。
+			 * 这个 scale 让 wl_output 报 3840 逻辑，而缓冲只有 1920 ——
+			 * 客户端按 3840 排版、我们按 0.5 缩下去取样（超采样 / 降采样）。
+			 *
+			 * 下限不再是 1.0：1.0 的下限会让「小屏对齐到大逻辑」根本做不到
+			 * （那正是用户要的 7680 布局）。改成 0.1 —— 再小就没有实际意义了。 */
+			double s_unify = (double)phys_w / (double)target_w;
+			double s_quant = vidow_scale_quantize(s_unify, 0.1, 8.0);
+			/* **无条件返回**：逻辑统一打开时，配置里写的 scale 让位。
+			 * 否则 4K 屏配了 auto（→1.0）会把统一算出来的 1.0 当成「不变」
+			 * 从而不覆盖，别的屏又已经按 0.5 走了 —— 两屏逻辑尺寸就对不上。
+			 * 每块屏的逻辑尺寸必须都由这一个公式决定，才谈得上「统一」。 */
+			snprintf(why, why_len,
+				"逻辑统一：物理 %dx%d / 基准 %dx%d = %.2f",
+				phys_w, phys_h, target_w, target_h, s_unify);
+			return s_quant;
+		}
+	}
+
 	double ppi = 0.0;
 	if (wlr_output->phys_width > 0 && wlr_output->phys_height > 0) {
 		double diag_px = sqrt((double)w * w + (double)h * h);
 		double diag_in = sqrt((double)wlr_output->phys_width *
-			wlr_output->phys_width + (double)wlr_output->phys_height *
-			wlr_output->phys_height) / 25.4;
+			(double)wlr_output->phys_width + (double)wlr_output->phys_height *
+			(double)wlr_output->phys_height) / 25.4;
 		ppi = diag_in > 0.0 ? diag_px / diag_in : 0.0;
 	}
 
@@ -729,6 +932,18 @@ static void output_state_applied(struct vidow_server *server,
 	vidow_backdrop_damage(server, true);
 	vidow_arrange_layers(server);
 	vidow_arrange(server);
+	/* 逻辑尺寸统一：这块屏的模式刚变过，「基准」可能跟着变了（比如新屏是
+	 * 4K、刚切上来），别的屏的缩放也要重算。放在 arrange 之后是因为
+	 * 基准要读最新的 width/height。递归风险：apply_scale_all 只在倍率真的
+	 * 变了时才走到这里，链断了。 */
+	if (server->config.logical_uniform) {
+		struct vidow_output *other;
+		wl_list_for_each(other, &server->outputs, link) {
+			if (other != output) {
+				vidow_output_apply_scale(server, other);
+			}
+		}
+	}
 	/* 这块屏的缩放可能变了（IPC output_scale / 配置 SIGHUP）：X 那边的全局缩放
 	 * 是「所有屏里最大的那个」，跟着重算一遍 —— 它是 X 屏幕尺寸、RandR 模式和
 	 * Xft.dpi 的依据。没变的话这个调用自己就返回了。 */
@@ -741,9 +956,11 @@ static void output_state_applied(struct vidow_server *server,
 void vidow_output_apply_scale(struct vidow_server *server,
 		struct vidow_output *output) {
 	struct wlr_output *wlr_output = output->wlr_output;
-	struct wlr_output_mode *mode = wlr_output_preferred_mode(wlr_output);
-	int w = mode != NULL ? mode->width : wlr_output->width;
-	int h = mode != NULL ? mode->height : wlr_output->height;
+	/* 用**当前实际尺寸**，不是 preferred_mode：IPC 的 output-mode / 配置里
+	 * 点名的自定义模式都跑在 preferred 之外（headless 的 preferred 永远是
+	 * 1280x720），拿 preferred 算「物理 / 基准」会算成错的倍率。 */
+	int w = wlr_output->width;
+	int h = wlr_output->height;
 	char why[64];
 	double scale = output_pick_scale(server, wlr_output, w, h, why, sizeof(why));
 	if (fabs(scale - (double)wlr_output->scale) < 1e-3) {
@@ -1768,6 +1985,25 @@ bool vidow_output_init(struct vidow_server *server) {
 		wl_display_get_event_loop(server->display), anim_watchdog, server);
 	if (server->anim_timer == NULL) {
 		wlr_log(WLR_ERROR, "failed to create the animation watchdog");
+	}
+	/* 抓帧兜底节奏：**配置先落**（config.lua 的 capture_fps，默认 60），
+	 * 环境变量覆盖它（临时调试 / 脚本场景不用改配置文件）。 */
+	server->capture_fps = server->config.capture_fps;
+	if (server->capture_fps < 0) {
+		server->capture_fps = 0;
+	}
+	const char *fps_env = getenv("VIDOW_CAPTURE_FPS");
+	if (fps_env != NULL && *fps_env != '\0') {
+		char *end = NULL;
+		long v = strtol(fps_env, &end, 10);
+		if (end != fps_env && v >= 0 && v <= 1000) {
+			server->capture_fps = (int)v;
+			wlr_log(WLR_INFO, "抓帧兜底节奏：%d fps（VIDOW_CAPTURE_FPS 覆盖配置）",
+				server->capture_fps);
+		} else {
+			wlr_log(WLR_ERROR, "VIDOW_CAPTURE_FPS=\"%s\" 不是 0..1000 的整数，"
+				"用配置值 %d fps", fps_env, server->capture_fps);
+		}
 	}
 	server->capture_timer = wl_event_loop_add_timer(
 		wl_display_get_event_loop(server->display), capture_watchdog, server);

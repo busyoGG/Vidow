@@ -1941,6 +1941,10 @@ void vidow_config_sync(struct vidow_server *server) {
 	vidow_activation_apply_config(server);
 	/* decor 开关改了：客户端要不要自己画标题栏得重新通知（见 decoration.c） */
 	vidow_decoration_apply_config(server);
+	/* cursor_theme / cursor_size 改了：重建 cursor manager。以前只有启动和
+	 * `vidowmsg cursor-size` 调它，改配置再 reload 光标根本不动（用户报的
+	 * 「光标大小不能热更新」）。 */
+	vidow_cursor_apply(server);
 	/* portal 那两个键改了也要跟上：XDG_CURRENT_DESKTOP 重设一遍，生效的
 	 * portals.conf 重新算一遍（内容没变的话什么都不做，不会白重启 portal）。 */
 	vidow_portal_desktop_env(&server->config);

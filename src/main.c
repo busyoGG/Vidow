@@ -1,4 +1,6 @@
 #include <unistd.h>
+#include <sys/resource.h>
+#include <sys/wait.h>
 #include "server.h"
 #include "env.h"
 #include "hooks.h"
@@ -6,6 +8,7 @@
 #include "gesture.h"
 #include "sessionlock.h"
 
+#include <errno.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
@@ -54,10 +57,54 @@ static enum wlr_log_importance log_level_from_env(void) {
  * 这里只摘「挂在 wlroots 对象上、由我们自己加的」那些：对象内部的监听器
  * （窗口 / 输出 / layer 的）各自在 destroy 回调里已经摘干净了。 */
 
-/* SIGTERM / SIGINT：走正常退出路径（wl_display_terminate），不用默认动作直接
- * 结束进程。默认动作不跑清理，环境还原（portalconf.c）也就没了 —— 用户管理器
- * 里会一直留着 vidow 的 socket，回到宿主合成器以后新拉起来的 portal 后端连的是
- * 一个已经消失的 socket。Ctrl+C 和 pkill 都走这条。 */
+/* 读 gsettings 的一个字符串键（org.gnome.desktop.interface 那组）。
+ *
+ * 为什么走 popen 而不是链 libgio：vidow 没有 GLib 依赖（整个进程就 wlroots +
+ * 几个 X/DRM 库），为了两个设置项拉进 GLib 不划算；这条只在启动时跑一次，
+ * 开销无所谓。拿不到（没装 gsettings / 没 D-Bus / 键不存在）返回 NULL。 */
+static char *vidow_gsettings_string(const char *key) {
+	char cmd[256];
+	snprintf(cmd, sizeof(cmd),
+		"gsettings get org.gnome.desktop.interface %s 2>/dev/null", key);
+	FILE *f = popen(cmd, "r");
+	if (f == NULL) {
+		return NULL;
+	}
+	char buf[256];
+	if (fgets(buf, sizeof(buf), f) == NULL) {
+		pclose(f);
+		return NULL;
+	}
+	pclose(f);
+	/* 输出是 GVariant 字面量：'Bibata-Modern-Ice'（带单引号）。去引号去空白。 */
+	char *s = buf;
+	s[strcspn(s, "\n")] = '\0';
+	while (*s == ' ' || *s == '\t' || *s == '\'') {
+		s++;
+	}
+	size_t len = strlen(s);
+	while (len > 0 && (s[len - 1] == '\'' || s[len - 1] == ' ' ||
+			s[len - 1] == '\t')) {
+		s[--len] = '\0';
+	}
+	if (len == 0 || strcmp(s, "@ms") == 0) {
+		return NULL;
+	}
+	return strdup(s);
+}
+
+/* 读 gsettings 的一个整数键（cursor-size）。失败返回 -1。 */
+static int vidow_gsettings_int(const char *key) {
+	char *s = vidow_gsettings_string(key);
+	if (s == NULL) {
+		return -1;
+	}
+	int v = atoi(s);
+	free(s);
+	return v;
+}
+
+
 static int terminate_signal(int signo, void *data) {
 	(void)signo;
 	struct vidow_server *server = data;
@@ -260,6 +307,109 @@ static void idle_init(struct vidow_server *server) {
 	wl_signal_add(&server->backend->events.new_input, &server->idle_new_input);
 }
 
+
+/* 光标主题 / 尺寸：**一个入口**，启动建一次、改配置 / IPC 再建一次。
+ *
+ * 取值顺序（每一档都只在「上一档没给」时才看）：
+ *   1. config 里的 cursor_theme / cursor_size（0 / 空 = 没指定）
+ *   2. 环境变量 XCURSOR_THEME / XCURSOR_SIZE（用户 export 的，
+ *      或 26-autostart.lua 里那行 XCURSOR_SIZE=64 gtk-launch steam 同源）
+ *   3. gsettings（GNOME / 大多数主题包改的就是这两个键）
+ *   4. Adwaita + 24（等于以前的行为）
+ *
+ * 重建而不是「就地改」：wlroots 的 size 是 manager 创建时定死的，只能换一个新的，
+ * 再把输出重新挂一遍（每个输出按自己的 scale 加载一份）+ 重新设一次当前光标图。
+ * 用户报的「wayland 光标大小怎么改不了」就是原来只在启动读一次、没有别的入口。 */
+void vidow_cursor_apply(struct vidow_server *server) {
+	const char *cur_theme = server->config.cursor_theme[0] != '\0' ?
+		server->config.cursor_theme : NULL;
+	const char *theme_src = "config";
+	if (cur_theme == NULL) {
+		cur_theme = getenv("XCURSOR_THEME");
+		theme_src = "环境变量";
+	}
+	if (cur_theme == NULL || cur_theme[0] == '\0') {
+		cur_theme = vidow_gsettings_string("cursor-theme");
+		theme_src = "gsettings";
+	}
+	if (cur_theme == NULL || cur_theme[0] == '\0') {
+		cur_theme = "Adwaita";
+		theme_src = "缺省";
+	}
+	int cur_size = server->config.cursor_size > 0 ? server->config.cursor_size : 0;
+	const char *size_src = "config";
+	if (cur_size == 0) {
+		const char *env_size = getenv("XCURSOR_SIZE");
+		size_src = "环境变量";
+		if (env_size != NULL && env_size[0] != '\0') {
+			int v = atoi(env_size);
+			if (v > 0 && v <= 512) {
+				cur_size = v;
+			}
+		}
+		if (cur_size == 0) {
+			int v = vidow_gsettings_int("cursor-size");
+			size_src = "gsettings";
+			if (v > 0 && v <= 512) {
+				cur_size = v;
+			}
+		}
+	}
+	if (cur_size <= 0) {
+		cur_size = 24;
+		size_src = "缺省";
+	}
+	/* 给 Wayland 客户端（Qt / GTK / Electron 都读这两个）也说出来：
+	 * 不设的话它们各自去猜，桌面上就会出现两套光标尺寸。 */
+	setenv("XCURSOR_THEME", cur_theme, 0);
+	{
+		char sz[16];
+		snprintf(sz, sizeof(sz), "%d", cur_size);
+		setenv("XCURSOR_SIZE", sz, 0);
+	}
+	wlr_log(WLR_INFO, "cursor: 主题 %s、尺寸 %d（来自 %s / %s；config 的 "
+		"cursor_theme/cursor_size 优先）", cur_theme, cur_size, theme_src,
+		size_src);
+
+	struct wlr_xcursor_manager *mgr = wlr_xcursor_manager_create(cur_theme,
+		cur_size);
+	if (mgr == NULL && strcmp(cur_theme, "Adwaita") != 0) {
+		/* 主题名对、但目录不在 XCURSOR_PATH 里：退回 Adwaita，别留个空
+		 * manager（后面每个 wlr_cursor_set_xcursor 都会静默失败，光标
+		 * 直接消失）。 */
+		wlr_log(WLR_ERROR, "cursor: 主题 %s 加载不了（不在 XCURSOR_PATH "
+			"里？），退回 Adwaita", cur_theme);
+		mgr = wlr_xcursor_manager_create("Adwaita", cur_size);
+	}
+	if (mgr == NULL) {
+		mgr = wlr_xcursor_manager_create(NULL, cur_size);
+	}
+	if (mgr == NULL) {
+		wlr_log(WLR_ERROR, "cursor: cursor manager 建不出来，光标保持原样");
+		return;
+	}
+
+	/* 每块屏按自己的 scale 加载一份（2 倍屏上要 2 倍图，不然糊 / 小一号）。 */
+	struct wlr_xcursor_manager *old = server->cursor_mgr;
+	server->cursor_mgr = mgr;
+	struct vidow_output *o;
+	wl_list_for_each(o, &server->outputs, link) {
+		wlr_xcursor_manager_load(mgr, o->wlr_output->scale);
+	}
+	/* 已经显示着光标的场景节点换上新 manager 的那份图。形状 / 客户端给的图
+	 * 由 vidow_cursor_fx_reapply() 重设（它知道当前形状和隐藏状态）。 */
+	if (server->cursor_fx != NULL) {
+		vidow_cursor_fx_reapply(server);
+	} else {
+		wlr_cursor_set_xcursor(server->cursor, mgr, "left_ptr");
+	}
+	/* 旧的 manager 没人再引用：上面的 set_* 已经把图从它那儿换走了。 */
+	if (old != NULL) {
+		wlr_xcursor_manager_destroy(old);
+	}
+}
+
+
 static void server_finish(struct vidow_server *server) {
 	vidow_extworkspace_finish(server);
 	if (server->session != NULL) {
@@ -421,6 +571,35 @@ int main(int argc, char *argv[]) {
 		return 2;
 	}
 
+	/* 先把 fd 上限抬上去。SDDM 的 sddm-helper 只给 1024（systemd 那边是
+	 * 524288，但 helper 没继承），而 vidow 光是正常跑就要几百个 fd：每个
+	 * 客户端缓冲、每块输出的交换链、Xwayland / portal 的 socket 都在里面。
+	 * 2026-10-21 那次 dmabuf 泄漏（见 fdwatch.c）打满这 1024 之后，Xwayland
+	 * 继承的同一上限也耗尽 —— 它静默退出，wlroots 只打一句
+	 * 「Restarting Xwayland (lazy)」，而 Steam 那边看到的是
+	 * 「X connection to :1 broken」，跟着一起死。查了半天才发现链条起点
+	 * 是这里。
+	 *
+	 * 提高上限**不是**修泄漏（泄漏在 fdwatch.c 那套监控下另案处理），是把
+	 * 「一泄漏就静默连环炸」改成「涨到几千你自己能在日志里看见」。取
+	 * 65536：足够高，又不至于把 /proc 撑爆。
+	 *
+	 * 子进程（Xwayland / portal / 配置里 spawn 的那些）自动继承。 */
+	{
+		struct rlimit rl;
+		if (getrlimit(RLIMIT_NOFILE, &rl) == 0 &&
+				rl.rlim_cur < 65536 && rl.rlim_cur != RLIM_INFINITY) {
+			rlim_t want = 65536;
+			if (rl.rlim_max != RLIM_INFINITY && want > rl.rlim_max) {
+				want = rl.rlim_max;
+			}
+			if (want > rl.rlim_cur) {
+				rl.rlim_cur = want;
+				(void)setrlimit(RLIMIT_NOFILE, &rl);
+			}
+		}
+	}
+
 	if (write_config) {
 		char path[PATH_MAX];
 		vidow_config_path(path, sizeof(path));
@@ -508,8 +687,75 @@ int main(int argc, char *argv[]) {
 		wlr_log(WLR_INFO, "会话: 没有（嵌套 / headless 后端），切 VT 的键位不接管");
 	}
 
-	/* Ctrl+C / pkill 也要走正常退出：环境还原挂在退出路径上。 */
-	int signals[] = { SIGTERM, SIGINT };
+	/* 只认 SIGTERM（pkill / systemctl stop）：环境还原挂在退出路径上，所以这条
+	 * 必须走正常退出。
+	 *
+	 * **不注册 SIGINT**，照 Hyprland 的做法（Compositor.cpp 只
+	 * `wl_event_loop_add_signal(..., SIGTERM, ...)`；handleCritSignal 里那个
+	 * SIGINT 分支从来没被注册过）。原因：合成器常常和它拉起的终端 / 程序
+	 * 在同一个前台进程组里，在 kitty 里按 Ctrl+C 时终端会把 SIGINT 发给**整组**，
+	 * 注册了就等于「子进程按 Ctrl+C，合成器跟着退出」。会话里那些自己 setsid
+	 * 的程序（noctalia 之类）不会波及，所以现象看起来是「有的程序能传染、有的
+	 * 不能」—— 差别在进程组，不在客户端。
+	 *
+	 * **光不注册还不够**：不注册只是走默认动作，而 SIGINT 的默认动作就是
+	 * 终止进程。
+	 *
+	 * 2026-10-24 用户报「kitty 里 vshell 按 Ctrl+C 还是把 vidow 退掉」：
+	 * 那种跑法下 vidow 和终端里那个 shell 在**同一个前台进程组**，终端一按
+	 * Ctrl+C 就把 SIGINT 发给整组，vidow 收到默认动作当场退出。
+	 *
+	 * 修法不是忽略信号（那样 dbg.sh 里「按 Ctrl+C 退出」也跟着失效，调试
+	 * 时只能 ps 找 pid 再 kill），而是**把自己从终端的前台进程组里摘出去**：
+	 * 见下面 setsid() 那一段。
+	 */
+	/* 把自己摘出终端的前台进程组。
+	 *
+	 * 只用终端自己起的会话才有意义（systemd 起的 vidow 早就是独立 session）。
+	 *
+	 * 判据：`tcgetpgrp(STDIN_FILENO)` 和我们的 pgid 相等 = 终端会把 Ctrl+C
+	 * 发给这一组（我们就在里面）。
+	 *
+	 * 为什么不直接在自己身上 setsid()：POSIX 规定「已经是进程组的组长就不能
+	 * 再 setsid」，而 shell 起前台任务时恰好让子进程当组长 —— 正好是我们要处理
+	 * 的这个情况，直接调必然 EPERM。所以先 fork、让子进程（不是组长）去
+	 * setsid，父进程原地等它、把退出码原样带出去（dbg.sh 依赖这个：它拿
+	 * vidow 的退出码判崩没崩）。
+	 *
+	 * 摘出去之后：终端按 Ctrl+C 打不到我们了（不再同组）；而 kill -INT <pid>
+	 * 仍然能退 —— SIGINT 的默认动作还在，只是不再被终端整组广播打到。 */
+	if (isatty(STDIN_FILENO) && tcgetpgrp(STDIN_FILENO) == getpgrp()) {
+		pid_t pid = fork();
+		if (pid == 0) {
+			/* 子进程：不是组长，可以 setsid。失败就照原样继续跑（只是
+			 * 还有可能被 Ctrl+C 打到，比直接不启动强）。 */
+			if (setsid() < 0) {
+				wlr_log(WLR_ERROR, "setsid 失败（继续跑，Ctrl+C 仍会退）");
+			}
+		} else if (pid > 0) {
+			/* 父进程：等子进程退，把它的退出码原样返回。 */
+			int status = 0;
+			while (waitpid(pid, &status, 0) < 0) {
+				if (errno != EINTR) {
+					return 1;
+				}
+			}
+			if (WIFEXITED(status)) {
+				return WEXITSTATUS(status);
+			}
+			if (WIFSIGNALED(status)) {
+				raise(WTERMSIG(status));
+				return 128 + WTERMSIG(status);
+			}
+			return 1;
+		} else {
+			/* fork 自己失败：不致命，照原样继续跑。 */
+			wlr_log(WLR_ERROR, "fork 失败，跳过 setsid（Ctrl+C 仍会退）");
+		}
+	}
+
+
+	int signals[] = { SIGTERM };
 	for (size_t i = 0; i < sizeof(signals) / sizeof(signals[0]); i++) {
 		if (wl_event_loop_add_signal(wl_display_get_event_loop(server.display),
 				signals[i], terminate_signal, &server) == NULL) {
@@ -590,8 +836,21 @@ int main(int argc, char *argv[]) {
 	wlr_primary_selection_v1_device_manager_create(server.display);
 
 	server.output_layout = wlr_output_layout_create(server.display);
-	/* waybar 等客户端要求 zxdg_output_manager_v1 才能拿到输出信息 */
-	wlr_xdg_output_manager_v1_create(server.display, server.output_layout);
+	/* waybar 等客户端要求 zxdg_output_manager_v1 才能拿到输出信息。
+	 *
+	 * **不用 wlr_xdg_output_manager_v1**：那个对所有客户端报同一份逻辑尺寸，
+	 * 而 Xwayland 需要的是**设备像素**（否则 X 屏幕只有逻辑大小，X 客户端画的
+	 * 东西和 vidow 的坐标系对不上）。以前是靠写
+	 * _XWAYLAND_GLOBAL_OUTPUT_SCALE 属性绕过去的，副作用是 Xwayland 也会把每个
+	 * X surface 的 buffer scale 设成 S —— 1x1 的辅助窗口（米哈游启动器 / Steam
+	 * 的托盘宿主）于是必然撞上 wlroots 的
+	 * "Buffer size (1x1) is not divisible by scale (2)" 校验被直接杀掉。
+	 *
+	 * src/xdgoutput.c 自己实现一份：按客户端区分，Xwayland 拿设备像素，其余
+	 * 客户端照旧拿逻辑尺寸。KWin（xdgoutput_v1.cpp:191）和 Hyprland
+	 * （XDGOutput.cpp:122）也是改这一处。 */
+	vidow_xdg_output_manager_create(server.display, server.output_layout,
+		&server);
 	/* 输出抓帧：grim / slurp / wf-recorder / OBS 走的就是下面这两个协议。
 	 * 两份都是 **vidow 自己实现**的（src/capture.c / src/screencopy.c）：
 	 * wlroots 那两份都是把屏幕上那一帧的缓冲直接拷给客户端，抓到的永远等于
@@ -658,9 +917,19 @@ int main(int argc, char *argv[]) {
 
 	server.cursor = wlr_cursor_create();
 	wlr_cursor_attach_output_layout(server.cursor, server.output_layout);
-	server.cursor_mgr = wlr_xcursor_manager_create(NULL, 24);
-	wlr_xcursor_manager_load(server.cursor_mgr, 1);
-	wlr_cursor_set_xcursor(server.cursor, server.cursor_mgr, "left_ptr");
+	/* 光标主题 / 尺寸：以前写死 `wlr_xcursor_manager_create(NULL, 24)`，
+	 * NULL = 一律用 Adwaita（主题「不见了，一直是默认」）—— 用户在 GNOME /
+	 * KDE 里选的 Bibata 那些根本没被读过。24 也是写死的，2 倍屏上小一号。
+	 *
+	 * 取值的顺序（每一档都只在「上一档没给」时才看）：
+	 *   1. 环境变量 XCURSOR_THEME / XCURSOR_SIZE（用户自己 export 的，或
+	 *      26-autostart.lua 里那行 XCURSOR_SIZE=64 gtk-launch steam 同源）
+	 *   2. gsettings（GNOME / 大多数主题包改的就是这两个键）
+	 *   3. Adwaita + 24（wlroots 自己的默认，等于以前的行为）
+	 *
+	 * 主题名要和 size 一起交给 wlroots：wlr_xcursor_manager_load() 会按输出缩放
+	 * 再加载一份，所以这里给的是「逻辑尺寸」，2 倍屏上自动变 2 倍。 */
+	vidow_cursor_apply(&server);
 
 	server.seat = wlr_seat_create(server.display, "seat0");
 	vidow_cursor_shape_init(&server);
@@ -716,11 +985,20 @@ int main(int argc, char *argv[]) {
 		return 1;
 	}
 
+	/* 自唤醒 fd 的节拍器要先起来：配置监听的 inotify、exec 的退出管道都走它
+	 * （合成器的自唤醒 fd 不挂 wl_event_loop_add_fd，见 fdwatch.c）。 */
+	vidow_fdwatch_init(&server);
+
 	/* 改完文件自动重载（不用再 kill -HUP）。放在配置加载**之前**：配置里
 	 * vidow.include() 读进来的每一份（configs/ 下的那些文件）都要当场登记进来，改哪份
 	 * 都得自动重载 —— 配置加载完再起来就晚了，那一轮 include 已经过去了。
 	 * 初始化这一下记的是文件当前状态，不会被当成「变了」。 */
 	vidow_configwatch_init(&server);
+
+	/* fd 泄漏看门狗：默认不跑，VIDOW_FD_WATCH=1 才建。放在这儿是为了让它
+	 * 覆盖住后面所有初始化 + 主循环 —— 2026-10-21 那次泄漏是在「用了一阵之后
+	 * 连上 sunshine」时发生的，起来就得盯着。 */
+	vidow_fd_watch_init(&server);
 
 	/* 配置文件是 Lua，加载得最晚：它要能看见输出和 seat（配置里的
 	 * vidow.workspace_create(name, output) / workspace_list() / ipc_path() 都得
@@ -741,6 +1019,8 @@ int main(int argc, char *argv[]) {
 	vidow_portal_env_restore();
 
 	vidow_configwatch_finish(&server);
+	vidow_fdwatch_finish(&server);
+	vidow_fd_watch_finish(&server);
 	vidow_capturemask_finish(&server);
 	/* 输入设备的账本（见 input.c）：报事件用的那些，设备自己没了就没了 */
 	/* 手指还拖着条带时退出：把手势状态清掉（不然 arrange 一直绕过「把焦点列滚回

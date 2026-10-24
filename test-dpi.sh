@@ -157,9 +157,12 @@ if command -v zenity >/dev/null; then
 	grep -aq "place .* -> " "$SX" &&
 		pass "X11 的 GTK 对话框被摆位了（没被压成 1x1）" ||
 		fail "X11 的 GTK 对话框没有被摆位（大概还卡在 1x1）"
-	grep -aq "childenv GDK_SCALE=2" "$LOG" &&
-		pass "子进程真的拿到 GDK_SCALE=2（X11 客户端按 2 倍画）" ||
-		fail "子进程没拿到 GDK_SCALE=2"
+	# KDE 模式：**不设 GDK_SCALE**。缩放只走 X 的 Xft.dpi = S×96
+	# （见 src/xwayland.c 的 vidow_xwayland_env）。两个来源同时存在时
+	# GTK/Chromium 会把它们相乘，那才是重复缩放。
+	grep -aq "childenv GDK_SCALE=nil" "$LOG" &&
+		pass "子进程没有 GDK_SCALE（缩放只走 Xft.dpi，和 KDE 一致）" ||
+		fail "子进程拿到了 GDK_SCALE=$(grep -a 'childenv GDK_SCALE' "$LOG" | tail -1)"
 	# 反向：**QT_SCALE_FACTOR 绝不能设**。它是唯一一个「X11 和 Wayland 都认」的
 	# 缩放变量：Wayland 的 Qt 程序会在输出缩放之外再乘它一遍 —— 只要有一块 2 倍
 	# 屏（S = ceil(最密那块) = 2），**每块屏**上的 Qt 窗口就都大 2 倍（实测 kate
@@ -213,12 +216,18 @@ if outs:
     densest = max(o["scale"] for o in outs.values())
     # 2) X 的全局缩放
     xs = re.findall(r"xwayland: 全局缩放 ([\d.]+) -> ([\d.]+)", log)
-    final_x = float(xs[-1][1]) if xs else 0.0
+    # 取**最大值**而不是最后一值：测试后段的 scaletest 会临时改缩放，
+    # 最后一值可能已经被它改回去了。
+    final_x = max((float(v) for _a, v in xs), default=0.0)
     check(final_x == float(int(densest) + (densest % 1 > 0)),
           "XWayland 全局缩放 = ceil(最密的屏 %.2fx) = %.2f（X 只有一套坐标，"
           "低了这个数密屏上就是放大糊）" % (densest, final_x))
-    check("GDK_SCALE=%d" % final_x in log,
-          "给 X11 的 GTK 客户端按同一倍数下发 GDK_SCALE（Wayland 的 GTK 不认它）")
+    # KDE 模式：缩放通过 X 的 Xft.dpi = S×96 传（不设 GDK_SCALE）
+    check("xwayland: Xft.dpi = %d" % (int(final_x) * 96) in log,
+          "Xft.dpi = %d = S(%.0f) × 96（X 客户端唯一的缩放来源，和 KDE 一致）"
+          % (int(final_x) * 96, final_x))
+    check("GDK_SCALE" not in log or "childenv GDK_SCALE=nil" in log,
+          "不设 GDK_SCALE（和 KDE 一致：两个来源相乘才是重复缩放）")
     check("GDK_SCALE=QT_SCALE_FACTOR" not in log,
           "绝不设 QT_SCALE_FACTOR（Wayland 的 Qt 也认它，会把所有屏上的 Qt 窗口"
           "都乘一遍）")
@@ -276,13 +285,14 @@ if hits:
         inside = [r for r in rects if r[1] <= float(lx) < r[1] + r[3] and
                   r[2] <= float(ly) < r[2] + r[4]]
     ox, oy = (inside[-1][1], inside[-1][2]) if inside else (0, 0)
-    exp_x = (float(lx) - ox) * final_x
-    exp_y = (float(ly) - oy) * final_x
+    # KDE 模式：X 坐标 = 逻辑坐标，1:1（不再乘 xwayland_scale）
+    exp_x = float(lx) - ox
+    exp_y = float(ly) - oy
     check(inside != [] and abs(float(sx) - exp_x) <= 1.5 and
           abs(float(sy) - exp_y) <= 1.5,
           "X11 命中坐标：光标 %s,%s 在窗口原点 %d,%d 的表面上 -> 局部 %s,%s "
-          "（预期 %.0f,%.0f = (光标-原点)x%.2f）"
-          % (lx, ly, ox, oy, sx, sy, exp_x, exp_y, final_x))
+          "（预期 %.0f,%.0f = 光标-原点，1:1）"
+          % (lx, ly, ox, oy, sx, sy, exp_x, exp_y))
 # 6) SSD 对齐：X11 与 Wayland 的窗口都走同一条装饰管线 —— 装饰缓冲尺寸必须等于
 #    (窗口尺寸 + 2×内边距) × 输出缩放，两边各自成立（zenity 的自然尺寸在两种
 #    后端上会差几十像素，那是 GTK 的事，不是装饰的事）。

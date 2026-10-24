@@ -923,6 +923,52 @@ bool vidow_mini_ui_init(struct vidow_server *server) {
 	return true;
 }
 
+/* 拖动跟手时该给哪几块屏排帧。
+ *
+ * **不能只给 view->output**（那要到松手换工作区才变）：窗口跟着光标越过屏边界
+ * 之后是画在**对面那块屏**上的（场景图是全局坐标），对面那块屏自己不去渲染，
+ * 屏幕上就看不到它 —— 用户 2026-10-23 报的「第一次拖到另一块屏一定不显示，之后
+ * 超过一定距离也会消失」。那块屏通常只有它自己的帧事件来唤醒，而静态屏（比如
+ * 只放着播放器 / 空白桌面）可能一段时间都没有任何帧事件，所以必须主动催。
+ *
+ * 排的是「窗口现在压在上面的那些屏」：光标所在的那块 + 窗口盒子碰到的每块。
+ * 排帧是幂等的（wlr_output_schedule_frame 里有 frame_pending 挡着），所以一帧
+ * 最多催出一次渲染。 */
+void vidow_drag_schedule_outputs(struct vidow_server *server,
+		struct vidow_view *view, const char *why) {
+	if (server == NULL) {
+		return;
+	}
+	struct wlr_output *under = wlr_output_layout_output_at(
+		server->output_layout, server->cursor->x, server->cursor->y);
+	if (under != NULL) {
+		vidow_output_schedule_frame(server, under, why);
+	}
+	if (view == NULL || view->scene_tree == NULL) {
+		return;
+	}
+	struct wlr_box box = vidow_view_screen_box(view);
+	if (box.width <= 0 || box.height <= 0) {
+		return;
+	}
+	struct vidow_output *output;
+	wl_list_for_each(output, &server->outputs, link) {
+		struct wlr_output *wlr_output = output->wlr_output;
+		if (wlr_output == NULL || !wlr_output->enabled ||
+				wlr_output == under) {
+			continue;
+		}
+		struct wlr_box obox;
+		wlr_output_layout_get_box(server->output_layout, wlr_output,
+			&obox);
+		struct wlr_box hit;
+		if (!wlr_box_intersection(&hit, &box, &obox)) {
+			continue;
+		}
+		vidow_output_schedule_frame(server, wlr_output, why);
+	}
+}
+
 /* 光标走够 niri 的 16px 阈值：这时才真的开始拖 —— 摘出布局、降到 75%
  * 不透明度、锁视口、起果冻、摆落点预览。 */
 static void tile_drag_activate(struct vidow_server *server,
@@ -1024,8 +1070,7 @@ void vidow_tile_grab_update(struct vidow_server *server, double lx, double ly) {
 		double ddy = ly - view->drag_start_cy;
 		if (ddx * ddx + ddy * ddy < 256.0) {
 			vidow_view_apply_anim_place(view);
-			vidow_output_schedule_frame(server, view->output,
-				"拖动阈值内");
+			vidow_drag_schedule_outputs(server, view, "拖动阈值内");
 			return;
 		}
 		tile_drag_activate(server, view);
@@ -1041,7 +1086,7 @@ void vidow_tile_grab_update(struct vidow_server *server, double lx, double ly) {
 	 * （wlr_output_schedule_frame 里有 frame_pending 挡着），所以一帧最多催出
 	 * 一次渲染，不会变成「每个事件渲染一遍」。 */
 	vidow_view_apply_anim_place(view);
-	vidow_output_schedule_frame(server, view->output, "拖动跟手");
+	vidow_drag_schedule_outputs(server, view, "拖动跟手");
 	/* 落点预览块跟着一起更新（很便宜：就是几个整形比较 + 摆一次节点）。
 	 * 小窗（S4）的落点区同理 —— 顺序不能反：落点区先算，插入提示块才知道
 	 * 要不要让位。 */

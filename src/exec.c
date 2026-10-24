@@ -23,6 +23,7 @@ struct exec_stream {
 	char *buf;
 	size_t len, cap;
 	bool eof;
+	bool dropped; /* 超过 EXEC_MAX_BYTES、只读不存了（读空就先给结果） */
 };
 
 /* One `sh -c` in flight. stdout and stderr are kept apart: stdout is the
@@ -93,12 +94,14 @@ static void exec_reap(struct vidow_exec *job) {
 	}
 }
 
-static void exec_stream_close(struct exec_stream *st) {
+static void exec_stream_close(struct vidow_exec *job, struct exec_stream *st) {
 	if (st->src != NULL) {
 		wl_event_source_remove(st->src);
 		st->src = NULL;
 	}
 	if (st->fd >= 0) {
+		/* fdwatch 那边登记的那份也摘掉（没登记过就是空操作）。 */
+		vidow_fdwatch_deregister(st->fd, VIDOW_FDWATCH_EXEC, job);
 		close(st->fd);
 		st->fd = -1;
 	}
@@ -106,7 +109,7 @@ static void exec_stream_close(struct exec_stream *st) {
 
 static void exec_stream_eof(struct vidow_exec *job, struct exec_stream *st) {
 	st->eof = true;
-	exec_stream_close(st);
+	exec_stream_close(job, st);
 	if (job->out.eof && job->err.eof) {
 		exec_finish(job, true, NULL);
 	}
@@ -117,8 +120,8 @@ static void exec_finish(struct vidow_exec *job, bool ok, const char *reason) {
 		return;
 	}
 	job->finished = true;
-	exec_stream_close(&job->out);
-	exec_stream_close(&job->err);
+	exec_stream_close(job, &job->out);
+	exec_stream_close(job, &job->err);
 	exec_reap(job);
 	wl_list_remove(&job->link);
 
@@ -162,13 +165,15 @@ static void exec_finish(struct vidow_exec *job, bool ok, const char *reason) {
 	free(errout);
 }
 
+/* 读管道里现在能读的。返回 1 = 读到空了（下一拍不用再来），0 = 没读完
+ * （fdwatch 会在下一拍再叫一遍）。 */
 static int exec_drain(struct vidow_exec *job, struct exec_stream *st,
 		uint32_t mask) {
 	if (!(mask & WL_EVENT_READABLE)) {
 		if (mask & (WL_EVENT_HANGUP | WL_EVENT_ERROR)) {
 			exec_stream_eof(job, st);
 		}
-		return 0;
+		return 1;
 	}
 
 	char buf[4096];
@@ -176,21 +181,22 @@ static int exec_drain(struct vidow_exec *job, struct exec_stream *st,
 		ssize_t n = read(st->fd, buf, sizeof(buf));
 		if (n == 0) {
 			exec_stream_eof(job, st);
-			return 0;
+			return 1;
 		}
 		if (n < 0) {
 			if (errno == EINTR) {
 				continue;
 			}
 			if (errno == EAGAIN || errno == EWOULDBLOCK) {
-				return 0;
+				return 1;
 			}
 			exec_stream_eof(job, st);
-			return 0;
+			return 1;
 		}
 		/* Keep draining past the cap so the child never blocks on a full
 		 * pipe, but stop growing the buffer. */
 		if (st->len + (size_t)n + 1 > EXEC_MAX_BYTES) {
+			st->dropped = true;
 			continue;
 		}
 		if (st->len + (size_t)n + 1 > st->cap) {
@@ -206,6 +212,12 @@ static int exec_drain(struct vidow_exec *job, struct exec_stream *st,
 		st->len += (size_t)n;
 		st->buf[st->len] = '\0';
 	}
+	/* 读空了。上限之外还有产出（超长输出）：这份就不等到 EOF 了，跟以前一样
+	 * 先给出去 —— 否则一个 `yes` 会让这个 job 一直挂到超时。 */
+	if (st->dropped) {
+		exec_stream_eof(job, st);
+	}
+	return 1;
 }
 
 static int exec_out_readable(int fd, uint32_t mask, void *data) {
@@ -216,6 +228,15 @@ static int exec_out_readable(int fd, uint32_t mask, void *data) {
 static int exec_err_readable(int fd, uint32_t mask, void *data) {
 	(void)fd;
 	return exec_drain(data, &((struct vidow_exec *)data)->err, mask);
+}
+
+/* fdwatch 版：走到这儿一定「可读」（或者上一拍说了没读完）。
+ * 返回 1 = 读干净了；0 = 还没读完，下一拍再来。 */
+static int exec_stream_fdw(int fd, void *data) {
+	(void)fd;
+	struct vidow_exec *job = data;
+	return exec_drain(job, &job->out, WL_EVENT_READABLE) &
+		exec_drain(job, &job->err, WL_EVENT_READABLE);
 }
 
 static int exec_timeout_cb(void *data) {
@@ -242,6 +263,11 @@ static bool exec_stream_open(struct vidow_exec *job, struct exec_stream *st,
 	int flags = fcntl(fd, F_GETFL, 0);
 	if (flags >= 0) {
 		fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+	}
+	/* 合成器的自唤醒 fd 不挂 add_fd（见 fdwatch.c）；fdwatch 起不来时才退回
+	 * 事件循环。 */
+	if (vidow_fdwatch_register(fd, VIDOW_FDWATCH_EXEC, exec_stream_fdw, job)) {
+		return true;
 	}
 	st->src = wl_event_loop_add_fd(wl_display_get_event_loop(job->server->display),
 		fd, WL_EVENT_READABLE, handler, job);
@@ -308,8 +334,8 @@ struct vidow_exec *vidow_exec_run(struct vidow_server *server,
 
 	if (!exec_stream_open(job, &job->out, outpipe[0], exec_out_readable) ||
 			!exec_stream_open(job, &job->err, errpipe[0], exec_err_readable)) {
-		exec_stream_close(&job->out);
-		exec_stream_close(&job->err);
+		exec_stream_close(job, &job->out);
+		exec_stream_close(job, &job->err);
 		kill(-pid, SIGKILL);
 		waitpid(pid, NULL, 0);
 		free(job);
@@ -331,8 +357,8 @@ void vidow_exec_cancel_all(struct vidow_server *server) {
 			kill(-job->pid, SIGKILL);
 		}
 		job->finished = true;
-		exec_stream_close(&job->out);
-		exec_stream_close(&job->err);
+		exec_stream_close(job, &job->out);
+		exec_stream_close(job, &job->err);
 		exec_reap(job);
 		wl_list_remove(&job->link);
 		free(job->out.buf);

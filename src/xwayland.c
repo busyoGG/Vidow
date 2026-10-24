@@ -8,6 +8,7 @@
 #include <string.h>
 
 #include <wlr/util/log.h>
+#include <wlr/xcursor.h>
 #include <wlr/xwayland/shell.h>
 #include <xcb/xcb.h>
 
@@ -398,6 +399,34 @@ static void xwayland_ready(struct wl_listener *listener, void *data) {
 	 * wlr_xwayland_set_seat 会先摘旧监听，重入安全。 */
 	wlr_xwayland_set_seat(server->xwayland, server->seat);
 
+	/* X clients without their own cursor inherit the root cursor. Seed it on
+	 * every Xwayland start, otherwise they inherit X's default cross. The image
+	 * buffer is borrowed from cursor_mgr; Xwayland retains it as needed. */
+	/* Scale 1 is wrong on a HiDPI output: Xwayland hands this buffer to X
+	 * clients as their inherited root cursor, and a 1x 24px image inside a
+	 * 2x desktop is drawn small but its hotspot/clear area still covers a
+	 * 2x cursor box, so the pointer comes out clipped (reported on the 2x
+	 * output while the 1x one looked fine). Use the largest output scale,
+	 * which is what the cursor manager preloads for. */
+	double cursor_scale = 1.0;
+	struct vidow_output *o;
+	wl_list_for_each(o, &server->outputs, link) {
+		double sc = o->wlr_output->scale;
+		if (sc > cursor_scale) {
+			cursor_scale = sc;
+		}
+	}
+	struct wlr_xcursor *cursor = wlr_xcursor_manager_get_xcursor(
+		server->cursor_mgr, "left_ptr", (float)cursor_scale);
+	if (cursor != NULL && cursor->image_count > 0) {
+		struct wlr_xcursor_image *image = cursor->images[0];
+		struct wlr_buffer *buffer = wlr_xcursor_image_get_buffer(image);
+		if (buffer != NULL) {
+			wlr_xwayland_set_cursor(server->xwayland, buffer,
+				image->hotspot_x, image->hotspot_y);
+		}
+	}
+
 	/* New Xwayland instance: recheck its root against the virtual union. */
 	server->xwayland_scale_ok = true;
 	server->xwayland_scale_probed = false;
@@ -500,7 +529,10 @@ static void handle_new_xwayland_surface(struct wl_listener *listener,
 	struct vidow_server *server =
 		wl_container_of(listener, server, new_xwayland_surface);
 	struct wlr_xwayland_surface *xsurface = data;
-
+	wlr_log(WLR_INFO,
+		"x11-life new xid=0x%x xs=%p surface=%p surface_id=%u",
+		xsurface->window_id, xsurface, xsurface->surface,
+		xsurface->surface_id);
 	/* xwm 自己那条连接上的窗口不是客户端窗口：我们剪贴板桥的监听窗口，还有
 	 * xwm 的 selection_window 之类的内部窗口（都建在同一条连接上）。它们永远
 	 * 不映射，但 xwm 照样会给它们建 surface —— 收进视图模型就是一个 1x1 的
@@ -564,6 +596,12 @@ bool vidow_xwayland_apply_config(struct vidow_server *server) {
 	}
 
 	wlr_xwayland_set_seat(server->xwayland, server->seat);
+
+	/* 关于 Xwayland 的 ready 管道（wlroots 的 server->pipe_source）：Xwayland
+	 * 写完 ready 字节之后这个管道**一直是可读的**，wlroots 挂在主循环上的那个源
+	 * 于是每轮都醒 —— 一个常驻自唤醒。这里没能接管：libwayland 不导出 event
+	 * source 的底层 fd，而 ready 事件也**不能**提前自己发（wlroots 的
+	 * handle_ready 要做 init / 建 XWM 连接）。其余自唤醒 fd 都已经走 fdwatch 了。 */
 
 	server->xwayland_ready.notify = xwayland_ready;
 	wl_signal_add(&server->xwayland->events.ready, &server->xwayland_ready);

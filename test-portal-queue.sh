@@ -55,7 +55,9 @@ cleanup() {
 		*pattern.py*|*build/vidowmsg*|*gdbus\ call*) kill "$pid" 2>/dev/null ;;
 		esac
 	done 2>/dev/null
-	pkill -x vidow 2>/dev/null
+	# **别用 pkill -x vidow**：那会按进程名把用户正在用的那个 vidow 也一起
+	# 杀掉（踩过一次，用户的桌面当场没了）。只杀这个脚本自己起的那个。
+	[ -n "${VIDOW_PID:-}" ] && kill "$VIDOW_PID" 2>/dev/null
 	pkill -x vidow-portal 2>/dev/null
 	[ -n "${VIDOW_TEST_KEEP:-}" ] || rm -rf "$R"
 }
@@ -79,6 +81,7 @@ unset VIDOW_TEST_OUTPUTS VIDOW_TEST_ACTION
 
 WLR_BACKENDS=headless WLR_HEADLESS_OUTPUTS=2 WLR_RENDERER=pixman VIDOW_LOG=debug \
 	./build/vidow > "$R/vidow.log" 2>&1 &
+VIDOW_PID=$!
 for _ in $(seq 1 60); do
 	grep -aq "vidow ready" "$R/vidow.log" && break
 	sleep 0.25

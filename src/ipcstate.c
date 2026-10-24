@@ -337,6 +337,22 @@ void vidow_ipc_json_window(struct jbuf *b, struct vidow_server *server,
 		 * 时会比槽位大，排查「框和画面不一般大」要看这对。 */
 		jb_kv_int(b, "frame_width", fgeo.w);
 		jb_kv_int(b, "frame_height", fgeo.h);
+		/* Runtime popup diagnostics: distinguish hidden/transparent nodes from
+		 * a valid X drawable rendered through a stale scene texture. */
+		jb_kv_bool(b, "tree_enabled", view->scene_tree != NULL &&
+			view->scene_tree->node.enabled);
+		jb_kv_bool(b, "scene_parked", view->scene_parked);
+		jb_kv_bool(b, "fx_active", view->fx.active);
+		if (view->scene_surface != NULL && view->scene_surface->buffer != NULL) {
+			struct wlr_scene_buffer *sb = view->scene_surface->buffer;
+			jb_kv_double(b, "node_opacity", sb->opacity);
+			jb_kv_int(b, "dst_width", sb->dst_width);
+			jb_kv_int(b, "dst_height", sb->dst_height);
+			jb_kv_double(b, "source_x", sb->src_box.x);
+			jb_kv_double(b, "source_y", sb->src_box.y);
+			jb_kv_double(b, "source_width", sb->src_box.width);
+			jb_kv_double(b, "source_height", sb->src_box.height);
+		}
 		jb_obj_end(b);
 	} else {
 		jb_null(b);

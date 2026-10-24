@@ -141,6 +141,7 @@ sources = files(
   'src/output.c',
   'src/outputconf.c',
   'src/view.c',
+  'src/xwmscale.c',
   'src/input.c',
   'src/cursorfx.c',
   'src/capturemask.c',
@@ -163,6 +164,7 @@ sources = files(
   'src/exec.c',
   'src/script.c',
   'src/configwatch.c',
+  'src/fdwatch.c',
   'src/im.c',
   'src/bgeffect.c',
   'src/portal.c',
@@ -176,6 +178,7 @@ sources = files(
   'src/ipcstate.c',
   'src/portalconf.c',
   'src/xwayland.c',
+  'src/xdgoutput.c',
   'src/sessionlock.c',
   'src/capture.c',
   'src/jelly.c',
@@ -378,6 +381,14 @@ xdo_client_code = custom_target('xdg-output-unstable-v1-client-protocol.c',
   input: xdo_xml,
   output: 'xdg-output-unstable-v1-client-protocol.c',
   command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
+# 合成器侧也要这个协议：src/xdgoutput.c 自己实现 zxdg_output_manager_v1，
+# 只为 Xwayland 客户端把 logical_size 报成设备像素（见那里的长注释）。
+# 代码表（marshal 函数）服务端和客户端共用同一份 xdo_client_code —— 
+# private-code 生成的符号与用途无关，只需要一份，别生成两份（会重复定义）。
+xdo_server_header = custom_target('xdg-output-unstable-v1-server-protocol.h',
+  input: xdo_xml,
+  output: 'xdg-output-unstable-v1-server-protocol.h',
+  command: [wayland_scanner, 'server-header', '@INPUT@', '@OUTPUT@'])
 
 gtk3_dep = dependency('gtk+-3.0')
 # 截图要写 PNG（portal 的 Screenshot 接口回的是个文件 URI）。
@@ -518,7 +529,10 @@ executable('vidow',
   # ext_foreign_toplevel_handle_v1_interface（窗口抓帧源的参数类型），那个
   # interface 结构在这个协议的 private-code 里（libwlroots 没导出这些符号）。
   sources + [bgeffect_code, xa_server_code, eics_server_code, sc_server_code,
-             etl_code, zkde_server_code, xkg_server_code],
+             etl_code, zkde_server_code, xkg_server_code,
+             # xdg-output 服务端头 + 代码表：src/xdgoutput.c 自己实现
+             # zxdg_output_manager_v1（只为 Xwayland 报设备像素）。
+             xdo_server_header, xdo_client_code],
   dependencies: [wlroots_dep, xkbcommon_dep, wayland_server_dep, math_dep,
                  egl_dep, gles2_dep, pixman_dep, lua_dep, xcb_dep,
                  xcb_xfixes_dep, drm_dep, pipewire_dep, libinput_dep],

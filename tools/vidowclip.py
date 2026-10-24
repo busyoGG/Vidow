@@ -176,19 +176,22 @@ def one_line(text, limit=70):
     return text[:limit] + ("…" if len(text) > limit else "")
 
 
-class ClipWindow(Gtk.Window):
+class ClipPage(Gtk.Box):
+    """设置窗口里的「剪贴板」这一页。
+
+    原来是独立的 ClipWindow；现在只是 SettingsWindow 右边 Notebook 的一页，
+    所以不再自己 set_default_size / connect destroy —— 窗口生命周期归外壳。
+    """
+
     def __init__(self, ipc):
-        super().__init__(title="vidow 剪贴板")
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.set_border_width(8)
         self.ipc = ipc
         self.entries = []
         self.selected = None       # 选中的那条（dict）
         self.dirty = False
-        self.set_default_size(940, 620)
-        self.connect("destroy", Gtk.main_quit)
 
-        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        root.set_border_width(8)
-        self.add(root)
+        root = self
 
         self.status = Gtk.Label(xalign=0.0)
         self.status.set_line_wrap(True)
@@ -593,6 +596,73 @@ class ClipWindow(Gtk.Window):
         return True
 
 
+class SettingsWindow(Gtk.Window):
+    """vidow 设置。
+
+    外形按「设置」来：左边一列分类，右边是这一类的面板。
+    目前只有「剪贴板」一类 —— 后面加别的设置项就再 append 一个页面。
+    """
+
+    PAGES = [
+        # (图标, 标题, 工厂)
+        ("📋", "剪贴板", ClipPage),
+    ]
+
+    def __init__(self, ipc):
+        super().__init__(title="vidow 设置")
+        self.set_default_size(980, 660)
+        self.connect("destroy", Gtk.main_quit)
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        self.add(outer)
+
+        # ---- 左侧分类 ----
+        side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        side.set_size_request(180, -1)
+        side.get_style_context().add_class("sidebar")
+        side.set_border_width(10)
+        outer.pack_start(side, False, False, 0)
+
+        # ---- 右侧内容 ----
+        self.stack = Gtk.Stack()
+        self.stack.set_hexpand(True)
+        self.stack.set_vexpand(True)
+        outer.pack_start(self.stack, True, True, 0)
+
+        self.buttons = []
+        self.pages = {}
+        for icon, title, factory in self.PAGES:
+            page = factory(ipc)
+            self.stack.add_named(page, title)
+            self.pages[title] = page
+
+            btn = Gtk.Button()
+            box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            ico = Gtk.Label(label=icon)
+            lbl = Gtk.Label(label=title, xalign=0.0)
+            box.pack_start(ico, False, False, 0)
+            box.pack_start(lbl, True, True, 0)
+            btn.add(box)
+            btn.get_style_context().add_class("flat")
+            btn.connect("clicked", self.on_nav, title)
+            side.pack_start(btn, False, False, 0)
+            self.buttons.append((title, btn))
+
+        side.pack_start(Gtk.Box(), True, True, 0)   # 把下半截顶开
+        self.select(self.PAGES[0][1])
+
+    def on_nav(self, _btn, title):
+        self.select(title)
+
+    def select(self, title):
+        self.stack.set_visible_child_name(title)
+        for name, btn in self.buttons:
+            on = (name == title)
+            btn.get_style_context().remove_class("suggested-action")
+            if on:
+                btn.get_style_context().add_class("suggested-action")
+
+
 def self_check(ipc):
     """--check：不建窗口，只把 IPC 这条路走一遍（脚本里判断能不能用）。"""
     state = ipc.call("clipboard")
@@ -638,7 +708,7 @@ def main():
         except (IpcError, OSError, ValueError) as exc:
             print("vidowclip.py: IPC 走不通：%s" % exc)
             return 1
-    window = ClipWindow(ipc)
+    window = SettingsWindow(ipc)
     window.show_all()
     Gtk.main()
     return 0

@@ -1198,7 +1198,7 @@ vidow.output{ name = "HDMI-A-1", scale = 1.25 }              -- 只改缩放，�
 
 xwayland = true                     -- 起 XWayland（懒启动：真有人连 X 才 fork）
 xwayland_scale = "auto"             -- X 的全局缩放 = ceil(最密那块屏的缩放)
-xwayland_env = true                 -- 给 X11 客户端下发 GDK_SCALE / QT_SCALE_FACTOR
+xwayland_env = true                 -- 给 X11 客户端下发 Qt / 光标环境变量（不设 GDK_SCALE）
 ```
 
 `vidow.output{}` 每写一行就是一块屏，只写要管的字段（`name` 必须有）：
@@ -1238,8 +1238,8 @@ xwayland_env = true                 -- 给 X11 客户端下发 GDK_SCALE / QT_SC
 | --- | --- | --- |
 | `scale` | `auto` | 所有输出的默认策略：`auto` = 按 ppi 推，或者写一个数（`1.75`）；单块屏点名用 `vidow.output{ name = …, scale = … }` |
 | `xwayland` | `true` | 起不起 XWayland（`0` = 完全不碰 X 那一摊） |
-| `xwayland_scale` | `auto` | `auto` = `ceil(最密那块屏的缩放)`；`off` = 一律 1:1；也可以写死一个数 |
-| `xwayland_env` | `true` | 给 X11 客户端下发 `GDK_SCALE` / `QT_AUTO_SCREEN_SCALE_FACTOR` / `XCURSOR_SIZE`（用户自己显式设过的不抢）。**不设 `QT_SCALE_FACTOR`**：Wayland 的 Qt 也认它，会把所有屏上的 Qt 窗口乘一遍（见下）。**不管** `_XWAYLAND_GLOBAL_OUTPUT_SCALE` 和 `Xft.dpi` —— 那两个是 X 服务自己的事实，vidow 总是自己写 |
+| `xwayland_scale` | `auto` | `auto` = `ceil(最密那块屏的缩放)`；`off` = 一律 1:1；也可以写死一个数。它现在的含义是 **`Xft.dpi = 这个数 × 96`** —— X 屏幕始终是逻辑尺寸，不放大 |
+| `xwayland_env` | `true` | 给 X11 客户端下发 `QT_AUTO_SCREEN_SCALE_FACTOR` / `XCURSOR_SIZE` / `XCURSOR_THEME`（用户自己显式设过的不抢）。**不设 `GDK_SCALE`、不设 `QT_SCALE_FACTOR`** —— 缩放只留一个来源：X 的 `Xft.dpi`（= S×96，和 KDE 的 `plasma-setup-xwayland` 一致）。两个来源同时存在时 GTK/Chromium 会把它们相乘，那才是重复缩放。**不管** `_XWAYLAND_GLOBAL_OUTPUT_SCALE` 和 `Xft.dpi` —— 那两个是 X 服务自己的事实，vidow 总是自己写 |
 
 ### 跨屏拖动：拖着的那一段也按对面那块屏的倍率烘
 
@@ -1447,67 +1447,44 @@ X11 没有 per-window 的缓冲区缩放，所以：
      - 未覆盖：其余直接调 `wlr_scene_buffer_set_opacity` 的地方（fx.c 3124/3581/3699、
        view.c 1749/4662、capturemask.c）没逐个查是否也会吃到缓动进度。
 
-5. **告诉 X 服务它该按设备像素报屏幕**：往 root window 写
-   `_XWAYLAND_GLOBAL_OUTPUT_SCALE = S`（CARDINAL）。打过 HiDPI 补丁的 Xwayland
-   （`xorg-xwayland-lily` / xorg 的 MR!733）收到之后才会把 X 屏幕和 RandR 模式也
-   乘上 S —— 这正是上面第 2 条假设的「X 像素 = 逻辑 × S」。**不写它的后果**：X 屏幕
-   只有逻辑尺寸，按屏幕尺寸算布局的客户端（GTK）会把整屏当成一半大小，最大化的窗口
-   只占 1/4 面积、固定尺寸的登录窗也和面板对不上。
+5. **X 屏幕保持逻辑尺寸**：往 root window 写 `_XWAYLAND_GLOBAL_OUTPUT_SCALE = 1`
+   （CARDINAL）。**不放大** —— X 客户端的坐标、窗口尺寸都等于逻辑坐标，vidow 这边
+   不做任何除法。这和 KDE/KWin 一致（KWin 内部用 `toXNative/fromXNative` 只在自己
+   边界换算，发包给 X 的屏幕始终是逻辑尺寸）。
 
-   回归判据里的「没打补丁」那条路用测试钩子 `VIDOW_TEST_XWAYLAND_UNPATCHED=1` 模拟
-   （本机装的正好是补丁版，否则没法验）。
+   **为什么不再放大**（这是改过的设计）：老模型是「X 屏幕放大 S 倍成设备像素 +
+   vidow 把每个窗口除以 S」。屏幕放大和 DPI 放大（下面第 6 条）同时存在，CEF 系
+   （Steam 的登录窗和主窗口）算出来的尺寸和 vidow 除回去的对不上 —— 实测
+   `xwayland_scale = 2` 时 Steam 主窗口 **map 0 次**（根本建不出来），`= 1` 时
+   正常 map 2 次。判据表见下。
 
-   **这台 Xwayland 认不认？vidow 量一次**：写完属性之后读 root window 的尺寸，跟
-   「布局逻辑尺寸 × S」对账。为什么不是量一次就完事：Xwayland 处理属性**之前**屏幕
-   也是逻辑尺寸（它就是那样报的），而它是在自己的事件循环里处理 —— 忙的时候要等一会
-   儿。所以按 0.12 / 0.25 / 0.5 / 1 秒（共约 1.9 秒）反复量，量到「设备像素」立刻收工。
-   对得上 = 补丁版，日志说「这台 Xwayland 认这个属性」；只有逻辑尺寸 = 不认 ——
-   这时**自动退回 1 倍**：
-   X 屏幕 = 逻辑尺寸、`Xft.dpi = 96`、`GDK_SCALE = 1`，几何全对（不会出现 1/4 的窗口），
-   代价是 2 倍屏上 X 客户端糊一点。也就是说 **vidow 不要求你装哪个 Xwayland**：装了
-   补丁版就有清晰的 X 客户端，没装也不会摆错。要强制 1 倍就写 `xwayland_scale = off`。
-6. **Xft.dpi = 96 × S**（写进 `RESOURCE_MANAGER`，保留别人的资源项）。`GDK_SCALE` /
-   `QT_SCALE_FACTOR` 只覆盖 GTK / Qt；Chromium/CEF（微信登录窗就是）、Electron、
-   Java、Wine 只认 Xft.dpi。不给，它们按 1 倍画，而 vidow 按 S 除 —— 窗口只剩该有的
-   1/4。回归判据见 `test-xwayland-hidpi.sh`（属性、Xft.dpi、X 屏幕 = 逻辑 × S，
-   以及端到端：点一下 xev 收到的 root 坐标 = 布局坐标 × S）。
+6. **Xft.dpi = S × 96**（写进 `RESOURCE_MANAGER`，保留别人的资源项）。这是 X 客户端
+   **唯一**的缩放来源，和 KDE 的 `plasma-setup-xwayland` 完全一样
+   （`const int dpi = xwaylandScale * 96;`）。S=2 时写 192。
 
-`GDK_SCALE = S` 发给 X11 客户端：认这个变量的 GTK 按 S 倍绘制（于是和 Wayland 程序
-一样大）；不认的老程序（xterm、xeyes）保持 1:1 绘制 —— **物理尺寸在两块屏上依然一致、
-依然清晰，但相对 Wayland 程序偏小**。这是 X11 的硬限制：要么放大（一样大但糊），要么
-不放大（清晰但小）。想要后一种取舍就把 `xwayland_scale` 设成 `off`。
+   **vidow 不设 `GDK_SCALE`**（KWin 源码里也搜不到任何 `GDK_SCALE`）。两个来源同时
+   存在时 GTK/Chromium 会把它们**相乘**（DPR = `GDK_SCALE × Xft.dpi/96`），那才是
+   重复缩放 —— 这正是以前「Steam/Obsidian 界面在每块屏上都大 2 倍」的原因。
+   只留一个来源就没有这个问题。
 
-**`QT_SCALE_FACTOR` 绝不设**（这一条是用户报出来的）：它是唯一一个「X11 和 Wayland
-都认」的缩放变量 —— Wayland 的 Qt 程序会在输出缩放之外**再乘它一遍**，于是只要有一块
-2 倍屏（`S = ceil(最密那块)` = 2），**每块屏**上的 Qt 窗口就都大 2 倍（实测 kate 的
-逻辑宽度 634 → 1090；GTK 不受影响：实测 GTK3/GTK4 在 Wayland 下不认 `GDK_SCALE`，声明
-的还是 1 倍）。Qt 那边改走 X 自己的 DPI：`QT_AUTO_SCREEN_SCALE_FACTOR=1` + 上面那条
-`Xft.dpi = 96×S`（写在 X 的 `RESOURCE_MANAGER` 里，Wayland 客户端根本看不到）。
-代价说清楚：混 DPI（一块 1 倍一块 2 倍）时 X 屏幕的 DPI 是两块屏混出来的一个值，Qt 推
-出来的倍数可能不是 S —— 这时 X11 的 Qt 程序按 1 倍画，在密屏上会偏小。要精确就单独给
-这个程序设：`env QT_SCALE_FACTOR=2 kate`（只影响这一个进程）。
+   回归判据见 `test-xwayland-hidpi.sh`（`_XWAYLAND_GLOBAL_OUTPUT_SCALE = 1`、
+   `Xft.dpi = S×96`、X 屏幕 = 逻辑尺寸，以及端到端：点一下 xev 收到的 root 坐标
+   = 布局坐标 **1:1**）。
 
-**逐窗口改**：`off` 是全体的取舍，可有些程序（微信登录窗、CEF 系那一类）自己不肯按
-`S` 倍画，混在认这套的 GTK/Qt 程序里，全局怎么设都不对。窗口规则可以只给它们改缩放
-桥 —— `x11_scale = 1` 就是「这个客户端没按 `S` 倍画，缓冲区别除」：
+**实测对照（同一套 headless，只改 `xwayland_scale`）**：
 
-```lua
-vidow.rule{ title = "微信", x11_scale = 1 }     -- 按标题（WM_NAME / 窗口标题）
-vidow.rule{ class = "WeChat", x11_scale = 1 }   -- 按 WM_CLASS
-```
+| `xwayland_scale` | X 屏幕 | `Xft.dpi` | Steam 主窗口 |
+| --- | --- | --- | --- |
+| 1 | 逻辑尺寸 | 96 | map 2 ✓ |
+| 2（**旧设计**：屏幕放大 + DPI 放大） | 逻辑 × 2 | 192 | **map 0** ✗ |
+| 2（**新设计**：屏幕不放大 + DPI 放大） | 逻辑尺寸 | 192 | map 2 ✓ |
 
-效果：固定尺寸 300×300 的 X11 窗口在 2 倍屏上，默认（除 2）布局里只剩 150×150 ——
-面积是该有的 1/4，看着就是「小得不对劲」；写了 `x11_scale = 1` 之后是 300×300，和同
-尺寸的 Wayland 窗口一样大（内容是放大 2 倍，略糊，这是 X11 的代价）。命中坐标一直跟
-着渲染走（`局部 = (布局 - 原点) × 实际倍数`），两种设置下都是点哪儿就哪儿。
-`vidowmsg rules` 能把 `x11_scale` 查回来；回归判据见 `test-x11scale.sh`（同一个
-300×300 的固定尺寸 X11 窗口跑两遍：150×150 vs 300×300）。
+**`QT_SCALE_FACTOR` 也不设**：它是唯一一个「X11 和 Wayland 都认」的缩放变量 ——
+Wayland 的 Qt 程序会在输出缩放之外**再乘它一遍**，于是只要有一块 2 倍屏
+（`S = ceil(最密那块)` = 2），**每块屏**上的 Qt 窗口就都大 2 倍（实测 kate 的
+逻辑宽度 634 → 1090）。Qt 那边改走 X 自己的 DPI：`QT_AUTO_SCREEN_SCALE_FACTOR=1`
++ 上面那条 `Xft.dpi`。
 
-改过缩放的窗口还有一个坑（实测撞出来的）：场景的命中判定会问表面自己的输入区域，
-而那个区域按「表面声明的逻辑尺寸」卡边界 —— 我们把它画成 2 倍大之后，右边和下边一大片
-就成了「看得见、点不着」。所以尺寸和表面声明对不上的时候，vidow 把命中区域交给节点
-自己的盒子（`point_accepts_input = NULL`，代价是这类窗口不再遵守 X 的 shape；默认
-尺寸一致时照旧）。`test-x11scale.sh` 里两种设置都扫过命中区域。
 
 ### X11 的 SSD 和 Wayland 一样
 
@@ -4260,7 +4237,7 @@ test-geometry.sh  窗口几何（xdg_surface.set_window_geometry）比表面还�
                   声明尺寸上、内容铺满框（老行为是被 clamp 成「画面小一圈、右边一条糊边」；
                   靶子 tools/geowin 左红中绿右蓝 + 正中一条白线，白线位置就是判据）
 test-xwayland-hidpi.sh  XWayland 的 HiDPI 告知：`_XWAYLAND_GLOBAL_OUTPUT_SCALE`
-                  让 X 屏幕 / RandR 变成设备像素（补丁生效时），`Xft.dpi = 96×S`，
+                  让 X 屏幕 / RandR 变成设备像素（补丁生效时），`Xft.dpi = 96`，
                   以及没打补丁时量到屏幕没跟着缩放、自动退回 1 倍（钩子模拟），
                   端到端点一下 xev 收到的 root 坐标 = 布局坐标 × S，改缩放跟着变
 test-vt.sh        tty 的 VT 切换：headless 下验「认得 Ctrl+Alt+F2（F1..F12 + Ctrl+Alt
@@ -5071,7 +5048,7 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
      = 所有屏都大 2 倍；④1 倍屏上更直观：干净 634x708 → 带变量 1090x708（宽度翻倍）。
 
      修法：**不再设 `QT_SCALE_FACTOR`**，Qt 那边改走 X 自己的 DPI
-     （`QT_AUTO_SCREEN_SCALE_FACTOR=1` + 早就写好的 `Xft.dpi = 96×S`，那是 X 的
+     （`QT_AUTO_SCREEN_SCALE_FACTOR=1` + 早就写好的 `Xft.dpi = 96`，那是 X 的
      `RESOURCE_MANAGER` 属性，Wayland 客户端看不到）。`GDK_SCALE` 留着 —— 实测
      GTK3/GTK4 在 Wayland 下都不认它（1 倍屏上给 `GDK_SCALE=2`，声明还是 1 倍），
      所以它只影响 X11 的 GTK。代价如实写进 README：混 DPI 时 X 屏幕的 DPI 是两块屏
@@ -6025,6 +6002,44 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
        `vidow_pointer_motion()`，把那两条接上就全覆盖（一行调用的事）。触屏没接（vidow 本来就没接 touch）。
        没有全屏特例。
 
+270. **`vidowmsg lock` / `unlock` / `lock-status`：把 idle 那条线和会话锁接起来（hypridle 的 `on-timeout` 现在有命令可跑了）**
+（2026-10-21；接的是第 269 条（idle 两个 global）和第 266–268 条（会话锁）之间缺的那一环）
+
+     - **缺的是什么**：269 让 `ext-idle-notify-v1` 能用了，267 让会话锁能锁能解锁了，但两者之间没有桥 ——
+       `hypridle` 到点只能跑 `hyprlock` 这类独立客户端，vidow 这边既不知道锁成了没、也没法查询状态。
+       本机**一个锁屏客户端都没装**（`hyprlock` / `swaylock` / `waylock` / `gtklock` / `i3lock` 全缺，当初写
+       `tools/locktest.c` 就是这个原因），所以「装一个客户端」这一步也得有人指路。
+     - **三个命令**（`src/ipc.c`）：
+       - `lock` —— 探测并拉起锁屏客户端。顺序：`VIDOW_LOCK_COMMAND`（vidow **自己**的环境变量，不是 IPC 请求里的）
+         → 按 PATH 找 `hyprlock` / `swaylock` / `waylock` / `gtklock` / `i3lock`。都找不到就报错说明缺什么。
+         用 `vidow_exec_detached()`（双 fork + setsid）拉起，客户端比这条 IPC 活得久。
+         返回 `{"locked":false,"pending":true}` —— 客户端刚起来，`ext_session_lock_v1.locked` 还没握手完；
+         已锁时返回 `{"locked":true,"already":true}`（幂等，不重复拉第二个客户端）。
+       - `lock-status` —— `{"locked":bool,"manager":bool}`。判据是 `server->session_lock != NULL`
+         （非 NULL = 有客户端握住了锁）。
+       - `unlock` —— **故意不提供强制解锁**。协议规定解锁只能由锁屏客户端发 `unlock_and_destroy`；
+         合成器当然能强拆，但那等于给任何拿到 IPC socket 的进程一条「不解密码也能开屏」的后门。
+         所以它只报告状态并在 `note` 里说清楚怎么解锁。
+     - **为什么不自己画锁屏**：`ext-session-lock-v1` 规定锁屏内容由**客户端**画（合成器只提供 lock surface，
+       谁都不许在上面画自己的东西）。vidow 能做的是「把客户端拉起来」+「报告状态」，就这两件。
+     - **实测**（headless，临时 `HOME` / `XDG_RUNTIME_DIR`；把 `locktest` 当客户端用）：
+       `lock-status` → `{"locked":false,…}`；`unlock` → 报状态并附 `note`；本机无客户端时 `lock` →
+       `没有可用的锁屏客户端：装一个（…）或者设 VIDOW_LOCK_COMMAND=<命令>`；
+       指定 `VIDOW_LOCK_COMMAND=build/locktest` 后日志逐行是
+       `ipc: lock → 拉起锁屏客户端 …/locktest` → `sessionlock: HEADLESS-1 的 lock surface 来了，已 configure 1280x720`
+       → `sessionlock: locked 已发（还有 0 块屏没呈现锁后第一帧）` → `sessionlock: 锁上了（1 块屏）`。
+       locktest 从 stdin 读命令、拿到 EOF 就退出，于是紧接着出现
+       `sessionlock: lock 对象没了但没有 unlock ——客户端崩溃 / 被 kill，按协议保持锁定（黑屏死锁，只剩 VT 切换能出去）`
+       —— **这条是设计行为**（267 的「客户端崩溃保持锁定」），不是失败。
+     - **接 hypridle 的写法**（`hypridle.conf`）：
+       ```
+       listener { timeout = 300; on-timeout = vidowmsg lock }
+       ```
+       播视频 / 看网页的客户端会用 `zwp-idle-inhibit-v1` 说「别锁屏」，269 已把这个 global 和抑制转达都接好了，
+       所以看视频不会到点被锁。
+     - **已知边界**：`lock` 拉起客户端后不等握手完成就返回（协议上是异步的），要确认锁上了得再查
+       `lock-status`；客户端崩溃会保持锁定（协议要求），此时只能切 VT 出去 —— 这是 267 定下的策略，没改。
+
 268. **会话锁补漏：锁定期间窗口抓帧不再泄漏被藏窗口的内容（镜面场景只关这一趟、回黑帧而不是 failed）**（用户：「锁定期间窗口抓帧不能泄漏被藏窗口内容」；2026-10-14）
 
      - **洞在哪**：窗口抓帧走的是私有镜面场景 `grab->scene`（`wlr_scene_subsurface_tree_create`，`src/wincapture.c:398`）+ 自己的假输出 `grab->scene_output`（`:304`/`:344`），跟锁屏时被 `set_enabled(false)` 的那棵正常树**没有任何关系** —— 输出抓帧（`src/capture.c`/`screencopy.c`/`screencast.c` 输出源）已实测不泄，只有窗口这条路照样把被藏窗口画出来。入口：`tools/capture.c`（ext-image-copy-capture + ext-foreign-toplevel-list 的窗口源，和 xdg-desktop-portal 选择器 / OBS 窗口源同一条路）→ `src/portal.c:113` 的 `capture_request` → `vidow_win_capture_source_create()`（`src/wincapture.c:728`）→ `source_request_frame()`（`:616`）→ `source_render()`（`:571`）→ **`vidow_win_grab_render()`（`src/wincapture.c:264`）**。
@@ -6070,7 +6085,14 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
      - **会话锁现在的准确状态**：**能锁、能解锁**（客户端 `unlock_and_destroy` → 桌面 + 焦点 + 布局都回来）、**客户端崩溃保持锁定**（黑屏死锁，只剩 VT 切换能出去，
        `vidowmsg` 故意没有强制解锁后门）、**锁定期间输出抓帧 / 录屏不含桌面**（上面三组像素数字）。回归 `test-sessionlock.sh` 全绿。
      - **还没做 / 已知边界**（如实记）：
-       - **自动锁屏（idle）没做**：`wlr_idle_notify_v1` / `wlr_idle_inhibit_v1` 两个 global 都没建，`swayidle` / `hypridle` 这类「空闲触发锁屏」的客户端现在还接不上（方案 §5 的 S5，独立可选步）。
+       - ~~**自动锁屏（idle）没做**~~ **这条已经过时，作废**（2026-10-21 更正）：两个 global 都已经建了 ——
+         `ext-idle-notify-v1`（`wlr_idle_notifier_v1_create`，`src/main.c:291`）和
+         `zwp-idle-inhibit-manager-v1`（`wlr_idle_inhibit_v1_create`，`src/main.c:292`），活动喂给通知
+         （`src/main.c:183`，挂在 backend 的 `new_input` 上）、抑制转达给通知（`src/main.c:263`）也都接好了。
+         `wayland-info` 实测两个 global 都在（`ext_idle_notifier_v1` v2 + `zwp_idle_inhibit_manager_v1` v1），
+         `test-idlewake.sh` 6 PASS / 1 FAIL（唯一失败是「空屏截图不是全黑」那条抓帧断言，和 idle 无关）。
+         详细记录见第 269 条。`swayidle` / `hypridle` 现在能直接接上，到点跑 `vidowmsg lock`（第 270 条）。
+         （原文把函数名也写错了：应为 `wlr_idle_notifier_v1_create`，不是 `wlr_idle_notify_v1_create`。）
        - `vidowmsg pick-window x y` 这类**只读探测**锁定期间仍会做命中测试（`src/ipc.c:1901`）—— 它不改输入路由，但会暴露「被藏起来的窗口在哪」。本次范围外，没动。
        - **窗口**抓帧（`src/wincapture.c` 的 `vidow_win_grab_render()`，给 `ext-image-copy-capture` 的 toplevel 源 / KDE 的窗口录屏用）走的是**单独一棵镜面场景**，
          不经过被关掉的那棵正常树 —— 锁定期间它仍然能抓到被藏起来的那个窗口的内容。这不在方案 §4 风险 3（「输出抓帧漏桌面」）的范围里，`wincapture.c` 也不在本次允许改的文件里，**只记不修**，要处理得单独定策（合成器对 toplevel 源有没有权限模型是另一个问题）。
@@ -10269,7 +10291,7 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
    - 分数缩放下 GTK3 不认 fractional-scale，会按 `ceil` 渲染再被我们缩小（仍然清晰，
      只是多花像素）；GTK4 / Qt6 认 fractional-scale，按 1.70 精确渲染
    - Xft 系（GTK2、老 Motif）不认 `GDK_SCALE`：保持 1:1（清晰但相对偏小）。`Xft.dpi`
-     vidow 已经写了（= 96 × S），GTK2 这类会按它放大字号；要自己接管就在 config.lua 里
+     vidow 已经写了（恒 96，不乘 S），GTK2 这类按它走；要自己接管就在 config.lua 里
      跑 `xrdb -merge` —— 但别和 `GDK_SCALE` 一起用，会叠成 4 倍字号
    - 没接 `wlr_xwayland_surface_offer_focus`（ICCCM 的 GLOBAL 输入模型），只发 activate
 3. 热插拔的边界：

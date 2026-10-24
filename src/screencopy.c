@@ -8,8 +8,10 @@
  *
  * 节奏跟着 wlroots 那份：copy 之后**等下一次输出提交**再出帧（不是当场渲染）。
  * 这一点不能省：录屏客户端（wf-recorder）就是靠 ready 事件被节流的，当场出帧
- * 会让它按编码速度空转（实测过 2500fps 那种）。屏幕静止时没有提交，靠
- * output.c 的 capture_watchdog 每 50ms 催一帧（vidow_screencopy_has_pending）。
+ * 会让它按编码速度空转（实测过 2500fps 那种）。**节奏的主人是客户端**：它发
+ * 一个 copy、我们回一个 ready，它再发下一个；capture_fps 不是「推帧频率」，
+ * 只是「屏幕静止时多久替它催一次」的兜底间隔（见 output.c 的
+ * capture_interval_ms，默认 60Hz，0 = 关掉兜底）。
  *
  * 支持：wl_shm 与 linux-dmabuf 目标缓冲、区域抓帧（capture_output_region）、
  * copy_with_damage 的 damage 事件、overlay_cursor（自己把光标图合成上去）。
@@ -324,6 +326,17 @@ static void frame_send_ready(struct vidow_screencopy_frame *frame,
 }
 
 static void frame_fail(struct vidow_screencopy_frame *frame) {
+	/* 失败要说清理由（抓不到图 / 目标缓冲不合适 / 拷不进去）。协议上客户端
+	 * 只收到一句 failed，wf-recorder 那边就打出来 "Failed to copy frame"，
+	 * 没有这条日志根本分不出断在哪一步。 */
+	wlr_log(WLR_ERROR, "screencopy: 出帧失败 output=%s cached=%d cap=%d "
+		"buffer=%p（%d x %d）",
+		frame->output != NULL && frame->output->name != NULL ?
+			frame->output->name : "-",
+		frame->copied, (int)frame->buffer_cap,
+		(void *)frame->buffer,
+		frame->buffer != NULL ? frame->buffer->width : 0,
+		frame->buffer != NULL ? frame->buffer->height : 0);
 	if (frame->resource != NULL) {
 		zwlr_screencopy_frame_v1_send_failed(frame->resource);
 	}
@@ -728,6 +741,45 @@ static void manager_handle_display_destroy(struct wl_listener *listener,
 
 bool vidow_screencopy_has_pending(struct vidow_screencopy *manager) {
 	return manager != NULL && !wl_list_empty(&manager->frames);
+}
+
+/* 「这一块屏上有没有还没出完的帧」。和上面那个（只看「全局有没有」）的区别：
+ * capture_watchdog 现在按屏推帧，全局有一条就整屏标脏重画所有输出的话，
+ * 双屏时抓 A 屏会把 B 屏也白白重画一遍（B 屏上根本没有客户端在等）。
+ *
+ * 只认**真的在等提交**的帧：copy 之后 output_commit 才挂上（见 frame_handle_copy），
+ * 挂上之前客户端还在等 buffer 事件、还没交缓冲，这时候不用我们推。已经挂上的那些
+ * 一定是等这块屏的下一次 commit。 */
+static bool frame_pending_on(struct vidow_screencopy_frame *frame,
+		struct wlr_output *output) {
+	if (frame == NULL || output == NULL) {
+		return false;
+	}
+	if (frame->output != output) {
+		return false;
+	}
+	/* copy 之后才挂上 output_commit（见 frame_handle_copy），没挂上的帧客户端还在
+	 * 等 buffer 事件、还没交缓冲，不需要我们推。判断「挂上没有」不能看
+	 * wl_list_empty：capture_output 里 wl_list_init 过的空 listener 也是「空链表」
+	 * 形态，两种状态分不开。self 指针自己指自己 = 还没挂。 */
+	return frame->output_commit.link.next != &frame->output_commit.link;
+}
+
+bool vidow_screencopy_has_pending_for_output(struct vidow_screencopy *manager,
+		struct wlr_output *output) {
+	/* 不算「输出关着」这一条：关着的屏确实不该推帧，但那是 capture_watchdog 那边
+	 * 的职责（vidow_output_render 自己会早退，关屏的帧也等不到 commit，输出销毁时
+	 * frame_handle_output_destroy 会回 failed）。这里只回答「谁在等这块屏」。 */
+	if (manager == NULL || output == NULL) {
+		return false;
+	}
+	struct vidow_screencopy_frame *frame;
+	wl_list_for_each(frame, &manager->frames, link) {
+		if (frame_pending_on(frame, output)) {
+			return true;
+		}
+	}
+	return false;
 }
 
 struct vidow_screencopy *vidow_screencopy_create(struct wl_display *display,
