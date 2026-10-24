@@ -139,6 +139,19 @@ void vidow_output_render(struct vidow_output *output) {
 	 * 这一帧画出来的位置同一个时刻。 */
 	int64_t st_t0 = vidow_now_ns();
 	vidow_anim_tick(server);
+	/* 动画**最后一帧**推完就把自己从链表里摘了（anim.c），于是下面第 599 行
+	 * 那个「动画还在跑就再要一帧」的判据当场失效 —— 不会再有任何帧来消费
+	 * 它刚才挂上的 arrange_dirty。上面的 arrange_dirty（第 109 行）在本帧
+	 * 开头就消费过了，赶不上这一次。
+	 *
+	 * 症状：resize 补间的最后一帧不落屏，窗口停在倒数第二帧的宽度上，
+	 * 切一下窗口（来了一帧新的）才补上。
+	 *
+	 * 在 tick 之后再消费一次，让动画这一帧算出来的布局当帧生效。 */
+	if (server->arrange_dirty) {
+		server->arrange_dirty = false;
+		vidow_arrange(server);
+	}
 	/* 拖窗口的果冻：积分弹簧、把弯了的窗口重画一遍（见 jelly.c）。 */
 	vidow_jelly_tick(server, vidow_now_ns());
 	int64_t st_t1 = vidow_now_ns();
