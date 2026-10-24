@@ -2622,7 +2622,7 @@ static void layer_bd_drop(struct vidow_layer_surface *ls) {
 
 
 
-static void decor_draw(struct vidow_server *server,
+static bool decor_draw(struct vidow_server *server,
 		struct vidow_fx_target *fx, struct wlr_buffer *dst,
 		struct wlr_texture *src, struct wlr_texture *mask,
 		const float border[4], int ox, int oy,
@@ -2807,8 +2807,13 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 			/* 有动画那趟时装饰按满 alpha 画：整块的淡入淡出由动画着色器统一乘
 			 * 一次，两边各乘一次就成了 alpha²（淡得比设定的快）。 */
 			double decor_alpha = anim != NULL ? 1.0 : alpha;
-			decor_draw(server, fx, target, tex, NULL, border, ox, oy,
-				decor_alpha, scale, &look);
+			if (!decor_draw(server, fx, target, tex, NULL, border, ox, oy,
+					decor_alpha, scale, &look)) {
+				if (tex_owned) {
+					wlr_texture_destroy(tex);
+				}
+				return false;
+			}
 			displayed = target;
 			decorated = target;
 		} else {
@@ -2842,8 +2847,13 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 		} else if (decorated != NULL) {
 			/* 动画那趟没画成（FBO 拿到就没了）：装饰还在，把它按真正的 alpha
 			 * 重画一遍补上淡入淡出，别让窗口整块亮一帧。 */
-			decor_draw(server, fx, decorated, tex, NULL, border, ox, oy,
-				alpha, scale, &look);
+			if (!decor_draw(server, fx, decorated, tex, NULL, border, ox, oy,
+					alpha, scale, &look)) {
+				if (tex_owned) {
+					wlr_texture_destroy(tex);
+				}
+				return false;
+			}
 		}
 		if (atex != tex) {
 			wlr_texture_destroy(atex);
@@ -4393,7 +4403,7 @@ struct decor_geo {
 };
 
 
-static void decor_pass(struct vidow_server *server,
+static bool decor_pass(struct vidow_server *server,
 		struct vidow_fx_target *fx, struct wlr_buffer *dst,
 		const struct decor_geo *g,
 		struct wlr_texture *src, struct wlr_texture *mask,
@@ -4407,7 +4417,7 @@ static void decor_pass(struct vidow_server *server,
 
 	struct wlr_egl *egl = NULL;
 	if (begin_pass(server, dst, g->dst_w, g->dst_h, &egl) == 0) {
-		return;
+		return false;
 	}
 
 	glUseProgram(d->program);
@@ -4540,6 +4550,7 @@ static void decor_pass(struct vidow_server *server,
 	draw_quad(d->program);
 	glUseProgram(0);
 	end_pass(egl);
+	return true;
 }
 
 /* 屏幕那条路：几何从 fx（离屏缓冲 + 窗口在输出上的位置）来。 */
@@ -4561,12 +4572,11 @@ bool vidow_fx_render_shadow(struct vidow_server *server,
 		.content_alpha = 1.0f,
 	};
 	const float no_border[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-	decor_pass(server, fx, dst, &g, server->empty_tex, NULL, no_border,
+	return decor_pass(server, fx, dst, &g, server->empty_tex, NULL, no_border,
 		1.0, fx->scale, look, true);
-	return true;
 }
 
-static void decor_draw(struct vidow_server *server,
+static bool decor_draw(struct vidow_server *server,
 		struct vidow_fx_target *fx, struct wlr_buffer *dst,
 		struct wlr_texture *src, struct wlr_texture *mask,
 		const float border[4], int ox, int oy,
@@ -4622,7 +4632,7 @@ static void decor_draw(struct vidow_server *server,
 		.split_x = -1.0f,
 		.content_alpha = 1.0f,
 	};
-	decor_pass(server, fx, dst, &g, src, mask, border, alpha, scale, look,
+	return decor_pass(server, fx, dst, &g, src, mask, border, alpha, scale, look,
 		false);
 }
 
@@ -4703,10 +4713,9 @@ bool vidow_fx_capture_decor(struct vidow_server *server,
 		.content_alpha = 0.0f,
 	};
 
-	decor_pass(server, &fx, c->dst, &g,
+	return decor_pass(server, &fx, c->dst, &g,
 		c->content != NULL ? c->content : server->empty_tex, NULL,
 		c->border, 1.0, frame_scale, c->look, false);
-	return true;
 }
 
 static bool anim_draw(struct vidow_server *server,
