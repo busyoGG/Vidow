@@ -391,11 +391,16 @@ void vidow_exec_detached(const char *script) {
 				close(devnull);
 			}
 		}
-		/* ① 信号屏蔽字复位。
-		 * vidow 自己会屏蔽一批信号（事件循环那一套），子进程**继承**过去 ——
-		 * 应用一旦等被屏蔽的信号（SIGCHLD 最典型）就永久卡住，表现就是用户报的
-		 * 「自启动应用会自杀 / 感觉像是被卡死一样」。fork+exec 之间只允许
-		 * async-signal-safe 的调用，sigprocmask 正好是。 */
+		/* Reset inherited signal state before exec. SIGINT/SIGQUIT are ignored by
+		 * Vidow itself so a terminal Ctrl+C cannot kill the compositor; do not let
+		 * that policy leak into kitty/vshell or other detached applications. */
+		struct sigaction dfl;
+		memset(&dfl, 0, sizeof(dfl));
+		dfl.sa_handler = SIG_DFL;
+		sigemptyset(&dfl.sa_mask);
+		sigaction(SIGINT, &dfl, NULL);
+		sigaction(SIGQUIT, &dfl, NULL);
+		/* vidow may also carry a blocked signal mask into children. */
 		sigset_t empty;
 		sigemptyset(&empty);
 		sigprocmask(SIG_SETMASK, &empty, NULL);

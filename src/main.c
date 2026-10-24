@@ -112,13 +112,6 @@ static int terminate_signal(int signo, void *data) {
 	return 0;
 }
 
-/* Keep terminal-generated interrupts from killing the compositor. This is a
- * caught disposition rather than SIG_IGN, so clients spawned by Vidow reset
- * SIGINT/SIGQUIT to their normal defaults across exec. */
-static void ignore_terminal_signal(int signo) {
-	(void)signo;
-}
-
 /* 会话从「切走了」回到「回来了」：VT 切回来（Ctrl+Alt+F3 再切回来）时，屏幕上的
  * framebuffer 已经是别人的了，场景里的东西一个像素都没变，但必须整屏重画一遍 ——
  * 不然切回来看到的是一张旧图 / 花屏。wlroots 的 DRM 后端自己管「不活动时别往 DRM
@@ -715,13 +708,12 @@ int main(int argc, char *argv[]) {
 	 * 不会破坏 DRM/libinput 的设备接管；退出使用 SIGTERM（pkill / systemctl stop）。
 	 */
 	/* Terminal-generated SIGINT/SIGQUIT goes to the whole foreground process
-	 * group. Catch it so Ctrl+C interrupts vshell's foreground job without
-	 * terminating Vidow. A caught disposition is reset by exec, unlike
-	 * SIG_IGN, so clients spawned by Vidow keep their normal Ctrl+C behavior. */
+	 * group. Ignore them in the compositor. Detached children reset these two
+	 * dispositions to SIG_DFL immediately before exec, so kitty/vshell keeps
+	 * normal Ctrl+C behavior. */
 	struct sigaction ign;
 	memset(&ign, 0, sizeof(ign));
-	ign.sa_handler = ignore_terminal_signal;
-	ign.sa_flags = SA_RESTART;
+	ign.sa_handler = SIG_IGN;
 	sigemptyset(&ign.sa_mask);
 	if (sigaction(SIGINT, &ign, NULL) != 0 ||
 			sigaction(SIGQUIT, &ign, NULL) != 0) {
