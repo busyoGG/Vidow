@@ -1344,6 +1344,7 @@ X11 没有 per-window 的缓冲区缩放，所以：
    - 低 DPI 的屏（`s < S`）：落屏像素 = `逻辑 × s` < 缓冲区 → **缩小，不糊**
    - 两块屏上的物理尺寸一样（逻辑尺寸一样，而 scale ∝ ppi）
 4. 命中坐标按同一比例换回来：`局部 = (布局坐标 - 窗口原点) × S`，点哪儿就是哪儿。
+
 257. **输入法抢键盘后，按住修饰键只认第一次：Mod+滚轮 / Mod+左键第二轮就失效**（用户报「mod 长按只能消费一次的 bug 回归了」「修饰键都有这个问题」）。
 
      - 根因：`input.c` 的指针绑定用 `wlr_seat_get_keyboard()` 拿 seat 上那把键盘，
@@ -5469,7 +5470,7 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
        `--default-config 13-cursor.lua` 重新生成、并给 `section_groups[]` 补上这两族的表写法提示之后全过。
 
 
-257. **Xwayland 退出重启后剪贴板桥全废：X 侧一复制就 SIGSEGV（`clip->conn` 是野指针）+ Wayland→X 彻底不通（`xwayland->seat` 被 xwm 清空）**（用户报「Xwayland 重启后 X 那边复制就崩、Wayland 复制的 X 客户端拿不到」；2026-10-14；复现脚本 `/tmp/clipsync/restart.sh`）
+252. **Xwayland 退出重启后剪贴板桥全废：X 侧一复制就 SIGSEGV（`clip->conn` 是野指针）+ Wayland→X 彻底不通（`xwayland->seat` 被 xwm 清空）**（用户报「Xwayland 重启后 X 那边复制就崩、Wayland 复制的 X 客户端拿不到」；2026-10-14；复现脚本 `/tmp/clipsync/restart.sh`）
 
      - 背景：wlroots 给 Xwayland 传的是 `-terminate`，**最后一个 X 客户端一走它就退出**；懒启动模式下
        wlroots 复用的是同一个 `wlr_xwayland_server` 对象，下一个 X 客户端连上来时再 fork 一个新的 Xwayland

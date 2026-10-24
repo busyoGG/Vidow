@@ -1378,7 +1378,7 @@ static bool x11_event(struct wlr_xwayland *xwayland, xcb_generic_event_t *event)
 	struct vidow_clipboard *clip = &server->clipboard;
 	/* x11_conn()：Xwayland 重启过的话这条事件来自新 xwm 的连接，手上那条已经
 	 * 死了 —— 当场摘桥（绝不去碰它），这一条交给 wlroots 默认处理，100ms 后
-	 * x11_attach() 会用新连接重新接管（README 257）。 */
+	 * x11_attach() 会用新连接重新接管（README 252）。 */
 	if (!clip->active || x11_conn(clip) == NULL) {
 		return false;
 	}
@@ -1602,7 +1602,7 @@ static void sel_init(struct vidow_clipboard *clip,
 
 /* 放掉 X 侧：clip->conn 这条「xwm 的连接」不再归我们。
  *
- * 为什么必须单独有这一步（README 257）：wlroots 给 Xwayland 传的是 -terminate，
+ * 为什么必须单独有这一步（README 252）：wlroots 给 Xwayland 传的是 -terminate，
  * 最后一个 X 客户端一走它就退出，而退出时 wlroots 会把 xwm 的 xcb 连接
  * xcb_disconnect 掉（xwm_destroy）—— clip->conn 当场变成野指针，下一次
  * xcb_convert_selection 就是段错误。

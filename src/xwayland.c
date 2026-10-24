@@ -394,7 +394,7 @@ static void xwayland_ready(struct wl_listener *listener, void *data) {
 	 * 掉），而懒启动模式下重启用的是同一个 wlr_xwayland 对象 —— 只在建的时候
 	 * 设过一次的话，重启后 xwayland->seat 一直是 NULL：xwm 拒掉所有选区事件
 	 * （日志刷 "not handling selection events: no seat assigned to xwayland"），
-	 * Wayland 复制的东西 X 侧永远拿不到（README 257）。
+	 * Wayland 复制的东西 X 侧永远拿不到（README 252）。
 	 * wlr_xwayland_set_seat 会先摘旧监听，重入安全。 */
 	wlr_xwayland_set_seat(server->xwayland, server->seat);
 
