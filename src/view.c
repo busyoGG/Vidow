@@ -3583,6 +3583,23 @@ static void output_arrange(struct vidow_server *server,
 	}
 	output->viewport_x = viewport;
 
+	/* 把最终视口写回**当前显示的那块工作区**。
+	 *
+	 * viewport_x 挂在 output 上（一块屏只有一个滚动位置），而每块工作区想记住
+	 * 「自己离开时滚到哪」—— 那份记忆就是 ws->viewport_x。老代码只在切换的
+	 * 那一瞬间抄一次（workspace.c: prev->viewport_x = out->viewport_x），可那一刻
+	 * 抄到的是**上一次 arrange 之后**的值：焦点跟随、新窗口插入、列宽变化都会
+	 * 让 arrange 把视口滚到别处，于是抄下去的是个陈旧值，切回来的位置就不对 ——
+	 * 用户看到的「切工作区窗口自己动一下」。
+	 *
+	 * 所以在这里（所有滚动都算完、clamp 过之后）落账：谁显示着，谁的 viewport_x
+	 * 就是屏幕上这个值。切换时那份快照只是兜底，真值一直跟着屏幕走。 */
+	struct vidow_workspace *vp_ws =
+		vidow_workspace_shown_for(server, output->wlr_output);
+	if (vp_ws != NULL) {
+		vp_ws->viewport_x = viewport;
+	}
+
 	/* Pass 3: place the tiled windows. Floating views are placed afterwards
 	 * so that a follow-float can read its parent's fresh tile geometry.
 	 * 最小化的窗口不摆放（它原来的几何留着，放回来那次 arrange 会重算），
