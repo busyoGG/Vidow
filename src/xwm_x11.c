@@ -924,6 +924,32 @@ struct vidow_x11_server *vidow_x11_server_create(struct vidow_server *server,
 	g_x11 = x11;
 	atoms_intern(x11);
 
+	/* **预取扩展，并确认 composite 真的在。**
+	 *
+	 * xcb_composite_redirect_subwindows() 是异步的：扩展不在时它照样把请求
+	 * 发出去，然后 X 服务器回一个错误 —— 我们不看就永远不知道。之前
+	 * 「窗口建出来但画不出内容」正是这种沉默失败。Hyprland 在
+	 * CXWM::gatherResources() 里先 prefetch 再 query（XWM.cpp:909-911）。 */
+	xcb_prefetch_extension_data(conn, &xcb_composite_id);
+	{
+		const xcb_query_extension_reply_t *ext =
+			xcb_get_extension_data(conn, &xcb_composite_id);
+		if (ext == NULL || !ext->present) {
+			wlr_log(WLR_ERROR, "xwm: **composite 扩展不在** —— X 窗口将"
+				"永远画不出内容（redirect 会静默失败）");
+		} else {
+			xcb_composite_query_version_cookie_t vc =
+				xcb_composite_query_version(conn, 0, 4);
+			xcb_composite_query_version_reply_t *vr =
+				xcb_composite_query_version_reply(conn, vc, NULL);
+			if (vr != NULL) {
+				wlr_log(WLR_INFO, "xwm: composite 扩展 %u.%u",
+					vr->major_version, vr->minor_version);
+				free(vr);
+			}
+		}
+	}
+
 	/* **抢 SubstructureRedirect**：这一步之后我们就是真正的 WM，
 	 * 客户端窗口的 map / configure 请求都先到我们这儿。 */
 	uint32_t values[] = {
