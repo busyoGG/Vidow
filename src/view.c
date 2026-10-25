@@ -6517,6 +6517,19 @@ static void view_unmap(struct wl_listener *listener, void *data) {
 	 * 会认为「已经 replay 过」直接跳过 view_map，导致 scene node 不启用 → 黑屏。
 	 * Steam 主界面第二次打开黑屏就是这个原因。 */
 	view->x11_map_replayed = false;
+	/* 同理，configure 的去重账也得作废。`cfg_sent` 记的是「上一次发出去的
+	 * 位置尺寸」，去重是为了别让客户端白重画一帧；但 unmap 之后这次协商就
+	 * 结束了，下一次 map 是一次全新的协商 —— 客户端在等我们说「按这个尺寸
+	 * 画」，我们却拿上一次的账认定「已经说过了」，一句话都不发。
+	 *
+	 * Steam 重开主窗口复用同一个 X 窗口、尺寸和上次一模一样，于是
+	 * wlr_xwayland_surface_configure 一次都没被调用（日志里 x11-cfg 一条
+	 * 都没有），它自己画一帧就停下来等 ConfigureNotify，永远等不到 ——
+	 * 画面上就是黑的，`vidowmsg` 里 mapped / visible / placed 全是对的。
+	 * 首开之所以正常，只是那时候 cfg_sent 还是 false。
+	 * 拖动之所以能救回来，是因为位置变了，去重条件不成立，configure 重新发
+	 * 了出去。 */
+	view->cfg_sent = false;
 	vidow_portal_view_mapped(view, false);
 	if (view->focus_helper) {
 		/* 辅助窗口走了：键盘还给原来的焦点窗口。它从来没进过 server->focused，
