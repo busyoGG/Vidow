@@ -4294,6 +4294,11 @@ struct vidow_view *vidow_view_at(struct vidow_server *server,
 		double lx, double ly, struct wlr_surface **surface,
 		double *sx, double *sy);
 void vidow_focus_view(struct vidow_view *view);
+/* 把窗口放上屏 / 收下来。原来是 view.c 里的 static，xwm.c 的状态机要调，
+ * 于是导出 —— 参数照旧是那两个监听器的形状（监听器指针 + 数据），这样
+ * 调用方不用知道内部是怎么取 view 的，也免得再造一套平行的入口。 */
+void view_map(struct wl_listener *listener, void *data);
+void view_unmap(struct wl_listener *listener, void *data);
 /* 「跳到这个窗口」的入口（MRU 切换器提交 / IPC 的 focus-window）：目标是迷你 /
  * 图标态的话，先把它摊成自由小窗（FREE）**再**给焦点 —— 顺序不能反，
  * vidow_focus_view 对 MINI / ICON 有守卫（不变量：server->focused 永不指向

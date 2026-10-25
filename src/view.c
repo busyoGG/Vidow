@@ -1,5 +1,6 @@
 #include "server.h"
 #include "ipc.h"
+#include "xwm.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -6343,11 +6344,7 @@ static void view_reconsider_map(struct vidow_view *view);
 static bool x11_is_popup(const struct wlr_xwayland_surface *x);
 static void x11_trace_view(const char *event, struct vidow_view *view,
 		struct wlr_surface *surface);
-static bool x11_window_is_viewable(struct vidow_server *server,
-		const struct wlr_xwayland_surface *x);
-static void x11_replay_map_if_xmapped(struct vidow_view *view,
-		bool trust_x_viewable);
-static void view_map(struct wl_listener *listener, void *data) {
+void view_map(struct wl_listener *listener, void *data) {
 	(void)data;
 	struct vidow_view *view = wl_container_of(listener, view, map);
 	struct vidow_server *server = view->server;
@@ -6572,7 +6569,7 @@ static void view_reconsider_map(struct vidow_view *view) {
 	vidow_arrange(view->server);
 }
 
-static void view_unmap(struct wl_listener *listener, void *data) {
+void view_unmap(struct wl_listener *listener, void *data) {
 	(void)data;
 	struct vidow_view *view = wl_container_of(listener, view, unmap);
 	struct vidow_server *server = view->server;
@@ -6834,18 +6831,15 @@ static void view_commit(struct wl_listener *listener, void *data) {
 	 * 在这儿补一次。抄 Hyprland considerMap 的思路 —— 见 view_reconsider_map。 */
 	view_reconsider_map(view);
 
-	/* 补漏的 map：X 表面已经 mapped、我们这边还没认账。
+	/* 统一的状态机：客户端刚交了这一帧，按「有没有 buffer」对齐一次显示
+	 * 状态。这是 Hyprland 的 commit 监听（XSurface.cpp:97）那一步 ——
+	 * 有 texture 且没放上屏就放上去，没 texture 却放着就收下来。
 	 *
-	 * 踩过的：Steam 用 `steam steam://open/main` 主动打开主界面时，X 层窗口
-	 * 已经是 IsViewable（xwininfo 能看到），属性流（title / 缓冲尺寸）也都到
-	 * 了，但 map 信号没走完我们这条监听 —— 场景节点停在 disabled，画面上看不
-	 * 到窗口，`vidowmsg windows` 里也没有它。和 x11_associate 里那次补偿
-	 * （wlr_xwayland_surface 建 view 时 surface 早就 mapped）是同一个现象，
-	 * 只是晚了一步发生在这儿。
-	 *
-	 * 判据只看 wlroots 记住的 mapped：它和 commit 是同一条事件流里的状态，
-	 * 不会比客户端实际状态超前，所以不会把真正想藏起来的窗口拉出来。 */
-	x11_replay_map_if_xmapped(view, false);
+	 * 以前这里是 x11_replay_map_if_xmapped 的一长串前置条件（mapped、
+	 * x11_map_replayed、scene_tree、focus_helper 都不能挡），判据和
+	 * associate / map_request 两处各不相同，于是出现了「三处都说没问题、
+	 * 屏幕上什么都没有」的死角。现在只有一个判据。 */
+	xwm_surface_sync(view);
 
 	/* **排帧**。这是 X11 和 Wayland 共用的交帧入口，而 vidow 是按需渲染
 	 * （vidow_output_schedule_frame）—— 不在这里要一帧，客户端交上来的新内容
@@ -7749,53 +7743,8 @@ static void x11_trace_view(const char *event, struct vidow_view *view,
  * 不看 wlroots 那边的 surface->mapped —— 它要等一次 commit / 属性流才更新，
  * 而「map 请求先于关联到达」的那种时序里，我们需要的是 X 侧的**真实**状态。
  * 查不到（连接没起来 / 窗口没了）一律当不是，让调用方保持原行为。 */
-static bool x11_window_is_viewable(struct vidow_server *server,
-		const struct wlr_xwayland_surface *x) {
-	if (server == NULL || server->xwayland == NULL || x == NULL ||
-			x->window_id == XCB_WINDOW_NONE) {
-		return false;
-	}
-	xcb_connection_t *conn =
-		wlr_xwayland_get_xwm_connection(server->xwayland);
-	if (conn == NULL) {
-		return false;
-	}
-	xcb_get_window_attributes_cookie_t cookie =
-		xcb_get_window_attributes(conn, x->window_id);
-	xcb_get_window_attributes_reply_t *reply =
-		xcb_get_window_attributes_reply(conn, cookie, NULL);
-	if (reply == NULL) {
-		return false;
-	}
-	bool viewable = reply->map_state == XCB_MAP_STATE_VIEWABLE;
-	free(reply);
-	return viewable;
-}
-
 /* Replay the X11 map edge when wlroots mapped the surface without a new
  * commit. This is event-driven and idempotent per association. */
-static void x11_replay_map_if_xmapped(struct vidow_view *view,
-		bool trust_x_viewable) {
-	if (view == NULL || view->kind != VIDOW_VIEW_X11 || view->mapped ||
-			view->x11_map_replayed || view->focus_helper || view->popup ||
-			view->x11 == NULL || view->x11->surface == NULL ||
-			view->scene_tree == NULL) {
-		return;
-	}
-	/* During normal wlroots map/commit handling, the surface flag is authoritative.
-	 * Association is different: XWayland can already have an IsViewable window
-	 * while the wlroots surface has not observed the map edge yet. */
-	bool mapped = view->x11->surface->mapped;
-	if (!mapped && trust_x_viewable) {
-		mapped = x11_window_is_viewable(view->server, view->x11);
-	}
-	if (!mapped) {
-		return;
-	}
-	view->x11_map_replayed = true;
-	view_map(&view->map, NULL);
-}
-
 static void x11_attach_surface(struct vidow_view *view) {
 	struct vidow_server *server = view->server;
 	if (view->x11 == NULL || view->x11->surface == NULL ||
@@ -7842,10 +7791,11 @@ static void x11_attach_surface(struct vidow_view *view) {
 			view->x11->surface, view, "x11", NULL);
 	}
 
-	/* A new association gets one chance to replay a map that happened before
-	 * the scene surface was attached. */
+	/* 场景树刚建好：让状态机按「有没有 buffer」对齐一次。这里以前是
+	 * 「replay 一次 map」并顺手把 x11_map_replayed 清掉 —— 那套标志位
+	 * 现在不再参与判定，状态机只看 buffer。 */
 	view->x11_map_replayed = false;
-	x11_replay_map_if_xmapped(view, true);
+	xwm_surface_sync(view);
 
 	/* Xwayland can associate an already-painted surface after its last commit.
 	 * wlr_scene_surface_create() installs the commit listener, but there may be
@@ -7941,25 +7891,14 @@ static void x11_associate(struct wl_listener *listener, void *data) {
 	wlr_log(WLR_DEBUG, "x11: associate %s",
 		vidow_view_title(view) != NULL ? vidow_view_title(view) : "(无题)");
 
-	/* map 请求可能比这条关联先到（Steam 关掉再打开时实测就是）：
+	/* map 请求常常比这条关联先到（Steam 关掉再打开时实测就是）：那时候
+	 * surface 还是 NULL，判不了，于是事件等于丢了。更早的写法是这里去问
+	 * 一次 X 的 IsViewable 再补一遍 map —— 但「X 说 viewable」和「我们有
+	 * 东西可画」是两件事，补出来的可能是个空壳。
 	 *
-	 *   19.002  map_request   —— 此时 view->x11->surface 还是 NULL，
-	 *                            前置条件一条都不满足，事件就这么丢了
-	 *   19.015  attach        —— 场景树刚建好
-	 *   19.015  associate     —— 本函数
-	 *
-	 * 而 X 侧窗口从此一直是 IsViewable，不会再补发一次 map 请求 —— 画面就
-	 * 永远不上屏，`vidowmsg windows` 里也查不到它（用户报的「重开黑屏」）。
-	 *
-	 * 所以关联完再问一次 X 服务器的真实状态：窗口已经是 viewable 就直接走
-	 * 一遍 map。x11_replay_map_if_xmapped 自己按 x11_map_replayed 去重，
-	 * 重复调用是安全的。 */
-	if (view->x11 != NULL && view->x11->window_id != XCB_WINDOW_NONE) {
-		struct wlr_xwayland_surface *xs = view->x11;
-		if (!view->mapped && x11_window_is_viewable(view->server, xs)) {
-			x11_replay_map_if_xmapped(view, true);
-		}
-	}
+	 * 现在只做一件事：让状态机按「有没有 buffer」重新对齐。surface 刚
+	 * 建出来时多半还没 buffer，那就什么都不做，等 commit 来说话。 */
+	xwm_surface_sync(view);
 }
 
 static void x11_dissociate(struct wl_listener *listener, void *data) {
@@ -7972,11 +7911,10 @@ static void x11_dissociate(struct wl_listener *listener, void *data) {
 static void x11_map_request(struct wl_listener *listener, void *data) {
 	(void)data;
 	struct vidow_view *view = wl_container_of(listener, view, x11_map_request);
-	if (view->x11 != NULL && view->x11->surface != NULL &&
-			view->x11->surface->mapped && view->scene_tree != NULL &&
-			!view->mapped) {
-			x11_replay_map_if_xmapped(view, false);
-	}
+	/* 交给统一的状态机：它只认「客户端有没有交 buffer」，不看 X 这时候
+	 * 报的是什么状态。map 请求常常早于 associate 到（Steam 重开主窗口
+	 * 实测就是这样），这时候还判不了，等 associate / commit 再来说话。 */
+	xwm_surface_sync(view);
 }
 
 static void x11_set_title(struct wl_listener *listener, void *data) {
