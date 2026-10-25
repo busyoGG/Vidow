@@ -401,6 +401,7 @@ void vidow_exec_detached(const char *script) {
 		sigemptyset(&dfl.sa_mask);
 		sigaction(SIGINT, &dfl, NULL);
 		sigaction(SIGQUIT, &dfl, NULL);
+		sigaction(SIGPIPE, &dfl, NULL);
 		/* vidow may also carry a blocked signal mask into children. */
 		sigset_t empty;
 		sigemptyset(&empty);

@@ -816,6 +816,25 @@ int main(int argc, char *argv[]) {
 			strerror(errno));
 	}
 
+	/* SIGPIPE 也忽略掉，而且这一条是**必须**的。
+	 *
+	 * 默认动作是「终止进程」，而合成器天天往可能已经断掉的对端写：
+	 * 剪贴板把数据塞进 pipe（clipboard.c 的 wlr_data_source_send 用的是
+	 * fds[1]，读端是客户端）、IPC 往订阅者那条 socket 上写（ipc.c 的
+	 * write(c->fd, …)）。客户端一退出，这些写就撞上 EPIPE。
+	 *
+	 * 现场（gdb 抓到的收尾）：Mod+Return 起的 kitty 里跑 vshell，vshell
+	 * 一退/client 一断，所有线程依次 exited，最后
+	 *   Program terminated with signal SIGPIPE, Broken pipe.
+	 * 于是 compositor 静默消失：没有 core、没有断言，连退出日志都写不出来
+	 * —— 因为这不是任何一条退出路径，是信号默认动作。
+	 *
+	 * 忽略之后这些 write 会返回 -1 / EPIPE，由各调用点自己当「对端没了」
+	 * 处理（IPC 那边本来就有这个分支）。 */
+	if (sigaction(SIGPIPE, &ign, NULL) != 0) {
+		wlr_log(WLR_ERROR, "failed to ignore SIGPIPE: %s", strerror(errno));
+	}
+
 	int signals[] = { SIGTERM };
 	for (size_t i = 0; i < sizeof(signals) / sizeof(signals[0]); i++) {
 		if (wl_event_loop_add_signal(wl_display_get_event_loop(server.display),
