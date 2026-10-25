@@ -2096,6 +2096,32 @@ static bool view_clip_box(struct vidow_view *view, struct wlr_box *out) {
 	 * 对面那块屏上了（场景图是全局坐标），按旧归属屏裁就会把越界那半块整块切掉
 	 * —— 屏幕上就是「拖到一定距离窗口就没了」（用户 2026-10-23 报的）。倍率、
 	 * 裁剪、模糊底衬三处必须是同一个判据，见 view_drag_output()。 */
+	/* **拖动中的窗口不裁**（用户 2026-10-25：「拖拽跨屏之后就能正常两个屏幕
+	 * 渲染，但跨屏之前不行」）。
+	 *
+	 * view_drag_output() 按「重叠面积最大」选屏。拖到一半（窗口 70% 还在原屏）
+	 * 它返回原屏，下面就把窗口裁到原屏框里 —— 伸出原屏的那一条被切掉，看起来
+	 * 就是「跨屏之前另一块屏上没有内容」。等窗口大半越过去，判据翻到新屏，
+	 * 整块又基本落在新屏框内，于是「跨屏之后正常」。
+	 *
+	 * 但拖拽期间 view_sync_drag_outputs() 已经让表面 enter 到**所有相交的屏**
+	 * 了（那是另一条硬约束：表面没 enter 过的屏根本不画它）。既然两块屏本来
+	 * 都在画，这里再裁就只剩「切掉一半」这一个效果 —— 和那条 enter 逻辑直接
+	 * 打架。跨屏拖拽本来就该两块屏各画一半、拼起来是完整的窗口（Hyprland 的
+	 * 逐屏渲染就是这个效果，每半块用自己那块屏的底衬）。
+	 *
+	 * 只豁免**移动**：改大小（RESIZE）不拖出去，照旧裁；而且它每帧换源缓冲
+	 * 尺寸，裁剪框跟着抖没有意义。松手之后归到新工作区，裁剪自然恢复。
+	 *
+	 * 注意这和上面「浮窗拖拽中仍按 view_drag_output 裁」那段不冲突 —— 浮窗
+	 * 走的是上面那条 return false / fbox 分支，根本到不了这里；这条只对
+	 * 平铺窗口的拖拽生效。 */
+	bool drag_moving = view->dragging &&
+		view->server->grab_mode != VIDOW_GRAB_RESIZE &&
+		view->server->grab_mode != VIDOW_GRAB_RESIZE_TILE;
+	if (drag_moving) {
+		return false;
+	}
 	struct wlr_output *clip_out = view_drag_output(view);
 	if (clip_out == NULL) {
 		clip_out = view_home_output(view);
