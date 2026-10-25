@@ -2323,9 +2323,32 @@ bool vidow_view_scanout_ok(struct vidow_view *view) {
 	if (view->fx.shader != NULL) {
 		return false;
 	}
-	/* 裁过（跨屏那一半 / overview 里缩放）：直通没法裁，画面会画到隔壁屏上。 */
-	if (view->fx.clip_on) {
-		return false;
+	/* 裁过（跨屏那一半 / overview 里缩放）：这条**不能删**，但也不能像
+	 * 以前那样一律退回合成管线 —— 无装饰的窗口（Steam 主窗口就是）退回
+	 * 去以后 fx 那条路拿不到 decorated 图，整块画不出来，屏幕上就是黑的。
+	 *
+	 * 实测：Steam 首开 clip_on=0 走直通、画面正常；关掉再开 clip_on=1
+	 * 被踢到合成管线，纹理有 3808x2050 内容（x11-scene 里 tex 非空、
+	 * dst 也对），屏幕上却什么都没有 —— 而且 XWayland 只交 1 帧就停，
+	 * 因为没人给它 frame_done。
+	 *
+	 * 直通其实能裁：把裁剪框写到场景节点的裁剪属性上就行，不用绕离屏
+	 * 缓冲。下面 crop 那段就是干这个的。 */
+	/* 只在**真的要裁掉一块**时才拒绝直通（窗口整块在屏内时裁不裁无所谓，
+	 * 硬退回合成管线纯属自找黑屏）。 */
+	if (view->fx.clip_on && view->fx.clip.width > 0 &&
+			view->fx.clip.height > 0) {
+		struct wlr_box vis = {0};
+		struct wlr_box node_box = {
+			.x = view->geom.x, .y = view->geom.y,
+			.width = view->geom.width,
+			.height = view->geom.height,
+		};
+		if (wlr_box_intersection(&vis, &node_box, &view->fx.clip) &&
+				(vis.width < node_box.width ||
+					vis.height < node_box.height)) {
+			return false; /* 真的被切掉一块：直通画不了 */
+		}
 	}
 	struct vidow_look look;
 	vidow_view_look(&view->server->config, &view->rule_eff, view->fullscreen,

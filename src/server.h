@@ -1734,6 +1734,33 @@ struct vidow_view {
 	bool x11_alpha_known;
 	bool x11_alpha_on;
 	float x11_opacity;
+	/* 重映射后强制重建 XWayland 导出的 dmabuf。
+	 *
+	 * 现象：Steam 关掉主窗口再打开，X 侧 pixmap 有内容（import 抓到 99%
+	 * 非黑），我们拿到的纹理也是 3808x2050，但里面全零 —— XWayland 导出
+	 * 的那份 dmabuf 没被重新填过。用户实测**拖一下 / 缩放一下 / 切一次
+	 * 工作区**画面就出来了，三种操作的共同点是逼 XWayland 重建 pixmap。
+	 *
+	 * 所以这里在「重新上屏」的那一刻主动抖一下尺寸：先 +1 像素、下一轮
+	 * 再还原。X 服务器只在尺寸真的变了才重新分配 pixmap，同尺寸的
+	 * configure 它不理（ICCCM 连 ConfigureNotify 都不发，view.c 里
+	 * 504 行那个分支就是给这种情况补事件的），所以必须真的改一下。 */
+	struct wl_event_source *x11_rebuild_timer;
+	bool x11_rebuild_pending; /* 已经抖过 +1，等还原 */
+	int x11_rebuild_w;         /* 抖动前的真实尺寸 */
+	int x11_rebuild_h;
+	/* X11 表面的「欠帧」计数，见 view.c 里 xwm 交帧那段说明。
+	 *
+	 * XWayland 的渲染由 wl_surface 的 frame callback 驱动，而回调只在
+	 * Vidow 真画完一帧时才发；Vidow 又是按需渲染。两边互等，画面就冻在
+	 * 重映射后的那张空白帧上（实测 Steam 第二次开主窗口：重开后只有
+	 * 1 帧，首开 2285 帧；手动切一次工作区强制整屏重绘，立刻涨到
+	 * 1008 帧、画面正常）。这里记「还欠它几帧」，由补帧闹钟推着走完。 */
+	int x11_want_frames;
+	/* 排错「重开黑屏」：unmap 那一刻手里握着的 buffer。重开后客户端交上来
+	 * 的如果还是这一个指针，说明它压根没画新东西，我们画的是残留。
+	 * 只用于日志对比，不参与任何判定。 */
+	struct wlr_buffer *buf_before_unmap;
 	/* 拖动时的果冻形变（见 jelly.c）：非空就是「现在正弯着」——窗口本来的
 	 * 装饰节点让位，由它显示。松手后它自己晃回去再消失。 */
 	struct vidow_jelly *jelly;

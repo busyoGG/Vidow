@@ -1,6 +1,13 @@
 #include "server.h"
 #include "ipc.h"
 #include "xwm.h"
+#include "x11.h"
+
+#include <drm_fourcc.h>
+#include <EGL/egl.h>
+#include <wlr/render/egl.h>
+#include <wlr/render/gles2.h>
+#include <GLES2/gl2.h>
 
 #include <math.h>
 #include <stdlib.h>
@@ -501,6 +508,33 @@ void vidow_view_set_size(struct vidow_view *view, int w, int h) {
 				x, y, cw, ch);
 			return; /* 位置尺寸一个都没变：别让客户端白重画一帧 */
 		}
+		/* 「尺寸没变」也要回一声，否则客户端不知道自己被确认了。
+		 *
+		 * ICCCM 规定：请求的尺寸和当前尺寸相同时，X 服务器不会自动发
+		 * ConfigureNotify（它只在真的发生改变时发）。Hyprland 在
+		 * XSurface.cpp:206 专门为这种情况补了一个合成事件，注释写得很清楚
+		 * （"ICCCM requires a synthetic event when window size is not changed"）。
+		 *
+		 * 我们没补。于是「关掉窗口再打开、位置尺寸和上次一模一样」这一路
+		 * （Steam 主窗口就是这样）走下来：configure 发出去了，客户端交了
+		 * 一帧黑的，然后停在那儿等确认 —— 等一个永远不会来的
+		 * ConfigureNotify。画面就这么定在黑色上，而 X 侧其实一直在正常
+		 * 绘制（import -window 能抓到完整画面），`vidowmsg` 里 mapped /
+		 * visible / placed 也全都是对的。
+		 *
+		 * 判据是「这次要发的几何 == 上一次真发出去的几何」。
+		 *
+		 * 刻意**不看** cfg_sent：它记的是「这一轮协商里已经发过没有」，
+		 * 而 view_unmap 会把它清成 false（unmap 之后下一次 map 是一次全新
+		 * 协商）。拿它当条件，重开时它一定是 0，这段补发就永远不触发 ——
+		 * 第一次写完实测就是这么哑的（日志里 `上次 16,94 3808x2050`
+		 * 和这次一模一样，却一条「补发」都没有）。
+		 *
+		 * cfg_x/y/w/h 才是「上一次真的发出去的值」，unmap 不清它 ——
+		 * 正好用它判断「X 会不会自己发 ConfigureNotify」。 */
+		bool same_as_last = view->cfg_x == x &&
+			view->cfg_y == y && view->cfg_w == cw &&
+			view->cfg_h == ch;
 		wlr_log(WLR_INFO, "x11-cfg %s: 发 %d,%d %dx%d（上次 %d,%d %dx%d，"
 			"cfg_sent=%d）",
 			vidow_view_title(view) != NULL ?
@@ -509,6 +543,43 @@ void vidow_view_set_size(struct vidow_view *view, int w, int h) {
 			view->cfg_h, view->cfg_sent);
 		wlr_xwayland_surface_configure(view->x11, (int16_t)x, (int16_t)y,
 			(uint16_t)cw, (uint16_t)ch);
+		/* 尺寸和上一轮完全相同时，X 服务器不会自己发 ConfigureNotify
+		 * （ICCCM 只在尺寸真的变了才发）。手动补一个，否则客户端一直等
+		 * 确认、不再重绘 —— 见上面 same_as_last 那段注释。 */
+		if (same_as_last) {
+			xcb_connection_t *conn = wlr_xwayland_get_xwm_connection(
+				view->server->xwayland);
+			wlr_log(WLR_INFO, "x11-cfg %s: 命中「尺寸没变」分支，"
+				"conn=%p window_id=0x%x",
+				vidow_view_title(view) != NULL ?
+					vidow_view_title(view) : "(无题)",
+				(void *)conn,
+				(unsigned)view->x11->window_id);
+			if (conn != NULL &&
+					view->x11->window_id != XCB_WINDOW_NONE) {
+				xcb_configure_notify_event_t e;
+				memset(&e, 0, sizeof(e));
+				e.response_type = XCB_CONFIGURE_NOTIFY;
+				e.event = view->x11->window_id;
+				e.window = view->x11->window_id;
+				e.x = (int16_t)x;
+				e.y = (int16_t)y;
+				e.width = (uint16_t)cw;
+				e.height = (uint16_t)ch;
+				e.border_width = 0;
+				e.above_sibling = XCB_NONE;
+				e.override_redirect = view->x11->override_redirect;
+				xcb_send_event(conn, false, view->x11->window_id,
+					XCB_EVENT_MASK_STRUCTURE_NOTIFY,
+					(const char *)&e);
+				xcb_flush(conn);
+				wlr_log(WLR_INFO, "x11-cfg %s: 尺寸没变，补发 "
+					"ConfigureNotify %d,%d %dx%d",
+					vidow_view_title(view) != NULL ?
+						vidow_view_title(view) : "(无题)",
+					x, y, cw, ch);
+			}
+		}
 		view->cfg_x = x;
 		view->cfg_y = y;
 		view->cfg_w = cw;
@@ -2424,6 +2495,7 @@ void vidow_view_render_pump(struct vidow_server *server,
 		bool want = view->mapped && !view->popup && view->output ==
 			output->wlr_output &&
 			(view->force_render || vidow_view_capture_held(view) ||
+				view->x11_want_frames > 0 ||
 				/* 小窗（S3）：被停到屏外（图标暂停出帧那条路）/ 所在屏关了
 				 * 的时候也要保活，否则游戏自己停帧，点开是一张死画面。
 				 * 下面 view_on_screen() 为真时会 continue，所以这条只在
@@ -2458,6 +2530,31 @@ void vidow_view_render_pump(struct vidow_server *server,
 		 * 所以这里加**迟滞**：连续 PUMP_HYSTERESIS 帧「看不上屏」才真的开始补，
 		 * 连续同样多帧「看得上屏」才停。抖动幅度小于这个窗口时状态不再翻转，
 		 * 真实的状态变化（切工作区 / 最小化）只晚这几帧，用户感知不到。 */
+		/* **X11 欠帧先处理**：它和「有没有画在屏上」无关。
+		 *
+		 * XWayland 要一个 frame callback 才会继续画下一帧，而回调只在
+		 * Vidow 真画完一帧时才发。重映射后的窗口交一帧空白就停住了，
+		 * 之后两边互等（实测 Steam 重开：只有 1 帧，首开 2285 帧；
+		 * 手动切一次工作区强制整屏重绘，立刻 1008 帧、画面正常）。
+		 *
+		 * 所以这里给它在屏上也照样催帧：画一帧 = 发一次 frame done =
+		 * XWayland 往前走一步。等它把内容画出来（欠帧耗尽）自然就停。 */
+		if (view->x11_want_frames > 0) {
+			if (view->x11_want_frames == 30 ||
+					view->x11_want_frames == 1) {
+				wlr_log(WLR_INFO, "x11 欠帧 %d → 催帧: %s",
+					view->x11_want_frames,
+					vidow_view_title(view) != NULL ?
+						vidow_view_title(view) : "(无题)");
+			}
+			view->x11_want_frames--;
+			if (view->x11_want_frames == 0) {
+				wlr_log(WLR_DEBUG, "x11 欠帧清空: %s",
+					vidow_view_title(view) != NULL ?
+						vidow_view_title(view) : "(无题)");
+			}
+			keep_going = true;
+		}
 		if (view_on_screen(server, output, view)) {
 			view->pump_hidden_frames = 0;
 			if (view->pump_shown_frames < PUMP_HYSTERESIS) {
@@ -6599,6 +6696,10 @@ void view_unmap(struct wl_listener *listener, void *data) {
 	 * 拖动之所以能救回来，是因为位置变了，去重条件不成立，configure 重新发
 	 * 了出去。 */
 	view->cfg_sent = false;
+	/* 记下「走的时候手里是哪一帧」。重开时如果客户端交上来的还是这同一个
+	 * buffer，说明 XWayland 根本没给它画新内容，我们画出来的必然是 unmap
+	 * 之前那一刻的残留。只做记录，不改行为。 */
+	view->buf_before_unmap = view->last_buffer;
 	vidow_portal_view_mapped(view, false);
 	if (view->focus_helper) {
 		/* 辅助窗口走了：键盘还给原来的焦点窗口。它从来没进过 server->focused，
@@ -6853,6 +6954,36 @@ static void view_commit(struct wl_listener *listener, void *data) {
 			!view->server->locked) {
 		vidow_output_schedule_frame(view->server, view->output,
 			"客户端交帧");
+		/* **X11 表面要额外多推几帧**。
+		 *
+		 * 原因是一条互相等待：XWayland 的渲染循环由 wl_surface 的
+		 * frame callback 驱动，而 frame callback 只在 Vidow 真正画完
+		 * 一帧（vidow_output_render → send_frame_done）时才发。Vidow
+		 * 又是按需渲染 —— 没有损伤就一帧都不画。
+		 *
+		 * 于是：XWayland 交了一帧（可能是窗口刚重映射时的空白帧）→
+		 * Vidow 画完、发 frame done → 之后没有损伤，Vidow 停手 →
+		 * frame done 断流 → XWayland 再也不画 → 画面永久冻结在那一帧
+		 * 空图上。实测 Steam 第二次开主窗口就是这样：重开后
+		 * x11-probe 只出现 **1 次**（首开 2285 次），纹理 3808x2050
+		 * 但内容全 0（首开是 0xff332211）。
+		 *
+		 * 手动切一下工作区（强制整屏重绘）画面立刻正常 —— 正好证明
+		 * 「只要再发一次 frame done，XWayland 就会继续画」。
+		 *
+		 * 所以这里给 X11 表面多要几帧：每次 commit 再推 3 帧，把
+		 * XWayland 从「等回调」里拽出来。Wayland 客户端不需要这个
+		 * （它们的渲染节奏由自己的帧循环决定），只对 X11 做。 */
+		if (view->x11 != NULL) {
+			/* 记一笔「欠帧」，交给补帧闹钟推（见下面 want 的判定）。
+			 * 只在 commit 里记一次不够 —— 重开时 XWayland 就交这
+			 * 一帧，之后全靠闹钟把它拽出来。 */
+			if (view->x11_want_frames < 30) {
+				view->x11_want_frames = 30;
+			}
+			vidow_output_schedule_frame(view->server, view->output,
+				"X11 表面续帧");
+		}
 	}
 	/* X11 弹出物：内容换了（圆角 / 自带阴影的 alpha 可能跟着变），背后那张
 	 * 模糊按新 mask 重烘一遍。 */
@@ -6972,10 +7103,12 @@ static void view_commit(struct wl_listener *listener, void *data) {
 			struct timespec ts;
 			clock_gettime(CLOCK_MONOTONIC, &ts);
 			double now = (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+			/* 这一帧的纹理里到底是什么颜色？X 侧有画面、我们画出来
+			 * 全黑，那就得看手上这份数据本身。直接读像素，不猜。 */
 			if (now - view->buf_trace_at >= 2.0) {
 				view->buf_trace_at = now;
 				wlr_log(WLR_INFO, "x11-buf %s: src=%p last=%p %dx%d "
-					"mapped=%d col=%p tree=%p",
+					"mapped=%d col=%p tree=%p 与关闭前同一帧=%d",
 					vidow_view_title(view) != NULL ?
 						vidow_view_title(view) : "(无题)",
 					(void *)client->source, (void *)view->last_buffer,
@@ -6984,7 +7117,10 @@ static void view_commit(struct wl_listener *listener, void *data) {
 					vidow_view_surface(view) != NULL ?
 						vidow_view_surface(view)->current.height : -1,
 					view->mapped, (void *)view->column,
-					(void *)view->scene_tree);
+					(void *)view->scene_tree,
+					(int)(view->buf_before_unmap != NULL &&
+						view->buf_before_unmap ==
+							client->source));
 				/* 颜色格式：Steam 主窗口是 Depth 32（带 alpha）。
 				 * `import -window` 从 X 侧抓到的是有内容的，`grim` 抓到的
 				 * 却是纯黑/纯白 —— 差别只可能在「我们怎么解释这个 buffer」。
@@ -7797,6 +7933,38 @@ static void x11_attach_surface(struct vidow_view *view) {
 	view->x11_map_replayed = false;
 	xwm_surface_sync(view);
 
+	/* 重开时那个 buffer 里到底是什么颜色？
+	 *
+	 * 已经确认的事实：X 侧有完整画面（import -window 抓得到），而我们手上
+	 * 这一帧被画成了纯黑，且它不是 unmap 之前那个 buffer 指针。剩下的唯一
+	 * 可能就是这个 buffer 本身是空的 —— 那么问题在 XWayland 交上来的内容，
+	 * 不在我们怎么解释它。直接读像素，别再猜。 */
+	if (view->x11->surface->buffer != NULL && server->renderer != NULL) {
+		struct wlr_texture *tex =
+			wlr_surface_get_texture(view->x11->surface);
+		if (tex != NULL) {
+			uint32_t px[3 * 4] = {0};
+			int tw = (int)tex->width, th = (int)tex->height;
+			int sx = tw / 4, sy = th / 4;
+			struct wlr_texture_read_pixels_options opt = {
+				.data = px,
+				.stride = 4 * sizeof(uint32_t),
+				.src_box = {.x = sx, .y = sy, .width = 3, .height = 1},
+				.format = WL_SHM_FORMAT_ARGB8888,
+			};
+			if (wlr_texture_read_pixels(tex, &opt)) {
+				wlr_log(WLR_INFO, "x11-tex %s: 纹理 %dx%d 采样 %08x %08x %08x",
+					vidow_view_title(view) != NULL ?
+						vidow_view_title(view) : "(无题)",
+					tw, th, px[0], px[1], px[2]);
+			} else {
+				wlr_log(WLR_INFO, "x11-tex %s: 读像素失败",
+					vidow_view_title(view) != NULL ?
+						vidow_view_title(view) : "(无题)");
+			}
+		}
+	}
+
 	/* Xwayland can associate an already-painted surface after its last commit.
 	 * wlr_scene_surface_create() installs the commit listener, but there may be
 	 * no new commit after this association. The current client buffer must be
@@ -8196,6 +8364,11 @@ static void x11_destroy_view(struct wl_listener *listener, void *data) {
 		view->last_app_id[0] != '\0' ? view->last_app_id :
 			vidow_view_app_id(view));
 
+	/* 尺寸抖动那个闹钟：view 要没了，先撤掉，否则回调拿到野指针。 */
+	if (view->x11_rebuild_timer != NULL) {
+		wl_event_source_remove(view->x11_rebuild_timer);
+		view->x11_rebuild_timer = NULL;
+	}
 	wl_list_remove(&view->x11_associate.link);
 	wl_list_remove(&view->x11_dissociate.link);
 	wl_list_remove(&view->x11_map_request.link);

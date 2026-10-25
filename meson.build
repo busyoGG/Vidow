@@ -142,6 +142,7 @@ sources = files(
   'src/outputconf.c',
   'src/view.c',
   'src/xwm.c',
+  'src/x11.c',
   'src/xwmscale.c',
   'src/input.c',
   'src/cursorfx.c',
