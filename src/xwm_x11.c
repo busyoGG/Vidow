@@ -597,6 +597,11 @@ static void x11_handle_map_request(xcb_map_request_event_t *e) {
 
 static void x11_handle_map_notify(xcb_map_notify_event_t *e) {
 	struct vidow_x11_surface *s = surface_for_window(e->window);
+	if (getenv("VIDOW_X11_TRACE") != NULL) {
+		wlr_log(WLR_INFO, "x11-trace: MapNotify xid=0x%x %s surface=%p",
+			e->window, s != NULL ? "" : "**未知窗口**",
+			s != NULL ? (void *)s->surface : NULL);
+	}
 	if (s == NULL) {
 		return;
 	}
@@ -614,6 +619,11 @@ static void x11_handle_map_notify(xcb_map_notify_event_t *e) {
 
 static void x11_handle_unmap_notify(xcb_unmap_notify_event_t *e) {
 	struct vidow_x11_surface *s = surface_for_window(e->window);
+	if (getenv("VIDOW_X11_TRACE") != NULL) {
+		wlr_log(WLR_INFO, "x11-trace: UnmapNotify xid=0x%x %s surface=%p",
+			e->window, s != NULL ? "" : "**未知窗口**",
+			s != NULL ? (void *)s->surface : NULL);
+	}
 	if (s == NULL) {
 		return;
 	}

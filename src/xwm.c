@@ -45,6 +45,15 @@ enum xwm_sync_result xwm_surface_sync(struct vidow_view *view) {
 	}
 
 	bool want = xwm_surface_should_be_mapped(view);
+	if (getenv("VIDOW_X11_TRACE") != NULL) {
+		wlr_log(WLR_INFO, "sync-trace: %s xid=0x%x want=%d mapped=%d "
+			"buffer=%d surf=%p view=%p",
+			vidow_view_title(view) != NULL ?
+				vidow_view_title(view) : "(无题)",
+			view->x11->window_id, want, view->mapped,
+			wlr_surface_has_buffer(view->x11->surface),
+			(void *)view->x11->surface, (void *)view);
+	}
 	if (want == view->mapped) {
 		return XWM_SYNC_NOOP;
 	}
