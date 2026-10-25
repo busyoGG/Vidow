@@ -6275,6 +6275,8 @@ static bool x11_window_is_viewable(struct vidow_server *server,
 		const struct wlr_xwayland_surface *x);
 static void x11_replay_map_if_xmapped(struct vidow_view *view,
 		bool trust_x_viewable);
+/* 已认过账但场景节点还关着 → 重新打开（见 view_commit 里的调用点）。 */
+static void x11_remap_if_node_closed(struct vidow_view *view);
 static void view_map(struct wl_listener *listener, void *data) {
 	(void)data;
 	struct vidow_view *view = wl_container_of(listener, view, map);
@@ -6761,6 +6763,22 @@ static void view_commit(struct wl_listener *listener, void *data) {
 	 * 判据只看 wlroots 记住的 mapped：它和 commit 是同一条事件流里的状态，
 	 * 不会比客户端实际状态超前，所以不会把真正想藏起来的窗口拉出来。 */
 	x11_replay_map_if_xmapped(view, false);
+
+	/* 补漏的 **unmap → remap**：窗口已经认过账（view->mapped 为真），但场景
+	 * 节点还停在 disabled / parked —— 上面那个 x11_replay_map_if_xmapped 帮不
+	 * 上忙，它的第一条判据就是「view->mapped 为假才往下走」。
+	 *
+	 * 为什么会有这种状态：view_map() 一进门就把 view->mapped 置真，然后才去算
+	 * show / set_parked / set_enabled。Steam 每次重开主窗口都**复用同一个 X 窗
+	 * 口**（xid 0x2000041 一直不变），view 和 scene_tree 都是原来那个，于是
+	 * 它第二次 map 时 view_map() 在「view->mapped 已经为真」那行直接 return，
+	 * 节点保持上一次 unmap 时的关闭状态 —— 客户端照交帧（x11-buf 能看到），
+	 * 我们照收，就是没人把它打开。表现就是主窗口全黑、`vidowmsg windows` 里
+	 * 一切正常，手动拖一下就好（拖动走 grab → arrange，顺带把它摆出来）。
+	 *
+	 * 判据只认「节点真关着 + 客户端真有缓冲」：这两条同时成立时，窗口不可能
+	 * 是我们故意藏起来的（故意藏走的是 scene_parked，节点仍然 enabled）。 */
+	x11_remap_if_node_closed(view);
 
 	/* **排帧**。这是 X11 和 Wayland 共用的交帧入口，而 vidow 是按需渲染
 	 * （vidow_output_schedule_frame）—— 不在这里要一帧，客户端交上来的新内容
@@ -7677,6 +7695,43 @@ static void x11_replay_map_if_xmapped(struct vidow_view *view,
 	}
 	view->x11_map_replayed = true;
 	view_map(&view->map, NULL);
+}
+
+/* 已经认过账（view->mapped 为真）但场景节点还关着 → 把它打开。
+ *
+ * 这是 view_map() 幂等短路留下的死角：那函数一进门就 `if (view->mapped)
+ * return;`，而「打开节点 + 算 parked」写在它后面。X11 客户端复用同一个 X 窗口
+ * 时（Steam 重开主窗口就是这样，xid 不变），第二次 map 会在那行直接返回，
+ * 节点留着上次 unmap 时的关闭状态。客户端照常交帧，我们照常收帧，画面上却
+ * 什么都没有 —— 这就是「Steam 第二次打开主窗口黑屏」。
+ *
+ * 判据两条同时成立才动手：
+ *   1. 节点确实关着（enabled == false）。我们主动藏窗口走的是 scene_parked，
+ *      节点本身仍然 enabled，所以不会误伤。
+ *   2. 客户端确实有缓冲。没有缓冲就没什么可显示的，等下一次 commit 再说。
+ * 修的是状态，不是事件顺序 —— 跟 Hyprland 在 commitSurface 里按 texture 补
+ * map() 是同一个思路（XSurface.cpp:98）。 */
+static void x11_remap_if_node_closed(struct vidow_view *view) {
+	if (view == NULL || view->kind != VIDOW_VIEW_X11 || !view->mapped ||
+			view->popup || view->focus_helper || view->scene_tree == NULL ||
+			view->x11 == NULL || view->x11->surface == NULL) {
+		return;
+	}
+	if (view->scene_tree->node.enabled) {
+		return; /* 节点开着：正常路径，没这回事 */
+	}
+	struct wlr_surface *surface = vidow_view_surface(view);
+	if (surface == NULL || surface->current.buffer_width <= 0 ||
+			surface->current.buffer_height <= 0) {
+		return; /* 还没缓冲，没什么可显示的 */
+	}
+	wlr_log(WLR_INFO, "x11: %s 已认账但节点还关着，重新打开（重开复用同一"
+		"个 X 窗口的那条路）",
+		vidow_view_title(view) != NULL ? vidow_view_title(view) : "(无题)");
+	wlr_scene_node_set_enabled(&view->scene_tree->node, true);
+	vidow_view_set_parked(view, false);
+	vidow_backdrop_damage_view(view);
+	vidow_arrange(view->server);
 }
 
 static void x11_attach_surface(struct vidow_view *view) {
