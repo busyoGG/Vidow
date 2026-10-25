@@ -2689,6 +2689,10 @@ struct vidow_server {
 	 * 拖动时每动一下都会重摆一次，这种情况不该把整个世界代次推一遍。置位之后，
 	 * 只要有任何一个**别的**窗口报「我变了」（vidow_backdrop_damage_view）就清掉。 */
 	bool arrange_self_only;
+	/* 这一趟 arrange 不要推世界代次（gen_scene）。视口过渡每帧重摆用 ——
+	 * 每帧推一次会让模糊金字塔每帧整块重烘，主线程打满。见
+	 * viewport_anim_update() 的说明。 */
+	bool arrange_skip_world_damage;
 
 	/* 正在渲染的那个输出的物理尺寸和布局原点（物理像素），给着色器当
 	 * u_output_size / u_origin 的基准。 */

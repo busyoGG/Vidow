@@ -4100,7 +4100,20 @@ static void viewport_anim_update(void *data, double t, double linear) {
 	if (obox.width > 0 && obox.height > 0) {
 		vidow_backdrop_damage_box(a->server, &obox);
 	}
+	/* **arrange 期间把「世界变了」那笔账挂起**（见 vidow_arrange 末尾）。
+	 *
+	 * 视口过渡每帧都要重摆一遍，而 vidow_arrange() 收口时会调
+	 * vidow_backdrop_damage() → gen_scene++。gen_scene 是模糊金字塔的键
+	 * （fx.c: oslot->blur_set.gen != gen_scene - self_gen 就算过期），
+	 * 每帧 +1 = 每帧整块重烘一次模糊链（实测 1280x1280、levels=3）。
+	 * 主线程 100%，Wayland 事件不再派发，Xwayland 收不到唤醒于是不
+	 * accept 新连接 —— 表现为「X 卡住、X 应用打不开、自启动流程卡住」。
+	 *
+	 * 视口平移这件事本身由上面的 vidow_backdrop_damage_box 记了损伤，
+	 * 足够让受影响的底衬重抓，不需要再推世界代次。 */
+	a->server->arrange_skip_world_damage = true;
 	vidow_arrange(a->server);
+	a->server->arrange_skip_world_damage = false;
 }
 
 static void viewport_anim_done(void *data, bool cancelled) {
@@ -4256,13 +4269,24 @@ static void output_arrange(struct vidow_server *server,
 			target = max_viewport;
 		}
 		if (output->viewport_anim != NULL) {
-			/* 过渡正跑着：这一帧**别覆盖**视口，让它按曲线走。目标变了
-			 * 才重起一条（从当前动画值接着走，不跳回起点）。 */
-			if ((double)lround(output->viewport_anim_to) !=
-					(double)lround(target)) {
-				viewport_slide(server, output, output->viewport_x,
-					target, server->config.window_move_ms);
-			}
+			/* 过渡正跑着：这一帧**别覆盖**视口，让它按曲线走。
+			 *
+			 * ⚠️ **这里绝对不能因为 target 变了就重起动画**（以前就是
+			 * 这么写的，结果是 CPU 打满、X 新连接进不来、整个会话假死）。
+			 *
+			 * 死循环链条：window_move_easing 默认 out_back，曲线会过冲，
+			 * viewport_anim_update 把过冲值写进 viewport_x → 下一帧
+			 * focus_viewport_target 拿过冲后的 viewport 算「最小滚动」，
+			 * 过冲让 `right > target + work_width` 这类边界判断翻面 →
+			 * 算出不同的 target → 这里重启动画 → viewport_slide 里
+			 * vidow_anim_cancel + vidow_anim_start 把 start_ns 重置 →
+			 * raw 永远涨不到 1.0 → 下一帧重复。动画永远走不完，每帧
+			 * 重烘 1280x1280 的模糊链，主线程 100%，Wayland 事件不再
+			 * 派发，Xwayland 收不到唤醒于是不 accept 新连接。
+			 *
+			 * 目标只该在**动画启动那一刻**定下来；跑到一半改主意属于
+			 * 「用户又按了一次」—— 那条路走下面 viewport_want_slide
+			 * 分支（那时 anim 已经是 NULL）。 */
 			viewport = output->viewport_x;
 		} else if (target != viewport && server->config.window_move_ms > 0 &&
 				output->viewport_want_slide) {
@@ -4419,7 +4443,7 @@ void vidow_arrange(struct vidow_server *server) {
 	 * vidow_restack —— 没人站错队时它一个节点都不碰）。 */
 	vidow_restack(server, NULL);
 
-	if (!server->arrange_self_only) {
+	if (!server->arrange_self_only && !server->arrange_skip_world_damage) {
 		vidow_backdrop_damage(server, false);
 	}
 	server->arrange_self_only = false;
