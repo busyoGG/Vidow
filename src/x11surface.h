@@ -276,6 +276,9 @@ struct vidow_x11_configure_request {
 
 /* X 窗口对象 ↔ 合成器侧 view。 */
 void vidow_view_attach_x11_surface(struct vidow_view *view);
+
+/* 读一块 X11 表面纹理的采样值，判断它是不是全空。诊断用。 */
+void vidow_view_probe_x11_texture(struct vidow_view *view);
 void vidow_view_x11_gone(struct vidow_view *view);
 void vidow_view_x11_configure_request(struct vidow_view *view,
 	int x, int y, int w, int h);

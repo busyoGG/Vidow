@@ -103,6 +103,11 @@ enum xwm_sync_result xwm_surface_sync(struct vidow_view *view) {
 			view->scene_surface->surface->mapped,
 			view->x11->surface->mapped);
 	}
+	/* 表面和状态全对、屏幕还是黑的时候，唯一剩下的可能就是这个
+	 * buffer 本身是空的。直接读像素。 */
+	if (vidow_xtrace_on() && want && !surf_mapped) {
+		vidow_view_probe_x11_texture(view);
+	}
 	if (want == view->mapped && (!want || surf_mapped)) {
 		return XWM_SYNC_NOOP;
 	}

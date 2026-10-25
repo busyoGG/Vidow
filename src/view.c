@@ -8365,6 +8365,41 @@ static void x11_drop_surface(struct vidow_view *view) {
 	vidow_portal_view_mapped(view, false);
 }
 
+/* 读一块表面纹理的采样值，判断它是不是全空。诊断用。 */
+void vidow_view_probe_x11_texture(struct vidow_view *view) {
+	if (view == NULL || view->x11 == NULL || view->x11->surface == NULL ||
+			view->server == NULL || view->server->renderer == NULL) {
+		return;
+	}
+	struct wlr_surface *surf = view->x11->surface;
+	if (surf->buffer == NULL) {
+		wlr_log(WLR_INFO, "x11-tex %s: 没有 buffer",
+			vidow_view_title(view) != NULL ?
+				vidow_view_title(view) : "(无题)");
+		return;
+	}
+	struct wlr_texture *tex = wlr_surface_get_texture(surf);
+	if (tex == NULL) {
+		wlr_log(WLR_INFO, "x11-tex %s: 取不到纹理",
+			vidow_view_title(view) != NULL ?
+				vidow_view_title(view) : "(无题)");
+		return;
+	}
+	uint32_t px[3] = {0};
+	int tw = (int)tex->width, th = (int)tex->height;
+	struct wlr_texture_read_pixels_options opt = {
+		.data = px,
+		.stride = 4 * sizeof(uint32_t),
+		.src_box = {.x = tw / 4, .y = th / 4, .width = 3, .height = 1},
+		.format = WL_SHM_FORMAT_ARGB8888,
+	};
+	bool ok = wlr_texture_read_pixels(tex, &opt);
+	wlr_log(WLR_INFO, "x11-tex %s: %dx%d %s 采样 %08x %08x %08x",
+		vidow_view_title(view) != NULL ?
+			vidow_view_title(view) : "(无题)",
+		tw, th, ok ? "" : "(读失败)", px[0], px[1], px[2]);
+}
+
 void vidow_view_attach_x11_surface(struct vidow_view *view) {
 	x11_trace_view("associate", view, view->x11 != NULL ? view->x11->surface : NULL);
 	x11_attach_surface(view);
