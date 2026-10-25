@@ -960,6 +960,22 @@ bool vidow_overview_click(struct vidow_server *server, double sx, double sy) {
 	struct wlr_surface *surface = NULL;
 	double lx = 0, ly = 0;
 	struct vidow_view *hit = vidow_view_at(server, sx, sy, &surface, &lx, &ly);
+	/* 诊断：点在哪儿、命中谁、那块屏有没有摆行。排查「另一块屏上的
+	 * overview 点不动」时看这一行（VIDOW_OVDEBUG=1 才打）。 */
+	if (getenv("VIDOW_OVDEBUG") != NULL) {
+		struct wlr_output *at = wlr_output_layout_output_at(
+			server->output_layout, sx, sy);
+		struct vidow_output *atout = at != NULL ?
+			vidow_output_lookup(server, at) : NULL;
+		wlr_log(WLR_INFO, "ovclick: 点 %.0f,%.0f 屏=%s used=%d "
+			"命中=%s 主屏=%s", sx, sy,
+			at != NULL && at->name != NULL ? at->name : "?",
+			atout != NULL ? (int)atout->ov.used : -1,
+			hit != NULL && vidow_view_title(hit) != NULL ?
+				vidow_view_title(hit) : "(无)",
+			ov->output != NULL && ov->output->name != NULL ?
+				ov->output->name : "?");
+	}
 	/* **不再要求命中项在主屏上**：每块屏都进 overview、各自摆自己那份行表，
 	 * 所以点哪块屏上的窗口都该选中它。以前限死 ov->output（进来时聚焦的那块），
 	 * 别的屏上点窗口没反应（而且紧接着 vidow_overview_exit 就退了，看着像
@@ -1078,10 +1094,43 @@ void vidow_overview_scroll(struct vidow_server *server, int steps) {
 	overview_apply(server);
 }
 
+/* overview 开着的时候，`ov->output` 跟着**鼠标所在那块屏**走。
+ *
+ * 用户：「overview需要跟随鼠标聚焦，不然无法操作另一个显示器的overview」。
+ *
+ * ov->output 进来时记的是 server->focused_output（那一刻人待的屏），之后原本
+ * 一直不变。它被 overview_scale() 用来报「代表值」，也是滚轮 / 点击的兜底
+ * 目标 —— 鼠标挪到另一块屏上以后，兜底还指着进来时那块，于是那块屏上的操作
+ * 看着像「没反应」。
+ *
+ * 现在每帧对一次账：鼠标压在哪块屏（且那块屏确实摆了行）就把它记成主屏。
+ * 只改这一个字段，不动 server->focused_output —— 那个是窗口焦点归属，由
+ * input.c 的指针路径自己维护，overview 里窗口是缩着的，不该抢它。 */
+static void overview_track_pointer(struct vidow_server *server) {
+	struct vidow_overview *ov = &server->overview;
+	if (server->cursor == NULL) {
+		return;
+	}
+	struct wlr_output *at = wlr_output_layout_output_at(
+		server->output_layout, server->cursor->x, server->cursor->y);
+	if (at == NULL) {
+		return;
+	}
+	struct vidow_output *out = vidow_output_lookup(server, at);
+	if (out == NULL || !out->ov.used) {
+		return;
+	}
+	if (ov->output == at) {
+		return;
+	}
+	ov->output = at;
+}
+
 void vidow_overview_update(struct vidow_server *server) {
 	if (!vidow_overview_active(server)) {
 		return;
 	}
+	overview_track_pointer(server);
 	overview_apply(server);
 }
 
