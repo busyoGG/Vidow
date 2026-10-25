@@ -4161,6 +4161,22 @@ static void viewport_anim_done(void *data, bool cancelled) {
 			vidow_arrange(a->server);
 		}
 		a->output->viewport_anim = NULL;
+		/* **兑现动画期间欠下的那一次。**
+		 *
+		 * 上面那次 arrange 必须在 anim 还挂着的时候跑（见注释：结束帧
+		 * 位置仍归视口管，否则每个窗口都会多起一条 480ms 位移补间）。
+		 * 而欠账要等 anim 摘掉才可能起新过渡 —— 于是摘完再 arrange
+		 * 一次：这时 anim == NULL、want_slide 为真，Pass 2 走
+		 * viewport_slide() 滚到最新焦点列。
+		 *
+		 * 连按 Mod+L 三次就是靠这条补上的：第一次滚到中途，第二、三次的
+		 * 请求先记在 viewport_slide_pending，第一次滚完立刻接着滚到
+		 * 最后那个目标，而不是一口气不滚。 */
+		if (!cancelled && a->output->viewport_slide_pending) {
+			a->output->viewport_slide_pending = false;
+			a->output->viewport_want_slide = true;
+			vidow_arrange(a->server);
+		}
 	}
 	free(a);
 }
@@ -4171,6 +4187,8 @@ static void viewport_slide(struct vidow_server *server,
 	if (output == NULL) {
 		return;
 	}
+	/* 这条过渡本身就是来兑现焦点切换的，之前记的欠账到此作废。 */
+	output->viewport_slide_pending = false;
 	if (output->viewport_anim != NULL) {
 		vidow_anim_cancel(output->viewport_anim);
 		output->viewport_anim = NULL;
@@ -4334,6 +4352,19 @@ static void output_arrange(struct vidow_server *server,
 			 * 摘掉、want_slide 还是 true，于是**又起一条**视口过渡，滚完再
 			 * 起下一条…… 一次聚焦被拆成一串动画，每滚一段回弹一次（用户
 			 * 2026-10-25：「现在不是一次滚到目标，是每滚到一个窗口回弹一次」）。 */
+			/* **动画期间又来了「换焦点列」：记一笔欠账，别丢。**
+			 *
+			 * 用户 2026-10-26：「现在窗口聚焦不能一口气移动到目标窗口了」。
+			 * 连按 Mod+L 实测（间隔 100ms 三次）：
+			 *     第1次 焦点切换 + tween 2862 -> 1908
+			 *     第2次 焦点切换，无 tween
+			 *     第3次 焦点切换，无 tween
+			 * 焦点跑屏幕外去了。原因就是这个分支以前把 want_slide 一言
+			 * 不发地清掉，新请求连痕都不留 —— 动画结束时标志已经是假，
+			 * 视口不再滚。 */
+			if (output->viewport_want_slide) {
+				output->viewport_slide_pending = true;
+			}
 			output->viewport_want_slide = false;
 			viewport = output->viewport_x;
 		} else if (target != viewport && server->config.window_move_ms > 0 &&
