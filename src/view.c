@@ -3777,23 +3777,6 @@ void vidow_place_view(struct vidow_view *view, int x, int y, int w, int h) {
 		return;
 	}
 
-	/* 目标位置没变：这一趟布局没打算动它。
-	 *
-	 * **手里要是正跑着一个位移补间，那个补间就是朝这个位置跑的 —— 别掐它。**
-	 * 以前这里不分青红皂白 cancel + anim_off = 0：而同一帧里 arrange 会跑好几
-	 * 遍（关一个窗口那条路实测 3 遍：unmap 一次、摘列一次、换焦点一次），第二
-	 * 遍就把上一遍刚起的补间清掉、偏移归零 —— 窗口当场落到终点，看起来就是
-	 * 「关窗的时候隔壁那块瞬移」（用户报「窗口关闭的时候移动动画不够自然，好像
-	 * 有点瞬移」）。没有补间在跑时照旧把残留偏移清掉（保持原来的语义）。 */
-	if (!moved) {
-		if (view->anim_move == NULL) {
-			view->anim_off_x = 0.0;
-			view->anim_off_y = 0.0;
-		}
-		vidow_view_apply_anim(view);
-		return;
-	}
-
 	/* 列宽过渡正跑着：这一帧它右边那些列的位置变化**是过渡本身推出来的** ——
 	 * 每帧重起一次位移补间的话它们会一直吊在过渡后面（补间刚走 5%，下一帧又
 	 * 从那儿重新起一条 190ms 的），过渡结束后再自己飘到位，看着就是「隔壁那
@@ -3861,6 +3844,36 @@ void vidow_place_view(struct vidow_view *view, int x, int y, int w, int h) {
 		view->anim_move = NULL;
 		view->anim_off_x = 0.0;
 		view->anim_off_y = 0.0;
+		vidow_view_apply_anim(view);
+		return;
+	}
+
+	/* 目标位置没变：这一趟布局没打算动它。
+	 *
+	 * **手里要是正跑着一个位移补间，那个补间就是朝这个位置跑的 —— 别掐它。**
+	 * 以前这里不分青红皂白 cancel + anim_off = 0：而同一帧里 arrange 会跑好几
+	 * 遍（关一个窗口那条路实测 3 遍：unmap 一次、摘列一次、换焦点一次），第二
+	 * 遍就把上一遍刚起的补间清掉、偏移归零 —— 窗口当场落到终点，看起来就是
+	 * 「关窗的时候隔壁那块瞬移」（用户报「窗口关闭的时候移动动画不够自然，好像
+	 * 有点瞬移」）。没有补间在跑时照旧把残留偏移清掉（保持原来的语义）。
+	 *
+	 * ⚠️ **必须放在 viewport_sliding 那条之后**（da69176 把它放前面，回弹就
+	 * 只在一部分窗口上出现）。
+	 *
+	 * 视口过渡期间这个函数是每帧、对每个窗口都调一遍的。视口每帧挪一点，但
+	 * 有些窗口的 geom 恰好一帧都没变（它本来就在条带上的正确位置，或者这一帧
+	 * 视口的位移被取整吃掉了）—— 那些窗口走到这条早退，**保留**手里的
+	 * anim_move，于是它的 anim_off 和视口的过冲叠加在一起；而走了上面
+	 * viewport_sliding 分支的窗口 anim_off 是 0，只有视口的过冲。两拨窗口
+	 * 走的不是同一条曲线，观感就是「头尾几个有回弹、中间几个直接停住」
+	 * （用户 2026-10-25：「回弹只有头尾有，中间几个窗口没有」）。
+	 *
+	 * 视口在动的时候，位置归视口管，这里一律早退、什么都不碰。 */
+	if (!moved) {
+		if (view->anim_move == NULL) {
+			view->anim_off_x = 0.0;
+			view->anim_off_y = 0.0;
+		}
 		vidow_view_apply_anim(view);
 		return;
 	}
@@ -4088,17 +4101,23 @@ static void viewport_anim_update(void *data, double t, double linear) {
 	a->output->viewport_x = v;
 	/* **整块屏记一笔损伤就够，不要每个窗口各记一笔。**
 	 *
-	 * 底衬损伤会经 blur_note_damage() 分发给所有 layer surface（noctalia
-	 * 的 panel / notification）。视口过渡一帧要摆几十个窗口，每个都记一笔
-	 * 就是每帧几十笔 × 每个 layer —— panel 的模糊底衬永远追不上，越堆越多
-	 * 最后卡死（用户：「layer 动画会卡，而且会死掉（noctalia」）。
+	 * 整条带子在横向平移，受影响的本来就是一整块屏 —— 一帧记一笔，而不是
+	 * 每个窗口各记一笔（那会经 blur_note_damage 分发给所有 layer surface，
+	 * 每帧几十笔 × 每个 layer，panel 的模糊底衬永远追不上，最后卡死。用户：
+	 * 「layer 动画会卡，而且会死掉（noctalia」）。
 	 *
-	 * 整条带子在横向平移，受影响的本来就是一整块屏。 */
+	 * 但**不能记给 layer surface**：layer 不跟着视口走，它们的位置和底衬
+	 * 一点没变。以前这里用的是 vidow_backdrop_damage_box()（会记给 layer），
+	 * 而 5b7d441 为了躲开上面那个卡死，干脆连窗口的损伤也一起不记了 —— 于是
+	 * 窗口横移之后上一帧画在隔壁屏上的那一块没人擦，别的窗口底衬里留着它的
+	 * 残影（用户：「窗口聚焦移动的时候也会漏一点内容到隔壁显示器」）。
+	 *
+	 * 正解是分开：记给窗口（别人的底衬里画着它，必须重抓），不记给 layer。 */
 	struct wlr_box obox = {0};
 	wlr_output_layout_get_box(a->server->output_layout,
 		a->output->wlr_output, &obox);
 	if (obox.width > 0 && obox.height > 0) {
-		vidow_backdrop_damage_box(a->server, &obox);
+		vidow_backdrop_damage_box_views_only(a->server, &obox);
 	}
 	/* **arrange 期间把「世界变了」那笔账挂起**（见 vidow_arrange 末尾）。
 	 *

@@ -3535,6 +3535,11 @@ void vidow_backdrop_damage(struct vidow_server *server, bool layers);
 void vidow_backdrop_damage_output(struct vidow_output *output);
 /* 只记一笔损伤区域（布局逻辑坐标，同 pending_damage 的说明），不动世界代次 ——
  * 给「窗口挪走之后，老位置也得让别人的底衬重抓」这种一个事件两处损伤用。 */
+/* 同上，但**只记给窗口，不记给 layer surface**。视口过渡每帧平移整条带子
+ * 时用：窗口得重抓（别人的底衬里画着它），layer 不跟着视口走、不用管 ——
+ * 一并记给 layer 会把 noctalia 的模糊底衬压垮。 */
+void vidow_backdrop_damage_box_views_only(struct vidow_server *server,
+		const struct wlr_box *box);
 void vidow_backdrop_damage_box(struct vidow_server *server,
 		const struct wlr_box *box);
 /* 窗口「现在画在哪」：布局几何 + 动画偏移（拖拽 / 开合 / overview 都算在这上面）。 */

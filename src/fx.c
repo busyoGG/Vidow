@@ -1614,6 +1614,32 @@ void vidow_backdrop_damage_box(struct vidow_server *server,
 	blur_note_damage(server, box, NULL);
 }
 
+/* 只记给**窗口**的底衬，不记给 layer surface。
+ *
+ * 视口过渡每帧平移整条带子，每个窗口都要报「我换位置了」—— 别的窗口的底衬里
+ * 画着它，得重抓，这必须记。但 layer surface（noctalia 的 panel / 通知）**不
+ * 跟着视口走**，它们的位置和底衬一点没变；以前一并记给它们，每帧几十笔 × 每个
+ * layer，panel 的模糊底衬永远追不上，越堆越多最后卡死（用户：「layer 动画会
+ * 卡，而且会死掉（noctalia」）。
+ *
+ * 而完全不记（5b7d441 的做法）又会漏图：窗口横移之后上一帧画在隔壁屏上的那一
+ * 块没人擦，别的窗口底衬里留着它的残影（用户：「窗口聚焦移动的时候也会漏一点
+ * 内容到隔壁显示器」）。两头都不对，所以要的是「记给窗口、不记给 layer」。 */
+void vidow_backdrop_damage_box_views_only(struct vidow_server *server,
+		const struct wlr_box *box) {
+	if (box == NULL || box->width <= 0 || box->height <= 0) {
+		return;
+	}
+	struct vidow_view *view;
+	wl_list_for_each(view, &server->views, link) {
+		dmg_add(&view->fx.pending_damage, box);
+	}
+	struct vidow_popup_blur *pb;
+	wl_list_for_each(pb, &server->popup_blurs, link) {
+		dmg_add(&pb->fx.pending_damage, box);
+	}
+}
+
 /* 私有底衬要不要因为这次损伤重抓：损伤盒子空 = 没损伤（不用）；否则看它跟
  * 「这张底衬管得着的那块区域」（布局逻辑坐标）碰不碰得到。区域本身已经把模糊
  * 半径算进去了（见 view_region_rect），所以碰到区域就是碰到能影响它的内容。 */
