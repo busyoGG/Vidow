@@ -490,8 +490,22 @@ void vidow_view_set_size(struct vidow_view *view, int w, int h) {
 		int x = (int)lround(nx), y = (int)lround(ny);
 		if (view->cfg_sent && view->cfg_x == x && view->cfg_y == y &&
 				view->cfg_w == cw && view->cfg_h == ch) {
+			/* 这里以前一言不发地 return，害得我把「日志里没有 x11-cfg」
+			 * 读成「configure 没发」—— 其实这条日志压根不存在，首开正常
+			 * 时也是 0 条。排「Steam 重开黑屏」两种结局都得看得见。 */
+			wlr_log(WLR_INFO, "x11-cfg %s: 跳过 %d,%d %dx%d"
+				"（和上次一模一样）",
+				vidow_view_title(view) != NULL ?
+					vidow_view_title(view) : "(无题)",
+				x, y, cw, ch);
 			return; /* 位置尺寸一个都没变：别让客户端白重画一帧 */
 		}
+		wlr_log(WLR_INFO, "x11-cfg %s: 发 %d,%d %dx%d（上次 %d,%d %dx%d，"
+			"cfg_sent=%d）",
+			vidow_view_title(view) != NULL ?
+				vidow_view_title(view) : "(无题)",
+			x, y, cw, ch, view->cfg_x, view->cfg_y, view->cfg_w,
+			view->cfg_h, view->cfg_sent);
 		wlr_xwayland_surface_configure(view->x11, (int16_t)x, (int16_t)y,
 			(uint16_t)cw, (uint16_t)ch);
 		view->cfg_x = x;
@@ -757,6 +771,64 @@ void vidow_view_x11_scale(struct vidow_view *view) {
 	struct wlr_scene_buffer *node = view->scene_surface->buffer;
 	bool changed = node->dst_width != dst_w || node->dst_height != dst_h;
 	wlr_scene_buffer_set_dest_size(node, dst_w, dst_h);
+	/* X11 Depth 32 窗口的 alpha 该不该当真，按 EWMH 的老规矩判：
+	 *
+	 *   1. 设了 _NET_WM_WINDOW_OPACITY（< 1.0）→ 用 alpha（wlroots 已经把
+	 *      这个属性解析进 x11->opacity 了，不用自己开 XCB 连接）；
+	 *   2. 窗口类型天然带透明（工具提示、下拉、菜单、通知、DND……）→ 用 alpha；
+	 *   3. 其余（普通窗口）→ **忽略 alpha，整块当不透明**。
+	 *
+	 * 第 3 条不是优化，是必须的：XWayland 给 Depth 32 窗口交的是 ARGB8888
+	 * （x11-fmt 里 fmt=0x34325241），而它的 alpha 填 0 —— 按预乘采样一遍就
+	 * 是 `RGB × 0 = 纯黑`。Steam 重开主窗口正好踩中：首开交 XR24
+	 * （fmt=0x34325258）画得好好的，重开换成 AR24 就全黑，而 `import -window`
+	 * 从 X 侧抓出来是有内容的（24 位 RGB），所以内容一直都在，是我们解释错
+	 * 了缓冲区。普通窗口本来就没有透明通道可言，X 那边的合成结果已经拍平了。 */
+	bool use_alpha = view->x11 != NULL && view->x11->opacity < 1.0f;
+	static const enum wlr_xwayland_net_wm_window_type translucent_types[] = {
+		WLR_XWAYLAND_NET_WM_WINDOW_TYPE_TOOLTIP,
+		WLR_XWAYLAND_NET_WM_WINDOW_TYPE_DROPDOWN_MENU,
+		WLR_XWAYLAND_NET_WM_WINDOW_TYPE_POPUP_MENU,
+		WLR_XWAYLAND_NET_WM_WINDOW_TYPE_COMBO,
+		WLR_XWAYLAND_NET_WM_WINDOW_TYPE_DND,
+		WLR_XWAYLAND_NET_WM_WINDOW_TYPE_NOTIFICATION,
+		WLR_XWAYLAND_NET_WM_WINDOW_TYPE_SPLASH,
+	};
+	if (!use_alpha && view->x11 != NULL) {
+		for (size_t i = 0;
+				i < sizeof(translucent_types) /
+					sizeof(translucent_types[0]); i++) {
+			if (wlr_xwayland_surface_has_window_type(view->x11,
+					translucent_types[i])) {
+				use_alpha = true;
+				break;
+			}
+		}
+	}
+	/* 只在判定结果变了的时候动节点：每帧重设一遍会让场景白白重烘。
+	 * 记在 view->x11_alpha_on / x11_opacity 里，两个值都没变就跳过。 */
+	float want_opacity = use_alpha && view->x11 != NULL &&
+		view->x11->opacity < 1.0f ? view->x11->opacity : 1.0f;
+	if (!view->x11_alpha_known || view->x11_alpha_on != use_alpha ||
+			view->x11_opacity != want_opacity) {
+		view->x11_alpha_known = true;
+		view->x11_alpha_on = use_alpha;
+		view->x11_opacity = want_opacity;
+		if (!use_alpha) {
+			pixman_region32_t opaque;
+			pixman_region32_init_rect(&opaque, 0, 0, dst_w, dst_h);
+			wlr_scene_buffer_set_opaque_region(node, &opaque);
+			pixman_region32_fini(&opaque);
+		} else {
+			/* 用 alpha 的窗口必须清掉那条「整块不透明」的账，否则换了
+			 * 类型 / opacity 之后还按旧账画。 */
+			pixman_region32_t empty;
+			pixman_region32_init(&empty);
+			wlr_scene_buffer_set_opaque_region(node, &empty);
+			pixman_region32_fini(&empty);
+		}
+		wlr_scene_buffer_set_opacity(node, want_opacity);
+	}
 	/* This is a preferred-scale hint only, not a promise that Xwayland will
 	 * change buffer_scale. Display geometry and input use actual committed
 	 * dimensions above; never rely on this hint to repair coordinate spaces. */
@@ -6919,6 +6991,38 @@ static void view_commit(struct wl_listener *listener, void *data) {
 						vidow_view_surface(view)->current.height : -1,
 					view->mapped, (void *)view->column,
 					(void *)view->scene_tree);
+				/* 颜色格式：Steam 主窗口是 Depth 32（带 alpha）。
+				 * `import -window` 从 X 侧抓到的是有内容的，`grim` 抓到的
+				 * 却是纯黑/纯白 —— 差别只可能在「我们怎么解释这个 buffer」。
+				 * 打 format / premultiplied / 缓冲区实际尺寸，看两种状态是否
+				 * 不一样。 */
+				if (vidow_view_surface(view) != NULL) {
+					struct wlr_surface_state *st =
+						&vidow_view_surface(view)->current;
+					uint32_t fmt = 0, mhi = 0, mlo = 0;
+					bool dmabuf = false;
+					struct wlr_dmabuf_attributes attribs = {0};
+					if (st->buffer != NULL &&
+							wlr_buffer_get_dmabuf(st->buffer,
+								&attribs)) {
+						dmabuf = true;
+						fmt = attribs.format;
+						mhi = (uint32_t)(attribs.modifier >> 32);
+						mlo = (uint32_t)(attribs.modifier
+							& 0xffffffffu);
+					}
+					wlr_log(WLR_INFO, "x11-fmt %s: dmabuf=%d "
+						"fmt=0x%x mod=0x%x%08x buf=%dx%d "
+						"scale=%d transform=%d",
+						vidow_view_title(view) != NULL ?
+							vidow_view_title(view) : "(无题)",
+						(int)dmabuf, fmt, mhi, mlo,
+						st->buffer != NULL ?
+							st->buffer->width : -1,
+						st->buffer != NULL ?
+							st->buffer->height : -1,
+						(int)st->scale, (int)st->transform);
+				}
 			}
 		}
 		if (client != NULL && client->source != NULL &&

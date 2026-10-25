@@ -1727,6 +1727,13 @@ struct vidow_view {
 	/* 排错用：上一次打 X11 换帧日志的时间。60Hz 的窗口一帧一行会把日志
 	 * 刷爆，所以同一条最多两秒一行（见 view_commit 的 X11 分支）。 */
 	double buf_trace_at;
+	/* X11 Depth 32 窗口的 alpha 判定结果（见 vidow_view_x11_scale）。
+	 * x11_alpha_known = 还没判过；x11_alpha_on = 这个窗口用 alpha 通道
+	 * （而不是整块当不透明）；x11_opacity = 记到节点上的整体不透明度。
+	 * 三个一起比，判定没变就不动场景节点 —— 这个函数每帧 commit 都会走。 */
+	bool x11_alpha_known;
+	bool x11_alpha_on;
+	float x11_opacity;
 	/* 拖动时的果冻形变（见 jelly.c）：非空就是「现在正弯着」——窗口本来的
 	 * 装饰节点让位，由它显示。松手后它自己晃回去再消失。 */
 	struct vidow_jelly *jelly;
