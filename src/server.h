@@ -4440,4 +4440,15 @@ void vidow_portal_env_restore(void);
  * 是用户管理器里的合成器，不导入的话对话框会画到别的桌面上）。 */
 void vidow_portal_conf_sync(const struct vidow_config *cfg);
 
+/* ---------------------------------------------------------------- 退出来源 */
+
+/* 把「这一次会话是怎么结束的」写进 $XDG_STATE_HOME/vidow/exit.log。
+ *
+ * 三条退出入口（SIGTERM / 键位 quit / IPC quit）各自调一次，写清来源。起因是
+ * 「Ctrl+C 之后整个桌面没了」这种报告：SDDM 把会话 stderr 丢进 /dev/null，
+ * journalctl 里一个字都查不到，只能靠猜是哪条路径。
+ *
+ * 没有初始化或写失败时是空操作 —— 记日志不能影响退出本身。 */
+void vidow_exit_log(const char *source, const char *detail);
+
 #endif /* VIDOW_SERVER_H */

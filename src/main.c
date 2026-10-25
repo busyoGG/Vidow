@@ -11,6 +11,10 @@
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
+#include <time.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 
 #include <wayland-server-core.h>
 #include <wlr/types/wlr_linux_drm_syncobj_v1.h>
@@ -107,10 +111,96 @@ static int vidow_gsettings_int(const char *key) {
 /* 退出必须能分辨是谁干的：合成器被「按错一个键」带走时，用户看到的只是桌面
  * 没了，日志里那句含糊的「收到退出信号」帮不上任何忙。三条退出入口
  * （SIGTERM / 键位 quit / IPC quit）各自把来源写清楚。 */
+/* 「退出」这件事必须留痕。
+ *
+ * 起因：报告「Ctrl+C 之后整个桌面没了」时，SDDM 把会话的 stderr 丢进 /dev/null，
+ * journalctl _COMM=vidow 是空的 —— 合成器到底是被信号、被键位、还是被 IPC quit
+ * 带走的，一点痕迹都没有，只能靠猜。这里在没设 VIDOW_LOG_FILE 时把退出原因写进
+ * $XDG_STATE_HOME/vidow/exit.log（默认 ~/.local/state/vidow/exit.log）。
+ *
+ * 只写退出路径，日常使用不会刷屏；注销 / 重启之后上一次会话的死因还在。 */
+static int exit_log_fd = -1;
+
+/* mkdir -p 的最小版本：逐级建，已存在的跳过。只给退出日志这一处用。 */
+static int mkdir_p(const char *dir) {
+	char tmp[PATH_MAX];
+	size_t len = strlen(dir);
+	if (len == 0 || len >= sizeof(tmp)) {
+		return -1;
+	}
+	memcpy(tmp, dir, len + 1);
+	for (char *p = tmp + 1; *p != '\0'; p++) {
+		if (*p != '/') {
+			continue;
+		}
+		*p = '\0';
+		if (mkdir(tmp, 0755) != 0 && errno != EEXIST) {
+			return -1;
+		}
+		*p = '/';
+	}
+	if (mkdir(tmp, 0755) != 0 && errno != EEXIST) {
+		return -1;
+	}
+	return 0;
+}
+
+static void vidow_exit_log_init(void) {
+	const char *state = getenv("XDG_STATE_HOME");
+	char dir[PATH_MAX];
+	char path[PATH_MAX];
+
+	if (state != NULL && state[0] != '\0') {
+		snprintf(dir, sizeof(dir), "%s/vidow", state);
+	} else {
+		const char *home = getenv("HOME");
+		if (home == NULL || home[0] == '\0') {
+			return;
+		}
+		snprintf(dir, sizeof(dir), "%s/.local/state/vidow", home);
+	}
+	/* 目录可能还不存在（新装的会话 / 换过 XDG_STATE_HOME）。递归建一层就够：
+	 * 只有 ~/.local/state/vidow 这个尾部是我们自己的。 */
+	if (mkdir_p(dir) != 0) {
+		return;
+	}
+	snprintf(path, sizeof(path), "%s/exit.log", dir);
+	exit_log_fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+}
+
+/* 退出原因写一行：时间 + pid + 来源 + 说明。写不进去就算了，别把退出本身弄坏。 */
+void vidow_exit_log(const char *source, const char *detail) {
+	if (exit_log_fd < 0) {
+		return;
+	}
+	char line[512];
+	char stamp[64] = "?";
+	time_t now = time(NULL);
+	struct tm tm;
+	if (localtime_r(&now, &tm) != NULL) {
+		strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", &tm);
+	}
+	int n;
+	if (detail != NULL && detail[0] != '\0') {
+		n = snprintf(line, sizeof(line), "%s pid=%d 退出: %s（%s）\n",
+			stamp, (int)getpid(), source, detail);
+	} else {
+		n = snprintf(line, sizeof(line), "%s pid=%d 退出: %s\n",
+			stamp, (int)getpid(), source);
+	}
+	if (n > 0) {
+		size_t len = (size_t)n < sizeof(line) ? (size_t)n : sizeof(line) - 1;
+		ssize_t ignored = write(exit_log_fd, line, len);
+		(void)ignored;
+	}
+}
+
 static int terminate_signal(int signo, void *data) {
 	struct vidow_server *server = data;
-	wlr_log(WLR_INFO, "退出: 收到 SIG%d（%s），开始收尾", signo,
-		signo == SIGTERM ? "pkill / systemctl stop / 会话结束" : "其他信号");
+	const char *detail = signo == SIGTERM
+		? "pkill / systemctl stop / 会话结束" : "其他信号";
+	vidow_exit_log("收到信号", detail);
+	wlr_log(WLR_INFO, "退出: 收到 SIG%d（%s），开始收尾", signo, detail);
 	wl_display_terminate(server->display);
 	return 0;
 }
@@ -627,6 +717,8 @@ int main(int argc, char *argv[]) {
 			dup2(fileno(lf), STDOUT_FILENO);
 			setvbuf(lf, NULL, _IOLBF, 0);
 		}
+	} else {
+		vidow_exit_log_init();
 	}
 	wlr_log_init(log_level_from_env(), NULL);
 
