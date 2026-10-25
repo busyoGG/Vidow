@@ -2962,15 +2962,17 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 		 * 那块属于显示器、不属于工作区，应该照常显示。
 		 *
 		 * 屏框是布局坐标里的真值，直接问 output_layout。 */
-		struct vidow_overview *ov = &fx->view->server->overview;
-		if (ov->output != NULL) {
-			struct wlr_box full = {0};
+		/* 用**窗口自己所在那块屏**的框（每块屏都进 overview，各自裁自己
+		 * 那块屏的范围）。以前固定用 overview.output，别的屏上的窗口被裁到
+		 * 主屏矩形里。 */
+		struct wlr_box full = {0};
+		if (fx->view->output != NULL) {
 			wlr_output_layout_get_box(fx->view->server->output_layout,
-				ov->output, &full);
-			if (full.width > 0 && full.height > 0) {
-				ov_clip_box = full;
-				ov_clip = true;
-			}
+				fx->view->output, &full);
+		}
+		if (full.width > 0 && full.height > 0) {
+			ov_clip_box = full;
+			ov_clip = true;
 		}
 	}
 	if (instance != NULL || fx->clip_on || ov_clip) {
@@ -5834,11 +5836,14 @@ void vidow_popup_blur_invalidate(struct vidow_popup_blur *pb) {
  * 还在，不至于变成一块没压过的壁纸。 */
 static void vidow_overview_blur_frame(struct vidow_server *server,
 		struct vidow_output *output) {
-	struct vidow_overview *ov = &server->overview;
+	struct vidow_overview *g = &server->overview;
+	/* **每块屏各有一份底衬**（以前是单实例、只画进 overview 时聚焦的那块屏，
+	 * 别的屏上一片空白）。 */
+	struct vidow_ov_screen *ov = &output->ov;
 	struct vidow_fx_target *fx = &ov->fx;
 
-	/* 只画 overview 锁的那块屏，而且得真在展开（t > 0）。 */
-	bool want = ov->output == output->wlr_output && ov->t > 0.002 &&
+	/* 每块屏画自己那份，而且得真在展开（t > 0）。 */
+	bool want = g->t > 0.002 &&
 		server->config.overview_blur && server->config.blur_enabled;
 	if (!want || output->blur_tex == NULL) {
 		if (fx->node != NULL) {

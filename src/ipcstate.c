@@ -1321,10 +1321,36 @@ void vidow_ipc_json_overview(struct jbuf *b, struct vidow_server *server) {
 	jb_kv_str(b, "output", server->overview.output != NULL ?
 		server->overview.output->name : NULL);
 	/* 上下排布的工作区列表：几行、一行多高、列表滚到哪儿了（以前报的是相机
-	 * 位置 + 滚轮平移，那是「一条列带 + 一个相机」的模型，已经没了）。 */
-	jb_kv_int(b, "rows", server->overview.n_rows);
-	jb_kv_double(b, "row_h", server->overview.row_h);
-	jb_kv_double(b, "list_scroll", server->overview.list_scroll);
+	 * 位置 + 滚轮平移，那是「一条列带 + 一个相机」的模型，已经没了）。
+	 *
+	 * 顶层报的是**主屏**（overview.output，进来时聚焦的那块）那一份 —— 老字段
+	 * 保持原样，测试不用改。每块屏各自那一份在下面的 screens 数组里。 */
+	struct vidow_output *main_out = server->overview.output != NULL ?
+		vidow_output_lookup(server, server->overview.output) : NULL;
+	if (main_out != NULL) {
+		jb_kv_int(b, "rows", main_out->ov.n_rows);
+		jb_kv_double(b, "row_h", main_out->ov.row_h);
+		jb_kv_double(b, "list_scroll", main_out->ov.list_scroll);
+	} else {
+		jb_kv_int(b, "rows", 0);
+		jb_kv_double(b, "row_h", 0.0);
+		jb_kv_double(b, "list_scroll", 0.0);
+	}
+	/* 每块屏一份（多显示器时每块屏各摆自己的行表）。 */
+	jb_key(b, "screens");
+	jb_arr(b);
+	struct vidow_output *out;
+	wl_list_for_each(out, &server->outputs, link) {
+		jb_obj(b);
+		jb_kv_str(b, "output", out->wlr_output->name);
+		jb_kv_bool(b, "used", out->ov.used);
+		jb_kv_int(b, "rows", out->ov.n_rows);
+		jb_kv_double(b, "row_h", out->ov.row_h);
+		jb_kv_double(b, "scale", out->ov.scale);
+		jb_kv_double(b, "list_scroll", out->ov.list_scroll);
+		jb_obj_end(b);
+	}
+	jb_arr_end(b);
 	jb_obj_end(b);
 }
 

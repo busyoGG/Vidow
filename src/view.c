@@ -2277,16 +2277,18 @@ static void view_apply_clip_impl(struct vidow_view *view) {
 		 * gap 之后的可用区）。用户要的语义：「工作区内窗口可以溢出工作区，
 		 * 但不会溢出显示器」—— 窗口探进 panel 那一条属于显示器，应该照常
 		 * 显示，拿工作区当裁剪框就把它切掉了。 */
-		struct vidow_overview *ov = &view->server->overview;
-		if (ov->output != NULL) {
-			struct wlr_box full = {0};
+		/* 用**窗口自己所在那块屏**的框。以前固定用 overview.output（进来时
+		 * 聚焦的那块），别的屏上的窗口就被裁到主屏那块矩形里 —— 越界部分全
+		 * 被切掉，看起来就是非激活显示器没内容。 */
+		struct wlr_box full = {0};
+		if (view->output != NULL) {
 			wlr_output_layout_get_box(view->server->output_layout,
-				ov->output, &full);
-			if (full.width > 0 && full.height > 0) {
-				view->fx.clip_on = true;
-				view->fx.clip = full;
-				return; /* 表面树那一份不裁：保住命中测试 */
-			}
+				view->output, &full);
+		}
+		if (full.width > 0 && full.height > 0) {
+			view->fx.clip_on = true;
+			view->fx.clip = full;
+			return; /* 表面树那一份不裁：保住命中测试 */
 		}
 	}
 	if (on != was_on) {
@@ -2773,12 +2775,16 @@ bool vidow_view_should_park(struct vidow_server *server,
 	}
 	if (!vidow_workspace_view_visible(server, view) &&
 			!view_sliding_out(server, view)) {
-		/* overview 里**这块屏上别的工作区也要画**（它们上下排成一列，见
-		 * overview.c）—— 平时「藏起来的工作区不画」，全景里得放回来，不然
-		 * 那一行是空的。最小化的照旧不画（它连列里都不占位置，摆不出坐标）；
-		 * 别的屏上的照旧停着（全景只看一块屏）。 */
-		bool in_overview = vidow_overview_active(server) &&
-			view->output == server->overview.output && !view->minimized;
+		/* overview 里**所有屏、每块屏上所有工作区都要画**（它们各自上下排成
+		 * 一列，见 overview.c）—— 平时「藏起来的工作区不画」，全景里得放回来，
+		 * 不然那一行是空的。最小化的照旧不画（它连列里都不占位置，摆不出坐标）。
+		 *
+		 * 以前这里还要求 view->output == server->overview.output（唯一那块
+		 * 「进来时聚焦的屏」），别的屏上的窗口一律停着 —— 于是非激活显示器
+		 * 上什么都看不到（用户 2026-10-25：「overview 触发的时候应该所有
+		 * 显示器都进 overview，现在虽然都进了但非激活显示器不显示内容」）。
+		 * 现在每块屏各有一份行表，所有屏上的窗口都该摊开。 */
+		bool in_overview = vidow_overview_active(server) && !view->minimized;
 		if (!in_overview) {
 			return true; /* 最小化 / 工作区被藏起来：也不画 */
 		}
@@ -2848,9 +2854,10 @@ static double view_overview_alpha(struct vidow_server *server,
 	if (server->overview.t <= 0.0 || server->overview.output == NULL) {
 		return alpha;
 	}
-	if (view->output != server->overview.output) {
-		return alpha * (1.0 - server->overview.t);
-	}
+	/* **不再按「是不是焦点屏」发暗**：所有屏一起进 overview，每块屏都摊开
+	 * 自己那份行表，所以每块屏上的窗口都该正常显示。以前非焦点屏的窗口会被
+	 * 乘上 (1 - t) 淡到全透明 —— 那正是「非激活显示器不显示内容」的成因之一
+	 * （就算把行摆过去，窗口也是透明的）。 */
 	/* overview 里**不做整体隐藏**：溢出工作区的部分由 fx.c 的 ov_clip 裁掉
 	 * （它把这块窗口裁到「这一行的矩形」，也就是屏幕上可见的那一块）。
 	 *
@@ -4341,9 +4348,9 @@ void vidow_view_output_gone(struct vidow_server *server,
 		struct vidow_output *fallback) {
 	struct wlr_output *to = fallback != NULL ? fallback->wlr_output : NULL;
 
-	/* overview 是锁着一块屏的（每帧都按那块屏的工作区算缩放和相机）：它锁的
-	 * 那块屏没了就把 overview 收掉，不然下一帧就在读已经释放的屏。先把 output
-	 * 清掉再收 —— 收的过程里那几帧走 overview_apply() 的 output == NULL 分支。 */
+	/* overview 里每块屏各有一份状态（行表 / 遮罩 / 底衬），都挂在 vidow_output
+	 * 上 —— 这块屏一拔，那份状态跟着结构体一起没了。主屏（overview.output）
+	 * 没了就把整个 overview 收掉，不然下一帧在读已经释放的屏。 */
 	if (server->overview.output == dead) {
 		server->overview.output = NULL;
 		vidow_overview_exit(server);

@@ -1194,32 +1194,46 @@ struct vidow_ov_row {
  *     「不压暗」时它跟着一起消失，壁纸原样）。
  *
  * 定义放在 vidow_fx_target 之后：里面内嵌了一个 fx 目标（糊掉的那张壁纸）。 */
+/* 每块屏各自的那一份 overview 状态（见 struct vidow_overview 的说明）。
+ *
+ * 为什么拆出来：以前 overview 是**单实例** —— 进来时把 server->focused_output
+ * 记进 ov->output，之后所有行、遮罩、底衬都只服务那一块屏。别的屏上一片空白
+ * （用户：「overview 触发的时候应该所有显示器都进 overview，现在虽然都进了但
+ * 非激活显示器不显示内容」）。
+ *
+ * 现在每块屏各自摆自己的行、自己一块遮罩、自己一份底衬，互不影响。共用的是
+ * 「开关状态和进度」（ov->on / ov->t / ov->scale），因为它们本来就该同步 ——
+ * 所有屏一起进、一起出，不然画面会散架。 */
+struct vidow_ov_screen {
+	bool used;               /* 这块屏这次进来有没有摆过行（没摆就不画） */
+	double scale;            /* 这块屏的缩略比例（由 t 算出 —— 各屏行高不同） */
+	struct vidow_ov_row *rows;      /* 行表（每行 = 这块屏上的一块工作区） */
+	int n_rows, cap_rows;
+	int n_skipped;           /* 这块屏上没摆行的空工作区 */
+	double list_scroll;      /* 列表纵向滚动（屏幕像素） */
+	double row_h;            /* 一行的屏幕高（= 工作区高 × scale） */
+	int out_x, out_y, out_w, out_h; /* 这块屏的工作区（摆行 / 遮罩都用它） */
+	struct wlr_scene_rect *dim;     /* 这块屏的压暗遮罩 */
+	/* 这块屏糊掉的那张壁纸（overview_blur）：摊满整块屏、垫在遮罩下面。 */
+	struct vidow_fx_target fx;
+	bool fx_on;                     /* 这一帧真的画上了 */
+	struct vidow_anim *scroll_anim; /* 这块屏列表滚动的缓动 */
+	double scroll_from;
+	double scroll_to;
+};
+
+/* overview 的**全局**部分：开关状态和进度。
+ *
+ * 这些是所有屏共用的 —— 所有显示器一起进、一起出，进度同步（不然画面会散架）。
+ * 每块屏自己的那份（行表 / 遮罩 / 底衬 / 滚动）在 struct vidow_ov_screen 里，
+ * 挂在 struct vidow_output 上（见那边的说明）。 */
 struct vidow_overview {
 	bool on;                 /* 目标状态（动画朝它走） */
 	double t;                /* 0..1，当前进度 */
 	double anim_from;        /* 这次动画的起点 t（中途反向就从这儿接着走） */
-	double scale;            /* 由 t 算出的缩放（所有行共用一个） */
-	struct vidow_ov_row *rows;      /* 行表（每行 = 一块工作区），按需分配、复用 */
-	int n_rows, cap_rows;
-	int n_skipped;           /* 这块屏上没摆行的空工作区（栈尾那块空位之类） */
-	double list_scroll;      /* 列表纵向滚动（屏幕像素），滚轮控制 */
-	double row_h;            /* 一行的屏幕高（= 工作区高 × scale） */
 	bool swallow_release;    /* 点选退出后，把它对应的那次松手也吃掉 */
-	int out_x, out_y, out_w, out_h; /* 那块屏的工作区（摆行 / 遮罩都用它） */
-	struct wlr_output *output;      /* 进入时锁定的那块屏 */
-	struct wlr_scene_rect *dim;     /* 压暗壁纸的遮罩 */
-	/* 糊掉的那张壁纸（overview_blur）：摊满整块屏、垫在遮罩下面。复用 fx 那条
-	 * 路（跟 layer 的底衬同一套：共享底衬 + blur_only，见 fx.c）。 */
-	struct vidow_fx_target fx;
-	bool fx_on;                     /* 这一帧真的画上了 */
+	struct wlr_output *output;      /* 主屏：进来时聚焦的那块（IPC / 果冻判定用） */
 	struct vidow_anim *anim;
-	/* 列表滚动的缓动（滚轮）。**独立于**进出那条 anim：进出管 t / 透明度，
-	 * 这条只管 list_scroll —— 进出动画跑着的时候滚一下，两条能同时走，不该
-	 * 互相打断。以前滚轮直接写 list_scroll，是瞬移（用户报的「overview 滚动
-	 * 需要过渡动画」）。 */
-	struct vidow_anim *scroll_anim;
-	double scroll_from;      /* 这次滚动的起点（起手那一刻画在屏上的 list_scroll） */
-	double scroll_to;        /* 目标（连滚时按它算下一格，见 vidow_overview_scroll） */
 };
 
 /* 「有人正拿着这个窗口」（窗口截图源：录屏 / 窗口预览）。记录挂在窗口上，源自己
@@ -1266,6 +1280,13 @@ struct vidow_output {
 	struct wl_list link; /* vidow_server.outputs */
 	struct vidow_server *server;
 	struct wlr_output *wlr_output;
+	/* 这块屏自己的 overview 状态（行表 / 遮罩 / 底衬 / 滚动）。
+	 *
+	 * 以前这些全是单实例、只服务「进来时聚焦的那块屏」，别的屏一片空白。
+	 * 现在每块屏各有一份 —— 所有屏一起进 overview，各自摆自己屏上的工作区
+	 * （用户 2026-10-25：「overview 触发的时候应该所有显示器都进 overview，
+	 * 现在虽然都进了但非激活显示器不显示内容」）。 */
+	struct vidow_ov_screen ov;
 	struct wlr_scene_output *scene_output;
 	struct wlr_output_layout_output *layout_output;
 	/* 这块屏的抓帧器（capture.c 的 vidow_capture）：独立的假输出 + 自己的
