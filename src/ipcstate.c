@@ -251,6 +251,13 @@ void vidow_ipc_json_window(struct jbuf *b, struct vidow_server *server,
 	jb_kv_str(b, "app_id", vidow_view_app_id(view));
 	jb_kv_bool(b, "mapped", view->mapped);
 	jb_kv_bool(b, "configured", view->configured);
+	/* cfg_sent / cfg_w / cfg_h：排错「重开黑屏」这类问题时，光看 configured
+	 * 不够 —— X11 客户端从来不设 configured（那条只有 xdg 的 initial_commit
+	 * 分支会写），真正决定「要不要再发一次 configure」的是 cfg_sent 加这三个
+	 * 已发尺寸（view.c 里尺寸没变就 return 那条）。 */
+	jb_kv_bool(b, "cfg_sent", view->cfg_sent);
+	jb_kv_uint(b, "cfg_w", (uint32_t)(view->cfg_w > 0 ? view->cfg_w : 0));
+	jb_kv_uint(b, "cfg_h", (uint32_t)(view->cfg_h > 0 ? view->cfg_h : 0));
 	jb_kv_bool(b, "placed", view->placed);
 	jb_kv_bool(b, "popup", view->popup);
 	jb_kv_bool(b, "fullscreen", view->fullscreen);
