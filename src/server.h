@@ -1724,6 +1724,9 @@ struct vidow_view {
 	struct vidow_fx_target fx;
 	int fx_dx, fx_dy; /* surface offset inside the view tree */
 	struct wlr_buffer *last_buffer; /* locked, feeds the close animation */
+	/* 排错用：上一次打 X11 换帧日志的时间。60Hz 的窗口一帧一行会把日志
+	 * 刷爆，所以同一条最多两秒一行（见 view_commit 的 X11 分支）。 */
+	double buf_trace_at;
 	/* 拖动时的果冻形变（见 jelly.c）：非空就是「现在正弯着」——窗口本来的
 	 * 装饰节点让位，由它显示。松手后它自己晃回去再消失。 */
 	struct vidow_jelly *jelly;

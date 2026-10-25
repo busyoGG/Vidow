@@ -6885,6 +6885,29 @@ static void view_commit(struct wl_listener *listener, void *data) {
 		struct wlr_client_buffer *client =
 			vidow_view_surface(view) != NULL ?
 			vidow_view_surface(view)->buffer : NULL;
+		/* 排错「重开黑屏」：X11 每次换新 buffer 记一行。第二次打开 Steam
+		 * 时如果这行根本不出现，就是客户端没交帧（在等 configure 或自己的
+		 * 状态机卡住）；出现了但画面还是空的，才是我们这边没画。
+		 * 只在 buffer 真变了时打，不然 60Hz 的窗口会把日志刷爆。 */
+		if (client != NULL && client->source != view->last_buffer) {
+			struct timespec ts;
+			clock_gettime(CLOCK_MONOTONIC, &ts);
+			double now = (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+			if (now - view->buf_trace_at >= 2.0) {
+				view->buf_trace_at = now;
+				wlr_log(WLR_INFO, "x11-buf %s: src=%p last=%p %dx%d "
+					"mapped=%d col=%p tree=%p",
+					vidow_view_title(view) != NULL ?
+						vidow_view_title(view) : "(无题)",
+					(void *)client->source, (void *)view->last_buffer,
+					vidow_view_surface(view) != NULL ?
+						vidow_view_surface(view)->current.width : -1,
+					vidow_view_surface(view) != NULL ?
+						vidow_view_surface(view)->current.height : -1,
+					view->mapped, (void *)view->column,
+					(void *)view->scene_tree);
+			}
+		}
 		if (client != NULL && client->source != NULL &&
 				client->source != view->last_buffer) {
 			wlr_buffer_unlock(view->last_buffer);
