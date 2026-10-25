@@ -2273,20 +2273,20 @@ static void view_apply_clip_impl(struct vidow_view *view) {
 	 * 的工作区（ov->out_* 就是它的工作区，布局坐标，和 fx->clip 同一坐标系）。 */
 	if (vidow_overview_active(view->server) &&
 			view->mini == VIDOW_MINI_NONE && view->mapped) {
+		/* ⚠️ 裁到**显示器**，不是 ov->out_×（那是工作区 = 屏框扣掉 panel /
+		 * gap 之后的可用区）。用户要的语义：「工作区内窗口可以溢出工作区，
+		 * 但不会溢出显示器」—— 窗口探进 panel 那一条属于显示器，应该照常
+		 * 显示，拿工作区当裁剪框就把它切掉了。 */
 		struct vidow_overview *ov = &view->server->overview;
-		if (ov->output != NULL && ov->out_w > 0 && ov->out_h > 0) {
-			view->fx.clip_on = true;
-			view->fx.clip = (struct wlr_box){.x = ov->out_x,
-				.y = ov->out_y, .width = ov->out_w,
-				.height = ov->out_h};
-			/* 这条日志是给「overview 跨屏」这个 bug 留的判据锚点：overview
-			 * 开着时每个窗口都该打一行，裁的范围就是 overview 那块屏的
-			 * 工作区。看不见这行 = 这段没跑（裁剪没生效）。 */
-			wlr_log(WLR_INFO,
-				"overview clip: view %p 裁到 %d,%d %dx%d",
-				(void *)view, ov->out_x, ov->out_y,
-				ov->out_w, ov->out_h);
-			return; /* 表面树那一份不裁：保住命中测试 */
+		if (ov->output != NULL) {
+			struct wlr_box full = {0};
+			wlr_output_layout_get_box(view->server->output_layout,
+				ov->output, &full);
+			if (full.width > 0 && full.height > 0) {
+				view->fx.clip_on = true;
+				view->fx.clip = full;
+				return; /* 表面树那一份不裁：保住命中测试 */
+			}
 		}
 	}
 	if (on != was_on) {

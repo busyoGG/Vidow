@@ -814,8 +814,7 @@ void vidow_overview_map(struct vidow_server *server, struct vidow_view *view,
  * 行矩形外就 alpha = 0」的判据 —— 那层整体隐藏已经撤掉了（判据和裁剪框不是
  * 同一个东西，会把该裁一半显示的窗口整个藏掉）。 */
 bool vidow_overview_view_box(struct vidow_server *server,
-		struct vidow_view *view, struct wlr_box *out,
-		struct wlr_box *row_out) {
+		struct vidow_view *view, struct wlr_box *out) {
 	const struct vidow_overview *ov = &server->overview;
 	if (ov->t <= 0.0 || ov->output == NULL || view->output != ov->output) {
 		return false;
@@ -839,8 +838,6 @@ bool vidow_overview_view_box(struct vidow_server *server,
 	wlr_scene_node_coords(&sb->node, &cx, &cy);
 	*out = (struct wlr_box){.x = cx, .y = cy,
 		.width = sb->dst_width, .height = sb->dst_height};
-	*row_out = (struct wlr_box){.x = row->rect_x, .y = row->y,
-		.width = row->rect_w, .height = (int)lround(ov->row_h)};
 	return true;
 }
 

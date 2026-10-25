@@ -2937,27 +2937,38 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 	struct wlr_box ov_clip_box = {0};
 	if (fx->view != NULL && vidow_overview_active(fx->view->server) &&
 			fx->view->mini == VIDOW_MINI_NONE && fx->view->mapped) {
-		/* 裁到**这一行的矩形**（不是整块屏）：overview 把每块工作区画成一块缩小
-		 * 的屏，行与行之间有间隙，条带比行宽的那些列在屏幕上本来就在屏外。
-		 * 裁到行矩形 = 「所有窗口都显示，超出的部分被显示器裁掉」。
+		/* 裁到**显示器**，不是行矩形。
 		 *
-		 * 以前这里裁的是 ov->out_×（整块屏），而 view.c 另有一层「整块落在行外
-		 * 就 alpha=0」的整体隐藏；两套边界不一致，落在行间隙里、本该只露出半截
-		 * 的窗口被整个藏掉了。现在隐藏撤了，裁剪边界收成行矩形，两者合一。
+		 * 用户要的语义（2026-10-25）：「工作区内窗口可以溢出工作区，但不会
+		 * 溢出显示器」。overview 把每块工作区画成一块缩小的屏，行矩形只是
+		 * 那块「缩小屏」的边框 —— 拿它当裁剪框等于把窗口裁在工作区里，
+		 * 窗口稍微探出自己那一行就整块被切掉，而屏幕上明明还有地方。
 		 *
-		 * vidow_overview_view_box() 只读场景节点、不写行状态，可以在这儿调。 */
-		struct wlr_box vb = {0};
-		if (vidow_overview_view_box(fx->view->server, fx->view, &vb,
-				&ov_clip_box)) {
-			ov_clip = true;
-		} else {
-			struct vidow_overview *ov = &fx->view->server->overview;
-			if (ov->output != NULL && ov->out_w > 0 && ov->out_h > 0) {
-				/* 查不到行（窗口还没摆进 overview）：退回整块屏，
-				 * 至少别画到隔壁显示器上。 */
-				ov_clip_box = (struct wlr_box){.x = ov->out_x,
-					.y = ov->out_y, .width = ov->out_w,
-					.height = ov->out_h};
+		 * 以前这里裁的是行矩形（更早是整块屏），两种都试过。行矩形那版的
+		 * 问题就是上面这条：行与行之间本来有间隙，间隙属于显示器、不属于
+		 * 任何工作区，窗口探进间隙应该照常显示（就像正常桌面里窗口探出
+		 * 工作区边界一样），不该被切。
+		 *
+		 * 所以裁剪边界回到显示器：行内随便溢出，出屏才切。隔壁显示器上
+		 * 不会画到 —— 场景图是全局坐标的，这块屏的节点裁在自己屏框里，
+		 * 就落不到别人那块上。
+		 *
+		 * 行矩形仍然有用（命中测试、动画目标），只是不再当裁剪框。 */
+		/* ⚠️ 用**显示器**的框，不是 ov->out_×。
+		 *
+		 * ov->out_× 存的是 vidow_work_area()（工作区 = 屏框扣掉 panel /
+		 * gap 之后的可用区）。拿它当裁剪框，窗口探进 panel 那一条还是会被
+		 * 切 —— 而用户要的是「溢出工作区可以，溢出显示器不行」，panel
+		 * 那块属于显示器、不属于工作区，应该照常显示。
+		 *
+		 * 屏框是布局坐标里的真值，直接问 output_layout。 */
+		struct vidow_overview *ov = &fx->view->server->overview;
+		if (ov->output != NULL) {
+			struct wlr_box full = {0};
+			wlr_output_layout_get_box(fx->view->server->output_layout,
+				ov->output, &full);
+			if (full.width > 0 && full.height > 0) {
+				ov_clip_box = full;
 				ov_clip = true;
 			}
 		}
