@@ -39,9 +39,4 @@ bool xwm_surface_should_be_mapped(const struct vidow_view *view);
  * 表面还没 associate 的时候判不了，调用方应当等 associate 之后再来。 */
 bool xwm_surface_ready(const struct vidow_view *view);
 
-/* 重新上屏时逼 XWayland 重建导出的 dmabuf（尺寸抖 1 像素再还原）。
- *
- * 只在「这个窗口以前上过屏、现在又上来」时有用；首次映射不需要。 */
-void xwm_surface_force_rebuild(struct vidow_view *view);
-
 #endif /* VIDOW_XWM_H */

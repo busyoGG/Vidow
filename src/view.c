@@ -2,7 +2,6 @@
 #include "ipc.h"
 #include "x11surface.h"
 #include "xwm.h"
-#include "x11.h"
 
 #include <drm_fourcc.h>
 #include <EGL/egl.h>
@@ -502,7 +501,7 @@ void vidow_view_set_size(struct vidow_view *view, int w, int h) {
 			/* 这里以前一言不发地 return，害得我把「日志里没有 x11-cfg」
 			 * 读成「configure 没发」—— 其实这条日志压根不存在，首开正常
 			 * 时也是 0 条。排「Steam 重开黑屏」两种结局都得看得见。 */
-			wlr_log(WLR_INFO, "x11-cfg %s: 跳过 %d,%d %dx%d"
+			wlr_log(WLR_DEBUG, "x11-cfg %s: 跳过 %d,%d %dx%d"
 				"（和上次一模一样）",
 				vidow_view_title(view) != NULL ?
 					vidow_view_title(view) : "(无题)",
@@ -536,7 +535,7 @@ void vidow_view_set_size(struct vidow_view *view, int w, int h) {
 		bool same_as_last = view->cfg_x == x &&
 			view->cfg_y == y && view->cfg_w == cw &&
 			view->cfg_h == ch;
-		wlr_log(WLR_INFO, "x11-cfg %s: 发 %d,%d %dx%d（上次 %d,%d %dx%d，"
+		wlr_log(WLR_DEBUG, "x11-cfg %s: 发 %d,%d %dx%d（上次 %d,%d %dx%d，"
 			"cfg_sent=%d）",
 			vidow_view_title(view) != NULL ?
 				vidow_view_title(view) : "(无题)",
@@ -549,7 +548,7 @@ void vidow_view_set_size(struct vidow_view *view, int w, int h) {
 		 * 确认、不再重绘 —— 见上面 same_as_last 那段注释。 */
 		if (same_as_last) {
 			xcb_connection_t *conn = vidow_x11_connection();
-			wlr_log(WLR_INFO, "x11-cfg %s: 命中「尺寸没变」分支，"
+			wlr_log(WLR_DEBUG, "x11-cfg %s: 命中「尺寸没变」分支，"
 				"conn=%p window_id=0x%x",
 				vidow_view_title(view) != NULL ?
 					vidow_view_title(view) : "(无题)",
@@ -573,7 +572,7 @@ void vidow_view_set_size(struct vidow_view *view, int w, int h) {
 					XCB_EVENT_MASK_STRUCTURE_NOTIFY,
 					(const char *)&e);
 				xcb_flush(conn);
-				wlr_log(WLR_INFO, "x11-cfg %s: 尺寸没变，补发 "
+				wlr_log(WLR_DEBUG, "x11-cfg %s: 尺寸没变，补发 "
 					"ConfigureNotify %d,%d %dx%d",
 					vidow_view_title(view) != NULL ?
 						vidow_view_title(view) : "(无题)",
@@ -6696,10 +6695,6 @@ void view_unmap(struct wl_listener *listener, void *data) {
 	 * 拖动之所以能救回来，是因为位置变了，去重条件不成立，configure 重新发
 	 * 了出去。 */
 	view->cfg_sent = false;
-	/* 记下「走的时候手里是哪一帧」。重开时如果客户端交上来的还是这同一个
-	 * buffer，说明 XWayland 根本没给它画新内容，我们画出来的必然是 unmap
-	 * 之前那一刻的残留。只做记录，不改行为。 */
-	view->buf_before_unmap = view->last_buffer;
 	vidow_portal_view_mapped(view, false);
 	if (view->focus_helper) {
 		/* 辅助窗口走了：键盘还给原来的焦点窗口。它从来没进过 server->focused，
@@ -7108,66 +7103,6 @@ static void view_commit(struct wl_listener *listener, void *data) {
 		struct wlr_client_buffer *client =
 			vidow_view_surface(view) != NULL ?
 			vidow_view_surface(view)->buffer : NULL;
-		/* 排错「重开黑屏」：X11 每次换新 buffer 记一行。第二次打开 Steam
-		 * 时如果这行根本不出现，就是客户端没交帧（在等 configure 或自己的
-		 * 状态机卡住）；出现了但画面还是空的，才是我们这边没画。
-		 * 只在 buffer 真变了时打，不然 60Hz 的窗口会把日志刷爆。 */
-		if (client != NULL && client->source != view->last_buffer) {
-			struct timespec ts;
-			clock_gettime(CLOCK_MONOTONIC, &ts);
-			double now = (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
-			/* 这一帧的纹理里到底是什么颜色？X 侧有画面、我们画出来
-			 * 全黑，那就得看手上这份数据本身。直接读像素，不猜。 */
-			if (now - view->buf_trace_at >= 2.0) {
-				view->buf_trace_at = now;
-				wlr_log(WLR_INFO, "x11-buf %s: src=%p last=%p %dx%d "
-					"mapped=%d col=%p tree=%p 与关闭前同一帧=%d",
-					vidow_view_title(view) != NULL ?
-						vidow_view_title(view) : "(无题)",
-					(void *)client->source, (void *)view->last_buffer,
-					vidow_view_surface(view) != NULL ?
-						vidow_view_surface(view)->current.width : -1,
-					vidow_view_surface(view) != NULL ?
-						vidow_view_surface(view)->current.height : -1,
-					view->mapped, (void *)view->column,
-					(void *)view->scene_tree,
-					(int)(view->buf_before_unmap != NULL &&
-						view->buf_before_unmap ==
-							client->source));
-				/* 颜色格式：Steam 主窗口是 Depth 32（带 alpha）。
-				 * `import -window` 从 X 侧抓到的是有内容的，`grim` 抓到的
-				 * 却是纯黑/纯白 —— 差别只可能在「我们怎么解释这个 buffer」。
-				 * 打 format / premultiplied / 缓冲区实际尺寸，看两种状态是否
-				 * 不一样。 */
-				if (vidow_view_surface(view) != NULL) {
-					struct wlr_surface_state *st =
-						&vidow_view_surface(view)->current;
-					uint32_t fmt = 0, mhi = 0, mlo = 0;
-					bool dmabuf = false;
-					struct wlr_dmabuf_attributes attribs = {0};
-					if (st->buffer != NULL &&
-							wlr_buffer_get_dmabuf(st->buffer,
-								&attribs)) {
-						dmabuf = true;
-						fmt = attribs.format;
-						mhi = (uint32_t)(attribs.modifier >> 32);
-						mlo = (uint32_t)(attribs.modifier
-							& 0xffffffffu);
-					}
-					wlr_log(WLR_INFO, "x11-fmt %s: dmabuf=%d "
-						"fmt=0x%x mod=0x%x%08x buf=%dx%d "
-						"scale=%d transform=%d",
-						vidow_view_title(view) != NULL ?
-							vidow_view_title(view) : "(无题)",
-						(int)dmabuf, fmt, mhi, mlo,
-						st->buffer != NULL ?
-							st->buffer->width : -1,
-						st->buffer != NULL ?
-							st->buffer->height : -1,
-						(int)st->scale, (int)st->transform);
-				}
-			}
-		}
 		if (client != NULL && client->source != NULL &&
 				client->source != view->last_buffer) {
 			wlr_buffer_unlock(view->last_buffer);
@@ -7875,7 +7810,7 @@ static void x11_trace_view(const char *event, struct vidow_view *view,
 	}
 	bool xmapped = view->x11 != NULL && view->x11->surface != NULL &&
 		view->x11->surface->mapped;
-	wlr_log(WLR_INFO,
+	wlr_log(WLR_DEBUG,
 		"x11-life %s xid=0x%x xs=%p surf=%p xmapped=%d mapped=%d helper=%d "
 		"tree=%p scene=%p ws=%p col=%p",
 		event,
@@ -8329,10 +8264,6 @@ static void view_x11_destroyed(struct vidow_view *view) {
 			vidow_view_app_id(view));
 
 	/* 尺寸抖动那个闹钟：view 要没了，先撤掉，否则回调拿到野指针。 */
-	if (view->x11_rebuild_timer != NULL) {
-		wl_event_source_remove(view->x11_rebuild_timer);
-		view->x11_rebuild_timer = NULL;
-	}
 	/* 以前这里要摘掉 20 个 wlroots 信号的监听器。现在窗口对象归我们自己
 	 * （见 src/x11surface.h），X 侧销毁时由 xwm_x11.c 的
 	 * x11_handle_destroy() 调进来，没有信号要摘 —— 只把反向指针断开，

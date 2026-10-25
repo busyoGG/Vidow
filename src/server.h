@@ -1728,9 +1728,6 @@ struct vidow_view {
 	struct vidow_fx_target fx;
 	int fx_dx, fx_dy; /* surface offset inside the view tree */
 	struct wlr_buffer *last_buffer; /* locked, feeds the close animation */
-	/* 排错用：上一次打 X11 换帧日志的时间。60Hz 的窗口一帧一行会把日志
-	 * 刷爆，所以同一条最多两秒一行（见 view_commit 的 X11 分支）。 */
-	double buf_trace_at;
 	/* X11 Depth 32 窗口的 alpha 判定结果（见 vidow_view_x11_scale）。
 	 * x11_alpha_known = 还没判过；x11_alpha_on = 这个窗口用 alpha 通道
 	 * （而不是整块当不透明）；x11_opacity = 记到节点上的整体不透明度。
@@ -1749,10 +1746,6 @@ struct vidow_view {
 	 * 再还原。X 服务器只在尺寸真的变了才重新分配 pixmap，同尺寸的
 	 * configure 它不理（ICCCM 连 ConfigureNotify 都不发，view.c 里
 	 * 504 行那个分支就是给这种情况补事件的），所以必须真的改一下。 */
-	struct wl_event_source *x11_rebuild_timer;
-	bool x11_rebuild_pending; /* 已经抖过 +1，等还原 */
-	int x11_rebuild_w;         /* 抖动前的真实尺寸 */
-	int x11_rebuild_h;
 	/* X11 表面的「欠帧」计数，见 view.c 里 xwm 交帧那段说明。
 	 *
 	 * XWayland 的渲染由 wl_surface 的 frame callback 驱动，而回调只在
@@ -1765,10 +1758,6 @@ struct vidow_view {
 	 * 冷却的话，每次 commit 都会重新记一笔 30 帧，而催帧又促使 Xwayland
 	 * 再交一帧 —— 正反馈，实测 160 次/秒的空转。 */
 	uint32_t x11_want_frames_at;
-	/* 排错「重开黑屏」：unmap 那一刻手里握着的 buffer。重开后客户端交上来
-	 * 的如果还是这一个指针，说明它压根没画新东西，我们画的是残留。
-	 * 只用于日志对比，不参与任何判定。 */
-	struct wlr_buffer *buf_before_unmap;
 	/* 拖动时的果冻形变（见 jelly.c）：非空就是「现在正弯着」——窗口本来的
 	 * 装饰节点让位，由它显示。松手后它自己晃回去再消失。 */
 	struct vidow_jelly *jelly;

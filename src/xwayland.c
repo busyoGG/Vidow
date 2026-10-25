@@ -2,7 +2,6 @@
 #include "ipc.h"
 #include "server.h"
 #include "x11surface.h"
-#include "x11.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -557,24 +556,12 @@ static void xwayland_ready(struct wl_listener *listener, void *data) {
 	/* X 的剪贴板桥要等 xwm 的连接可用才能接（见 clipboard.c）。 */
 	vidow_clipboard_x11_ready(server);
 
-	/* 自己那条只读的 xcb 连接（见 src/x11.c）。XWayland 已经起来了，
-	 * socket 有了、root window 也有了，现在才能连。
-	 *
-	 * 为什么要自己连一条：wlr_xwayland_surface.mapped 只反映「收到过
-	 * MapRequest」，一个已经映射过的窗口被重新 map 时 X 只发 MapNotify，
-	 * 那个字段就永远停在 0 —— 于是我们手里没有任何权威来源能回答
-	 * 「X 服务器眼里这个窗口现在可见吗」。这条连接只读不抢
-	 * （SubstructureNotify，不是 SubstructureRedirect），不会干扰 wlroots。 */
-	x11_observe_start(server);
 }
 
 static void xwayland_destroy(struct wl_listener *listener, void *data) {
 	(void)data;
 	struct vidow_server *server = wl_container_of(listener, server, xwayland_destroy);
 	xwayland_probe_stop(server);
-	/* 观察层用的是一条独立连接：X 服务要拆了，先自己收干净，
-	 * 不然事件源还挂在已失效的 fd 上。 */
-	x11_observe_stop();
 	/* X 服务要拆了：剪贴板桥手上那条连接马上就不算数了（wlroots 紧接着
 	 * xwm_destroy → xcb_disconnect），先摘掉，别留野指针。 */
 	vidow_clipboard_x11_detach(server);
