@@ -1311,6 +1311,20 @@ struct vidow_output {
 	struct wlr_scene_rect *lock_blank;
 	bool lock_frame_pending;
 	double viewport_x;          /* horizontal scroll offset of the column strip */
+	/* 条带横向滚动的过渡（换焦点把焦点列滚回可见区那一下）。
+	 *
+	 * 视口本来是**瞬跳**的：每个窗口再各自补一条 window_move_ms 的位移，
+	 * 于是观感是「几个窗口各走各的」—— 窗口 A 走了 200px、B 走了 380px，
+	 * 各自从自己的旧位置飘到新位置，看着就是它们在互相追。
+	 *
+	 * 真正该动的东西只有一件：**条带本身**。让视口按曲线走，窗口每帧按「当前
+	 * 视口」摆位（不跑位移补间），整条带子就是刚性的 —— 窗口相对位置一点不变。
+	 * 这就是 niri 的做法。
+	 *
+	 * viewport_anim_from / to：这条过渡的起终点（逻辑像素）。 */
+	struct vidow_anim *viewport_anim;
+	double viewport_anim_from;
+	double viewport_anim_to;
 	/* 切工作区的过渡：正在被推开的（旧的）那块工作区，和驱动它的动画。
 	 * 过渡期间 arrange 会把 slide_from 的列也摆一遍（按它自己的 slide_y），
 	 * 见 view.c 的 output_arrange 和 workspace.c 的 slide_start。 */

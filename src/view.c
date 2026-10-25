@@ -3615,6 +3615,11 @@ static void view_snapshot_close(struct vidow_view *view) {
 		&view->rule_eff, view->fullscreen);
 }
 
+/* 视口过渡是不是正在这块屏上跑（定义在 output_arrange 那一段：窗口摆位要靠
+ * 它决定「横向归视口、自己不补间」）。 */
+static bool viewport_sliding(struct vidow_server *server,
+		struct wlr_output *output);
+
 void vidow_place_view(struct vidow_view *view, int x, int y, int w, int h) {
 	if (w < 1) {
 		w = 1;
@@ -3625,9 +3630,6 @@ void vidow_place_view(struct vidow_view *view, int x, int y, int w, int h) {
 
 	struct vidow_config *cfg = &view->server->config;
 	bool moved = view->geom.x != x || view->geom.y != y;
-	/* 横向和纵向分开记：过渡期间只有**纵向**是过渡推出来的（下面那条
-	 * workspace_slide_n 的判据要用），换焦点把列滚回可见区那一下动的是横向。 */
-	bool x_moved = view->geom.x != x;
 	bool resized = view->geom.width != w || view->geom.height != h;
 
 	/* 「现在画在哪」必须在覆盖 geom 之前取：覆盖之后再拿 geom 算补间起点，
@@ -3778,18 +3780,22 @@ void vidow_place_view(struct vidow_view *view, int x, int y, int w, int h) {
 	 * 每帧重起一次位移补间的话它们会一直吊在过渡后面（和上面列宽那条一个道理），
 	 * 看着就是「工作区滑过去了、窗口还在原地飘」。过渡期间直接落位，整块工作区
 	 * 刚性跟着曲线走。 */
-	if (view->server->workspace_slide_n > 0 && !x_moved) {
-		/* 纵向位移是过渡本身推出来的：这里照旧直接落位（上一帧刚起的那条
-		 * 补间不掐的话它会一直吊在过渡后面）。
+	if (view->server->workspace_slide_n > 0) {
+		/* **切工作区期间，窗口一律直接落位，不做位移补间。**
 		 *
-		 * **但手里要是有横向补间（切完工作区立刻换焦点 → 把焦点列滚回
-		 * 可见区），别掐它**：以前这里一律 cancel + 偏移清零，那一下横向
-		 * 就变成瞬移。补间留着，纵向起点按 0 走（纵向归过渡）。 */
-		if (view->anim_move != NULL) {
-			view->anim_from_y = 0.0;
-			vidow_view_apply_anim(view);
-			return;
-		}
+		 * 整块工作区是靠 ws->slide_y 平移的（过渡自己推），窗口各自再补一条
+		 * 位移就变成「工作区在滑、里面的窗口还在自己挪」—— 两套动画叠在一起，
+		 * 看着就是窗户没跟着工作区走。用户要的是「整块一起动」：窗口相对位置
+		 * 一点不变，只有整块在平移。
+		 *
+		 * 横向也一起归零：切工作区那一下 viewport 会换成新工作区自己的那份
+		 * （workspace.c 的 focus_workspace），新旧视口不同时窗口的 x 会跳一下 ——
+		 * 这一跳发生在**新工作区还在屏外**的时刻（slide_start 里 to->slide_y
+		 * 先设成 ±屏高），所以根本看不见。让它瞬时到位，之后整块滑进来，
+		 * 窗口就已经在自己的位置上了。
+		 *
+		 * 以前这里是 `&& !x_moved`，横向一动就走下面的补间分支 —— 那正是
+		 * 「切工作区时窗口自己挪一段」的来源。 */
 		vidow_anim_cancel(view->anim_move);
 		view->anim_move = NULL;
 		view->anim_off_x = 0.0;
@@ -3807,10 +3813,27 @@ void vidow_place_view(struct vidow_view *view, int x, int y, int w, int h) {
 		return;
 	}
 
+	/* **视口过渡正跑着：窗口直接落位，不跑位移补间。**
+	 *
+	 * 视口每帧都在动，窗口的 x 也跟着每帧变 —— 不掐补间的话每个窗口都会从
+	 * 「上一帧画的位置」补一条 window_move_ms 的位移，而那条永远追不上，
+	 * 于是整条带子看起来软塌塌地拖在后面（正是「窗口各走各的」那个观感）。
+	 *
+	 * 让视口负责全部横向位移、窗口只做刚体：相对位置一帧都不变。 */
+	if (viewport_sliding(view->server, view->output)) {
+		vidow_anim_cancel(view->anim_move);
+		view->anim_move = NULL;
+		view->anim_off_x = 0.0;
+		view->anim_off_y = 0.0;
+		vidow_view_apply_anim(view);
+		return;
+	}
+
 	/* Tween from wherever the window is drawn right now, so a new layout
 	 * change mid-flight does not snap it back. */
 	view->anim_from_x = (double)(drawn_x - x);
 	view->anim_from_y = (double)(drawn_y - y);
+
 	vidow_anim_cancel(view->anim_move);
 	view->anim_move = vidow_anim_start(view->server, "move",
 		cfg->window_move_ms, cfg->window_move_easing,
@@ -4004,6 +4027,94 @@ int vidow_workspace_preview_layout(struct vidow_server *server,
 	return cursor > 0 ? cursor - inner : 0;
 }
 
+/* ------------------------------------------------ 条带横向滚动的过渡
+ *
+ * 换焦点时 focus_viewport_target() 会给一个新的视口值。原来是**直接赋值**，
+ * 然后每个窗口各自补一条 window_move_ms 位移 —— 问题在于每条的起点是「它
+ * 上次画的位置」，终点是它自己的新位置，各走各的距离，观感就是几个窗口在
+ * 互相追（用户报的「窗口在聚焦过渡动画的时候作为一个整体」）。
+ *
+ * 改成让**视口**走曲线：每帧按当前视口摆窗口、窗口本身不跑位移补间。整条
+ * 条带刚性平移，窗口之间的相对位置一帧都不会变。 */
+struct vp_anim {
+	struct vidow_server *server;
+	struct vidow_output *output;
+};
+
+static void viewport_anim_update(void *data, double t, double linear) {
+	(void)linear;
+	struct vp_anim *a = data;
+	if (a->output == NULL) {
+		return;
+	}
+	double v = a->output->viewport_anim_from +
+		(a->output->viewport_anim_to - a->output->viewport_anim_from) * t;
+	a->output->viewport_x = v;
+	vidow_arrange(a->server);
+}
+
+static void viewport_anim_done(void *data, bool cancelled) {
+	struct vp_anim *a = data;
+	if (a->output != NULL) {
+		if (!cancelled && a->output->viewport_anim != NULL) {
+			a->output->viewport_x = a->output->viewport_anim_to;
+		}
+		a->output->viewport_anim = NULL;
+		if (!cancelled) {
+			vidow_arrange(a->server);
+		}
+	}
+	free(a);
+}
+
+/* 把视口从 from 滑到 to（毫秒 ms，0 = 直接到位）。 */
+static void viewport_slide(struct vidow_server *server,
+		struct vidow_output *output, double from, double to, int ms) {
+	if (output == NULL) {
+		return;
+	}
+	if (output->viewport_anim != NULL) {
+		vidow_anim_cancel(output->viewport_anim);
+		output->viewport_anim = NULL;
+	}
+	if (ms <= 0 || from == to) {
+		output->viewport_x = to;
+		return;
+	}
+	struct vp_anim *a = calloc(1, sizeof(*a));
+	if (a == NULL) {
+		output->viewport_x = to;
+		return;
+	}
+	a->server = server;
+	a->output = output;
+	output->viewport_anim_from = from;
+	output->viewport_anim_to = to;
+	output->viewport_anim = vidow_anim_start(server, "视口滚动", ms,
+		server->config.window_move_easing, viewport_anim_update,
+		viewport_anim_done, a);
+	if (output->viewport_anim == NULL) {
+		output->viewport_x = to;
+		free(a);
+		return;
+	}
+	wlr_log(WLR_DEBUG, "viewport tween: %.0f -> %.0f（%dms）", from, to, ms);
+}
+
+static bool viewport_sliding(struct vidow_server *server,
+		struct wlr_output *output) {
+	if (output == NULL) {
+		return false;
+	}
+	struct vidow_output *o;
+	wl_list_for_each(o, &server->outputs, link) {
+		if (o->wlr_output == output) {
+			return o->viewport_anim != NULL;
+		}
+	}
+	return false;
+}
+
 static void output_arrange(struct vidow_server *server,
 		struct vidow_output *output) {
 	struct wlr_box work = vidow_work_area(server, output->wlr_output);
@@ -4058,6 +4169,14 @@ static void output_arrange(struct vidow_server *server,
 	}
 	int total_width = cursor > 0 ? cursor - inner : 0;
 
+	/* 切工作区的过渡里先把这条视口滚动掐掉：新工作区要整块滑进来，视口这时
+	 * 还在自己滚的话，窗口会跟着它横着飘一段 —— 又变成「窗口自己动」。
+	 * 必须在 Pass 2 读视口**之前**做，不然这一帧先按滚动中的视口摆了一次。 */
+	if (server->workspace_slide_n > 0 && output->viewport_anim != NULL) {
+		vidow_anim_cancel(output->viewport_anim);
+		output->viewport_anim = NULL;
+	}
+
 	/* Pass 2: scroll the minimum amount that makes the focused column fully
 	 * visible. Focus moves, the view follows. */
 	double viewport = output->viewport_x;
@@ -4076,7 +4195,33 @@ static void output_arrange(struct vidow_server *server,
 		 * —— 刚为了看落点滚出去，立刻就被它拽回来，等于滚不动。 */
 		viewport = output->drag_viewport;
 	} else {
-		viewport = focus_viewport_target(server, output, viewport, work.width);
+		/* 视口要滚到新位置时**走过渡**，而不是瞬跳 + 每个窗口各自补位移。
+		 * 见 viewport_slide 上面那段：整条带子刚性平移，窗口作为整体走。 */
+		double target = focus_viewport_target(server, output, viewport,
+			work.width);
+		if (target < 0) {
+			target = 0;
+		}
+		if (target > max_viewport) {
+			target = max_viewport;
+		}
+		if (output->viewport_anim != NULL) {
+			/* 过渡正跑着：这一帧**别覆盖**视口，让它按曲线走。目标变了
+			 * 才重起一条（从当前动画值接着走，不跳回起点）。 */
+			if ((double)lround(output->viewport_anim_to) !=
+					(double)lround(target)) {
+				viewport_slide(server, output, output->viewport_x,
+					target, server->config.window_move_ms);
+			}
+			viewport = output->viewport_x;
+		} else if (target != viewport && server->config.window_move_ms > 0) {
+			/* 起点用**当前视口**，这样连续换焦点不会从上次的起点重来。 */
+			viewport_slide(server, output, viewport, target,
+				server->config.window_move_ms);
+			viewport = output->viewport_x;
+		} else {
+			viewport = target;
+		}
 	}
 	if (viewport < 0) {
 		viewport = 0;
