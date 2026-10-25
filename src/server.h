@@ -2001,6 +2001,33 @@ struct vidow_keyboard {
 	struct wl_listener modifiers;
 	struct wl_listener key;
 	struct wl_listener destroy;
+
+	/* ---- 按键自动重复 ----
+	 *
+	 * 为什么合成器得自己干这件事：wlroots 0.20 **不做重复**，它只把
+	 * repeat_rate/repeat_delay 通过 wl_keyboard.repeat_info 报给客户端，
+	 * 指望客户端自己重复。Wayland 原生客户端（终端、编辑器）确实自己重复，
+	 * 所以一直没暴露问题。
+	 *
+	 * 但 Xwayland 不是这样：它是 Wayland 客户端，同时又是 X 服务器的输入
+	 * 驱动。X11 的 autorepeat 是**服务器**行为（客户端调
+	 * XkbSetDetectableAutoRepeat 与否只决定它看到什么形式），Xwayland 等的是
+	 * 我们按 repeat_info 把重复键送过来 —— 收不到就永远不重复。
+	 *
+	 * 实测（xev 抓 X 侧）：按住一个键 5 秒，应该约 125 次重复，实际只收到
+	 * 1~3 次 —— 游戏里就是「按住 W 走两步停一下」。
+	 *
+	 * 所以这里自己起一个定时器，按住不放就按 repeat_rate 重发。发的是
+	 * **同一对 press+release**（X11 autorepeat 的原生形式）：Xwayland 拿到
+	 * 之后会翻译成 X 的 KeyPress/KeyRelease 对，客户端用
+	 * XkbSetDetectableAutoRepeat 合并成连续 KeyPress。只发 press 不发
+	 * release 的话 X 侧会认为键一直没松开，反而卡住。 */
+	struct wl_event_source *repeat_timer;
+	/* 现在按住的那个键（evdev 码 + 时间戳）。-1 = 没有键按着。 */
+	int32_t repeat_keycode;
+	uint32_t repeat_time_msec;
+	/* 已经等过初始延迟没有：false = 还在 delay 阶段。 */
+	bool repeat_started;
 };
 
 /* 客户端要的一个「快捷键抑制」（zwp_keyboard_shortcuts_inhibitor_v1）。一个表面

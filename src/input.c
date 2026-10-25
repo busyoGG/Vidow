@@ -155,6 +155,81 @@ static void input_note_key_press(struct vidow_server *server) {
 	}
 }
 
+/* ------------------------------------------------------ 按键自动重复 */
+
+/* 定义在文件后面（注入那段）。这里只是重复定时器要用它取时间戳。 */
+static uint32_t inject_now_ms(void);
+
+/* 定时器到点了：把当前按住的键再发一遍（press + release 一对）。
+ *
+ * 为什么成对发：这是 X11 autorepeat 的原生形式。Xwayland 收到 Wayland 的
+ * press 会翻译成 X 的 KeyPress，收到 release 翻译成 KeyRelease —— 它不做
+ * 「按住」这个概念，只做逐条翻译。所以「重复」在我们这边就是「再按一次」。
+ *
+ * 客户端如果调过 XkbSetDetectableAutoRepeat（大多数游戏 / SDL / GLFW 都调），
+ * X 服务器会把中间的 KeyRelease 吃掉，只让它看见连续 KeyPress —— 正是它要的。
+ * 没调的（老式 Xlib 程序）会自己判断「release 紧接着同一个键的 press = 重复」。
+ * 两种都正确，这也是 X.Org 自己实现 autorepeat 的做法。 */
+static int keyboard_repeat_cb(void *data) {
+	struct vidow_keyboard *kb = data;
+	struct vidow_server *server = kb->server;
+	if (kb->repeat_keycode < 0 || server->seat == NULL) {
+		return 0;
+	}
+	/* 焦点没了就别再往里塞键（X11 那边会当成发错窗口）。 */
+	if (server->seat->keyboard_state.focused_surface == NULL) {
+		kb->repeat_keycode = -1;
+		return 0;
+	}
+	uint32_t now = inject_now_ms();
+	if (!kb->repeat_started) {
+		/* 初始延迟过了，这一发是第一下重复。 */
+		kb->repeat_started = true;
+	}
+	uint32_t keycode = (uint32_t)kb->repeat_keycode;
+	wlr_seat_set_keyboard(server->seat, kb->wlr_keyboard);
+	wlr_seat_keyboard_notify_key(server->seat, now, keycode,
+		WL_KEYBOARD_KEY_STATE_PRESSED);
+	wlr_seat_keyboard_notify_key(server->seat, now, keycode,
+		WL_KEYBOARD_KEY_STATE_RELEASED);
+
+	int rate = server->config.repeat_rate;
+	if (rate <= 0) {
+		kb->repeat_keycode = -1;
+		return 0;
+	}
+	wl_event_source_timer_update(kb->repeat_timer, 1000 / rate);
+	return 0;
+}
+
+/* 停掉重复（松键 / 焦点跑了 / 键盘没了）。 */
+static void keyboard_repeat_stop(struct vidow_keyboard *kb) {
+	if (kb->repeat_timer != NULL) {
+		wl_event_source_timer_update(kb->repeat_timer, 0);
+	}
+	kb->repeat_keycode = -1;
+	kb->repeat_started = false;
+}
+
+/* 按下某个键：安排重复。delay 是第一次重复的等待时间（config.repeat_delay）。 */
+static void keyboard_repeat_start(struct vidow_keyboard *kb, uint32_t keycode,
+		uint32_t time_msec) {
+	if (kb->repeat_timer == NULL) {
+		return;
+	}
+	int rate = kb->server->config.repeat_rate;
+	int delay = kb->server->config.repeat_delay;
+	/* rate = 0 是「关掉重复」（X 那边也是这个约定：xset r rate 0 = 关）。 */
+	if (rate <= 0) {
+		keyboard_repeat_stop(kb);
+		return;
+	}
+	kb->repeat_keycode = (int32_t)keycode;
+	kb->repeat_time_msec = time_msec;
+	kb->repeat_started = false;
+	wl_event_source_timer_update(kb->repeat_timer, delay > 0 ? delay : 1);
+}
+
 static void keyboard_key(struct wl_listener *listener, void *data) {
 	struct vidow_keyboard *kb = wl_container_of(listener, kb, key);
 	struct vidow_server *server = kb->server;
@@ -324,6 +399,14 @@ static void keyboard_key(struct wl_listener *listener, void *data) {
 		wlr_seat_set_keyboard(server->seat, kb->wlr_keyboard);
 		wlr_seat_keyboard_notify_key(server->seat, event->time_msec,
 			event->keycode, event->state);
+		/* 自动重复：按下就排上，松开就停。虚拟键盘 / 输入法回注也走
+		 * 这里 —— 它们按住的键同样该重复（wtype 打字不会用到，但游戏
+		 * 手柄映射的虚拟键会）。 */
+		if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+			keyboard_repeat_start(kb, event->keycode, event->time_msec);
+		} else {
+			keyboard_repeat_stop(kb);
+		}
 	}
 }
 
@@ -335,6 +418,10 @@ static void keyboard_destroy(struct wl_listener *listener, void *data) {
 	wl_list_remove(&kb->key.link);
 	wl_list_remove(&kb->destroy.link);
 	wl_list_remove(&kb->link);
+	if (kb->repeat_timer != NULL) {
+		wl_event_source_remove(kb->repeat_timer);
+		kb->repeat_timer = NULL;
+	}
 
 	/* 别让 seat 指着一个马上要释放的键盘 */
 	struct vidow_server *server = kb->server;
@@ -425,6 +512,15 @@ static void server_add_keyboard(struct vidow_server *server,
 	wl_signal_add(&wlr_keyboard->events.key, &kb->key);
 	kb->destroy.notify = keyboard_destroy;
 	wl_signal_add(&device->events.destroy, &kb->destroy);
+
+	/* 自动重复的定时器（见 keyboard_repeat_cb 的注释：wlroots 不做重复，
+	 * 但 Xwayland 等着我们做）。 */
+	kb->repeat_keycode = -1;
+	kb->repeat_timer = wl_event_loop_add_timer(
+		wl_display_get_event_loop(server->display), keyboard_repeat_cb, kb);
+	if (kb->repeat_timer == NULL) {
+		wlr_log(WLR_ERROR, "键盘: 重复定时器建不起来，按住键不会重复");
+	}
 
 	wl_list_insert(&server->keyboards, &kb->link);
 	wlr_seat_set_keyboard(server->seat, wlr_keyboard);
