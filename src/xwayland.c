@@ -416,6 +416,30 @@ static void xwayland_set_root_cursor(struct vidow_server *server,
 	wlr_buffer_end_data_ptr_access(buffer);
 }
 
+/* Xwayland 进程 fork 出来之后、它连 display 之前。
+ *
+ * **bind 的白名单要在这里就给好。** Xwayland 一起来第一件事就是连 display
+ * 并 bind xwayland_shell_v1，而 wlroots 的检查（反汇编：
+ * `cmp client, shell->client` / 不等就报 Permission denied）在 shell->client
+ * 为 NULL 时**不放行任何人** —— 连 Xwayland 自己也不行。等 ready 事件再
+ * set_client 就太晚了：那时 bind 已经失败、Xwayland 已经退出。
+ *
+ * start 在 fork 成功之后立刻发，这时 server->client 已经分配好了。 */
+static void xwayland_start(struct wl_listener *listener, void *data) {
+	(void)data;
+	struct vidow_server *server = wl_container_of(listener, server, xwayland_start);
+	if (server->xwayland_server == NULL) {
+		return;
+	}
+	struct wl_client *client = server->xwayland_server->client;
+	wlr_log(WLR_INFO, "xwayland: start（pid %d，client %p，shell %p）",
+		(int)server->xwayland_server->pid, (void *)client,
+		(void *)server->xwayland_shell);
+	if (server->xwayland_shell != NULL && client != NULL) {
+		wlr_xwayland_shell_v1_set_client(server->xwayland_shell, client);
+	}
+}
+
 static void xwayland_ready(struct wl_listener *listener, void *data) {
 	struct vidow_server *server = wl_container_of(listener, server, xwayland_ready);
 	struct wlr_xwayland_server_ready_event *ev = data;
@@ -590,6 +614,7 @@ static void xwayland_destroy(struct wl_listener *listener, void *data) {
 	/* X 服务要拆了：剪贴板桥手上那条连接马上就不算数了（wlroots 紧接着
 	 * xwm_destroy → xcb_disconnect），先摘掉，别留野指针。 */
 	vidow_clipboard_x11_detach(server);
+	wl_list_remove(&server->xwayland_start.link);
 	wl_list_remove(&server->xwayland_ready.link);
 	wl_list_remove(&server->xwayland_destroy.link);
 	/* 我们自己的 XWM 也要收干净：拆事件源、释放窗口对象。
@@ -681,6 +706,9 @@ bool vidow_xwayland_apply_config(struct vidow_server *server) {
 		}
 	}
 
+	server->xwayland_start.notify = xwayland_start;
+	wl_signal_add(&server->xwayland_server->events.start,
+		&server->xwayland_start);
 	server->xwayland_ready.notify = xwayland_ready;
 	wl_signal_add(&server->xwayland_server->events.ready,
 		&server->xwayland_ready);

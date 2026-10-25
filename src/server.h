@@ -2570,6 +2570,8 @@ struct vidow_server {
 	/* xwayland_shell_v1：只用来把 wl_surface 和 WL_SURFACE_SERIAL 对上号。
 	 * 这是唯一还需要 wlroots 参与 X11 的地方。 */
 	struct wlr_xwayland_shell_v1 *xwayland_shell;
+	/* start：fork 之后立刻（bind 白名单要在这里给，见 xwayland.c）。 */
+	struct wl_listener xwayland_start;
 	struct wl_listener xwayland_ready;
 	struct wl_listener xwayland_destroy;
 	/* X11 客户端被告知的缩放。X 只有一套坐标，所以只能是一个全局值。 */
