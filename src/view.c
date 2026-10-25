@@ -492,13 +492,6 @@ void vidow_view_set_size(struct vidow_view *view, int w, int h) {
 				view->cfg_w == cw && view->cfg_h == ch) {
 			return; /* 位置尺寸一个都没变：别让客户端白重画一帧 */
 		}
-		wlr_log(WLR_INFO, "x11-cfg %s: 发 configure %d,%d %dx%d"
-			"（上次 %d,%d %dx%d，cfg_sent=%d，X 侧 %dx%d）",
-			vidow_view_title(view) != NULL ? vidow_view_title(view) : "(无题)",
-			x, y, cw, ch, view->cfg_x, view->cfg_y, view->cfg_w,
-			view->cfg_h, view->cfg_sent,
-			view->x11->surface != NULL ? view->x11->width : -1,
-			view->x11->surface != NULL ? view->x11->height : -1);
 		wlr_xwayland_surface_configure(view->x11, (int16_t)x, (int16_t)y,
 			(uint16_t)cw, (uint16_t)ch);
 		view->cfg_x = x;
@@ -6481,18 +6474,9 @@ static void view_reconsider_map(struct vidow_view *view) {
 	if (view->popup || view->focus_helper) {
 		return; /* 弹出物 / 已按辅助窗口处理过 */
 	}
-	if (view->ws != NULL && view->column != NULL) {
-		return; /* 已有归属、也已经在列里了 */
+	if (view->ws != NULL) {
+		return; /* 已经有归属了 */
 	}
-	/* 只看 ws 是不够的：Steam 关掉再打开时，view 的 ws 在建 view 那一刻
-	 * 就已经按光标那块屏填好了，可 column 还是 NULL（窗口没进列）。原来这里
-	 * 「ws 有值就 return」，于是下面 view_ensure_column + vidow_arrange 一次
-	 * 都不跑 —— 窗口没有列、没有 geometry，画面就停在黑色底片上，`vidowmsg
-	 * windows` 里却一切正常（mapped=true、placed=true、visible=true）。
-	 *
-	 * 用户报的「Steam 第二次打开主窗口黑屏、拖动一下就恢复」正是这条：
-	 * 拖带动 grab 走的是 arrange，补上了缺的那一趟。所以判据要连 column
-	 * 一起看，两个都齐了才算「已经安排过」。 */
 	if (surface->current.width <= 1 && surface->current.height <= 1) {
 		/* 第一帧就是 1x1：现在尺寸可信了，按辅助窗口办（只拦布局，
 		 * 不动场景节点 —— 见 view_map 里那段）。 */
