@@ -575,6 +575,11 @@ static void x11_handle_configure_notify(xcb_configure_notify_event_t *e) {
 
 static void x11_handle_map_request(xcb_map_request_event_t *e) {
 	struct vidow_x11_surface *s = surface_for_window(e->window);
+	if (getenv("VIDOW_X11_TRACE") != NULL) {
+		wlr_log(WLR_INFO, "x11-trace: MapRequest xid=0x%x %s surface=%p",
+			e->window, s != NULL ? "" : "**未知窗口，丢弃**",
+			s != NULL ? (void *)s->surface : NULL);
+	}
 	if (s == NULL) {
 		return;
 	}
