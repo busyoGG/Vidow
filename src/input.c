@@ -1064,8 +1064,33 @@ static void focus_follows_mouse(struct vidow_server *server,
 	if (server->pointer_button_count != 0) {
 		return;
 	}
-	if (!server->config.focus_follows_mouse || hit == NULL ||
-			hit == server->focused) {
+	if (!server->config.focus_follows_mouse) {
+		return;
+	}
+	/* **光标划到另一块屏的空区域上：键盘焦点跟过去。**
+	 *
+	 * 用户 2026-10-26：「焦点无法跟随鼠标所在屏幕」。
+	 *
+	 * 以前只有「点在空区域」那一条路会换屏（见 pointer_button 里的
+	 * vidow_workspace_focus_output），悬停完全不换 —— 于是光标移到另一块屏
+	 * 上、键盘焦点还留在原屏的窗口上，接下来的键位（close-window /
+	 * focus-column …）全作用在看不见的那一边。
+	 *
+	 * 只换 focused_output + server->focused，不碰「哪扇窗拿着键盘」的
+	 * 其它记账：这跟 niri 的 focus_output 语义一致，键盘焦点落在目标屏
+	 * 的活动工作区上（vidow_workspace_focus_output 里做的）。
+	 *
+	 * hit == NULL 才走这里：光标压在窗口上那条路由下面原有的逻辑管。 */
+	if (hit == NULL) {
+		struct wlr_output *hover_output = wlr_output_layout_output_at(
+			server->output_layout, server->cursor->x, server->cursor->y);
+		if (hover_output != NULL &&
+				hover_output != server->focused_output) {
+			vidow_workspace_focus_output(server, hover_output);
+		}
+		return;
+	}
+	if (hit == server->focused) {
 		return;
 	}
 	/* 指针没离开过这个窗口（上一次压着的也是它）：不跟。 */

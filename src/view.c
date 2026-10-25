@@ -4161,22 +4161,6 @@ static void viewport_anim_done(void *data, bool cancelled) {
 			vidow_arrange(a->server);
 		}
 		a->output->viewport_anim = NULL;
-		/* **兑现动画期间欠下的那一次。**
-		 *
-		 * 上面那次 arrange 必须在 anim 还挂着的时候跑（见注释：结束帧
-		 * 位置仍归视口管，否则每个窗口都会多起一条 480ms 位移补间）。
-		 * 而欠账要等 anim 摘掉才可能起新过渡 —— 于是摘完再 arrange
-		 * 一次：这时 anim == NULL、want_slide 为真，Pass 2 走
-		 * viewport_slide() 滚到最新焦点列。
-		 *
-		 * 连按 Mod+L 三次就是靠这条补上的：第一次滚到中途，第二、三次的
-		 * 请求先记在 viewport_slide_pending，第一次滚完立刻接着滚到
-		 * 最后那个目标，而不是一口气不滚。 */
-		if (!cancelled && a->output->viewport_slide_pending) {
-			a->output->viewport_slide_pending = false;
-			a->output->viewport_want_slide = true;
-			vidow_arrange(a->server);
-		}
 	}
 	free(a);
 }
@@ -4187,8 +4171,6 @@ static void viewport_slide(struct vidow_server *server,
 	if (output == NULL) {
 		return;
 	}
-	/* 这条过渡本身就是来兑现焦点切换的，之前记的欠账到此作废。 */
-	output->viewport_slide_pending = false;
 	if (output->viewport_anim != NULL) {
 		vidow_anim_cancel(output->viewport_anim);
 		output->viewport_anim = NULL;
@@ -4352,21 +4334,39 @@ static void output_arrange(struct vidow_server *server,
 			 * 摘掉、want_slide 还是 true，于是**又起一条**视口过渡，滚完再
 			 * 起下一条…… 一次聚焦被拆成一串动画，每滚一段回弹一次（用户
 			 * 2026-10-25：「现在不是一次滚到目标，是每滚到一个窗口回弹一次」）。 */
-			/* **动画期间又来了「换焦点列」：记一笔欠账，别丢。**
+			/* **动画期间又换了一次焦点列 = 中途改道，一条动画滚到底。**
 			 *
-			 * 用户 2026-10-26：「现在窗口聚焦不能一口气移动到目标窗口了」。
-			 * 连按 Mod+L 实测（间隔 100ms 三次）：
-			 *     第1次 焦点切换 + tween 2862 -> 1908
-			 *     第2次 焦点切换，无 tween
-			 *     第3次 焦点切换，无 tween
-			 * 焦点跑屏幕外去了。原因就是这个分支以前把 want_slide 一言
-			 * 不发地清掉，新请求连痕都不留 —— 动画结束时标志已经是假，
-			 * 视口不再滚。 */
-			if (output->viewport_want_slide) {
-				output->viewport_slide_pending = true;
+			 * 用户 2026-10-26 两次反馈：
+			 *   「现在窗口聚焦不能一口气移动到目标窗口了」
+			 *   「不对啊 应该是丝滑到底 现在怎么是一个一个窗口过度」
+			 *
+			 * 上一版把丢掉的那次请求记成欠账、等动画跑完再补一条 —— 补出来
+			 * 的效果就是「滚一段、停一下、再滚一段」，一个窗口一个窗口地过。
+			 * 要的是一路上改道：接着现在这个位置继续滚向最新的目标。
+			 *
+			 * 上面那条「绝不能因为 target 变了就重启动画」的警告针对的是
+			 * **每帧拿过冲后的视口重算 target** 那种触发：out_back 过冲让
+			 * 边界判断翻面 → target 变 → 重启 → start_ns 重置 → raw 永远
+			 * 到不了 1.0 → 每帧重启，主线程 100%。
+			 *
+			 * 这里的触发条件是 viewport_want_slide，它只在 vidow_view_focus()
+			 * 真的换了焦点列时置一次（见 5071 行上面那段），不是每帧比较
+			 * 出来的 —— 重启次数等于用户按键次数，天然有界。改完 want_slide
+			 * 立刻清掉，下一帧 anim 还挂着但标志是假，走的还是「别覆盖」
+			 * 那一支，不会再进这里。
+			 *
+			 * from 用 output->viewport_x，也就是动画当前（带过冲）的位置，
+			 * 所以改道那一刻视口不跳，只是换个方向继续走。 */
+			if (output->viewport_want_slide && target != viewport &&
+					server->config.window_move_ms > 0) {
+				output->viewport_want_slide = false;
+				viewport_slide(server, output, viewport, target,
+					server->config.window_move_ms);
+				viewport = output->viewport_x;
+			} else {
+				output->viewport_want_slide = false;
+				viewport = output->viewport_x;
 			}
-			output->viewport_want_slide = false;
-			viewport = output->viewport_x;
 		} else if (target != viewport && server->config.window_move_ms > 0 &&
 				output->viewport_want_slide) {
 			/* **只有「换了焦点列」才让视口走过渡。**

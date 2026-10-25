@@ -333,11 +333,21 @@ static void mru_layout(struct vidow_server *server) {
 	/* 先把每个预览的尺寸算出来（先按最大缩放，grid 装不下时再统一缩）。 */
 	int n = mru->n;
 	double shrink = 1.0;
-	if (cfg->mru_layout == VIDOW_MRU_GRID) {
+	bool grid_layout = cfg->mru_layout == VIDOW_MRU_GRID;
+	{
 		/* 装不下就整体缩小：横着按最宽那一行、竖着按总高度，取更狠的那个比例。
-		 * 两趟就够（第一趟估、第二趟拿缩小后的尺寸再确认一次），不搞迭代。 */
-		/* 迭代收敛：行高取整、行间距不缩，一趟算不准，多来几趟（窗口数
+		 *
+		 * **strip 也要缩。** 以前只有 grid 缩，strip 装不下就把条子滚起来，
+		 * 滚出工作区的卡片被下面那段「整张卡片不在工作区里就置空」清掉 ——
+		 * 用户 2026-10-26：「MRU 应该显示所有窗口的预览，现在超出范围的
+		 * 窗口预览会消失」。置空是为了不把卡片画到隔壁屏（场景是全局
+		 * 坐标），但代价就是滚动条尾部的窗口没有预览。现在 strip 按
+		 * 「全部一行」参与同一个收缩迭代，整条清单缩到工作区内，每个
+		 * 窗口都有预览。
+		 *
+		 * 迭代收敛：行高取整、行间距不缩，一趟算不准，多来几趟（窗口数
 		 * 有上限，代价可以忽略）。 */
+		int per_row_eff = grid_layout ? per_row : (n > 0 ? n : 1);
 		for (int pass = 0; pass < 8; pass++) {
 			double worst_w = 0, sum_h = 0;
 			int row_w = 0, row_n = 0, rows = 0, row_h = 0;
@@ -361,7 +371,7 @@ static void mru_layout(struct vidow_server *server) {
 				if (h > row_h) {
 					row_h = h;
 				}
-				if (row_n == per_row || i == n - 1) {
+				if (row_n == per_row_eff || i == n - 1) {
 					if (row_w > worst_w) {
 						worst_w = row_w;
 					}

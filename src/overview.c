@@ -1,5 +1,6 @@
 #include "server.h"
 #include "ipc.h"
+#include "xtrace.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -267,7 +268,22 @@ static int row_rect_w(struct vidow_server *server,
 		box.width = ov->out_w;
 		box.height = ov->out_h;
 	}
-	int w = (int)lround(ov->row_h * (double)box.width / (double)box.height);
+	/* **宽按工作区算，不按整块输出算。**
+	 *
+	 * 行里的内容坐标是「工作区局部」的（row_view_rect 交给
+	 * vidow_workspace_preview_layout 的是 ov->out_w / ov->out_h，也就是扣掉
+	 * 面板之后的工作区），而这里以前拿整块输出的长宽比 —— 1920x1080 对
+	 * 1904x1025，比例差 4%。于是矩形比内容窄一圈：靠右的窗口探出矩形外面，
+	 * 看着就是「预览窗口和工作区区域对不上」（用户 2026-10-26 报的就是
+	 * 「两个 0.5 窗口在 overview 超出了工作区范围」）。
+	 *
+	 * 用同一个尺寸算就严丝合缝：内容宽 = out_w * scale，矩形宽 = row_h *
+	 * (out_w / out_h) = out_h * scale * out_w / out_h = out_w * scale。 */
+	if (box.width < 1 || box.height < 1) {
+		box.width = ov->out_w;
+		box.height = ov->out_h;
+	}
+	int w = (int)lround(ov->row_h * (double)ov->out_w / (double)ov->out_h);
 	return w > 0 ? w : 1;
 }
 
@@ -873,6 +889,18 @@ void vidow_overview_map(struct vidow_server *server, struct vidow_view *view,
 	if (row == NULL ||
 			!row_view_rect(server, out, row, view, &lx, &ly, &lw, &lh)) {
 		return; /* 不在这块屏的工作区里 / 最小化：原样 */
+	}
+	if (vidow_xtrace_on() && ov->t >= 0.999) {
+		wlr_log(WLR_INFO, "ov-trace: %s ws=%p row=%p 局部=%d,%d %dx%d "
+			"行矩形=%d,%d %dx%d 行高=%.0f content_x=%.0f scale=%.3f "
+			"-> 屏=%d,%d",
+			vidow_view_title(view) != NULL ?
+				vidow_view_title(view) : "(无题)",
+			(void *)view->ws, (void *)row, (int)lx, (int)ly, lw, lh,
+			row->rect_x, row->y, row->rect_w, out->ov.row_h,
+			row->content_x, out->ov.scale,
+			(int)lround(row->content_x + (lx + oxr) * out->ov.scale),
+			(int)lround((double)row->y + (ly + oyr) * out->ov.scale));
 	}
 	/* 展开那一端：这一行里的位置。中间在「原来在哪」和「行里在哪」之间线性插值
 	 * —— 进出的动画都在 t 上走，t = 0 那一端正好是原样。 */

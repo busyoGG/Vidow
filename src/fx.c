@@ -2210,9 +2210,6 @@ static bool view_wants_blur_ever(struct vidow_view *view) {
 	 * 注意是「这一刻不给贴图」而不是把 fx->blur 关掉 —— 那个标志是 fx_begin()
 	 * 按配置设的，改它的话退出 overview 之后就再也恢复不了（踩过：overview 一趟
 	 * 回来，所有窗口的装饰底衬都不模糊了）。 */
-	if (vidow_overview_active(view->server)) {
-		return false;
-	}
 	if (view->rule_eff.set[VRA_BLUR] ||
 			view->server->config.blur_all ||
 			view->float_mode != VIDOW_FLOAT_NONE) {
@@ -2739,7 +2736,23 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 	 *
 	 * 阈值取 0.98 而不是「< 1」：overview 进出场动画的头尾几帧 ov 是 0.999 /
 	 * 0.998 这种值，那几帧窗口还是原尺寸、模糊是对的，不该跳一下。 */
-	if (ov < 0.98) {
+	/* **但 overview 里的窗口要保留模糊。**
+	 *
+	 * 上面那条阈值原本一刀切掉所有 ov < 0.98 的渲染，overview 的窗口正好
+	 * 落在这个范围（ov = 0.46）—— 于是 overview 里窗口背后那圈模糊直接没有
+	 * 了。用户 2026-10-26：「窗口模糊效果没关掉 但对不上了 几乎消失」。
+	 *
+	 * 两种情况得分开：
+	 *   - MRU / overview 的**缩略图**（mru.c 的 mru_card_thumb）：画的是窗口
+	 *     缓冲缩过一道的副本，垫一层按屏幕坐标抓的模糊就是「预览内容发糊」，
+	 *     该关；
+	 *   - overview 里**窗口自己**：它就是屏幕上那扇窗口的缩小版，背后本来就
+	 *     该糊。采样坐标已经按 ov 修好了（见下面 blur_k 那段），所以能给。
+	 *
+	 * 判据用 fx->view：缩略图那条路的 target 没有挂 view（mru.c 自己建
+	 * vidow_fx_target，只设 anim_scale / content_box），窗口那条路一定有。 */
+	bool is_thumb = fx->view == NULL;
+	if (ov < 0.98 && (is_thumb || !vidow_overview_active(server))) {
 		look.blur = false;
 	}
 	/* 果冻期间内容图里**不烘模糊**：模糊由 jelly.c 的网格单独一层按屏幕坐标
@@ -2804,15 +2817,36 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 	 * 把采样坐标按同一倍率展开：p 是缓冲像素，节点把缓冲映射到屏幕时乘了
 	 * anim_scale，所以模糊 UV 里的 p 也乘 anim_scale，再补上中心缩放的
 	 * 平移量。静止时 scale=1 / bias=0，一个像素都不变。 */
+	/* **模糊 UV 要跟着「缓冲怎么映射到屏幕」走。**
+	 *
+	 * 着色器算的是 o = (borg - content_off + p * blur_scale + blur_bias) / bsize
+	 * —— p 是**缓冲像素**，borg 是窗口在屏幕上的原点。缓冲里这个像素最终落在
+	 * 屏幕的哪个点，取决于节点把它缩放到多大：anim_scale（开合动画）和 ov
+	 * （overview / 小窗 / 预览的缩略倍率）都会缩。
+	 *
+	 * 以前只乘了 anim_scale。于是 overview 里窗口缩到 0.46、位置也换了，采样
+	 * 坐标却还按原尺寸算 —— 采到的模糊跟窗口现在盖住的那块屏幕完全不是一回
+	 * 事（窗口缩小后大多采到贴图边缘之外，clamp 之后几乎全透明）。用户
+	 * 2026-10-26 的原话：「窗口模糊效果没关掉 但对不上了 几乎消失」。
+	 *
+	 * 把 ov 一起乘进去：节点按 ov 缩小，采样半径就按 1/ov 展开 —— 窗口左边
+	 * 那个像素去采屏幕上它现在真正盖住的位置。bias 用同一条式子：中心缩放
+	 * 的平移量。
+	 *
+	 * 注意 ov 是**调用方传进来的那个**（view.c 的 fx_ov = ov * mini_scale），
+	 * 和 out_scale 用的 ov 是同一个值 —— out_scale = scale / ov 里两者同乘，
+	 * 输出倍率一点没变，所以这里只影响采样坐标，不影响烘图分辨率。 */
 	double blur_as = fx->anim_scale > 0.0 ? fx->anim_scale : 1.0;
-	fx->blur_scale_x = (float)blur_as;
-	fx->blur_scale_y = (float)blur_as;
+	double blur_ov = ov > 0.0 ? ov : 1.0;
+	double blur_k = blur_as * blur_ov;
+	fx->blur_scale_x = (float)blur_k;
+	fx->blur_scale_y = (float)blur_k;
 	fx->blur_bias_x = 0.0f;
 	fx->blur_bias_y = 0.0f;
-	if (fabs(blur_as - 1.0) > 1e-4) {
-		fx->blur_bias_x = (float)((1.0 - blur_as) *
+	if (fabs(blur_k - 1.0) > 1e-4) {
+		fx->blur_bias_x = (float)((1.0 - blur_k) *
 			((double)fx->px_pad + (double)fx->w * 0.5));
-		fx->blur_bias_y = (float)((1.0 - blur_as) *
+		fx->blur_bias_y = (float)((1.0 - blur_k) *
 			((double)fx->px_pad + (double)fx->h * 0.5));
 	}
 

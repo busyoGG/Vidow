@@ -1329,24 +1329,6 @@ struct vidow_output {
 	 * Pass 2）。关窗 / 列宽变化 / 拖拽落位不置它 —— 那些情况该由每个窗口
 	 * 自己的位移补间表现补位，视口一过渡就会把所有窗口的补间掐掉。 */
 	bool viewport_want_slide;
-	/* **动画期间又来了一次「换焦点列」**。
-	 *
-	 * 用户 2026-10-26：「现在窗口聚焦不能一口气移动到目标窗口了」。
-	 *
-	 * 连按 Mod+L 时，第 1 次起了 480ms 的视口过渡；第 2、3 次按下去时
-	 * 动画还在跑，arrange 走进 `viewport_anim != NULL` 那一支，把
-	 * viewport_want_slide 清掉、视口保持不动 —— 新请求就这么丢了。
-	 * 动画跑完 viewport_anim_done() 重新 arrange 时标志已经是 false，
-	 * 视口不再滚，焦点列留在屏幕外。
-	 *
-	 * 实测（间隔 100ms 连按 3 次）：
-	 *     第1次 焦点切换 + tween 2862 -> 1908
-	 *     第2次 焦点切换，无 tween
-	 *     第3次 焦点切换，无 tween
-	 *
-	 * 这个字段就是「欠着的那一次」：动画期间被丢掉时置真，动画结束那帧
-	 * 消费掉并补一条过渡，让视口接着滚到最新目标。 */
-	bool viewport_slide_pending;
 	/* 切工作区的过渡：正在被推开的（旧的）那块工作区，和驱动它的动画。
 	 * 过渡期间 arrange 会把 slide_from 的列也摆一遍（按它自己的 slide_y），
 	 * 见 view.c 的 output_arrange 和 workspace.c 的 slide_start。 */
