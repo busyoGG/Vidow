@@ -4141,10 +4141,24 @@ static void viewport_anim_done(void *data, bool cancelled) {
 		if (!cancelled && a->output->viewport_anim != NULL) {
 			a->output->viewport_x = a->output->viewport_anim_to;
 		}
-		a->output->viewport_anim = NULL;
+		/* **先把这一帧摆完，再摘掉 viewport_anim。**
+		 *
+		 * 以前是反过来的：viewport_anim = NULL 之后才 vidow_arrange()。于是
+		 * 这一趟 arrange 里 viewport_sliding() 已经是假，每个窗口都发现
+		 * 「我的 geom 跟上一帧画的位置不一样」（视口从过冲位置落到精确终点，
+		 * 差那一点点），于是各起一条 window_move_ms 的位移补间 —— 整条带子
+		 * 滚到位之后，又慢悠悠补 480ms 的位移，回弹全堆在这一段。
+		 *
+		 * 用户 2026-10-25：「窗口回弹动画是在聚焦滚动完最后才跑的」「聚焦过渡
+		 * 动画怎么不能一次性滚到目标，变成一个一个窗口过渡动画完了才能动」。
+		 *
+		 * 正确的语义：**视口过渡结束的那一帧，位置仍然归视口管**。摆完再摘，
+		 * 窗口的 geom 就在这一帧落定，不产生残余位移差，也就不会起那条多余
+		 * 的补间。 */
 		if (!cancelled) {
 			vidow_arrange(a->server);
 		}
+		a->output->viewport_anim = NULL;
 	}
 	free(a);
 }
@@ -4180,7 +4194,11 @@ static void viewport_slide(struct vidow_server *server,
 		free(a);
 		return;
 	}
-	wlr_log(WLR_DEBUG, "viewport tween: %.0f -> %.0f（%dms）", from, to, ms);
+	/* INFO 级：这条一帧最多打一行，而「滚动被打断成一段一段」这种问题只有
+	 * 看见「一次预期 → 一串 tween」才能判断。用户报「每滚到一个窗口回弹一次」
+	 * 时就是靠它定位的。 */
+	wlr_log(WLR_INFO, "viewport tween: %.0f -> %.0f（%dms，want_slide=%d）",
+		from, to, ms, (int)output->viewport_want_slide);
 }
 
 static bool viewport_sliding(struct vidow_server *server,
@@ -4306,6 +4324,15 @@ static void output_arrange(struct vidow_server *server,
 			 * 目标只该在**动画启动那一刻**定下来；跑到一半改主意属于
 			 * 「用户又按了一次」—— 那条路走下面 viewport_want_slide
 			 * 分支（那时 anim 已经是 NULL）。 */
+			/* **这里必须把 want_slide 清掉。**
+			 *
+			 * 它是「下一次 arrange 让视口走过渡」的一次性许可，只有消费掉才
+			 * 算数。以前这个分支不清，标志会一直留到动画跑完 ——
+			 * viewport_anim_done() 里那句 vidow_arrange() 进来时 anim 已经
+			 * 摘掉、want_slide 还是 true，于是**又起一条**视口过渡，滚完再
+			 * 起下一条…… 一次聚焦被拆成一串动画，每滚一段回弹一次（用户
+			 * 2026-10-25：「现在不是一次滚到目标，是每滚到一个窗口回弹一次」）。 */
+			output->viewport_want_slide = false;
 			viewport = output->viewport_x;
 		} else if (target != viewport && server->config.window_move_ms > 0 &&
 				output->viewport_want_slide) {
