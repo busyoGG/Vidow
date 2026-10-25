@@ -98,7 +98,10 @@ static void usage(void) {
 "订阅：watch [事件名…]\n"
 "\n"
 "指认目标：--id N / --app-id 名字 / --title 子串 / --output 输出名 / --workspace 名字\n"
-"选项：--socket PATH --raw --timeout SEC --json '<JSON>' / --button 键 --count N\n", stderr);
+"选项：--socket PATH --raw --short --timeout SEC --json '<JSON>' / --button 键 --count N\n"
+"      --short（windows 专用）：打一张表而不是全量 JSON —— 每个窗口一行，\n"
+"      只列 ID / 屏 / 工作区 / 几何 / 宽度倍数 / 标记 / app_id / 标题。\n"
+"      标记：F 浮动 / f 全屏 / M 最小化 / * 焦点 / h 不在当前工作区 / ! 未映射\n", stderr);
 }
 
 /* ------------------------------------------------------------- 参数 */
@@ -252,6 +255,392 @@ static const char *positional_key(const char *cmd, int index) {
 /* ------------------------------------------------------------- 排版 */
 
 /* 把一段 JSON 排成给人看的样子（字符串里的东西一个字节都不动）。 */
+static void pretty_print(const char *line, size_t len);
+
+/* ---------------------------------------------------------- 简易版窗口表
+ *
+ * `vidowmsg windows --short`：一屏看完，一行一个窗口。
+ *
+ * 全量 windows 有 45 个字段、一个窗口上百行 —— 找「这个窗口在哪块屏、
+ * 什么 app」的时候根本没法看。这里只挑最常看的几列。
+ *
+ * **不引 JSON 解析器**：这个文件刻意只依赖 POSIX（见文件头），为了一张表把
+ * json.c 拖进来不值。这里是「够用就好」的字段抽取 —— 只在 windows 的应答
+ * 上用，字段都是合成的固定名字（id / title / app_id …），不会嵌套到
+ * 需要真解析器的程度。抽取失败就退回完整 JSON，不会把数据弄丢。 */
+
+/* 在 obj 开头那段里找 "key":<value>，返回值起点，*len 给长度。
+ * val_kind: 1 = 字符串（去引号、解 \\" 和 \\\\），2 = 数字/true/false/null。 */
+static const char *json_field(const char *obj, size_t obj_len,
+		const char *key, size_t *val_len, int *val_kind) {
+	char pat[64];
+	snprintf(pat, sizeof(pat), "\"%s\":", key);
+	size_t plen = strlen(pat);
+	for (size_t i = 0; i + plen <= obj_len; i++) {
+		if (memcmp(obj + i, pat, plen) != 0) {
+			continue;
+		}
+		const char *v = obj + i + plen;
+		if ((size_t)(v - obj) >= obj_len) {
+			return NULL;
+		}
+		if (*v == '"') {
+			const char *e = v + 1;
+			while ((size_t)(e - obj) < obj_len && *e != '\0') {
+				if (*e == '\\') {
+					e += 2;
+					continue;
+				}
+				if (*e == '"') {
+					break;
+				}
+				e++;
+			}
+			*val_len = (size_t)(e - (v + 1));
+			*val_kind = 1;
+			return v + 1;
+		}
+		const char *e = v;
+		while ((size_t)(e - obj) < obj_len && *e != ',' && *e != '}' &&
+				*e != ']' && *e != '\n') {
+			e++;
+		}
+		*val_len = (size_t)(e - v);
+		*val_kind = 2;
+		return v;
+	}
+	return NULL;
+}
+
+/* 把 (ptr,len) 抄进 out，解掉 JSON 的 \" \\ \n \t；屏幕宽度按 UTF-8 算。 */
+static void json_copy(char *out, size_t out_sz, const char *ptr, size_t len) {
+	size_t o = 0;
+	for (size_t i = 0; i < len && o + 1 < out_sz; i++) {
+		char c = ptr[i];
+		if (c == '\\' && i + 1 < len) {
+			char n = ptr[++i];
+			c = n == 'n' ? ' ' : (n == 't' ? ' ' : n);
+		}
+		out[o++] = c;
+	}
+	out[o] = '\0';
+}
+
+/* 显示宽度：UTF-8 连续字节算一个字符；东亚宽字符（3 字节的）算两格。 */
+static int text_width(const char *str) {
+	int w = 0;
+	for (const unsigned char *p = (const unsigned char *)str; *p != '\0';) {
+		if (*p < 0x80) {
+			w += 1;
+			p += 1;
+		} else if ((*p & 0xE0) == 0xC0) {
+			w += 1;
+			p += 2;
+		} else if ((*p & 0xF0) == 0xE0) {
+			w += 2; /* CJK：占两格 */
+			p += 3;
+		} else {
+			w += 1;
+			p += 4;
+		}
+	}
+	return w;
+}
+
+/* 按显示宽度补空格（用于对齐）。 */
+static void pad_to(const char *str, int want) {
+	fputs(str, stdout);
+	int w = text_width(str);
+	for (int i = w; i < want; i++) {
+		fputc(' ', stdout);
+	}
+}
+
+/* 截断到 maxw 显示宽度，末尾加 …（省得一个长标题把整张表撑开）。 */
+static void clip_to(char *out, size_t out_sz, const char *src, int maxw) {
+	size_t o = 0;
+	int w = 0;
+	for (const unsigned char *p = (const unsigned char *)src; *p != '\0';) {
+		int cw, cbytes;
+		if (*p < 0x80) {
+			cw = 1;
+			cbytes = 1;
+		} else if ((*p & 0xE0) == 0xC0) {
+			cw = 1;
+			cbytes = 2;
+		} else if ((*p & 0xF0) == 0xE0) {
+			cw = 2;
+			cbytes = 3;
+		} else {
+			cw = 1;
+			cbytes = 4;
+		}
+		if (w + cw > maxw) {
+			if (o + 4 < out_sz) {
+				memcpy(out + o, "…", 3);
+				o += 3;
+			}
+			break;
+		}
+		if (o + (size_t)cbytes + 1 > out_sz) {
+			break;
+		}
+		memcpy(out + o, p, (size_t)cbytes);
+		o += (size_t)cbytes;
+		w += cw;
+		p += cbytes;
+	}
+	out[o] = '\0';
+}
+
+/* 应答里的 windows 数组 -> 一张表。
+ *
+ * 列：id / 屏 / 工作区 / 尺寸 / 宽度倍数 / 状态标记 / app_id / 标题
+ * 标记位（紧凑写）：F=浮动 T=平铺 M=最小化 f=全屏 *=焦点 h=隐藏 !=未映射 */
+static void print_windows_short(const char *line, size_t len) {
+	const char *arr = strstr(line, "\"result\":");
+	arr = arr != NULL ? arr + 9 : line;
+	/* 定位顶层数组 */
+	const char *p = strchr(arr, '[');
+	if (p == NULL) {
+		pretty_print(line, len);
+		return;
+	}
+	p++;
+	int count = 0;
+
+	/* 先扫一遍算列宽，再打 —— 不然对齐不了。 */
+	struct row {
+		char id[12], out[16], ws[20], geo[24], cw[8], flags[12];
+		char app[28], title[64];
+	};
+	static struct row rows[256];
+	/* 初值是表头的显示宽度 */
+	int wid_id = text_width("ID"), wid_out = text_width("屏");
+	int wid_ws = text_width("工作区"), wid_geo = text_width("几何");
+	int wid_cw = text_width("宽"), wid_flags = text_width("标记");
+	int wid_app = text_width("app_id");
+
+	const char *end = line + len;
+	while (p < end && *p != ']' && count < 256) {
+		if (*p != '{') {
+			p++;
+			continue;
+		}
+		/* 这个对象的范围：配对花括号（跳过字符串里的） */
+		const char *obj = p;
+		int depth = 0;
+		bool instr = false;
+		bool esc = false;
+		for (; p < end; p++) {
+			char c = *p;
+			if (instr) {
+				if (esc) {
+					esc = false;
+				} else if (c == '\\') {
+					esc = true;
+				} else if (c == '"') {
+					instr = false;
+				}
+				continue;
+			}
+			if (c == '"') {
+				instr = true;
+			} else if (c == '{' || c == '[') {
+				depth++;
+			} else if (c == '}' || c == ']') {
+				depth--;
+				if (depth == 0) {
+					p++;
+					break;
+				}
+			}
+		}
+		size_t olen = (size_t)(p - obj);
+		struct row *r = &rows[count];
+
+		size_t vl;
+		int vk;
+		const char *v = json_field(obj, olen, "id", &vl, &vk);
+		if (v != NULL) {
+			json_copy(r->id, sizeof(r->id), v, vl);
+		} else {
+			r->id[0] = '\0';
+		}
+		v = json_field(obj, olen, "output", &vl, &vk);
+		if (v != NULL && vk == 1) {
+			json_copy(r->out, sizeof(r->out), v, vl);
+		} else {
+			snprintf(r->out, sizeof(r->out), "-");
+		}
+		v = json_field(obj, olen, "workspace", &vl, &vk);
+		/* 工作区没起名字时字段是空串（不是 null）：空串也得回退到序号，
+		 * 不然整列空白 —— 而窗口几乎全都没起名字。 */
+		if (v != NULL && vk == 1 && vl > 0) {
+			json_copy(r->ws, sizeof(r->ws), v, vl);
+		} else {
+			/* 工作区没名字：用序号（同名工作区很常见） */
+			const char *wid = json_field(obj, olen, "workspace_id",
+				&vl, &vk);
+			if (wid != NULL) {
+				char num[12];
+				snprintf(num, sizeof(num), "%.*s", (int)vl, wid);
+				snprintf(r->ws, sizeof(r->ws), "#%s", num);
+			} else {
+				snprintf(r->ws, sizeof(r->ws), "-");
+			}
+		}
+		/* 几何：从 "geometry":{…} 里拿 x/y/width/height */
+		{
+			const char *gg = strstr(obj, "\"geometry\":");
+			r->geo[0] = '\0';
+			if (gg != NULL && (size_t)(gg - obj) < olen && gg[11] == '{') {
+				const char *ge = strchr(gg, '}');
+				if (ge != NULL) {
+					size_t gl = (size_t)(ge - gg);
+					int gx = 0, gy = 0, gw = 0, gh = 0;
+					const char *q;
+					if ((q = json_field(gg, gl, "x", &vl, &vk)) != NULL) {
+						gx = atoi(q);
+					}
+					if ((q = json_field(gg, gl, "y", &vl, &vk)) != NULL) {
+						gy = atoi(q);
+					}
+					if ((q = json_field(gg, gl, "width", &vl, &vk)) != NULL) {
+						gw = atoi(q);
+					}
+					if ((q = json_field(gg, gl, "height", &vl, &vk)) != NULL) {
+						gh = atoi(q);
+					}
+					snprintf(r->geo, sizeof(r->geo), "%d,%d %dx%d",
+						gx, gy, gw, gh);
+				}
+			}
+			if (r->geo[0] == '\0') {
+				snprintf(r->geo, sizeof(r->geo), "-");
+			}
+		}
+		v = json_field(obj, olen, "column_width", &vl, &vk);
+		if (v != NULL) {
+			char tmp[16];
+			snprintf(tmp, sizeof(tmp), "%.*s", (int)vl, v);
+			double cw = atof(tmp);
+			snprintf(r->cw, sizeof(r->cw), "%.2g", cw);
+		} else {
+			snprintf(r->cw, sizeof(r->cw), "-");
+		}
+		/* 标记位 */
+		{
+			char fl[16];
+			int n = 0;
+			bool floating = false, fullscreen = false, minimized = false;
+			bool focused = false, visible = false, mapped = false;
+			v = json_field(obj, olen, "floating", &vl, &vk);
+			floating = v != NULL && strncmp(v, "true", 4) == 0;
+			v = json_field(obj, olen, "fullscreen", &vl, &vk);
+			fullscreen = v != NULL && strncmp(v, "true", 4) == 0;
+			v = json_field(obj, olen, "minimized", &vl, &vk);
+			minimized = v != NULL && strncmp(v, "true", 4) == 0;
+			v = json_field(obj, olen, "focused", &vl, &vk);
+			focused = v != NULL && strncmp(v, "true", 4) == 0;
+			v = json_field(obj, olen, "visible", &vl, &vk);
+			visible = v != NULL && strncmp(v, "true", 4) == 0;
+			v = json_field(obj, olen, "mapped", &vl, &vk);
+			mapped = v != NULL && strncmp(v, "true", 4) == 0;
+			if (floating) {
+				fl[n++] = 'F';
+			}
+			if (fullscreen) {
+				fl[n++] = 'f';
+			}
+			if (minimized) {
+				fl[n++] = 'M';
+			}
+			if (focused) {
+				fl[n++] = '*';
+			}
+			if (!visible) {
+				fl[n++] = 'h';
+			}
+			if (!mapped) {
+				fl[n++] = '!';
+			}
+			fl[n] = '\0';
+			snprintf(r->flags, sizeof(r->flags), "%s", n > 0 ? fl : "-");
+		}
+		v = json_field(obj, olen, "app_id", &vl, &vk);
+		if (v != NULL && vk == 1) {
+			json_copy(r->app, sizeof(r->app), v, vl);
+		} else {
+			snprintf(r->app, sizeof(r->app), "-");
+		}
+		v = json_field(obj, olen, "title", &vl, &vk);
+		{
+			char full[512];
+			if (v != NULL && vk == 1) {
+				json_copy(full, sizeof(full), v, vl);
+			} else {
+				snprintf(full, sizeof(full), "-");
+			}
+			clip_to(r->title, sizeof(r->title), full, 40);
+		}
+
+		/* 列宽按**显示宽度**算（CJK 表头占两格），并且把表头也算进去。 */
+		int w;
+		if ((w = text_width(r->id)) > wid_id) {
+			wid_id = w;
+		}
+		if ((w = text_width(r->out)) > wid_out) {
+			wid_out = w;
+		}
+		if ((w = text_width(r->ws)) > wid_ws) {
+			wid_ws = w;
+		}
+		if ((w = text_width(r->geo)) > wid_geo) {
+			wid_geo = w;
+		}
+		if ((w = text_width(r->cw)) > wid_cw) {
+			wid_cw = w;
+		}
+		if ((w = text_width(r->flags)) > wid_flags) {
+			wid_flags = w;
+		}
+		if ((w = text_width(r->app)) > wid_app) {
+			wid_app = w;
+		}
+		count++;
+	}
+
+	if (count == 0) {
+		fputs("（没有窗口）\n", stdout);
+		return;
+	}
+
+	/* 表头 */
+	pad_to("ID", wid_id + 2);
+	pad_to("屏", wid_out + 2);
+	pad_to("工作区", wid_ws + 2);
+	pad_to("几何", wid_geo + 2);
+	pad_to("宽", wid_cw + 2);
+	pad_to("标记", wid_flags + 2);
+	pad_to("app_id", wid_app + 2);
+	fputs("标题\n", stdout);
+
+	for (int i = 0; i < count; i++) {
+		struct row *r = &rows[i];
+		pad_to(r->id, wid_id + 2);
+		pad_to(r->out, wid_out + 2);
+		pad_to(r->ws, wid_ws + 2);
+		pad_to(r->geo, wid_geo + 2);
+		pad_to(r->cw, wid_cw + 2);
+		pad_to(r->flags, wid_flags + 2);
+		pad_to(r->app, wid_app + 2);
+		fputs(r->title, stdout);
+		fputc('\n', stdout);
+	}
+	fprintf(stdout, "\n总共 %d 个窗口\n", count);
+}
+
 static void pretty_print(const char *line, size_t len) {
 	int depth = 0;
 	bool in_string = false;
@@ -409,6 +798,7 @@ int main(int argc, char *argv[]) {
 	const char *socket_path = NULL;
 	const char *json_arg = NULL;
 	bool raw = false;
+	bool short_out = false;
 	int timeout_sec = 5;
 	bool watch = false;
 
@@ -431,6 +821,8 @@ int main(int argc, char *argv[]) {
 			json_arg = argv[++i];
 		} else if (strcmp(a, "--raw") == 0) {
 			raw = true;
+		} else if (strcmp(a, "--short") == 0 || strcmp(a, "-s") == 0) {
+			short_out = true;
 		} else if (strcmp(a, "--timeout") == 0 && i + 1 < argc) {
 			timeout_sec = atoi(argv[++i]);
 		} else if (strcmp(a, "--help") == 0 || strcmp(a, "-h") == 0 ||
@@ -661,6 +1053,9 @@ int main(int argc, char *argv[]) {
 					} else if (raw) {
 						printf("%s\n", start);
 						fflush(stdout);
+					} else if (short_out && cmd != NULL &&
+							strcmp(cmd, "windows") == 0) {
+						print_windows_short(start, strlen(start));
 					} else {
 						/* 应答是 {"ok":true,"result":…}：只排 result
 						 * 那一段（末尾那个 '}' 是信封的，去掉）。 */
