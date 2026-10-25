@@ -2,6 +2,7 @@
 #include "flipprobe.h"
 #include "ipc.h"
 #include "x11surface.h"
+#include "xtrace.h"
 #include "xwm.h"
 
 #include <drm_fourcc.h>
@@ -8840,6 +8841,50 @@ void vidow_view_new_x11(struct vidow_x11_surface *xsurface) {
 		xsurface->override_redirect ? "，override-redirect" : "",
 		view->float_mode == VIDOW_FLOAT_NONE ? "平铺" : "浮动",
 		view->popup ? "，弹出物（不装饰/不进布局/不做动画）" : "");
+
+	/* **X11：窗口一建出来就先回一次 configure，别等它进布局。**
+	 *
+	 * 这是一条死锁，Steam 关掉再打开必踩（用户 2026-10-26 报的「steam
+	 * 第二次窗口打不开了，黑屏」）：
+	 *
+	 *   Steam 建好顶层窗口 → 等一个 configure 才 XMapWindow
+	 *   → 不 map 就没有 wayland surface（xwayland 那时才导出）
+	 *   → 没 surface 就进不了布局（arrange 只走 ws->columns 里的 view）
+	 *   → 不进布局，vidow_place_view 永远不调 set_size，configure 一条不发
+	 *   → Steam 永远等不到 → 画面永远黑
+	 *
+	 * 实测（2026-10-26）：`counts` 里 windows=194 / windows_mapped=6 /
+	 * columns=0 —— Steam 的 view 在链上、不在列里；xwininfo 是
+	 * `Map State: IsUnMapped`、`WM_STATE: not found`；日志里只有
+	 * `xwm: create xid=0x2000041`，一条 x11-cfg 都没有。手动
+	 * `xdotool windowmap` 之后 Vidow 立刻 associate 并正常显示（截图确认）。
+	 *
+	 * 所以这一步必须**脱离布局**独立做：用 X 侧报上来的几何（就是客户端
+	 * 自己要的尺寸，create 时从 XGetWindowAttributes 读的）原样回给它。
+	 * ICCCM 允许这样做，Hyprland 在 XSurface 建好时同样会先发一次。
+	 *
+	 * 已经 mapped 的不发：那种窗口走正常 arrange 那条路（vidow_place_view），
+	 * 这里再发一次会和布局抢几何。
+	 *
+	 * 尺寸 <= 0 时不发：那是「客户端自己定」的语义，回 0x0 等于命令它保持
+	 * 1x1（见 vidow_view_set_size 里 w <= 0 那段注释）。 */
+	if (vidow_xtrace_on()) {
+		wlr_log(WLR_INFO, "x11-cfg-create: %s or=%d popup=%d %dx%d mapped=%d",
+			vidow_view_title(view) != NULL ? vidow_view_title(view) : "(无题)",
+			(int)xsurface->override_redirect, (int)view->popup,
+			xsurface->width, xsurface->height, (int)xsurface->mapped);
+	}
+	if (!xsurface->override_redirect && !view->popup &&
+			xsurface->width > 0 && xsurface->height > 0 &&
+			!xsurface->mapped) {
+		vidow_x11_surface_configure(xsurface,
+			(int16_t)xsurface->x, (int16_t)xsurface->y,
+			(uint16_t)xsurface->width, (uint16_t)xsurface->height);
+		wlr_log(WLR_INFO, "x11: 新窗口先回 configure %d,%d %dx%d"
+			"（不等布局，破 map/configure 死锁）",
+			xsurface->x, xsurface->y,
+			xsurface->width, xsurface->height);
+	}
 }
 
 /* ---- 给 xwm_x11.c 的直接入口 ------------------------------------------

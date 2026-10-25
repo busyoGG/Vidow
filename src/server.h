@@ -4103,10 +4103,33 @@ struct wlr_box vidow_view_geometry(const struct vidow_view *view);
  * fullscreen 规则，窗口建出来闪一下就没了，主窗口从头到尾 IsUnMapped；同一份
  * 配置在 Hyprland 上正常（Hyprland 用 fullscreen_state 请求式下发，不看 map）。
  *
- * X11 只要有 surface 就能发 _NET_WM_STATE / configure —— 那只是 X 属性，不挑时机。 */
+ * X11 只要有 surface 就能发 _NET_WM_STATE / configure —— 那只是 X 属性，不挑时机。
+ *
+ * **2026-10-26：X11 分支不再要求 surface。** 上面那段「米哈游启动器」的结论
+ * 只改了「不要求 mapped」，还留着 `view->x11->surface != NULL` —— 那条同样是
+ * 死锁的一半，Steam 主窗口就是这么卡死的：
+ *
+ *   Steam 关掉再打开 → 它建好 3808x2050 的顶层窗口，然后**等一个 configure**
+ *   才 XMapWindow（实测 xwininfo: Map State: IsUnMapped，WM_STATE 都没有）
+ *   → 不 map，xwayland 就不建 wayland surface
+ *   → 这里的 surface != NULL 为假，configure 永远不发
+ *   → Steam 永远等不到，画面永远是黑的
+ *
+ * 实测钉死的三点（2026-10-26 会话）：
+ *   ① xwininfo -id 0x2000041 → `Map State: IsUnMapped`、`WM_STATE: not found`
+ *   ② 日志里 xwm 只有 `create xid=0x2000041 3808x2050`，**没有一条 MapRequest**
+ *   ③ 手动 `xdotool windowmap 0x2000041` → Vidow 立刻
+ *      `associate xid=0x2000041 serial=2 surface=0x...`，画面正常（截图确认）
+ *
+ * 而 vidow_x11_surface_configure() 通篇只用 s->window_id 发 xcb_configure_window
+ * + 合成 ConfigureNotify，**一个字节的 surface 都不碰**。所以那条判据纯属多余。
+ *
+ * 判据改成「窗口还在（s 非 NULL）」：X 侧的 configure 是发给 X 窗口的，只要
+ * 那个窗口还没销毁就该发。 */
 static inline bool vidow_view_configure_ready(const struct vidow_view *view) {
 	if (view->kind == VIDOW_VIEW_X11) {
-		return view->x11 != NULL && view->x11->surface != NULL;
+		return view->x11 != NULL &&
+			view->x11->window_id != XCB_WINDOW_NONE;
 	}
 	return view->xdg_toplevel != NULL &&
 		view->xdg_toplevel->base->initialized;
