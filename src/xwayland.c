@@ -680,9 +680,26 @@ bool vidow_xwayland_apply_config(struct vidow_server *server) {
 	 *
 	 * enable_wm = true：让 Xwayland 建 wm_fd 并传 -wm 参数。这个 fd 到了
 	 * xwayland_ready() 里就交给 xcb_connect_to_fd，成为我们自己的 XWM 连接。
-	 * lazy = true：真有客户端连 X 的时候才起进程。 */
+	 * lazy = false：**必须关掉懒启动。**
+	 *
+	 * wlroots 的懒启动路径（server.c 的 server_start_lazy）是这样交接的：
+	 * 先把 x_fd[0]/x_fd[1] 注册到合成器的事件循环，等第一个连接到来，
+	 * xwayland_socket_connected() 把这两个注册**移除**，再 server_start()
+	 * 把 fd 用 -listenfd 传给 Xwayland —— 从此 accept 的责任归 Xwayland。
+	 *
+	 * 但 Xwayland 24.1.14 不接管：实测它的 epoll 里只有 Wayland 连接和
+	 * -wm 那个 fd，两个 -listenfd 一个都没注册，strace 下连接进了队列它
+	 * 也**一次 accept 都不调**。于是第一个连接之后就再也进不来人 ——
+	 * /tmp/.X11-unix/X0 的 accept 队列（backlog 只有 1，见 wlroots
+	 * sockets.c 的 listen(fd, 1)）被 fcitx5 / xrdb 这类自启动客户端占满，
+	 * 后面所有 X 应用都卡在 connect() 里：xclock 停在 unix_wait_for_peer、
+	 * xdpyinfo 直接超时。用户看到的就是「X 阻塞了，X 应用打不开，自启动
+	 * 流程也卡住」。
+	 *
+	 * lazy = false 走 server_start() 直接起，Xwayland 从第一刻就持有
+	 * listen fd，不经过那段会丢注册的交接。 */
 	struct wlr_xwayland_server_options options = {
-		.lazy = true,
+		.lazy = false,
 		.enable_wm = true,
 		.no_touch_pointer_emulation = true,
 		.force_xrandr_emulation = false,
