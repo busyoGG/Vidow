@@ -395,6 +395,27 @@ static void handle_surface_destroy(struct wl_listener *listener, void *data) {
 		vidow_view_x11_gone(s->view);
 	}
 	s->surface = NULL;
+	/* **serial 必须跟着一起清。**
+	 *
+	 * 用户报的「Steam 第二次窗口打不开」。实测时序（VIDOW_X11_TRACE）：
+	 *
+	 *   00:05:38.462  UnmapNotify  surface=0x560b3c5610d0
+	 *   00:05:42.501  MapRequest   surface=(nil)
+	 *   00:05:42.604  client_message serial=3   ← 新 serial 到了
+	 *
+	 * 中间这 4 秒 Steam 把旧表面销毁了，我们在这里把 s->surface 清成
+	 * NULL —— 但 serial 留着上一次的值。于是新 serial 到达时，下面那句
+	 *
+	 *     if (s->serial != 0) return;
+	 *
+	 * 把它当重复消息丢掉；handle_shell_new_surface() 那条路也配不上
+	 * （它要 s->serial == 新 serial）。两条路全断，窗口永远 associate
+	 * 不上，s->surface 一直是 NULL，xwm_surface_sync() 直接 NOOP ——
+	 * 表现就是「X 里窗口好好的，Vidow 里没有」。
+	 *
+	 * serial 的意义是「这个窗口当前那块 wl_surface 的编号」。表面没了，
+	 * 它就没有意义了，必须归零，否则下一个 serial 永远进不来。 */
+	s->serial = 0;
 }
 
 /* 表面交帧：这是「客户端真的画出东西了」的唯一证据。
@@ -459,6 +480,9 @@ static void x11_dissociate(struct vidow_x11_surface *s) {
 	wl_list_init(&s->surface_destroy.link);
 	wl_list_init(&s->surface_commit.link);
 	s->surface = NULL;
+	/* 同 handle_surface_destroy()：表面没了，serial 就失效了。
+	 * 留着它会把下一个窗口的 WL_SURFACE_SERIAL 当成重复消息丢掉。 */
+	s->serial = 0;
 }
 
 /* 找 root 上 32 位 visual 对应的 render format —— 做光标要用。
@@ -703,7 +727,14 @@ static void x11_handle_client_message(xcb_client_message_event_t *e) {
 			e->data.data32[0], e->data.data32[1]);
 	}
 	if (e->type == x11->atoms.net_wm_surface_serial) {
-		if (s->serial != 0) {
+		/* **判据是「有没有活着的表面」，不是「有没有见过 serial」。**
+		 *
+		 * 只看 s->serial != 0 会漏掉一种情况：表面已经没了（s->surface
+		 * 为 NULL）但 serial 因为某条清理路径没归零 —— 这时候新 serial
+		 * 就是唯一能救活这个窗口的东西，丢掉它窗口就永远不显示。
+		 * 真正要挡的重复消息长这样：serial 一样、表面还在。
+		 * （surface 销毁时 serial 已归零，见 handle_surface_destroy。） */
+		if (s->serial != 0 && s->surface != NULL) {
 			return;
 		}
 		uint32_t lo = e->data.data32[0];
