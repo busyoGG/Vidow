@@ -89,14 +89,21 @@ static const struct atom_spec atom_specs[] = {
 #undef ATOM
 
 static void atoms_intern(struct vidow_x11_server *x11) {
-	for (size_t i = 0; i < sizeof(atom_specs) / sizeof(atom_specs[0]); i++) {
-		const char *name = atom_specs[i].name;
-		xcb_intern_atom_cookie_t cookie = xcb_intern_atom(x11->conn, 0,
-			(uint16_t)strlen(name), name);
+	/* 和 x11_read_window_data() 同一个道理：**先全发，再全收**。
+	 * 这里是 35 个 atom，按老写法就是 35 次同步往返，全在 XWM 建起来的
+	 * 那一刻串行做完 —— 启动时白等一截。cookie 攒着一起收只要 1 次。 */
+	enum { ATOM_COUNT = sizeof(atom_specs) / sizeof(atom_specs[0]) };
+	xcb_intern_atom_cookie_t cookies[ATOM_COUNT];
+	for (size_t i = 0; i < ATOM_COUNT; i++) {
+		cookies[i] = xcb_intern_atom(x11->conn, 0,
+			(uint16_t)strlen(atom_specs[i].name), atom_specs[i].name);
+	}
+	for (size_t i = 0; i < ATOM_COUNT; i++) {
 		xcb_intern_atom_reply_t *reply =
-			xcb_intern_atom_reply(x11->conn, cookie, NULL);
+			xcb_intern_atom_reply(x11->conn, cookies[i], NULL);
 		if (reply == NULL) {
-			wlr_log(WLR_ERROR, "xwm: intern %s 失败", name);
+			wlr_log(WLR_ERROR, "xwm: intern %s 失败",
+				atom_specs[i].name);
 			continue;
 		}
 		*(xcb_atom_t *)(void *)((char *)x11 + atom_specs[i].offset) =
@@ -294,11 +301,24 @@ static void x11_read_window_data(struct vidow_x11_surface *s) {
 		x11->atoms.net_wm_opacity,
 		x11->atoms.net_wm_pid,
 	};
-	for (size_t i = 0; i < sizeof(props) / sizeof(props[0]); i++) {
-		xcb_get_property_cookie_t cookie = xcb_get_property(x11->conn, 0,
-			s->window_id, props[i], XCB_ATOM_ANY, 0, 2048);
+	/* **先把 12 个请求全发出去，再一起收回复**。
+	 *
+	 * 以前是「发一个 → 等回复 → 发下一个」，每个属性一次同步往返。12 个
+	 * 属性 = 12 次往返，而且全都在新窗口的 associate 路径上同步执行 ——
+	 * 主循环停在那里等 X 服务器，用户看到的就是「打开新窗口时卡一下」。
+	 * X 服务器慢的时候（远端、忙、Xwayland 正在初始化）会卡几百毫秒。
+	 *
+	 * xcb 的 cookie 本来就是为这个设计的：请求发出去不等，攒够了再收。
+	 * 12 次往返压成 1 次 —— 只有第一次真的等，后面 11 个回复早就到了。 */
+	enum { PROP_COUNT = sizeof(props) / sizeof(props[0]) };
+	xcb_get_property_cookie_t cookies[PROP_COUNT];
+	for (size_t i = 0; i < PROP_COUNT; i++) {
+		cookies[i] = xcb_get_property(x11->conn, 0, s->window_id,
+			props[i], XCB_ATOM_ANY, 0, 2048);
+	}
+	for (size_t i = 0; i < PROP_COUNT; i++) {
 		xcb_get_property_reply_t *reply =
-			xcb_get_property_reply(x11->conn, cookie, NULL);
+			xcb_get_property_reply(x11->conn, cookies[i], NULL);
 		if (reply == NULL) {
 			continue;
 		}
@@ -358,7 +378,25 @@ static void x11_associate(struct vidow_x11_surface *s,
 		return;
 	}
 	s->surface = surface;
+	/* 卡顿探针（VIDOW_STUTTER=1）：新窗口的 associate 是同步跑的，主循环
+	 * 停在这里等多久，用户就卡多久。读属性要问 X 服务器，慢的时候（远端
+	 * X、Xwayland 正忙）几百毫秒都可能。 */
+	struct timespec assoc_t0 = {0};
+	bool assoc_probe = getenv("VIDOW_STUTTER") != NULL;
+	if (assoc_probe) {
+		clock_gettime(CLOCK_MONOTONIC, &assoc_t0);
+	}
 	x11_read_window_data(s);
+	if (assoc_probe) {
+		struct timespec assoc_t1 = {0};
+		clock_gettime(CLOCK_MONOTONIC, &assoc_t1);
+		int64_t dt_ns = (int64_t)(assoc_t1.tv_sec - assoc_t0.tv_sec) *
+			1000000000LL + (assoc_t1.tv_nsec - assoc_t0.tv_nsec);
+		if (dt_ns >= 20 * 1000000LL) {
+			wlr_log(WLR_INFO, "卡顿: 新窗口读属性 xid=0x%x 花了 %.1fms",
+				s->window_id, (double)dt_ns / 1e6);
+		}
+	}
 
 	s->surface_destroy.notify = handle_surface_destroy;
 	wl_signal_add(&surface->events.destroy, &s->surface_destroy);
