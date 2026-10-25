@@ -460,6 +460,10 @@ static void x11_dissociate(struct vidow_x11_surface *s) {
 	s->surface = NULL;
 }
 
+/* 找 root 上 32 位 visual 对应的 render format —— 做光标要用。
+ * Hyprland 的 CXWM::getRenderFormat()。 */
+static void find_render_format(struct vidow_x11_server *x11);
+
 /* ------------------------------------------------------------ 事件处理 */
 
 static void x11_handle_create(xcb_create_notify_event_t *e) {
@@ -1037,6 +1041,22 @@ struct vidow_x11_server *vidow_x11_server_create(struct vidow_server *server,
 	xcb_composite_redirect_subwindows(conn, x11->screen->root,
 		XCB_COMPOSITE_REDIRECT_MANUAL);
 
+	/* **必须在这里找 render format，否则光标设不上。**
+	 *
+	 * 用户报的「X 应用光标没有，是叉」。实测 X 侧光标是 16x16 的 X 字形、
+	 * serial=1（从 Xwayland 启动后从未变过）—— 正是 X11 内置的默认光标。
+	 *
+	 * 根因：find_render_format() 这个函数**写好了却从来没人调用**。
+	 * render_format_id 一直是 XCB_NONE(0)，vidow_x11_set_cursor() 里那句
+	 *     xcb_render_create_picture(conn, pic, pix, x11->render_format_id, ...)
+	 * 传 format=0 必然失败，整条光标设置链静默断掉，X 客户端只好继承
+	 * Xwayland 自带的默认「叉」。
+	 *
+	 * xcb 是异步的，错误不看就永远不知道 —— 和 composite redirect 那次
+	 * 一模一样的沉默失败。Hyprland 在 CXWM::init() 里紧跟 getVisual()
+	 * 调 getRenderFormat()（XWM.cpp:1031）。 */
+	find_render_format(x11);
+
 	wm_window_create(x11);
 	supported_atoms_publish(x11);
 
@@ -1352,6 +1372,15 @@ void vidow_x11_set_cursor(const unsigned char *pixels, uint32_t stride,
 		int width, int height, int hotspot_x, int hotspot_y) {
 	struct vidow_x11_server *x11 = g_x11;
 	if (x11 == NULL || pixels == NULL || width <= 0 || height <= 0) {
+		return;
+	}
+	/* **format 为 0 就别往下走了**：xcb_render_create_picture 会失败，
+	 * 而且因为 xcb 异步、我们又不看错误，整条链静默断掉 —— 表现就是
+	 * 「光标是叉」。以前 find_render_format() 从来没被调用过，
+	 * render_format_id 一直是 0，正好踩中这条。 */
+	if (x11->render_format_id == XCB_NONE) {
+		wlr_log(WLR_ERROR, "xwm: render_format_id 是 0，光标设不了"
+			"（find_render_format 没跑？）");
 		return;
 	}
 	const int CURSOR_DEPTH = 32;
