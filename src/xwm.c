@@ -128,6 +128,22 @@ enum xwm_sync_result xwm_surface_sync(struct vidow_view *view) {
 			 * set_enabled(false)），得让布局重新算一遍把它打开、
 			 * 摆到正确位置。 */
 			vidow_arrange(view->server);
+			/* **还得让 X 客户端重画一次。**
+			 *
+			 * 光把表面 map 上不够：Steam 重开时只交了一帧空白就不再动
+			 * 了（实测 commit 只有 1 次，首开是两千多次）。它要收到
+			 * configure 才肯重新渲染 —— 用户说的「拖拽或者 resize
+			 * 一下就好」正是这个原因。
+			 *
+			 * 复用窗口重开时位置和尺寸和上次一模一样，于是 arrange 走到
+			 * view.c 那条 configure 路径时命中「和上次一模一样」直接
+			 * return —— configure 压根没发出去，客户端等一个永远不会来
+			 * 的 ConfigureNotify，画面就这么定在黑色上。
+			 *
+			 * 清掉 cfg_sent，让 arrange 下面这次 configure 真的发出去；
+			 * 几何没变的补发（合成 ConfigureNotify）由那条路径自己处理，
+			 * 判据只看 cfg_x/y/w/h、不看 cfg_sent，所以一定会跟上。 */
+			view->cfg_sent = false;
 		} else {
 			view_map(&view->map, NULL);
 		}
