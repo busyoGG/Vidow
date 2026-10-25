@@ -118,6 +118,51 @@ static void im_popup_update(struct vidow_server *server) {
 	/* 光标矩形是窗口 surface 的局部坐标，加上窗口在场景里的位置才是屏幕坐标 */
 	int px = vx + view->fx_dx + rect.x;
 	int py = vy + view->fx_dy + rect.y + rect.height;
+
+	/* **把候选框夹在当前显示器范围内**（用户：「Fcitx5弹窗现在会跨屏，
+	 * 应该夹到当前显示器范围内」）。
+	 *
+	 * 以前这里直接摆到光标正下方就完事，没有任何边界处理：光标在屏幕右半边
+	 * / 底部时光标正下方放不下，候选框就伸出本屏、画到隔壁显示器上（场景图
+	 * 是全局坐标的，隔壁那块屏照画落在自己坐标里的所有节点）。
+	 *
+	 * 夹取策略（纯夹，不翻）：
+	 *   1. 右 / 下越界：往左 / 上挪回来，挪到屏幕边上为止；
+	 *   2. 实在放不下（候选框比屏还宽 / 高）：贴左上角。
+	 * 不做「翻到光标上方」—— 那要猜候选框高度、而且每次输入都会跳，纯夹
+	 * 更稳（代价是光标贴屏幕最底时候选框会盖住光标那一行，可接受）。 */
+	struct wlr_box obox = {0};
+	struct wlr_output *out = view->output;
+	if (out != NULL) {
+		wlr_output_layout_get_box(server->output_layout, out, &obox);
+	}
+	if (obox.width > 0 && obox.height > 0) {
+		/* 用**表面逻辑尺寸**，不是 wlr_buffer 的 width/height —— 后者是
+		 * 物理像素，2 倍屏上会大出一倍，夹取就会过严（候选框明明放得下
+		 * 也被往左上拽）。 */
+		int pw = popup->scene->surface != NULL ?
+			popup->scene->surface->current.width : 0;
+		int ph = popup->scene->surface != NULL ?
+			popup->scene->surface->current.height : 0;
+		if (pw > 0 && ph > 0) {
+			int max_x = obox.x + obox.width - pw;
+			int max_y = obox.y + obox.height - ph;
+			if (px > max_x) {
+				px = max_x;
+			}
+			if (py > max_y) {
+				py = max_y;
+			}
+			/* 左 / 上：挪到头就别再挪了（候选框比屏宽时 max_x < obox.x） */
+			if (px < obox.x) {
+				px = obox.x;
+			}
+			if (py < obox.y) {
+				py = obox.y;
+			}
+		}
+	}
+
 	wlr_scene_node_set_position(&popup->scene->buffer->node, px, py);
 	/* 候选框挪了：背后那块模糊的采样坐标 / 区域跟着变，下一帧重画。 */
 	if (popup->blur != NULL) {
