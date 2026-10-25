@@ -1,4 +1,5 @@
 #include "server.h"
+#include "flipprobe.h"
 #include "ipc.h"
 #include "x11surface.h"
 #include "xwm.h"
@@ -1764,6 +1765,9 @@ static void view_pin_scale(struct vidow_view *view) {
 	 * 里直接跳过 —— 客户端不会每帧重算缓冲（见那里的注释）。 */
 	bool changed = view->pref_scale != want;
 	if (changed) {
+		if (getenv("VIDOW_FLIP") != NULL) {
+			vidow_flip_note("scale", view, want != 0);
+		}
 		view->pref_scale = want;
 		wlr_surface_set_preferred_buffer_scale(surface, want);
 		wlr_fractional_scale_v1_notify_scale(surface, (double)want);
@@ -2262,6 +2266,9 @@ static void view_apply_clip_impl(struct vidow_view *view) {
 		 * 裁的是同一块节点里的显示范围，它看不见 —— 这里自己补一笔。 */
 		vidow_backdrop_damage_view_rect(view, NULL);
 	}
+	if (getenv("VIDOW_FLIP") != NULL) {
+		vidow_flip_note("clip", view, on);
+	}
 	view->fx.clip_on = on;
 	view->fx.clip = box;
 	/* overview：**只裁画**（fx 那一份离屏缓冲），不裁表面树 ——
@@ -2510,6 +2517,9 @@ void vidow_view_render_pump(struct vidow_server *server,
 			view->pump_hidden_frames = 0;
 			view->pump_shown_frames = 0;
 			if (view->render_pumping) {
+				if (getenv("VIDOW_FLIP") != NULL) {
+					vidow_flip_note("pump", view, false);
+				}
 				view->render_pumping = false;
 				wlr_log(WLR_DEBUG, "强制渲染: %s 停（不再需要）",
 					vidow_view_title(view) != NULL ?
@@ -2817,6 +2827,9 @@ bool vidow_view_should_park(struct vidow_server *server,
 void vidow_view_set_parked(struct vidow_view *view, bool park) {
 	if (view->scene_parked == park) {
 		return;
+	}
+	if (getenv("VIDOW_FLIP") != NULL) {
+		vidow_flip_note("park", view, park);
 	}
 	view->scene_parked = park;
 	/* 它自己进/出画面了：底衬的合成结果变了。账记在它头上（它自己的私有底衬
@@ -6459,6 +6472,9 @@ void view_map(struct wl_listener *listener, void *data) {
 		return;
 	}
 
+	if (getenv("VIDOW_FLIP") != NULL) {
+		vidow_flip_note("mapped", view, true);
+	}
 	view->mapped = true;
 	vidow_portal_view_mapped(view, true);
 	/* 窗口规则先判一遍：float / workspace / output 决定它落在哪儿、怎么摆，
@@ -6679,6 +6695,21 @@ void view_unmap(struct wl_listener *listener, void *data) {
 	struct wlr_output *output = view->output;
 	x11_trace_view("unmap-enter", view, NULL);
 
+	/* **幂等**：跟 view_map 开头那道 `if (view->mapped) return;` 对称。
+	 *
+	 * XWayland 那条路会从好几个地方调 xwm_surface_sync()（property notify /
+	 * MapNotify / UnmapNotify / 我们自己 replay 之后），而 should_be_mapped()
+	 * 判的是「有没有 buffer」—— 同一个 unmap 状态可能被连着判中两次，于是
+	 * view_unmap 跑两遍：portal 收两次通知、几何重置两次、动画队列里塞两笔。
+	 * 状态不会错（都写同一个值），但每次都要重排 + 重画，是白烧掉的一帧。
+	 * map 那边早有这道闸，unmap 这边漏了。 */
+	if (!view->mapped) {
+		return;
+	}
+
+	if (getenv("VIDOW_FLIP") != NULL) {
+		vidow_flip_note("mapped", view, false);
+	}
 	view->mapped = false;
 	/* 忘了「上一次钉过几倍」：客户端 unmap 之后可能换一个新 surface 回来
 	 * （Chromium 的 widget 重建就是这样），新 surface 需要我们重新发一次
@@ -6993,6 +7024,9 @@ static void view_commit(struct wl_listener *listener, void *data) {
 				ts.tv_nsec / 1000000);
 			if (view->x11_want_frames == 0 &&
 					now_ms - view->x11_want_frames_at >= 500) {
+				if (getenv("VIDOW_FLIP") != NULL) {
+					vidow_flip_note("x11frames", view, true);
+				}
 				view->x11_want_frames = 30;
 				view->x11_want_frames_at = now_ms;
 			}
@@ -7997,6 +8031,9 @@ static void x11_drop_surface(struct vidow_view *view) {
 	x11_trace_view("drop-done", view, NULL);
 	/* Dissociate is not X11 destruction. Keep the view/layout identity, but
 	 * force the next association to replay map and rebuild scene placement. */
+	if (getenv("VIDOW_FLIP") != NULL) {
+		vidow_flip_note("mapped", view, false);
+	}
 	view->mapped = false;
 	view->x11_map_replayed = false;
 	/* **强制清理缓冲缩放状态**：Steam 二次打开时，pref_scale 残留导致

@@ -63,6 +63,15 @@ struct vidow_x11_surface {
 	/* _NET_WM_STATE 里的原子。 */
 	xcb_atom_t *state_atoms;
 	size_t state_count;
+	/* 我们自己最后一次 publish_state() 写下去的那份 _NET_WM_STATE（排序后的
+	 * 指纹）。X 会把自己写的属性再以 PropertyNotify 回发一次，那条通知进来
+	 * 又要读属性、又要重判全屏/最大化/最小化 —— 白跑一趟 X 往返，还可能引起
+	 * 重排。指纹一样就认作「这是我们自己写的回显」，直接跳过。
+	 *
+	 * 只比指纹不设时间窗：属性是 X 串行投递的，回显一定在我们写之后到；
+	 * 真客户端改了属性，指纹必然不同。 */
+	uint64_t state_echo_hash;
+	bool state_echo_valid;
 
 	xcb_size_hints_t *size_hints; /* WM_NORMAL_HINTS */
 	xcb_icccm_wm_hints_t *hints;  /* WM_HINTS */

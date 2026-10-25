@@ -145,6 +145,7 @@ sources = files(
   'src/output.c',
   'src/outputconf.c',
   'src/view.c',
+  'src/flipprobe.c',
   'src/xwm.c',
   'src/xwm_x11.c',
   'src/xwmscale.c',

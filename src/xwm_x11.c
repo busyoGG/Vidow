@@ -571,6 +571,30 @@ static void x11_handle_property_notify(xcb_property_notify_event_t *e) {
 			memcpy(&parent, xcb_get_property_value(reply), 4);
 			s->parent = surface_for_window(parent);
 		}
+	} else if (e->atom == g_x11->atoms.net_wm_state && s->state_echo_valid) {
+		/* **自己写的回显**：publish_state() 写 _NET_WM_STATE，X 会把这条
+		 * 变更再以 PropertyNotify 发回给我们。指纹一样就说明是我们刚写的
+		 * 那一份，读它、重判全屏/最大化/最小化全是白跑 —— 每次都多一趟 X
+		 * 往返，状态没变也会走一遍重排。
+		 *
+		 * 真客户端改属性时指纹必然不同（原子集合变了），所以不会误吞。 */
+		uint64_t h = 1469598103934665603ULL;
+		int len = xcb_get_property_value_length(reply);
+		int cnt = len / 4;
+		const uint32_t *vals = xcb_get_property_value(reply);
+		uint64_t acc = 0;
+		for (int i = 0; i < cnt; i++) {
+			acc ^= (uint64_t)vals[i];
+		}
+		h ^= acc;
+		h *= 1099511628211ULL;
+		if (h == s->state_echo_hash) {
+			free(reply);
+			return; /* 是我们自己写的：不重读、不重判 */
+		}
+		/* 不是回显 = 客户端真的改了状态：照常读进来（下面 free 之后统一
+		 * 走 property_changed 那条分派）。 */
+		x11_read_prop(s, e->atom, reply);
 	} else {
 		x11_read_prop(s, e->atom, reply);
 	}
@@ -1038,6 +1062,19 @@ static void publish_state(struct vidow_x11_surface *s) {
 			s->window_id, x11->atoms.net_wm_state, XCB_ATOM_ATOM, 32,
 			(uint32_t)n, props);
 	}
+	/* 记下我们刚写下去的那份的指纹：X 会把这条属性变更以 PropertyNotify
+	 * 回发给我们自己，读到同样的指纹就认作回显、跳过（见 x11surface.h 里
+	 * state_echo_hash 的说明）。
+	 *
+	 * 指纹**与顺序无关**（全部异或再乘一次）：X 属性里的原子顺序不保证
+	 * 跟写的顺序一样，按顺序算哈希会把真回显判成「不同」，过滤就失效。 */
+	uint64_t h = 1469598103934665603ULL; /* FNV-1a 64 */
+	for (int i = 0; i < n; i++) {
+		h ^= (uint64_t)props[i];
+	}
+	h *= 1099511628211ULL;
+	s->state_echo_hash = h;
+	s->state_echo_valid = true;
 	xcb_flush(x11->conn);
 }
 
