@@ -83,6 +83,26 @@ enum xwm_sync_result xwm_surface_sync(struct vidow_view *view) {
 	 * 所以提前返回的条件里必须带上表面自己的状态：两个都对齐了才算
 	 * 真的对齐。 */
 	bool surf_mapped = view->x11->surface->mapped;
+	if (vidow_xtrace_on() && view->scene_surface != NULL) {
+		/* **场景表面和 X 表面必须是同一块。**
+		 *
+		 * 用户报「Steam 第二次打开黑屏，拖拽或 resize 一下才好」。
+		 * 实测：重开后客户端 commit 了 872 次、surface->mapped=1、
+		 * view->mapped=1、configure 也确实发出去了，屏幕上还是全黑；
+		 * 而 cycle-column-width 一下立刻出画面 —— 且那一瞬间
+		 * **commit 次数是 0**。也就是说纹理一直是好的，只是场景节点
+		 * 采样的不是这块表面。 */
+		bool same = view->scene_surface->surface == view->x11->surface;
+		wlr_log(WLR_INFO, "scene-trace: %s scene_surf=%p x11_surf=%p %s "
+			"scene_mapped=%d x11_mapped=%d",
+			vidow_view_title(view) != NULL ?
+				vidow_view_title(view) : "(无题)",
+			(void *)view->scene_surface->surface,
+			(void *)view->x11->surface,
+			same ? "一致" : "**不一致，画的是旧表面**",
+			view->scene_surface->surface->mapped,
+			view->x11->surface->mapped);
+	}
 	if (want == view->mapped && (!want || surf_mapped)) {
 		return XWM_SYNC_NOOP;
 	}
