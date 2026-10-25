@@ -27,6 +27,11 @@ xcb_xfixes_dep = dependency('xcb-xfixes')
 # 32 位 ARGB 的 pixmap → render picture → cursor（照 Hyprland 的
 # CXWM::setCursor()）。
 xcb_render_dep = dependency('xcb-render')
+# 我们自己当 X 合成器：必须把 root 的子窗口 redirect 到 offscreen pixmap
+# （xcb_composite_redirect_subwindows），否则窗口内容不进合成管线，Xwayland
+# 也就不往 Wayland 交 surface —— 表现是窗口建出来了、但永远是空的。
+# Hyprland 在 CXWM::init() 里同样这一步。
+xcb_composite_dep = dependency('xcb-composite')
 # libinput 设备配置（input.c 的 vidow_input_apply_libinput）：点按 / 反向滚动 /
 # 加速曲线那些设备属性直接调 libinput。wlroots 把 libinput 放在 Requires.private
 # 里，链接时不会自动带过来，所以自己声明一份（版本跟着 wlroots 0.20 的要求）。
@@ -542,7 +547,8 @@ executable('vidow',
              xdo_server_header, xdo_client_code],
   dependencies: [wlroots_dep, xkbcommon_dep, wayland_server_dep, math_dep,
                  egl_dep, gles2_dep, pixman_dep, lua_dep, xcb_dep,
-                 xcb_xfixes_dep, xcb_render_dep, drm_dep, pipewire_dep,
+                 xcb_xfixes_dep, xcb_render_dep, xcb_composite_dep,
+                 drm_dep, pipewire_dep,
                  libinput_dep],
   include_directories: include_directories('.'),
   install: false)

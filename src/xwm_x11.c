@@ -90,6 +90,7 @@ static const struct atom_spec atom_specs[] = {
 	 * wm_selection_callback -> listen_on_fds）。没人接管就永远不 listen，
 	 * 所有 X 客户端卡死在 connect()。 */
 	ATOM(wm_s0, "WM_S0"),
+	ATOM(net_wm_cm_s0, "_NET_WM_CM_S0"),
 };
 #undef ATOM
 
@@ -823,6 +824,12 @@ static void wm_window_create(struct vidow_x11_server *x11) {
 	 *     xcb_set_selection_owner(conn, m_wmWindow, WM_S0, XCB_CURRENT_TIME) */
 	xcb_set_selection_owner(x11->conn, x11->wm_window, x11->atoms.wm_s0,
 		XCB_CURRENT_TIME);
+
+	/* **声明「我是 X 合成器」。** 截图 / 录屏 / DRI3 探测都靠这个 selection
+	 * 判断有没有合成器在跑。Hyprland 在 CXWM::createWMWindow() 里同样把
+	 * WM_S0 和 _NET_WM_CM_S0 一起挂到 wm_window 上。 */
+	xcb_set_selection_owner(x11->conn, x11->wm_window,
+		x11->atoms.net_wm_cm_s0, XCB_CURRENT_TIME);
 }
 
 static void supported_atoms_publish(struct vidow_x11_server *x11) {
@@ -948,6 +955,25 @@ struct vidow_x11_server *vidow_x11_server_create(struct vidow_server *server,
 			free(r);
 		}
 	}
+
+	/* **把 root 的子窗口 redirect 到 offscreen pixmap —— 这一步不做，X 窗口
+	 * 永远画不出内容。**
+	 *
+	 * 用户报的「x 应用都无法显示」就是它：X 侧一切正常（117 个 xwm: create、
+	 * 属性读得到、_NET_SUPPORTING_WM_CHECK 也在），但 0 个 associate、0 个
+	 * map_request —— Xwayland 手里根本没有可交的 surface。
+	 *
+	 * 原因：我们是 X 合成器，窗口的绘制必须先被重定向到 offscreen pixmap，
+	 * 合成器再把它当作纹理取走。不做 redirect，客户端的绘制直接落到屏幕
+	 * 上（rootless 下没有真实屏幕，等于丢掉），Xwayland 也就没有内容可以
+	 * 导出成 dmabuf 交给 Wayland 侧。
+	 *
+	 * Hyprland 在 CXWM::init() 里紧跟 change_window_attributes 做这一步：
+	 *     xcb_composite_redirect_subwindows(conn, screen->root,
+	 *         XCB_COMPOSITE_REDIRECT_MANUAL);
+	 * 之前我们整份代码里连 composite 扩展都没碰过。 */
+	xcb_composite_redirect_subwindows(conn, x11->screen->root,
+		XCB_COMPOSITE_REDIRECT_MANUAL);
 
 	wm_window_create(x11);
 	supported_atoms_publish(x11);
