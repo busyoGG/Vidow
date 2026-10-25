@@ -420,6 +420,31 @@ static void xwayland_ready(struct wl_listener *listener, void *data) {
 	struct vidow_server *server = wl_container_of(listener, server, xwayland_ready);
 	struct wlr_xwayland_server_ready_event *ev = data;
 
+	/* **必须在这里把 Xwayland 的 client 交给 shell。**
+	 *
+	 * wlroots 内部对 xwayland_shell_v1 的 bind 做了白名单检查（反汇编确认：
+	 * `cmp client, shell->client` / 不等就报 "Permission denied to bind to
+	 * xwayland_shell_v1"）。shell 刚 create 出来时那个字段是 NULL，谁都不
+	 * 放行 —— 包括 Xwayland 自己。
+	 *
+	 * 踩过的弯路：自己写 wl_display_set_global_filter 去比
+	 * `client == xserver->client`，永远不成立（filter 跑在 ready 之前，
+	 * 那时 xserver->client 还没赋值），于是 Xwayland 被拒在门外：
+	 *     XWAYLAND: error 3: Permission denied to bind to xwayland_shell_v1
+	 *     (EE) could not connect to wayland server
+	 *     Xwayland startup failed, not setting up xwm
+	 * 整个 X 服务起不来，/tmp/.X11-unix 空着，DISPLAY=:0 连不上。
+	 *
+	 * 正确做法就是 wlroots 给的这个入口。ready 是**唯一**能拿到
+	 * xserver->client 的时刻（start 事件在 fork 之后、连 display 之前，
+	 * 那时 client 还没分配）。 */
+	if (server->xwayland_shell != NULL && ev->server != NULL &&
+			ev->server->client != NULL) {
+		wlr_xwayland_shell_v1_set_client(server->xwayland_shell,
+			ev->server->client);
+	}
+
+
 	/* **这里是整个 X11 架构的分界线。**
 	 *
 	 * wlroots 把这个 wm_fd 交出来，等的就是有人在自己的事件循环里接住它 ——
@@ -585,24 +610,6 @@ static void handle_new_xwayland_surface(struct wl_listener *listener,
 }
 
 
-/* 只让 Xwayland 自己拿到 xwayland_shell_v1：否则任何 Wayland 客户端都能伪造
- * 「我是一个 X11 窗口」，去蹭只有 X 窗口才有的东西。 */
-static bool global_filter(const struct wl_client *client,
-		const struct wl_global *global, void *data) {
-	struct vidow_server *server = data;
-	/* 只让 Xwayland 自己拿到 xwayland_shell_v1：否则任何 Wayland 客户端都能
-	 * 伪造「我是一个 X11 窗口」，去蹭只有 X 窗口才有的东西。
-	 *
-	 * 注意这里比的是 wlr_xwayland_server->client，不再是 wlr_xwayland。
-	 * shell 对象现在是我们自己建的，Xwayland 进程由 wlr_xwayland_server 拉起。 */
-	if (server->xwayland_shell == NULL ||
-			global != server->xwayland_shell->global) {
-		return true;
-	}
-	struct wlr_xwayland_server *xserver = server->xwayland_server;
-	return xserver != NULL && client == xserver->client;
-}
-
 bool vidow_xwayland_init(struct vidow_server *server) {
 	return vidow_xwayland_apply_config(server);
 }
@@ -621,7 +628,7 @@ bool vidow_xwayland_apply_config(struct vidow_server *server) {
 		wlr_log(WLR_INFO, "xwayland: 配置里关了，拆掉 X 服务");
 		xwayland_probe_stop(server);
 		/* destroy 的信号处理会把我们的 XWM 也收掉、把 xwayland_server
-		 * 置空；global_filter 那时就成了直通车，不用再动。 */
+		 * 置空。 */
 		wlr_xwayland_server_destroy(server->xwayland_server);
 		if (server->xwayland_shell != NULL) {
 			wlr_xwayland_shell_v1_destroy(server->xwayland_shell);
@@ -680,8 +687,6 @@ bool vidow_xwayland_apply_config(struct vidow_server *server) {
 	server->xwayland_destroy.notify = xwayland_destroy;
 	wl_signal_add(&server->xwayland_server->events.destroy,
 		&server->xwayland_destroy);
-	wl_display_set_global_filter(server->display, global_filter, server);
-
 	/* 配置里启动的客户端要能连上 X：lazy 模式下 socket 现在就有了。 */
 	setenv("DISPLAY", server->xwayland_server->display_name, 1);
 	/* DISPLAY 变了就得再推一轮：systemd 拉起来的 X11 程序也要连得上 vidow 的 X */

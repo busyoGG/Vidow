@@ -1325,6 +1325,10 @@ struct vidow_output {
 	struct vidow_anim *viewport_anim;
 	double viewport_anim_from;
 	double viewport_anim_to;
+	/* 下一帧允许视口走过渡（只有「换焦点列」才置真，见 output_arrange
+	 * Pass 2）。关窗 / 列宽变化 / 拖拽落位不置它 —— 那些情况该由每个窗口
+	 * 自己的位移补间表现补位，视口一过渡就会把所有窗口的补间掐掉。 */
+	bool viewport_want_slide;
 	/* 切工作区的过渡：正在被推开的（旧的）那块工作区，和驱动它的动画。
 	 * 过渡期间 arrange 会把 slide_from 的列也摆一遍（按它自己的 slide_y），
 	 * 见 view.c 的 output_arrange 和 workspace.c 的 slide_start。 */

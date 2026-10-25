@@ -3821,10 +3821,21 @@ void vidow_place_view(struct vidow_view *view, int x, int y, int w, int h) {
 	 *
 	 * 让视口负责全部横向位移、窗口只做刚体：相对位置一帧都不变。 */
 	if (viewport_sliding(view->server, view->output)) {
+		/* 视口每帧都在动，窗口跟着横移：**两端的旧位置都要记损伤**，否则
+		 * 上一帧画在隔壁屏上的那一块没人擦 —— 用户报的「聚焦移动的时候会
+		 * 漏一点内容到隔壁显示器」就是它（以前每个窗口有自己的位移补间，
+		 * view_move_update 里会 damage 两次；现在走这条捷径，漏了这一步）。
+		 *
+		 * 损伤必须在改 anim_off 之前取（取的是上一帧画的那块）。 */
+		struct wlr_box before = view->geom;
+		before.x += (int)lround(view->anim_off_x);
+		before.y += (int)lround(view->anim_off_y);
 		vidow_anim_cancel(view->anim_move);
 		view->anim_move = NULL;
 		view->anim_off_x = 0.0;
 		view->anim_off_y = 0.0;
+		vidow_backdrop_damage_box(view->server, &before);
+		vidow_backdrop_damage_view(view);
 		vidow_view_apply_anim(view);
 		return;
 	}
@@ -4214,20 +4225,45 @@ static void output_arrange(struct vidow_server *server,
 					target, server->config.window_move_ms);
 			}
 			viewport = output->viewport_x;
-		} else if (target != viewport && server->config.window_move_ms > 0) {
-			/* 起点用**当前视口**，这样连续换焦点不会从上次的起点重来。 */
+		} else if (target != viewport && server->config.window_move_ms > 0 &&
+				output->viewport_want_slide) {
+			/* **只有「换了焦点列」才让视口走过渡。**
+			 *
+			 * 关窗 / 列宽变化 / 拖拽落位也会让视口需要挪，但那时候各列自己
+			 * 在重排（列没了、宽度变了），该由每个窗口自己的位移补间表现
+			 * ——「隔壁那几列滑过来补位」。这里再起一条视口过渡的话，
+			 * viewport_sliding() 会让**所有**窗口直接落位，补位动画全没，
+			 * 看着就是「关窗瞬间移动」。
+			 *
+			 * 用显式标记而不是比较 last_focused_col：那个字段在
+			 * vidow_view_focus() 里就已经更新过了，等排到这儿早相等了，
+			 * 判据永远为假。 */
+			output->viewport_want_slide = false;
 			viewport_slide(server, output, viewport, target,
 				server->config.window_move_ms);
 			viewport = output->viewport_x;
 		} else {
+			output->viewport_want_slide = false;
 			viewport = target;
 		}
 	}
-	if (viewport < 0) {
-		viewport = 0;
-	}
-	if (viewport > max_viewport) {
-		viewport = max_viewport;
+	/* **视口过渡在跑时不 clamp**：window_move_easing 默认是 out_back，
+	 * 它的曲线本来就会过冲（1.0 + c3·u³ + c1·u² 在 t≈0.85 处冲过 1）。
+	 * 那个过冲正是「回弹」的观感 —— 以前视口是瞬跳、回弹靠每个窗口的位移
+	 * 补间自己做，所以看得见；现在横向位移全归视口，这里一 clamp 就把它
+	 * 削平了，回弹整个消失。
+	 *
+	 * 动画期间放过冲值，落位时由 viewport_anim_done 写回精确的
+	 * viewport_anim_to（那个值在启动时就 clamp 过了），所以最终位置不会
+	 * 越界 —— 只是中间几帧允许画到条带外面一点。 */
+	bool vp_animating = output->viewport_anim != NULL;
+	if (!vp_animating) {
+		if (viewport < 0) {
+			viewport = 0;
+		}
+		if (viewport > max_viewport) {
+			viewport = max_viewport;
+		}
 	}
 	output->viewport_x = viewport;
 
@@ -4876,6 +4912,18 @@ void vidow_focus_view(struct vidow_view *view) {
 		/* center_focused_column = "on-overflow" 要知道「上一个焦点列」是谁
 		 * （见 focus_viewport_target）。换焦点时才动它。 */
 		server->last_focused_col = previous != NULL ? previous->column : NULL;
+		/* 换了焦点列 → 允许下一次 arrange 让视口走过渡（整条带子刚性平移）。
+		 * 同一列里换窗口不置它：那不该让条子滚。 */
+		if (view->column != NULL && previous != NULL &&
+				previous->column != view->column) {
+			struct vidow_output *o;
+			wl_list_for_each(o, &server->outputs, link) {
+				if (o->wlr_output == view->output) {
+					o->viewport_want_slide = true;
+					break;
+				}
+			}
+		}
 		/* 「现在谁拿着键盘」是排查焦点问题（抢焦点 / 顶不上来）的第一现场，
 		 * 而且只在真的换人时才打一行。 */
 		wlr_log(WLR_INFO, "焦点: %s -> %s",
