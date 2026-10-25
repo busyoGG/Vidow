@@ -1,0 +1,1340 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#0b0d10">
+<title>vidow 远程</title>
+<style>
+  :root {
+    --bg: #0b0d10;
+    --bar: #14181e;
+    --fg: #e6edf3;
+    --dim: #8b949e;
+    --acc: #4c8dff;
+    --danger: #f85149;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body {
+    margin: 0; padding: 0; height: 100%; overflow: hidden;
+    background: var(--bg); color: var(--fg);
+    font: 14px/1.4 system-ui, -apple-system, "Noto Sans SC", sans-serif;
+    overscroll-behavior: none;
+  }
+
+  /* 画面区：铺满，视频保持比例居中 */
+  /* 显示器抽屉：贴底、盖住画面、点外面不关（手机上误触太容易） */
+  #outpanel {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 60;
+    background: #1b1b1f; color: #eee; border-top-left-radius: 14px;
+    border-top-right-radius: 14px; padding: 10px 12px max(14px, env(safe-area-inset-bottom));
+    box-shadow: 0 -6px 24px rgba(0,0,0,.5); max-height: 70vh; overflow: auto;
+  }
+  #outpanel .ohead {
+    display: flex; justify-content: space-between; align-items: center;
+    font-size: 15px; font-weight: 600; padding-bottom: 8px;
+  }
+  #outpanel .orow {
+    display: flex; align-items: center; gap: 10px; padding: 12px 6px;
+    border-radius: 10px; font-size: 15px;
+  }
+  #outpanel .orow:active { background: #2a2a30; }
+  #outpanel .orow.off { opacity: .45; }
+  #outpanel .orow input[type=radio] { width: 20px; height: 20px; accent-color: #7aa2f7; }
+  #outpanel .oname { font-weight: 600; min-width: 66px; }
+  #outpanel .oinfo { color: #999; font-size: 13px; }
+  #outpanel .oempty { padding: 16px 6px; color: #999; }
+
+  #stage {
+    position: fixed; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    background: #000;
+    touch-action: none;
+  }
+  #vid {
+    max-width: 100%; max-height: 100%;
+    display: block;
+    /* 关掉浏览器自己的手势，触摸全部交给我们 */
+    touch-action: none;
+  }
+  /* 触摸点可视反馈（点击位置的一个小圈） */
+  #ripple {
+    position: fixed; width: 44px; height: 44px; margin: -22px 0 0 -22px;
+    border: 2px solid var(--acc); border-radius: 50%;
+    pointer-events: none; opacity: 0;
+    transition: opacity .12s;
+  }
+  #ripple.on { opacity: .9; }
+
+  /* 顶部工具条（可收起） */
+  #bar {
+    position: fixed; top: 0; left: 0; right: 0;
+    padding: max(8px, env(safe-area-inset-top)) 10px 8px;
+    background: linear-gradient(180deg, rgba(20,24,30,.95), rgba(20,24,30,.72));
+    backdrop-filter: blur(8px);
+    display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+    transform: translateY(0); transition: transform .22s ease;
+    z-index: 10;
+  }
+  #bar.hidden { transform: translateY(-110%); }
+  .btn {
+    appearance: none; border: 1px solid #2a313b; background: #1b2129;
+    color: var(--fg); border-radius: 9px; padding: 8px 12px;
+    font-size: 13px; font-weight: 500; min-height: 36px;
+    display: inline-flex; align-items: center; gap: 6px;
+  }
+  .btn:active { background: #252d38; }
+  .btn.on { background: var(--acc); border-color: var(--acc); color: #fff; }
+  .btn.danger { border-color: #5a2b2b; color: #ffb3ad; }
+
+  #ws { display: flex; gap: 6px; overflow-x: auto; scrollbar-width: none; }
+  #ws::-webkit-scrollbar { display: none; }
+  .wsbtn {
+    min-width: 40px; justify-content: center;
+  }
+
+  /* 状态条 */
+  #stat {
+    position: fixed; left: 10px; bottom: max(10px, env(safe-area-inset-bottom));
+    font-size: 12px; color: var(--dim);
+    background: rgba(11,13,16,.72); padding: 5px 9px; border-radius: 8px;
+    pointer-events: none; z-index: 9;
+  }
+  #stat.err { color: var(--danger); }
+
+  /* 键盘输入浮层：真正的 input 必须在屏幕上「存在」但不可见，
+     否则 iOS 不会弹键盘 */
+  /* 隐藏输入框：软键盘的锚。
+   *
+   * **不能用 opacity:0 / width:1px / z-index:-1** —— Android Chrome 判定
+   * 「元素不可见」时直接不弹软键盘（用户报的「软键盘弹不出来」就是这）。
+   * 现在的做法是：正常尺寸、opacity 1，但整块移到视口外（left:-9999px），
+   * 对用户看不见、对浏览器是「可见的输入框」，focus() 必定弹键盘。 */
+  #kbd {
+    position: fixed; left: -9999px; top: 0;
+    width: 200px; height: 32px; opacity: 1;
+    border: 0; padding: 0; background: transparent; color: transparent;
+    font-size: 16px;  /* < 16px 时 iOS/部分安卓会自动缩放页面 */
+  }
+
+  /* 收起工具栏后的常驻把手 */
+  #handle {
+    position: fixed; top: max(8px, env(safe-area-inset-top)); left: 8px;
+    z-index: 40; width: 40px; height: 36px;
+    background: rgba(30,30,38,.88); color: #ddd;
+    border: 1px solid #3a3a44; border-radius: 8px; font-size: 16px;
+  }
+
+  /* 功能键条：贴着软键盘上方，键盘弹出时跟着走 */
+  #fkeys {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 30;
+    display: none; flex-direction: column; gap: 4px;
+    padding: 6px 6px max(6px, env(safe-area-inset-bottom));
+    background: #14141a; border-top: 1px solid #2a2a32;
+    max-height: 42vh; overflow-y: auto;
+  }
+  #fkeys.on { display: flex; }
+  #fkeys .frow { display: flex; gap: 4px; flex-wrap: wrap; }
+  #fkeys .fbtn {
+    flex: 1 1 auto; min-width: 44px; height: 38px;
+    background: #26262e; color: #ddd; border: 1px solid #3a3a44;
+    border-radius: 7px; font-size: 13px; font-family: inherit;
+  }
+  #fkeys .fbtn:active { background: #3a3a48; }
+  #fkeys .fbtn.on {
+    background: #4a7cc7; border-color: #6b9be0; color: #fff; font-weight: 700;
+  }
+  #fkeys .f btn { min-width: 36px; }
+
+  /* 启动遮罩 */
+  #splash {
+    position: fixed; inset: 0; display: flex; align-items: center;
+    justify-content: center; flex-direction: column; gap: 14px;
+    background: var(--bg); z-index: 20;
+    transition: opacity .3s;
+  }
+  #splash.gone { opacity: 0; pointer-events: none; }
+  .spin {
+    width: 30px; height: 30px; border: 3px solid #232a33;
+    border-top-color: var(--acc); border-radius: 50%;
+    animation: spin .8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #splash .hint { color: var(--dim); font-size: 13px; max-width: 80vw; text-align: center; }
+</style>
+</head>
+<body>
+
+<div id="stage">
+  <!-- autoplay + muted + playsinline 三件套：移动端自动播放的前提。
+       controls 关掉（我们自己的手势层要吃掉全部触摸）。 -->
+  <video id="vid" playsinline webkit-playsinline muted autoplay preload="auto"></video>
+  <!-- WebCodecs 解码直接画在这块 canvas 上：不经播放器管线，延迟最低。
+       width/height 属性 = 视频真实像素；CSS 交给 #stage 的 flex 居中 +
+       max-width/max-height 保持比例（canvas 不认 object-fit，得自己算）。 -->
+  <canvas id="cv" style="display:none;max-width:100%;max-height:100%;margin:auto"></canvas>
+</div>
+<div id="ripple"></div>
+
+<div id="bar">
+  <button class="btn" id="btnMenu" title="收起/展开">☰</button>
+  <button class="btn" id="btnWs" title="工作区">⊞</button>
+  <button class="btn" id="btnOut" title="切换显示器">🖥</button>
+  <button class="btn" id="btnKbd" title="键盘">⌨︎</button>
+  <button class="btn" id="btnMod" title="组合键">⌘</button>
+  <button class="btn" id="btnScroll" title="滚动模式">↕︎</button>
+  <button class="btn" id="btnRight" title="右键">右</button>
+</div>
+
+<!-- 组合键面板：先按下 Mod 再点鼠标，或者直接点这里的快捷键 -->
+<div id="modpanel" style="display:none">
+  <div class="mrow">
+    <button class="btn" data-a="spawn kitty">终端</button>
+    <button class="btn" data-a="close-window">关窗</button>
+    <button class="btn" data-a="focus-window next">切窗</button>
+    <button class="btn" data-a="focus-column left">左移</button>
+    <button class="btn" data-a="focus-column right">右移</button>
+    <button class="btn" data-a="focus-workspace next">下工作区</button>
+    <button class="btn" data-a="focus-workspace prev">上工作区</button>
+    <button class="btn" data-a="toggle-floating">浮窗</button>
+  </div>
+  <div class="mrow">
+    <button class="btn" data-a="focus-window down">下窗口</button>
+    <button class="btn" data-a="focus-window up">上窗口</button>
+    <button class="btn" data-a="maximize-column">最大列</button>
+    <button class="btn" data-a="center-column">居中列</button>
+    <button class="btn" data-a="cycle-column-width">改宽</button>
+    <button class="btn" data-a="toggle-fullscreen">全屏</button>
+    <button class="btn" data-a="toggle-overview">概览</button>
+    <button class="btn" data-a="minimize-window">最小化</button>
+  </div>
+  <div class="mrow modscroll">
+    <span class="lbl">按住 Super 再刷：</span>
+    <button class="btn" id="btnModScroll">滚轮模式</button>
+  </div>
+</div>
+
+<button id="handle" style="display:none" title="展开工具栏">☰</button>
+
+<div id="wspanel" style="display:none">
+  <div class="ohead">
+    <span>工作区</span>
+    <button class="btn" id="wsclose">关闭</button>
+  </div>
+  <div id="wslist"></div>
+</div>
+
+<div id="outpanel" style="display:none">
+  <div class="ohead">
+    <span>显示器</span>
+    <button class="btn" id="outclose">关闭</button>
+  </div>
+  <div id="outlist"></div>
+</div>
+
+<div id="stat">连接中…</div>
+<input id="kbd" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false">
+
+<!-- 功能键条：安卓软键盘没有 Ctrl/Alt/Super，这一排补上。
+     点修饰键→高亮（粘住），再打字母就打出一个组合键。 -->
+<div id="fkeys">
+  <div class="frow">
+    <button class="fbtn mod" data-mod="ctrl">Ctrl</button>
+    <button class="fbtn mod" data-mod="alt">Alt</button>
+    <button class="fbtn mod" data-mod="shift">Shift</button>
+    <button class="fbtn mod" data-mod="super">Super</button>
+  </div>
+  <div class="frow">
+    <button class="fbtn" data-key="Escape">Esc</button>
+    <button class="fbtn" data-key="Tab">Tab</button>
+    <button class="fbtn" data-key="Return">⏎</button>
+    <button class="fbtn" data-key="BackSpace">⌫</button>
+    <button class="fbtn" data-key="Delete">Del</button>
+    <button class="fbtn" data-key="Up">↑</button>
+    <button class="fbtn" data-key="Down">↓</button>
+    <button class="fbtn" data-key="Left">←</button>
+    <button class="fbtn" data-key="Right">→</button>
+    <button class="fbtn" data-key="Home">Home</button>
+    <button class="fbtn" data-key="End">End</button>
+    <button class="fbtn" data-key="Page_Up">PgUp</button>
+    <button class="fbtn" data-key="Page_Down">PgDn</button>
+  </div>
+  <div class="frow">
+    <button class="fbtn f" data-key="F1">F1</button>
+    <button class="fbtn f" data-key="F2">F2</button>
+    <button class="fbtn f" data-key="F3">F3</button>
+    <button class="fbtn f" data-key="F4">F4</button>
+    <button class="fbtn f" data-key="F5">F5</button>
+    <button class="fbtn f" data-key="F6">F6</button>
+    <button class="fbtn f" data-key="F7">F7</button>
+    <button class="fbtn f" data-key="F8">F8</button>
+    <button class="fbtn f" data-key="F9">F9</button>
+    <button class="fbtn f" data-key="F10">F10</button>
+    <button class="fbtn f" data-key="F11">F11</button>
+    <button class="fbtn f" data-key="F12">F12</button>
+  </div>
+</div>
+
+<div id="splash">
+  <div class="spin"></div>
+  <div class="hint">正在连接 vidow…</div>
+</div>
+
+<script>
+'use strict';
+
+const $ = (id) => document.getElementById(id);
+const vid = $('vid');
+const stage = $('stage');
+const stat = $('stat');
+const ripple = $('ripple');
+const bar = $('bar');
+
+const BUILD = 'v14-工作区抽屉+收起把手';
+
+window.addEventListener('error', (e) => {
+  fetch('/api/dbg?m=' + encodeURIComponent('JSERR ' + e.message + ' @' + e.lineno + ':' + e.colno),
+    { cache: 'no-store' }).catch(() => {});
+});
+window.addEventListener('unhandledrejection', (e) => {
+  fetch('/api/dbg?m=' + encodeURIComponent('REJECT ' + (e.reason && e.reason.message || e.reason)),
+    { cache: 'no-store' }).catch(() => {});
+});   /* 改了前端就改这里，手机上能看到 */
+let ws = null;
+let out = null;              // {name, w, h, scale}
+let ms_state = null;
+let scrollMode = false;      // ↕︎ 开启时单指拖动 = 滚动
+let rightMode = false;       // 右 开启时点击 = 右键
+
+function setStat(text, is_err) {
+  stat.textContent = text;
+  stat.classList.toggle('err', !!is_err);
+}
+
+// ---------------------------------------------------------------- WebSocket
+
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(`${proto}//${location.host}/ws`);
+  ws.binaryType = 'arraybuffer';
+
+  ws.onopen = () => {
+    /* 把「本机能不能用 WebCodecs」告诉服务端：
+     * 能用 → 服务端走 raw（裸流直通，最低延迟）
+     * 不能用 → 服务端走 fmp4（MediaSource，兼容老浏览器）
+     * 注意 WebCodecs 只在安全上下文（https / localhost）里存在。 */
+    send({ t: 'hello', wc: wc.supported() && window.isSecureContext });
+  };
+
+  ws.onmessage = (ev) => {
+    window.__msg = (window.__msg || 0) + 1;
+    window.__types = window.__types || [];
+    if (window.__types.length < 5) window.__types.push(typeof ev.data + ':' + (ev.data.byteLength !== undefined ? ev.data.byteLength : String(ev.data).length));
+    if (typeof ev.data === 'string') {
+      let m;
+      try { m = JSON.parse(ev.data); } catch { return; }
+      handleCtrl(m);
+      return;
+    }
+    // ---- 二进制：裸 H.264 帧（raw 模式）或 fMP4 分片（fmp4 回退）
+    if (wc.on) wc.feed(ev.data);
+    else feed(ev.data);
+  };
+
+  ws.onclose = () => {
+    setStat('连接断开，3 秒后重连…', true);
+    /* 断开时把 MSE 拆干净，重连后重建（同一个 MediaSource 不能复用） */
+    queue = []; sb = null; sb_ready = false; inited = false;
+    if (ms) {
+      try { if (ms.readyState === 'open') ms.endOfStream(); } catch {}
+      ms = null;
+    }
+    try { vid.removeAttribute('src'); vid.load(); } catch {}
+    setTimeout(connect, 3000);
+  };
+
+  ws.onerror = () => setStat('连接出错', true);
+}
+
+/* 前端日志回传：手机上没有控制台，出问题只能靠这条到服务端。 */
+function dbg(m) {
+  try {
+    fetch('/api/dbg?m=' + encodeURIComponent(String(m).slice(0, 200)), { cache: 'no-store' });
+  } catch (e) { /* 忽略 */ }
+}
+
+function send(obj) {
+  if (ws && ws.readyState === 1) {
+    ws.send(JSON.stringify(obj));
+    if (obj.t !== 'move') dbg('send ' + JSON.stringify(obj).slice(0, 120));
+  } else {
+    dbg('DROP ' + JSON.stringify(obj).slice(0, 120) + ' rs=' + (ws ? ws.readyState : 'null'));
+  }
+}
+
+/* ================================================================ WebCodecs
+ *
+ * 直通解码：WebSocket → VideoDecoder → canvas。
+ * 相比 MSE 的价值：**MSE 是播放器管线**，内部固定缓冲 + 时间轴调度，
+ * 实测端到端 200~500ms，参数怎么调都下不来。VideoDecoder 收帧即解即画，
+ * 中间没有播放器排队，是远程控制「跟手」的唯一做法。
+ *
+ * 服务端配合：
+ *   - wf-recorder 加 `-p aud=1`，每帧前有 AUD
+ *   - 按 AUD 切帧，每帧作为一个 WS 二进制消息发过来
+ *   - 另发一条 {t:'desc'} 带 avcC（AVCDecoderConfigurationRecord）
+ */
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d', { alpha: false, desynchronized: true });
+
+const wc = {
+  on: false,
+  dec: null,
+  desc: null,
+  last_ts: 0,
+  dropped: 0,
+  latency: 0,
+
+  supported() {
+    return typeof VideoDecoder !== 'undefined'
+      && typeof VideoFrame !== 'undefined'
+      && typeof EncodedVideoChunk !== 'undefined';
+  },
+
+  start(desc_b64) {
+    if (!this.supported()) return false;
+    this.on = true;
+    this.desc = desc_b64 ? b64_to_u8(desc_b64) : this.desc;
+    this.configure();
+    /* 把 <video> 藏掉，画到 canvas 上（延迟最低，也不受播放器策略影响） */
+    vid.style.display = 'none';
+    cv.style.display = 'block';
+    cv.style.aspectRatio = `${out ? out.w : 16} / ${out ? out.h : 9}`;
+    return true;
+  },
+
+  configure() {
+    if (this.dec) { try { this.dec.close(); } catch {} }
+    this.got_key = false;
+    this.skipped = 0;
+    /* codedWidth/Height 交给 description 里的 SPS 决定，不传更稳。
+     * hardwareAcceleration 用 'no-preference'：写死 prefer-hardware 时，
+     * 没有硬件解码器的环境（headless / 部分安卓）会直接
+     * Unsupported configuration（实测），让浏览器自己挑最稳。 */
+    const cfg = {
+      codec: 'avc1.640028',      // High 4.0，VAAPI 的实际输出
+      optimizeForLatency: true,
+      hardwareAcceleration: 'no-preference',
+    };
+    /* **不要传 description**：传了它就等于声明「帧数据是 AVCC 格式」
+     * （4 字节长度前缀），而服务端发的是 annexb（00 00 01 起始码）。
+     * 两者不匹配 → 解码器报 "Unable to determine size of bitstream buffer"。
+     * 不传的话解码器会从码流里的 SPS/PPS 自己判断尺寸，annexb 直通即可。 */
+    this.dec = new VideoDecoder({
+      output: (frame) => this.draw(frame),
+      error: (e) => { feed_err = 'decoder: ' + e.message; setStat(feed_err, true); },
+    });
+    try {
+      this.dec.configure(cfg);
+    } catch (e) {
+      feed_err = 'configure: ' + e.message + ' codec=' + cfg.codec + ' desc=' + (this.desc ? this.desc.length : 0);
+      setStat(feed_err, true);
+      throw e;
+    }
+  },
+
+  feed(buf) {
+    if (!this.dec || this.dec.state !== 'configured') return;
+    const u8 = new Uint8Array(buf);
+    this.fed = (this.fed || 0) + 1;
+    this.bytes = (this.bytes || 0) + u8.length;
+
+    /* 关键帧判定：看有没有 IDR(5) 或 SPS(7)。带 SPS 的帧要顺带更新 description，
+     * 但 WebCodecs 不支持热改 description，所以只在首次 configure 时用。 */
+    let is_key = false;
+    for (let i = 0; i + 4 < u8.length; i++) {
+      if (u8[i] === 0 && u8[i + 1] === 0 && u8[i + 2] === 1) {
+        const t = u8[i + 3] & 0x1f;
+        if (t === 5 || t === 7) { is_key = true; break; }
+        i += 2;
+      }
+    }
+    /* configure() 之后（以及 flush 之后）解码器要求**第一帧必须是关键帧**，
+     * 否则抛 "A key frame is required"。中途重连时上游可能正发 P 帧，
+     * 这里直接丢掉，等到 IDR 再开始喂。 */
+    if (!this.got_key) {
+      if (!is_key) { this.skipped = (this.skipped || 0) + 1; return; }
+      this.got_key = true;
+    }
+
+    /* 时间戳用单调递增的微秒。WebCodecs 要求单调，且解复用后
+     * 帧序由我们决定（本来就是顺序的），所以不用真时间戳。 */
+    this.last_ts += Math.round(1000000 / (out ? out.fps : 60));
+    try {
+      this.dec.decode(new EncodedVideoChunk({
+        type: is_key ? 'key' : 'delta',
+        timestamp: this.last_ts,
+        data: u8,
+      }));
+    } catch (e) {
+      this.dropped++;
+      if (!feed_err) { feed_err = 'decode: ' + e.message; setStat(feed_err, true); }
+    }
+  },
+
+  draw(frame) {
+    const t0 = performance.now();
+    try {
+      if (ctx) {
+        if (cv.width !== frame.displayWidth || cv.height !== frame.displayHeight) {
+          cv.width = frame.displayWidth;
+          cv.height = frame.displayHeight;
+        }
+        ctx.drawImage(frame, 0, 0);
+      }
+    } finally {
+      frame.close();
+    }
+    this.drawn = (this.drawn || 0) + 1;
+    this.latency = performance.now() - t0;
+    /* 端到端延迟估算：解码器队列里还压着几帧 × 帧间隔 = 残余排队时间。
+     * 这是「跟手」的真实指标 —— 排队越少越跟手。 */
+    try {
+      this.queued = this.dec ? (this.dec.decodeQueueSize || 0) : 0;
+      this.e2e = this.queued * (1000 / (out ? out.fps : 60));
+    } catch {}
+  },
+
+  reset() {
+    this.on = false;
+    if (this.dec) { try { this.dec.close(); } catch {} }
+    this.dec = null;
+    this.last_ts = 0; this.fed = 0; this.bytes = 0; this.drawn = 0; this.dropped = 0;
+  },
+};
+
+function b64_to_u8(b64) {
+  const bin = atob(b64);
+  const u8 = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+  return u8;
+}
+
+function handleCtrl(m) {
+  if (m.t === 'out') {
+    out = m;
+    vid.style.aspectRatio = `${m.w} / ${m.h}`;
+    setStat(`${m.name} ${m.w}×${m.h} @${m.fps}fps [v8] msg=${window.__msg||0}`);
+    /* 服务端说 raw 模式 + 浏览器支持 WebCodecs → 走低延迟直通解码。
+     * **必须等 desc（avcC）到了再 configure**：没有 description 时
+     * VideoDecoder.configure() 会直接抛 Unsupported configuration（实测）。 */
+    if (m.mode === 'raw' && wc.supported()) {
+      if (m.desc) wc.start(m.desc);
+      else wc.on = 'waiting';
+    }
+    $('splash').classList.add('gone');
+    loadWorkspaces();
+  } else if (m.t === 'desc') {
+    /* 解码器描述（avcC）。首次到达就 configure 开始解码。 */
+    if (wc.supported()) {
+      wc.start(m.b64);
+    }
+  } else if (m.t === 'reset') {
+    /* 服务端重启了管道（换输出 / 卡住重启）→ 时间轴变了。
+     * 拆掉 MediaSource 重建，否则旧时间轴的缓冲区会挡住新分片，永久黑屏。 */
+    queue = []; sb = null; sb_ready = false;
+    if (ms) {
+      try { if (ms.readyState === 'open') ms.endOfStream(); } catch {}
+      ms = null;
+    }
+    try { vid.removeAttribute('src'); vid.load(); } catch {}
+  } else if (m.t === 'err') {
+    setStat(m.msg, true);
+  }
+}
+
+// ---------------------------------------------------------------- 视频
+
+/* 播放被浏览器策略挡下时的兜底。
+ *
+ * 手机浏览器（尤其 iOS Safari、安卓某些省电模式）不允许**没有用户手势**
+ * 的自动播放，哪怕视频是 muted 也一样 —— 表现就是画面全黑、只有一句话
+ * 「点一下画面开始播放」。所以：
+ *   1. 先自动试一次；失败就把状态记为「等手势」。
+ *   2. 任何 touchstart / click 都当成手势，在事件处理里**同步**再播一次
+ *      （必须同步，异步调 play() 会被判定为「没有手势」，照样拒绝）。
+ *   3. 第一次成功之后取消监听。 */
+let need_gesture = false;
+
+function try_play(auto) {
+  const p = vid.play();
+  if (!p || typeof p.then !== 'function') return;
+  p.then(() => {
+    need_gesture = false;
+    setStat('播放中');
+  }).catch((err) => {
+    if (auto) {
+      need_gesture = true;
+      if (!feed_err) setStat('点一下画面开始播放', true);
+    }
+  });
+}
+
+function arm_gesture_play() {
+  const kick = () => {
+    if (!need_gesture) return;
+    try_play(false);
+    if (!need_gesture) {
+      stage.removeEventListener('touchstart', kick, true);
+      stage.removeEventListener('mousedown', kick, true);
+      document.removeEventListener('click', kick, true);
+    }
+  };
+  /* capture 阶段挂，保证在业务处理器之前就跑（业务处理器会 preventDefault，
+   * 但 play() 必须在同一个手势任务里发起）。 */
+  stage.addEventListener('touchstart', kick, true);
+  stage.addEventListener('mousedown', kick, true);
+  document.addEventListener('click', kick, true);
+}
+arm_gesture_play();
+
+/* 视频：**原生 MediaSource**，零第三方库。
+ *
+ * 服务端把 wf-recorder 的 mpegts 过一道 ffmpeg 转成 fMP4（ftyp+moov 作为
+ * 初始化段，之后每个 moof+mdat 是一个可独立 append 的分片），我们只要按
+ * 顺序 SourceBuffer.appendBuffer() 就行 —— 这是 MSE 的标准用法，没有
+ * mpegts.js 那套自定义 loader 的时序坑。 */
+let fed_bytes = 0, fed_chunks = 0, feed_err = '';
+let ms = null, sb = null, sb_ready = false, queue = [], inited = false;
+let init_chunk = null;   // ftyp+moov，必须最先 append
+
+/* Constrained Baseline 4.2。若哪天编码器参数变了，这几个候选按顺序试。 */
+/* 服务端 `-c:v copy` 直通 wf-recorder 的 H.264：**Constrained Baseline 4.2**
+ * → avc1.42C02A。这是当初手机能正常出画面的那套配置，别改。
+ * （手机 caps 自检也确认支持它。曾经为了"兼容安卓"改成重编 High/Main，
+ *  结果手机永久 rdy=1，白折腾。） */
+/* VAAPI 硬编写死 High 4.0（ffprobe 实测：High,1920,1080,40）→ avc1.640028。
+ * 软件 x264 回退时是 Constrained Baseline 4.2 → avc1.42C02A。
+ * 两个都列上，浏览器按顺序挑第一个能 addSourceBuffer 的。 */
+const MIME_LIST = [
+  'video/mp4; codecs="avc1.640028"',   // High 4.0   —— VAAPI
+  'video/mp4; codecs="avc1.42C02A"',   // Baseline 4.2 —— libx264 回退
+  'video/mp4; codecs="avc1.4D4028"',   // Main 4.0
+  'video/mp4; codecs="avc1.64002A"',   // High 4.2
+];
+let MIME = MIME_LIST[0];
+
+/* 一次性自检：把浏览器的解码能力报给服务端，方便远程排查。
+ * 手机上看不到 console，这是唯一的诊断出口。 */
+function report_caps() {
+  const out = { t: 'caps', ua: navigator.userAgent.slice(0, 120) };
+  try {
+    const types = [
+      'video/mp4; codecs="avc1.4D4028"',
+      'video/mp4; codecs="avc1.42C02A"',
+      'video/mp4; codecs="avc1.640028"',
+      'video/webm; codecs="vp8"',
+      'video/webm; codecs="vp9"',
+    ];
+    out.supported = types.filter((x) => MediaSource.isTypeSupported(x));
+  } catch (e) { out.err = e.message; }
+  send(out);
+}
+
+function setup_mse() {
+  if (ms) return;
+  if (!window.__caps_sent) { window.__caps_sent = 1; report_caps(); }
+  if (typeof MediaSource === 'undefined') {
+    setStat('这台浏览器不支持 MediaSource，换个浏览器试试', true);
+    return;
+  }
+  ms = new MediaSource();
+  vid.src = URL.createObjectURL(ms);
+  ms.addEventListener('sourceopen', () => {
+    try {
+      /* mime 里的 codecs 必须**跟编码器实际输出一致**。
+       * wf-recorder 默认 x264 出的是 Constrained Baseline level 4.2
+       * （ffprobe: h264,Constrained Baseline,42）→ avc1.42C02A。
+       * 原来写死 High 4.1（avc1.640029）不匹配，addSourceBuffer 不报错，
+       * 但画面解不出来、一直是黑的（踩过）。 */
+      let lastErr = null;
+      for (const m of MIME_LIST) {
+        try { sb = ms.addSourceBuffer(m); MIME = m; break; } catch (e) { lastErr = e; }
+      }
+      if (!sb) throw lastErr || new Error('没有可用的 codec');
+      sb.mode = 'segments';
+      sb.addEventListener('updateend', () => {
+        sb_ready = true;
+        pump();
+      });
+      sb_ready = true;
+      /* 初始化段必须先 append（MSE 要求先有 moov 才认分片） */
+      if (init_chunk) {
+        try { sb_ready = false; sb.appendBuffer(init_chunk); } catch (e) {
+          feed_err = 'append init: ' + e.message;
+        }
+      } else {
+        pump();
+      }
+    } catch (e) {
+      feed_err = 'addSourceBuffer: ' + e.message;
+      setStat(feed_err, true);
+    }
+  });
+}
+
+/* 独立的追赶定时器：光靠 pump()（有新分片才触发）不够，
+ * 浏览器在 segments 模式下 seek 有额外延迟，必须持续校。
+ * 每 200ms 检查一次，落后就跳，保证「操作 → 画面」够跟手。 */
+setInterval(() => {
+  if (!sb || vid.paused || sb.buffered.length === 0) return;
+  const start = sb.buffered.start(0);
+  const end = sb.buffered.end(sb.buffered.length - 1);
+  const ahead = end - vid.currentTime;
+  if (vid.currentTime < start - 0.1 || ahead > 0.35) {
+    try { vid.currentTime = Math.max(start, end - 0.1); } catch {}
+  } else if (ahead > 0.12) {
+    if (vid.playbackRate !== 1.1) vid.playbackRate = 1.1;
+  } else if (vid.playbackRate !== 1.0) {
+    vid.playbackRate = 1.0;
+  }
+}, 200);
+
+function pump() {
+  if (!sb || !sb_ready || sb.updating) return;
+
+  /* **把播放头拽进缓冲区**。
+   * 分片带的是 wf-recorder 管道启动至今的绝对时间戳（比如 115.5s 起），
+   * 而刷新页面后新的 MediaSource 从 0 开始 —— 播放头停在 0，缓冲区在
+   * 115s 之外，浏览器就永远 rdy=1（只有元数据）不出画面。
+   * 表现就是「第一次打开能看，一刷新就黑」（实测 buf=115.5~122.5 rdy=1）。
+   * 每次 append 前后都校一次，直播只追最新，落后太多就跳。 */
+  if (sb.buffered.length > 0) {
+    const start = sb.buffered.start(0);
+    const end = sb.buffered.end(sb.buffered.length - 1);
+    const ahead = end - vid.currentTime;
+    /* 落后超过 0.35 秒直接跳到最新 —— 远程控制要的是「跟手」，
+     * 容忍 2.5 秒就等于每次操作慢 2.5 秒（实测拖手感明显）。
+     * 阈值太小会在网络抖动时频繁跳帧，0.35 是实测手感与稳定的折中。 */
+    if (vid.currentTime < start || vid.currentTime > end || ahead > 0.35) {
+      try { vid.currentTime = Math.max(start, end - 0.15); } catch {}
+    }
+    /* 轻微落后（0.15~0.35s）时用 1.08 倍速慢慢追平，不跳帧更顺滑 */
+    vid.playbackRate = (ahead > 0.15) ? 1.08 : 1.0;
+  }
+
+  const next = queue.shift();
+  if (!next) return;
+  try {
+    sb_ready = false;
+    sb.appendBuffer(next);
+  } catch (e) {
+    /* QuotaExceeded：缓冲堆太多，清掉旧的再重试（活直播只保留最近一段） */
+    if (e.name === 'QuotaExceededError' && sb.buffered.length > 0) {
+      try {
+        sb.remove(0, Math.max(0, sb.buffered.end(0) - 2));
+      } catch {}
+      queue.unshift(next);
+      sb_ready = true;
+      return;
+    }
+    feed_err = 'appendBuffer: ' + e.message;
+    setStat(feed_err, true);
+  }
+}
+
+function feed(buf) {
+  fed_bytes += buf.byteLength;
+  fed_chunks++;
+  /* **第一块一定是初始化段**（服务端保证 ftyp+moov 先到）。单独存起来，
+   * 后面无论队列怎么截断都不会把它弄丢 —— 早期把它跟媒体分片混在一个队列
+   * 里、截断时被 splice 掉，结果 rdy 永远卡在 1、画面全黑（踩过）。 */
+  if (!init_chunk) {
+    init_chunk = new Uint8Array(buf);
+    /* 诊断：前 8 字节应该是 box 长度 + 'ftyp' */
+    const dv = new DataView(init_chunk.buffer, init_chunk.byteOffset);
+    // 走一遍 box 链，看初始化段到底包含什么
+    const boxes = [];
+    let p2 = 0;
+    while (p2 + 8 <= init_chunk.length) {
+      const sz = (init_chunk[p2] << 24 | init_chunk[p2+1] << 16 | init_chunk[p2+2] << 8 | init_chunk[p2+3]) >>> 0;
+      const ty = String.fromCharCode(init_chunk[p2+4], init_chunk[p2+5], init_chunk[p2+6], init_chunk[p2+7]);
+      boxes.push(ty + sz);
+      if (sz < 8) break;
+      p2 += sz;
+    }
+    window.__initinfo = init_chunk.length + ':' + boxes.join(',');
+  }
+  if (!sb) setup_mse();
+  queue.push(new Uint8Array(buf));
+  /* 队列上限：手机解码慢时丢掉旧的媒体分片，别让延迟无限堆高。
+   * 只动下标 1 之后的部分，初始化段（下标 0）永远保留。 */
+  if (queue.length > 60) {
+    queue.splice(1, queue.length - 40);
+  }
+  /* **每次都确保在播**：早期只在 setup_mse() 里调一次 play()，
+   * 刷新页面后 MSE 已经建好、不再走那条路径，视频就一直 paused，
+   * 表现是 buf 有数据但 rdy 卡 1、画面全黑（实测）。 */
+  if (vid.paused) try_play(false);
+  pump();
+}
+
+/* 诊断：每秒刷新状态条，卡在哪一步一眼看得见。 */
+setInterval(() => {
+  if (!out) return;
+  const tag = sb ? '解码中' : '未起播';
+  const V = 'v7';
+  const MSG = window.__msg || 0;
+  const rs = vid.readyState, wh = `${vid.videoWidth}x${vid.videoHeight}`;
+  /* WebCodecs 模式：显示解码帧数 / 每帧解码耗时 / 累计字节 */
+  if (wc.on === true) {
+    setStat(`[v8-wc] ${wc.drawn || 0}帧 解${(wc.latency||0).toFixed(1)}ms `
+      + `排队${wc.queued||0}帧≈${(wc.e2e||0).toFixed(0)}ms `
+      + `${((wc.bytes||0)/1024/1024).toFixed(1)}MB dec=${wc.dec ? wc.dec.state : '-'}`
+      + (feed_err ? ` | ${feed_err}` : ''));
+    return;
+  }
+  let brange = '-';
+  try {
+    if (sb && sb.buffered.length > 0) {
+      brange = sb.buffered.start(0).toFixed(1) + '~' + sb.buffered.end(sb.buffered.length-1).toFixed(1);
+    }
+  } catch {}
+  const msg = `[${V}] ${tag} 收${(fed_bytes/1024).toFixed(0)}KB/${fed_chunks}块 `
+    + `队列${queue.length} buf=${brange} `
+    + `视频${wh} rdy=${rs}` + (feed_err ? ` | ${feed_err}` : '');
+  // 首次卡住时把 MIME 也带出来，手机端兼容性一眼可见
+  const extra = (rs < 2 && fed_chunks > 2) ? ` mime=${MIME.split('codecs=')[1] || '?'}` : '';
+  if (!feed_err) setStat(msg + extra);
+}, 1000);
+
+
+// ---------------------------------------------------------------- 坐标换算
+
+/* 把屏幕触摸点换算成 vidow 的逻辑坐标。
+ * 画面在 stage 里是 letterbox 居中的，先减掉黑边，再按比例映射。 */
+function to_logical(clientX, clientY) {
+  /* **必须取当前真正显示的那个元素的矩形**：WebCodecs 模式下 <video> 被
+   * display:none 藏掉，它的 getBoundingClientRect() 全 0，用它算坐标会
+   * 把所有触控都判成「界外」直接 return null —— 表现就是「有画面但点不动」。 */
+  const el = (wc.on === true) ? cv : vid;
+  const r = el.getBoundingClientRect();
+  if (!out || r.width === 0) return null;
+
+  /* canvas 用 max-width/max-height + margin:auto 保持比例，可能比 stage 小，
+   * 但 getBoundingClientRect 拿到的就是它的真实显示区域，直接用即可。
+   * （早期版本对 <video> 用 object-fit:contain，那时要额外算 letterbox；
+   *  现在元素本身就已经是正确比例，不需要再算。） */
+  const nx = (clientX - r.left) / r.width;
+  const ny = (clientY - r.top) / r.height;
+  if (nx < 0 || nx > 1 || ny < 0 || ny > 1) return null;
+  return { x: Math.round(nx * out.w), y: Math.round(ny * out.h) };
+}
+
+// ---------------------------------------------------------------- 触摸 → 鼠标
+
+/* 手势状态：
+ *   - 单指：轻点 = 左键单击；按住拖动 = 拖拽（press → move… → release）
+ *   - 单指 + 滚动模式：拖动 = 滚动
+ *   - 双指：拖动 = 滚动（竖）/ 横向滚动
+ *   - 长按 500ms = 右键（避免和拖拽冲突，长按后不再发 click） */
+const G = {
+  id: null,
+  start: null,
+  last: null,
+  moved: false,
+  held: false,
+  longTimer: null,
+  scrolling: false,
+};
+
+function showRipple(x, y) {
+  ripple.style.left = x + 'px';
+  ripple.style.top = y + 'px';
+  ripple.classList.add('on');
+  setTimeout(() => ripple.classList.remove('on'), 160);
+}
+
+stage.addEventListener('touchstart', (ev) => {
+  if (ev.touches.length === 1 && G.id === null) {
+    const t = ev.touches[0];
+    const p = to_logical(t.clientX, t.clientY);
+    if (!p) return;
+    G.id = t.identifier;
+    G.start = p;
+    G.last = p;
+    G.moved = false;
+    G.held = false;
+    G.scrolling = scrollMode;
+    showRipple(t.clientX, t.clientY);
+    send({ t: 'move', x: p.x, y: p.y });
+    if (!scrollMode) {
+      G.longTimer = setTimeout(() => {
+        if (!G.moved) {
+          G.held = true;
+          send({ t: 'down', x: G.last.x, y: G.last.y, btn: 'right' });
+        }
+      }, 500);
+    }
+    ev.preventDefault();
+  } else if (ev.touches.length === 2) {
+    // 转双指：撤销单指的按下状态，进入滚动
+    clearTimeout(G.longTimer);
+    if (G.held) { send({ t: 'up', btn: 'right' }); G.held = false; }
+    G.id = null;
+    G.last2 = {
+      x: (ev.touches[0].clientX + ev.touches[1].clientX) / 2,
+      y: (ev.touches[0].clientY + ev.touches[1].clientY) / 2,
+    };
+    ev.preventDefault();
+  }
+}, { passive: false });
+
+stage.addEventListener('touchmove', (ev) => {
+  // 双指滚动
+  if (ev.touches.length === 2 && G.last2) {
+    const c = {
+      x: (ev.touches[0].clientX + ev.touches[1].clientX) / 2,
+      y: (ev.touches[0].clientY + ev.touches[1].clientY) / 2,
+    };
+    const dx = c.x - G.last2.x;
+    const dy = c.y - G.last2.y;
+    if (Math.abs(dx) > 2 || Math.abs(dy) > 2) {
+      send({ t: 'scroll', dx: -dx, dy: -dy });
+      G.last2 = c;
+    }
+    ev.preventDefault();
+    return;
+  }
+  if (G.id === null) return;
+  const t = Array.from(ev.touches).find((x) => x.identifier === G.id);
+  if (!t) return;
+
+  if (G.scrolling) {
+    const dx = t.clientX - (G.lastScreen ? G.lastScreen.x : t.clientX);
+    const dy = t.clientY - (G.lastScreen ? G.lastScreen.y : t.clientY);
+    G.lastScreen = { x: t.clientX, y: t.clientY };
+    if (Math.abs(dx) > 1 || Math.abs(dy) > 1) {
+      send({ t: 'scroll', dx: -dx * 2, dy: -dy * 2 });
+      G.moved = true;
+    }
+    ev.preventDefault();
+    return;
+  }
+
+  const p = to_logical(t.clientX, t.clientY);
+  if (!p) return;
+  const dist = Math.hypot(p.x - G.start.x, p.y - G.start.y);
+  if (!G.moved && dist > 6) {
+    G.moved = true;
+    clearTimeout(G.longTimer);
+    if (!G.held) send({ t: 'down', x: G.start.x, y: G.start.y, btn: 'left' });
+  }
+  if (G.moved) {
+    /* 前端也节流：按 ~60Hz（16ms）发，而不是每个 touchmove 事件都发。
+     * 手机触摸采样常是 120Hz，全发等于让服务端多做一倍无用功。 */
+    const now = performance.now();
+    if (!G.lastSend || now - G.lastSend >= 16) {
+      G.lastSend = now;
+      send({ t: 'move', x: p.x, y: p.y });
+    }
+    G.last = p;
+  }
+  ev.preventDefault();
+}, { passive: false });
+
+function end_touch(ev) {
+  clearTimeout(G.longTimer);
+  if (ev.touches.length === 0) {
+    if (G.held) {
+      send({ t: 'up', btn: 'right' });
+      G.held = false;
+    } else if (G.id !== null) {
+      if (G.moved) {
+        if (!G.scrolling) send({ t: 'up', btn: 'left' });
+      } else if (!G.scrolling) {
+        send({ t: 'click', x: G.start.x, y: G.start.y, btn: 'left', count: 1 });
+      }
+    }
+    G.id = null;
+    G.last2 = null;
+    G.lastScreen = null;
+    G.moved = false;
+  }
+  ev.preventDefault();
+}
+stage.addEventListener('touchend', end_touch, { passive: false });
+stage.addEventListener('touchcancel', end_touch, { passive: false });
+
+// 鼠标（桌面浏览器调试用）
+stage.addEventListener('mousedown', (ev) => {
+  const p = to_logical(ev.clientX, ev.clientY);
+  if (!p) return;
+  showRipple(ev.clientX, ev.clientY);
+  if (ev.button === 2) send({ t: 'click', x: p.x, y: p.y, btn: 'right' });
+  else send({ t: 'click', x: p.x, y: p.y, btn: 'left', count: ev.detail || 1 });
+  ev.preventDefault();
+});
+stage.addEventListener('contextmenu', (e) => e.preventDefault());
+stage.addEventListener('wheel', (ev) => {
+  send({ t: 'scroll', dx: ev.deltaX, dy: ev.deltaY });
+  ev.preventDefault();
+}, { passive: false });
+
+// ---------------------------------------------------------------- 工具条
+
+/* 收起工具栏后在左上角留一个常驻小把手 —— 原来收起就彻底没了，
+ * 用户只能刷新页面才能找回来（报「☰按了会隐藏但不知道怎么显示」）。 */
+function setBarHidden(hidden) {
+  bar.classList.toggle('hidden', hidden);
+  $('handle').style.display = hidden ? 'block' : 'none';
+  if (hidden) {
+    stat.style.bottom = 'auto';
+    stat.style.top = 'max(8px, env(safe-area-inset-top))';
+  } else {
+    stat.style.top = 'auto';
+    stat.style.bottom = 'max(10px, env(safe-area-inset-bottom))';
+  }
+}
+
+$('btnMenu').onclick = () => setBarHidden(!bar.classList.contains('hidden'));
+$('handle').onclick = () => setBarHidden(false);
+
+$('btnScroll').onclick = (e) => {
+  scrollMode = !scrollMode;
+  e.currentTarget.classList.toggle('on', scrollMode);
+};
+
+$('btnRight').onclick = (e) => {
+  rightMode = !rightMode;
+  e.currentTarget.classList.toggle('on', rightMode);
+};
+
+$('btnKbd').onclick = () => {
+  const k = $('kbd');
+  k.value = '';
+  /* 必须在这次点击的同步调用栈里 focus（不能 setTimeout），否则 Android
+   * 认为不是用户手势触发的，键盘还是不弹。 */
+  k.focus();
+  /* 保险：某些 WebView / 老版本 Chrome 要点一下才认，补一次 click。 */
+  try { k.click(); } catch (e) { /* 忽略 */ }
+  $('fkeys').classList.add('on');
+  toast('键盘已开 · 上方是功能键');
+};
+
+/* 键盘：用 input 事件拿字符。
+ *
+ * **不能靠比较 value 长度算增删** —— 手机输入法（尤其是中文、带联想候选的）
+ * 一次 input 就可能把整串替换掉，长度变化和真实增删对不上；原来的写法每次
+ * 还把 value 清空，导致 lastKbd 永远追不上，退格和中文全丢（用户报的
+ * 「无法输入文字、无法删除文字，只能输入快捷键字母」）。
+ *
+ * 现在按 **inputType** 分流：
+ *   - deleteContentBackward / Forward → 发 BackSpace / Delete
+ *   - insertText / insertCompositionText → 把 data 里的文字整段 type-text
+ * 发完清空 value，输入法继续组合也不受影响。 */
+/* 能直接当键码打出来的字符：ASCII 可打印 + 少数符号。
+ * 其余（中文 / emoji / 全角标点）走不了 type-text —— vidow 那边会回
+ * 「当前键盘布局里打不出来」，只能剪贴板 + Ctrl+V。 */
+const KEYBOARD_SAFE = /^[\x20-\x7e\n\t]*$/;
+
+function type_text(str) {
+  if (!str) return;
+  const pre = modPrefix();
+  if (pre && str.length === 1) {
+    /* 粘着修饰键时打单个字符 = 组合键（Ctrl+C 之类）。
+     * 走 send-key 而不是 type-text：type-text 只送字符，不带修饰。 */
+    send({ t: 'key', key: pre + '+' + str });
+    clearHeld();
+    return;
+  }
+  if (pre && str.length > 1) clearHeld();   /* 多字符就忽略修饰，别发怪东西 */
+  if (KEYBOARD_SAFE.test(str)) {
+    send({ t: 'text', text: str });
+  } else {
+    send({ t: 'paste', text: str });
+  }
+}
+
+$('kbd').addEventListener('input', (ev) => {
+  const e = ev.originalEvent || ev;
+  const type = e.inputType || '';
+  const data = e.data;
+  if (type.indexOf('delete') === 0) {
+    const fwd = type.indexOf('Forward') >= 0;
+    send({ t: 'key', key: fwd ? 'Delete' : 'BackSpace' });
+  } else if (data) {
+    /* **输入法组合期间不在这里发**。
+     *
+     * 中文输入时 Android 会先连发几轮 input（带拼音原文），最后再来一个
+     * compositionend（带真正上屏的字）。两个口子都发的话，同一段文字会
+     * 上屏两遍甚至四遍（用户实测「中文会输入两遍」，日志里 "可以了"
+     * 一次输入发了 4 条 paste）。
+     *
+     * 规则：isComposing / inputType=insertCompositionText 期间一律跳过，
+     * 等 compositionend 统一发一次；没有输入法（直接打英文）时 isComposing
+     * 为 false，照旧走这里。 */
+    const composingNow = e.isComposing || type === 'insertCompositionText';
+    if (!composingNow && !composing) type_text(data);
+  }
+  ev.target.value = '';
+});
+
+/* **退格必须单独拦**：手机软键盘在「空输入框」上按退格时，Android 认为没东西
+ * 可删，很多输入法**根本不派发 input 事件**（inputType 永远是空）。光靠
+ * input 那条路，用户按一百次退格手机上一点动静都没有（用户报的就是这个）。
+ * keydown 的 Backspace 是稳的，删完 preventDefault 免得把输入框本身也删了。 */
+$('kbd').addEventListener('keydown', (ev) => {
+  if (ev.key === 'Backspace') {
+    const p0 = modPrefix();
+    send({ t: 'key', key: p0 ? p0 + '+BackSpace' : 'BackSpace' });
+    if (p0) clearHeld();
+    ev.preventDefault();
+    return;
+  }
+  if (ev.key === 'Delete') {
+    send({ t: 'key', key: 'Delete' });
+    ev.preventDefault();
+  }
+});
+
+/* 输入法还在组合（中文拼音没上屏）时不要发，等 compositionend。 */
+let composing = false;
+$('kbd').addEventListener('compositionstart', () => { composing = true; });
+$('kbd').addEventListener('compositionend', (ev) => {
+  composing = false;
+  /* 只在这里发上屏后的最终文字（配合 input 里的跳过，保证只发一次）。 */
+  if (ev.data) type_text(ev.data);
+  ev.target.value = '';
+});
+
+$('kbd').addEventListener('keydown', (ev) => {
+  if (ev.key === 'Enter') {
+    send({ t: 'key', key: 'Return' });
+    ev.preventDefault();
+  } else if (ev.key === 'Escape') {
+    send({ t: 'key', key: 'Escape' });
+    ev.preventDefault();
+  } else if (ev.key === 'Tab') {
+    send({ t: 'key', key: 'Tab' });
+    ev.preventDefault();
+  }
+});
+
+// ---------------------------------------------------------------- 显示器
+
+let OUTS = [];        // 可用输出清单 [{name, w, h}]
+
+async function loadOutputs() {
+  try {
+    const r = await fetch('/api/state');
+    const st = await r.json();
+    OUTS = st.outputs || [];
+  } catch { OUTS = []; }
+}
+
+/* 显示器切换：底部抽屉 + 单选框（不用 prompt —— 手机上 prompt 会被当弹窗
+ * 拦掉，而且一排文字看不出来哪个是当前屏）。 */
+$('btnOut').onclick = async () => {
+  await loadOutputs();
+  const box = $('outlist');
+  box.innerHTML = '';
+  if (!OUTS.length) {
+    box.innerHTML = '<div class="oempty">拿不到显示器列表</div>';
+  } else {
+    const cur = out ? out.name : '';
+    OUTS.forEach((o) => {
+      const lab = document.createElement('label');
+      lab.className = 'orow' + (o.enabled === false ? ' off' : '');
+      const rb = document.createElement('input');
+      rb.type = 'radio';
+      rb.name = 'outscreen';
+      rb.value = o.name;
+      rb.checked = (o.name === cur);
+      rb.onclick = () => {
+        send({ t: 'out', name: o.name });
+        toast('切到 ' + o.name);
+        setTimeout(() => { $('outpanel').style.display = 'none'; }, 250);
+      };
+      const sp = document.createElement('span');
+      sp.className = 'oname';
+      sp.textContent = o.name;
+      const si = document.createElement('span');
+      si.className = 'oinfo';
+      si.textContent = o.w + '×' + o.h + (o.scale && o.scale !== 1 ? ' @' + o.scale + 'x' : '')
+        + (o.enabled === false ? '（已关）' : '');
+      lab.appendChild(rb);
+      lab.appendChild(sp);
+      lab.appendChild(si);
+      box.appendChild(lab);
+    });
+  }
+  $('outpanel').style.display = 'block';
+};
+
+$('outclose').onclick = () => { $('outpanel').style.display = 'none'; };
+
+function toast(msg) {
+  let t = document.getElementById('toast');
+  if (!t) {
+    t = document.createElement('div');
+    t.id = 'toast';
+    t.style.cssText = 'position:fixed;left:50%;bottom:80px;transform:translateX(-50%);'
+      + 'background:rgba(0,0,0,.85);color:#fff;padding:8px 14px;border-radius:8px;'
+      + 'font-size:14px;z-index:99;pointer-events:none';
+    document.body.appendChild(t);
+  }
+  t.textContent = msg;
+  t.style.display = 'block';
+  clearTimeout(t._h);
+  t._h = setTimeout(() => { t.style.display = 'none'; }, 1600);
+}
+
+setTimeout(() => toast('前端 ' + BUILD), 1200);
+
+// ---------------------------------------------------------------- 功能键条
+
+/* 安卓软键盘没有 Ctrl / Alt / Super，打不出任何组合键。
+ * 这里是一排「粘住」的修饰键：点一下高亮，之后打的每个键都带上它，
+ * 再点一下取消。和桌面键盘按住 Ctrl 打一串是一样的手感。 */
+const HELD = { ctrl: false, alt: false, shift: false, super: false };
+
+function modPrefix() {
+  const order = ['ctrl', 'alt', 'shift', 'super'];
+  return order.filter((k) => HELD[k])
+    .map((k) => (k === 'super' ? 'Super' : k))
+    .join('+');
+}
+
+function clearHeld() {
+  Object.keys(HELD).forEach((k) => { HELD[k] = false; });
+  document.querySelectorAll('#fkeys .fbtn.mod').forEach((b) => b.classList.remove('on'));
+}
+
+document.querySelectorAll('#fkeys .fbtn.mod').forEach((b) => {
+  b.onclick = () => {
+    const k = b.dataset.mod;
+    HELD[k] = !HELD[k];
+    b.classList.toggle('on', HELD[k]);
+    /* 键盘保持打开：重新 focus 回去，不然软键盘会收起来。 */
+    $('kbd').focus();
+  };
+});
+
+/* 功能键（Esc/Tab/方向/F1-12 …）：带上当前粘住的修饰键发一次。 */
+document.querySelectorAll('#fkeys .fbtn[data-key]').forEach((b) => {
+  b.onclick = () => {
+    const pre = modPrefix();
+    const key = pre ? pre + '+' + b.dataset.key : b.dataset.key;
+    send({ t: 'key', key });
+    toast(key);
+    clearHeld();
+    $('kbd').focus();
+  };
+});
+
+// ---------------------------------------------------------------- 组合键
+
+let modHeld = false;
+
+$('btnMod').onclick = () => {
+  const p = $('modpanel');
+  p.style.display = (p.style.display === 'none' || !p.style.display) ? 'block' : 'none';
+};
+
+/* 面板里的按钮发的是 **vidow 动作**，不是按键。
+ *
+ * 为什么不能用 send-key 送 Super+Return：注入的按键只走
+ * wlr_seat_keyboard_notify_key 发给**客户端**，不经过合成器的绑定表
+ * （vidow_keybind_key 只在物理键盘事件里调）—— 所以 Super+ 任何东西
+ * 都不会触发 vidow 自己的动作，按下去一点反应都没有（用户报的
+ * 「选终端没反应」）。正确路径是 IPC 的 action 命令。 */
+document.querySelectorAll('#modpanel button[data-a]').forEach((b) => {
+  b.onclick = () => {
+    send({ t: 'action', a: b.dataset.a });
+    toast(b.dataset.a);
+  };
+});
+
+/* 「滚轮模式」：先按住 Super，再在画面上下刷两指，等于 Mod+滚轮。
+ * vidow 的 Mod+滚轮 = focus-column -1|1（切列）。 */
+$('btnModScroll').onclick = () => {
+  modHeld = !modHeld;
+  const b = $('btnModScroll');
+  b.classList.toggle('on', modHeld);
+  b.textContent = modHeld ? '滚轮模式（开）' : '滚轮模式';
+};
+
+// ---------------------------------------------------------------- 工作区
+
+/* 工作区：抽屉 + 单选框。
+ *
+ * 原来是工具栏上一排小按钮，屏幕一多就分不清「1」是哪块屏的工作区
+ * （DP-2 和 DP-3 各有一个工作区 1）。现在按屏分组列出来，每行带单选框，
+ * 当前所在的那条高亮。 */
+$('btnWs').onclick = async () => {
+  const box = $('wslist');
+  box.innerHTML = '<div class="oempty">读取中…</div>';
+  $('wspanel').style.display = 'block';
+  let st;
+  try {
+    const r = await fetch('/api/state');
+    st = await r.json();
+  } catch (e) {
+    box.innerHTML = '<div class="oempty">拿不到工作区列表</div>';
+    return;
+  }
+  const list = st.workspaces || [];
+  const curOut = out ? out.name : (st.output && st.output.name) || '';
+  /* 只列当前这块屏的工作区 —— 切到别的屏的工作区在手机上只会让人困惑
+   * （画面没变化，因为你看的是这块屏）。 */
+  const mine = list.filter((w) => !w.output || w.output === curOut);
+  box.innerHTML = '';
+  if (!mine.length) {
+    box.innerHTML = '<div class="oempty">这块屏没有工作区</div>';
+    return;
+  }
+  mine.forEach((w) => {
+    const lab = document.createElement('label');
+    lab.className = 'orow';
+    const rb = document.createElement('input');
+    rb.type = 'radio';
+    rb.name = 'wssel';
+    rb.value = String(w.idx);
+    rb.checked = !!w.active;
+    /* 用 onclick 而不是 onchange：程序化 .click() 不触发 change，
+     * 而真机上点 label 也只在未选中时才 change —— checkbox/radio 的
+     * click 事件最稳。 */
+    rb.onclick = () => {
+      send({ t: 'ws', id: w.name || w.idx });
+      toast('工作区 ' + (w.name || w.idx));
+      setTimeout(() => { $('wspanel').style.display = 'none'; }, 250);
+    };
+    const sp = document.createElement('span');
+    sp.className = 'oname';
+    sp.textContent = w.name || String(w.idx);
+    const si = document.createElement('span');
+    si.className = 'oinfo';
+    si.textContent = w.active ? '当前' : (w.shown ? '显示中' : '');
+    lab.appendChild(rb);
+    lab.appendChild(sp);
+    lab.appendChild(si);
+    box.appendChild(lab);
+  });
+};
+
+$('wsclose').onclick = () => { $('wspanel').style.display = 'none'; };
+
+/* 兼容旧调用点 */
+async function loadWorkspaces() { /* 已并入 btnWs 的抽屉，保留空壳 */ }
+
+// ---------------------------------------------------------------- 启动
+
+window.addEventListener('error', (e) => { window.__err = e.message; });
+window.addEventListener('unhandledrejection', (e) => { window.__rej = String(e.reason && e.reason.message || e.reason); });
+connect();
+</script>
+</body>
+</html>
