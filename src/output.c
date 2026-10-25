@@ -27,6 +27,27 @@ static bool render_stats_on(void) {
 	return on != 0;
 }
 
+/* 卡顿探针：VIDOW_STUTTER=1 开，VIDOW_STUTTER_MS 改阈值（默认 100ms）。
+ * 只问一次环境变量（和上面那两个探针一个规矩）。 */
+static bool stutter_on(void) {
+	static int done = 0, on = 0;
+	if (!done) {
+		on = getenv("VIDOW_STUTTER") != NULL ? 1 : 0;
+		done = 1;
+	}
+	return on != 0;
+}
+
+static int64_t stutter_threshold_ns(void) {
+	static int64_t ns = -1;
+	if (ns < 0) {
+		const char *v = getenv("VIDOW_STUTTER_MS");
+		int ms = v != NULL ? atoi(v) : 0;
+		ns = (int64_t)(ms > 0 ? ms : 100) * 1000000LL;
+	}
+	return ns;
+}
+
 /* 帧事件掐断的测试钩子（VIDOW_TEST_STALL_OUTPUT=<屏名>），同样只问一次。 */
 static const char *stall_output_name(void) {
 	static int done = 0;
@@ -138,6 +159,35 @@ void vidow_output_render(struct vidow_output *output) {
 	 * 像背景跟着窗口一起弹。所有依赖 anim_off 的东西（区域原点、UV）必须和
 	 * 这一帧画出来的位置同一个时刻。 */
 	int64_t st_t0 = vidow_now_ns();
+	/* **卡顿探针**（VIDOW_STUTTER=1）：逐帧看「上一帧到现在隔了多久」。
+	 *
+	 * 为什么不能只看渲染统计：那个每 500ms 聚合一次，一次 300ms 的卡顿被
+	 * 平均成「60fps 正常」，看不出来。用户报的「突然卡一下」正是这种 ——
+	 * 单帧异常，平均无感。
+	 *
+	 * 这里只报超阈值的帧，附带上一帧各阶段耗时（能区分「GPU 慢」和
+	 * 「主循环根本没被唤醒」：后者说明卡在别处，不是渲染）。 */
+	if (stutter_on()) {
+		static int64_t prev_ns = 0;
+		if (prev_ns != 0) {
+			int64_t gap_ns = st_t0 - prev_ns;
+			if (gap_ns >= stutter_threshold_ns()) {
+				wlr_log(WLR_INFO,
+					"卡顿: 距上一帧 %.1fms（阈值 %.0fms）"
+					" | 上帧: 果冻 %.2f 模糊 %.2f 装饰 %.2f 提交 %.2f "
+					"| 帧数 %d 趟 %d 重烘 %d",
+					(double)gap_ns / 1e6,
+					(double)stutter_threshold_ns() / 1e6,
+					(double)vidow_stats.jelly_ns / 1e6,
+					(double)vidow_stats.blur_ns / 1e6,
+					(double)vidow_stats.decor_ns / 1e6,
+					(double)vidow_stats.commit_ns / 1e6,
+					vidow_stats.frames, vidow_stats.passes,
+					vidow_stats.bakes);
+			}
+		}
+		prev_ns = st_t0;
+	}
 	vidow_anim_tick(server);
 	/* 动画**最后一帧**推完就把自己从链表里摘了（anim.c），于是下面第 599 行
 	 * 那个「动画还在跑就再要一帧」的判据当场失效 —— 不会再有任何帧来消费
