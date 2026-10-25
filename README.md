@@ -10392,3 +10392,43 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
 2. layer surface 的装饰与模糊（状态栏/启动器也想要圆角）
 3. workspace / 多显示器列组
 4. `_NET_WM_STRUT`（面板预留），以及按屏幕边界夹菜单的客户端（把 X 屏幕也改成 `逻辑 × S`）
+
+32. 信号：合成器必须**显式忽略 SIGPIPE**，这不是可选加固。
+
+    现场：在 vidow 里开的 kitty 里跑 vshell，按 Ctrl+C，vidow 整个进程消失 —— 没有 core、
+    没有断言、连退出日志都写不出来。gdb 挂上去看到的收尾是
+
+        [Thread 1 ... (id 1) exited]
+        ...
+        Program terminated with signal SIGPIPE, Broken pipe.
+
+    也就是说所有线程都已经正常退完，最后收走进程的是 SIGPIPE 的默认动作。原因很日常：
+    合成器天天往**随时会消失的对端**写 —— 剪贴板把数据塞进 pipe
+    （`clipboard.c` 的 `wlr_data_source_send` 用 `fds[1]`，读端是客户端）、IPC 往订阅者
+    那条 socket 上写（`ipc.c` 的 `write(c->fd, …)`）。客户端一走，这些写就撞上 EPIPE。
+
+    `main.c` 里现在 SIGINT / SIGQUIT / SIGPIPE 三个一起设成 `SIG_IGN`（前两个的道理见那里的
+    注释：终端把 Ctrl+C 发给整个前台进程组），要求子进程在 `exec` 前把这三个都还原成
+    `SIG_DFL`（`exec.c` 的 `vidow_exec_detached`），否则 kitty / vshell 自己会失去 Ctrl+C。
+
+    判据：`grep SigIgn /proc/$(pgrep -xo vidow)/status` 里第 13 位（SIGPIPE）必须是 1；
+    `SigIgn: 0000000000001006` 就是对的（bit 2 = SIGINT、bit 3 = SIGQUIT、bit 13 = SIGPIPE）。
+
+33. **未解**：Steam 第二次打开主窗口黑屏（Hyprland 下同一个操作正常）。
+
+    已用数据排除的假设（都别再走一遍）：`configured` 是 xdg-only 标志、渲染逻辑不读它；
+    configure **确实发出去过**（`16,94 3808x2050`，见 `x11-cfg` 日志）；窗口在列里
+    （`column_width: 1`）；`不裁（屏框 0,0 0x0）` 是不裁剪分支的正常值；`WM_STATE` 是
+    `Normal`；colormap `not installed` 是 X11 常态；`atom_cache.cc` 那些 ERROR 在**健康**的
+    第一次打开时同样出现（共 1500+ 条噪声）。
+
+    数据指到的现象：第一次打开有 **13 次换帧**，之后每一次重开**只有 1 次**，然后客户端
+    就不再交帧了；窗口 xid 不变（复用同一个 X 窗口）。也就是**我们收到的每一帧都画了，
+    是 Steam 自己停下来了**。差距在 XWayland 与合成器之间某个我们没发的信号上。
+
+    复现步骤（照抄）：`spawn kitty` 之类先开一个正常会话 → `steam` 开出主窗口（正常）→
+    `vidowmsg close-window --id <N>` → 再 `steam` → 全黑。手动拖一下窗口就恢复
+    （拖动走 grab → arrange，顺带把 CEF 的合成唤醒）。
+
+    下一轮要带的工具：`x11-buf`（本仓库已加的换帧日志，`grep x11-buf`）对比健康/黑屏两次
+    的差别；再看 XWayland 侧给 Steam 发的 `Expose` / `ConfigureNotify` 序列。
