@@ -85,6 +85,11 @@ static const struct atom_spec atom_specs[] = {
 	ATOM(net_wm_moveresize, "_NET_WM_MOVERESIZE"),
 	ATOM(net_wm_surface_serial, "WL_SURFACE_SERIAL"),
 	ATOM(utf8_string, "UTF8_STRING"),
+	/* Xwayland 的开关：它要等有人接管 WM_S0 才把 -listenfd 的 socket 挂进
+	 * 自己的事件循环（见 xserver hw/xwayland/xwayland.c 的
+	 * wm_selection_callback -> listen_on_fds）。没人接管就永远不 listen，
+	 * 所有 X 客户端卡死在 connect()。 */
+	ATOM(wm_s0, "WM_S0"),
 };
 #undef ATOM
 
@@ -763,6 +768,28 @@ static void wm_window_create(struct vidow_x11_server *x11) {
 	xcb_change_property(x11->conn, XCB_PROP_MODE_REPLACE, x11->wm_window,
 		x11->atoms.net_supporting_wm_check, XCB_ATOM_WINDOW, 32, 1,
 		&x11->wm_window);
+
+	/* **接管 WM_S0 —— 这是 Xwayland 肯 listen 的前提。**
+	 *
+	 * 用户报的「X 阻塞了，X 应用打不开，自启动流程也卡住」根因就在这里。
+	 * Xwayland 拿到 -listenfd 之后**不立刻** listen，而是挂起等一个信号：
+	 *     hw/xwayland/xwayland.c
+	 *       wm_selection_callback()   ← 有人把 WM_S0 设为 owner
+	 *         listen_on_fds()         ← 这时候才 ListenOnOpenFD(listen_fds[i])
+	 * 没人接管 WM_S0，listen_on_fds() 就永不执行，两个 -listenfd 永远不
+	 * 进 Xwayland 的 epoll，accept() 一次都不调。
+	 *
+	 * 实测症状（全部吻合）：Xwayland 的 epoll 里只有 Wayland 连接和 -wm
+	 * 那个 fd，没有 listen fd；strace 下连接进了队列却零次 accept；
+	 * /tmp/.X11-unix/X0 的 Recv-Q 一直积压 fcitx5 和 xrdb（backlog 只有 1，
+	 * 见 wlroots sockets.c 的 listen(fd, 1)）；xdpyinfo 直接超时；
+	 * X 客户端 ESTAB 恒为 0。之前误判成 wlroots 懒启动的锅，把 lazy 关掉
+	 * （67c9ff7）也没用 —— 因为根本不在那条路上。
+	 *
+	 * Hyprland 同样是这一步：src/xwayland/XWM.cpp 的
+	 *     xcb_set_selection_owner(conn, m_wmWindow, WM_S0, XCB_CURRENT_TIME) */
+	xcb_set_selection_owner(x11->conn, x11->wm_window, x11->atoms.wm_s0,
+		XCB_CURRENT_TIME);
 }
 
 static void supported_atoms_publish(struct vidow_x11_server *x11) {

@@ -150,6 +150,8 @@ struct vidow_x11_server {
 		xcb_atom_t net_wm_moveresize;
 		xcb_atom_t net_wm_surface_serial;
 		xcb_atom_t utf8_string;
+		/* Xwayland 要等有人接管 WM_S0 才肯 listen -listenfd 的 socket。 */
+		xcb_atom_t wm_s0;
 	} atoms;
 
 	/* 所有活着的 X11 窗口。 */
