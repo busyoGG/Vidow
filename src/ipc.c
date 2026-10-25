@@ -1865,7 +1865,7 @@ static bool cmd_quit(struct vidow_server *server, struct jval *req,
 	(void)req;
 	(void)err;
 	(void)errlen;
-	wlr_log(WLR_INFO, "ipc: 收到 quit，退出");
+	wlr_log(WLR_INFO, "退出: IPC quit，开始收尾");
 	jb_obj(out);
 	jb_kv_bool(out, "quitting", true);
 	jb_obj_end(out);

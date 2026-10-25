@@ -1393,7 +1393,7 @@ bool vidow_action_run(struct vidow_server *server, const char *action) {
 		return true;
 	}
 	if (strcmp(name, "quit") == 0 || strcmp(name, "exit") == 0) {
-		wlr_log(WLR_INFO, "action: %s -> 退出合成器", action);
+		wlr_log(WLR_INFO, "退出: 键位 %s 触发了 quit，开始收尾", action);
 		wl_display_terminate(server->display);
 		return true;
 	}

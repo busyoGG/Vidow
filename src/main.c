@@ -104,10 +104,13 @@ static int vidow_gsettings_int(const char *key) {
 }
 
 
+/* 退出必须能分辨是谁干的：合成器被「按错一个键」带走时，用户看到的只是桌面
+ * 没了，日志里那句含糊的「收到退出信号」帮不上任何忙。三条退出入口
+ * （SIGTERM / 键位 quit / IPC quit）各自把来源写清楚。 */
 static int terminate_signal(int signo, void *data) {
-	(void)signo;
 	struct vidow_server *server = data;
-	wlr_log(WLR_INFO, "收到退出信号，收尾");
+	wlr_log(WLR_INFO, "退出: 收到 SIG%d（%s），开始收尾", signo,
+		signo == SIGTERM ? "pkill / systemctl stop / 会话结束" : "其他信号");
 	wl_display_terminate(server->display);
 	return 0;
 }
