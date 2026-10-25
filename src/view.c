@@ -1,5 +1,6 @@
 #include "server.h"
 #include "ipc.h"
+#include "x11surface.h"
 #include "xwm.h"
 #include "x11.h"
 
@@ -114,8 +115,8 @@ static struct vidow_view *view_from_surface(struct vidow_server *server,
 		return NULL;
 	}
 
-	struct wlr_xwayland_surface *xsurface =
-		wlr_xwayland_surface_try_from_wlr_surface(surface);
+	struct vidow_x11_surface *xsurface =
+		vidow_x11_surface_from_wl_surface(surface);
 	if (xsurface != NULL) {
 		struct vidow_view *view;
 		wl_list_for_each(view, &server->views, link) {
@@ -541,14 +542,13 @@ void vidow_view_set_size(struct vidow_view *view, int w, int h) {
 				vidow_view_title(view) : "(无题)",
 			x, y, cw, ch, view->cfg_x, view->cfg_y, view->cfg_w,
 			view->cfg_h, view->cfg_sent);
-		wlr_xwayland_surface_configure(view->x11, (int16_t)x, (int16_t)y,
+		vidow_x11_surface_configure(view->x11, (int16_t)x, (int16_t)y,
 			(uint16_t)cw, (uint16_t)ch);
 		/* 尺寸和上一轮完全相同时，X 服务器不会自己发 ConfigureNotify
 		 * （ICCCM 只在尺寸真的变了才发）。手动补一个，否则客户端一直等
 		 * 确认、不再重绘 —— 见上面 same_as_last 那段注释。 */
 		if (same_as_last) {
-			xcb_connection_t *conn = wlr_xwayland_get_xwm_connection(
-				view->server->xwayland);
+			xcb_connection_t *conn = vidow_x11_connection();
 			wlr_log(WLR_INFO, "x11-cfg %s: 命中「尺寸没变」分支，"
 				"conn=%p window_id=0x%x",
 				vidow_view_title(view) != NULL ?
@@ -629,7 +629,7 @@ void vidow_view_set_activated(struct vidow_view *view, bool activated) {
 		activated = true;
 	}
 	if (view->kind == VIDOW_VIEW_X11) {
-		wlr_xwayland_surface_activate(view->x11, activated);
+		vidow_x11_surface_activate(view->x11, activated);
 		return;
 	}
 	wlr_xdg_toplevel_set_activated(view->xdg_toplevel, activated);
@@ -640,7 +640,7 @@ void vidow_view_set_fullscreen(struct vidow_view *view, bool fullscreen) {
 		return;
 	}
 	if (view->kind == VIDOW_VIEW_X11) {
-		wlr_xwayland_surface_set_fullscreen(view->x11, fullscreen);
+		vidow_x11_surface_set_fullscreen(view->x11, fullscreen);
 		return;
 	}
 	wlr_xdg_toplevel_set_fullscreen(view->xdg_toplevel, fullscreen);
@@ -729,7 +729,7 @@ void vidow_view_set_maximized(struct vidow_view *view, bool maximized) {
 	if (view->kind == VIDOW_VIEW_X11) {
 		/* X11 的「最大化」是 _NET_WM_STATE_MAXIMIZED_HORZ / VERT 两个状态位。
 		 * 列最大化是整列撑满宽度，横竖一起给（和别的 WM 一样）。 */
-		wlr_xwayland_surface_set_maximized(view->x11, maximized, maximized);
+		vidow_x11_surface_set_maximized(view->x11, maximized, maximized);
 		return;
 	}
 	wlr_xdg_toplevel_set_maximized(view->xdg_toplevel, maximized);
@@ -737,7 +737,7 @@ void vidow_view_set_maximized(struct vidow_view *view, bool maximized) {
 
 void vidow_view_close(struct vidow_view *view) {
 	if (view->kind == VIDOW_VIEW_X11) {
-		wlr_xwayland_surface_close(view->x11);
+		vidow_x11_surface_close(view->x11);
 		return;
 	}
 	wlr_xdg_toplevel_send_close(view->xdg_toplevel);
@@ -857,20 +857,20 @@ void vidow_view_x11_scale(struct vidow_view *view) {
 	 * 从 X 侧抓出来是有内容的（24 位 RGB），所以内容一直都在，是我们解释错
 	 * 了缓冲区。普通窗口本来就没有透明通道可言，X 那边的合成结果已经拍平了。 */
 	bool use_alpha = view->x11 != NULL && view->x11->opacity < 1.0f;
-	static const enum wlr_xwayland_net_wm_window_type translucent_types[] = {
-		WLR_XWAYLAND_NET_WM_WINDOW_TYPE_TOOLTIP,
-		WLR_XWAYLAND_NET_WM_WINDOW_TYPE_DROPDOWN_MENU,
-		WLR_XWAYLAND_NET_WM_WINDOW_TYPE_POPUP_MENU,
-		WLR_XWAYLAND_NET_WM_WINDOW_TYPE_COMBO,
-		WLR_XWAYLAND_NET_WM_WINDOW_TYPE_DND,
-		WLR_XWAYLAND_NET_WM_WINDOW_TYPE_NOTIFICATION,
-		WLR_XWAYLAND_NET_WM_WINDOW_TYPE_SPLASH,
+	static const int translucent_types[] = {
+		VIDOW_X11_WT_TOOLTIP,
+		VIDOW_X11_WT_DROPDOWN_MENU,
+		VIDOW_X11_WT_POPUP_MENU,
+		VIDOW_X11_WT_COMBO,
+		VIDOW_X11_WT_DND,
+		VIDOW_X11_WT_NOTIFICATION,
+		VIDOW_X11_WT_SPLASH,
 	};
 	if (!use_alpha && view->x11 != NULL) {
 		for (size_t i = 0;
 				i < sizeof(translucent_types) /
 					sizeof(translucent_types[0]); i++) {
-			if (wlr_xwayland_surface_has_window_type(view->x11,
+			if (vidow_x11_surface_has_window_type(view->x11,
 					translucent_types[i])) {
 				use_alpha = true;
 				break;
@@ -5724,7 +5724,7 @@ void vidow_view_set_minimized(struct vidow_view *view, bool minimized) {
 	view->minimized = minimized;
 
 	if (view->kind == VIDOW_VIEW_X11 && view->x11 != NULL) {
-		wlr_xwayland_surface_set_minimized(view->x11, minimized);
+		vidow_x11_surface_set_minimized(view->x11, minimized);
 	} else if (view->xdg_toplevel != NULL &&
 			vidow_view_configure_ready(view)) {
 		/* 客户端第一帧还没来（surface 没 initialized）就 set_minimized 的话，
@@ -6438,7 +6438,7 @@ static void view_popup_release_keyboard(struct vidow_view *view) {
 static void view_reconsider_map(struct vidow_view *view);
 
 /* 弹出物判据（定义见文件后半段）—— view_map 的辅助窗口判据要用它。 */
-static bool x11_is_popup(const struct wlr_xwayland_surface *x);
+static bool x11_is_popup(const struct vidow_x11_surface *x);
 static void x11_trace_view(const char *event, struct vidow_view *view,
 		struct wlr_surface *surface);
 void view_map(struct wl_listener *listener, void *data) {
@@ -7583,43 +7583,43 @@ static void view_request_resize(struct wl_listener *listener, void *data) {
 
 /* X11 的窗口类型决定它是平铺还是浮动、要不要装饰。跟 xdg 那边的
  * detect_mode() 是一个意思，只是信息源不一样。 */
-static const enum wlr_xwayland_net_wm_window_type x11_float_types[] = {
-	WLR_XWAYLAND_NET_WM_WINDOW_TYPE_DIALOG,
-	WLR_XWAYLAND_NET_WM_WINDOW_TYPE_UTILITY,
-	WLR_XWAYLAND_NET_WM_WINDOW_TYPE_SPLASH,
-	WLR_XWAYLAND_NET_WM_WINDOW_TYPE_TOOLBAR,
-	WLR_XWAYLAND_NET_WM_WINDOW_TYPE_MENU,
-	WLR_XWAYLAND_NET_WM_WINDOW_TYPE_DROPDOWN_MENU,
-	WLR_XWAYLAND_NET_WM_WINDOW_TYPE_POPUP_MENU,
-	WLR_XWAYLAND_NET_WM_WINDOW_TYPE_TOOLTIP,
-	WLR_XWAYLAND_NET_WM_WINDOW_TYPE_NOTIFICATION,
-	WLR_XWAYLAND_NET_WM_WINDOW_TYPE_COMBO,
-	WLR_XWAYLAND_NET_WM_WINDOW_TYPE_DND,
-	WLR_XWAYLAND_NET_WM_WINDOW_TYPE_DOCK,
+static const int x11_float_types[] = {
+	VIDOW_X11_WT_DIALOG,
+	VIDOW_X11_WT_UTILITY,
+	VIDOW_X11_WT_SPLASH,
+	VIDOW_X11_WT_TOOLBAR,
+	VIDOW_X11_WT_MENU,
+	VIDOW_X11_WT_DROPDOWN_MENU,
+	VIDOW_X11_WT_POPUP_MENU,
+	VIDOW_X11_WT_TOOLTIP,
+	VIDOW_X11_WT_NOTIFICATION,
+	VIDOW_X11_WT_COMBO,
+	VIDOW_X11_WT_DND,
+	VIDOW_X11_WT_DOCK,
 };
 
 /* 这些窗口是「弹出物」：自己定位置尺寸，我们不该给它套边框。 */
-static const enum wlr_xwayland_net_wm_window_type x11_overlay_types[] = {
-	WLR_XWAYLAND_NET_WM_WINDOW_TYPE_MENU,
-	WLR_XWAYLAND_NET_WM_WINDOW_TYPE_DROPDOWN_MENU,
-	WLR_XWAYLAND_NET_WM_WINDOW_TYPE_POPUP_MENU,
-	WLR_XWAYLAND_NET_WM_WINDOW_TYPE_TOOLTIP,
-	WLR_XWAYLAND_NET_WM_WINDOW_TYPE_COMBO,
-	WLR_XWAYLAND_NET_WM_WINDOW_TYPE_DND,
-	WLR_XWAYLAND_NET_WM_WINDOW_TYPE_NOTIFICATION,
+static const int x11_overlay_types[] = {
+	VIDOW_X11_WT_MENU,
+	VIDOW_X11_WT_DROPDOWN_MENU,
+	VIDOW_X11_WT_POPUP_MENU,
+	VIDOW_X11_WT_TOOLTIP,
+	VIDOW_X11_WT_COMBO,
+	VIDOW_X11_WT_DND,
+	VIDOW_X11_WT_NOTIFICATION,
 };
 
-static bool x11_has_any_type(const struct wlr_xwayland_surface *x,
-		const enum wlr_xwayland_net_wm_window_type *types, size_t count) {
+static bool x11_has_any_type(const struct vidow_x11_surface *x,
+		const int *types, size_t count) {
 	for (size_t i = 0; i < count; i++) {
-		if (wlr_xwayland_surface_has_window_type(x, types[i])) {
+		if (vidow_x11_surface_has_window_type(x, types[i])) {
 			return true;
 		}
 	}
 	return false;
 }
 
-static bool x11_has_fixed_size(const struct wlr_xwayland_surface *x) {
+static bool x11_has_fixed_size(const struct vidow_x11_surface *x) {
 	const xcb_size_hints_t *hints = x->size_hints;
 	if (hints == NULL) {
 		return false;
@@ -7695,7 +7695,7 @@ bool vidow_view_fixed_size_hint(const struct vidow_view *view, int *w, int *h) {
 }
 
 enum vidow_float_mode vidow_x11_detect_mode(struct vidow_view *view) {
-	struct wlr_xwayland_surface *x = view->x11;
+	struct vidow_x11_surface *x = view->x11;
 	if (x == NULL) {
 		return VIDOW_FLOAT_NONE;
 	}
@@ -7730,7 +7730,7 @@ enum vidow_float_mode vidow_x11_detect_mode(struct vidow_view *view) {
  * 装饰我」，vidow 一律给 xdg_toplevel 套装饰，X11 的普通窗口也跟它一样。
  * （`_MOTIF_WM_HINTS` 还有个坑：XWM 是在窗口刚建出来时读它的，客户端往往之后才
  * 设，读到的永远是初始值。） */
-static bool x11_is_popup(const struct wlr_xwayland_surface *x) {
+static bool x11_is_popup(const struct vidow_x11_surface *x) {
 	if (x->override_redirect) {
 		return true;
 	}
@@ -8051,9 +8051,7 @@ static void x11_drop_surface(struct vidow_view *view) {
 	vidow_portal_view_mapped(view, false);
 }
 
-static void x11_associate(struct wl_listener *listener, void *data) {
-	(void)data;
-	struct vidow_view *view = wl_container_of(listener, view, x11_associate);
+void vidow_view_attach_x11_surface(struct vidow_view *view) {
 	x11_trace_view("associate", view, view->x11 != NULL ? view->x11->surface : NULL);
 	x11_attach_surface(view);
 	wlr_log(WLR_DEBUG, "x11: associate %s",
@@ -8069,25 +8067,19 @@ static void x11_associate(struct wl_listener *listener, void *data) {
 	xwm_surface_sync(view);
 }
 
-static void x11_dissociate(struct wl_listener *listener, void *data) {
-	(void)data;
-	struct vidow_view *view = wl_container_of(listener, view, x11_dissociate);
+void vidow_view_x11_gone(struct vidow_view *view) {
 	x11_trace_view("dissociate", view, NULL);
 	x11_drop_surface(view);
 }
 
-static void x11_map_request(struct wl_listener *listener, void *data) {
-	(void)data;
-	struct vidow_view *view = wl_container_of(listener, view, x11_map_request);
+void vidow_view_x11_map_request(struct vidow_view *view) {
 	/* 交给统一的状态机：它只认「客户端有没有交 buffer」，不看 X 这时候
 	 * 报的是什么状态。map 请求常常早于 associate 到（Steam 重开主窗口
 	 * 实测就是这样），这时候还判不了，等 associate / commit 再来说话。 */
 	xwm_surface_sync(view);
 }
 
-static void x11_set_title(struct wl_listener *listener, void *data) {
-	(void)data;
-	struct vidow_view *view = wl_container_of(listener, view, x11_set_title);
+static void view_x11_title_changed(struct vidow_view *view) {
 	/* Xwayland can emit the first property update in the same batch as
 	 * association. If the association was already complete when this view was
 	 * created, this is the next safe point to attach the scene surface. */
@@ -8104,24 +8096,18 @@ static void x11_set_title(struct wl_listener *listener, void *data) {
 	vidow_ipc_emit_window(view->server, "window-title-changed", view);
 }
 
-static void x11_set_class(struct wl_listener *listener, void *data) {
-	(void)data;
-	struct vidow_view *view = wl_container_of(listener, view, x11_set_class);
+static void view_x11_class_changed(struct vidow_view *view) {
 	vidow_portal_view_title(view);
 	vidow_rule_apply(view->server, view);
 	vidow_view_note_names(view);
 }
 
-static void x11_set_parent(struct wl_listener *listener, void *data) {
-	(void)data;
-	struct vidow_view *view = wl_container_of(listener, view, x11_set_parent);
+static void view_x11_parent_changed(struct vidow_view *view) {
 	vidow_float_update_mode(view);
 	vidow_portal_view_parent(view);
 }
 
-static void x11_set_geometry(struct wl_listener *listener, void *data) {
-	(void)data;
-	struct vidow_view *view = wl_container_of(listener, view, x11_set_geometry);
+static void view_x11_geometry_changed(struct vidow_view *view) {
 	if (!view->popup) {
 		/* 普通窗口的位置由布局决定，X 报的坐标只在浮动窗口的首次摆放里当参考。 */
 		return;
@@ -8139,18 +8125,13 @@ static void x11_set_geometry(struct wl_listener *listener, void *data) {
 	vidow_arrange(view->server);
 }
 
-static void x11_set_override_redirect(struct wl_listener *listener, void *data) {
-	(void)data;
-	struct vidow_view *view =
-		wl_container_of(listener, view, x11_set_override_redirect);
+static void view_x11_override_redirect_changed(struct vidow_view *view) {
 	x11_refresh_popup(view);
 	vidow_float_update_mode(view);
 	vidow_arrange(view->server);
 }
 
-static void x11_set_hints(struct wl_listener *listener, void *data) {
-	(void)data;
-	struct vidow_view *view = wl_container_of(listener, view, x11_set_hints);
+static void view_x11_hints_changed(struct vidow_view *view) {
 	/* min/max 提示要等到这里才齐，浮动判断得重跑一遍。 */
 	x11_refresh_popup(view);
 	vidow_float_update_mode(view);
@@ -8159,10 +8140,7 @@ static void x11_set_hints(struct wl_listener *listener, void *data) {
 /* `_NET_WM_WINDOW_TYPE` 是**另一条**消息（wlroots 的 set_hints 是 WM_HINTS）：
  * 客户端可以在映射之后才把窗口类型设成菜单/提示/下拉框，也可能反过来。类型变了
  * 就得重新分类（弹出物 <-> 普通窗口）、甚至把场景节点搬到另一层上。 */
-static void x11_set_window_type(struct wl_listener *listener, void *data) {
-	(void)data;
-	struct vidow_view *view =
-		wl_container_of(listener, view, x11_set_window_type);
+static void view_x11_window_type_changed(struct vidow_view *view) {
 	x11_refresh_popup(view);
 	vidow_float_update_mode(view);
 }
@@ -8170,10 +8148,7 @@ static void x11_set_window_type(struct wl_listener *listener, void *data) {
 /* WM_NORMAL_HINTS（min/max 尺寸）是另一条信号，必须有自己的回调：
  * wl_container_of 是按 listener 字段的地址反推 view 的，两个信号共用一个回调
  * 会算出错的 view 指针（这里踩过一次，直接段错误）。 */
-static void x11_set_size_hints(struct wl_listener *listener, void *data) {
-	(void)data;
-	struct vidow_view *view =
-		wl_container_of(listener, view, x11_set_size_hints);
+static void view_x11_size_hints_changed(struct vidow_view *view) {
 	vidow_float_update_mode(view);
 	/* S3b：这条信号不只带 min/max 尺寸，也带 PAspect（宽高比）—— 客户端常常
 	 * **映射之后**才设它（游戏进全屏那一刻），所以锁比例必须在这儿重判一次，
@@ -8181,15 +8156,12 @@ static void x11_set_size_hints(struct wl_listener *listener, void *data) {
 	vidow_mini_aspect_changed(view);
 }
 
-static void x11_request_configure(struct wl_listener *listener, void *data) {
-	struct vidow_view *view =
-		wl_container_of(listener, view, x11_request_configure);
-	struct wlr_xwayland_surface_configure_event *event = data;
-
-	if (event->width > 1 && event->height > 1) {
+static void view_x11_configure_request(struct vidow_view *view,
+		int rx, int ry, int rw, int rh, uint32_t rmask) {
+	if (rw > 1 && rh > 1) {
 		/* 记下来：这个请求常常早于「我们认出它是个对话框」，见 server.h */
-		view->x11_want_w = event->width;
-		view->x11_want_h = event->height;
+		view->x11_want_w = rw;
+		view->x11_want_h = rh;
 	}
 	/* 客户端往往先报尺寸、后报窗口类型/尺寸提示，先按最新的信息重判一次模式，
 	 * 免得把一个「其实该浮动」的窗口当平铺窗口把尺寸请求吞掉。 */
@@ -8197,26 +8169,27 @@ static void x11_request_configure(struct wl_listener *listener, void *data) {
 
 	wlr_log(WLR_DEBUG, "x11: %s 请求 configure %d,%d %ux%u（mask 0x%x）",
 		vidow_view_title(view) != NULL ? vidow_view_title(view) : "(无题)",
-		event->x, event->y, event->width, event->height, event->mask);
+		rx, ry, rw, rh, rmask);
 
 	/* overlay 窗口（菜单/下拉框）是在请求自己的位置和尺寸，照单全收：我们只管
 	 * 显示它，不指挥它。override-redirect 的窗口连这里都到不了（X 服务器直接
 	 * 照办，不会来问 WM），会走这里的是「声明了弹出类型但没设 OR」的那批。 */
 	if (view->popup) {
-		uint32_t m = event->mask;
-		int x = (m & XCB_CONFIG_WINDOW_X) != 0 ? event->x : view->x11->x;
-		int y = (m & XCB_CONFIG_WINDOW_Y) != 0 ? event->y : view->x11->y;
+		uint32_t m = rmask;
+		int x = (m & XCB_CONFIG_WINDOW_X) != 0 ? rx : view->x11->x;
+		int y = (m & XCB_CONFIG_WINDOW_Y) != 0 ? ry : view->x11->y;
 		int w = (m & XCB_CONFIG_WINDOW_WIDTH) != 0 ?
-			(int)event->width : view->x11->width;
+			(int)rw : view->x11->width;
 		int h = (m & XCB_CONFIG_WINDOW_HEIGHT) != 0 ?
-			(int)event->height : view->x11->height;
+			(int)rh : view->x11->height;
 		if (w < 1) {
 			w = 1;
 		}
 		if (h < 1) {
 			h = 1;
 		}
-		wlr_xwayland_surface_configure(view->x11, x, y, w, h);
+		vidow_x11_surface_configure(view->x11, (int16_t)x, (int16_t)y,
+			(uint16_t)w, (uint16_t)h);
 		/* 尺寸真的变了就得重新声明场景表面的尺寸 —— 和 x11_set_geometry 里
 		 * 那段同一个道理：漏了它，1x1 建窗的菜单永远长不大。 */
 		if (view->kind == VIDOW_VIEW_X11) {
@@ -8227,9 +8200,9 @@ static void x11_request_configure(struct wl_listener *listener, void *data) {
 	}
 	/* 浮动窗口自己定尺寸：客户端请求多大就给多大（X11 里这是它报名尺寸的
 	 * 正常途径）。位置仍按我们的规则（居中 / 跟随父窗口）。 */
-	if (view->float_mode != VIDOW_FLOAT_NONE && event->width > 1 &&
-			event->height > 1) {
-		double w = event->width, h = event->height;
+	if (view->float_mode != VIDOW_FLOAT_NONE && rw > 1 &&
+			rh > 1) {
+		double w = rw, h = rh;
 		vidow_xwm_from_native_size(view->server, view->output, w, h, &w, &h);
 		view->float_geom.width = (int)lround(w);
 		view->float_geom.height = (int)lround(h);
@@ -8238,12 +8211,9 @@ static void x11_request_configure(struct wl_listener *listener, void *data) {
 	}
 	/* 平铺窗口的尺寸由布局决定，客户端说了不算；照旧重排一次，等于回一个
 	 * configure 告诉它最终的几何，免得它一直等。 */
-	(void)event;
-	vidow_arrange(view->server);
+		vidow_arrange(view->server);
 }
-static void x11_request_move(struct wl_listener *listener, void *data) {
-	(void)data;
-	struct vidow_view *view = wl_container_of(listener, view, x11_request_move);
+static void view_x11_request_move(struct vidow_view *view) {
 	struct vidow_server *server = view->server;
 	if (view->float_mode == VIDOW_FLOAT_NONE) {
 		vidow_float_set_mode(view, VIDOW_FLOAT_FIXED);
@@ -8254,9 +8224,7 @@ static void x11_request_move(struct wl_listener *listener, void *data) {
 	vidow_pan_begin(server, view);
 }
 
-static void x11_request_resize(struct wl_listener *listener, void *data) {
-	(void)data;
-	struct vidow_view *view = wl_container_of(listener, view, x11_request_resize);
+static void view_x11_request_resize(struct vidow_view *view) {
 	struct vidow_server *server = view->server;
 	if (view->float_mode == VIDOW_FLOAT_NONE) {
 		vidow_float_set_mode(view, VIDOW_FLOAT_FIXED);
@@ -8264,36 +8232,25 @@ static void x11_request_resize(struct wl_listener *listener, void *data) {
 	vidow_float_begin_grab(server, view, true, true);
 }
 
-static void x11_request_activate(struct wl_listener *listener, void *data) {
-	(void)data;
-	struct vidow_view *view =
-		wl_container_of(listener, view, x11_request_activate);
+static void view_x11_request_activate(struct vidow_view *view) {
 	/* X11 的 _NET_ACTIVE_WINDOW（wmctrl、Electron 的通知、任务栏都在用）：
 	 * 跟 Wayland 的激活请求走同一条路（先把工作区端出来，再给焦点）。 */
 	vidow_view_activate(view);
 }
 
-static void x11_request_close(struct wl_listener *listener, void *data) {
-	(void)data;
-	struct vidow_view *view = wl_container_of(listener, view, x11_request_close);
+static void view_x11_request_close(struct vidow_view *view) {
 	/* 客户端（或者 wmctrl 之类）要求关自己：我们只负责把请求传下去。 */
 	vidow_view_close(view);
 }
 
-static void x11_request_fullscreen(struct wl_listener *listener, void *data) {
-	(void)data;
-	struct vidow_view *view =
-		wl_container_of(listener, view, x11_request_fullscreen);
+static void view_x11_request_fullscreen(struct vidow_view *view) {
 	if (view->x11 == NULL) {
 		return;
 	}
 	view_apply_fullscreen(view, view->x11->fullscreen, "X11 请求（_NET_WM_STATE_FULLSCREEN）");
 }
 
-static void x11_request_maximize(struct wl_listener *listener, void *data) {
-	(void)data;
-	struct vidow_view *view =
-		wl_container_of(listener, view, x11_request_maximize);
+static void view_x11_request_maximize(struct vidow_view *view) {
 	if (view->x11 == NULL) {
 		return;
 	}
@@ -8343,17 +8300,11 @@ static void x11_request_maximize(struct wl_listener *listener, void *data) {
 /* X11 客户端自己要求最小化 / 放回：`WM_CHANGE_STATE` 的 IconicState / NormalState，
  * 或者 `_NET_WM_STATE_HIDDEN`（托盘图标「收起来 / 放出来」走这条）。wlroots 把两种
  * 都转成同一个信号，event->minimize 就是要不要收起。 */
-static void x11_request_minimize(struct wl_listener *listener, void *data) {
-	struct wlr_xwayland_minimize_event *event = data;
-	struct vidow_view *view =
-		wl_container_of(listener, view, x11_request_minimize);
-
-	vidow_view_set_minimized(view, event->minimize);
+static void view_x11_request_minimize(struct vidow_view *view, bool minimize) {
+	vidow_view_set_minimized(view, minimize);
 }
 
-static void x11_destroy_view(struct wl_listener *listener, void *data) {
-	(void)data;
-	struct vidow_view *view = wl_container_of(listener, view, x11_destroy);
+static void view_x11_destroyed(struct vidow_view *view) {
 	x11_trace_view("destroy", view, NULL);
 	struct vidow_server *server = view->server;
 	struct wlr_output *output = view->output;
@@ -8369,26 +8320,14 @@ static void x11_destroy_view(struct wl_listener *listener, void *data) {
 		wl_event_source_remove(view->x11_rebuild_timer);
 		view->x11_rebuild_timer = NULL;
 	}
-	wl_list_remove(&view->x11_associate.link);
-	wl_list_remove(&view->x11_dissociate.link);
-	wl_list_remove(&view->x11_map_request.link);
-	wl_list_remove(&view->x11_set_title.link);
-	wl_list_remove(&view->x11_set_class.link);
-	wl_list_remove(&view->x11_set_parent.link);
-	wl_list_remove(&view->x11_set_geometry.link);
-	wl_list_remove(&view->x11_set_override_redirect.link);
-	wl_list_remove(&view->x11_set_hints.link);
-	wl_list_remove(&view->x11_set_size_hints.link);
-	wl_list_remove(&view->x11_set_window_type.link);
-	wl_list_remove(&view->x11_request_configure.link);
-	wl_list_remove(&view->x11_request_move.link);
-	wl_list_remove(&view->x11_request_resize.link);
-	wl_list_remove(&view->x11_request_activate.link);
-	wl_list_remove(&view->x11_request_close.link);
-	wl_list_remove(&view->x11_request_fullscreen.link);
-	wl_list_remove(&view->x11_request_maximize.link);
-	wl_list_remove(&view->x11_request_minimize.link);
-	wl_list_remove(&view->x11_destroy.link);
+	/* 以前这里要摘掉 20 个 wlroots 信号的监听器。现在窗口对象归我们自己
+	 * （见 src/x11surface.h），X 侧销毁时由 xwm_x11.c 的
+	 * x11_handle_destroy() 调进来，没有信号要摘 —— 只把反向指针断开，
+	 * 免得 X 那边还攥着已经释放的 view。 */
+	if (view->x11 != NULL) {
+		view->x11->view = NULL;
+		view->x11 = NULL;
+	}
 
 	x11_drop_surface(view);
 	/* 弹出物可能还攥着键盘（它从来不当焦点窗口），窗口没了就得还回去。 */
@@ -8464,8 +8403,11 @@ static void x11_add_listener(struct wl_listener *listener,
 	wl_signal_add(signal, listener);
 }
 
-void vidow_view_new_x11(struct vidow_server *server,
-		struct wlr_xwayland_surface *xsurface) {
+void vidow_view_new_x11(struct vidow_x11_surface *xsurface) {
+	struct vidow_server *server = vidow_x11_server_owner();
+	if (server == NULL || xsurface == NULL) {
+		return;
+	}
 	struct vidow_view *view = calloc(1, sizeof(*view));
 	if (view == NULL) {
 		return;
@@ -8474,6 +8416,7 @@ void vidow_view_new_x11(struct vidow_server *server,
 	view->server = server;
 	view->kind = VIDOW_VIEW_X11;
 	view->x11 = xsurface;
+	xsurface->view = view;
 	view->output = view_default_output(server);
 	if (view->output == NULL && !wl_list_empty(&server->outputs)) {
 		struct vidow_output *o = wl_container_of(server->outputs.next, o, link);
@@ -8494,48 +8437,11 @@ void vidow_view_new_x11(struct vidow_server *server,
 	wl_list_insert(&server->views, &view->link);
 	vidow_portal_view_new(view);
 
-	x11_add_listener(&view->x11_associate, &xsurface->events.associate,
-		x11_associate);
-	x11_add_listener(&view->x11_dissociate, &xsurface->events.dissociate,
-		x11_dissociate);
-	x11_add_listener(&view->x11_map_request, &xsurface->events.map_request,
-		x11_map_request);
-	x11_add_listener(&view->x11_set_title, &xsurface->events.set_title,
-		x11_set_title);
-	x11_add_listener(&view->x11_set_class, &xsurface->events.set_class,
-		x11_set_class);
-	x11_add_listener(&view->x11_set_parent, &xsurface->events.set_parent,
-		x11_set_parent);
-	x11_add_listener(&view->x11_set_geometry, &xsurface->events.set_geometry,
-		x11_set_geometry);
-	x11_add_listener(&view->x11_set_override_redirect,
-		&xsurface->events.set_override_redirect, x11_set_override_redirect);
-	x11_add_listener(&view->x11_set_hints, &xsurface->events.set_hints,
-		x11_set_hints);
-	x11_add_listener(&view->x11_set_window_type,
-		&xsurface->events.set_window_type, x11_set_window_type);
-	x11_add_listener(&view->x11_set_size_hints,
-		&xsurface->events.set_size_hints, x11_set_size_hints);
-	x11_add_listener(&view->x11_request_configure,
-		&xsurface->events.request_configure, x11_request_configure);
-	x11_add_listener(&view->x11_request_move, &xsurface->events.request_move,
-		x11_request_move);
-	x11_add_listener(&view->x11_request_resize, &xsurface->events.request_resize,
-		x11_request_resize);
-	x11_add_listener(&view->x11_request_activate,
-		&xsurface->events.request_activate, x11_request_activate);
-	x11_add_listener(&view->x11_request_close, &xsurface->events.request_close,
-		x11_request_close);
-	x11_add_listener(&view->x11_request_fullscreen,
-		&xsurface->events.request_fullscreen, x11_request_fullscreen);
-	x11_add_listener(&view->x11_request_maximize,
-		&xsurface->events.request_maximize, x11_request_maximize);
-	x11_add_listener(&view->x11_request_minimize,
-		&xsurface->events.request_minimize, x11_request_minimize);
-	x11_add_listener(&view->x11_destroy, &xsurface->events.destroy,
-		x11_destroy_view);
+	/* 以前这里挂 20 个 wlroots 信号的监听器。现在窗口对象是我们自己的
+	 * （src/x11surface.h），X 侧事件在 xwm_x11.c 里直接调下面这些函数 ——
+	 * 少一层信号转发，也少一类「信号没接上就永远不动」的故障。 */
 
-	/* 有些窗口送来 new_surface 时表面就已经在了（还没 associate 的就等信号）。 */
+	/* 有些窗口送来时表面就已经关联好了（还没关联的就等 x11_associate）。 */
 	x11_attach_surface(view);
 
 	vidow_float_update_mode(view);
@@ -8556,6 +8462,98 @@ void vidow_view_new_x11(struct vidow_server *server,
 		view->float_mode == VIDOW_FLOAT_NONE ? "平铺" : "浮动",
 		view->popup ? "，弹出物（不装饰/不进布局/不做动画）" : "");
 }
+
+/* ---- 给 xwm_x11.c 的直接入口 ------------------------------------------
+ *
+ * 这些就是以前那些 wlroots 信号回调，去掉信号层，直接按语义调。
+ * 命名和 x11surface.h 里的声明一一对应。 */
+
+
+
+
+
+
+
+void vidow_view_x11_property_changed(struct vidow_view *view, xcb_atom_t atom) {
+	if (view == NULL || view->x11 == NULL) {
+		return;
+	}
+	struct vidow_x11_server *x11 = vidow_x11_server_get();
+	if (x11 == NULL) {
+		return;
+	}
+	/* 一条 property 变更该引起哪些连锁反应，看是哪个属性。
+	 * 以前这是二十个独立信号，现在按原子分派 —— 语义完全一样。 */
+	if (atom == x11->atoms.net_wm_name || atom == x11->atoms.wm_name) {
+		view_x11_title_changed(view);
+	} else if (atom == XCB_ATOM_WM_CLASS) {
+		view_x11_class_changed(view);
+	} else if (atom == XCB_ATOM_WM_TRANSIENT_FOR) {
+		view_x11_parent_changed(view);
+	} else if (atom == x11->atoms.net_wm_window_type) {
+		view_x11_window_type_changed(view);
+	} else if (atom == x11->atoms.wm_normal_hints) {
+		view_x11_size_hints_changed(view);
+	} else if (atom == x11->atoms.wm_hints) {
+		view_x11_hints_changed(view);
+	} else if (atom == x11->atoms.net_wm_state) {
+		view_x11_request_fullscreen(view);
+		view_x11_request_maximize(view);
+		view_x11_request_minimize(view, view->x11->minimized);
+	}
+}
+
+void vidow_view_x11_geometry_changed(struct vidow_view *view,
+		int x, int y, int w, int h) {
+	(void)x;
+	(void)y;
+	(void)w;
+	(void)h;
+	if (view == NULL) {
+		return;
+	}
+	view_x11_geometry_changed(view);
+}
+
+void vidow_view_x11_state_changed(struct vidow_view *view) {
+	if (view == NULL || view->x11 == NULL) {
+		return;
+	}
+	view_x11_request_fullscreen(view);
+	view_x11_request_maximize(view);
+}
+
+void vidow_view_x11_activate_request(struct vidow_view *view) {
+	if (view == NULL) {
+		return;
+	}
+	view_x11_request_activate(view);
+}
+
+void vidow_view_x11_configure_request(struct vidow_view *view,
+		int x, int y, int w, int h) {
+	if (view == NULL) {
+		return;
+	}
+	view_x11_configure_request(view, x, y, w, h, 0);
+}
+
+void vidow_view_x11_destroyed(struct vidow_view *view) {
+	view_x11_destroyed(view);
+}
+
+void vidow_view_x11_request_move(struct vidow_view *view) {
+	view_x11_request_move(view);
+}
+
+void vidow_view_x11_request_resize(struct vidow_view *view) {
+	view_x11_request_resize(view);
+}
+
+void vidow_view_x11_request_close(struct vidow_view *view) {
+	view_x11_request_close(view);
+}
+
 
 static void server_new_toplevel(struct wl_listener *listener, void *data) {
 	struct vidow_server *server = wl_container_of(listener, server, new_toplevel);

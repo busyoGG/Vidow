@@ -1,3 +1,4 @@
+#include "x11surface.h"
 #include "server.h"
 #include "clipboard.h"
 #include "ipc.h"
@@ -1386,8 +1387,8 @@ static bool event_is_ours(struct vidow_clipboard *clip, xcb_generic_event_t *eve
 
 /* wlr_xwayland->user_event_handler：在 xwm 默认处理之前被调用，返回 true 就跳过
  * wlroots 的处理 —— 我们接管的正是「跳过」这件事。 */
-static bool x11_event(struct wlr_xwayland *xwayland, xcb_generic_event_t *event) {
-	struct vidow_server *server = xwayland->data;
+static bool x11_event(void *data, xcb_generic_event_t *event) {
+	struct vidow_server *server = data;
 	if (server == NULL) {
 		return false;
 	}
@@ -1652,14 +1653,15 @@ void vidow_clipboard_x11_detach(struct vidow_server *server) {
 		list[i]->x_owner = XCB_WINDOW_NONE;
 	}
 
-	struct wlr_xwayland *xwayland = server->xwayland;
-	if (xwayland != NULL) {
-		if (xwayland->user_event_handler == x11_event) {
-			xwayland->user_event_handler = NULL;
+	struct vidow_x11_server *x11 = vidow_x11_server_get();
+	if (x11 != NULL) {
+		if (x11->event_hook == x11_event) {
+			x11->event_hook = NULL;
+			x11->event_hook_data = NULL;
 		}
-		/* 只有「当前 xwm 用的就是这条连接」时才敢对它发请求：Xwayland 已经
+		/* 只有「当前 XWM 用的就是这条连接」时才敢对它发请求：Xwayland 已经
 		 * 退出过的话它早被释放了，碰它就是 UAF。 */
-		if (wlr_xwayland_get_xwm_connection(xwayland) == clip->conn) {
+		if (x11->conn == clip->conn) {
 			xcb_destroy_window(clip->conn, clip->window);
 			xcb_flush(clip->conn);
 		}
@@ -1679,8 +1681,8 @@ static xcb_connection_t *x11_conn(struct vidow_clipboard *clip) {
 		return NULL;
 	}
 	struct vidow_server *server = clip->server;
-	if (server->xwayland == NULL ||
-			wlr_xwayland_get_xwm_connection(server->xwayland) != clip->conn) {
+	if (server->xwayland_server == NULL ||
+			vidow_x11_connection() != clip->conn) {
 		vidow_clipboard_x11_detach(server);
 		return NULL;
 	}
@@ -1690,10 +1692,10 @@ static xcb_connection_t *x11_conn(struct vidow_clipboard *clip) {
 /* 接上 X 侧：拿 xwm 的连接、开自己的窗口、注册 XFixes、装上事件钩子。 */
 static void x11_attach(struct vidow_server *server) {
 	struct vidow_clipboard *clip = &server->clipboard;
-	if (server->xwayland == NULL) {
+	if (server->xwayland_server == NULL) {
 		return;
 	}
-	xcb_connection_t *conn = wlr_xwayland_get_xwm_connection(server->xwayland);
+	xcb_connection_t *conn = vidow_x11_connection();
 	if (conn == NULL) {
 		return; /* Xwayland 还没起来 */
 	}
@@ -1765,8 +1767,14 @@ static void x11_attach(struct vidow_server *server) {
 		clip->clip.property, clip->primary.property);
 
 	find_proxies(clip);
-	server->xwayland->data = server;
-	server->xwayland->user_event_handler = x11_event;
+	/* 挂到我们自己的 XWM 事件流上。语义和原来的
+	 * wlr_xwayland::user_event_handler 完全一样：认的事件吃掉（返回 true），
+	 * 剩下的交给窗口管理。 */
+	struct vidow_x11_server *x11 = vidow_x11_server_get();
+	if (x11 != NULL) {
+		x11->event_hook = x11_event;
+		x11->event_hook_data = server;
+	}
 
 	/* X 那边可能已经有人占着剪贴板了（配置热切换回来时）：先取一份 */
 	struct vidow_clip_selection *list[2] = {&clip->clip, &clip->primary};
@@ -1893,9 +1901,10 @@ void vidow_clipboard_apply_config(struct vidow_server *server) {
 		clip->active = false;
 		sel_shutdown_selection(&clip->clip);
 		sel_shutdown_selection(&clip->primary);
-		if (server->xwayland != NULL &&
-				server->xwayland->user_event_handler == x11_event) {
-			server->xwayland->user_event_handler = NULL;
+		struct vidow_x11_server *x11 = vidow_x11_server_get();
+		if (x11 != NULL && x11->event_hook == x11_event) {
+			x11->event_hook = NULL;
+			x11->event_hook_data = NULL;
 		}
 		return;
 	}
@@ -1910,9 +1919,10 @@ void vidow_clipboard_apply_config(struct vidow_server *server) {
 		x11_attach(server);
 	}
 	if (clip->conn != NULL) {
-		if (server->xwayland != NULL &&
-				server->xwayland->user_event_handler == NULL) {
-			server->xwayland->user_event_handler = x11_event;
+		struct vidow_x11_server *x11 = vidow_x11_server_get();
+		if (x11 != NULL && x11->event_hook == NULL) {
+			x11->event_hook = x11_event;
+			x11->event_hook_data = server;
 		}
 		/* primary 中途打开：seat 上现成的那份（如果有）拉回来，X 那边的
 		 * 通知也补注册一次 */

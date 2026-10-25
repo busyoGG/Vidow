@@ -63,6 +63,10 @@ void vidow_extworkspace_sync(struct vidow_server *server);
 #define VIDOW_VIEW_TAG_MAGIC 0x50574d56u /* "PWMV" */
 
 struct vidow_server;
+/* 我们自己的 X11 窗口对象与服务端。这里直接 include 而不是前置声明：
+ * view / rule / xwmscale 都要读窗口对象的字段（title、class、size_hints
+ * 这些），只有完整定义才编得过。x11surface.h 自己不依赖 server.h，没有环。 */
+#include "x11surface.h"
 struct vidow_jelly;
 struct vidow_xdo_manager;
 struct wlr_session_lock_manager_v1;
@@ -1506,7 +1510,7 @@ struct vidow_view {
 	struct vidow_server *server;
 	enum vidow_view_kind kind;
 	struct wlr_xdg_toplevel *xdg_toplevel;   /* kind == XDG 时有效 */
-	struct wlr_xwayland_surface *x11;        /* kind == X11 时有效 */
+	struct vidow_x11_surface *x11;           /* kind == X11 时有效（见 x11surface.h） */
 	struct wlr_scene_tree *scene_tree;
 	struct wlr_output *output; /* 现在摆在哪块屏上（由 ws->output 同步） */
 	/* 表面当前进的是哪块输出。enter/leave 自己管（见 view_sync_surface_outputs），
@@ -2462,9 +2466,24 @@ struct vidow_server {
 
 	struct wlr_compositor *compositor;
 	struct wlr_xdg_shell *xdg_shell;
-	/* XWayland（见 xwayland.c）。xwayland 为 NULL = 配置里关了。 */
-	struct wlr_xwayland *xwayland;
-	struct wl_listener new_xwayland_surface;
+	/* XWayland（见 xwayland.c）。xwayland 为 NULL = 配置里关了。
+	 *
+	 * **只用 wlr_xwayland_server**，不再用 wlr_xwayland。
+	 *
+	 * wlr_xwayland 会在内部建一个 wlr_xwm：X 连接、事件循环、窗口对象、
+	 * 什么时候把 pixmap 导出成 dmabuf，全归它管。我们只能在外面看它给出
+	 * 的结果 —— Steam 第二次开主窗口全黑就是栽在这上面（X 侧 import 抓到
+	 * 99% 非黑，我们拿到 3808x2050 的纹理，里面像素全是 0，而决定这件事的
+	 * 代码在 wlroots 内部，插不进去）。
+	 *
+	 * 现在照 Hyprland 的 src/xwayland/ 做：wlr_xwayland_server 只负责
+	 * fork/exec Xwayland 并把 wm_fd 交出来，XWM 是我们自己的（见
+	 * src/xwm_x11.c），窗口对象也是自己的（src/x11surface.h）。 */
+	struct wlr_xwayland_server *xwayland_server;
+	struct vidow_x11_server *xwm;
+	/* xwayland_shell_v1：只用来把 wl_surface 和 WL_SURFACE_SERIAL 对上号。
+	 * 这是唯一还需要 wlroots 参与 X11 的地方。 */
+	struct wlr_xwayland_shell_v1 *xwayland_shell;
 	struct wl_listener xwayland_ready;
 	struct wl_listener xwayland_destroy;
 	/* X11 客户端被告知的缩放。X 只有一套坐标，所以只能是一个全局值。 */
@@ -4436,8 +4455,7 @@ void vidow_xwayland_env(struct vidow_server *server);
 struct vidow_view *vidow_view_from_xwayland_surface(struct vidow_server *server,
 		struct wlr_xwayland_surface *xsurface);
 /* 新建一个 X11 窗口的 view（xwayland.c 收到 new_surface 时调）。 */
-void vidow_view_new_x11(struct vidow_server *server,
-		struct wlr_xwayland_surface *xsurface);
+void vidow_view_new_x11(struct vidow_x11_surface *xsurface);
 /* 告诉 wlroots 的场景图：这个 X11 的 surface 缓冲区是按 xwayland_scale 倍画
  * 的，所以放到场景里要缩回去。命中测试的坐标也要按同样的比例换算回来。 */
 void vidow_view_x11_scale(struct vidow_view *view);

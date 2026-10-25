@@ -628,9 +628,8 @@ void vidow_cursor_fx_motion(struct vidow_server *server) {
  * borrowed buffer with its actual density and convert the hotspot once. */
 bool vidow_cursor_set_client_surface(struct vidow_server *server,
 		struct wlr_surface *surface, int32_t hx, int32_t hy) {
-	bool x11 = surface != NULL && server->xwayland != NULL &&
-		server->xwayland->server != NULL &&
-		wl_resource_get_client(surface->resource) == server->xwayland->server->client;
+	bool x11 = surface != NULL && server->xwayland_server != NULL &&
+		wl_resource_get_client(surface->resource) == server->xwayland_server->client;
 	if (!x11) {
 		wlr_cursor_set_surface(server->cursor, surface, hx, hy);
 		return false;
@@ -690,8 +689,8 @@ void vidow_cursor_fx_set_surface(struct vidow_server *server,
 	if (surface != NULL) {
 		fx->surface_destroy.notify = surface_gone;
 		wl_signal_add(&surface->events.destroy, &fx->surface_destroy);
-		if (server->xwayland != NULL && server->xwayland->server != NULL &&
-				wl_resource_get_client(surface->resource) == server->xwayland->server->client) {
+		if (server->xwayland_server != NULL &&
+				wl_resource_get_client(surface->resource) == server->xwayland_server->client) {
 			fx->surface_commit.notify = client_cursor_commit;
 			wl_signal_add(&surface->events.commit, &fx->surface_commit);
 		}

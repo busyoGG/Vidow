@@ -180,20 +180,20 @@ static bool window_is_toplevel(const struct vidow_view *view) {
 	if (view->x11->override_redirect) {
 		return false;
 	}
-	static const enum wlr_xwayland_net_wm_window_type skip[] = {
-		WLR_XWAYLAND_NET_WM_WINDOW_TYPE_UTILITY,
-		WLR_XWAYLAND_NET_WM_WINDOW_TYPE_MENU,
-		WLR_XWAYLAND_NET_WM_WINDOW_TYPE_DROPDOWN_MENU,
-		WLR_XWAYLAND_NET_WM_WINDOW_TYPE_POPUP_MENU,
-		WLR_XWAYLAND_NET_WM_WINDOW_TYPE_TOOLTIP,
-		WLR_XWAYLAND_NET_WM_WINDOW_TYPE_COMBO,
-		WLR_XWAYLAND_NET_WM_WINDOW_TYPE_DND,
-		WLR_XWAYLAND_NET_WM_WINDOW_TYPE_NOTIFICATION,
-		WLR_XWAYLAND_NET_WM_WINDOW_TYPE_DOCK,
-		WLR_XWAYLAND_NET_WM_WINDOW_TYPE_DESKTOP,
+	static const int skip[] = {
+		VIDOW_X11_WT_UTILITY,
+		VIDOW_X11_WT_MENU,
+		VIDOW_X11_WT_DROPDOWN_MENU,
+		VIDOW_X11_WT_POPUP_MENU,
+		VIDOW_X11_WT_TOOLTIP,
+		VIDOW_X11_WT_COMBO,
+		VIDOW_X11_WT_DND,
+		VIDOW_X11_WT_NOTIFICATION,
+		VIDOW_X11_WT_DOCK,
+		VIDOW_X11_WT_DESKTOP,
 	};
 	for (size_t i = 0; i < sizeof(skip) / sizeof(skip[0]); ++i) {
-		if (wlr_xwayland_surface_has_window_type(view->x11, skip[i])) {
+		if (vidow_x11_surface_has_window_type(view->x11, skip[i])) {
 			return false;
 		}
 	}
@@ -478,7 +478,7 @@ void vidow_ipc_json_window(struct jbuf *b, struct vidow_server *server,
 		jb_kv_int(b, "y", view->x11->y);
 		jb_kv_int(b, "width", view->x11->width);
 		jb_kv_int(b, "height", view->x11->height);
-		jb_kv_int(b, "window_type_count", (long long)view->x11->window_type_len);
+		jb_kv_int(b, "window_type_count", (long long)view->x11->window_type_count);
 		jb_obj_end(b);
 	}
 	jb_obj_end(b);
@@ -1399,8 +1399,7 @@ void vidow_ipc_json_mru(struct jbuf *b, struct vidow_server *server) {
 void vidow_ipc_json_xwayland(struct jbuf *b, struct vidow_server *server) {
 	jb_obj(b);
 	jb_kv_bool(b, "enabled", server->config.xwayland);
-	jb_kv_bool(b, "running", server->xwayland != NULL &&
-		server->xwayland->server != NULL);
+	jb_kv_bool(b, "running", server->xwayland_server != NULL);
 	jb_kv_double(b, "scale", server->xwayland_scale);
 	jb_kv_str(b, "display", getenv("DISPLAY"));
 	jb_obj_end(b);

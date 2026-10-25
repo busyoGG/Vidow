@@ -91,9 +91,8 @@ static void output_send_details(struct vidow_xdo_output *o,
 	 * 测试钩子 VIDOW_TEST_XWAYLAND_UNPATCHED 照旧能把它当陌生人（验降级路）。 */
 	if (xdo_mgr != NULL && getenv("VIDOW_TEST_XWAYLAND_UNPATCHED") == NULL &&
 			xdo_mgr->server != NULL &&
-			xdo_mgr->server->xwayland != NULL &&
-			xdo_mgr->server->xwayland->server != NULL) {
-		xw = xdo_mgr->server->xwayland->server->client;
+			xdo_mgr->server->xwayland_server != NULL) {
+		xw = xdo_mgr->server->xwayland_server->client;
 	}
 	bool is_xwayland = xw != NULL && cli == xw;
 

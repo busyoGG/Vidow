@@ -240,7 +240,7 @@ void vidow_xwm_configure(struct vidow_view *view, int x, int y, int w, int h) {
 	vidow_xwm_to_native_point(view->server, output, x, y, &nx, &ny);
 	vidow_xwm_to_native_size(view->server, output, w, h, &nw, &nh);
 	/* X ConfigureWindow uses signed 16-bit positions and unsigned sizes. */
-	wlr_xwayland_surface_configure(view->x11,
+	vidow_x11_surface_configure(view->x11,
 		(int16_t)lround(fmax(INT16_MIN, fmin(INT16_MAX, nx))),
 		(int16_t)lround(fmax(INT16_MIN, fmin(INT16_MAX, ny))),
 		(uint16_t)lround(fmax(1, fmin(UINT16_MAX, nw))),

@@ -23,6 +23,10 @@ drm_dep = dependency('libdrm')
 pipewire_dep = dependency('libpipewire-0.3', version: '>=0.3.60')
 # 剪贴板桥（clipboard.c）靠 XFixes 监听 X 侧的 owner 变化。
 xcb_xfixes_dep = dependency('xcb-xfixes')
+# 我们自己的 XWM（xwm_x11.c）给 X 的根窗口设光标要用 Render 扩展：
+# 32 位 ARGB 的 pixmap → render picture → cursor（照 Hyprland 的
+# CXWM::setCursor()）。
+xcb_render_dep = dependency('xcb-render')
 # libinput 设备配置（input.c 的 vidow_input_apply_libinput）：点按 / 反向滚动 /
 # 加速曲线那些设备属性直接调 libinput。wlroots 把 libinput 放在 Requires.private
 # 里，链接时不会自动带过来，所以自己声明一份（版本跟着 wlroots 0.20 的要求）。
@@ -142,6 +146,7 @@ sources = files(
   'src/outputconf.c',
   'src/view.c',
   'src/xwm.c',
+  'src/xwm_x11.c',
   'src/x11.c',
   'src/xwmscale.c',
   'src/input.c',
@@ -537,7 +542,8 @@ executable('vidow',
              xdo_server_header, xdo_client_code],
   dependencies: [wlroots_dep, xkbcommon_dep, wayland_server_dep, math_dep,
                  egl_dep, gles2_dep, pixman_dep, lua_dep, xcb_dep,
-                 xcb_xfixes_dep, drm_dep, pipewire_dep, libinput_dep],
+                 xcb_xfixes_dep, xcb_render_dep, drm_dep, pipewire_dep,
+                 libinput_dep],
   include_directories: include_directories('.'),
   install: false)
 

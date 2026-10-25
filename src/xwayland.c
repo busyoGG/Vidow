@@ -1,6 +1,7 @@
 #include "env.h"
 #include "ipc.h"
 #include "server.h"
+#include "x11surface.h"
 #include "x11.h"
 
 #include <math.h>
@@ -253,10 +254,10 @@ static void x11_set_xft_dpi(xcb_connection_t *conn, int dpi) {
 
 /* Apply rendering density, never _XWAYLAND_GLOBAL_OUTPUT_SCALE. */
 static void x11_apply_scale_props(struct vidow_server *server) {
-	if (server->xwayland == NULL) {
+	if (server->xwayland_server == NULL) {
 		return;
 	}
-	xcb_connection_t *conn = wlr_xwayland_get_xwm_connection(server->xwayland);
+	xcb_connection_t *conn = vidow_x11_connection();
 	if (conn == NULL) {
 		return; /* X 还没起来（懒启动），ready 的时候再来 */
 	}
@@ -284,7 +285,7 @@ static void xwayland_probe_stop(struct vidow_server *server) {
 }
 
 static void xwayland_probe_schedule(struct vidow_server *server) {
-	if (server->xwayland == NULL || server->xwayland_scale_probed ||
+	if (server->xwayland_server == NULL || server->xwayland_scale_probed ||
 			server->xwayland_probe != NULL) {
 		return;
 	}
@@ -328,8 +329,8 @@ static void x11_screen_size(xcb_connection_t *conn, int *w, int *h) {
 
 static int xwayland_probe_cb(void *data) {
 	struct vidow_server *server = data;
-	xcb_connection_t *conn = server->xwayland != NULL ?
-		wlr_xwayland_get_xwm_connection(server->xwayland) : NULL;
+	xcb_connection_t *conn = server->xwayland_server != NULL ?
+		vidow_x11_connection() : NULL;
 	if (conn == NULL) {
 		xwayland_probe_stop(server);
 		return 0;
@@ -361,7 +362,7 @@ static int xwayland_probe_cb(void *data) {
 void vidow_xwayland_scale_apply(struct vidow_server *server) {
 	double before = server->xwayland_scale;
 	vidow_xwayland_scale_recompute(server);
-	if (server->xwayland == NULL) {
+	if (server->xwayland_server == NULL) {
 		return;
 	}
 	if (fabs(before - server->xwayland_scale) >= 1e-3) {
@@ -387,18 +388,64 @@ void vidow_xwayland_scale_apply(struct vidow_server *server) {
 }
 
 /* X 那边真的活了：这时候才能写 root window 的属性。 */
-static void xwayland_ready(struct wl_listener *listener, void *data) {
-	(void)data;
-	struct vidow_server *server = wl_container_of(listener, server, xwayland_ready);
+/* 把光标的像素读出来，交给 XWM 设到 root 上。
+ *
+ * 为什么不用 wlr_xwayland_set_cursor()：那个函数会把 buffer 转给 wlroots 内部
+ * 的 xwm。我们的 xwm 是自己的，光标也得自己设 —— 做法照 Hyprland 的
+ * CXWM::setCursor()（XWM.cpp:1389），像素来源则是 wlr_xcursor 的 buffer。
+ *
+ * cursor 会交一张 ARGB8888 的图，stride 是每行字节数；X 那边要的正是这个布局
+ * （32 位 depth + alpha_mask 0xff000000），所以直接抄过去就行。 */
+static void xwayland_set_root_cursor(struct vidow_server *server,
+		struct wlr_xcursor_image *image) {
+	if (server->xwm == NULL || image == NULL) {
+		return;
+	}
+	struct wlr_buffer *buffer = wlr_xcursor_image_get_buffer(image);
+	if (buffer == NULL) {
+		return;
+	}
+	void *data = NULL;
+	uint32_t format = 0;
+	size_t stride = 0;
+	if (!wlr_buffer_begin_data_ptr_access(buffer,
+			WLR_BUFFER_DATA_PTR_ACCESS_READ, &data, &format, &stride)) {
+		return;
+	}
+	vidow_x11_set_cursor(data, (uint32_t)stride, image->width,
+		image->height, image->hotspot_x, image->hotspot_y);
+	wlr_buffer_end_data_ptr_access(buffer);
+}
 
-	/* 把 seat 再交给 X 服务一次。Xwayland 退出时 wlroots 的 xwm_destroy 会
-	 * wlr_xwayland_set_seat(xwayland, NULL)（顺带把 seat 上那份 X 来的选区撤
-	 * 掉），而懒启动模式下重启用的是同一个 wlr_xwayland 对象 —— 只在建的时候
-	 * 设过一次的话，重启后 xwayland->seat 一直是 NULL：xwm 拒掉所有选区事件
-	 * （日志刷 "not handling selection events: no seat assigned to xwayland"），
-	 * Wayland 复制的东西 X 侧永远拿不到（README 252）。
-	 * wlr_xwayland_set_seat 会先摘旧监听，重入安全。 */
-	wlr_xwayland_set_seat(server->xwayland, server->seat);
+static void xwayland_ready(struct wl_listener *listener, void *data) {
+	struct vidow_server *server = wl_container_of(listener, server, xwayland_ready);
+	struct wlr_xwayland_server_ready_event *ev = data;
+
+	/* **这里是整个 X11 架构的分界线。**
+	 *
+	 * wlroots 把这个 wm_fd 交出来，等的就是有人在自己的事件循环里接住它 ——
+	 * 这就是 Hyprland 的 CXWM 构造函数干的事（XWM.cpp:1009：
+	 * xcb_connect_to_fd(m_server->m_xwmFDs[0])）。以前我们把它留给了
+	 * wlr_xwayland 内部的 wlr_xwm，所以窗口管理的一切都不归我们管。
+	 *
+	 * 现在我们自己接：xcb_connect_to_fd(ev->wm_fd) → 抢
+	 * SubstructureRedirect → 装进 wl_event_loop。从这一步起，窗口的
+	 * create / map / configure / 属性 / 销毁全走 src/xwm_x11.c。 */
+	xcb_connection_t *xwm_conn = xcb_connect_to_fd(ev->wm_fd, NULL);
+	if (xcb_connection_has_error(xwm_conn)) {
+		wlr_log(WLR_ERROR, "xwayland: xcb_connect_to_fd 失败，X 窗口管不了");
+		xcb_disconnect(xwm_conn);
+		return;
+	}
+	server->xwm = vidow_x11_server_create(server, xwm_conn);
+	if (server->xwm == NULL) {
+		wlr_log(WLR_ERROR, "xwayland: 自己的 XWM 起不来");
+		return;
+	}
+
+	/* 以前这里要 wlr_xwayland_set_seat()：它只把 seat 交给 wlroots 内部的
+	 * xwm，用来判选区归属。现在 xwm 是我们自己的，选区事件走
+	 * x11->event_hook（见 clipboard.c），不需要这一步。 */
 
 	/* X clients without their own cursor inherit the root cursor. Seed it on
 	 * every Xwayland start, otherwise they inherit X's default cross. The image
@@ -421,11 +468,10 @@ static void xwayland_ready(struct wl_listener *listener, void *data) {
 		server->cursor_mgr, "left_ptr", (float)cursor_scale);
 	if (cursor != NULL && cursor->image_count > 0) {
 		struct wlr_xcursor_image *image = cursor->images[0];
-		struct wlr_buffer *buffer = wlr_xcursor_image_get_buffer(image);
-		if (buffer != NULL) {
-			wlr_xwayland_set_cursor(server->xwayland, buffer,
-				image->hotspot_x, image->hotspot_y);
-		}
+		/* 自己把像素读出来交给 XWM —— 以前这是 wlr_xwayland_set_cursor()
+		 * 的活，它内部也是这么做的（见 src/xwm_x11.c 的
+		 * vidow_x11_set_cursor）。 */
+		xwayland_set_root_cursor(server, image);
 	}
 
 	/* New Xwayland instance: recheck its root against the virtual union. */
@@ -436,8 +482,8 @@ static void xwayland_ready(struct wl_listener *listener, void *data) {
 	/* 事件：X 服务真的起来了（懒启动，第一个 X 客户端连上来才有这一下）。
 	 * 配置里 exec_once 起的 X11 程序要等它的话，听这个。 */
 	const struct vidow_event_field fields[] = {
-		VIDOW_EV_STR("display", server->xwayland != NULL ?
-			server->xwayland->display_name : NULL),
+		VIDOW_EV_STR("display", server->xwayland_server != NULL ?
+			server->xwayland_server->display_name : NULL),
 		VIDOW_EV_NUM("scale", (long long)(server->xwayland_scale + 0.5)),
 		VIDOW_EV_END,
 	};
@@ -452,8 +498,8 @@ static void xwayland_ready(struct wl_listener *listener, void *data) {
 	 * 放在 x11_apply_scale_props 之前：Xwayland 一起来就可能已经查过
 	 * xdg_output 了，先认身份、再补属性。 */
 	vidow_xdg_output_set_xwayland_client(
-		server->xwayland != NULL && server->xwayland->server != NULL ?
-		server->xwayland->server->client : NULL);
+		server->xwayland_server != NULL && server->xwayland_server != NULL ?
+		server->xwayland_server->client : NULL);
 
 	/* 再把渲染密度告诉 X（Xft.dpi = S × 96，几何另走逐屏映射）。
 	 * 必须赶在第一个客户端连上之前 —— 客户端一进来就会按当时的 DPI 算布局。 */
@@ -464,7 +510,7 @@ static void xwayland_ready(struct wl_listener *listener, void *data) {
 	 * 这条日志是排查「X 窗口位置偏移 / 菜单跑到别的屏上」的第一现场。
 	 * 注意不能用 xcb_get_setup() 里的屏幕尺寸 —— 那是连接建立时的那一份，属性
 	 * 改了它也不会更新；root window 的 geometry 才是「现在」的。 */
-	xcb_connection_t *conn = wlr_xwayland_get_xwm_connection(server->xwayland);
+	xcb_connection_t *conn = vidow_x11_connection();
 	if (conn != NULL) {
 		xcb_window_t root = x11_root(conn);
 		xcb_get_geometry_reply_t *geo = root != XCB_NONE ?
@@ -534,39 +580,39 @@ static void xwayland_destroy(struct wl_listener *listener, void *data) {
 	vidow_clipboard_x11_detach(server);
 	wl_list_remove(&server->xwayland_ready.link);
 	wl_list_remove(&server->xwayland_destroy.link);
-	wl_list_remove(&server->new_xwayland_surface.link);
-	server->xwayland = NULL;
+	/* 我们自己的 XWM 也要收干净：拆事件源、释放窗口对象。
+	 * 必须在 xcb_disconnect 之前 —— 它读的是同一条连接。 */
+	vidow_x11_server_destroy(server->xwm);
+	server->xwm = NULL;
+	server->xwayland_server = NULL;
 }
 
+/* 以前这里是 wlroots 的 new_surface 信号：X 窗口由 wlroots 建对象、我们再
+ * 包一层 view。现在窗口对象归我们自己（src/x11surface.h），CreateNotify 到了
+ * 就由 xwm_x11.c 直接调 vidow_view_new_x11() —— 这个回调已经没有用处，
+ * 保留成空函数只是为了让下面的监听器注册代码暂时不用大改。 */
 static void handle_new_xwayland_surface(struct wl_listener *listener,
 		void *data) {
-	struct vidow_server *server =
-		wl_container_of(listener, server, new_xwayland_surface);
-	struct wlr_xwayland_surface *xsurface = data;
-	wlr_log(WLR_INFO,
-		"x11-life new xid=0x%x xs=%p surface=%p surface_id=%u",
-		xsurface->window_id, xsurface, xsurface->surface,
-		xsurface->surface_id);
-	/* xwm 自己那条连接上的窗口不是客户端窗口：我们剪贴板桥的监听窗口，还有
-	 * xwm 的 selection_window 之类的内部窗口（都建在同一条连接上）。它们永远
-	 * 不映射，但 xwm 照样会给它们建 surface —— 收进视图模型就是一个 1x1 的
-	 * 幽灵窗口，白占一格布局（识别见 clipboard.c 的 vidow_clipboard_owns_xwindow）。 */
-	if (vidow_clipboard_owns_xwindow(server, xsurface->window_id)) {
-		return;
-	}
-	vidow_view_new_x11(server, xsurface);
+	(void)listener;
+	(void)data;
 }
+
 
 /* 只让 Xwayland 自己拿到 xwayland_shell_v1：否则任何 Wayland 客户端都能伪造
  * 「我是一个 X11 窗口」，去蹭只有 X 窗口才有的东西。 */
 static bool global_filter(const struct wl_client *client,
 		const struct wl_global *global, void *data) {
 	struct vidow_server *server = data;
-	if (server->xwayland == NULL || server->xwayland->shell_v1 == NULL ||
-			global != server->xwayland->shell_v1->global) {
+	/* 只让 Xwayland 自己拿到 xwayland_shell_v1：否则任何 Wayland 客户端都能
+	 * 伪造「我是一个 X11 窗口」，去蹭只有 X 窗口才有的东西。
+	 *
+	 * 注意这里比的是 wlr_xwayland_server->client，不再是 wlr_xwayland。
+	 * shell 对象现在是我们自己建的，Xwayland 进程由 wlr_xwayland_server 拉起。 */
+	if (server->xwayland_shell == NULL ||
+			global != server->xwayland_shell->global) {
 		return true;
 	}
-	struct wlr_xwayland_server *xserver = server->xwayland->server;
+	struct wlr_xwayland_server *xserver = server->xwayland_server;
 	return xserver != NULL && client == xserver->client;
 }
 
@@ -582,18 +628,22 @@ bool vidow_xwayland_init(struct vidow_server *server) {
  * 之后又把开关打开（或者删掉那行再 SIGHUP）就重新建起来。 */
 bool vidow_xwayland_apply_config(struct vidow_server *server) {
 	if (!server->config.xwayland) {
-		if (server->xwayland == NULL) {
+		if (server->xwayland_server == NULL) {
 			return true;
 		}
 		wlr_log(WLR_INFO, "xwayland: 配置里关了，拆掉 X 服务");
 		xwayland_probe_stop(server);
-		/* destroy 的信号处理里会把监听摘掉、把 server->xwayland 置空；
-		 * global_filter 那时就成了直通车，不用再动。 */
-		wlr_xwayland_destroy(server->xwayland);
+		/* destroy 的信号处理会把我们的 XWM 也收掉、把 xwayland_server
+		 * 置空；global_filter 那时就成了直通车，不用再动。 */
+		wlr_xwayland_server_destroy(server->xwayland_server);
+		if (server->xwayland_shell != NULL) {
+			wlr_xwayland_shell_v1_destroy(server->xwayland_shell);
+			server->xwayland_shell = NULL;
+		}
 		unsetenv("DISPLAY");
 		return true;
 	}
-	if (server->xwayland != NULL) {
+	if (server->xwayland_server != NULL) {
 		return true;
 	}
 	if (server->compositor == NULL) {
@@ -601,33 +651,52 @@ bool vidow_xwayland_apply_config(struct vidow_server *server) {
 		return false;
 	}
 
-	/* lazy = true：真有客户端连 X 的时候才 fork Xwayland，没人用就不花这份钱。 */
-	server->xwayland = wlr_xwayland_create(server->display,
-		server->compositor, true);
-	if (server->xwayland == NULL) {
-		wlr_log(WLR_ERROR, "xwayland: wlr_xwayland_create 失败");
+	/* **只用 wlr_xwayland_server，不用 wlr_xwayland。**
+	 *
+	 * wlr_xwayland_server 只干三件事：fork/exec Xwayland、建 X socket、把
+	 * wm_fd 交出来。窗口管理一概不管 —— 正好是我们要的。
+	 *
+	 * 这是 Hyprland 的结构：它的 CXWayland 手里就只有一个
+	 * wlr_xwayland_server，XWM 完全自己写（src/xwayland/XWM.cpp）。
+	 *
+	 * enable_wm = true：让 Xwayland 建 wm_fd 并传 -wm 参数。这个 fd 到了
+	 * xwayland_ready() 里就交给 xcb_connect_to_fd，成为我们自己的 XWM 连接。
+	 * lazy = true：真有客户端连 X 的时候才起进程。 */
+	struct wlr_xwayland_server_options options = {
+		.lazy = true,
+		.enable_wm = true,
+		.no_touch_pointer_emulation = true,
+		.force_xrandr_emulation = false,
+		.terminate_delay = 0,
+	};
+	server->xwayland_server =
+		wlr_xwayland_server_create(server->display, &options);
+	if (server->xwayland_server == NULL) {
+		wlr_log(WLR_ERROR, "xwayland: wlr_xwayland_server_create 失败");
 		return false;
 	}
 
-	wlr_xwayland_set_seat(server->xwayland, server->seat);
-
-	/* 关于 Xwayland 的 ready 管道（wlroots 的 server->pipe_source）：Xwayland
-	 * 写完 ready 字节之后这个管道**一直是可读的**，wlroots 挂在主循环上的那个源
-	 * 于是每轮都醒 —— 一个常驻自唤醒。这里没能接管：libwayland 不导出 event
-	 * source 的底层 fd，而 ready 事件也**不能**提前自己发（wlroots 的
-	 * handle_ready 要做 init / 建 XWM 连接）。其余自唤醒 fd 都已经走 fdwatch 了。 */
+	/* xwayland_shell_v1 是唯一还要 wlroots 参与的 X11 部件：它把 Xwayland
+	 * 交上来的 wl_surface 和 X 窗口的 serial 对上号。窗口对象本身是我们的。
+	 * 版本取 1 —— 这个协议只有 v1。 */
+	if (server->xwayland_shell == NULL) {
+		server->xwayland_shell =
+			wlr_xwayland_shell_v1_create(server->display, 1);
+		if (server->xwayland_shell == NULL) {
+			wlr_log(WLR_ERROR, "xwayland: xwayland_shell_v1 建不起来");
+		}
+	}
 
 	server->xwayland_ready.notify = xwayland_ready;
-	wl_signal_add(&server->xwayland->events.ready, &server->xwayland_ready);
+	wl_signal_add(&server->xwayland_server->events.ready,
+		&server->xwayland_ready);
 	server->xwayland_destroy.notify = xwayland_destroy;
-	wl_signal_add(&server->xwayland->events.destroy, &server->xwayland_destroy);
-	server->new_xwayland_surface.notify = handle_new_xwayland_surface;
-	wl_signal_add(&server->xwayland->events.new_surface,
-		&server->new_xwayland_surface);
+	wl_signal_add(&server->xwayland_server->events.destroy,
+		&server->xwayland_destroy);
 	wl_display_set_global_filter(server->display, global_filter, server);
 
 	/* 配置里启动的客户端要能连上 X：lazy 模式下 socket 现在就有了。 */
-	setenv("DISPLAY", server->xwayland->display_name, 1);
+	setenv("DISPLAY", server->xwayland_server->display_name, 1);
 	/* DISPLAY 变了就得再推一轮：systemd 拉起来的 X11 程序也要连得上 vidow 的 X */
 	vidow_env_export_later(server);
 
@@ -635,6 +704,6 @@ bool vidow_xwayland_apply_config(struct vidow_server *server) {
 	vidow_xwayland_env(server);
 
 	wlr_log(WLR_INFO, "xwayland: DISPLAY=%s，懒启动，X 全局缩放 %.2f",
-		server->xwayland->display_name, server->xwayland_scale);
+		server->xwayland_server->display_name, server->xwayland_scale);
 	return true;
 }

@@ -1,9 +1,9 @@
 #include <wayland-server-core.h>
 #include <wlr/types/wlr_compositor.h>
-#include <wlr/xwayland.h>
 #include <wlr/util/log.h>
 
 #include "server.h"
+#include "x11surface.h"
 #include "xwm.h"
 
 /* X11 表面的「该不该在屏幕上」判定，见 xwm.h 顶部的说明。
@@ -57,7 +57,7 @@ enum xwm_sync_result xwm_surface_sync(struct vidow_view *view) {
 		/* **必须同时告诉 wlr_surface 它上屏了**。
 		 *
 		 * wlr_surface->mapped 不是「有没有 buffer」，而是「合成器认不认
-		 * 这个表面在屏幕上」。XWayland 会读它来决定要不要把 X pixmap
+		 * 这个表面在屏幕上」。Xwayland 会读它来决定要不要把 X pixmap
 		 * 导出成 dmabuf 交给合成器：mapped 为假时它认为这个窗口没人看，
 		 * 就不做那份拷贝 —— 于是我们拿到的纹理是**全零**的。
 		 *
@@ -74,7 +74,7 @@ enum xwm_sync_result xwm_surface_sync(struct vidow_view *view) {
 		if (surf != NULL) {
 			wlr_surface_map(surf);
 		}
-		/* 以前上过屏、现在又上来：XWayland 导出那份 dmabuf 可能还是
+		/* 以前上过屏、现在又上来：Xwayland 导出那份 dmabuf 可能还是
 		 * 空的（实测重开 Steam 主窗口：纹理 3808x2050 但像素全零）。
 		 * 抖一下尺寸逼它重建 pixmap。首次映射不用抖 —— 那时候
 		 * x11_rebuild_w 还是 0。 */
@@ -96,7 +96,7 @@ enum xwm_sync_result xwm_surface_sync(struct vidow_view *view) {
 	return XWM_SYNC_UNMAPPED;
 }
 
-/* ---- 重映射后逼 XWayland 重建 dmabuf ---------------------------------- */
+/* ---- 重映射后逼 Xwayland 重建 dmabuf ---------------------------------- */
 
 /* 抖动分两拍：第一拍 +1 像素，第二拍（这个回调）还原。
  *
@@ -111,10 +111,10 @@ static int x11_rebuild_restore(void *data) {
 	}
 	if (view->x11_rebuild_pending) {
 		view->x11_rebuild_pending = false;
-		wlr_xwayland_surface_configure(view->x11,
-			view->x11->x, view->x11->y,
-			(int16_t)view->x11_rebuild_w,
-			(int16_t)view->x11_rebuild_h);
+		vidow_x11_surface_configure(view->x11,
+			(int16_t)view->x11->x, (int16_t)view->x11->y,
+			(uint16_t)view->x11_rebuild_w,
+			(uint16_t)view->x11_rebuild_h);
 		wlr_log(WLR_DEBUG, "x11-rebuild: %s 还原 %dx%d",
 			vidow_view_title(view) != NULL ?
 				vidow_view_title(view) : "(无题)",
@@ -126,7 +126,7 @@ static int x11_rebuild_restore(void *data) {
 
 /* 重新上屏时调一次：把窗口尺寸抖 +1 像素，下一拍还原。
  *
- * 只在「之前上过屏、现在又上来」时调 —— 首次映射不用（那时 XWayland 会
+ * 只在「之前上过屏、现在又上来」时调 —— 首次映射不用（那时 Xwayland 会
  * 正常分配 pixmap，抖一下纯属多余）。判据是 x11_rebuild_w 有没有被填过。 */
 void xwm_surface_force_rebuild(struct vidow_view *view) {
 	if (view == NULL || view->x11 == NULL || view->x11->surface == NULL) {
@@ -147,9 +147,10 @@ void xwm_surface_force_rebuild(struct vidow_view *view) {
 	view->x11_rebuild_w = w;
 	view->x11_rebuild_h = h;
 	view->x11_rebuild_pending = true;
-	wlr_xwayland_surface_configure(view->x11, view->x11->x, view->x11->y,
-		(int16_t)(w + 1), (int16_t)h);
-	wlr_log(WLR_INFO, "x11-rebuild: %s 抖一下 %dx%d → %dx%d（逼 XWayland "
+	vidow_x11_surface_configure(view->x11,
+		(int16_t)view->x11->x, (int16_t)view->x11->y,
+		(uint16_t)(w + 1), (uint16_t)h);
+	wlr_log(WLR_INFO, "x11-rebuild: %s 抖一下 %dx%d → %dx%d（逼 Xwayland "
 		"重建 pixmap）", vidow_view_title(view) != NULL ?
 			vidow_view_title(view) : "(无题)", w, h, w + 1, h);
 	if (view->x11_rebuild_timer == NULL) {

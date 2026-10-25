@@ -1,5 +1,6 @@
 #include <unistd.h>
 #include <sys/resource.h>
+#include "x11surface.h"
 #include "server.h"
 #include "env.h"
 #include "hooks.h"
@@ -541,10 +542,9 @@ static void server_finish(struct vidow_server *server) {
 	if (server->ftl_capture != NULL) {
 		wl_list_remove(&server->new_capture_request.link);
 	}
-	if (server->xwayland != NULL) {
+	if (server->xwayland_server != NULL) {
 		wl_list_remove(&server->xwayland_ready.link);
 		wl_list_remove(&server->xwayland_destroy.link);
-		wl_list_remove(&server->new_xwayland_surface.link);
 	}
 	wl_list_remove(&server->cursor_motion.link);
 	wl_list_remove(&server->cursor_motion_absolute.link);

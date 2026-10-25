@@ -33,6 +33,7 @@
  *
  * 判据：./test-keyboard-grab.sh（Wayland 客户端抑制 + X11 的 XGrabKeyboard）。 */
 
+#include "x11surface.h"
 #include "server.h"
 
 #include <stdlib.h>
@@ -249,7 +250,7 @@ static void manager_handle_grab_keyboard(struct wl_client *client,
 	/* 协议要求「只给 Xwayland」：表面必须是**这个客户端自己的** X11 窗口表面。
 	 * 不是就回错误、不建对象（别的客户端想用这条路抓键盘，得先过这一关）。 */
 	if (surface == NULL ||
-			wlr_xwayland_surface_try_from_wlr_surface(surface) == NULL ||
+			vidow_x11_surface_from_wl_surface(surface) == NULL ||
 			wl_resource_get_client(surface_resource) != client) {
 		wlr_log(WLR_ERROR, "X11 键盘抓取: 拒绝（这个表面不是 Xwayland 的）");
 		wl_resource_post_error(resource, WL_DISPLAY_ERROR_INVALID_METHOD,
