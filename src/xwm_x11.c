@@ -628,6 +628,33 @@ static void x11_handle_map_request(xcb_map_request_event_t *e) {
 	}
 }
 
+/* ICCCM 2.1 的 WM_STATE：WM 必须给每个被管理的窗口写上这个属性，客户端
+ * 靠它判断「我到底被 WM 接住了没有、现在是普通 / 图标化 / 已撤下」。
+ *
+ * **vidow 从来没写过它**（atoms.wm_state 只声明、从没用过）。Steam 关掉再
+ * 打开时就是这样卡住的：它把顶层窗口建出来，然后等 WM_STATE 才
+ * XMapWindow —— 等不到就永远不 map，xwayland 于是不建 wayland surface，
+ * 屏幕上永远是黑的。实测 xprop -id 0x2000041 打出来是
+ * `WM_STATE: not found`，而同一个窗口在 Hyprland 上正常（Hyprland 的
+ * CXWaylandSurface::setWithdrawn 每次 map/unmap 都写这个属性，
+ * src/xwayland/XSurface.cpp:275）。
+ *
+ * 状态值按 ICCCM：NormalState=1 / IconicState=3 / WithdrawnState=0。
+ * 第二个字段是图标窗口（XCB_WINDOW_NONE = 没有单独的图标窗口）。 */
+static void x11_set_wm_state(struct vidow_x11_surface *s, uint32_t state) {
+	if (g_x11 == NULL || s == NULL || s->window_id == XCB_WINDOW_NONE) {
+		return;
+	}
+	uint32_t props[2] = { state, (uint32_t)XCB_WINDOW_NONE };
+	xcb_change_property(g_x11->conn, XCB_PROP_MODE_REPLACE, s->window_id,
+		g_x11->atoms.wm_state, g_x11->atoms.wm_state, 32, 2, props);
+	xcb_flush(g_x11->conn);
+	if (vidow_xtrace_on()) {
+		wlr_log(WLR_INFO, "x11-trace: WM_STATE xid=0x%x -> %u",
+			s->window_id, state);
+	}
+}
+
 static void x11_handle_map_notify(xcb_map_notify_event_t *e) {
 	struct vidow_x11_surface *s = surface_for_window(e->window);
 	if (vidow_xtrace_on()) {
@@ -645,6 +672,9 @@ static void x11_handle_map_notify(xcb_map_notify_event_t *e) {
 	 * 主窗口走的是 MapNotify（窗口是复用的：close-window 只发
 	 * WM_DELETE_WINDOW，Steam 保留窗口），于是表面永远不被认为在屏幕上，
 	 * Xwayland 也就不导出 dmabuf，我们拿到一张全零纹理。 */
+	/* ICCCM：窗口上屏了就是 NormalState（最小化过的写 IconicState）。 */
+	x11_set_wm_state(s, s->minimized ? XCB_ICCCM_WM_STATE_ICONIC :
+		XCB_ICCCM_WM_STATE_NORMAL);
 	if (s->view != NULL) {
 		xwm_surface_sync(s->view);
 	}
@@ -660,6 +690,10 @@ static void x11_handle_unmap_notify(xcb_unmap_notify_event_t *e) {
 	if (s == NULL) {
 		return;
 	}
+	/* ICCCM：从屏幕上下来的窗口是 WithdrawnState（不是 IconicState ——
+	 * 图标化是 WM 主动收起，走的是另一条路，X 侧窗口并没有 unmap）。
+	 * 客户端下一次 XMapWindow 时再写回 NormalState。 */
+	x11_set_wm_state(s, XCB_ICCCM_WM_STATE_WITHDRAWN);
 	if (s->view != NULL) {
 		xwm_surface_sync(s->view);
 	}
