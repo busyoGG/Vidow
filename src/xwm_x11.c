@@ -1468,14 +1468,23 @@ static void find_render_format(struct vidow_x11_server *x11) {
 	}
 	xcb_render_pictforminfo_iterator_t it =
 		xcb_render_query_pict_formats_formats_iterator(formats);
+	/* **判据只有 depth == 32，不查 mask。**
+	 *
+	 * 以前这里要求 alpha_mask==0xff && red_mask==0xff0000 &&
+	 * green_mask==0xff00 && blue_mask==0xff —— 那是**24 位深度**的
+	 * 通道布局。32 位 ARGB 在 XRender 里是每个通道各占 8 位，
+	 * 四个 mask 全都是 0xff：
+	 *
+	 *     id=0x29  depth=32  a=0000ff r=0000ff g=0000ff b=0000ff
+	 *
+	 * 所以那条判断永远不成立，render_format_id 一直是 0，
+	 * xcb_render_create_picture(format=0) 必然失败，光标设不上 ——
+	 * 用户看到的「X 应用光标是叉」就是这么来的。
+	 *
+	 * Hyprland 的 CXWM::getRenderFormat()（XWM.cpp:992）只判 depth == 32，
+	 * 取第一个就完事。照它写。 */
 	for (; it.rem > 0; xcb_render_pictforminfo_next(&it)) {
-		if (it.data->type != XCB_RENDER_PICT_TYPE_DIRECT ||
-				it.data->depth != 32) {
-			continue;
-		}
-		const xcb_render_directformat_t *d = &it.data->direct;
-		if (d->alpha_mask == 0xff && d->red_mask == 0xff0000 &&
-				d->green_mask == 0xff00 && d->blue_mask == 0xff) {
+		if (it.data->depth == 32) {
 			x11->render_format_id = it.data->id;
 			break;
 		}
