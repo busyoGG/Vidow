@@ -1,4 +1,5 @@
 #include "gesture.h"
+#include "xtrace.h"
 #include "ipc.h"
 #include "server.h"
 #include "sessionlock.h"
@@ -2205,7 +2206,7 @@ static void server_request_cursor(struct wl_listener *listener, void *data) {
 	struct wlr_seat_pointer_request_set_cursor_event *event = data;
 
 	struct wlr_seat_client *focused = server->seat->pointer_state.focused_client;
-	if (getenv("VIDOW_X11_TRACE") != NULL) {
+	if (vidow_xtrace_on()) {
 		wlr_log(WLR_INFO, "cursor-trace: set_cursor surface=%p %dx%d "
 			"hotspot=%d,%d focused=%p event_client=%p %s",
 			(void *)event->surface,

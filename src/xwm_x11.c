@@ -35,6 +35,7 @@
 #include <wlr/xwayland/shell.h>
 
 #include "server.h"
+#include "xtrace.h"
 #include "x11surface.h"
 #include "xwm.h"
 
@@ -579,7 +580,7 @@ static void x11_handle_configure_notify(xcb_configure_notify_event_t *e) {
 
 static void x11_handle_map_request(xcb_map_request_event_t *e) {
 	struct vidow_x11_surface *s = surface_for_window(e->window);
-	if (getenv("VIDOW_X11_TRACE") != NULL) {
+	if (vidow_xtrace_on()) {
 		wlr_log(WLR_INFO, "x11-trace: MapRequest xid=0x%x %s surface=%p",
 			e->window, s != NULL ? "" : "**未知窗口，丢弃**",
 			s != NULL ? (void *)s->surface : NULL);
@@ -597,7 +598,7 @@ static void x11_handle_map_request(xcb_map_request_event_t *e) {
 
 static void x11_handle_map_notify(xcb_map_notify_event_t *e) {
 	struct vidow_x11_surface *s = surface_for_window(e->window);
-	if (getenv("VIDOW_X11_TRACE") != NULL) {
+	if (vidow_xtrace_on()) {
 		wlr_log(WLR_INFO, "x11-trace: MapNotify xid=0x%x %s surface=%p",
 			e->window, s != NULL ? "" : "**未知窗口**",
 			s != NULL ? (void *)s->surface : NULL);
@@ -619,7 +620,7 @@ static void x11_handle_map_notify(xcb_map_notify_event_t *e) {
 
 static void x11_handle_unmap_notify(xcb_unmap_notify_event_t *e) {
 	struct vidow_x11_surface *s = surface_for_window(e->window);
-	if (getenv("VIDOW_X11_TRACE") != NULL) {
+	if (vidow_xtrace_on()) {
 		wlr_log(WLR_INFO, "x11-trace: UnmapNotify xid=0x%x %s surface=%p",
 			e->window, s != NULL ? "" : "**未知窗口**",
 			s != NULL ? (void *)s->surface : NULL);
@@ -695,7 +696,7 @@ static void x11_handle_client_message(xcb_client_message_event_t *e) {
 	/* **serial 配对**：Xwayland 对每个窗口发一条 WL_SURFACE_SERIAL
 	 * client message，data32[0..1] 是 64 位 serial。拿它去 xwayland_shell
 	 * 里找对应的 wl_surface —— 找不到 surface，窗口就永远画不出来。 */
-	if (getenv("VIDOW_X11_TRACE") != NULL) {
+	if (vidow_xtrace_on()) {
 		wlr_log(WLR_INFO, "x11-trace: client_message window=0x%x type=0x%x "
 			"(serial_atom=0x%x) data0=0x%x data1=0x%x",
 			e->window, e->type, x11->atoms.net_wm_surface_serial,
@@ -784,7 +785,7 @@ static int x11_dispatch(int fd, uint32_t mask, void *data) {
 			free(event);
 			continue;
 		}
-		if (getenv("VIDOW_X11_TRACE") != NULL) {
+		if (vidow_xtrace_on()) {
 			wlr_log(WLR_INFO, "x11-trace: event type=%u",
 				event->response_type & 0x7f);
 		}
@@ -912,7 +913,7 @@ static void handle_shell_new_surface(struct wl_listener *listener, void *data) {
 	struct vidow_x11_server *x11 =
 		wl_container_of(listener, x11, shell_new_surface);
 	struct wlr_xwayland_surface_v1 *shell_surface = data;
-	if (getenv("VIDOW_X11_TRACE") != NULL) {
+	if (vidow_xtrace_on()) {
 		wlr_log(WLR_INFO, "x11-trace: shell new_surface serial=%llu surface=%p",
 			(unsigned long long)shell_surface->serial,
 			(void *)shell_surface->surface);

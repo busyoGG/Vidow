@@ -3,6 +3,7 @@
 #include <wlr/util/log.h>
 
 #include "server.h"
+#include "xtrace.h"
 #include "x11surface.h"
 #include "xwm.h"
 
@@ -45,7 +46,7 @@ enum xwm_sync_result xwm_surface_sync(struct vidow_view *view) {
 	}
 
 	bool want = xwm_surface_should_be_mapped(view);
-	if (getenv("VIDOW_X11_TRACE") != NULL) {
+	if (vidow_xtrace_on()) {
 		wlr_log(WLR_INFO, "sync-trace: %s xid=0x%x want=%d mapped=%d "
 			"buffer=%d surf=%p view=%p",
 			vidow_view_title(view) != NULL ?
