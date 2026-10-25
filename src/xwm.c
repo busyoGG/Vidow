@@ -55,7 +55,35 @@ enum xwm_sync_result xwm_surface_sync(struct vidow_view *view) {
 			wlr_surface_has_buffer(view->x11->surface),
 			(void *)view->x11->surface, (void *)view);
 	}
-	if (want == view->mapped) {
+	/* **判据要连 wlr_surface->mapped 一起看，不能只看 view->mapped。**
+	 *
+	 * 用户报的「Steam 第二次打开窗口还是黑屏，需要拖拽或者 resize 才好」。
+	 *
+	 * 黑屏时实测（IPC）：buffer=3808x2050、dst=1904x1025、mapped=true、
+	 * 场景节点全开 —— 数据一个不缺，屏幕上全黑。resize 一下（哪怕只把
+	 * 列宽从 1 改成 0.333）立刻出画面，颜色数 1 → 166。
+	 *
+	 * 原因是这两个 mapped 是两个东西：
+	 *   view->mapped       我们自己记的「这个窗口在布局里展开着」；
+	 *   surface->mapped    wlroots 的「合成器认这块表面在屏上」。
+	 * Xwayland 读的是后者 —— 它为假时认为没人看这个窗口，**不把 X
+	 * pixmap 导出成 dmabuf**，我们拿到的纹理就是全零（首开 0xff666644，
+	 * 重开 0xff000000）。
+	 *
+	 * Steam 复用同一个 X 窗口重开时走 MapNotify 而不是 MapRequest，
+	 * wlroots 的 xwm_handle_map_notify() 只清 withdrawn、不碰 mapped，
+	 * 而 view->mapped 因为「上次还开着」仍然是 1。于是
+	 * want(1) == view->mapped(1) 直接返回，下面那句 wlr_surface_map()
+	 * 一次都没跑过 —— 表面永远不被承认，纹理永远是空的。
+	 *
+	 * resize 之所以能救：configure 改了尺寸 → 客户端重新提交 →
+	 * x11_drop_surface() 把 view->mapped 清成 0 → 下一次 commit 时
+	 * want(1) != mapped(0)，wlr_surface_map() 终于执行。
+	 *
+	 * 所以提前返回的条件里必须带上表面自己的状态：两个都对齐了才算
+	 * 真的对齐。 */
+	bool surf_mapped = view->x11->surface->mapped;
+	if (want == view->mapped && (!want || surf_mapped)) {
 		return XWM_SYNC_NOOP;
 	}
 
@@ -84,7 +112,25 @@ enum xwm_sync_result xwm_surface_sync(struct vidow_view *view) {
 		if (surf != NULL) {
 			wlr_surface_map(surf);
 		}
-		view_map(&view->map, NULL);
+		/* view_map() 头一句就是 if (view->mapped) return; —— 复用窗口
+		 * 重开时 view->mapped 本来就是 1，它会直接返回，布局那边一次都
+		 * 不刷新。可场景树在 dissociate 时被拆过（x11_drop_surface 把
+		 * scene_tree 清成 NULL），不重挂就还是黑的。
+		 *
+		 * 所以这里补一次：表面重新挂上、场景树重建、状态按当前布局
+		 * 重新对齐。vidow_view_attach_x11_surface 内部也是幂等的
+		 * （x11_attach_surface 见 scene_tree != NULL 就跳过）。 */
+		if (view->mapped) {
+			if (view->scene_tree == NULL) {
+				vidow_view_attach_x11_surface(view);
+			}
+			/* 场景树重建后节点是禁用状态（x11_attach_surface 末尾
+			 * set_enabled(false)），得让布局重新算一遍把它打开、
+			 * 摆到正确位置。 */
+			vidow_arrange(view->server);
+		} else {
+			view_map(&view->map, NULL);
+		}
 		return XWM_SYNC_MAPPED;
 	}
 

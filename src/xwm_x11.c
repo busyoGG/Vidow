@@ -426,6 +426,14 @@ static void handle_surface_commit(struct wl_listener *listener, void *data) {
 	(void)data;
 	struct vidow_x11_surface *s =
 		wl_container_of(listener, s, surface_commit);
+	if (vidow_xtrace_on()) {
+		wlr_log(WLR_INFO, "x11-trace: commit xid=0x%x view=%p buffer=%d "
+			"surf_mapped=%d size=%dx%d", s->window_id, (void *)s->view,
+			s->surface != NULL && wlr_surface_has_buffer(s->surface),
+			s->surface != NULL && s->surface->mapped,
+			s->surface != NULL ? s->surface->current.width : 0,
+			s->surface != NULL ? s->surface->current.height : 0);
+	}
 	if (s->view != NULL) {
 		xwm_surface_sync(s->view);
 	}
