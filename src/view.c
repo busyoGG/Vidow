@@ -8315,12 +8315,30 @@ static void x11_drop_surface(struct vidow_view *view) {
 		vidow_popup_blur_unregister(view->popup_blur, true);
 		view->popup_blur = NULL;
 	}
+	/* **监听器要在 scene_tree 判断之前摘。**
+	 *
+	 * 这三个挂在 wl_surface 上；wlroots 销毁表面时断言 commit 监听器列表
+	 * 必须为空（types/wlr_compositor.c:733）。以前 scene_tree == NULL 就
+	 * 直接 return，把三个监听器留在正在销毁的表面上 → abort。
+	 * 另外它们可能已经被摘过一次（surface destroy 和 X destroy 都会走到
+	 * 这里），所以逐个判空再摘。 */
+	if (view->map.link.next != NULL && view->map.link.next != &view->map.link) {
+		wl_list_remove(&view->map.link);
+		wl_list_init(&view->map.link);
+	}
+	if (view->unmap.link.next != NULL &&
+			view->unmap.link.next != &view->unmap.link) {
+		wl_list_remove(&view->unmap.link);
+		wl_list_init(&view->unmap.link);
+	}
+	if (view->commit.link.next != NULL &&
+			view->commit.link.next != &view->commit.link) {
+		wl_list_remove(&view->commit.link);
+		wl_list_init(&view->commit.link);
+	}
 	if (view->scene_tree == NULL) {
 		return;
 	}
-	wl_list_remove(&view->map.link);
-	wl_list_remove(&view->unmap.link);
-	wl_list_remove(&view->commit.link);
 	/* 场景节点归 wlroots 所有，可能比 view 活得久：先把 tag 摘掉。 */
 	view->scene_tree->node.data = NULL;
 	/* 表面那个 buffer 节点**不碰**：它是 view->scene_tree 的孩子，表面一没

@@ -360,8 +360,39 @@ static void handle_surface_destroy(struct wl_listener *listener, void *data) {
 	(void)data;
 	struct vidow_x11_surface *s =
 		wl_container_of(listener, s, surface_destroy);
+	/* **必须把 commit 监听器一起摘掉。**
+	 *
+	 * 用户报的「又崩溃了」，coredump 是 SIGABRT，日志最后一行：
+	 *     vidow: types/wlr_compositor.c:733: surface_handle_resource_destroy:
+	 *     Assertion `wl_list_empty(&surface->events.commit.listener_list)'
+	 *     failed.
+	 *
+	 * wl_surface 销毁时 wlroots 会断言「commit 监听器列表必须是空的」。
+	 * 这里以前只摘自己的 destroy 监听器、把 s->surface 置空就完事 ——
+	 * surface_commit 还挂在那个正在销毁的 surface 上，断言直接 abort。
+	 *
+	 * 这个 bug 一直藏着，因为此前 associate 从未成功过（X 连都连不上，
+	 * 见 2624757 / 959b6d9）。composite redirect 补上后 Xwayland 终于开始
+	 * 交 surface，第一次真正走到 associate → surface 销毁这条路上来。 */
 	wl_list_remove(&s->surface_destroy.link);
 	wl_list_init(&s->surface_destroy.link);
+	if (s->surface_commit.link.next != NULL &&
+			s->surface_commit.link.next != &s->surface_commit.link) {
+		wl_list_remove(&s->surface_commit.link);
+		wl_list_init(&s->surface_commit.link);
+	}
+	/* **view 那边的三个监听器（map / unmap / commit）也挂在同一个
+	 * wl_surface 上，必须一起摘。** 只摘我们自己这两个，wlroots 在
+	 * surface_handle_resource_destroy 里断言
+	 *     assert(wl_list_empty(&surface->events.commit.listener_list))
+	 * 立刻 abort —— 就是用户报的「又崩溃了」。
+	 *
+	 * 这里调 vidow_view_x11_gone() 而不是 x11_drop_surface() 的裸调用：
+	 * 它就是为「X 侧表面没了、但 view 还在布局里」设计的入口，
+	 * 会把 view->map / unmap / commit 全摘掉、清场景指针。 */
+	if (s->view != NULL) {
+		vidow_view_x11_gone(s->view);
+	}
 	s->surface = NULL;
 }
 
