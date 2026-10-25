@@ -466,6 +466,29 @@ static void x11_handle_destroy(xcb_destroy_notify_event_t *e) {
 	wlr_log(WLR_INFO, "xwm: destroy xid=0x%x", e->window);
 	x11_dissociate(s);
 	if (s->view != NULL) {
+		/* **先把这个 view 的 x11 反向指针断掉，再释放 s。**
+		 *
+		 * 用户报的「vidow 崩溃了」（部署 2624757 之后立刻崩，coredump 是
+		 * SIGSEGV，栈：#0 libc <- #1 libc <- #2 libc <- #3 libwlroots
+		 * <- #4 _wlr_log <- #5 view_apply_fullscreen
+		 * <- #6 view_sync_x11_fullscreen <- #7 vidow_views_sync_x11_fullscreen
+		 * <- #8 output_frame）。
+		 *
+		 * vidow_views_sync_x11_fullscreen() 每帧遍历 server->views，对每个
+		 * view 读 view->x11->fullscreen。而 vidow_view_x11_gone() 只做
+		 * x11_drop_surface()：它释放场景/FX 状态，**既不移除 view、也不清
+		 * view->x11**。真正清 view->x11 的地方只有 vidow_view_free()，而
+		 * X 窗口销毁**不等于** view 销毁（view 还挂在布局里）。
+		 *
+		 * 于是 s 被 free 之后，view->x11 成了野指针，下一帧
+		 * view_sync_x11_fullscreen() 一读就是 SIGSEGV —— 崩在 _wlr_log
+		 * 里是因为拿到的 title 指针也是垃圾。
+		 *
+		 * X 窗口先死、view 后死这个顺序很常见：日志里 32x32 / 1x1 的
+		 * helper 窗口（Qt、fcitx 那类）都是 create 完立刻 destroy。 */
+		if (s->view->x11 == s) {
+			s->view->x11 = NULL;
+		}
 		vidow_view_x11_gone(s->view);
 		s->view = NULL;
 	}

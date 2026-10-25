@@ -183,6 +183,8 @@ const char *vidow_view_app_id(const struct vidow_view *view) {
 		if (view->x11 == NULL) {
 			return NULL;
 		}
+		/* 再挡一次：X 窗口已经销毁、x11 结构已释放，view 还挂在布局里
+		 * （见 xwm_x11.c 的 x11_handle_destroy）。 */
 		return view->x11->class != NULL ? view->x11->class : view->x11->instance;
 	}
 	return view->xdg_toplevel != NULL ? view->xdg_toplevel->app_id : NULL;
