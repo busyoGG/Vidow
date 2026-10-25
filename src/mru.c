@@ -1172,6 +1172,9 @@ static void mru_card_style(const struct vidow_server *server,
 /* 每项背后那张卡片 + 压暗的背景。 */
 static void mru_scene_apply(struct vidow_server *server);
 static void mru_close_finish(struct vidow_server *server);
+/* 定义在下面（换选中项位移那段）。mru_scene_apply 要用它查旧位置。 */
+static const struct vidow_mru_slide *mru_slide_find(
+		const struct vidow_mru *mru, const struct vidow_view *view);
 
 /* 进 / 出的过渡：t 从 from 走到 to，每帧重画浮层。
  *
@@ -1298,6 +1301,35 @@ static void mru_scene_apply(struct vidow_server *server) {
 		}
 		int cx = slot->cx + (slot->cw - cw) / 2;
 		int cy = slot->cy + (slot->ch - ch) / 2;
+		/* **换选中项的位移**：从「刚才画在哪儿」插到这个新位置。
+		 *
+		 * mru->slide 由 mru_slide_anim 推（0 = 旧位置，1 = 新位置）。没有旧
+		 * 位置（新冒出来的项 / 没在过渡）就不插值，直接用新位置 —— 不然
+		 * 卡片会从 (0,0) 飞过来。
+		 *
+		 * 位置和尺寸都插：清单重排时卡片可能同时换位置和换大小（比如选中
+		 * 项变化导致某列变宽），只插位置会让尺寸一帧跳过去，看着还是生硬。 */
+		if (mru->slide < 1.0) {
+			const struct vidow_mru_slide *from =
+				mru_slide_find(mru, slot->view);
+			if (from != NULL) {
+				double k = mru->slide;
+				cx = (int)lround((double)from->cx +
+					((double)cx - (double)from->cx) * k);
+				cy = (int)lround((double)from->cy +
+					((double)cy - (double)from->cy) * k);
+				cw = (int)lround((double)from->cw +
+					((double)cw - (double)from->cw) * k);
+				ch = (int)lround((double)from->ch +
+					((double)ch - (double)from->ch) * k);
+				if (cw < 1) {
+					cw = 1;
+				}
+				if (ch < 1) {
+					ch = 1;
+				}
+			}
+		}
 		float fill[4], ring[4];
 		int bw = 0;
 		mru_card_style(server, slot->view, fill, ring, &bw);
@@ -1312,9 +1344,21 @@ static void mru_scene_apply(struct vidow_server *server) {
 		if (th < 1) {
 			th = 1;
 		}
+		/* 缩略图跟着**卡片**走：卡片插值到哪儿，缩略图就按同样的比例缩到
+		 * 它的内框里。以前两边各算各的，位移过渡一开始就会脱节（卡片在
+		 * 半路上、缩略图已经在新位置）。 */
+		double cscale = slot->cw > 0 ? (double)cw / (double)slot->cw : 1.0;
+		tw = (int)lround((double)tw * cscale);
+		th = (int)lround((double)th * cscale);
+		if (tw < 1) {
+			tw = 1;
+		}
+		if (th < 1) {
+			th = 1;
+		}
 		struct wlr_box thumb = {
-			slot->x + (slot->w - tw) / 2,
-			slot->y + (slot->h - th) / 2,
+			cx + (cw - tw) / 2,
+			cy + (ch - th) / 2,
 			tw, th,
 		};
 		mru_card_thumb(server, card, slot->view, &thumb, slot->zoom);
@@ -1327,11 +1371,152 @@ static void mru_scene_apply(struct vidow_server *server) {
 	}
 }
 
+/* ------------------------------------------------- 换选中项的位移过渡 */
+
+/* 把「现在每张卡片画在哪儿」抄一份。重排之前调 —— 重排一跑，slot 就全是
+ * 新位置了，旧位置只有这里存得下来。 */
+static void mru_slide_snapshot(struct vidow_server *server) {
+	struct vidow_mru *mru = &server->mru;
+	if (mru->slot == NULL || mru->slot_n <= 0) {
+		mru->slide_from_n = 0;
+		return;
+	}
+	if (mru->slide_from == NULL) {
+		mru->slide_from = calloc(MRU_MAX, sizeof(*mru->slide_from));
+		if (mru->slide_from == NULL) {
+			mru->slide_from_n = 0;
+			return;
+		}
+	}
+	/* 存**这一刻真正画出来的**框，不是 slot 的目标值。
+	 *
+	 * 区别只在「过渡途中又按了一次 Tab」时看得出来：那时上一段动画还没走完，
+	 * 卡片画在半路上，而 slot 里存的是它上一段的目标位置。照 slot 抄的话，
+	 * 卡片会先跳回那个旧目标再往新目标走 —— 连按 Tab 就是一顿一顿的。 */
+	double k = mru->slide;
+	bool mid_flight = mru->slide_anim != NULL && k < 1.0;
+	struct vidow_mru_slide *prev = mru->slide_from;
+	int prev_n = mru->slide_from_n;
+	/* 先把旧表挪开（下面要覆写同一个数组）。旧表的指针留着读，所以先复制。 */
+	struct vidow_mru_slide *old = NULL;
+	if (mid_flight && prev != NULL && prev_n > 0) {
+		old = malloc((size_t)prev_n * sizeof(*old));
+		if (old != NULL) {
+			memcpy(old, prev, (size_t)prev_n * sizeof(*old));
+		} else {
+			mid_flight = false;
+		}
+	}
+	mru->slide_from_n = 0;
+	for (int i = 0; i < mru->slot_n && mru->slide_from_n < MRU_MAX; i++) {
+		const struct vidow_mru_slot *slot = &mru->slot[i];
+		if (slot->view == NULL) {
+			continue;
+		}
+		struct vidow_mru_slide *from = &mru->slide_from[mru->slide_from_n++];
+		from->view = slot->view;
+		from->cx = slot->cx;
+		from->cy = slot->cy;
+		from->cw = slot->cw;
+		from->ch = slot->ch;
+		if (mid_flight) {
+			/* 上一段还没走完：按它此刻的进度算出「实际画在哪儿」。 */
+			for (int j = 0; j < prev_n; j++) {
+				if (old[j].view != slot->view) {
+					continue;
+				}
+				from->cx = (int)lround((double)old[j].cx +
+					((double)slot->cx - (double)old[j].cx) * k);
+				from->cy = (int)lround((double)old[j].cy +
+					((double)slot->cy - (double)old[j].cy) * k);
+				from->cw = (int)lround((double)old[j].cw +
+					((double)slot->cw - (double)old[j].cw) * k);
+				from->ch = (int)lround((double)old[j].ch +
+					((double)slot->ch - (double)old[j].ch) * k);
+				break;
+			}
+		}
+	}
+	free(old);
+}
+
+/* 这个窗口刚才画在哪儿。找不到（新冒出来的项）= NULL，不插值。 */
+static const struct vidow_mru_slide *mru_slide_find(
+		const struct vidow_mru *mru, const struct vidow_view *view) {
+	if (mru->slide_from == NULL) {
+		return NULL;
+	}
+	for (int i = 0; i < mru->slide_from_n; i++) {
+		if (mru->slide_from[i].view == view) {
+			return &mru->slide_from[i];
+		}
+	}
+	return NULL;
+}
+
+static void mru_slide_update(void *data, double t, double linear) {
+	struct vidow_server *server = data;
+	struct vidow_mru *mru = &server->mru;
+	(void)t;
+	mru->slide = linear;
+	mru_scene_apply(server);
+}
+
+static void mru_slide_done(void *data, bool cancelled) {
+	struct vidow_server *server = data;
+	struct vidow_mru *mru = &server->mru;
+	mru->slide_anim = NULL;
+	if (!cancelled) {
+		mru->slide = 1.0;
+	}
+	/* 过渡完了：旧位置没用了，清掉（下次换选中项重新抄）。 */
+	mru->slide_from_n = 0;
+	mru_scene_apply(server);
+	vidow_backdrop_damage(server, false);
+}
+
+/* 选中项变了 → 卡片从旧位置滑到新位置。
+ *
+ * 只在**面板已经显形**时走这条路：open_delay 还没到的时候画面本来就没出来，
+ * 那时候的选中变化由「显形过渡」自己表现（卡片从缩小状态长出来），再加一层
+ * 位移只会互相打架。 */
+static void mru_slide_start(struct vidow_server *server) {
+	struct vidow_mru *mru = &server->mru;
+	struct vidow_config *cfg = &server->config;
+	if (mru->slide_anim != NULL) {
+		vidow_anim_cancel(mru->slide_anim);
+		mru->slide_anim = NULL;
+	}
+	int ms = cfg->mru_slide_ms;
+	if (ms <= 0) {
+		mru->slide = 1.0;
+		mru->slide_from_n = 0;
+		return;
+	}
+	mru->slide = 0.0;
+	mru->slide_anim = vidow_anim_start(server, "mru-slide", ms,
+		(struct vidow_ease){ .kind = VIDOW_EASE_OUT_CUBIC },
+		mru_slide_update, mru_slide_done, server);
+	if (mru->slide_anim == NULL) {
+		/* 动画系统没接上（或者被节流）：直接到位，别让卡片卡在旧位置。 */
+		mru->slide = 1.0;
+		mru->slide_from_n = 0;
+	}
+}
+
 /* 清单 / 选中项变了：重排 + 重画自己那一层（窗口不动，所以不用碰 view）。 */
 static void mru_refresh(struct vidow_server *server) {
 	struct vidow_mru *mru = &server->mru;
+	/* 重排会覆盖 slot 里的位置 —— 想插值就得先抄一份（见 mru_slide_*）。 */
+	bool sliding = mru->shown && mru->t > 0.0 && mru->slide_from_n == 0;
+	if (sliding) {
+		mru_slide_snapshot(server);
+	}
 	if (mru->n > 0) {
 		mru_layout(server);
+	}
+	if (sliding) {
+		mru_slide_start(server);
 	}
 	mru_scene_apply(server);
 	/* 窗口一个都不动：切换器是浮层，只管自己那层（见 mru_scene_apply）。 */
@@ -1376,6 +1561,11 @@ static int mru_open_timer_fire(void *data) {
 	mru->shown = true;
 	/* 从 0 开始长出来（t 只让浮层从「缩小 + 无压暗」过渡到到位）。 */
 	mru->t = 0.0;
+	/* 位移过渡从「已到位」开始：这是面板第一次显形，卡片没有「旧位置」，
+	 * 该由 t 那条（缩小 → 原位）来表现。留着 0 的话会按上一次关闭前的
+	 * 坐标插值，卡片从屏幕外飞进来。 */
+	mru->slide = 1.0;
+	mru->slide_from_n = 0;
 	wlr_log(WLR_INFO, "mru: 面板显形（按住 %dms 之后，过渡 %dms）",
 		server->config.mru_open_delay_ms, server->config.mru_open_ms);
 	mru_refresh(server);
@@ -1598,6 +1788,14 @@ void vidow_mru_step_clamp(struct vidow_server *server, int dir) {
  * 淡出压根看不到一帧。 */
 static void mru_close_finish(struct vidow_server *server) {
 	struct vidow_mru *mru = &server->mru;
+	/* 面板没了，旧位置也没意义了 —— 留着的话下次打开第一帧会按上次关闭
+	 * 前的坐标插值，卡片从屏幕外飞进来。 */
+	if (mru->slide_anim != NULL) {
+		vidow_anim_cancel(mru->slide_anim);
+		mru->slide_anim = NULL;
+	}
+	mru->slide = 1.0;
+	mru->slide_from_n = 0;
 	mru->slot_n = 0;
 	mru->n = 0;
 	mru->scroll = 0.0;
@@ -1800,6 +1998,13 @@ void vidow_mru_finish(struct vidow_server *server) {
 	mru->order = NULL;
 	free(mru->slot);
 	mru->slot = NULL;
+	if (mru->slide_anim != NULL) {
+		vidow_anim_cancel(mru->slide_anim);
+		mru->slide_anim = NULL;
+	}
+	free(mru->slide_from);
+	mru->slide_from = NULL;
+	mru->slide_from_n = 0;
 	mru->card_n = 0;
 	mru->slot_n = 0;
 	mru->pending = NULL;

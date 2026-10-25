@@ -454,6 +454,9 @@ static const struct entry entries[] = {
 		"压暗跟着淡入，0 = 不做过渡（瞬间摆上去）" },
 	{ "mru_close_ms",    K_INT,    OFF(mru_close_ms),    SZ(mru_close_ms), 14,
 		"收起的过渡时长（毫秒），含义同 mru_open_ms；0 = 关掉时瞬间消失" },
+	{ "mru_slide_ms",    K_INT,    OFF(mru_slide_ms),    SZ(mru_slide_ms), 14,
+		"换选中项时卡片位移的过渡时长（毫秒）：按 Tab 之后卡片从旧位置滑到"
+		"新位置，0 = 瞬间跳过去" },
 	{ "mru_card_padding", K_INT, OFF(mru_card_padding),
 		SZ(mru_card_padding), 14,
 		"每一项背后那张卡片比预览大多少（逻辑像素）：预览到卡片边缘那圈。比 "
@@ -2157,6 +2160,9 @@ static void defaults(struct vidow_config *cfg) {
 	cfg->mru_backdrop_alpha = 0.6;   /* 半透明：桌面还看得见 */
 	cfg->mru_open_ms = 120;          /* 显形：短，别挡着「切完就能用」 */
 	cfg->mru_close_ms = 90;          /* 收起更快一点：走的时候不该拖 */
+	/* 换选中项的位移：比显形再快一点。这个动画是「每按一下 Tab 都放一遍」的，
+	 * 长了会跟不上连按的节奏（手快的时候会看到一串追不上的残影）。 */
+	cfg->mru_slide_ms = 110;
 	/* 卡片样式照 portal 的选择器（深色那套调色板）：底 #2f3336 压一点透明度、
 	 * 描边 #3b4045；强调色默认取 KDE Breeze 蓝 #3daee9 —— 和 portal 用同一个
 	 * 强调色（portal 那边读 kdeglobals，这里没法读，就按默认值来）。 */

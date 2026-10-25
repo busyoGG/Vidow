@@ -574,6 +574,10 @@ struct vidow_config {
 	/* 显形 / 收起的过渡时长（毫秒）。0 = 不做过渡，瞬间到位。 */
 	int mru_open_ms;
 	int mru_close_ms;
+	/* 换选中项时卡片位移的过渡时长（毫秒），0 = 瞬间跳过去。
+	 * 和 mru_open_ms 是两回事：那个管面板显形，这个管「按 Tab 之后卡片
+	 * 从旧位置滑到新位置」。 */
+	int mru_slide_ms;
 	int mru_card_padding;
 	int mru_card_radius;
 	float mru_card_color[4];
@@ -844,6 +848,12 @@ struct vidow_mru_slot {
 	double zoom;      /* 内容缩放（1.0 = 原尺寸） */
 };
 
+/* 换选中项时「这张卡片刚才画在哪儿」（见 vidow_mru.slide_from 的说明）。 */
+struct vidow_mru_slide {
+	struct vidow_view *view;
+	int cx, cy, cw, ch;
+};
+
 struct vidow_mru {
 	/* ---- 台账 ---- */
 	struct vidow_view *pending;     /* 拿到焦点、还在 debounce 里的那个 */
@@ -876,6 +886,23 @@ struct vidow_mru {
 	double t;
 	struct vidow_anim *anim;        /* 推 t 的那条 */
 	bool closing;                   /* 这条动画在往 0 走（关）还是往 1 走（开） */
+
+	/* ---- 换选中项时的位移过渡 ----
+	 *
+	 * 上面那个 t 只管「面板显形 / 收起」。**换选中项是另一回事**：按一下 Tab
+	 * 清单就重排了，每张卡片的目标位置当场变成新值，卡片一帧之间跳过去
+	 * （用户：「MRU 的窗口卡片移动没有过渡动画」）。
+	 *
+	 * 所以每次重排前把「现在画在哪儿」抄一份存这儿，重排后按 slide 从旧位置
+	 * 插到新位置。存的是**卡片框**（cx/cy/cw/ch），不是缩略图 —— 缩略图跟着
+	 * 卡片走，插值一次就够。
+	 *
+	 * 键是窗口指针：清单顺序变了、项被挤出视口再挤回来，位置都还能对上。
+	 * 找不到旧位置（新冒出来的项）就从目标位置开始，不插值。 */
+	struct vidow_mru_slide *slide_from;
+	int slide_from_n;
+	double slide;                   /* 0 = 全在旧位置，1 = 全在新位置 */
+	struct vidow_anim *slide_anim;  /* 推 slide 的那条 */
 	/* 每项背后那张卡片（超椭圆圆角的底 + 描边，见 mru.c）。节点按需建、建了留着
 	 * 复用；圆角是按覆盖率算出来的小图（wlr_scene_rect 画不出圆角），尺寸或样式
 	 * 变了才重画。 */
