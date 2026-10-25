@@ -1084,8 +1084,22 @@ static void focus_follows_mouse(struct vidow_server *server,
 	if (hit == NULL) {
 		struct wlr_output *hover_output = wlr_output_layout_output_at(
 			server->output_layout, server->cursor->x, server->cursor->y);
+		/* **判据不能拿 server->focused_output 比。**
+		 *
+		 * 它在上面的 vidow_pointer_motion 里已经被这一趟位移更新成
+		 * hover_output 了（那几行只改这一个字段，不动 server->focused），
+		 * 拿它比永远相等 —— 这条分支一次都不会跑（第一版就是这么哑的，
+		 * 实测光标移到 DP-2 空区、焦点仍留在 DP-3）。
+		 *
+		 * 要问的是「键盘焦点那扇窗在哪块屏上」：和它比才代表真的跨屏了。 */
+		struct vidow_output *focus_out = server->focused != NULL ?
+			vidow_output_lookup(server, server->focused->output) : NULL;
 		if (hover_output != NULL &&
-				hover_output != server->focused_output) {
+				(focus_out == NULL ||
+					focus_out->wlr_output != hover_output)) {
+			wlr_log(WLR_INFO, "悬停换屏: 光标在 %s，焦点跟过去（原焦点 %s）",
+				hover_output->name,
+				focus_out != NULL ? focus_out->wlr_output->name : "无");
 			vidow_workspace_focus_output(server, hover_output);
 		}
 		return;
