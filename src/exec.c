@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <wlr/util/log.h>
@@ -413,8 +414,36 @@ void vidow_exec_detached(const char *script) {
 		execl("/bin/sh", "sh", "-c", script, (char *)NULL);
 		_exit(127);
 	}
+	/* 这里的 waitpid 必须 WNOHANG。
+	 *
+	 * 原来写的是 waitpid(pid, &status, 0)：注释说「双 fork、不等它」，代码却
+	 * 真在主线程上等 —— 而这条路径是从 wlr_keyboard_notify_key 的同步回调里
+	 * 进来的（bind_run → vidow_action_run → 这里），等就等于把整个 Wayland
+	 * 事件循环按在「键盘事件处理到一半」的状态上。
+	 *
+	 * 现场（gdb 抓到的栈）：Mod+Return 起 kitty → kitty 里跑 vshell → vshell
+	 * 起来那一两秒内按 Ctrl+C，合成器直接没了：没有 core、没有断言、连退出
+	 * 日志都写不出来。vshell 的 6 块 layer 刚 map 完、一块都没 unmapped 就被
+	 * 拖进销毁路径。等够 10 秒再按就没事 —— 正好是这个等待窗口的边界。
+	 *
+	 * 中间那层 fork 是立刻 _exit(0) 的，所以正常情况下第一次 WNOHANG 就能
+	 * 收到；收不到就再试几次（每次让出 CPU），最后交给内核在进程退出时回收，
+	 * 无论如何都不在这里阻塞事件循环。 */
 	int status;
-	waitpid(pid, &status, 0);
+	for (int tries = 0; tries < 64; tries++) {
+		pid_t got = waitpid(pid, &status, WNOHANG);
+		if (got == pid || (got < 0 && errno == ECHILD)) {
+			return;
+		}
+		if (got < 0 && errno != EINTR) {
+			wlr_log(WLR_DEBUG, "exec: 回收中间进程 %d 失败: %s",
+				(int)pid, strerror(errno));
+			return;
+		}
+		struct timespec pause = {0, 1000000}; /* 1ms */
+		nanosleep(&pause, NULL);
+	}
+	wlr_log(WLR_DEBUG, "exec: 中间进程 %d 还没退，交给内核回收", (int)pid);
 }
 
 bool vidow_exec_init(struct vidow_server *server) {
