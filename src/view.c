@@ -6976,10 +6976,23 @@ static void view_commit(struct wl_listener *listener, void *data) {
 		 * （它们的渲染节奏由自己的帧循环决定），只对 X11 做。 */
 		if (view->x11 != NULL) {
 			/* 记一笔「欠帧」，交给补帧闹钟推（见下面 want 的判定）。
-			 * 只在 commit 里记一次不够 —— 重开时 XWayland 就交这
-			 * 一帧，之后全靠闹钟把它拽出来。 */
-			if (view->x11_want_frames < 30) {
+			 *
+			 * **只在没有债务时记**：以前这里写的是「不足 30 就补到 30」，
+			 * 而催帧本身会促使 Xwayland 再交一帧 —— 交一帧又把债务刷回
+			 * 30，于是形成正反馈：实测 95 秒里「欠帧 30 → 催帧」打了
+			 * 15197 次（约 160 次/秒），主循环一直在空转，同屏其他客户端
+			 * （Element 这类 Electron 应用）拿不到帧，直接卡死。
+			 *
+			 * 债务的语义是「拽它一把」，不是「让它永远满速跑」：
+			 * 已经欠着就让它自然耗尽，新的 commit 只是续上原有的那一笔。 */
+			struct timespec ts = {0};
+			clock_gettime(CLOCK_MONOTONIC, &ts);
+			uint32_t now_ms = (uint32_t)(ts.tv_sec * 1000 +
+				ts.tv_nsec / 1000000);
+			if (view->x11_want_frames == 0 &&
+					now_ms - view->x11_want_frames_at >= 500) {
 				view->x11_want_frames = 30;
+				view->x11_want_frames_at = now_ms;
 			}
 			vidow_output_schedule_frame(view->server, view->output,
 				"X11 表面续帧");
