@@ -120,6 +120,23 @@ enum xwm_sync_result xwm_surface_sync(struct vidow_view *view) {
 		 * 所以这里补一次：表面重新挂上、场景树重建、状态按当前布局
 		 * 重新对齐。vidow_view_attach_x11_surface 内部也是幂等的
 		 * （x11_attach_surface 见 scene_tree != NULL 就跳过）。 */
+		/* **两种「重新上屏」都要让客户端重画一次。**
+		 *
+		 * trace 实测（Steam 关掉再开，VIDOW_X11_TRACE）：
+		 *     want=0 mapped=0   ← unmap 时已清
+		 *     want=1 mapped=0   ← 重开走的是这一支，view_map()
+		 *     want=1 mapped=1
+		 * 也就是说复用窗口重开时 view->mapped 已经是 0，下面那条
+		 * view->mapped 分支根本不会进 —— 之前把清 cfg_sent 放在那里
+		 * 是放错位置了，一次都没执行。
+		 *
+		 * 几何没变时 view.c 的 configure 路径会命中「和上次一模一样」
+		 * 直接 return，客户端等一个永远不来的 ConfigureNotify，画面
+		 * 定在重开时那一帧空白上。所以这里无条件清一次，让紧接着的
+		 * arrange 把 configure 真发出去。 */
+		if (view->x11 != NULL) {
+			view->cfg_sent = false;
+		}
 		if (view->mapped) {
 			if (view->scene_tree == NULL) {
 				vidow_view_attach_x11_surface(view);
@@ -139,11 +156,7 @@ enum xwm_sync_result xwm_surface_sync(struct vidow_view *view) {
 			 * view.c 那条 configure 路径时命中「和上次一模一样」直接
 			 * return —— configure 压根没发出去，客户端等一个永远不会来
 			 * 的 ConfigureNotify，画面就这么定在黑色上。
-			 *
-			 * 清掉 cfg_sent，让 arrange 下面这次 configure 真的发出去；
-			 * 几何没变的补发（合成 ConfigureNotify）由那条路径自己处理，
-			 * 判据只看 cfg_x/y/w/h、不看 cfg_sent，所以一定会跟上。 */
-			view->cfg_sent = false;
+			 * （清 cfg_sent 已挪到上面无条件执行。） */
 		} else {
 			view_map(&view->map, NULL);
 		}

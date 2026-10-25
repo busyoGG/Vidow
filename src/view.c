@@ -504,7 +504,7 @@ void vidow_view_set_size(struct vidow_view *view, int w, int h) {
 			/* 这里以前一言不发地 return，害得我把「日志里没有 x11-cfg」
 			 * 读成「configure 没发」—— 其实这条日志压根不存在，首开正常
 			 * 时也是 0 条。排「Steam 重开黑屏」两种结局都得看得见。 */
-			wlr_log(WLR_DEBUG, "x11-cfg %s: 跳过 %d,%d %dx%d"
+			wlr_log(WLR_INFO, "x11-cfg %s: 跳过 %d,%d %dx%d"
 				"（和上次一模一样）",
 				vidow_view_title(view) != NULL ?
 					vidow_view_title(view) : "(无题)",
@@ -538,7 +538,7 @@ void vidow_view_set_size(struct vidow_view *view, int w, int h) {
 		bool same_as_last = view->cfg_x == x &&
 			view->cfg_y == y && view->cfg_w == cw &&
 			view->cfg_h == ch;
-		wlr_log(WLR_DEBUG, "x11-cfg %s: 发 %d,%d %dx%d（上次 %d,%d %dx%d，"
+		wlr_log(WLR_INFO, "x11-cfg %s: 发 %d,%d %dx%d（上次 %d,%d %dx%d，"
 			"cfg_sent=%d）",
 			vidow_view_title(view) != NULL ?
 				vidow_view_title(view) : "(无题)",
