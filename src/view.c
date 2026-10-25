@@ -3821,21 +3821,20 @@ void vidow_place_view(struct vidow_view *view, int x, int y, int w, int h) {
 	 *
 	 * 让视口负责全部横向位移、窗口只做刚体：相对位置一帧都不变。 */
 	if (viewport_sliding(view->server, view->output)) {
-		/* 视口每帧都在动，窗口跟着横移：**两端的旧位置都要记损伤**，否则
-		 * 上一帧画在隔壁屏上的那一块没人擦 —— 用户报的「聚焦移动的时候会
-		 * 漏一点内容到隔壁显示器」就是它（以前每个窗口有自己的位移补间，
-		 * view_move_update 里会 damage 两次；现在走这条捷径，漏了这一步）。
+		/* **这里不记底衬损伤。**
 		 *
-		 * 损伤必须在改 anim_off 之前取（取的是上一帧画的那块）。 */
-		struct wlr_box before = view->geom;
-		before.x += (int)lround(view->anim_off_x);
-		before.y += (int)lround(view->anim_off_y);
+		 * 视口过渡期间这个函数是每帧、对每个窗口都调一遍的，而底衬损伤
+		 * 会经 blur_note_damage() 分发给**所有** layer surface（noctalia
+		 * 的 panel / notification 全在里面）。每个窗口各记一笔 = 每帧几十
+		 * 笔 × 每个 layer，panel 的模糊底衬永远追不上，越堆越多最后卡死
+		 * （用户：「layer 动画会卡，而且会死掉（noctalia」）。
+		 *
+		 * 整条带子横向平移，受影响的是一整块屏 —— 损伤统一由
+		 * viewport_anim_update() 每帧记一笔整屏就够了。 */
 		vidow_anim_cancel(view->anim_move);
 		view->anim_move = NULL;
 		view->anim_off_x = 0.0;
 		view->anim_off_y = 0.0;
-		vidow_backdrop_damage_box(view->server, &before);
-		vidow_backdrop_damage_view(view);
 		vidow_view_apply_anim(view);
 		return;
 	}
@@ -4061,6 +4060,20 @@ static void viewport_anim_update(void *data, double t, double linear) {
 	double v = a->output->viewport_anim_from +
 		(a->output->viewport_anim_to - a->output->viewport_anim_from) * t;
 	a->output->viewport_x = v;
+	/* **整块屏记一笔损伤就够，不要每个窗口各记一笔。**
+	 *
+	 * 底衬损伤会经 blur_note_damage() 分发给所有 layer surface（noctalia
+	 * 的 panel / notification）。视口过渡一帧要摆几十个窗口，每个都记一笔
+	 * 就是每帧几十笔 × 每个 layer —— panel 的模糊底衬永远追不上，越堆越多
+	 * 最后卡死（用户：「layer 动画会卡，而且会死掉（noctalia」）。
+	 *
+	 * 整条带子在横向平移，受影响的本来就是一整块屏。 */
+	struct wlr_box obox = {0};
+	wlr_output_layout_get_box(a->server->output_layout,
+		a->output->wlr_output, &obox);
+	if (obox.width > 0 && obox.height > 0) {
+		vidow_backdrop_damage_box(a->server, &obox);
+	}
 	vidow_arrange(a->server);
 }
 
