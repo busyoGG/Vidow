@@ -644,6 +644,12 @@ static void x11_handle_client_message(xcb_client_message_event_t *e) {
 	/* **serial 配对**：Xwayland 对每个窗口发一条 WL_SURFACE_SERIAL
 	 * client message，data32[0..1] 是 64 位 serial。拿它去 xwayland_shell
 	 * 里找对应的 wl_surface —— 找不到 surface，窗口就永远画不出来。 */
+	if (getenv("VIDOW_X11_TRACE") != NULL) {
+		wlr_log(WLR_INFO, "x11-trace: client_message window=0x%x type=0x%x "
+			"(serial_atom=0x%x) data0=0x%x data1=0x%x",
+			e->window, e->type, x11->atoms.net_wm_surface_serial,
+			e->data.data32[0], e->data.data32[1]);
+	}
 	if (e->type == x11->atoms.net_wm_surface_serial) {
 		if (s->serial != 0) {
 			return;
@@ -726,6 +732,10 @@ static int x11_dispatch(int fd, uint32_t mask, void *data) {
 				x11->event_hook(x11->event_hook_data, event)) {
 			free(event);
 			continue;
+		}
+		if (getenv("VIDOW_X11_TRACE") != NULL) {
+			wlr_log(WLR_INFO, "x11-trace: event type=%u",
+				event->response_type & 0x7f);
 		}
 		switch (event->response_type & 0x7f) {
 		case XCB_CREATE_NOTIFY:
@@ -845,6 +855,11 @@ static void handle_shell_new_surface(struct wl_listener *listener, void *data) {
 	struct vidow_x11_server *x11 =
 		wl_container_of(listener, x11, shell_new_surface);
 	struct wlr_xwayland_surface_v1 *shell_surface = data;
+	if (getenv("VIDOW_X11_TRACE") != NULL) {
+		wlr_log(WLR_INFO, "x11-trace: shell new_surface serial=%llu surface=%p",
+			(unsigned long long)shell_surface->serial,
+			(void *)shell_surface->surface);
+	}
 	/* Wayland 侧先到：拿 serial 去 X 侧找已经收到 serial 的窗口。 */
 	struct vidow_x11_surface *s;
 	wl_list_for_each(s, &x11->surfaces, link) {
@@ -912,6 +927,27 @@ struct vidow_x11_server *vidow_x11_server_create(struct vidow_server *server,
 	xcb_change_window_attributes(conn, x11->screen->root,
 		XCB_CW_EVENT_MASK, values);
 	xcb_flush(conn);
+
+	/* **确认 SubstructureRedirect 真的抢到了。** 这一步只能有一个客户端
+	 * 持有；抢不到就是 BadAccess，而 xcb_change_window_attributes 是异步
+	 * 的 —— 不发出去同步一次，错误就永远看不到，表现是「窗口能建出来但
+	 * 永远收不到 MapRequest」，跟现在一模一样。 */
+	{
+		xcb_get_window_attributes_cookie_t c =
+			xcb_get_window_attributes(conn, x11->screen->root);
+		xcb_get_window_attributes_reply_t *r =
+			xcb_get_window_attributes_reply(conn, c, NULL);
+		if (r != NULL) {
+			wlr_log(WLR_INFO, "xwm: root 事件掩码 = 0x%x"
+				"（SubstructureRedirect=%s，SubstructureNotify=%s）",
+				r->your_event_mask,
+				(r->your_event_mask & XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT)
+					? "有" : "**没有**",
+				(r->your_event_mask & XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY)
+					? "有" : "**没有**");
+			free(r);
+		}
+	}
 
 	wm_window_create(x11);
 	supported_atoms_publish(x11);
