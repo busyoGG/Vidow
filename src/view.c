@@ -8452,8 +8452,11 @@ static void view_x11_destroyed(struct vidow_view *view) {
 		view->last_app_id[0] != '\0' ? view->last_app_id :
 			vidow_view_app_id(view));
 
-	/* 尺寸抖动那个闹钟：view 要没了，先撤掉，否则回调拿到野指针。 */
-	/* 以前这里要摘掉 20 个 wlroots 信号的监听器。现在窗口对象归我们自己
+	/* 以前这里还要撤掉「尺寸抖动」那个闹钟（重映射时抖 +1 像素逼 Xwayland
+	 * 重建 pixmap）—— 那个机制在 621282f 里删掉了，实测对 Steam 黑屏无效，
+	 * 真原因是帧债务和 X11 侧没重建渲染。现在没有闹钟要撤。
+	 *
+	 * 以前这里要摘掉 20 个 wlroots 信号的监听器。现在窗口对象归我们自己
 	 * （见 src/x11surface.h），X 侧销毁时由 xwm_x11.c 的
 	 * x11_handle_destroy() 调进来，没有信号要摘 —— 只把反向指针断开，
 	 * 免得 X 那边还攥着已经释放的 view。 */
