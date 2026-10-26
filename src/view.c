@@ -3103,8 +3103,8 @@ static void view_anim_place(struct vidow_view *view) {
 	x = (int)lround(sx_mapped);
 	y = (int)lround(sy_mapped);
 	if (vidow_xtrace_on() && view->kind == VIDOW_VIEW_X11 &&
-			vidow_view_title(view) != NULL &&
-			strstr(vidow_view_title(view), "Steam") != NULL) {
+			(view != NULL && vidow_view_title(view) != NULL &&
+			strcmp(vidow_view_title(view), "Steam") == 0)) {
 		wlr_log(WLR_INFO, "place: %s geom=%d,%d %dx%d anim_off=%.0f,%.0f"
 			" -> xy=%d,%d ov_t=%.2f",
 			vidow_view_title(view), view->geom.x, view->geom.y,
@@ -3129,6 +3129,30 @@ static void view_anim_place(struct vidow_view *view) {
 	}
 
 	wlr_scene_node_set_position(&view->scene_tree->node, x, y);
+	if (vidow_xtrace_on() && view->kind == VIDOW_VIEW_X11 &&
+			(view != NULL && vidow_view_title(view) != NULL &&
+			strcmp(vidow_view_title(view), "Steam") == 0)) {
+		struct wlr_scene_node *n;
+		int i = 0;
+		wlr_log(WLR_INFO, "place-set: %s 节点摆在 %d,%d（en=%d）",
+			vidow_view_title(view), x, y,
+			view->scene_tree->node.enabled);
+		wl_list_for_each(n, &view->scene_tree->children, link) {
+			if (i++ > 5) {
+				break;
+			}
+			if (n->type == WLR_SCENE_NODE_BUFFER) {
+				struct wlr_scene_buffer *sb = wlr_scene_buffer_from_node(n);
+				wlr_log(WLR_INFO, "place-set:   子 buf en=%d off=%d,%d "
+					"dst=%dx%d op=%.2f buf=%d", n->enabled, n->x, n->y,
+					sb->dst_width, sb->dst_height, sb->opacity,
+					sb->buffer != NULL);
+			} else {
+				wlr_log(WLR_INFO, "place-set:   子 type=%d en=%d off=%d,%d",
+					n->type, n->enabled, n->x, n->y);
+			}
+		}
+	}
 	vidow_fx_set_alpha(&view->scene_tree->node, alpha);
 
 	/* 客户端该按几倍渲染也在这儿钉（跟位置一起，每帧一次、只在真的变了时发）：
@@ -3437,30 +3461,9 @@ void vidow_view_anim_bake(struct vidow_view *view) {
 	int64_t bake_t0 = vidow_now_ns();
 	/* 这里以前有一行每次重烘就打的 DEBUG（node/geom/screen_box），日常使用是
 	 * 每帧 × 每个在动的窗口一行 —— 排查摆放错位时临时加回来，别常驻。 */
-	/* **X11 窗口的烘图倍率是全局 xwayland_scale，不是它所在那块屏的 scale。**
-	 *
-	 * XWayland 的坐标空间是**统一**的：所有 X 窗口按所有输出里最大的那个
-	 * scale（这里是 DP-2 的 2）拿缓冲，和窗口实际落在哪块屏无关。KWin 就是
-	 * 这么做的 —— workspace.cpp 的 updateXwaylandScale() 取所有输出 scale 的
-	 * 最大值设成全局 xwaylandScale，x11window.cpp 里
-	 * `const qreal bufferScale = kwinApp()->xwaylandScale();`，**从不**用
-	 * m_output->scale()。
-	 *
-	 * 用屏的 scale 会怎样（实测）：Steam 主窗口落在 DP-3（scale=1），而它的
-	 * 缓冲是 3808 宽（= 1904 × 2）。这里传 1.0，vidow_fx_frame 里
-	 * `out_scale = scale / ov = 1.0`，`dst = fx->w / out_scale = 3832` ——
-	 * 场景节点被摆成两倍大，1904 宽的视口里塞不下，右半截落到屏外，
-	 * 屏幕上就是纯黑。首开正常是因为那一路 scale 恰好是 2。 */
-	double fx_scale = view_scale(view);
-	if (view->kind == VIDOW_VIEW_X11) {
-		double xs = view->server->xwayland_scale;
-		if (xs > 0.0) {
-			fx_scale = xs;
-		}
-	}
 	bool fx_drawn = vidow_fx_frame(view->server, &view->fx, src, &geo,
 		mini_cx, mini_cy, x, y, alpha, view->server->focused == view,
-		view->fullscreen, fx_scale * fx_ov, fx_ov, &view->rule_eff);
+		view->fullscreen, view_scale(view) * fx_ov, fx_ov, &view->rule_eff);
 	/* 探针：整块窗口那么大的离屏渲染一共多少钱（见统计行的「重烘」；次数由
 	 * vidow_fx_frame 的 vidow_stats.bakes 记）。拖动 / 滚动动画里每个在动的
 	 * 窗口每帧都要烘一次，所以这项随窗口数线性涨。 */
@@ -7404,6 +7407,21 @@ static void view_commit(struct wl_listener *listener, void *data) {
 	(void)data;
 	struct vidow_view *view = wl_container_of(listener, view, commit);
 	struct wlr_surface *surface = vidow_view_surface(view);
+	/* 有界探针：每 60 次 commit 一行。用来判断「重开之后 XWayland 还在不在
+	 * 交帧」—— 交帧停了，bake_revision 就永远不涨，装饰图停在第一张空图上。 */
+	if (view->x11 != NULL) {
+		if (view->commit_n % 60 == 0) {
+			const char *t = vidow_view_title(view);
+			wlr_log(WLR_INFO, "commit-n: %s n=%d surf=%p buf=%dx%d",
+				t != NULL ? t : "(无题)", view->commit_n,
+				(void *)surface,
+				surface != NULL && surface->buffer != NULL ?
+					surface->buffer->base.width : -1,
+				surface != NULL && surface->buffer != NULL ?
+					surface->buffer->base.height : -1);
+		}
+		view->commit_n++;
+	}
 	if (!view->mapped || view->focus_helper || view->scene_tree == NULL ||
 			(view->x11 != NULL && view->x11->surface != NULL &&
 				!view->x11->surface->mapped)) {
@@ -7471,6 +7489,20 @@ static void view_commit(struct wl_listener *listener, void *data) {
 			clock_gettime(CLOCK_MONOTONIC, &ts);
 			uint32_t now_ms = (uint32_t)(ts.tv_sec * 1000 +
 				ts.tv_nsec / 1000000);
+			/* **续帧的预算按「时间窗」记，不是按帧数。**
+			 *
+			 * 以前记 30 帧：Vidow 出帧 ~4ms 一张，30 帧 = 0.12 秒就用完了，
+			 * 而 XWayland 从「收到第一个 frame done」到「真的把内容画出来」
+			 * 要几百毫秒（Steam 重开时它还要重建 webhelper 的合成层）。
+			 * 窗口一停，frame done 断流，两边又互等 —— 屏幕上永远是那张
+			 * 空图，直到用户手动切一次工作区强制重绘。
+			 *
+			 * 实测（本次）：重开后补帧确实触发了（日志 224 条「欠帧」），
+			 * 但都在 0.25 秒内耗尽；源纹理 dump 出来 1 色全黑（首开 5061
+			 * 色）。改成按时间窗记，窗口期覆盖 XWayland 真正出图的那一段。
+			 *
+			 * 冷却仍然保留（上面那条正反馈说明），只是从「帧数耗尽」换成
+			 * 「时间窗走完」。 */
 			if (view->x11_want_frames == 0 &&
 					now_ms - view->x11_want_frames_at >= 500) {
 				if (getenv("VIDOW_FLIP") != NULL) {
@@ -8319,12 +8351,44 @@ static void x11_trace_view(const char *event, struct vidow_view *view,
  * 查不到（连接没起来 / 窗口没了）一律当不是，让调用方保持原行为。 */
 /* Replay the X11 map edge when wlroots mapped the surface without a new
  * commit. This is event-driven and idempotent per association. */
+static void x11_drop_surface(struct vidow_view *view);
+
 static void x11_attach_surface(struct vidow_view *view) {
 	struct vidow_server *server = view->server;
-	if (view->x11 == NULL || view->x11->surface == NULL ||
-			view->scene_tree != NULL) {
-		x11_trace_view("attach-skip", view, NULL);
+	if (view->x11 == NULL || view->x11->surface == NULL) {
 		return;
+	}
+	/* **场景树已经按另一块表面建好了 → 先拆掉再建。**
+	 *
+	 * 这里以前只看 `scene_tree != NULL` 就返回，把两种完全不同的情况当成
+	 * 一种处理：
+	 *
+	 *   ① 同一块表面重复 attach（map 重放之类）—— 该 skip，什么都不用做。
+	 *   ② **换了一块新表面**（Steam 关掉主窗口、再从托盘打开）—— 必须重建。
+	 *
+	 * ②被当成①之后，新表面没有 commit 监听、场景表面还指着旧的（已销毁的）
+	 * 那块，于是新内容永远进不来：屏幕上停在旧的那张空图上，全黑。实测重开
+	 * 之后 commit-n 卡在 8460 一动不动，源缓冲 dump 出来 1 色（首开 5061 色）。
+	 *
+	 * 判据用 serial 而不是指针：新表面会分在旧表面释放的那块地址上，指针
+	 * 一模一样（见 x11surface.h 里 scene_serial 的说明）。 */
+	if (view->scene_tree != NULL) {
+		if (view->x11->scene_serial == view->x11->serial) {
+			x11_trace_view("attach-skip", view, NULL);
+			return;
+		}
+		x11_trace_view("attach-rebuild", view, view->x11->surface);
+		{
+			const char *t = vidow_view_title(view);
+			wlr_log(WLR_INFO,
+				"attach-rebuild: %s serial=%llu→%llu surf=%p",
+				t != NULL ? t : "(无题)",
+				(unsigned long long)view->x11->scene_serial,
+				(unsigned long long)view->x11->serial,
+				(void *)view->x11->surface);
+		}
+		/* 幂等：把旧场景树、commit/map/unmap 监听、FX 状态一起收干净。 */
+		x11_drop_surface(view);
 	}
 	x11_trace_view("attach", view, view->x11->surface);
 
@@ -8423,6 +8487,14 @@ static void x11_attach_surface(struct vidow_view *view) {
 static void x11_drop_surface(struct vidow_view *view) {
 	struct vidow_server *server = view->server;
 	x11_trace_view("drop", view, NULL);
+	/* 一次性日志（不受 trace 开关控制）：重开时这条到底有没有走到，是
+	 * 「新 surface 的 commit 监听挂不上」那个死结的关键判据 —— 不走的话
+	 * scene_tree 留着，下一次 associate 被 x11_attach_surface 的
+	 * `scene_tree != NULL` 挡掉，新内容永远进不来。 */
+	wlr_log(WLR_INFO, "drop-surface: %s scene_tree=%p surf=%p",
+		vidow_view_title(view) != NULL ? vidow_view_title(view) : "(无题)",
+		(void *)view->scene_tree,
+		(void *)(view->x11 != NULL ? view->x11->surface : NULL));
 	/* A wlroots X11 surface can be dissociated and associated again without the
 	 * X window being destroyed (Chromium/CEF does this while rebuilding widgets).
 	 * Release Vidow-owned scene/FX state before the old scene tree disappears;

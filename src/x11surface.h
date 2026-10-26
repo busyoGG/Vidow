@@ -35,6 +35,21 @@ struct vidow_x11_surface {
 	 * 配对靠 WL_SURFACE_SERIAL 这个 client message（见 xwm.c）。 */
 	struct wlr_surface *surface;
 	uint64_t serial; /* 0 = 还没收到 serial */
+	/* 上一次**建过场景**的那块表面。和 surface 不同：surface 在 dissociate
+	 * 时被清成 NULL，这个留着，用来判断「这次关联是不是换了块新表面」。
+	 *
+	 * **场景树是按哪一块表面建的**（记它的 serial）。
+	 *
+	 * Steam 关掉主窗口再从托盘打开，会复用同一个 X 窗口、并换一块新的
+	 * wl_surface。实测：
+	 *   00:01:08.650  associate xid=0x2000041 serial=2 surface=0x55b37c4fba80
+	 *   00:07:17.536  associate xid=0x2000041 serial=6 surface=0x55b37c4fba80
+	 * 注意**表面地址一模一样**（新表面分在旧表面释放的那块内存上），所以
+	 * 拿指针比是错的 —— 我第一版就是指针比，判据一次都没触发，黑屏照旧。
+	 * serial 每次关联都会涨，是唯一可靠的判据。
+	 *
+	 * 0 = 还没建过场景。 */
+	uint64_t scene_serial;
 
 	/* 几何（X 像素）。来自 ConfigureNotify，也是我们发给客户端的值。 */
 	int x, y;

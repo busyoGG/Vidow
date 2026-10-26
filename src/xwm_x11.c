@@ -474,6 +474,24 @@ static void x11_associate(struct vidow_x11_surface *s,
 		s->window_id, (unsigned long long)s->serial, (void *)surface);
 
 	if (s->view != NULL) {
+		/* **同一个 X 窗口换了一块 wl_surface（Steam 关掉再打开就是这样）。**
+		 *
+		 * 实测序列（serial 每次关联都 +1，XID 始终是 0x2000041）：
+		 *   00:01:45.368  associate xid=0x2000041 serial=2
+		 *   00:02:50.389  associate xid=0x2000041 serial=3
+		 * 中间**没有** create / destroy 那条 XID —— Steam 复用了同一个 X
+		 * 窗口，只是换了块 wl_surface。
+		 *
+		 * 旧表面销毁时 x11_drop_surface() 已经把 scene_tree 清成 NULL，
+		 * 但 view 上还留着上一块表面的状态（commit 监听已摘、场景表面指针
+		 * 已清）。这里必须**显式重建**，否则新表面的 commit 没人听：
+		 * 实测重开之后 commit-n 停在 8460 一动不动，源缓冲永远是那张空图，
+		 * 屏幕上就是黑的（首开 5061 色，重开 1 色）。
+		 *
+		 * 顺序要紧：先 gone（幂等，把可能残留的旧状态收干净），再 attach
+		 * （按新表面重建场景树和 commit 监听）。 */
+		/* 「换了一块新表面」的识别放在 x11_attach_surface 里做（判据是
+		 * scene_serial != serial），这里只管调。见那里的注释。 */
 		vidow_view_attach_x11_surface(s->view);
 		xwm_surface_sync(s->view);
 	}
