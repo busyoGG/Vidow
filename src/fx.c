@@ -1,4 +1,5 @@
 #include "server.h"
+#include "xtrace.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -2807,6 +2808,11 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 	double out_scale = ov > 0.0 ? scale / ov : scale;
 	if (!(out_scale > 0.0)) {
 		out_scale = 1.0;
+	}
+	if (vidow_xtrace_on()) {
+		wlr_log(WLR_INFO, "fx-trace: scale=%.2f ov=%.2f out_scale=%.2f "
+			"fx->w=%d cw=%d -> dst=%d", scale, ov, out_scale,
+			fx->w, cw, (int)lround((double)fx->w / out_scale));
 	}
 	if (!ensure_targets(server, fx, cw, ch, scale, out_scale)) {
 		wlr_log(WLR_INFO, "fx-frame ret: ensure");

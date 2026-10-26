@@ -835,7 +835,30 @@ void vidow_view_x11_scale(struct vidow_view *view) {
 	 * DPI and wl_surface.buffer_scale do not define this geometry transform. */
 	int scale = vidow_view_x11_scale_int(view); /* preferred buffer-scale hint only */
 	double dw = bw, dh = bh;
-	vidow_xwm_from_native_size(view->server, view->output, bw, bh, &dw, &dh);
+	/* ⚠️ output 缺失时换算会**静默失败**（transform() 查不到布局框就原样返回），
+	 * dest 于是等于缓冲像素数（2 倍大），窗口在屏上被放大两倍、右下一半跑到屏外。
+	 * 和 vidow_xwm_surface_box() 一样按 X 侧坐标兜底找屏，别让它空着。
+	 *
+	 * （注：这条兜底不是 Steam 重开黑屏的原因 —— 实测 conv_out 一直是有效的
+	 * DP-3，换算也一直算对 1904。它防的是另一条路：output 尚未指派时
+	 * dest 会被算成缓冲像素数。留着是因为错的那一版确实是错的。） */
+	struct wlr_output *conv_out = view->output;
+	if (conv_out == NULL && view->x11 != NULL) {
+		conv_out = vidow_xwm_output_at_native(view->server,
+			view->x11->x, view->x11->y);
+	}
+	vidow_xwm_from_native_size(view->server, conv_out, bw, bh, &dw, &dh);
+	if (vidow_xtrace_on()) {
+		struct wlr_box nb = {0}, lb = {0};
+		vidow_xwm_output_boxes(view->server, conv_out, &lb, &nb);
+		wlr_log(WLR_INFO, "x11-dst: %s out=%s bw=%d -> dw=%.0f "
+			"（native %dx%d logical %dx%d，比 %.3f）",
+			vidow_view_title(view) != NULL ?
+				vidow_view_title(view) : "(无题)",
+			conv_out != NULL ? conv_out->name : "NULL", bw, dw,
+			nb.width, nb.height, lb.width, lb.height,
+			nb.width > 0 ? (double)lb.width / (double)nb.width : -1.0);
+	}
 	int dst_w = (int)lround(dw), dst_h = (int)lround(dh);
 	if (dst_w < 1) {
 		dst_w = 1;
@@ -845,7 +868,19 @@ void vidow_view_x11_scale(struct vidow_view *view) {
 	}
 	struct wlr_scene_buffer *node = view->scene_surface->buffer;
 	bool changed = node->dst_width != dst_w || node->dst_height != dst_h;
+	if (vidow_xtrace_on() && changed) {
+		wlr_log(WLR_INFO, "x11-dst-was: %s 之前 dst=%dx%d，将改成 %dx%d",
+			vidow_view_title(view) != NULL ?
+				vidow_view_title(view) : "(无题)",
+			node->dst_width, node->dst_height, dst_w, dst_h);
+	}
 	wlr_scene_buffer_set_dest_size(node, dst_w, dst_h);
+	if (vidow_xtrace_on()) {
+		wlr_log(WLR_INFO, "x11-dst-set: %s 写 %dx%d，读回 %dx%d",
+			vidow_view_title(view) != NULL ?
+				vidow_view_title(view) : "(无题)",
+			dst_w, dst_h, node->dst_width, node->dst_height);
+	}
 	/* X11 Depth 32 窗口的 alpha 该不该当真，按 EWMH 的老规矩判：
 	 *
 	 *   1. 设了 _NET_WM_WINDOW_OPACITY（< 1.0）→ 用 alpha（wlroots 已经把
@@ -859,7 +894,20 @@ void vidow_view_x11_scale(struct vidow_view *view) {
 	 * （fmt=0x34325258）画得好好的，重开换成 AR24 就全黑，而 `import -window`
 	 * 从 X 侧抓出来是有内容的（24 位 RGB），所以内容一直都在，是我们解释错
 	 * 了缓冲区。普通窗口本来就没有透明通道可言，X 那边的合成结果已经拍平了。 */
-	bool use_alpha = view->x11 != NULL && view->x11->opacity < 1.0f;
+	/* ⚠️ **`opacity == 0` 的语义是「没设」，不是「全透明」。**
+	 *
+	 * 见 x11surface.h：`_NET_WM_OPACITY` 存的是 0..0xffffffff 的整数，0 = 没设。
+	 * 以前这里直接写 `opacity < 1.0f`，于是**每个**没设过这个属性的 X11 窗口都
+	 * 被当成「要用 alpha 且透明度为 0」—— 整块乘 0，画出来全黑。
+	 *
+	 * 为什么首开看不出来：XWayland 首开给 Steam 交的是 XR24（无 alpha 通道），
+	 * `set_opacity(0)` 对 XRGB 没有可见效果，照样画；关掉再开换成 AR24，
+	 * alpha 通道一生效，整块就被乘成 0 —— 用户报的「Steam 第二次打开黑屏、
+	 * 拖一下或 resize 就好」就是这个（resize 让它短暂换成 XR24 就又正常）。
+	 *
+	 * 判据改成「真的设过、且真的 < 1」：`opacity > 0 && opacity < 1.0f`。 */
+	bool use_alpha = view->x11 != NULL && view->x11->opacity > 0 &&
+		view->x11->opacity < 1.0f;
 	static const int translucent_types[] = {
 		VIDOW_X11_WT_TOOLTIP,
 		VIDOW_X11_WT_DROPDOWN_MENU,
@@ -883,7 +931,8 @@ void vidow_view_x11_scale(struct vidow_view *view) {
 	/* 只在判定结果变了的时候动节点：每帧重设一遍会让场景白白重烘。
 	 * 记在 view->x11_alpha_on / x11_opacity 里，两个值都没变就跳过。 */
 	float want_opacity = use_alpha && view->x11 != NULL &&
-		view->x11->opacity < 1.0f ? view->x11->opacity : 1.0f;
+		view->x11->opacity > 0 && view->x11->opacity < 1.0f ?
+		view->x11->opacity : 1.0f;
 	if (!view->x11_alpha_known || view->x11_alpha_on != use_alpha ||
 			view->x11_opacity != want_opacity) {
 		view->x11_alpha_known = true;
@@ -924,6 +973,18 @@ void vidow_view_x11_scale(struct vidow_view *view) {
 	/* 每帧都会走到这里（每个 commit）：只在真的变了的时候说话。
 	 * 「变了」= 场景尺寸变了 / 放大倍率变了 / 缓冲尺寸变了 —— 三者都记着，
 	 * 只比 scale 的话，客户端每帧换缓冲（CEF 一直这样）就又变成刷屏源。 */
+	if (vidow_xtrace_on()) {
+		wlr_log(WLR_INFO, "x11-alpha: %s use_alpha=%d op=%.2f "
+			"known=%d on=%d want_op=%.2f node_op=%.2f "
+			"dst=%dx%d buf=%dx%d surf=%dx%d",
+			vidow_view_title(view) != NULL ?
+				vidow_view_title(view) : "(无题)",
+			use_alpha, view->x11 != NULL ? view->x11->opacity : -1.0f,
+			view->x11_alpha_known, view->x11_alpha_on, want_opacity,
+			node->opacity,
+			dst_w, dst_h, bw, bh,
+			surface->current.width, surface->current.height);
+	}
 	if (changed || view->logged_scale != scale || view->logged_buf_w != bw) {
 		view->logged_scale = scale;
 		view->logged_buf_w = bw;

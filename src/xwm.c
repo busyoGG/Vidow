@@ -47,13 +47,41 @@ enum xwm_sync_result xwm_surface_sync(struct vidow_view *view) {
 
 	bool want = xwm_surface_should_be_mapped(view);
 	if (vidow_xtrace_on()) {
+		/* 一次性抓齐渲染管线的全部关键状态，别再一轮一轮猜。 */
+		struct wlr_scene_buffer *sb =
+			view->scene_surface != NULL ? view->scene_surface->buffer : NULL;
+		struct wlr_fbox sbox = {0};
+		bool has_sbox = false;
+		if (sb != NULL) {
+			sbox = sb->src_box; /* 公开字段，见 wlr_scene.h:192 */
+			has_sbox = true;
+		}
+		struct wlr_box geom = vidow_view_geometry(view);
 		wlr_log(WLR_INFO, "sync-trace: %s xid=0x%x want=%d mapped=%d "
-			"buffer=%d surf=%p view=%p",
+			"buffer=%d surf=%p view=%p | sb=%p en=%d pos=%d,%d "
+			"dest=%dx%d src=%.0f,%.0f %.0fx%.0f(%d) geom=%d,%d %dx%d "
+			"clip_on=%d parked=%d",
 			vidow_view_title(view) != NULL ?
 				vidow_view_title(view) : "(无题)",
 			view->x11->window_id, want, view->mapped,
 			wlr_surface_has_buffer(view->x11->surface),
-			(void *)view->x11->surface, (void *)view);
+			(void *)view->x11->surface, (void *)view,
+			(void *)sb, sb != NULL ? sb->node.enabled : -1,
+			sb != NULL ? sb->node.x : 0, sb != NULL ? sb->node.y : 0,
+			sb != NULL ? sb->dst_width : 0,
+			sb != NULL ? sb->dst_height : 0,
+			has_sbox ? sbox.x : -1.0, has_sbox ? sbox.y : -1.0,
+			has_sbox ? sbox.width : -1.0, has_sbox ? sbox.height : -1.0,
+			has_sbox ? 1 : 0,
+			geom.x, geom.y, geom.width, geom.height,
+			view->fx.clip_on, view->scene_parked);
+		if (view->fx.clip_on) {
+			wlr_log(WLR_INFO, "sync-trace: %s clip框=%d,%d %dx%d",
+				vidow_view_title(view) != NULL ?
+					vidow_view_title(view) : "(无题)",
+				view->fx.clip.x, view->fx.clip.y,
+				view->fx.clip.width, view->fx.clip.height);
+		}
 	}
 	/* **判据要连 wlr_surface->mapped 一起看，不能只看 view->mapped。**
 	 *
@@ -170,6 +198,30 @@ enum xwm_sync_result xwm_surface_sync(struct vidow_view *view) {
 			 * set_enabled(false)），得让布局重新算一遍把它打开、
 			 * 摆到正确位置。 */
 			vidow_arrange(view->server);
+			/* **attach 之后要再校一次 dest。**
+			 *
+			 * 探针实测（2026-10-26）：commit → vidow_view_x11_scale() 写
+			 * dst=1904、读回也是 1904，但紧接着
+			 * wlr_scene_surface_create() 末尾的 surface_reconfigure() 把 dst
+			 * 设回 **surface 的逻辑尺寸** 3808（wlroots scene/surface.c:148
+			 * `set_dest_size(scene_buffer, state->width, state->height)`）。
+			 * 场景节点于是 2 倍大、右下一半落在屏外。
+			 *
+			 * 这不是 Steam 重开黑屏的**全部**原因（dest 校回 1904 之后画面
+			 * 仍然是黑的，见 view.c 里那段排查记录），但它确实是错的：
+			 * 节点尺寸必须和窗口几何一致，否则输入命中和裁剪都按错的框算。
+			 * 场景节点就位之后在这里重设一遍，幂等。 */
+			if (view->kind == VIDOW_VIEW_X11) {
+				vidow_view_x11_scale(view);
+				if (vidow_xtrace_on() && view->scene_surface != NULL &&
+						view->scene_surface->buffer != NULL) {
+					wlr_log(WLR_INFO, "xwm: %s attach 后校 dest=%dx%d",
+						vidow_view_title(view) != NULL ?
+							vidow_view_title(view) : "(无题)",
+						view->scene_surface->buffer->dst_width,
+						view->scene_surface->buffer->dst_height);
+				}
+			}
 			/* **还得让 X 客户端重画一次。**
 			 *
 			 * 光把表面 map 上不够：Steam 重开时只交了一帧空白就不再动
