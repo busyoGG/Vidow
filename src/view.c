@@ -3102,6 +3102,16 @@ static void view_anim_place(struct vidow_view *view) {
 		&sx_mapped, &sy_mapped);
 	x = (int)lround(sx_mapped);
 	y = (int)lround(sy_mapped);
+	if (vidow_xtrace_on() && view->kind == VIDOW_VIEW_X11 &&
+			vidow_view_title(view) != NULL &&
+			strstr(vidow_view_title(view), "Steam") != NULL) {
+		wlr_log(WLR_INFO, "place: %s geom=%d,%d %dx%d anim_off=%.0f,%.0f"
+			" -> xy=%d,%d ov_t=%.2f",
+			vidow_view_title(view), view->geom.x, view->geom.y,
+			view->geom.width, view->geom.height,
+			view->anim_off_x, view->anim_off_y, x, y,
+			vidow_overview_scale(view->server) < 1.0 ? 1.0 : 0.0);
+	}
 
 	/* 停车：滚出自己那块屏 / 工作区藏起来的窗口不关节点，改成停到所有输出框外面
 	 * （见 server.h 的 scene_parked）。位置只有这一个出口 —— 藏不藏、摆哪儿都在
@@ -3345,6 +3355,19 @@ void vidow_view_anim_bake(struct vidow_view *view) {
 	vidow_view_apply_clip(view);
 	/* 直通那一路：不烘，整块交给场景（见上）。 */
 	if (view_scanout_switch(view)) {
+		/* **直通这条早退也要校 dest。**
+		 *
+		 * 下面那趟重烘（vidow_fx_frame）会把 dest 算成窗口逻辑尺寸；直通
+		 * 一 return，就再没人管它，节点停在 wlroots 上一次 commit 设的
+		 * **surface 逻辑尺寸**上（Steam 的 3808x2050，2 倍），右下一半落
+		 * 在屏外 —— 屏幕上就是纯黑。
+		 *
+		 * 复现链（探针实测）：重开时 bake 打印「缓存命中跳过重烘」，说明
+		 * 装饰图被判定仍然有效、这趟根本没进；能改 dest 的只剩这里。
+		 * 首开不黑是因为首开走了重烘那条路，dest 被设成 1904。 */
+		if (view->kind == VIDOW_VIEW_X11) {
+			vidow_view_x11_scale(view);
+		}
 		return;
 	}
 	struct vidow_server *server = view->server;
@@ -3414,9 +3437,30 @@ void vidow_view_anim_bake(struct vidow_view *view) {
 	int64_t bake_t0 = vidow_now_ns();
 	/* 这里以前有一行每次重烘就打的 DEBUG（node/geom/screen_box），日常使用是
 	 * 每帧 × 每个在动的窗口一行 —— 排查摆放错位时临时加回来，别常驻。 */
+	/* **X11 窗口的烘图倍率是全局 xwayland_scale，不是它所在那块屏的 scale。**
+	 *
+	 * XWayland 的坐标空间是**统一**的：所有 X 窗口按所有输出里最大的那个
+	 * scale（这里是 DP-2 的 2）拿缓冲，和窗口实际落在哪块屏无关。KWin 就是
+	 * 这么做的 —— workspace.cpp 的 updateXwaylandScale() 取所有输出 scale 的
+	 * 最大值设成全局 xwaylandScale，x11window.cpp 里
+	 * `const qreal bufferScale = kwinApp()->xwaylandScale();`，**从不**用
+	 * m_output->scale()。
+	 *
+	 * 用屏的 scale 会怎样（实测）：Steam 主窗口落在 DP-3（scale=1），而它的
+	 * 缓冲是 3808 宽（= 1904 × 2）。这里传 1.0，vidow_fx_frame 里
+	 * `out_scale = scale / ov = 1.0`，`dst = fx->w / out_scale = 3832` ——
+	 * 场景节点被摆成两倍大，1904 宽的视口里塞不下，右半截落到屏外，
+	 * 屏幕上就是纯黑。首开正常是因为那一路 scale 恰好是 2。 */
+	double fx_scale = view_scale(view);
+	if (view->kind == VIDOW_VIEW_X11) {
+		double xs = view->server->xwayland_scale;
+		if (xs > 0.0) {
+			fx_scale = xs;
+		}
+	}
 	bool fx_drawn = vidow_fx_frame(view->server, &view->fx, src, &geo,
 		mini_cx, mini_cy, x, y, alpha, view->server->focused == view,
-		view->fullscreen, view_scale(view) * fx_ov, fx_ov, &view->rule_eff);
+		view->fullscreen, fx_scale * fx_ov, fx_ov, &view->rule_eff);
 	/* 探针：整块窗口那么大的离屏渲染一共多少钱（见统计行的「重烘」；次数由
 	 * vidow_fx_frame 的 vidow_stats.bakes 记）。拖动 / 滚动动画里每个在动的
 	 * 窗口每帧都要烘一次，所以这项随窗口数线性涨。 */
@@ -4468,6 +4512,14 @@ static void output_arrange(struct vidow_server *server,
 		if (viewport > max_viewport) {
 			viewport = max_viewport;
 		}
+	}
+	if (vidow_xtrace_on()) {
+		wlr_log(WLR_INFO, "vp: %s viewport=%.0f（旧 %.0f）max=%d "
+			"work=%dx%d total=%d focus=%s", output->wlr_output->name,
+			viewport, output->viewport_x, max_viewport,
+			work.width, work.height, total_width,
+			server->focused != NULL ?
+				vidow_view_title(server->focused) : "无");
 	}
 	output->viewport_x = viewport;
 

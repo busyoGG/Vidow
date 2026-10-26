@@ -2371,6 +2371,17 @@ bool vidow_view_scanout_ok(struct vidow_view *view) {
 		if (wlr_box_intersection(&vis, &node_box, &view->fx.clip) &&
 				(vis.width < node_box.width ||
 					vis.height < node_box.height)) {
+			if (vidow_xtrace_on()) {
+				wlr_log(WLR_INFO, "scanout: %s 拒绝直通 —— 真被切掉一块 "
+					"vis=%d,%d %dx%d node=%d,%d %dx%d clip=%d,%d %dx%d",
+					vidow_view_title(view) != NULL ?
+						vidow_view_title(view) : "(无题)",
+					vis.x, vis.y, vis.width, vis.height,
+					node_box.x, node_box.y,
+					node_box.width, node_box.height,
+					view->fx.clip.x, view->fx.clip.y,
+					view->fx.clip.width, view->fx.clip.height);
+			}
 			return false; /* 真的被切掉一块：直通画不了 */
 		}
 	}
@@ -2419,7 +2430,17 @@ bool vidow_view_scanout_ok(struct vidow_view *view) {
 	 * 或者客户端自己声明了盖住整块表面的 opaque region（GTK 那套：格式带 alpha，
 	 * 但声明整块不透明）。后者 wlroots 判「这个节点盖住了下面的东西」用的也是它
 	 * （见 wlr_scene.c 的 scene_node_opaque_region）—— 它不认，直通也轮不到。 */
-	return view_content_opaque(view, &geo);
+	bool ok = view_content_opaque(view, &geo);
+	if (vidow_xtrace_on()) {
+		wlr_log(WLR_INFO, "scanout: %s 结果=%d（走%s）clip_on=%d "
+			"look: r=%.1f bw=%.1f sr=%.1f noise=%.1f",
+			vidow_view_title(view) != NULL ?
+				vidow_view_title(view) : "(无题)", ok,
+			ok ? "直通" : "合成管线", view->fx.clip_on,
+			look.corner_radius, look.border_width,
+			look.shadow_radius, look.noise);
+	}
+	return ok;
 }
 
 /* Hide/show a toplevel for a backdrop capture. A decorated window is drawn
@@ -2811,8 +2832,10 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 	}
 	if (vidow_xtrace_on()) {
 		wlr_log(WLR_INFO, "fx-trace: scale=%.2f ov=%.2f out_scale=%.2f "
-			"fx->w=%d cw=%d -> dst=%d", scale, ov, out_scale,
-			fx->w, cw, (int)lround((double)fx->w / out_scale));
+			"fx->w=%d cw=%d -> dst=%d view=%s", scale, ov, out_scale,
+			fx->w, cw, (int)lround((double)fx->w / out_scale),
+			fx->view != NULL && vidow_view_title(fx->view) != NULL ?
+				vidow_view_title(fx->view) : "(非窗口)");
 	}
 	if (!ensure_targets(server, fx, cw, ch, scale, out_scale)) {
 		wlr_log(WLR_INFO, "fx-frame ret: ensure");
@@ -4468,7 +4491,27 @@ static void view_bake_for_output(struct vidow_server *server,
 				sl->dec_output_box.x == ob.x && sl->dec_output_box.y == ob.y &&
 				sl->dec_output_box.width == ob.width &&
 				sl->dec_output_box.height == ob.height) {
+			if (vidow_xtrace_on()) {
+				wlr_log(WLR_INFO, "bake: %s 缓存命中跳过重烘 "
+					"rev=%u/%u blur=%u/%u",
+					vidow_view_title(view) != NULL ?
+						vidow_view_title(view) : "(无题)",
+					sl->dec_revision, view->fx.bake_revision,
+					sl->dec_blur_ver, view->fx.blur_ver);
+			}
 			continue;
+		}
+		if (vidow_xtrace_on()) {
+			wlr_log(WLR_INFO, "bake: %s 要重烘 dec_valid=%d en=%d "
+				"rev=%u/%u blur=%u/%u",
+				vidow_view_title(view) != NULL ?
+					vidow_view_title(view) : "(无题)",
+				sl != NULL ? sl->dec_valid : -1,
+				sl != NULL && sl->node != NULL ?
+					sl->node->node.enabled : -1,
+				sl != NULL ? sl->dec_revision : 0,
+				view->fx.bake_revision,
+				sl != NULL ? sl->dec_blur_ver : 0, view->fx.blur_ver);
 		}
 		view->fx.bake_output = output->wlr_output;
 		vidow_view_anim_bake(view);
