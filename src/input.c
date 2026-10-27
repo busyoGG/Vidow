@@ -6,6 +6,7 @@
 
 #include <limits.h>
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -282,7 +283,8 @@ static bool key_pressed_elsewhere(struct vidow_server *server,
 		const struct vidow_keyboard *self, uint32_t key) {
 	struct vidow_keyboard *other;
 	wl_list_for_each(other, &server->keyboards, link) {
-		if (other == self || other->virtual != NULL || other->inject) {
+		if (other == self || other->virtual != NULL || other->inject ||
+				other->uinput) {
 			continue;
 		}
 		if (key_state_contains(other, key)) {
@@ -338,8 +340,11 @@ static bool hover_trace_on(void) {
 
 static bool input_key_share(struct vidow_keyboard *kb, uint32_t key,
 		bool pressed) {
-	/* 虚拟 / 注入键盘：不参与合并，各自独立生效。 */
-	if (kb->virtual != NULL || kb->inject) {
+	/* 虚拟 / 注入 / 外部 uinput 键盘：不参与合并，各自独立生效。
+	 *
+	 * uinput 那条（ydotoold）见 server.h 里 kb->uinput 的注释：它的按键状态
+	 * 可能永远留着一条没配对的 press，参与去重会把用户的松开吞掉。 */
+	if (kb->virtual != NULL || kb->inject || kb->uinput) {
 		return true;
 	}
 	if (pressed) {
@@ -716,6 +721,50 @@ static void server_add_keyboard(struct vidow_server *server,
 	if (device != NULL && virtual == NULL && device->name != NULL) {
 		snprintf(kb->device_name, sizeof(kb->device_name), "%s",
 			device->name);
+	}
+
+	/* **uinput 设备（ydotoold 那类）也当虚拟键盘。**
+	 *
+	 * ydotoold / ydotool 通过 /dev/uinput 造一块真键盘（libinput 眼里它就是
+	 * 普通键盘，不是 wlr_virtual_keyboard_v1），所以 virtual 是 NULL ——
+	 * 于是它会参与 input_key_share() 的跨键盘去重。问题是它的按键状态可能
+	 * 永远留着一条没配对的 press（宏跑一半被打断、uinput 设备重建、或者
+	 * 干脆就是「按住不放」的语义），那条记录**没有任何路径会清掉**。
+	 *
+	 * 后果正是用户报的「按一秒后反复按下释放」：你按同一个键，press 放行、
+	 * release 走到 key_pressed_elsewhere() 发现 ydotoold「还按着」→ 吞掉。
+	 * 客户端那边这个键永远按着，600ms 后按 repeat_info 自己开始自动重复。
+	 *
+	 * 判据用 bustype：uinput 造的设备是 BUS_VIRTUAL(0x06)，物理键盘是
+	 * BUS_USB(0x03) / BUS_I8042(0x11)。比按名字匹配（"ydotoold virtual
+	 * device"）可靠 —— 任何走 uinput 的工具都会被认出来。
+	 *
+	 * 只影响「参不参与跨键盘去重」，不影响它能不能打字：虚拟键盘那条早
+	 * 就 return true（见 input_key_share 开头）。 */
+	if (kb->virtual == NULL && !kb->inject && device != NULL) {
+		struct libinput_device *li =
+			wlr_libinput_get_device_handle(device);
+		if (li != NULL) {
+			const char *sysname = libinput_device_get_sysname(li);
+			if (sysname != NULL && sysname[0] != '\0') {
+				char path[PATH_MAX];
+				snprintf(path, sizeof(path),
+					"/sys/class/input/%s/device/id/bustype",
+					sysname);
+				FILE *f = fopen(path, "r");
+				if (f != NULL) {
+					unsigned int bustype = 0;
+					if (fscanf(f, "%x", &bustype) == 1 &&
+							bustype == 0x06 /* BUS_VIRTUAL */) {
+						kb->uinput = true;
+						wlr_log(WLR_INFO, "键盘: %s 是 uinput 设备"
+							"（bustype=0x06），不参与跨键盘去重",
+							kb->device_name);
+					}
+					fclose(f);
+				}
+			}
+		}
 	}
 
 	/* 虚拟键盘自己会送 keymap（协议要求），别用我们的覆盖它：输入法回注的

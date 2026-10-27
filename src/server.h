@@ -1011,6 +1011,7 @@ struct vidow_blur_slot {
 	 * 记下来之后，位置一变就重烘 —— 拖拽才需要，静止时这个值也不动，
 	 * 不会多烘。 */
 	struct wlr_box dec_screen_box;
+
 };
 
 struct vidow_fx_target {
@@ -1824,18 +1825,6 @@ struct vidow_view {
 	 * 再还原。X 服务器只在尺寸真的变了才重新分配 pixmap，同尺寸的
 	 * configure 它不理（ICCCM 连 ConfigureNotify 都不发，view.c 里
 	 * 504 行那个分支就是给这种情况补事件的），所以必须真的改一下。 */
-	/* X11 表面的「欠帧」计数，见 view.c 里 xwm 交帧那段说明。
-	 *
-	 * XWayland 的渲染由 wl_surface 的 frame callback 驱动，而回调只在
-	 * Vidow 真画完一帧时才发；Vidow 又是按需渲染。两边互等，画面就冻在
-	 * 重映射后的那张空白帧上（实测 Steam 第二次开主窗口：重开后只有
-	 * 1 帧，首开 2285 帧；手动切一次工作区强制整屏重绘，立刻涨到
-	 * 1008 帧、画面正常）。这里记「还欠它几帧」，由补帧闹钟推着走完。 */
-	int x11_want_frames;
-	/* 上一次为「续帧」记账的时刻（毫秒）。见 view.c 里那段说明：没有这个
-	 * 冷却的话，每次 commit 都会重新记一笔 30 帧，而催帧又促使 Xwayland
-	 * 再交一帧 —— 正反馈，实测 160 次/秒的空转。 */
-	uint32_t x11_want_frames_at;
 	/* 拖动时的果冻形变（见 jelly.c）：非空就是「现在正弯着」——窗口本来的
 	 * 装饰节点让位，由它显示。松手后它自己晃回去再消失。 */
 	struct vidow_jelly *jelly;
@@ -2068,6 +2057,22 @@ struct vidow_keyboard {
 	/* vidow 自己造的注入键盘（IPC 的 send-key / type-text 用它按键），
 	 * 不是真设备也不是客户端来的 */
 	bool inject;
+	/* **外部 uinput 设备**（ydotoold / ydotool 那类，bustype = BUS_VIRTUAL）。
+	 *
+	 * 它既不是 wlr_virtual_keyboard_v1（virtual 为 NULL），也不是我们造的
+	 * （inject 为 false），在 libinput 眼里就是一块普通键盘 —— 于是会参与
+	 * input_key_share() 的跨键盘去重。
+	 *
+	 * 问题：它的 pressed[] 里可能永远留着一条没配对的 press（宏跑一半被打
+	 * 断、uinput 设备重建、或者干脆是「按住不放」的语义），没有任何路径会
+	 * 清掉它。之后你按同一个键，press 放行、release 走到
+	 * key_pressed_elsewhere() 发现它「还按着」→ 吞掉。客户端那边这个键永远
+	 * 按着，600ms 后按 repeat_info 自己开始自动重复 —— 用户报的「按一秒后
+	 * 反复按下释放」。
+	 *
+	 * 所以它不参与跨键盘去重（和 virtual / inject 同等对待）。判据见
+	 * server_add_keyboard() 里读 /sys/class/input/<sysname>/device/id/bustype。 */
+	bool uinput;
 	/* 物理设备名（/sys/class/input/eventN/device/name），只用于日志。
 	 *
 	 * ⚠️ **不能拿它判「同一把键盘」**：同一把键盘的不同接口，内核给的名字
@@ -2112,30 +2117,19 @@ struct vidow_keyboard {
 
 	/* ---- 按键自动重复 ----
 	 *
-	 * 为什么合成器得自己干这件事：wlroots 0.20 **不做重复**，它只把
-	 * repeat_rate/repeat_delay 通过 wl_keyboard.repeat_info 报给客户端，
-	 * 指望客户端自己重复。Wayland 原生客户端（终端、编辑器）确实自己重复，
-	 * 所以一直没暴露问题。
+	 * **这里没有重复定时器，故意的。** repeat_rate / repeat_delay 通过
+	 * wlr_keyboard_set_repeat_info() 走 wl_keyboard.repeat_info 报给客户端，
+	 * Wayland 原生客户端和 Xwayland **各自**按这个信息自己重复：
+	 * Xwayland 收到 repeat_info 会 XkbSetRepeatKeys(AutoRepeatModeOn)，由
+	 * X server 内核产生重复 KeyPress（见 input.c 顶部「按键自动重复」那段
+	 * 引的 xwayland-input.c 源码）。
 	 *
-	 * 但 Xwayland 不是这样：它是 Wayland 客户端，同时又是 X 服务器的输入
-	 * 驱动。X11 的 autorepeat 是**服务器**行为（客户端调
-	 * XkbSetDetectableAutoRepeat 与否只决定它看到什么形式），Xwayland 等的是
-	 * 我们按 repeat_info 把重复键送过来 —— 收不到就永远不重复。
+	 * 以前这里有个 repeat_timer，合成器自己补发 press+release 对，只发给
+	 * X11 —— 等于两路重复叠加，每一下都是「松开再按下」。后果是所有按键
+	 * 都乱：全屏游戏按住 Alt 呼出鼠标时 Alt 反复释放、鼠标被反复抢捕获
+	 * 卡在屏幕中间；打字丢字符、快慢不均。
 	 *
-	 * 实测（xev 抓 X 侧）：按住一个键 5 秒，应该约 125 次重复，实际只收到
-	 * 1~3 次 —— 游戏里就是「按住 W 走两步停一下」。
-	 *
-	 * 所以这里自己起一个定时器，按住不放就按 repeat_rate 重发。发的是
-	 * **同一对 press+release**（X11 autorepeat 的原生形式）：Xwayland 拿到
-	 * 之后会翻译成 X 的 KeyPress/KeyRelease 对，客户端用
-	 * XkbSetDetectableAutoRepeat 合并成连续 KeyPress。只发 press 不发
-	 * release 的话 X 侧会认为键一直没松开，反而卡住。 */
-	struct wl_event_source *repeat_timer;
-	/* 现在按住的那个键（evdev 码 + 时间戳）。-1 = 没有键按着。 */
-	int32_t repeat_keycode;
-	uint32_t repeat_time_msec;
-	/* 已经等过初始延迟没有：false = 还在 delay 阶段。 */
-	bool repeat_started;
+	 * 别再加回来。Hyprland 整个代码库里也没有任何 autorepeat 合成逻辑。 */
 };
 
 /* 客户端要的一个「快捷键抑制」（zwp_keyboard_shortcuts_inhibitor_v1）。一个表面
@@ -4264,6 +4258,10 @@ void vidow_view_set_parked(struct vidow_view *view, bool park);
 /* 视口外强制渲染：这一帧给「不在画面上但要保活」的窗口补帧回调（详见 view.c）。 */
 void vidow_view_render_pump(struct vidow_server *server,
 		struct vidow_output *output, uint32_t msec);
+/* 给这块屏上所有 X11 视图无条件发一次 frame_done（详见 view.c）。
+ * 和 render_pump 不同：这里没有任何判据，画完一帧就发一次。 */
+void vidow_views_send_x11_frame_done(struct vidow_server *server,
+		struct vidow_output *output);
 /* 记一笔「有人拿着这个窗口的画面」（窗口截图源）。源销毁或者客户端跑掉就自动不再
  * 算持有；拿着期间窗口一直强制渲染。 */
 void vidow_view_capture_hold(struct vidow_view *view,
@@ -4648,6 +4646,8 @@ void vidow_activation_init(struct vidow_server *server);
 void vidow_activation_apply_config(struct vidow_server *server);
 /* 窗口刚建 / 将销毁：维护窗口列表 handle。 */
 void vidow_portal_view_new(struct vidow_view *view);
+/* 窗口改判成弹出物时撤掉它的 foreign-toplevel 条目（见 portal.c）。 */
+void vidow_portal_view_drop_toplevel(struct vidow_view *view);
 void vidow_portal_view_free(struct vidow_view *view);
 /* 标题、app_id、父子关系变了。 */
 void vidow_portal_view_title(struct vidow_view *view);
