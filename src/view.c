@@ -1412,6 +1412,24 @@ static void view_ensure_column(struct vidow_server *server,
 	if (view->column != NULL) {
 		return;
 	}
+	/* **弹出物不进列。** 列是条带上的位置，popup 的位置跟父窗口走
+	 * （见 view_popup 的定位），它根本不需要一条列。
+	 *
+	 * 漏了这条判据的症状（用户 2026-10-28 01:09 报「屏幕上出现一条空白带，
+	 * 窗口没铺满」）：popup 的 float_mode 是 NONE（detect_mode 见它没有固定
+	 * 尺寸提示，见 float.c），view_map 里 `float_mode == NONE → view_ensure_column`
+	 * 就给它建了一条列；而关闭时 view_unmap 的 popup 分支直接 return
+	 * （只还键盘 + arrange，见同文件 view_unmap），列没被摘。那条列里挂着一个
+	 * popup view，`vidow_ipc_json_column` 的 windows 只报 window_is_toplevel
+	 * 的窗口（popup 被排除），于是 IPC 看着是 `windows: []`；可
+	 * vidow_workspace_cleanup 用的是 `wl_list_empty(&col->views)`，链表非空 →
+	 * 永远不删 → arrange 还按旧宽度摆它 → 屏上一条什么都没有的竖条。
+	 *
+	 * 不放 view_unmap 那边修：那个分支 return 得早，是为了 popup 的键盘语义；
+	 * 让 popup 从一开始就别建列更干净，arrange / 焦点 / 命中都不用再判一次。 */
+	if (view->popup) {
+		return;
+	}
 
 	struct vidow_column *col = calloc(1, sizeof(*col));
 	if (col == NULL) {
@@ -7604,6 +7622,12 @@ void view_unmap(struct wl_listener *listener, void *data) {
 	if (view->popup) {
 		/* 弹出物从来没有成为过 server->focused，只需要把它握着的键盘还回去。 */
 		view_popup_release_keyboard(view);
+		/* **防御**：早先版本的 view_ensure_column 会给 popup 也建列（见那里的
+		 * 评论），这些残留列得趁 unmap 摘掉。popup 正常情况下 column 为 NULL，
+		 * vidow_view_leave_column 会立刻返回，无害；真挂着一条就顺手收掉，
+		 * 否则它永远是 `windows: []` 但 `wl_list_empty` 为假的僵尸列。 */
+		vidow_view_leave_column(view);
+		vidow_workspace_cleanup(server);
 		vidow_arrange(server);
 		return;
 	}
