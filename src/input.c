@@ -1081,7 +1081,20 @@ static void focus_follows_mouse(struct vidow_server *server,
 	 * 的活动工作区上（vidow_workspace_focus_output 里做的）。
 	 *
 	 * hit == NULL 才走这里：光标压在窗口上那条路由下面原有的逻辑管。 */
-	if (hit == NULL) {
+	/* **跨屏就把焦点带过去 —— 光标压在窗口上时也一样。**
+	 *
+	 * 用户 2026-10-27：「光标移动到另一个屏幕的时候无法把焦点也带过去，
+	 * 我操作窗口的命令自然无法影响到另一个屏幕的窗口」。
+	 *
+	 * 以前这段只在 hit == NULL（光标停在空区域）时跑。光标压在对面那块屏
+	 * 的**窗口**上时 hit 非空，直接落到下面「hit == prev_hover 就不跟」
+	 * 那条 —— 于是键盘焦点一直留在原屏，键位全作用在看不见的那一边。
+	 *
+	 * 判据只看「键盘焦点那扇窗在哪块屏」，跟 hit 是不是空无关：
+	 * 跨屏了就先把 focused_output 换过去，再让下面原有的
+	 * 「悬停到哪扇窗就聚焦哪扇窗」逻辑接着跑（它会顺带把焦点落到
+	 * 对面那块屏上的具体窗口）。 */
+	{
 		struct wlr_output *hover_output = wlr_output_layout_output_at(
 			server->output_layout, server->cursor->x, server->cursor->y);
 		/* **判据不能拿 server->focused_output 比。**
@@ -1102,6 +1115,8 @@ static void focus_follows_mouse(struct vidow_server *server,
 				focus_out != NULL ? focus_out->wlr_output->name : "无");
 			vidow_workspace_focus_output(server, hover_output);
 		}
+	}
+	if (hit == NULL) {
 		return;
 	}
 	if (hit == server->focused) {
