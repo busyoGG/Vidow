@@ -300,7 +300,7 @@ static bool key_pressed_elsewhere(struct vidow_server *server,
 static bool probe_keys_on(void) {
 	static int done = 0, on = 0;
 	if (!done) {
-		on = probe_keys_on() ? 1 : 0;
+		on = getenv("VIDOW_PROBE_KEYS") != NULL ? 1 : 0;
 		done = 1;
 	}
 	return on != 0;
@@ -309,7 +309,7 @@ static bool probe_keys_on(void) {
 static bool key_trace_on(void) {
 	static int done = 0, on = 0;
 	if (!done) {
-		on = key_trace_on() ? 1 : 0;
+		on = getenv("VIDOW_KEY_TRACE") != NULL ? 1 : 0;
 		done = 1;
 	}
 	return on != 0;
@@ -318,7 +318,7 @@ static bool key_trace_on(void) {
 static bool hover_trace_on(void) {
 	static int done = 0, on = 0;
 	if (!done) {
-		on = hover_trace_on() ? 1 : 0;
+		on = getenv("VIDOW_HOVER_TRACE") != NULL ? 1 : 0;
 		done = 1;
 	}
 	return on != 0;
