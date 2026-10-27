@@ -646,7 +646,7 @@ static bool keybind_locked_key(struct vidow_server *server, xkb_keysym_t sym,
 			/* 命中了但不放行：这是「锁定期间绑定被白名单挡住」的直接证据
 			 * （test-sessionlock.sh 的 D 就断言这一行 —— 光看「工作区没变」
 			 * 不够，注入那条路平时本来就不触发键位）。 */
-			wlr_log(WLR_INFO, "sessionlock: 绑定 %s（%s）锁定期间不生效 —— "
+			wlr_log(WLR_DEBUG, "sessionlock: 绑定 %s（%s）锁定期间不生效 —— "
 				"白名单只有 VT 切换", bind->trigger, bind->action);
 			return true;
 		}
@@ -690,7 +690,7 @@ static bool keybind_mru_key(struct vidow_server *server, xkb_keysym_t sym,
 		return true; /* 没绑的键（打字那些）：照样吃掉，不透给客户端 */
 	}
 	if (!bind_mru_allowed(bind)) {
-		wlr_log(WLR_INFO, "mru: 绑定 %s（%s）切换器开着期间不生效 —— "
+		wlr_log(WLR_DEBUG, "mru: 绑定 %s（%s）切换器开着期间不生效 —— "
 			"白名单只有 next-window / previous-window",
 			bind->trigger, bind->action);
 		return true;

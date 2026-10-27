@@ -2805,7 +2805,7 @@ void vidow_view_render_pump(struct vidow_server *server,
 			const char *why = view->minimized ? "它最小化了" :
 				(!vidow_workspace_view_visible(server, view) ?
 					"它那块工作区藏起来了" : "它滚出视口了");
-			wlr_log(WLR_INFO, "强制渲染: %s %s，照样补帧回调"
+			wlr_log(WLR_DEBUG, "强制渲染: %s %s，照样补帧回调"
 				"（%s，%s）", vidow_view_title(view) != NULL ?
 					vidow_view_title(view) : "(无题)", why,
 				vidow_view_capture_held(view) ? "有人正在录屏 / 预览它" :
@@ -3233,12 +3233,12 @@ static void view_anim_place(struct vidow_view *view) {
 			}
 			if (n->type == WLR_SCENE_NODE_BUFFER) {
 				struct wlr_scene_buffer *sb = wlr_scene_buffer_from_node(n);
-				wlr_log(WLR_INFO, "place-set:   子 buf en=%d off=%d,%d "
+				wlr_log(WLR_DEBUG, "place-set:   子 buf en=%d off=%d,%d "
 					"dst=%dx%d op=%.2f buf=%d", n->enabled, n->x, n->y,
 					sb->dst_width, sb->dst_height, sb->opacity,
 					sb->buffer != NULL);
 			} else {
-				wlr_log(WLR_INFO, "place-set:   子 type=%d en=%d off=%d,%d",
+				wlr_log(WLR_DEBUG, "place-set:   子 type=%d en=%d off=%d,%d",
 					n->type, n->enabled, n->x, n->y);
 			}
 		}
@@ -7636,7 +7636,7 @@ static void view_commit(struct wl_listener *listener, void *data) {
 				view->commit_report_ns = now_ns;
 			} else if (now_ns - view->commit_report_ns >= 2000 * 1000000LL) {
 				double span = (double)(now_ns - view->commit_report_ns) / 1e9;
-				wlr_log(WLR_INFO,
+				wlr_log(WLR_DEBUG,
 					"交帧统计 %s: %.1f fps（%lld 帧 / %.1fs，均 %.0fms，最坏 %.0fms）",
 					vidow_view_title(view) != NULL ? vidow_view_title(view) : "(无题)",
 					(double)view->commit_n / span, (long long)view->commit_n,
@@ -7789,7 +7789,7 @@ static void view_commit(struct wl_listener *listener, void *data) {
 			(double)surface->current.buffer_width /
 				(double)surface->current.width : 1.0;
 		view->logged_client_scale = (int)lround(client_scale);
-		wlr_log(WLR_INFO, "surface %s: 缓冲 %dx%d 声明 %d 倍 -> 逻辑 %dx%d"
+		wlr_log(WLR_DEBUG, "surface %s: 缓冲 %dx%d 声明 %d 倍 -> 逻辑 %dx%d"
 			"（输出 %.2fx，设备像素 %dx%d）",
 			vidow_view_title(view) != NULL ? vidow_view_title(view) : "(无题)",
 			surface->current.buffer_width, surface->current.buffer_height,

@@ -814,7 +814,7 @@ static bool pw_stream_fill(struct vidow_sc_pw_stream *ps,
 		ps->last_send_ns = vidow_now_ns();
 		if (!ps->dmabuf_logged) {
 			ps->dmabuf_logged = true;
-			wlr_log(WLR_INFO, "screencast: dmabuf 直通交帧（%ux%u stride %u）"
+			wlr_log(WLR_DEBUG, "screencast: dmabuf 直通交帧（%ux%u stride %u）"
 				"—— 不再回读，消费者直接读那块内存", width, height,
 				slot->stride);
 		}
@@ -878,7 +878,7 @@ static bool pw_stream_fill(struct vidow_sc_pw_stream *ps,
 				lit++;
 			}
 		}
-		wlr_log(WLR_INFO,
+		wlr_log(WLR_DEBUG,
 			"screencast: 第一帧 %ux%u（非黑 %zu%%，采样 %zu 点）",
 			width, height, n > 0 ? 100 * lit / n : 0, n);
 	}
@@ -973,7 +973,7 @@ static void stream_fill_cursor(struct vidow_sc_pw_stream *ps, struct spa_buffer 
 				stream->out_h, &box, &scale)) {
 			if (ps->cursor_state != VIDOW_SC_CURSOR_NO_FRAME) {
 				ps->cursor_state = VIDOW_SC_CURSOR_NO_FRAME;
-				wlr_log(WLR_INFO, "screencast: 光标不在这一路里 —— 取景框算不出来"
+				wlr_log(WLR_DEBUG, "screencast: 光标不在这一路里 —— 取景框算不出来"
 					"（窗口停到屏外了 / 已经没了）");
 			}
 			return;
@@ -1002,7 +1002,7 @@ static void stream_fill_cursor(struct vidow_sc_pw_stream *ps, struct spa_buffer 
 			(size_t)VIDOW_CURSOR_MAX_PX * VIDOW_CURSOR_MAX_PX * 4)) {
 		if (ps->cursor_state != VIDOW_SC_CURSOR_NONE_SCREEN) {
 			ps->cursor_state = VIDOW_SC_CURSOR_NONE_SCREEN;
-			wlr_log(WLR_INFO, "screencast: 光标不在这一路里 —— 这块屏（%s）上"
+			wlr_log(WLR_DEBUG, "screencast: 光标不在这一路里 —— 这块屏（%s）上"
 				"没有可见光标（指针在别的屏上？）",
 				stream->output != NULL ? stream->output->name : "?");
 		}

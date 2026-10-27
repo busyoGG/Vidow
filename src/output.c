@@ -108,7 +108,7 @@ void vidow_output_render(struct vidow_output *output) {
 			box.width != output->box.width ||
 			box.height != output->box.height) {
 		if (output->box.width > 0) {
-			wlr_log(WLR_INFO, "output %s: 布局位置 %d,%d %dx%d -> %d,%d %dx%d",
+			wlr_log(WLR_DEBUG, "output %s: 布局位置 %d,%d %dx%d -> %d,%d %dx%d",
 				output->wlr_output->name, output->box.x, output->box.y,
 				output->box.width, output->box.height, box.x, box.y,
 				box.width, box.height);
@@ -270,7 +270,7 @@ void vidow_output_render(struct vidow_output *output) {
 		}
 		if (st_t4 - win_ns >= 500 * 1000000LL) {
 			double f = vidow_stats.frames > 0 ? (double)vidow_stats.frames : 1.0;
-			wlr_log(WLR_INFO,
+			wlr_log(WLR_DEBUG,
 				"渲染统计: %d 帧/帧窗(%.0fms) %.1f fps | 模糊 %.2fms/帧"
 				"(shared %d own %d chain %d) | 装饰 %.2fms/帧(%d 次重烘) | "
 				"果冻 %.2fms/帧 | 提交 %.2fms/帧 | 贴图 +%d/-%d | 趟 %d | "
@@ -653,7 +653,7 @@ static void output_frame(struct wl_listener *listener, void *data) {
 	if (output->want_frame && server->trace_timer != NULL) {
 		int64_t gap = (now_ns - output->last_frame_ns) / 1000000;
 		if (gap >= 300) {
-			wlr_log(WLR_INFO, "trace: %s 又出帧了（停了 %lldms，这期间被要了"
+			wlr_log(WLR_DEBUG, "trace: %s 又出帧了（停了 %lldms，这期间被要了"
 				" %d 帧）", output->wlr_output->name, (long long)gap,
 				output->want_frame_n);
 		}
@@ -1249,7 +1249,7 @@ void vidow_output_vrr_on_demand_update(struct vidow_server *server,
 	if (!want && !was_on) {
 		return; /* 本来也没提上去过：不用 commit 一次去「降」 */
 	}
-	wlr_log(WLR_INFO, "output %s: 按需 VRR -> %s（%s）", wlr_output->name,
+	wlr_log(WLR_DEBUG, "output %s: 按需 VRR -> %s（%s）", wlr_output->name,
 		want ? "提上去" : "降回来",
 		want ? "屏上显示着要 VRR 的窗口" : "没有要 VRR 的窗口了");
 	vidow_output_set_vrr(server, wlr_output, want);

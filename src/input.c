@@ -803,7 +803,7 @@ static void server_new_virtual_keyboard(struct wl_listener *listener, void *data
 		wl_container_of(listener, server, new_virtual_keyboard);
 	struct wlr_virtual_keyboard_v1 *virtual_keyboard = data;
 
-	wlr_log(WLR_INFO, "virtual keyboard attached");
+	wlr_log(WLR_DEBUG, "virtual keyboard attached");
 	input_device_note(server, &virtual_keyboard->keyboard.base);
 	server_add_keyboard(server, &virtual_keyboard->keyboard,
 		&virtual_keyboard->keyboard.base, virtual_keyboard, false);
@@ -3267,7 +3267,7 @@ bool vidow_inject_key_combo(struct vidow_server *server, const char *combo,
 			inject_key(server, c.mods[i], false);
 		}
 	}
-	wlr_log(WLR_INFO, "注入: 按键 %s（%s）", combo,
+	wlr_log(WLR_DEBUG, "注入: 按键 %s（%s）", combo,
 		mode == 0 ? "按下并松开" : mode == 1 ? "按下" : "松开");
 	return true;
 }

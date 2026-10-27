@@ -2810,7 +2810,7 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 	/* 果冻期间投影仍然烘在内容图里：它和窗口共用同一张网格，形状完全
 	 * 跟着窗口弯；模糊由 jelly 网格单独一层按窗口区域裁，不会把投影圈进去。 */
 	if (geo == NULL || geo->w <= 0 || geo->h <= 0) {
-		wlr_log(WLR_INFO, "fx-frame ret: geo0");
+		wlr_log(WLR_DEBUG, "fx-frame ret: geo0");
 		return false;
 	}
 
@@ -2842,7 +2842,7 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 	double px_w = ((double)cw + 2.0 * pad) * (scale > 0.0 ? scale : 1.0);
 	double px_h = ((double)ch + 2.0 * pad) * (scale > 0.0 ? scale : 1.0);
 	if (px_w > MAX_TARGET_PX || px_h > MAX_TARGET_PX) {
-		wlr_log(WLR_INFO, "fx-frame ret: toobig");
+		wlr_log(WLR_DEBUG, "fx-frame ret: toobig");
 		return false;
 	}
 	/* 输出缩放 = 设备像素 / 逻辑像素。scale 是烘图用的倍率（= 输出缩放 × ov），
@@ -2859,7 +2859,7 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 				vidow_view_title(fx->view) : "(非窗口)");
 	}
 	if (!ensure_targets(server, fx, cw, ch, scale, out_scale)) {
-		wlr_log(WLR_INFO, "fx-frame ret: ensure");
+		wlr_log(WLR_DEBUG, "fx-frame ret: ensure");
 		return false;
 	}
 	/* 开窗动画的缩放只作用在场景节点上（离屏缓冲照旧原尺寸烘）。模糊已经
@@ -2903,7 +2903,7 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 	bool tex_owned = true;
 	struct wlr_texture *tex = client_scene_texture(server, src, &tex_owned);
 	if (tex == NULL) {
-		wlr_log(WLR_INFO, "fx-frame ret: texnull");
+		wlr_log(WLR_DEBUG, "fx-frame ret: texnull");
 		return false;
 	}
 
@@ -2998,7 +2998,7 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 	tex_owned = false; /* 借来的那张已经还了，后面别再碰 */
 
 	if (displayed == NULL) {
-		wlr_log(WLR_INFO, "fx-frame ret: displayed");
+		wlr_log(WLR_DEBUG, "fx-frame ret: displayed");
 		return false;
 	}
 
@@ -3162,7 +3162,7 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 			cropped = true;
 
 			if (ov_clip) {
-				wlr_log(WLR_INFO,
+				wlr_log(WLR_DEBUG,
 					"overview clip: view %p 裁到 %d,%d %dx%d（源 %d,%d %dx%d → 显示 %dx%d）",
 					(void *)fx->view, clip.x, clip.y,
 					clip.width, clip.height,
@@ -3518,7 +3518,7 @@ static bool layer_blur_bail(struct vidow_layer_surface *ls, int reason,
 		const char *what) {
 	if (ls->blur_fail != reason) {
 		ls->blur_fail = reason;
-		wlr_log(WLR_INFO, "layer 模糊没画: %s（namespace=%s 输出=%s）",
+		wlr_log(WLR_DEBUG, "layer 模糊没画: %s（namespace=%s 输出=%s）",
 			what,
 			ls->layer_surface != NULL && ls->layer_surface->namespace != NULL ?
 				ls->layer_surface->namespace : "?",
@@ -5346,7 +5346,7 @@ static bool popup_blur_bail(struct vidow_popup_blur *pb, int reason,
 		const char *what) {
 	if (pb->blur_fail != reason) {
 		pb->blur_fail = reason;
-		wlr_log(WLR_INFO, "弹出物模糊没画: %s（%s）", what,
+		wlr_log(WLR_DEBUG, "弹出物模糊没画: %s（%s）", what,
 			pb->tag != NULL ? pb->tag : "?");
 	}
 	return false;
