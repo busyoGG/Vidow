@@ -1386,6 +1386,32 @@ static void focus_follows_mouse(struct vidow_server *server,
 	if (server->pointer_button_count != 0) {
 		return;
 	}
+	/* **全屏窗口拿着焦点时，悬停不换焦点。**
+	 *
+	 * 全屏（游戏）本来就不该被「光标划过」抢走键盘 —— 用户在游戏里操作，
+	 * 光标可能停在任意位置（尤其是 FPS 类游戏周期性释放指针约束之后，
+	 * 光标会跳回它记着的位置，那里往往压着另一块屏上的窗口）。
+	 *
+	 * 少了这条会形成一个 2.5 秒一轮的反馈循环（实测 00:49:27–00:49:37，
+	 * 每 2.5 秒完整跑一遍）：
+	 *
+	 *   游戏释放指针约束（客户端销毁了约束，光标恢复）
+	 *     → 光标落回 DP-3，那里压着 Vivaldi
+	 *     → 悬停换屏：焦点 崩坏：星穹铁道 -> Vivaldi
+	 *     → 游戏失去键盘焦点，X server 收到新的 keymap
+	 *     → XWayland 重开 autorepeat（XkbSetRepeatKeys）
+	 *     → 玩家按着的 A/W 开始被 X 自动重复（release+press 对）
+	 *     → **角色原地抖动**（用户报的「aw 会反复交换触发，不是同时」）
+	 *
+	 * 关键在「不是同时」：A 和 W 各自独立重复，相位不同，于是按下的顺序
+	 * 一会儿是 A→W、一会儿 W→A，游戏看到的是两个方向交替而不是同时 ——
+	 * 角色就在斜向和单向之间来回摆。
+	 *
+	 * 全屏窗口的判据用 view->fullscreen（客户端请求的全屏），不是几何铺满
+	 * —— 后者在「窗口刚好和屏幕一样大」时也成立，会误伤普通平铺。 */
+	if (server->focused != NULL && server->focused->fullscreen) {
+		return;
+	}
 	if (!server->config.focus_follows_mouse) {
 		return;
 	}
@@ -3274,13 +3300,40 @@ void vidow_seat_focus_surface(struct wlr_seat *seat,
 	if (seat == NULL) {
 		return;
 	}
+	/* **焦点离开时，把还按着的键给旧表面补上松开。**
+	 *
+	 * Wayland 协议里 wl_keyboard.leave 不带按键状态，客户端收到 leave 自己
+	 * 该把「按着」清掉 —— 原生 Wayland 客户端确实这么做。**Xwayland 不这么
+	 * 做**：X server 那边是一套独立的按键状态机，收不到 KeyRelease 就认为键
+	 * 一直按着，然后按 X 自己的 autorepeat（XkbSetRepeatKeys，来自
+	 * wl_keyboard.repeat_info）开始不停重复 —— 屏幕上就是「按住一个键，焦点
+	 * 一走开它就开始反复按下释放」。
+	 *
+	 * 触发场景就是用户报的那个：全屏 X11 游戏里按住方向键 / Alt 呼出鼠标，
+	 * 光标移出窗口 → 悬停换屏把焦点切给别的窗口 → 游戏收不到松开 → 人物
+	 * 一直朝那个方向跑，直到点回游戏。
+	 *
+	 * kb->keycodes 是 wlroots 维护的「此刻按着哪些键」（evdev 键码），正好
+	 * 就是要补的那批。必须在 notify_enter **之前**发：enter 会把
+	 * focused_surface 换掉，之后就不知道该往哪个表面发了。 */
+	struct wlr_keyboard *kb = wlr_seat_get_keyboard(seat);
+	struct wlr_surface *prev = seat->keyboard_state.focused_surface;
+	if (kb != NULL && prev != NULL && prev != surface &&
+			kb->num_keycodes > 0) {
+		uint32_t now = inject_now_ms();
+		for (size_t i = 0; i < kb->num_keycodes; i++) {
+			wlr_seat_keyboard_notify_key(seat, now, kb->keycodes[i],
+				WL_KEYBOARD_KEY_STATE_RELEASED);
+		}
+		wlr_log(WLR_DEBUG, "键盘焦点: 离开时给旧表面补了 %zu 个松开",
+			kb->num_keycodes);
+	}
 	if (surface == NULL) {
 		wlr_log(WLR_DEBUG, "键盘焦点: 目标窗口还没有表面（NULL），先清掉焦点"
 			"（等它真有表面了会再进来一次）");
 		wlr_seat_keyboard_notify_clear_focus(seat);
 		return;
 	}
-	struct wlr_keyboard *kb = wlr_seat_get_keyboard(seat);
 	if (kb != NULL) {
 		wlr_seat_keyboard_notify_enter(seat, surface, kb->keycodes,
 			kb->num_keycodes, &kb->modifiers);
