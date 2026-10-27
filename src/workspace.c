@@ -516,6 +516,44 @@ void vidow_workspace_cleanup(struct vidow_server *server) {
 		}
 		ws_destroy(server, ws);
 	}
+
+	/* **空列收尸。**
+	 *
+	 * 正常路径下窗口离开列时 vidow_view_leave_column() 会把空列摘掉
+	 * （见 src/view.c），但有一条漏网的路：xdg 的 initial_commit 分支
+	 * **故意在 map 之前建列**（客户端要拿 configure 才知道多大），要是那个
+	 * 客户端在 map 之前就没了 —— X11 辅助窗口 12ms 内 create→destroy、
+	 * Wayland 客户端渲染进程断开 —— 列已经挂在 ws->columns 上，而
+	 * leave_column() 永远不会跑（它只从 view 那一侧触发）。列就这么留着，
+	 * 越攒越多。
+	 *
+	 * 症状：vidowmsg columns 里冒出 windows 为 [] 的列。渲染上看不见
+	 * （arrange_columns 的 Pass 1 对「没有可见窗口的列」宽度清零、不占位，
+	 * 见 src/view.c），所以它纯粹是链表 / 内存泄漏 —— 但 IPC 输出是脏的，
+	 * 每帧 arrange 也要多走几条。
+	 *
+	 * 放在这儿是因为 vidow_workspace_cleanup() 的调用时机正好覆盖「关窗 /
+	 * 客户端断开 / 切工作区」，而且它本来就在做同一类收尸（空工作区）。 */
+	wl_list_for_each(ws, &server->workspaces, link) {
+		struct vidow_column *col, *ctmp;
+		wl_list_for_each_safe(col, ctmp, &ws->columns, link) {
+			if (!wl_list_empty(&col->views)) {
+				continue;
+			}
+			wl_list_remove(&col->link);
+			/* 列宽过渡的 data 是这条列：不掐掉的话下一帧它写一块已经 free
+			 * 掉的内存（和 vidow_view_leave_column 里那段同一个理由）。 */
+			vidow_anim_cancel(col->anim_width);
+			col->anim_width = NULL;
+			if (server->last_focused_col == col) {
+				server->last_focused_col = NULL;
+			}
+			wlr_log(WLR_DEBUG, "column: 收掉空列 id=%llu（%s）",
+				(unsigned long long)col->id,
+				ws->output != NULL ? ws->output->name : "-");
+			free(col);
+		}
+	}
 }
 
 bool vidow_workspace_set_name(struct vidow_server *server,
