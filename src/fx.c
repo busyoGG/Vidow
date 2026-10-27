@@ -1003,6 +1003,9 @@ static GLuint begin_pass_rect(struct vidow_server *server, struct wlr_buffer *ds
 	if (!gl_make_current(server, egl)) {
 		return 0;
 	}
+	/* 本帧开过离屏趟：vidow_fx_flush() 那一次 glFlush 才有意义
+	 * （静止画面一个趟都不开，别每帧白付一次 eglMakeCurrent）。 */
+	server->fx_passed = true;
 	glBindFramebuffer(GL_FRAMEBUFFER, fbo);
 	glViewport(0, 0, w, h);
 	glDisable(GL_BLEND);
@@ -1051,6 +1054,13 @@ void vidow_fx_flush(struct vidow_server *server) {
 	if (!server->shader_ok) {
 		return;
 	}
+	/* 这一帧一个离屏趟都没开（静止画面最常见）：没有任何命令等着提交，
+	 * 不必白付一次 eglMakeCurrent + glFlush（amdgpu 上各 ~40µs）。
+	 * 置位在 begin_pass_rect，用掉就清 —— 下一帧重新从「没开过」算起。 */
+	if (!server->fx_passed) {
+		return;
+	}
+	server->fx_passed = false;
 	struct wlr_egl *egl = NULL;
 	if (!gl_make_current(server, &egl)) {
 		return;

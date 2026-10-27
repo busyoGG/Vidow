@@ -2721,6 +2721,12 @@ struct vidow_server {
 	struct wl_list closing; /* vidow_closing.link */
 	struct wl_list shaders; /* vidow_shader.link */
 	bool shader_ok;         /* GLES2 custom shader path usable */
+	/* 这一帧开过离屏趟吗（见 fx.c 的 begin_pass / vidow_fx_flush）。
+	 *
+	 * 一帧一次的 glFlush 只对「真的开过趟」有意义：静止画面上一个趟都不开，
+	 * 却照样每帧 eglMakeCurrent + glFlush（实测 amdgpu 上一次 ~40µs），纯白付。
+	 * begin_pass 置位，vidow_fx_flush 用掉就清 —— 下一帧重新从「没开过」算起。 */
+	bool fx_passed;
 
 	struct wl_list outputs;   /* vidow_output.link */
 	struct wl_list views;     /* vidow_view.link */
