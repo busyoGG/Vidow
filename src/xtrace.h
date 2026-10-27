@@ -13,4 +13,13 @@
 /* X11/XWM 全链路追踪。 */
 bool vidow_xtrace_on(void);
 
+/* 客户端交帧探针（view_commit 里每 60 次 commit 一行）。
+ *
+ * 原神这类满速提交的 X11 游戏跑 160fps，无条件打就是每秒 2.7 行、一天
+ * 二十多万行往 session log 里写。默认关，要看时：
+ *     touch /tmp/vidow-commit-trace    # 开
+ *     rm    /tmp/vidow-commit-trace    # 关
+ * 或者 VIDOW_COMMIT_TRACE=1 起会话。 */
+bool vidow_commit_trace_on(void);
+
 #endif /* VIDOW_XTRACE_H */

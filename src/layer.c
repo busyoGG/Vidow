@@ -528,6 +528,21 @@ static void layer_surface_map(struct wl_listener *listener, void *data) {
 	vidow_arrange(server);
 	vidow_ipc_emit_layer(server, "layer-mapped", ls);
 	background_changed(ls);
+
+	/* **新上屏的 layer 要立刻拿到指针焦点。**
+	 *
+	 * 指针焦点的 enter 只在指针**移动**时发（见 input.c 的
+	 * vidow_pointer_motion），映射本身不触发。于是「鼠标一动不动、有客户端
+	 * 新映射一块全屏 layer」时，那块 surface 永远收不到 wl_pointer.enter ——
+	 * 客户端要是靠 enter 认「指针在我这块屏上」，就会一直等到自己的超时。
+	 *
+	 * 用户报的「vshot 截图卡一下、鼠标动一下就不卡」就是这个：vshot 的冻结
+	 * 覆盖层上来之后等 pointer enter 才认当前屏（wayland/mod.rs 的
+	 * wait_for_current_output），而鼠标不动就没人给它发。Hyprland 那边正常，
+	 * 因为它在 layer 映射后会重算一次指针焦点。
+	 *
+	 * 放在 arrange 之后：命中测试要读刚算好的 ls->geom。 */
+	vidow_pointer_motion(server, 0);
 }
 
 static void layer_surface_unmap(struct wl_listener *listener, void *data) {

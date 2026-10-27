@@ -87,9 +87,22 @@ struct vidow_screencopy_frame {
 
 	struct wl_listener output_destroy;
 	struct wl_listener output_commit;
+
+	/* 抓帧那一段（重画整个场景 + 读回像素）**推迟到 idle 里做**。
+	 *
+	 * 原来它直接在 output 的 commit 监听器里同步跑：渲染器还在提交这一帧，
+	 * 我们就插进去重画一遍整个场景，再 wlr_texture_read_pixels 等 GPU 把像素
+	 * 读回 CPU。那条路径是同步的（glReadPixels 语义），整个合成器主循环就
+	 * 停在那儿等 —— 屏幕上看到的是「截图的时候卡一下」，用户报的就是这个。
+	 *
+	 * 挪到 idle 之后：commit 监听器只挂一个 idle source 就返回，主循环立刻
+	 * 回去处理输入 / 输出，抓帧在下一轮空闲时才跑。抓到的还是同一帧（我们
+	 * 自己重画，见 vidow_capture_grab 的说明），所以像素内容不变。 */
+	struct wl_event_source *idle;
 };
 
 static void frame_fail(struct vidow_screencopy_frame *frame);
+static void frame_idle_grab(void *data);
 
 /* ------------------------------------------------------------ damage 记账 */
 
@@ -299,6 +312,12 @@ static void frame_destroy(struct vidow_screencopy_frame *frame) {
 	wl_list_remove(&frame->output_destroy.link);
 	wl_list_remove(&frame->output_commit.link);
 	wl_list_remove(&frame->link);
+	/* 还挂着的 idle 必须在这里销毁：它带着 frame 指针，frame 一 free 就是
+	 * use-after-free（客户端截完就断开、输出刚好没了，都会走到这条路）。 */
+	if (frame->idle != NULL) {
+		wl_event_source_remove(frame->idle);
+		frame->idle = NULL;
+	}
 	wlr_buffer_unlock(frame->buffer);
 	if (frame->client != NULL) {
 		client_unref(frame->client);
@@ -397,8 +416,41 @@ static void frame_handle_output_commit(struct wl_listener *listener, void *data)
 	wl_list_remove(&frame->output_commit.link);
 	wl_list_init(&frame->output_commit.link);
 
+	/* 抓帧推迟到 idle：这一趟要重画整个场景 + 同步把像素读回 CPU，直接在这里
+	 * 跑就把合成器主循环卡住了（见结构体里 idle 那段说明）。挂上就返回。 */
+	if (frame->idle == NULL) {
+		frame->idle = wl_event_loop_add_idle(
+			wl_display_get_event_loop(frame->manager->server->display),
+			frame_idle_grab, frame);
+	}
+	if (frame->idle == NULL) {
+		goto err;
+	}
+	return;
+
+err:
+	frame_fail(frame);
+	frame_destroy(frame);
+}
+
+/* idle 里真正抓帧（原来整段都在 frame_handle_output_commit 里，见那里的说明）。 */
+static void frame_idle_grab(void *data) {
+	struct vidow_screencopy_frame *frame = data;
+	struct wlr_output *output = frame->output;
+
+	frame->idle = NULL; /* wl_event_loop_add_idle 的 source 已经自己没了 */
+	if (output == NULL || frame->buffer == NULL) {
+		goto err;
+	}
+
+	/* 分段计时（VIDOW_CAPTURE_TRACE=1 才打）：截图慢 / 卡顿要能分清是
+	 * 「重画整个场景」「把像素读回 CPU」「画进客户端缓冲」哪一段花的钱。 */
+	bool trace = getenv("VIDOW_CAPTURE_TRACE") != NULL;
+	int64_t t0 = trace ? vidow_now_ns() : 0;
+
 	struct wlr_buffer *src =
 		vidow_capture_grab(frame->manager->server, output);
+	int64_t t1 = trace ? vidow_now_ns() : 0;
 	if (src == NULL) {
 		goto err;
 	}
@@ -416,7 +468,15 @@ static void frame_handle_output_commit(struct wl_listener *listener, void *data)
 	bool ok = frame->buffer_cap == WLR_BUFFER_CAP_DMABUF
 		? copy_to_dmabuf(frame, src)
 		: copy_to_shm(frame, src);
+	int64_t t2 = trace ? vidow_now_ns() : 0;
 	wlr_buffer_unlock(src);
+	if (trace) {
+		wlr_log(WLR_INFO, "CAPTRACE %s %dx%d %s: 场景渲染 %.2fms，"
+			"拷进缓冲 %.2fms，合计 %.2fms",
+			output->name, frame->box.width, frame->box.height,
+			frame->buffer_cap == WLR_BUFFER_CAP_DMABUF ? "dmabuf" : "shm",
+			(t1 - t0) / 1e6, (t2 - t1) / 1e6, (t2 - t0) / 1e6);
+	}
 	if (!ok) {
 		goto err;
 	}
@@ -513,7 +573,22 @@ static void frame_handle_copy(struct wl_client *wl_client,
 	/* 等下一次输出提交再出帧（节奏 / 静止屏的问题见文件头）。 */
 	frame->output_commit.notify = frame_handle_output_commit;
 	wl_signal_add(&frame->output->events.commit, &frame->output_commit);
-	wlr_output_update_needs_frame(frame->output);
+
+	/* **必须 schedule，不能只 update_needs_frame。**
+	 *
+	 * update_needs_frame 只发一个 needs_frame 信号、置一个标志，**不排帧**
+	 * （见 wlroots 的 output.c：它只 wl_signal_emit，真正排帧的是
+	 * wlr_output_schedule_frame）。Vidow 里也没有任何人监听 needs_frame，
+	 * 所以那行等于什么都没做。
+	 *
+	 * 后果就是用户报的「截图要卡一会儿才截到」：屏幕静止时根本没有下一次
+	 * 提交，frame_handle_output_commit 永远等不到；要等别的事件（鼠标动、
+	 * 光标闪、客户端重绘）碰巧触发一帧，才连带把这张图发出去。动一下鼠标
+	 * 截图就快、放着不动就慢 —— 就是这个。
+	 *
+	 * schedule_frame 会真的排一帧（进 wayland 的事件循环，走正常的渲染 →
+	 * commit），commit 一到 frame_handle_output_commit 就跑。 */
+	wlr_output_schedule_frame(frame->output);
 }
 
 static void frame_handle_copy_with_damage(struct wl_client *wl_client,
