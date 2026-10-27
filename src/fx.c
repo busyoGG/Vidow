@@ -3101,11 +3101,25 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 				wlr_output_layout_get_box(server->output_layout,
 					instance->out, &output_clip);
 			}
-			/* A per-output bake must not expand the view's workspace clip.
-			 * Only an actively dragged view may span output instances. */
+			/* **正在拖的窗口不裁到这块屏里。**
+			 *
+			 * 拖拽期间窗口本来就该两块屏各画一半、拼起来是完整的（见
+			 * view.c 的 view_is_being_dragged：浮窗和平铺拖拽都算）。
+			 * 这里再裁到 output_clip，越界那半块就被切掉 —— 屏幕上就是
+			 * 「卡在屏交界处过不去」。
+			 *
+			 * 不裁的时候得有个边界：用布局总框（所有屏并起来），既不
+			 * 切掉任何一块，也不会让节点跑到无穷远。 */
 			bool dragging = fx->view != NULL &&
-				(fx->view->dragging || server->grab_view == fx->view);
-			if (fx->clip_on && !dragging) {
+				(fx->view->dragging || server->grab_view == fx->view) &&
+				server->grab_mode != VIDOW_GRAB_RESIZE &&
+				server->grab_mode != VIDOW_GRAB_RESIZE_TILE;
+			if (dragging) {
+				struct wlr_box all = {0};
+				wlr_output_layout_get_box(server->output_layout,
+					NULL, &all);
+				clip = all.width > 0 ? all : output_clip;
+			} else if (fx->clip_on) {
 				struct wlr_box visible = {0};
 				wlr_box_intersection(&visible, &clip, &output_clip);
 				clip = visible;
