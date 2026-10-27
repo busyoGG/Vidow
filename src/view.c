@@ -1755,7 +1755,52 @@ static double view_scale(const struct vidow_view *view) {
 		return 1.0;
 	}
 	double scale = out->scale;
-	return scale > 0.0 ? scale : 1.0;
+	if (scale <= 0.0) {
+		scale = 1.0;
+	}
+	/* **跨屏拖拽时取两块屏里较高的倍率。**
+	 *
+	 * 一块 wl_surface 只有一个 buffer_scale，横跨两块 scale 不同的屏时，
+	 * 不管选哪个，另一半都只能靠缩放去凑：
+	 *   选低的（1x）：2x 那半把 1 倍缓冲放大 —— 糊，用户报的
+	 *                 「跨屏的时候高分辨率那一半就模糊」。
+	 *   选高的（2x）：1x 那半把 2 倍缓冲缩小 —— 清晰，只是多画像素。
+	 *
+	 * 所以拖拽期间跨屏时按高的那个走。判据只看「拖拽中 + 真的和别的屏相交」，
+	 * 不拖的时候仍然按归属屏（否则停在 2x 屏上的窗口会一直按别的屏的倍率
+	 * 渲染，白烧带宽）。
+	 *
+	 * 注：这不改变「松手之后归到新工作区、按那块屏的倍率重画」的最终结果，
+	 * 只影响拖拽过程里那几帧的观感。 */
+	if (view->dragging && view->server != NULL) {
+		struct wlr_box box = vidow_view_screen_box(view);
+		if (box.width > 0 && box.height > 0) {
+			struct vidow_output *o;
+			wl_list_for_each(o, &view->server->outputs, link) {
+				struct wlr_output *wo = o->wlr_output;
+				if (wo == NULL || !wo->enabled || wo->scale <= scale) {
+					continue;
+				}
+				struct wlr_box obox;
+				wlr_output_layout_get_box(view->server->output_layout,
+					wo, &obox);
+				struct wlr_box hit;
+				if (!wlr_box_intersection(&hit, &box, &obox)) {
+					continue;
+				}
+				scale = wo->scale;
+			}
+		}
+	}
+	if (getenv("VIDOW_SCALE_TRACE") != NULL && view->dragging) {
+		wlr_log(WLR_INFO, "SCALETRACE %s drag=1 -> scale=%.2f "
+			"geom=%d,%d %dx%d grab_mode=%d",
+			vidow_view_title(view) != NULL ? vidow_view_title(view) : "(无题)",
+			scale, view->geom.x, view->geom.y,
+			view->geom.width, view->geom.height,
+			(int)view->server->grab_mode);
+	}
+	return scale;
 }
 
 struct pin_scale_ctx {
@@ -2019,6 +2064,38 @@ bool vidow_view_in_output_box(struct vidow_server *server,
 		at.y < box.y + box.height && at.y + at.height > box.y;
 }
 
+/* **这个窗口现在是不是「正被手拖着」。**
+ *
+ * 两条路各置各的标志，判据必须同时认：
+ *   - 浮窗 / X11 拖动走 input.c 那条抓取：view->dragging = true
+ *     （server->grab_mode 是 MOVE / RESIZE）。
+ *   - 平铺窗口拖拽走 drag.c：**不动 view->dragging**，只置
+ *     drag_detached（见 tile_drag_activate）+ server->grab_view = view，
+ *     grab_mode 是 TILE / RESIZE_TILE。
+ *
+ * 只看 view->dragging 就会漏掉平铺拖拽 —— 那正是用户 2026-10-27 报的
+ * 「第一次拖拽过程会夹住窗口」：平铺窗口一越过屏边界就被 view_clip_box
+ * 裁回原来那块屏，屏幕上就是停在交界处过不去。
+ *
+ * 改大小（RESIZE / RESIZE_TILE）不算：它不把窗口拖到别的屏上去，而且每帧
+ * 换源缓冲尺寸，裁剪框跟着抖没有意义。 */
+static bool view_is_being_dragged(const struct vidow_view *view) {
+	if (view->dragging) {
+		return view->server->grab_mode != VIDOW_GRAB_RESIZE &&
+			view->server->grab_mode != VIDOW_GRAB_RESIZE_TILE;
+	}
+	if (view->server->grab_view == view) {
+		if (view->server->grab_mode != VIDOW_GRAB_MOVE &&
+				view->server->grab_mode != VIDOW_GRAB_TILE) {
+			return false;
+		}
+		/* 平铺拖拽走完 16px 阈值才算真的拖起来（之前只是按着，
+		 * 窗口还该老老实实待在自己的屏里）。 */
+		return view->drag_detached || view->dragging;
+	}
+	return false;
+}
+
 /* 这块窗口现在该不该裁到自己那块屏里，裁的话边界是哪块屏的框。 */
 static bool view_clip_box(struct vidow_view *view, struct wlr_box *out) {
 	struct vidow_server *server = view->server;
@@ -2082,6 +2159,22 @@ static bool view_clip_box(struct vidow_view *view, struct wlr_box *out) {
 	 * 裁（view_drag_output），这样松手前对面那块屏本来就在画它，只是裁到那块
 	 * 屏自己的工作区里。 */
 	if (view->float_mode != VIDOW_FLOAT_NONE) {
+		/* **拖拽中的浮窗不裁**（和平铺窗口下面那条同一个理由）。
+		 *
+		 * 用户 2026-10-27 报的「拖拽窗口到另一个显示器，第一次高分辨率拖
+		 * 低分辨率，像是被窗口大小卡住一样过不去」就是这条：浮窗在拖拽时
+		 * 仍然被裁到「当前那块屏」，而下面 view_drag_output() 又按光标换屏，
+		 * 于是窗口越过边界那一刻被切掉，屏幕上就是「停在屏交界过不去」。
+		 *
+		 * 拖拽期间 view_sync_drag_outputs() 已经让表面 enter 到所有相交的
+		 * 屏（没 enter 的屏根本不画它），所以这里再裁只剩「切掉一半」这一个
+		 * 效果 —— 跨屏拖拽本来就该两块屏各画一半、拼起来是完整的窗口。
+		 * 松手之后归到新工作区，裁剪自然恢复，不会留下永久越界的窗口。
+		 *
+		 * 只豁免移动：改大小（RESIZE）照旧裁。 */
+		if (view_is_being_dragged(view)) {
+			return false;
+		}
 		struct wlr_output *fout = vidow_view_display_output(view);
 		if (fout == NULL) {
 			fout = view_home_output(view);
@@ -2180,10 +2273,7 @@ static bool view_clip_box(struct vidow_view *view, struct wlr_box *out) {
 	 * 注意这和上面「浮窗拖拽中仍按 view_drag_output 裁」那段不冲突 —— 浮窗
 	 * 走的是上面那条 return false / fbox 分支，根本到不了这里；这条只对
 	 * 平铺窗口的拖拽生效。 */
-	bool drag_moving = view->dragging &&
-		view->server->grab_mode != VIDOW_GRAB_RESIZE &&
-		view->server->grab_mode != VIDOW_GRAB_RESIZE_TILE;
-	if (drag_moving) {
+	if (view_is_being_dragged(view)) {
 		return false;
 	}
 	struct wlr_output *clip_out = view_drag_output(view);
@@ -7408,9 +7498,15 @@ static void view_commit(struct wl_listener *listener, void *data) {
 	struct vidow_view *view = wl_container_of(listener, view, commit);
 	struct wlr_surface *surface = vidow_view_surface(view);
 	/* 有界探针：每 60 次 commit 一行。用来判断「重开之后 XWayland 还在不在
-	 * 交帧」—— 交帧停了，bake_revision 就永远不涨，装饰图停在第一张空图上。 */
+	 * 交帧」—— 交帧停了，bake_revision 就永远不涨，装饰图停在第一张空图上。
+	 *
+	 * **默认关，VIDOW_COMMIT_TRACE=1 才开。**
+	 *
+	 * 以前是无条件打的。原神这类满速提交的 X11 游戏跑 160fps，就是每秒
+	 * 2.7 行、一天二十多万行往 session log 里写 —— 排查时留着，日常是白烧
+	 * IO（日志还要被 tail / 编辑器读）。 */
 	if (view->x11 != NULL) {
-		if (view->commit_n % 60 == 0) {
+		if (vidow_commit_trace_on() && view->commit_n % 60 == 0) {
 			const char *t = vidow_view_title(view);
 			wlr_log(WLR_INFO, "commit-n: %s n=%d surf=%p buf=%dx%d",
 				t != NULL ? t : "(无题)", view->commit_n,
