@@ -528,6 +528,33 @@ bool vidow_im_owns_keyboard(struct vidow_server *server,
 	if (im->grab == NULL) {
 		return false;
 	}
+	/* **没有活跃输入上下文时不抢键盘。**
+	 *
+	 * im->active 是「合成器已经给输入法发过 activate」—— 也就是某个客户端的
+	 * 输入框正拿着焦点。没有输入框的时候，输入法拿到按键也没用：它没有可以
+	 * 插入文字的地方，只能决定「消费」还是「回注」。而 fcitx5 的 grab 是常驻
+	 * 的（实测 grab=true / active=false 同时成立），对游戏这种没有输入框的
+	 * 窗口**会把按键吞掉**，回注的时机和顺序都不受控。
+	 *
+	 * 实测（2026-10-28 00:52，xtest-keys 记录 X11 客户端真正收到的事件，
+	 * 用 ydotool 按住 A+W 2.2 秒）：
+	 *   fcitx5 关闭 → 86 个事件，W 正常 autorepeat 42 次
+	 *   fcitx5 开启 → **0 个事件**（按键全被输入法吞掉）
+	 * 游戏是 X11 程序，它看到的就是这 0 个事件 —— 角色要么不动，要么按
+	 * fcitx5 回注的时序断断续续地动（用户报的「aw 反复交换触发、角色在
+	 * 抖动」）。
+	 *
+	 * 判据用 im->active 而不是 grab：grab 是输入法单方面抓的，fcitx5 抓到
+	 * 就一直不放；active 才是「现在真有输入框」这个事实。有输入框时行为
+	 * 完全不变（照旧全部转发给输入法），没输入框时按键直接到客户端。
+	 *
+	 * 代价：没有输入框时输入法收不到按键，它自己的全局快捷键（fcitx5 的
+	 * Ctrl+Space 之类）不再由这条路触发。用户已经有
+	 * ~/文档/EnhanceScript/fcitx5-input-switcher.sh 用 ydotool 切换，不依赖
+	 * grab 这条路。 */
+	if (!im->active) {
+		return false;
+	}
 	/* 输入法自己回注的按键不能再喂回去：那是它决定「这个键我不消费」的
 	 * 产物，喂回去就自己喂自己，死循环。 */
 	if (kb->virtual != NULL && im->method != NULL &&

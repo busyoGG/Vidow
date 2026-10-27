@@ -8,15 +8,22 @@
  *   cc -O2 -o build/xtest-keys tools/xtest-keys.c -lX11
  *
  * 用法：
- *   ./build/xtest-keys [秒数]        # 默认 6 秒
+ *   ./build/xtest-keys [秒数] [--detectable]   # 默认 6 秒
+ *
+ *   --detectable  先调 XkbSetDetectableAutoRepeat(True)。
+ *                 开了之后 X server **不再发 autorepeat 产生的假 KeyRelease**，
+ *                 只发 KeyPress。绝大多数游戏框架（SDL2 / GLFW / Wine）都会开。
+ *                 用它来区分「游戏看到的」和「没开这个的客户端看到的」。
  *
  * 输出每行：时间(ms) 事件 键码 keysym 名称
  *
  * 窗口会自己抢焦点（XSetInputFocus），所以不需要点它。
  */
 #include <X11/Xlib.h>
+#include <X11/XKBlib.h>
 #include <X11/keysym.h>
 #include <stdio.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
@@ -29,9 +36,17 @@ static double now_ms(void) {
 }
 
 int main(int argc, char **argv) {
-	int seconds = argc > 1 ? atoi(argv[1]) : 6;
-	if (seconds <= 0) {
-		seconds = 6;
+	int seconds = 6;
+	bool detectable = false;
+	for (int i = 1; i < argc; i++) {
+		if (strcmp(argv[i], "--detectable") == 0) {
+			detectable = true;
+		} else {
+			int v = atoi(argv[i]);
+			if (v > 0) {
+				seconds = v;
+			}
+		}
 	}
 
 	Display *dpy = XOpenDisplay(NULL);
@@ -39,6 +54,16 @@ int main(int argc, char **argv) {
 		fprintf(stderr, "xtest-keys: 连不上 X server（DISPLAY=%s）\n",
 			getenv("DISPLAY") ? getenv("DISPLAY") : "(空)");
 		return 1;
+	}
+
+	/* **必须在建窗口之前调**：XkbSetDetectableAutoRepeat 影响的是本客户端
+	 * 收到的 autorepeat 事件形态 —— 开了之后 X server 不再发「重复产生的
+	 * KeyRelease」，只发 KeyPress。游戏框架（SDL2 / GLFW / Wine）都会开。 */
+	if (detectable) {
+		Bool supported = False;
+		XkbSetDetectableAutoRepeat(dpy, True, &supported);
+		printf("DETECTABLE requested=1 supported=%d\n", supported ? 1 : 0);
+		fflush(stdout);
 	}
 
 	int screen = DefaultScreen(dpy);
