@@ -3054,15 +3054,24 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 		/* 用**窗口自己所在那块屏**的框（每块屏都进 overview，各自裁自己
 		 * 那块屏的范围）。以前固定用 overview.output，别的屏上的窗口被裁到
 		 * 主屏矩形里。 */
-		struct wlr_box full = {0};
-		if (fx->view->output != NULL) {
-			wlr_output_layout_get_box(fx->view->server->output_layout,
-				fx->view->output, &full);
-		}
-		if (full.width > 0 && full.height > 0) {
-			ov_clip_box = full;
-			ov_clip = true;
-		}
+		/* **不再在这里裁。**
+		 *
+		 * 这里原本把裁剪框设成「窗口归属那块显示器的布局框」，可 overview
+		 * 里节点画的是**行坐标**（每块工作区缩成一条，见 server.h 的
+		 * vidow_ov_row：screen = 行的 content_x/y + 局部 * scale），
+		 * 跟布局里的显示器框压根不是一个坐标系。两者一相减，窗口只要探出
+		 * 显示器一点点，交集就空了 —— 下面那条「整个身子都在框外」的分支
+		 * 把节点甩到 -1000000，窗口在 overview 里整个消失（用户 2026-10-27
+		 * 报的「overview 的窗口超出一点显示器就消失」）。
+		 *
+		 * 不裁也不会画到隔壁屏上：场景图是全局坐标，每块屏自己的节点被
+		 * wlroots 裁在那块屏的框里，落不到别人那块上。这本来就是上面注释
+		 * 里写的语义 —— 「行内随便溢出，出屏才切」，而出屏那一刀由输出
+		 * 自己的裁剪天然完成，不需要我们在这儿再算一遍。
+		 *
+		 * 行矩形（row->rect_*）仍然有用：命中测试、动画目标都靠它，
+		 * 只是不再当裁剪框。 */
+		(void)ov_clip_box;
 	}
 	if (instance != NULL || fx->clip_on || ov_clip) {
 		/* fx->clip 是**布局坐标**里的那块屏；这个节点的位置是相对父树的
@@ -3163,6 +3172,9 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 		instance->dec_output_scale = instance->out->scale;
 		wlr_output_layout_get_box(server->output_layout, instance->out,
 			&instance->dec_output_box);
+		/* 位置也记一笔：拖拽只动 anim_off、不推进 bake_revision，
+		 * 不记这个的话拖动全程都会被判定「缓存命中」而不重烘。 */
+		instance->dec_screen_box = vidow_view_screen_box(fx->view);
 	}
 
 	/* dump_target 自己记得「dump 过几份、上限多少」（VIDOW_FX_DUMP 没设就立刻返回），
@@ -4490,7 +4502,10 @@ static void view_bake_for_output(struct vidow_server *server,
 				sl->dec_output_scale == output->wlr_output->scale &&
 				sl->dec_output_box.x == ob.x && sl->dec_output_box.y == ob.y &&
 				sl->dec_output_box.width == ob.width &&
-				sl->dec_output_box.height == ob.height) {
+				sl->dec_output_box.height == ob.height &&
+				sl->dec_screen_box.x == vb.x && sl->dec_screen_box.y == vb.y &&
+				sl->dec_screen_box.width == vb.width &&
+				sl->dec_screen_box.height == vb.height) {
 			if (vidow_xtrace_on()) {
 				wlr_log(WLR_INFO, "bake: %s 缓存命中跳过重烘 "
 					"rev=%u/%u blur=%u/%u",

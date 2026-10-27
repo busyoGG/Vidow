@@ -999,6 +999,18 @@ struct vidow_blur_slot {
 	uint64_t dec_revision, dec_blur_ver;
 	double dec_output_scale;
 	struct wlr_box dec_output_box;
+	/* 烘这张图时窗口**画在哪儿**（geom + anim_off，布局坐标）。
+	 *
+	 * 拖拽只动 anim_off、不动 geom，也不推进 bake_revision（那条只在
+	 * vidow_view_apply_anim 里走），所以下面那串缓存判据在拖动全程一个都
+	 * 不变 —— 这块屏的装饰就被判定「还是这一版」，永远不重烘，节点停在
+	 * 上一次烘出来的位置。表现：从 2x 屏往 1x 屏拖，窗口卡在 2x 屏边上
+	 * 不动，超过一整个窗口宽才突然跳过去（那时窗口和这块屏不再相交，
+	 * 走的是另一条分支）；反过来从 1x 拖到 2x 就正常。
+	 *
+	 * 记下来之后，位置一变就重烘 —— 拖拽才需要，静止时这个值也不动，
+	 * 不会多烘。 */
+	struct wlr_box dec_screen_box;
 };
 
 struct vidow_fx_target {
