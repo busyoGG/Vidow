@@ -235,6 +235,14 @@ void vidow_ipc_json_column(struct jbuf *b, struct vidow_server *server,
 		}
 	}
 	jb_arr_end(b);
+	/* **列里到底挂了几个 view**（不只是 toplevel）。
+	 *
+	 * 上面的 windows 只报 window_is_toplevel 的窗口 —— popup / 没上屏的 /
+	 * override-redirect 全被排除。于是「列看着是空的、cleanup 却不肯删」
+	 * 这种状态在 IPC 里完全看不出来（vidow_workspace_cleanup 用的是
+	 * wl_list_empty(&col->views)，那个链表非空就不删）。诊断这类僵尸列必须
+	 * 能看见真实长度，否则只能靠猜。 */
+	jb_kv_int(b, "view_count", (long long)wl_list_length(&col->views));
 	jb_obj_end(b);
 }
 

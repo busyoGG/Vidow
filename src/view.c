@@ -8999,6 +8999,28 @@ void vidow_view_attach_x11_surface(struct vidow_view *view) {
 void vidow_view_x11_gone(struct vidow_view *view) {
 	x11_trace_view("dissociate", view, NULL);
 	x11_drop_surface(view);
+	/* **X 窗口没了，这条列也得让它走。**
+	 *
+	 * 这个函数故意不销毁 view（见下面那段：X 窗口先死、view 后死是常态），
+	 * 但它漏了一步 —— view 还挂在 col->views 上。于是：
+	 *
+	 *   1. vidow_workspace_cleanup() 用 wl_list_empty(&col->views) 判「列空
+	 *      不空」，链表里还躺着这个 view → 永远不删；
+	 *   2. vidow_ipc_json_column() 的 windows 只报 window_is_toplevel 的窗口
+	 *      （没上屏的被排除）→ IPC 看着是 `windows: []`；
+	 *   3. arrange_columns 按旧宽度继续摆这条列 → 屏上一条什么都没有的竖条，
+	 *      旁边的窗口不合拢。
+	 *
+	 * 这就是用户 2026-10-28 反复报的「屏幕上出现一条空白带，窗口没铺满」
+	 * 「所有窗口关闭都会把列留下来」。实测：开一个 X11 窗口再关掉，空列
+	 * 稳定 +1，宽度停在 949（= 半屏），而列里没有任何 toplevel 窗口。
+	 *
+	 * 只摘列、不销毁 view：view 留着是对的（X 窗口可能重建，重新 map 时
+	 * view_map 会再调 view_ensure_column 把它放回条带）。摘完顺手收尸，
+	 * 让这条空列立刻从 ws->columns 上消失，再重排一次让邻居合拢。 */
+	vidow_view_leave_column(view);
+	vidow_workspace_cleanup(view->server);
+	vidow_arrange(view->server);
 	/* **X 窗口没了就把 foreign-toplevel 条目摘掉。**
 	 *
 	 * X 窗口先死、view 后死是常态（xwm_x11.c 的 x11_handle_destroy 里写着：
