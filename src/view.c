@@ -505,11 +505,15 @@ void vidow_view_set_size(struct vidow_view *view, int w, int h) {
 			/* 这里以前一言不发地 return，害得我把「日志里没有 x11-cfg」
 			 * 读成「configure 没发」—— 其实这条日志压根不存在，首开正常
 			 * 时也是 0 条。排「Steam 重开黑屏」两种结局都得看得见。 */
-			wlr_log(WLR_INFO, "x11-cfg %s: 跳过 %d,%d %dx%d"
-				"（和上次一模一样）",
-				vidow_view_title(view) != NULL ?
-					vidow_view_title(view) : "(无题)",
-				x, y, cw, ch);
+			/* 只在 VIDOW_X11_TRACE 下打：这条挂在 configure 路径上，
+			 * 一次会话实测 526 行同步写盘。 */
+			if (vidow_xtrace_on()) {
+				wlr_log(WLR_INFO, "x11-cfg %s: 跳过 %d,%d %dx%d"
+					"（和上次一模一样）",
+					vidow_view_title(view) != NULL ?
+						vidow_view_title(view) : "(无题)",
+					x, y, cw, ch);
+			}
 			return; /* 位置尺寸一个都没变：别让客户端白重画一帧 */
 		}
 		/* 「尺寸没变」也要回一声，否则客户端不知道自己被确认了。
@@ -1178,6 +1182,18 @@ struct vidow_view *vidow_view_at(struct vidow_server *server,
 	}
 	struct wlr_scene_node *node =
 		wlr_scene_node_at(&server->scene->tree.node, lx, ly, sx, sy);
+	if (getenv("VIDOW_PICK_TRACE") != NULL) {
+		int nx = 0, ny = 0;
+		if (node != NULL) wlr_scene_node_coords(node, &nx, &ny);
+		struct wlr_scene_buffer *sb = node != NULL &&
+			node->type == WLR_SCENE_NODE_BUFFER ?
+			wlr_scene_buffer_from_node(node) : NULL;
+		wlr_log(WLR_INFO, "pick-trace: %.0f,%.0f node=%p type=%d at %d,%d "
+			"scene_surface=%p parent=%p", lx, ly, (void *)node,
+			node != NULL ? (int)node->type : -1, nx, ny,
+			sb != NULL ? (void *)wlr_scene_surface_try_from_buffer(sb) : NULL,
+			node != NULL ? (void *)node->parent : NULL);
+	}
 	if (node == NULL || node->type != WLR_SCENE_NODE_BUFFER) {
 		return NULL;
 	}
@@ -1247,8 +1263,22 @@ static bool column_has_views(struct vidow_column *col) {
  * 注意别把它当成「藏起来的工作区」那种不可见：那边是整列都不在条带上，这边列还在，
  * 只是这条列可能空着。所以下面这些判据是「还占着位置」而不是「场景节点开着」。 */
 static bool view_shows(const struct vidow_view *view) {
-	return view != NULL && !view->minimized && !view->drag_detached &&
-		!view->focus_helper;
+	/* **mapped 也是判据。** 窗口 unmap 之后它在列里的位置要留着（重新 map
+	 * 回来还得在原处），但它已经不画了 —— 不画的东西不能占屏上的宽度。
+	 *
+	 * 漏了这条的症状（用户 2026-10-28 01:09 报的「屏幕上出现一条空白带，
+	 * 窗口没铺满」）：关掉一个窗口，view_unmap() 里那道幂等闸
+	 * （`if (!view->mapped) return;`，见同文件 view_unmap 开头）让这一趟直接
+	 * 返回，列没被摘掉；列里那个 view 的 mapped 已经是 false，可 view_shows()
+	 * 不看它，照样返回 true → column_has_shown_views() 认为「这列有东西」→
+	 * arrange_columns 的 Pass 1 不给它清零宽度 → 屏上留一条什么都没有的竖条，
+	 * 旁边的窗口不合拢。
+	 *
+	 * 判据用 mapped 而不是「场景节点开着」：mapped 是 vidow 自己的布局状态，
+	 * 在 view_map() 里置 true、view_unmap() 里置 false，X11 那边 destroy 时
+	 * 也走同一条路，比去问场景树可靠（场景节点在过渡动画里可能还开着）。 */
+	return view != NULL && view->mapped && !view->minimized &&
+		!view->drag_detached && !view->focus_helper;
 }
 
 /* 列里第一个「还占着位置」的窗口（焦点落点用）。 */
@@ -1718,6 +1748,77 @@ static struct wlr_output *view_drag_output(const struct vidow_view *view) {
 	if (!dragging) {
 		return NULL;
 	}
+	/* **拖拽中按光标在哪块屏判，不按窗口面积判。**
+	 *
+	 * 面积判法在两块屏逻辑尺寸相近、而窗口本身又接近整屏宽的时候会失灵：
+	 * 实测这台机器 DP-3 = 1920x1080@1x、DP-2 = 1920x1080@2x，从 DP-2 拖一个
+	 * 1904x1025 的窗口去 DP-3，窗口要拖到 x<1000（中心早就越过边界）才够
+	 * 让 DP-3 的可见面积超过 DP-2 —— 那之前一路都算「还在 DP-2」，倍率钉在
+	 * 2 倍不变。用户看到的就是两件事：
+	 *   1. 高分辨率屏往低分辨率拖，像被窗口大小卡住，过不去；
+	 *   2. 跨屏那一半发糊（按 2 倍渲染，却画在 1 倍屏上）。
+	 *
+	 * 拖拽时用户看的是光标，不是窗口面积：光标落在哪块屏，就把那块屏的
+	 * 倍率给窗口。这也和「窗口真的跟着光标画到对面那块屏上」的既有约定一致
+	 * （vidow_view_display_output 依赖这里给出正确的屏来算模糊底衬 / UV）。
+	 *
+	 * 光标不在任何输出上（拖到布局外）才退回面积判法，保持原来的兜底。 */
+	/* **光标所在屏和窗口相交的屏里，取倍率最高的那块。**
+	 *
+	 * 光看光标是不够的（2026-10-27 用户实测复现）：窗口 1904 宽停在 DP-2
+	 * （2x）上，光标一越过边界进 DP-3（1x），这里就返回 DP-3 —— 而窗口
+	 * 1904 像素里还有一大半画在 DP-2 上。三处判据于是分叉：
+	 *
+	 *   view_scale()      取「相交屏里最高倍率」= 2.0  ← 客户端按 2x 画
+	 *   view_drag_output() 取光标屏        = DP-3  ← 底衬 / UV 按 1x 算
+	 *
+	 * 屏幕上看到的就是「跨屏时高分辨率那一半模糊」：2x 的缓冲被按 1x 的
+	 * 设备像素采样。
+	 *
+	 * 一块 wl_surface 只有一个 buffer_scale，跨两块不同倍率的屏时**只能**
+	 * 选一个（选低的必然糊），所以两处必须选同一个 —— 都按「相交屏里
+	 * 最高的那个」，和 view_scale 的既有理由一致（见那里的注释）。
+	 *
+	 * 光标屏只作为「窗口一点都没跨到别的屏上」时的自然结果：窗口只和
+	 * 光标那块屏相交时，最高倍率就是那块屏的。 */
+	struct wlr_output *under = wlr_output_layout_output_at(
+		view->server->output_layout,
+		view->server->cursor->x, view->server->cursor->y);
+	struct wlr_box wbox = vidow_view_screen_box(view);
+	struct wlr_output *pick = NULL;
+	double pick_scale = 0.0;
+	struct vidow_output *o;
+	wl_list_for_each(o, &view->server->outputs, link) {
+		struct wlr_output *wo = o->wlr_output;
+		if (wo == NULL || !wo->enabled) {
+			continue;
+		}
+		if (wbox.width > 0 && wbox.height > 0) {
+			struct wlr_box obox;
+			wlr_output_layout_get_box(view->server->output_layout, wo,
+				&obox);
+			struct wlr_box hit;
+			if (!wlr_box_intersection(&hit, &wbox, &obox)) {
+				continue;
+			}
+		} else if (wo != under) {
+			continue;
+		}
+		double sc = wo->scale > 0.0 ? wo->scale : 1.0;
+		/* 倍率相同的时候优先光标那块屏 —— 用户看的是光标。 */
+		if (pick == NULL || sc > pick_scale ||
+				(sc == pick_scale && wo == under)) {
+			pick = wo;
+			pick_scale = sc;
+		}
+	}
+	if (pick != NULL) {
+		return pick;
+	}
+	if (under != NULL && under->enabled) {
+		return under;
+	}
+
 	struct wlr_box box = vidow_view_screen_box(view);
 	if (box.width <= 0 || box.height <= 0) {
 		return NULL;
@@ -1775,10 +1876,24 @@ static double view_scale(const struct vidow_view *view) {
 	if (view->dragging && view->server != NULL) {
 		struct wlr_box box = vidow_view_screen_box(view);
 		if (box.width > 0 && box.height > 0) {
+			/* **先数清楚窗口现在压在几块屏上。**
+			 *
+			 * 只有真跨屏（>= 2 块）才需要「取最高倍率」这个折中。窗口
+			 * 完全落在某一块屏里的时候，那块屏的倍率就是唯一正确的答案
+			 * —— 按别的屏的倍率渲染，底衬贴图的原点 / 尺寸全对不上，
+			 * 屏幕上就是跨屏拖完之后背景错位 / 横条。
+			 *
+			 * 以前这里没有这一步：scale 的初值来自 view_drag_output()，
+			 * 而它**本身**就返回「相交屏里最高倍率的那块」。于是
+			 * `wo->scale <= scale` 这个跳过条件把每一块屏都跳过了 ——
+			 * 循环一次都没生效过，scale 永远停在初值上。窗口从 2x 的
+			 * DP-2 拖进 1x 的 DP-3、整个都在 DP-3 里了，还在按 2x 算。 */
+			struct vidow_output *hits[8];
+			size_t hit_n = 0;
 			struct vidow_output *o;
 			wl_list_for_each(o, &view->server->outputs, link) {
 				struct wlr_output *wo = o->wlr_output;
-				if (wo == NULL || !wo->enabled || wo->scale <= scale) {
+				if (wo == NULL || !wo->enabled) {
 					continue;
 				}
 				struct wlr_box obox;
@@ -1788,7 +1903,23 @@ static double view_scale(const struct vidow_view *view) {
 				if (!wlr_box_intersection(&hit, &box, &obox)) {
 					continue;
 				}
-				scale = wo->scale;
+				if (hit_n < sizeof(hits) / sizeof(hits[0])) {
+					hits[hit_n++] = o;
+				}
+			}
+			if (hit_n == 1) {
+				/* 只压着一块：就是它，不折中。 */
+				double only = hits[0]->wlr_output->scale;
+				scale = only > 0.0 ? only : 1.0;
+			} else if (hit_n > 1) {
+				/* 真跨屏：取最高的那个（一块 wl_surface 只能有一个
+				 * buffer_scale，选低的必然糊 —— 见上面那段）。 */
+				for (size_t i = 0; i < hit_n; i++) {
+					double sc = hits[i]->wlr_output->scale;
+					if (sc > scale) {
+						scale = sc;
+					}
+				}
 			}
 		}
 	}
@@ -2644,19 +2775,92 @@ static bool view_on_screen(struct vidow_server *server,
 	if (!vidow_workspace_view_visible(server, view)) {
 		return false;
 	}
-	struct wlr_box box = {0};
-	wlr_output_layout_get_box(server->output_layout, output->wlr_output, &box);
-	if (box.width < 1) {
-		return false;
-	}
 	/* overview 里所有窗口都被缩到画面里了，这时它们都画得到。 */
 	if (vidow_overview_active(server)) {
 		return true;
 	}
-	return view->geom.x < box.x + box.width &&
-		view->geom.x + view->geom.width > box.x &&
-		view->geom.y < box.y + box.height &&
-		view->geom.y + view->geom.height > box.y;
+	/* **判据是「它的几何落在哪块屏的框里」，不是「它是不是被指派给 output」。**
+	 *
+	 * 这个函数的语义是「它到底有没有被画到屏幕上」，只用来决定要不要补帧。
+	 * 以前它只拿**传进来的那块** output 的框去比 view->geom：
+	 *
+	 *     wlr_output_layout_get_box(..., output->wlr_output, &box);
+	 *     return 相交(view->geom, box);
+	 *
+	 * 而调用方（vidow_view_render_pump）是按 `view->output == output` 分发
+	 * 的，两者本该一致 —— 但 view->output 和 view->geom 会短暂（甚至长期）
+	 * 分叉：拖动 / 布局重排 / 换工作区之后，geom 已经是新位置，output 还
+	 * 停在旧屏上。于是 Steam 明明画在 DP-2 上（点击坐标 2586,92 都命中它），
+	 * view->output 却是 DP-2、geom 却是 0,0（DP-3 的坐标），矩形不相交
+	 * → 判成「它滚出视口了」→ 每 5~6ms 强制补帧一次，整机卡。
+	 *
+	 * 用户实测的旁证：**滚出去一次再滚回来就不卡了** —— 那一下会重算 geom
+	 * 和 output，两者对齐，判据立刻恢复正常。
+	 *
+	 * 所以这里改成问「有没有落在任意一块屏里」。判据本身还是几何相交，
+	 * 只是不再相信 view->output 这一个字段。 */
+	bool on = false;
+	struct vidow_output *o;
+	wl_list_for_each(o, &server->outputs, link) {
+		struct wlr_box box = {0};
+		wlr_output_layout_get_box(server->output_layout, o->wlr_output, &box);
+		if (box.width < 1 || box.height < 1) {
+			continue;
+		}
+		if (view->geom.x < box.x + box.width &&
+				view->geom.x + view->geom.width > box.x &&
+				view->geom.y < box.y + box.height &&
+				view->geom.y + view->geom.height > box.y) {
+			on = true;
+			break;
+		}
+	}
+	(void)output;
+	return on;
+}
+
+/* **每帧给 X11 视图无条件发一次 frame_done。**
+ *
+ * 这是照 Hyprland 的做法补上的（`/tmp/hypr-src` 的 src/output/MonitorFrameScheduler.cpp）：
+ * 它的帧事件里统一调 renderMonitor()，frame_done 由 aquamarine/wlroots 的标准
+ * 路径发，**不需要任何「补帧预算」**。Vidow 以前没有这一步，靠一套
+ * 「x11_want_frames 欠帧预算」去凑 —— 那套要穿过三道闸（在屏闸 / 迟滞闸 /
+ * 节流闸），任何一道判错就是黑屏（预算被扣光但没发出去）或者卡顿（闸门全开、
+ * 180Hz 空转）。两个症状来回摆了很多轮，2026-10-27 把那套预算整个删了。
+ *
+ * 为什么不能只靠 wlr_scene_output_send_frame_done()：
+ * 它只给**场景认为可见**的节点发回调。而 Vidow 的 FX 管线把真实表面的
+ * opacity 强制设成 0（内容由 decor 烘焙图来画，见 fx.c），wlroots 认为
+ * 这块表面「看不见」，于是跳过它 —— XWayland 就永远等不到 frame callback，
+ * 交一帧空白之后彻底停住。实测：Steam 重开后 40 秒只有 1 次 commit。
+ *
+ * 所以这里不看可见性、不看工作区、不看是否在屏上：**这块屏画完一帧，就给
+ * 所有归属它的 X11 视图发一次**。语义和 Wayland 客户端收到 wl_callback.done
+ * 完全一致 —— 「我用过你的画面了，你可以交下一帧」。
+ *
+ * 唯一保留的判据是 `view->output == output`：frame_done 应该按屏发，一块屏
+ * 一帧一次，不能两块屏各发一次（那会让 X11 客户端被催着跑双倍帧率）。 */
+void vidow_views_send_x11_frame_done(struct vidow_server *server,
+		struct vidow_output *output) {
+	if (server == NULL || output == NULL) {
+		return;
+	}
+	struct timespec now;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	struct vidow_view *view;
+	wl_list_for_each(view, &server->views, link) {
+		if (view->kind != VIDOW_VIEW_X11 || view->x11 == NULL ||
+				view->output != output->wlr_output) {
+			continue;
+		}
+		struct wlr_surface *surface = vidow_view_surface(view);
+		if (surface == NULL) {
+			continue;
+		}
+		/* 子表面也要发：XWayland 的窗口可能带子表面（输入法、tooltip 挂载）。 */
+		struct pump_ctx ctx = { .now = &now, .surfaces = 0 };
+		wlr_surface_for_each_surface(surface, pump_surface, &ctx);
+	}
 }
 
 /* 每帧调一次：把「规则要求保活」或者「正被人拿着（录屏 / 预览）」但**没画到**的
@@ -2683,7 +2887,6 @@ void vidow_view_render_pump(struct vidow_server *server,
 		bool want = view->mapped && !view->popup && view->output ==
 			output->wlr_output &&
 			(view->force_render || vidow_view_capture_held(view) ||
-				view->x11_want_frames > 0 ||
 				/* 小窗（S3）：被停到屏外（图标暂停出帧那条路）/ 所在屏关了
 				 * 的时候也要保活，否则游戏自己停帧，点开是一张死画面。
 				 * 下面 view_on_screen() 为真时会 continue，所以这条只在
@@ -2721,31 +2924,14 @@ void vidow_view_render_pump(struct vidow_server *server,
 		 * 所以这里加**迟滞**：连续 PUMP_HYSTERESIS 帧「看不上屏」才真的开始补，
 		 * 连续同样多帧「看得上屏」才停。抖动幅度小于这个窗口时状态不再翻转，
 		 * 真实的状态变化（切工作区 / 最小化）只晚这几帧，用户感知不到。 */
-		/* **X11 欠帧先处理**：它和「有没有画在屏上」无关。
+		/* **在屏上就不补帧**（迟滞防抖）。
 		 *
-		 * XWayland 要一个 frame callback 才会继续画下一帧，而回调只在
-		 * Vidow 真画完一帧时才发。重映射后的窗口交一帧空白就停住了，
-		 * 之后两边互等（实测 Steam 重开：只有 1 帧，首开 2285 帧；
-		 * 手动切一次工作区强制整屏重绘，立刻 1008 帧、画面正常）。
+		 * 已经画在画面上的窗口由场景那边正常发 frame_done，不该走这条路。
+		 * 迟滞是为了防 arrange 期间 view->geom / 工作区逐帧变化导致状态
+		 * 每帧翻转（翻一次喂客户端一帧，全屏游戏被反复唤醒重画）。
 		 *
-		 * 所以这里给它在屏上也照样催帧：画一帧 = 发一次 frame done =
-		 * XWayland 往前走一步。等它把内容画出来（欠帧耗尽）自然就停。 */
-		if (view->x11_want_frames > 0) {
-			if (view->x11_want_frames == 30 ||
-					view->x11_want_frames == 1) {
-				wlr_log(WLR_INFO, "x11 欠帧 %d → 催帧: %s",
-					view->x11_want_frames,
-					vidow_view_title(view) != NULL ?
-						vidow_view_title(view) : "(无题)");
-			}
-			view->x11_want_frames--;
-			if (view->x11_want_frames == 0) {
-				wlr_log(WLR_DEBUG, "x11 欠帧清空: %s",
-					vidow_view_title(view) != NULL ?
-						vidow_view_title(view) : "(无题)");
-			}
-			keep_going = true;
-		}
+		 * 2026-10-27：这里原来还有一条 `x11_owes` 旁路，让「X11 欠帧」的
+		 * 窗口跳过这道闸。那条旁路已经删了 —— 见下面关于 X11 欠帧的说明。 */
 		if (view_on_screen(server, output, view)) {
 			view->pump_hidden_frames = 0;
 			if (view->pump_shown_frames < PUMP_HYSTERESIS) {
@@ -2770,18 +2956,36 @@ void vidow_view_render_pump(struct vidow_server *server,
 			continue; /* 刚看不上屏，还没连续够：先不动 */
 		}
 
-		/* 节流（逐窗口，规则 / 全局配置说了算；0 = 不限）。还没到点的记下最早
-		 * 该醒的时刻，收尾时定个闹钟 —— 不能什么都不做：客户端提交一次之后就
-		 * 没人再推了，30Hz / 15Hz 的补帧会断在半路（踩过：全局 30 补出来 0 帧）。 */
-		if (view->pump_interval_ms > 0 &&
-				msec < (uint32_t)view->pump_next_ms) {
+		/* 节流（逐窗口，规则 / 全局配置说了算）。还没到点的记下最早该醒的
+		 * 时刻，收尾时定个闹钟 —— 不能什么都不做：客户端提交一次之后就没人
+		 * 再推了，30Hz / 15Hz 的补帧会断在半路（踩过：全局 30 补出来 0 帧）。
+		 *
+		 * **节流绝不允许退化成不限速。**
+		 *
+		 * pump_interval_ms 为 0 时老代码直接放行（不设下一次的到点时刻），
+		 * 于是每个渲染帧都补一次 —— Vidow 出帧 4~6ms 一张，那就是 180Hz
+		 * 空转。实测：游戏滚出视口时日志「不限速」每 6ms 一条，主循环被
+		 * 占满，按键队列延迟一路累积到 2078ms（KEYPROBE 的 lag 每 40ms
+		 * 涨一次）。
+		 *
+		 * 现在 0 一律按全局 force_render_hz 兜底；那个值也是 0（用户显式
+		 * 要「不限」）时按 60Hz 兜底 —— 「不限」这个语义在补帧路径上没有
+		 * 正当用途，只会把主循环烧穿。 */
+		int interval = view->pump_interval_ms > 0 ?
+			view->pump_interval_ms :
+			(server->config.force_render_hz > 0 ?
+				(1000 / (server->config.force_render_hz > 1000 ?
+					1000 : server->config.force_render_hz)) : 16);
+		if (interval < 1) {
+			interval = 1;
+		}
+		if (msec < (uint32_t)view->pump_next_ms) {
 			if (next_due == 0 || view->pump_next_ms < next_due) {
 				next_due = view->pump_next_ms;
 			}
 			continue;
 		}
-		view->pump_next_ms = view->pump_interval_ms > 0 ?
-			(int64_t)msec + view->pump_interval_ms : 0;
+		view->pump_next_ms = (int64_t)msec + interval;
 
 		struct wlr_surface *surface = vidow_view_surface(view);
 		if (surface != NULL) {
@@ -2794,12 +2998,7 @@ void vidow_view_render_pump(struct vidow_server *server,
 		if (!view->render_pumping) {
 			view->render_pumping = true;
 			char rate[32];
-			if (view->pump_interval_ms > 0) {
-				snprintf(rate, sizeof(rate), "节流 %dHz",
-					1000 / view->pump_interval_ms);
-			} else {
-				snprintf(rate, sizeof(rate), "不限速");
-			}
+			snprintf(rate, sizeof(rate), "节流 %dHz", 1000 / interval);
 			/* 「为什么它没画在画面上」说清楚：最小化 / 工作区被藏起来 / 滚出
 			 * 视口 —— 三种的判据都是 view_on_screen()，这里只是把原因写出来。 */
 			const char *why = view->minimized ? "它最小化了" :
@@ -3407,8 +3606,28 @@ static void view_anim_place(struct vidow_view *view) {
 	view->fx_dy = sy - vy;
 }
 
-/* 只摆位置（给拖动跟手那条路用，见 drag.c）。 */
+/* 只摆位置（给拖动跟手那条路用，见 drag.c）。
+ *
+ * **位置变了就得让装饰重烘一次。**
+ *
+ * 装饰图里烘死了窗口在**本屏上的位置**（decor_geo 的 origin_x / origin_y，
+ * 进着色器的 u_origin —— 底衬模糊按它算采样 UV）。窗口一挪，这个 UV 就错
+ * 了：屏幕上表现为底衬整块横向错位 / 一条条横纹（就是最初那个跨屏 bug）。
+ * 所以位置一变必须重烘，光挪节点不够。
+ *
+ * 缓存键（fx.c 的 view_bake_for_output）里**没有窗口位置** —— 因为平时位置
+ * 只在 vidow_view_apply_anim 里变，那里会推进 bake_revision。拖拽走的是这条
+ * 「只摆位置」的轻路，于是拖动全程缓存判据一个都不变，这块屏的装饰被判
+ * 「还是这一版」、永远不重烘，节点停在上一次烘出来的位置。
+ *
+ * 推进一格就够：它让「这一帧的位置」和「烘这张图时的位置」区分开，
+ * 下一帧自然重烘一次。不推进 blur_ver（模糊贴图没变，不用重抓）。
+ *
+ * 试过「位置变了只挪节点、不重烘」（2026-10-27）：跨屏拖拽当场回归到最初的
+ * 底衬错位，因为 u_origin 是烘死的。真要省这笔钱，得把 u_origin 从烘死的
+ * uniform 改成每帧传进去的 —— 那是另一层改动。 */
 void vidow_view_apply_anim_place(struct vidow_view *view) {
+	view->fx.bake_revision++;
 	view_anim_place(view);
 }
 
@@ -3573,6 +3792,13 @@ void vidow_view_anim_bake(struct vidow_view *view) {
 void vidow_view_apply_anim(struct vidow_view *view) {
 	/* Commits, placement and animation updates invalidate every output instance.
 	 * The per-output refresh loop itself must not advance this revision. */
+	if (getenv("VIDOW_PUMP_TRACE") != NULL) {
+		wlr_log(WLR_INFO, "ANIMTRACE %s rev=%u blur=%u/%u anim=%d jelly=%d",
+			vidow_view_title(view) != NULL ? vidow_view_title(view) : "(无题)",
+			view->fx.bake_revision, view->fx.blur_drawn,
+			view->fx.blur_ver,
+			view->anim_open != NULL ? 1 : 0, view->jelly != NULL ? 1 : 0);
+	}
 	view->fx.bake_revision++;
 	view_anim_place(view);
 	vidow_view_anim_bake(view);
@@ -7159,7 +7385,24 @@ void view_map(struct wl_listener *listener, void *data) {
 		/* 分类往往发生在表面建出来之前（那时候没东西可摆），所以这里再按 X
 		 * 说的地方摆一次；顺带保证第一次上屏就落在对的位置上，不会闪一下。 */
 		vidow_popup_place(view);
-		view_popup_grab_keyboard(view);
+		/* **X11 弹出物不拿 wl_keyboard 焦点。**
+		 *
+		 * 原来这里调 view_popup_grab_keyboard()，理由是「菜单要收方向键 /
+		 * Esc」。但 X11 的菜单根本不靠 wl_keyboard 收键：它在 X server 内部
+		 * 自己 XGrabKeyboard（Xwayland 就是那个 server），键盘事件走 X 自己
+		 * 的 grab 路由，合成器插不插手都一样。
+		 *
+		 * 代价却是实打实的：notify_enter 一改 seat 的 focused_surface，
+		 * Xwayland 那边会跟着重算指针 enter/leave，于是菜单刚出来就被判成
+		 * 「指针不在我身上」，自己关掉。实测日志（2026-10-27 00:16:16–21，
+		 * 连按右键 5 次）每次都是这个顺序：
+		 *   x11: 新窗口 (无题)（override-redirect，弹出物…）
+		 *   焦点: 好友列表 -> (无题)      ← 这里
+		 *   焦点: (无) -> 好友列表
+		 * 即「菜单抢一次键盘 → 立刻被关 → 键盘还回去」。 */
+		if (view->kind != VIDOW_VIEW_X11) {
+			view_popup_grab_keyboard(view);
+		}
 	} else if (view->pending_activate) {
 		/* 有人早就请求激活它了（点通知的时候窗口还没上屏）：现在兑现。 */
 		view->pending_activate = false;
@@ -7571,42 +7814,21 @@ static void view_commit(struct wl_listener *listener, void *data) {
 		 * XWayland 从「等回调」里拽出来。Wayland 客户端不需要这个
 		 * （它们的渲染节奏由自己的帧循环决定），只对 X11 做。 */
 		if (view->x11 != NULL) {
-			/* 记一笔「欠帧」，交给补帧闹钟推（见下面 want 的判定）。
+			/* **X11 表面交帧了就排一帧。**
 			 *
-			 * **只在没有债务时记**：以前这里写的是「不足 30 就补到 30」，
-			 * 而催帧本身会促使 Xwayland 再交一帧 —— 交一帧又把债务刷回
-			 * 30，于是形成正反馈：实测 95 秒里「欠帧 30 → 催帧」打了
-			 * 15197 次（约 160 次/秒），主循环一直在空转，同屏其他客户端
-			 * （Element 这类 Electron 应用）拿不到帧，直接卡死。
+			 * 这里以前还有一整套「欠帧预算」：每次 commit 记 30 帧债务，
+			 * 由补帧循环（vidow_view_render_pump）催着消耗，目的是把
+			 * XWayland 从「等 frame callback」里拽出来（Steam 重开黑屏）。
 			 *
-			 * 债务的语义是「拽它一把」，不是「让它永远满速跑」：
-			 * 已经欠着就让它自然耗尽，新的 commit 只是续上原有的那一笔。 */
-			struct timespec ts = {0};
-			clock_gettime(CLOCK_MONOTONIC, &ts);
-			uint32_t now_ms = (uint32_t)(ts.tv_sec * 1000 +
-				ts.tv_nsec / 1000000);
-			/* **续帧的预算按「时间窗」记，不是按帧数。**
+			 * 2026-10-27 删掉的理由：真正的 frame_done 早就由
+			 * vidow_views_send_x11_frame_done() 在**每次渲染收尾无条件**
+			 * 发了（output.c，不看可见性、不看工作区、不看在不在屏上），
+			 * 欠帧预算唯一的作用退化成「让输出别停」—— 而这件事
+			 * schedule_frame 一行就做完了。
 			 *
-			 * 以前记 30 帧：Vidow 出帧 ~4ms 一张，30 帧 = 0.12 秒就用完了，
-			 * 而 XWayland 从「收到第一个 frame done」到「真的把内容画出来」
-			 * 要几百毫秒（Steam 重开时它还要重建 webhelper 的合成层）。
-			 * 窗口一停，frame done 断流，两边又互等 —— 屏幕上永远是那张
-			 * 空图，直到用户手动切一次工作区强制重绘。
-			 *
-			 * 实测（本次）：重开后补帧确实触发了（日志 224 条「欠帧」），
-			 * 但都在 0.25 秒内耗尽；源纹理 dump 出来 1 色全黑（首开 5061
-			 * 色）。改成按时间窗记，窗口期覆盖 XWayland 真正出图的那一段。
-			 *
-			 * 冷却仍然保留（上面那条正反馈说明），只是从「帧数耗尽」换成
-			 * 「时间窗走完」。 */
-			if (view->x11_want_frames == 0 &&
-					now_ms - view->x11_want_frames_at >= 500) {
-				if (getenv("VIDOW_FLIP") != NULL) {
-					vidow_flip_note("x11frames", view, true);
-				}
-				view->x11_want_frames = 30;
-				view->x11_want_frames_at = now_ms;
-			}
+			 * 那套预算的代价却很实在：它让补帧循环绕过「在屏上就不补」
+			 * 和迟滞两道闸，每 500ms 无脑续 30 帧，窗口滚出视口时把主循环
+			 * 烧穿（实测按键队列延迟累积到 2078ms）。 */
 			vidow_output_schedule_frame(view->server, view->output,
 				"X11 表面续帧");
 		}
@@ -8391,6 +8613,12 @@ static void x11_refresh_popup(struct vidow_view *view) {
 		return;
 	}
 	view->popup = popup;
+	/* 改判成弹出物：从 foreign-toplevel 列表里摘掉。反方向（本来误判成
+	 * 弹出物、后来发现是普通窗口）要补注册 —— 注册现在只在 map 时发生，
+	 * 那一刻的判据可能还是错的。 */
+	if (popup) {
+		vidow_portal_view_drop_toplevel(view);
+	}
 	view_takeover_surface_scale(view);
 	if (view->scene_tree != NULL) {
 		/* 改判成弹出物 / 变回普通窗口：背后的模糊跟着换。场景树留着（只换
@@ -8506,6 +8734,24 @@ static void x11_attach_surface(struct vidow_view *view) {
 		wlr_log(WLR_ERROR, "x11: 建不出场景表面");
 		return;
 	}
+	/* **记下这棵树是按哪一块表面建的 —— 这是上面「换没换表面」判据的唯一
+	 * 依据，以前漏了这一步。**
+	 *
+	 * x11surface.h 把 scene_serial 定义成「0 = 还没建过场景」，上面那条判据
+	 * 写的是 `scene_serial == serial → skip`。但全仓库从来没有给它赋过值，
+	 * 它恒为 0：
+	 *
+	 *   - serial 也恰好是 0（还没收到 WL_SURFACE_SERIAL）时，判据成立，
+	 *     同一块表面的重复 attach 被跳过 —— 这是想要的行为，但纯属巧合；
+	 *   - serial != 0 时判据永远不成立，**每次都当「换了新表面」拆掉重建**，
+	 *     包括 map 重放那种本该 skip 的重复 attach。
+	 *
+	 * 后者才是要修的：反复拆建场景树会让 fx 状态、commit 监听、表面缩放
+	 * 钉子全部重来一遍，而 X11 客户端在 attach 期间可能正在交帧。
+	 *
+	 * 赋值放在场景表面建好之后：那之前的失败路径没有树，也就没有「按哪块
+	 * 表面建的」可言。 */
+	view->x11->scene_serial = view->x11->serial;
 
 	view->map.notify = view_map;
 	wl_signal_add(&view->x11->surface->events.map, &view->map);
@@ -8732,6 +8978,17 @@ void vidow_view_attach_x11_surface(struct vidow_view *view) {
 void vidow_view_x11_gone(struct vidow_view *view) {
 	x11_trace_view("dissociate", view, NULL);
 	x11_drop_surface(view);
+	/* **X 窗口没了就把 foreign-toplevel 条目摘掉。**
+	 *
+	 * X 窗口先死、view 后死是常态（xwm_x11.c 的 x11_handle_destroy 里写着：
+	 * 32x32 / 1x1 的 helper 窗口 create 完立刻 destroy）。这条路径只清表面，
+	 * **既不销毁 view、也不碰它的 toplevel handle**，于是条目一直挂在列表里。
+	 *
+	 * 实测（2026-10-27，zwlr 枚举）：30 条 toplevel 对 7 个真窗口，剩下 23 条
+	 * 是 `Input` / `Default IME` / `rundll32` / `OpenGL 4.5` /
+	 * `Steam SDL Dummy OpenGL Window` 这类 Steam + fcitx 的辅助窗口 —— X 树里
+	 * 一个都搜不到，条目却还在，顶栏就一直摆着它们。 */
+	vidow_portal_view_drop_toplevel(view);
 }
 
 void vidow_view_x11_map_request(struct vidow_view *view) {
@@ -8803,8 +9060,26 @@ static void view_x11_hints_changed(struct vidow_view *view) {
  * 客户端可以在映射之后才把窗口类型设成菜单/提示/下拉框，也可能反过来。类型变了
  * 就得重新分类（弹出物 <-> 普通窗口）、甚至把场景节点搬到另一层上。 */
 static void view_x11_window_type_changed(struct vidow_view *view) {
+	bool was_popup = view->popup;
 	x11_refresh_popup(view);
 	vidow_float_update_mode(view);
+	/* **改判成弹出物之后，得让状态机再对齐一次。**
+	 *
+	 * _NET_WM_WINDOW_TYPE 常常晚于 map 到达（Chromium / Steam 的菜单都是先
+	 * 建窗口、先映射，属性过一会儿才写）。这类窗口第一次进来时还是「普通
+	 * 窗口」，走的是 view_map() 那条路 —— 场景节点按布局摆好、也可能被
+	 * 浮窗规则摆到别处。
+	 *
+	 * 属性一到、x11_refresh_popup() 把它改判成弹出物、把场景树搬到
+	 * layer_popups，但**没人再跑一遍上屏状态机**：节点还是布局时代的位置，
+	 * 尺寸还是布局时代的 dest，于是弹出物画在错的坐标上（实测 test-xwayland-popup.sh
+	 * 的「属性晚到」那节：place xp-popup -> 540,300，而客户端说的是 500,500）。
+	 *
+	 * xwm_surface_sync() 对弹出物会走 xwm.c 里那条专用分支（surface map +
+	 * 按客户端绝对坐标摆位 + 打开节点），正是这里需要的收尾。 */
+	if (!was_popup && view->popup) {
+		xwm_surface_sync(view);
+	}
 }
 
 /* WM_NORMAL_HINTS（min/max 尺寸）是另一条信号，必须有自己的回调：
@@ -9196,6 +9471,14 @@ void vidow_view_x11_property_changed(struct vidow_view *view, xcb_atom_t atom) {
 	} else if (atom == XCB_ATOM_WM_TRANSIENT_FOR) {
 		view_x11_parent_changed(view);
 	} else if (atom == x11->atoms.net_wm_window_type) {
+		/* 类型变更必须留一行：这是「先普通窗口、后改判成弹出物」那条路
+		 * 唯一的入口，判断它有没有到达全靠这一行。 */
+		if (vidow_xtrace_on()) {
+			wlr_log(WLR_INFO, "x11-type: %s 窗口类型变更 → 重判（当前 popup=%d）",
+				vidow_view_title(view) != NULL ?
+					vidow_view_title(view) : "(无题)",
+				view->popup);
+		}
 		view_x11_window_type_changed(view);
 	} else if (atom == x11->atoms.wm_normal_hints) {
 		view_x11_size_hints_changed(view);
