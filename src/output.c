@@ -48,6 +48,19 @@ static int64_t stutter_threshold_ns(void) {
 	return ns;
 }
 
+/* 每帧重烘探针：VIDOW_PUMP_TRACE=1 开。
+ *
+ * 和上面几个一个规矩 —— **只问一次**。这条以前写在「每帧 × 每个窗口」的
+ * 循环体里，原神那种 160fps 的满速提交就是每秒上千次 environ 线性扫描。 */
+static bool pump_trace_on(void) {
+	static int done = 0, on = 0;
+	if (!done) {
+		on = getenv("VIDOW_PUMP_TRACE") != NULL ? 1 : 0;
+		done = 1;
+	}
+	return on != 0;
+}
+
 /* 帧事件掐断的测试钩子（VIDOW_TEST_STALL_OUTPUT=<屏名>），同样只问一次。 */
 static const char *stall_output_name(void) {
 	static int done = 0;
@@ -216,6 +229,14 @@ void vidow_output_render(struct vidow_output *output) {
 	struct vidow_view *view;
 	wl_list_for_each(view, &server->views, link) {
 		if (view->fx.active && view->fx.blur_drawn != view->fx.blur_ver) {
+			if (pump_trace_on()) {
+				wlr_log(WLR_INFO, "PUMPTRACE 每帧重烘: %s drawn=%u ver=%u "
+					"rev=%u",
+					vidow_view_title(view) != NULL ?
+						vidow_view_title(view) : "(无题)",
+					view->fx.blur_drawn, view->fx.blur_ver,
+					view->fx.bake_revision);
+			}
 			vidow_view_apply_anim(view);
 		}
 	}

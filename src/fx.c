@@ -1345,6 +1345,17 @@ static bool client_buffer_wait(struct vidow_server *server,
 	return ok;
 }
 
+/* 贴图选择探针（VIDOW_FX_TRACE_TEXTURE=1）。这个函数在渲染路径上
+ * （vidow_fx_frame / decor_pass 都会调），所以开关只问一次。 */
+static bool fx_trace_texture_on(void) {
+	static int done = 0, on = 0;
+	if (!done) {
+		on = getenv("VIDOW_FX_TRACE_TEXTURE") != NULL ? 1 : 0;
+		done = 1;
+	}
+	return on != 0;
+}
+
 static struct wlr_texture *client_scene_texture(struct vidow_server *server,
 		struct wlr_scene_buffer *scene_buffer, bool *owned) {
 	if (scene_buffer == NULL || scene_buffer->buffer == NULL ||
@@ -1355,7 +1366,7 @@ static struct wlr_texture *client_scene_texture(struct vidow_server *server,
 		wlr_client_buffer_get(scene_buffer->buffer);
 	struct wlr_texture *texture =
 		client_texture(server->renderer, scene_buffer->buffer, owned);
-	if (getenv("VIDOW_FX_TRACE_TEXTURE") != NULL) {
+	if (fx_trace_texture_on()) {
 		wlr_log(WLR_INFO,
 			"fx-texture: sb=%p buffer=%p client=%p source=%p client_tex=%p "
 			"selected=%p size=%dx%d owned=%d",
@@ -3745,6 +3756,30 @@ static bool view_region_rect(struct vidow_server *server,
  * 两个 getenv 各只问一次（每次重抓都要问一遍：一帧里四五个元素重抓就是十来次；
  * getenv 在 profile 里比我们自己的模糊代码还显眼）。**文件存在性每次都看** ——
  * test-blurpartial.sh 就是跑着跑着把文件建出来切过去的。 */
+/* 渲染热路径上的两个探针开关，只问一次环境变量。
+ *
+ * 它们都在「每帧 × 每个窗口」的函数里（view_region_build 的模糊重跑、
+ * decor_draw 的 span），原神那种 160fps 满速提交下 getenv 的 environ
+ * 线性扫描每秒上千次。环境变量进程起来之后不会变，缓存住就行 —— 和
+ * 本文件上面 scanout_off / blur_no_partial 一个规矩。 */
+static bool blur_trace_on(void) {
+	static int done = 0, on = 0;
+	if (!done) {
+		on = getenv("VIDOW_BLUR_TRACE") != NULL ? 1 : 0;
+		done = 1;
+	}
+	return on != 0;
+}
+
+static bool span_trace_on(void) {
+	static int done = 0, on = 0;
+	if (!done) {
+		on = getenv("VIDOW_SPAN_TRACE") != NULL ? 1 : 0;
+		done = 1;
+	}
+	return on != 0;
+}
+
 static bool blur_no_partial(void) {
 	static int on = -1;
 	static int file_read = 0;
@@ -4049,7 +4084,7 @@ static bool view_region_build(struct vidow_server *server,
 	/* 这一行每次模糊重跑一行（滚动 / 动画里每帧每个窗口都可能触发）。
 	 * 日常使用不该刷，但排查「模糊重跑为什么这么频繁 / 损伤框算错」时它是
 	 * 唯一的线索 —— 用 VIDOW_BLUR_TRACE=1 开，别常驻。 */
-	if (getenv("VIDOW_BLUR_TRACE") != NULL) {
+	if (blur_trace_on()) {
 		wlr_log(WLR_DEBUG, "blur: own region %s %dx%d at %d,%d levels=%d"
 			"（损伤 %dx%d at %d,%d，%s %dx%d）",
 			vidow_view_title(view) != NULL ? vidow_view_title(view) : "?",
@@ -4814,7 +4849,7 @@ static bool decor_draw(struct vidow_server *server,
 	int dcw2 = fx->cur_slot != NULL ? fx->cur_slot->dec_content_w : fx->content_w;
 	int dch2 = fx->cur_slot != NULL ? fx->cur_slot->dec_content_h : fx->content_h;
 	int dpad2 = fx->cur_slot != NULL ? fx->cur_slot->dec_px_pad : fx->px_pad;
-	if (getenv("VIDOW_SPAN_TRACE") != NULL && bs != NULL) {
+	if (span_trace_on() && bs != NULL) {
 		wlr_log(WLR_INFO, "span: out=%s scale=%.2f target=%dx%d content=%dx%d origin=%d,%d viewport=%d,%d %dx%d region=%d,%d %dx%d tex=%p",
 			bs->out->name, scale, dw2, dh2, dcw2, dch2, ox, oy,
 			out_x, out_y, out_w, out_h, rg_x, rg_y, rg_w, rg_h, (void *)bs->tex);

@@ -1874,7 +1874,7 @@ static void view_pin_scale(struct vidow_view *view) {
 	 * 里直接跳过 —— 客户端不会每帧重算缓冲（见那里的注释）。 */
 	bool changed = view->pref_scale != want;
 	if (changed) {
-		if (getenv("VIDOW_FLIP") != NULL) {
+		if (vidow_flip_on()) {
 			vidow_flip_note("scale", view, want != 0);
 		}
 		view->pref_scale = want;
@@ -2446,7 +2446,7 @@ static void view_apply_clip_impl(struct vidow_view *view) {
 		 * 裁的是同一块节点里的显示范围，它看不见 —— 这里自己补一笔。 */
 		vidow_backdrop_damage_view_rect(view, NULL);
 	}
-	if (getenv("VIDOW_FLIP") != NULL) {
+	if (vidow_flip_on()) {
 		vidow_flip_note("clip", view, on);
 	}
 	view->fx.clip_on = on;
@@ -2697,7 +2697,7 @@ void vidow_view_render_pump(struct vidow_server *server,
 			view->pump_hidden_frames = 0;
 			view->pump_shown_frames = 0;
 			if (view->render_pumping) {
-				if (getenv("VIDOW_FLIP") != NULL) {
+				if (vidow_flip_on()) {
 					vidow_flip_note("pump", view, false);
 				}
 				view->render_pumping = false;
@@ -3008,7 +3008,7 @@ void vidow_view_set_parked(struct vidow_view *view, bool park) {
 	if (view->scene_parked == park) {
 		return;
 	}
-	if (getenv("VIDOW_FLIP") != NULL) {
+	if (vidow_flip_on()) {
 		vidow_flip_note("park", view, park);
 	}
 	view->scene_parked = park;
@@ -7014,7 +7014,7 @@ void view_map(struct wl_listener *listener, void *data) {
 		return;
 	}
 
-	if (getenv("VIDOW_FLIP") != NULL) {
+	if (vidow_flip_on()) {
 		vidow_flip_note("mapped", view, true);
 	}
 	view->mapped = true;
@@ -7249,7 +7249,7 @@ void view_unmap(struct wl_listener *listener, void *data) {
 		return;
 	}
 
-	if (getenv("VIDOW_FLIP") != NULL) {
+	if (vidow_flip_on()) {
 		vidow_flip_note("mapped", view, false);
 	}
 	view->mapped = false;
@@ -8666,7 +8666,7 @@ static void x11_drop_surface(struct vidow_view *view) {
 	x11_trace_view("drop-done", view, NULL);
 	/* Dissociate is not X11 destruction. Keep the view/layout identity, but
 	 * force the next association to replay map and rebuild scene placement. */
-	if (getenv("VIDOW_FLIP") != NULL) {
+	if (vidow_flip_on()) {
 		vidow_flip_note("mapped", view, false);
 	}
 	view->mapped = false;

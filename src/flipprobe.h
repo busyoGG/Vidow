@@ -13,4 +13,12 @@
 
 void vidow_flip_note(const char *what, void *obj, bool now);
 
+/* 探针开着吗（VIDOW_FLIP=1）。
+ *
+ * **调用方在热路径上（每帧 / 每次摆放）时用这个，别自己 getenv**：
+ * getenv 要遍历 environ 做 strcmp，原神那种 160fps 的满速提交下
+ * 每秒上千次，实测在 profile 里能占到 0.39%。环境变量进程起来之后不会变，
+ * 这里问一次就缓存住。 */
+bool vidow_flip_on(void);
+
 #endif

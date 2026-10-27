@@ -292,6 +292,38 @@ static bool key_pressed_elsewhere(struct vidow_server *server,
 /* 这个按键事件该不该放行给客户端（照 Hyprland 的 shareKeyFromAllKBs）。
  *
  * 放行 = true，同时把状态记好。调用方只在 true 时继续往下走。 */
+/* 输入热路径上的探针开关，只问一次环境变量。
+ *
+ * keyboard_key 是每次按键、focus_follows_mouse 是每次指针移动都会走的函数，
+ * getenv 的 environ 线性扫描在这里白烧（按住 W 连发时尤其明显）。环境变量
+ * 进程起来之后不会变，缓存住就行 —— 和 output.c / fx.c 那几处一个规矩。 */
+static bool probe_keys_on(void) {
+	static int done = 0, on = 0;
+	if (!done) {
+		on = probe_keys_on() ? 1 : 0;
+		done = 1;
+	}
+	return on != 0;
+}
+
+static bool key_trace_on(void) {
+	static int done = 0, on = 0;
+	if (!done) {
+		on = key_trace_on() ? 1 : 0;
+		done = 1;
+	}
+	return on != 0;
+}
+
+static bool hover_trace_on(void) {
+	static int done = 0, on = 0;
+	if (!done) {
+		on = hover_trace_on() ? 1 : 0;
+		done = 1;
+	}
+	return on != 0;
+}
+
 static bool input_key_share(struct vidow_keyboard *kb, uint32_t key,
 		bool pressed) {
 	/* 虚拟 / 注入键盘：不参与合并，各自独立生效。 */
@@ -419,16 +451,23 @@ static void keyboard_key(struct wl_listener *listener, void *data) {
 			event->keycode, event->state);
 		return;
 	}
-	if (getenv("VIDOW_PROBE_KEYS") != NULL) {
+	if (probe_keys_on()) {
 		char nb[64] = "?";
 		if (nsyms > 0) {
 			xkb_keysym_get_name(syms[0], nb, sizeof(nb));
 		}
-		wlr_log(WLR_INFO, "KEYPROBE evdev=%u syms=%d sym0=0x%04X(%s) "
-			"mods=0x%X alt=%d logo=%d bound=%d", event->keycode, nsyms,
-			nsyms > 0 ? syms[0] : 0, nb, mods,
-			!!(mods & WLR_MODIFIER_ALT), !!(mods & WLR_MODIFIER_LOGO),
-			nsyms > 0);
+		/* **队列延迟**：event->time_msec 是内核给这个事件打的时间戳
+		 * （libinput 原样带上来），和现在的单调时钟一比就是这个按键在
+		 * Vidow 里排了多久才被处理 —— 卡顿如果是「事件被堵在队列里」，
+		 * 这个数会明显跳；如果一直是 0~2ms，那卡顿在别处（渲染 / 客户端）。 */
+		int64_t now_ms = (int64_t)(vidow_now_ns() / 1000000);
+		int64_t lag = now_ms - (int64_t)event->time_msec;
+		wlr_log(WLR_INFO, "KEYPROBE evdev=%u %s lag=%lldms syms=%d "
+			"sym0=0x%04X(%s) mods=0x%X bound=%d",
+			event->keycode,
+			event->state == WL_KEYBOARD_KEY_STATE_PRESSED ? "down" : "up",
+			(long long)lag, nsyms,
+			nsyms > 0 ? syms[0] : 0, nb, mods, nsyms > 0);
 	}
 	/* config.lua 里 vidow.bind() 声明的键位（动作字符串见 README 的动作表）：
 	 * 工作区切换 / 窗口与列的方向移动 / 浮动 / 全屏 / 全景 / 起命令 / 切 tty …
@@ -447,7 +486,7 @@ static void keyboard_key(struct wl_listener *listener, void *data) {
 	 * 不受影响；这里只管「物理键盘之间」的去重。 */
 	{
 		bool shared = input_key_share(kb, event->keycode, pressed);
-		if (getenv("VIDOW_KEY_TRACE") != NULL) {
+		if (key_trace_on()) {
 			wlr_log(WLR_INFO, "KEYTRACE dev=%s key=%u %s -> %s held=%zu",
 				kb->device_name[0] ? kb->device_name : "(无)",
 				event->keycode, pressed ? "按下" : "松开",
@@ -1331,6 +1370,17 @@ static void focus_follows_mouse(struct vidow_server *server,
 		return;
 	}
 	/* 指针没离开过这个窗口（上一次压着的也是它）：不跟。 */
+	if (hover_trace_on()) {
+		wlr_log(WLR_INFO, "hover-trace: 光标 %.0f,%.0f hit=%s(%p) prev=%s(%p) "
+			"focused=%s(%p)", server->cursor->x, server->cursor->y,
+			hit != NULL && vidow_view_title(hit) ? vidow_view_title(hit) : "无",
+			(void *)hit,
+			prev_hover != NULL && vidow_view_title(prev_hover) ?
+				vidow_view_title(prev_hover) : "无", (void *)prev_hover,
+			server->focused != NULL && vidow_view_title(server->focused) ?
+				vidow_view_title(server->focused) : "无",
+			(void *)server->focused);
+	}
 	if (hit == prev_hover) {
 		return;
 	}
@@ -2779,6 +2829,13 @@ static void inject_key(struct vidow_server *server, uint32_t keycode,
 	/* 注入的键也走「X11 抓着键盘就给它」那条规矩（不然测试里没法验证抓取：
 	 * 真按键不好造，注入的键又不触发键位，正好拿来量「键送给了谁」）。 */
 	vidow_xwayland_grab_assert(server);
+	/* 探针：注入的键也打一条，test-key-latency.sh 用它数「到达了几个」。
+	 * 注入路径的时间戳是 inject_now_ms()（自己造的），拿不到内核时间戳，
+	 * 所以 lag 恒为 0 —— 那个数只在真键盘（keyboard_key）那边有意义。 */
+	if (probe_keys_on()) {
+		wlr_log(WLR_INFO, "KEYPROBE evdev=%u %s lag=0ms inject=1",
+			keycode, pressed ? "down" : "up");
+	}
 	wlr_seat_keyboard_notify_key(server->seat, inject_now_ms(), keycode,
 		pressed ? WL_KEYBOARD_KEY_STATE_PRESSED
 			: WL_KEYBOARD_KEY_STATE_RELEASED);

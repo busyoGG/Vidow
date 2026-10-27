@@ -2,6 +2,7 @@
 #include "flipprobe.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
@@ -19,6 +20,15 @@ struct flip_slot {
 static struct flip_slot flip_slots[512];
 static int flip_n;
 static long long flip_last_ns;
+
+bool vidow_flip_on(void) {
+	static int done = 0, on = 0;
+	if (!done) {
+		on = getenv("VIDOW_FLIP") != NULL ? 1 : 0;
+		done = 1;
+	}
+	return on != 0;
+}
 
 void vidow_flip_note(const char *what, void *obj, bool now) {
 	struct timespec ts;
