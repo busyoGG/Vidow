@@ -531,28 +531,46 @@ bool vidow_im_owns_keyboard(struct vidow_server *server,
 	/* **没有活跃输入上下文时不抢键盘。**
 	 *
 	 * im->active 是「合成器已经给输入法发过 activate」—— 也就是某个客户端的
-	 * 输入框正拿着焦点。没有输入框的时候，输入法拿到按键也没用：它没有可以
-	 * 插入文字的地方，只能决定「消费」还是「回注」。而 fcitx5 的 grab 是常驻
-	 * 的（实测 grab=true / active=false 同时成立），对游戏这种没有输入框的
-	 * 窗口**会把按键吞掉**，回注的时机和顺序都不受控。
+	 * 输入框正拿着焦点。没有输入框的时候，输入法拿到按键也没有用：它没有
+	 * 可以插入文字的地方，只能决定「消费」还是「回注」，而 fcitx5 的 grab
+	 * 是常驻的（实测 grab=true / active=false 同时成立）。
 	 *
-	 * 实测（2026-10-28 00:52~00:57，xtest-keys 记录 X11 客户端真正收到的
-	 * 事件，用 ydotool 按住 A+W 2.2 秒）：
-	 *   输入法 keyboard-us（英文键盘） → 56 个事件，正常
-	 *   输入法 rime（中文）           → **0 个事件**（按键全被吞掉）
-	 *   fcitx5-remote -c（关闭输入法） → 56 个事件，正常
+	 * **真正的伤害不是「吞键」，是 fcitx5 回注时自己合成重复。**
+	 * 用 VIDOW_KEY_TRACE 看 vidow 收到的按键（2026-10-28 00:36，输入法是
+	 * keyboard-us 英文键盘，ydotool 按住 A+W 1.2 秒）：
+	 *
+	 *   00:36:24.614 dev=ydotoold virtual device key=30 按下 → 放行
+	 *   00:36:24.615 dev=(无)                    key=30 按下 → 放行   ← 回注
+	 *   00:36:24.626 dev=ydotoold virtual device key=17 按下 → 放行
+	 *   00:36:24.627 dev=(无)                    key=17 按下 → 放行   ← 回注
+	 *   00:36:25.224 dev=(无) key=17 松开 → 放行
+	 *   00:36:25.224 dev=(无) key=17 按下 → 放行    ← 每 40ms 一对
+	 *   00:36:25.264 dev=(无) key=17 松开 → 放行
+	 *   00:36:25.264 dev=(无) key=17 按下 → 放行
+	 *
+	 * `dev=(无)` 就是 fcitx5 的 wl_virtual_keyboard_v1。它拿到 repeat_info
+	 * （rate=25 / delay=600）之后**自己合成重复**，而且发的是「松开+按下」
+	 * 成对事件，不是纯按下。这些事件走的是正常的按键通道，XWayland 会把
+	 * 它们当成**真的松开**转给 X 客户端 —— XkbSetDetectableAutoRepeat() 只
+	 * 能过滤 X server 自己合成的 autorepeat，过滤不了从 Wayland 送进来的
+	 * 假 release。
+	 *
+	 * 于是游戏看到：A 一直按着、W 每 40ms 松开一次 → 角色在「斜走」和
+	 * 「直走」之间摆 —— 用户报的「aw 反复交换触发、角色在抖动」。
+	 *
+	 * 用 xtest-keys 量到的对照（ydotool 按住 A+W 2.2 秒）：
+	 *   输入法 keyboard-us（英文，会回注） → 56 个事件（但夹着假 release）
+	 *   输入法 rime（中文，会吞键）       → **0 个事件**
+	 *   fcitx5-remote -c（关闭）          → 56 个事件，纯干净
 	 * 三种状态下 grab 都是 true、active 都是 false —— **协议层看不出区别**，
-	 * 差别全在 fcitx5 内部（它只有在 rime 那种「要组字」的输入法下才消费
-	 * 按键，英文键盘是纯透传）。
-	 *
-	 * 所以不能靠 fcitx5 自觉。游戏是 X11 程序，它看到的就是这 0 个事件 ——
-	 * 角色要么不动，要么按 fcitx5 回注的时序断断续续地动（用户报的
-	 * 「aw 反复交换触发、角色在抖动」）。
+	 * 差别全在 fcitx5 内部。所以不能靠 fcitx5 自觉，也不能要求用户每次手动
+	 * -c 或者切英文（用户反馈「我一直都是切到英文玩的」，照样抖）。
 	 *
 	 * 判据用 im->active 而不是 grab：grab 是输入法单方面抓的，fcitx5 抓到
 	 * 就一直不放；active 才是「现在真有输入框」这个事实。有输入框时行为
 	 * 完全不变（照旧全部转发给输入法），没输入框时按键直接到客户端 ——
-	 * 不管当前挂的是 rime 还是 keyboard-us，也不管用户有没有手动 -c。
+	 * 不经过 fcitx5 就不会有它合成的假 release，X server 用自己那套标准
+	 * autorepeat，客户端的 detectable 能正常过滤。
 	 *
 	 * 代价：没有输入框时输入法收不到按键，它自己的全局快捷键（fcitx5 的
 	 * Ctrl+Space 之类）不再由这条路触发。用户已经有
