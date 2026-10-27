@@ -4,10 +4,13 @@
 #include "server.h"
 #include "sessionlock.h"
 
+#include <limits.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <linux/input-event-codes.h>
@@ -292,36 +295,45 @@ static bool key_pressed_elsewhere(struct vidow_server *server,
 /* 这个按键事件该不该放行给客户端（照 Hyprland 的 shareKeyFromAllKBs）。
  *
  * 放行 = true，同时把状态记好。调用方只在 true 时继续往下走。 */
-/* 输入热路径上的探针开关，只问一次环境变量。
+/* 输入热路径上的探针开关。
  *
  * keyboard_key 是每次按键、focus_follows_mouse 是每次指针移动都会走的函数，
- * getenv 的 environ 线性扫描在这里白烧（按住 W 连发时尤其明显）。环境变量
- * 进程起来之后不会变，缓存住就行 —— 和 output.c / fx.c 那几处一个规矩。 */
-static bool probe_keys_on(void) {
-	static int done = 0, on = 0;
-	if (!done) {
-		on = getenv("VIDOW_PROBE_KEYS") != NULL ? 1 : 0;
-		done = 1;
+ * getenv 的 environ 线性扫描在这里白烧（按住 W 连发时尤其明显）。
+ *
+ * 开关本体：环境变量（进程起来就定死）或 /tmp 文件（**不用重启**，和
+ * xtrace.c 那套一个规矩）。排查现场问题时进程往往不能重启 —— 用户正开着
+ * 游戏 / 开着会话 —— 所以文件那条路是必需的。
+ *
+ * 一秒缓存：按住 W 连发时这个函数每秒被问几十次，每次都 stat 一次系统调用
+ * 不划算。 */
+static bool switch_on(const char *env, const char *path) {
+	if (getenv(env) != NULL) {
+		return true;
 	}
-	return on != 0;
+	static const char *last_env = NULL;
+	static time_t checked = 0;
+	static bool cached = false;
+	time_t now = time(NULL);
+	if (last_env == env && now == checked) {
+		return cached;
+	}
+	last_env = env;
+	checked = now;
+	struct stat st;
+	cached = stat(path, &st) == 0;
+	return cached;
+}
+
+static bool probe_keys_on(void) {
+	return switch_on("VIDOW_PROBE_KEYS", "/tmp/vidow-probe-keys");
 }
 
 static bool key_trace_on(void) {
-	static int done = 0, on = 0;
-	if (!done) {
-		on = getenv("VIDOW_KEY_TRACE") != NULL ? 1 : 0;
-		done = 1;
-	}
-	return on != 0;
+	return switch_on("VIDOW_KEY_TRACE", "/tmp/vidow-key-trace");
 }
 
 static bool hover_trace_on(void) {
-	static int done = 0, on = 0;
-	if (!done) {
-		on = getenv("VIDOW_HOVER_TRACE") != NULL ? 1 : 0;
-		done = 1;
-	}
-	return on != 0;
+	return switch_on("VIDOW_HOVER_TRACE", "/tmp/vidow-hover-trace");
 }
 
 static bool input_key_share(struct vidow_keyboard *kb, uint32_t key,
@@ -575,22 +587,16 @@ static void keyboard_key(struct wl_listener *listener, void *data) {
 		 * 这个判据（见上面的 modifiers 分支），只有按键这条漏了 —— 于是
 		 * fcitx5 一抓键盘，按键被**丢掉**（既不到它也不到客户端）= 用户报的
 		 * 「启动了 Fcitx5 之后键盘都不能用了」。用同一个判据，锁定守卫也一起有。 */
-		if (vidow_im_owns_keyboard(server, kb)) {
-			vidow_im_grab_send_key(event->time_msec, event->keycode,
-				event->state == WL_KEYBOARD_KEY_STATE_PRESSED);
-			return;
-		}
+		/* 这里以前还有一段 vidow_im_owns_keyboard 判断 + vidow_im_grab_send_key
+		 * 的兜底 —— 是死代码：上面那个 to_im 分支（同一个判据）已经把它拦住了，
+		 * 能走到这儿的必然 to_im == false。删掉，免得下次读代码时以为输入法
+		 * 有两条分发路径。 */
 		wlr_seat_set_keyboard(server->seat, kb->wlr_keyboard);
 		wlr_seat_keyboard_notify_key(server->seat, event->time_msec,
 			event->keycode, event->state);
-		/* 自动重复：按下就排上，松开就停。虚拟键盘 / 输入法回注也走
-		 * 这里 —— 它们按住的键同样该重复（wtype 打字不会用到，但游戏
-		 * 手柄映射的虚拟键会）。 */
-		if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
-			keyboard_repeat_start(kb, event->keycode, event->time_msec);
-		} else {
-			keyboard_repeat_stop(kb);
-		}
+		/* 这里**不要**再合成重复：见文件上方「按键自动重复」那段说明。
+		 * repeat_rate / repeat_delay 已经通过 wl_keyboard.repeat_info 报给
+		 * 客户端（含 Xwayland），重复由它们自己做。 */
 	}
 }
 
@@ -602,10 +608,15 @@ static void keyboard_destroy(struct wl_listener *listener, void *data) {
 	wl_list_remove(&kb->key.link);
 	wl_list_remove(&kb->destroy.link);
 	wl_list_remove(&kb->link);
-	if (kb->repeat_timer != NULL) {
-		wl_event_source_remove(kb->repeat_timer);
-		kb->repeat_timer = NULL;
-	}
+
+	/* **按键状态跟着这块键盘一起消失。**
+	 *
+	 * 不清的话它按着的键会永远算「按着」：key_pressed_elsewhere() 还把它
+	 * 算在名单里（不对，已经从链表摘了）—— 真正的风险是拔键盘时正按着的
+	 * 那几个键，别的键盘以后按同一个键会被判「重复」丢掉，按键直接失灵。
+	 * 链表已经摘掉了，这里清零只是明确语义。 */
+	kb->pressed_len = 0;
+	kb->im_len = 0;
 
 	/* 别让 seat 指着一个马上要释放的键盘 */
 	struct vidow_server *server = kb->server;
@@ -1291,6 +1302,21 @@ static void focus_follows_mouse(struct vidow_server *server,
 			hit->mini == VIDOW_MINI_ICON)) {
 		return;
 	}
+	/* **弹出物也不跟。** 和上面小窗同一个理由、同一个位置。
+	 *
+	 * X11 的菜单 / 提示是 override-redirect 窗口，它靠 X 自己的 grab 收指针
+	 * 和键盘，从来不是"焦点窗口"。光标扫过菜单时这里一跟，焦点就从父窗口
+	 * 跳到菜单上，Steam 那边看到菜单被激活 + 指针已经不在菜单里，立刻把
+	 * 菜单销毁 —— 用户报的"鼠标移上去菜单就关了"。
+	 *
+	 * 实测（2026-10-27 00:16:16–21，连按右键 5 次）每次都是：
+	 *   x11: 新窗口 (无题)（override-redirect，弹出物…）
+	 *   焦点: 好友列表 -> (无题)      ← 这里跟过去的
+	 *   焦点: (无) -> 好友列表
+	 * view_map() 那边早有"弹出物不抢焦点"（见那条注释），悬停这条路漏了。 */
+	if (hit != NULL && hit->popup) {
+		return;
+	}
 	if (warp_in_progress) {
 		/* 这一趟指针位移是「键盘换焦点顺手把光标带过去」造成的（见
 		 * vidow_warp_cursor_to_focus），不是用户在挪鼠标。 */
@@ -1746,9 +1772,14 @@ void vidow_pointer_motion(struct vidow_server *server, uint32_t time_msec) {
 	 * 「指针被抓着就不跟」一个意思）。 */
 	focus_follows_mouse(server, hit);
 
-	if (hit != NULL && hit->kind == VIDOW_VIEW_X11) {
-		/* 诊断用：把命中判定用到的每一个数都打出来（用户报「只有一半能
-		 * 交互」，需要知道是哪一层的数不对）。 */
+	/* **只在 VIDOW_X11_TRACE 打开时打。**
+	 *
+	 * 这行原来是无条件的，而它挂在指针移动的热路径上：每次 motion 都要
+	 * 走一遍 vidow_view_title() + vidow_view_hit_scale()，再写一行同步日志
+	 * 到文件。游戏里鼠标一直在动，实测一次会话能刷出 3800+ 行
+	 * （日志里 input.c:1450 占比最高），事件循环被写盘拖住 —— 用户报的
+	 * 「开游戏很卡」「按键 stutter」都和这条有关。 */
+	if (hit != NULL && hit->kind == VIDOW_VIEW_X11 && vidow_xtrace_on()) {
 		struct wlr_scene_buffer *hnode = hit->scene_surface != NULL ?
 			hit->scene_surface->buffer : NULL;
 		struct wlr_surface *hsurf = vidow_view_surface(hit);
