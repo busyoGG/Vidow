@@ -156,79 +156,183 @@ static void input_note_key_press(struct vidow_server *server) {
 	}
 }
 
-/* ------------------------------------------------------ 按键自动重复 */
-
-/* 定义在文件后面（注入那段）。这里只是重复定时器要用它取时间戳。 */
-static uint32_t inject_now_ms(void);
-
-/* 定时器到点了：把当前按住的键再发一遍（press + release 一对）。
+/* ------------------------------------------------------ 按键自动重复
  *
- * 为什么成对发：这是 X11 autorepeat 的原生形式。Xwayland 收到 Wayland 的
- * press 会翻译成 X 的 KeyPress，收到 release 翻译成 KeyRelease —— 它不做
- * 「按住」这个概念，只做逐条翻译。所以「重复」在我们这边就是「再按一次」。
+ * **合成器不合成重复。** 这里以前有一整套定时器（keyboard_repeat_cb /
+ * keyboard_repeat_start / keyboard_repeat_stop / focus_is_x11），按住键就按
+ * repeat_rate 补发 press+release 对，只给 X11 客户端发。删掉的原因：那套的
+ * 前提是错的。
  *
- * 客户端如果调过 XkbSetDetectableAutoRepeat（大多数游戏 / SDL / GLFW 都调），
- * X 服务器会把中间的 KeyRelease 吃掉，只让它看见连续 KeyPress —— 正是它要的。
- * 没调的（老式 Xlib 程序）会自己判断「release 紧接着同一个键的 press = 重复」。
- * 两种都正确，这也是 X.Org 自己实现 autorepeat 的做法。 */
-static int keyboard_repeat_cb(void *data) {
-	struct vidow_keyboard *kb = data;
-	struct vidow_server *server = kb->server;
-	if (kb->repeat_keycode < 0 || server->seat == NULL) {
-		return 0;
-	}
-	/* 焦点没了就别再往里塞键（X11 那边会当成发错窗口）。 */
-	if (server->seat->keyboard_state.focused_surface == NULL) {
-		kb->repeat_keycode = -1;
-		return 0;
-	}
-	uint32_t now = inject_now_ms();
-	if (!kb->repeat_started) {
-		/* 初始延迟过了，这一发是第一下重复。 */
-		kb->repeat_started = true;
-	}
-	uint32_t keycode = (uint32_t)kb->repeat_keycode;
-	wlr_seat_set_keyboard(server->seat, kb->wlr_keyboard);
-	wlr_seat_keyboard_notify_key(server->seat, now, keycode,
-		WL_KEYBOARD_KEY_STATE_PRESSED);
-	wlr_seat_keyboard_notify_key(server->seat, now, keycode,
-		WL_KEYBOARD_KEY_STATE_RELEASED);
+ * 前提写的是「Xwayland 等合成器把重复键送过来，自己不会重复」。查 Xwayland
+ * 源码（hw/xwayland/xwayland-input.c）直接推翻了它：
+ *
+ *     static void
+ *     keyboard_handle_repeat_info (void *data, struct wl_keyboard *keyboard,
+ *                                  int32_t rate, int32_t delay)
+ *     {
+ *         ...
+ *         ctrl->repeat_delay = delay;
+ *         ctrl->repeat_interval = 1000 / rate;
+ *         XkbSetRepeatKeys(dev, -1, AutoRepeatModeOn);
+ *     }
+ *
+ * 也就是说 Xwayland 收到 wl_keyboard.repeat_info 之后，**由 X server 内核
+ * 自己产生重复 KeyPress**（那是 X11 的原生行为）。我们再用 wl_seat 往里塞
+ * 一份 press+release，等于两路重复叠加：
+ *
+ *   - 塞进去的每一下都是「松开再按下」，X 侧看到的是一串 KeyRelease
+ *   - 用户实测：全屏游戏里按住 Alt 呼出鼠标，一秒后 Alt 开始反复释放，
+ *     鼠标被反复抢捕获，**一直卡在屏幕中间**
+ *   - 同理所有按键都会乱：打字丢字符、快慢不均、连发双击
+ *
+ * 正确的做法就是**什么都不做**：repeat_rate / repeat_delay 通过
+ * wlr_keyboard_set_repeat_info() 交给 wl_keyboard.repeat_info
+ * （见下面 keyboard_apply_config），Wayland 原生客户端和 Xwayland 各自按
+ * 这个信息自己重复。Hyprland 也是这么做的 —— 它整个代码库里没有任何
+ * autorepeat 合成逻辑。 */
 
-	int rate = server->config.repeat_rate;
-	if (rate <= 0) {
-		kb->repeat_keycode = -1;
-		return 0;
+/* ---------------------------------------------------- 跨键盘按键状态合并
+ *
+ * **同一把键盘的多个 event 节点会各报一遍同一个按键。** 实测这把
+ * SKN Wireless Link 有四个节点，其中两个都带按键能力且范围重叠：
+ *   event10 "SKN  Wireless Link "           报 16 个键
+ *   event11 "SKN  Wireless Link  Keyboard"  报 282 个键（包含上面那批）
+ * 按一下 d，libinput 从两个节点各报一次 —— 不分青红皂白转发给客户端，
+ * Xwayland 游戏里就是「按键反复按下 / 释放」、人物动一下停一下。
+ *
+ * 按设备名 / 设备 ID 去重都不可靠（名字不同；sysfs 路径在虚拟键盘上没有）。
+ * 照 Hyprland 的做法（InputManager.cpp 的 shareKeyFromAllKBs + IKeyboard 的
+ * updatePressed）：**承认每块键盘都是独立设备，在分发这一步合并状态。**
+ *
+ *   - 每块键盘各自记「我按着哪些键」（vidow_keyboard.pressed）。
+ *   - 一个按下事件：如果**别的**键盘已经按着同一个键，就是重复的，丢掉。
+ *   - 一个松开事件：如果**别的**键盘还按着同一个键，不能松（否则另一个节点
+ *     还没松，客户端就收到了一次假的释放）—— 丢掉，等最后一个松开。
+ *
+ * 和 Hyprland 的区别：它还有第三层「seat 已发过的键」表（m_pressed），这里
+ * 用每块键盘的状态就够了 —— 第二层已经保证「同一个键在按下期间只会被放行
+ * 一次、在全部松开时才放行一次释放」，再叠一层是重复。 */
+static bool key_state_contains(const struct vidow_keyboard *kb, uint32_t key) {
+	for (size_t i = 0; i < kb->pressed_len; i++) {
+		if (kb->pressed[i] == key) {
+			return true;
+		}
 	}
-	wl_event_source_timer_update(kb->repeat_timer, 1000 / rate);
-	return 0;
+	return false;
 }
 
-/* 停掉重复（松键 / 焦点跑了 / 键盘没了）。 */
-static void keyboard_repeat_stop(struct vidow_keyboard *kb) {
-	if (kb->repeat_timer != NULL) {
-		wl_event_source_timer_update(kb->repeat_timer, 0);
+static void key_state_add(struct vidow_keyboard *kb, uint32_t key) {
+	if (key_state_contains(kb, key)) {
+		return;
 	}
-	kb->repeat_keycode = -1;
-	kb->repeat_started = false;
+	if (kb->pressed_len >= sizeof(kb->pressed) / sizeof(kb->pressed[0])) {
+		/* 满了：挤掉最旧的一条。只影响「同时按住三十几个键」的极端情况，
+		 * 而且丢的是状态记录不是按键事件本身。 */
+		memmove(&kb->pressed[0], &kb->pressed[1],
+			(kb->pressed_len - 1) * sizeof(kb->pressed[0]));
+		kb->pressed_len--;
+	}
+	kb->pressed[kb->pressed_len++] = key;
 }
 
-/* 按下某个键：安排重复。delay 是第一次重复的等待时间（config.repeat_delay）。 */
-static void keyboard_repeat_start(struct vidow_keyboard *kb, uint32_t keycode,
-		uint32_t time_msec) {
-	if (kb->repeat_timer == NULL) {
-		return;
+static void key_state_remove(struct vidow_keyboard *kb, uint32_t key) {
+	for (size_t i = 0; i < kb->pressed_len; i++) {
+		if (kb->pressed[i] == key) {
+			memmove(&kb->pressed[i], &kb->pressed[i + 1],
+				(kb->pressed_len - i - 1) * sizeof(kb->pressed[0]));
+			kb->pressed_len--;
+			return;
+		}
 	}
-	int rate = kb->server->config.repeat_rate;
-	int delay = kb->server->config.repeat_delay;
-	/* rate = 0 是「关掉重复」（X 那边也是这个约定：xset r rate 0 = 关）。 */
-	if (rate <= 0) {
-		keyboard_repeat_stop(kb);
-		return;
+}
+
+/* 这条按下的**去向**记账：送给了输入法就记下来，松开时必须还走那条路。
+ * 见 server.h 的 im_keys 那段说明（press/release 分家会让键卡在按住状态）。 */
+static bool im_route_take(struct vidow_keyboard *kb, uint32_t key) {
+	for (size_t i = 0; i < kb->im_len; i++) {
+		if (kb->im_keys[i] == key) {
+			memmove(&kb->im_keys[i], &kb->im_keys[i + 1],
+				(kb->im_len - i - 1) * sizeof(kb->im_keys[0]));
+			kb->im_len--;
+			return true;
+		}
 	}
-	kb->repeat_keycode = (int32_t)keycode;
-	kb->repeat_time_msec = time_msec;
-	kb->repeat_started = false;
-	wl_event_source_timer_update(kb->repeat_timer, delay > 0 ? delay : 1);
+	return false;
+}
+
+static void im_route_add(struct vidow_keyboard *kb, uint32_t key) {
+	if (im_route_take(kb, key)) {
+		return; /* 已经记过了（同一条按下重复上报） */
+	}
+	if (kb->im_len == sizeof(kb->im_keys) / sizeof(kb->im_keys[0])) {
+		memmove(&kb->im_keys[0], &kb->im_keys[1],
+			(kb->im_len - 1) * sizeof(kb->im_keys[0]));
+		kb->im_len--;
+	}
+	kb->im_keys[kb->im_len++] = key;
+}
+
+/* 别的键盘还按着这个键吗（不含 kb 自己）。虚拟 / 注入键盘不参与 —— 它们
+ * 是输入法回注和 IPC 造出来的，本来就该各自独立生效（用户按的键和输入法
+ * 注入的键不冲突）。 */
+static bool key_pressed_elsewhere(struct vidow_server *server,
+		const struct vidow_keyboard *self, uint32_t key) {
+	struct vidow_keyboard *other;
+	wl_list_for_each(other, &server->keyboards, link) {
+		if (other == self || other->virtual != NULL || other->inject) {
+			continue;
+		}
+		if (key_state_contains(other, key)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/* 这个按键事件该不该放行给客户端（照 Hyprland 的 shareKeyFromAllKBs）。
+ *
+ * 放行 = true，同时把状态记好。调用方只在 true 时继续往下走。 */
+static bool input_key_share(struct vidow_keyboard *kb, uint32_t key,
+		bool pressed) {
+	/* 虚拟 / 注入键盘：不参与合并，各自独立生效。 */
+	if (kb->virtual != NULL || kb->inject) {
+		return true;
+	}
+	if (pressed) {
+		/* 自己已经按着（同一个节点重复报）：丢掉。 */
+		if (key_state_contains(kb, key)) {
+			return false;
+		}
+		/* **别的节点按着也照放（对齐 Hyprland 的 shareKeyFromAllKBs）。**
+		 *
+		 * Hyprland 里 press 那条是直接返回 true 的：
+		 *
+		 *     bool finalState = pressed;
+		 *     if (finalState) return finalState;   // press 不做跨键盘去重
+		 *     for (kb : m_keyboards) { if (kb->getPressed(key)) return true; }
+		 *
+		 * 只有**松开**才问「还有别的键盘按着这个键吗」。区别在于两块键盘
+		 * 真的各按了一个同名键时：Hyprland 两个按下都放行（客户端收到
+		 * 两次 press），Vidow 以前把第二个按下吞掉、松手时却仍然按「还有
+		 * 别人按着」吞掉第一个松开 —— 客户端那边这个键永远按着，600ms 后
+		 * 按 repeat_info 自己开始自动重复，就是「按下一秒后反复按下释放」。
+		 *
+		 * 真正的重复上报（同一把键盘的两个 event 节点）由**上面那条自己
+		 * 按着**判据拦掉；跨节点的重复上报本来就不该靠这条兜底 —— 靠它
+		 * 反而会把「两块键盘各按各的」误伤成状态错乱。 */
+		key_state_add(kb, key);
+		return true;
+	}
+	/* 松开：自己没按着 = 重复的松开（或者按下时被丢掉了），丢掉。 */
+	if (!key_state_contains(kb, key)) {
+		return false;
+	}
+	/* 别的节点还按着：还没到真的松开，先记下自己松了，等最后一个。 */
+	key_state_remove(kb, key);
+	if (key_pressed_elsewhere(kb->server, kb, key)) {
+		return false;
+	}
+	return true;
 }
 
 static void keyboard_key(struct wl_listener *listener, void *data) {
@@ -332,6 +436,28 @@ static void keyboard_key(struct wl_listener *listener, void *data) {
 	/* 按下和松开都要过绑定表：「松开才触发」的绑定和「单独一个修饰键」都靠松开
 	 * 那一下收尾（见 keybind.c 的 pending_release）。 */
 	bool pressed = event->state == WL_KEYBOARD_KEY_STATE_PRESSED;
+
+	/* **跨键盘按键状态合并（照 Hyprland）。**
+	 *
+	 * 放在绑定表之前：重复上报的按键连快捷键都不该触发两次（同一把键盘的
+	 * 两个 event 节点各报一次，按一下 Super+Q 会关两个窗口）。见
+	 * input_key_share 上面那段实测数据。
+	 *
+	 * 锁定 / 输入法 / MRU / overview 那几条路都在上面早退了，各自的语义
+	 * 不受影响；这里只管「物理键盘之间」的去重。 */
+	{
+		bool shared = input_key_share(kb, event->keycode, pressed);
+		if (getenv("VIDOW_KEY_TRACE") != NULL) {
+			wlr_log(WLR_INFO, "KEYTRACE dev=%s key=%u %s -> %s held=%zu",
+				kb->device_name[0] ? kb->device_name : "(无)",
+				event->keycode, pressed ? "按下" : "松开",
+				shared ? "放行" : "丢弃", kb->pressed_len);
+		}
+		if (!shared) {
+			return;
+		}
+	}
+
 	for (int i = 0; i < nsyms; i++) {
 		handled = vidow_keybind_key(server, syms[i], pressed, mods,
 			inhibited) || handled;
@@ -373,8 +499,26 @@ static void keyboard_key(struct wl_listener *listener, void *data) {
 
 	/* 输入法要吃原始按键，由它决定消费还是用虚拟键盘回注。只对「被抢走的
 	 * 那个」键盘这么做：输入法回注用的是它自己的虚拟键盘，否则会转圈。
-	 * 我们自己的快捷键（Super+…）在上面已经处理过了，仍然能用。 */
-	if (!handled && vidow_im_owns_keyboard(server, kb)) {
+	 * 我们自己的快捷键（Super+…）在上面已经处理过了，仍然能用。
+	 *
+	 * **松开跟着按下时那条路走**，不现判。按住一个键的这段时间里 fcitx5
+	 * 完全可能抢走 / 放掉键盘，现判就会让 press 和 release 分家：按下给了
+	 * 客户端、松开被吞进输入法，客户端那边这个键永远按着 —— 600ms 后它按
+	 * repeat_info 开始自动重复，就是用户报的「按下一秒后反复按下释放」。
+	 * 记账见 server.h 的 im_keys。 */
+	bool to_im = pressed ? vidow_im_owns_keyboard(server, kb) :
+		im_route_take(kb, event->keycode);
+	/* 按下时输入法还抓着、松开时已经放掉了：vidow_im_key 在 grab == NULL 时
+	 * 直接 return，这个松开就**谁都没收到**。改送客户端 —— 客户端可能没收到
+	 * 对应的按下（那次也给了输入法），多一个孤立 release 无害；丢掉才是让
+	 * 状态对不上。 */
+	if (to_im && server->im.grab == NULL) {
+		to_im = false;
+	}
+	if (pressed && to_im) {
+		im_route_add(kb, event->keycode);
+	}
+	if (!handled && to_im) {
 		vidow_im_key(server, event->time_msec, event->keycode, event->state);
 		return;
 	}
@@ -481,10 +625,48 @@ static void server_add_keyboard(struct vidow_server *server,
 	if (kb == NULL) {
 		return;
 	}
+
+	/* **同一个物理键盘的多个 event 节点：只接一个。**
+	 *
+	 * 有些键盘（用户这把 SKN Wireless Link）固件把按键同时暴露在两个
+	 * /dev/input/event* 节点上 —— 实测 event10 和 event11 的
+	 * capabilities/key 都声明支持 evdev 32（d 键），按一下 d，libinput 从
+	 * 两个节点各报一次，于是 keyboard_key 被调两遍，日志里同一条 KEYPROBE
+	 * （时间戳、lag、mods 全都一模一样）出现两次。用户报的「键盘 stutter，
+	 * 所有按键都会」就是它：一个按键被当成两次按下，游戏里就是人物动一下、
+	 * 停一下。
+	 *
+	 * 判据用设备名（/sys/class/input/eventN/device/name）：同名 = 同一把
+	 * 键盘的不同接口（名称里没有 Keyboard 的那个通常是媒体键 / 组合键接口）。
+	 * 第一个接入的留下，后面的跳过。**虚拟键盘和注入键盘不参与**
+	 * （device == NULL 或 virtual != NULL 全都放行）：输入法会反复建虚拟
+	 * 键盘，它们本来就没有物理节点，名字也可能重复。
+	 *
+	 * 只比同类设备（都是键盘），所以不会误伤同名的鼠标。 */
+	/* **不再按设备名 / 设备 ID 去重。**
+	 *
+	 * 同一把键盘的多个 event 节点（实测这把 SKN Wireless Link 有四个，
+	 * event10 报 16 个键、event11 报 282 个键、范围重叠）本来就都会接入，
+	 * 靠名字判不可靠（两个节点名字不同："SKN  Wireless Link " 和
+	 * "SKN  Wireless Link  Keyboard"）。真正的去重放在按键分发那一步 ——
+	 * 照 Hyprland 的 shareKeyFromAllKBs：每块键盘各自记按下的键，分发前
+	 * 问一遍「还有别的键盘按着这个键吗」，重复的按下 / 松开直接丢掉。
+	 * 见 input_key_share()。 */
+	if (device != NULL && virtual == NULL) {
+		const char *dname = device->name != NULL ? device->name : "";
+		if (dname[0] != '\0') {
+			snprintf(kb->device_name, sizeof(kb->device_name), "%s", dname);
+		}
+	}
+
 	kb->server = server;
 	kb->wlr_keyboard = wlr_keyboard;
 	kb->virtual = virtual;
 	kb->inject = inject;
+	if (device != NULL && virtual == NULL && device->name != NULL) {
+		snprintf(kb->device_name, sizeof(kb->device_name), "%s",
+			device->name);
+	}
 
 	/* 虚拟键盘自己会送 keymap（协议要求），别用我们的覆盖它：输入法回注的
 	 * 按键是按它自己的 keymap 发的，覆盖了就会解释成别的键（ESC 关窗口）。 */
@@ -493,16 +675,34 @@ static void server_add_keyboard(struct vidow_server *server,
 	 * 实测 fcitx5 就不送（`vidowmsg seats` 里 layout: null），空 keymap 让客户端
 	 * 翻译不出任何键，表现就是「输入法开着，一个字都打不出来，只有合成器自己
 	 * 的快捷键还能用」——用户报的就是这个。 */
-	struct xkb_context *context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+	static struct xkb_keymap *default_keymap = NULL;
 	bool need_keymap = virtual == NULL || wlr_keyboard->keymap == NULL;
-	if (context != NULL && need_keymap) {
-		struct xkb_keymap *keymap = xkb_keymap_new_from_names(context, NULL,
-			XKB_KEYMAP_COMPILE_NO_FLAGS);
-		if (keymap != NULL) {
-			wlr_keyboard_set_keymap(wlr_keyboard, keymap);
-			xkb_keymap_unref(keymap);
+	if (need_keymap) {
+		/* **编译一次就够，之后复用。**
+		 *
+		 * 原来每次接入键盘都 xkb_context_new + xkb_keymap_new_from_names，
+		 * 也就是重新跑一遍完整的 XKB 编译。fcitx5 建的虚拟键盘不送 keymap
+		 * （见上面那段），所以它每接入一次就得在这里编一份 —— 实测一次会话
+		 * 74 次接入、218 次 xkbcomp 编译（日志里成片的
+		 * 「XKEYBOARD keymap compiler (xkbcomp) reports」），中位间隔 2 秒，
+		 * 还有 0~1 秒的密集连发。编译期间事件循环被占住，正好按下的键就
+		 * 卡住了 —— 用户报的「按键 stutter，x 自己 repeat 也有概率 stutter」。
+		 *
+		 * keymap 是只读的、可以共享（wlr_keyboard_set_keymap 会自己 ref），
+		 * 编译结果又只跟编译时用的 RMLVO 默认值有关，所以进程内留一份
+		 * static 引用就够，不随键盘数量增长。 */
+		if (default_keymap == NULL) {
+			struct xkb_context *context =
+				xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+			if (context != NULL) {
+				default_keymap = xkb_keymap_new_from_names(context, NULL,
+					XKB_KEYMAP_COMPILE_NO_FLAGS);
+				xkb_context_unref(context);
+			}
 		}
-		xkb_context_unref(context);
+		if (default_keymap != NULL) {
+			wlr_keyboard_set_keymap(wlr_keyboard, default_keymap);
+		}
 	}
 	/* 重复速率 / 延迟和 NumLock 都从配置来（默认 25 / 600 / 不点亮 = 改前行为）。 */
 	keyboard_apply_config(server, wlr_keyboard);
@@ -514,17 +714,25 @@ static void server_add_keyboard(struct vidow_server *server,
 	kb->destroy.notify = keyboard_destroy;
 	wl_signal_add(&device->events.destroy, &kb->destroy);
 
-	/* 自动重复的定时器（见 keyboard_repeat_cb 的注释：wlroots 不做重复，
-	 * 但 Xwayland 等着我们做）。 */
-	kb->repeat_keycode = -1;
-	kb->repeat_timer = wl_event_loop_add_timer(
-		wl_display_get_event_loop(server->display), keyboard_repeat_cb, kb);
-	if (kb->repeat_timer == NULL) {
-		wlr_log(WLR_ERROR, "键盘: 重复定时器建不起来，按住键不会重复");
-	}
-
 	wl_list_insert(&server->keyboards, &kb->link);
-	wlr_seat_set_keyboard(server->seat, wlr_keyboard);
+	/* **虚拟键盘接入时不要抢 seat 键盘。**
+	 *
+	 * 以前这里无条件 set_keyboard，而 fcitx5 每建一个输入上下文就新建一块
+	 * 虚拟键盘（实测一次会话 95 次 attach）。每次接入都把 seat 键盘切到虚拟
+	 * 键盘上，物理键盘按下一个键时 keyboard_key 又切回来（见下面的
+	 * wlr_seat_set_keyboard(server->seat, kb->wlr_keyboard)）—— 一来一回，
+	 * 每次切换 wlr_seat_set_keyboard 都要给所有客户端重发 keymap +
+	 * repeat_info（wlroots types/seat/wlr_seat_keyboard.c：键盘不同就重发）。
+	 *
+	 * 客户端（游戏 / XWayland）收到成片的 keymap 重发，按键状态机跟着抖：
+	 * 用户报的「斜着走会 awaw 这样发送」「按下一秒后反复按下释放」就是它。
+	 *
+	 * 虚拟键盘**只在回注按键那一刻**才需要当 seat 键盘 —— 那条路自己会
+	 * set_keyboard（见 vidow_im_key / 注入键那条）。接入时安静地挂在
+	 * server->keyboards 里就行，它的 key 事件照样会被分发到。 */
+	if (virtual == NULL && !inject) {
+		wlr_seat_set_keyboard(server->seat, wlr_keyboard);
+	}
 	/* 输入法正抢着键盘时，得让它知道键盘换了，否则它拿不到 keymap */
 	vidow_im_set_keyboard(server, wlr_keyboard);
 }

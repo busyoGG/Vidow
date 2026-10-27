@@ -2068,6 +2068,43 @@ struct vidow_keyboard {
 	/* vidow 自己造的注入键盘（IPC 的 send-key / type-text 用它按键），
 	 * 不是真设备也不是客户端来的 */
 	bool inject;
+	/* 物理设备名（/sys/class/input/eventN/device/name），只用于日志。
+	 *
+	 * ⚠️ **不能拿它判「同一把键盘」**：同一把键盘的不同接口，内核给的名字
+	 * 并不一样。实测这把 SKN Wireless Link 有四个节点：
+	 *   event10 "SKN  Wireless Link "           报 16 个键
+	 *   event11 "SKN  Wireless Link  Keyboard"  报 282 个键（范围包含上面那批）
+	 * 两个节点都报同一个物理按键。判重见下面的 pressed。 */
+	char device_name[128];
+
+	/* **这块键盘自己按着哪些键**（evdev keycode，不含 +8 的 xkb 偏移）。
+	 *
+	 * 照 Hyprland 的 IKeyboard::m_pressed：每块键盘各自记账，分发前再跨键盘
+	 * 合并（见 input.c 的 input_key_share）。这是「同一把键盘的多个 event
+	 * 节点各报一遍」和「输入法虚拟键盘回注同一个键」共同的解法 —— 比按设备
+	 * 名 / 设备 ID 去重可靠，因为那些判据都得猜「哪些节点是同一把键盘」，
+	 * 而按键状态本身就是事实。
+	 *
+	 * 固定容量：普通键盘同时按下的键不会有几十个，超了就丢掉最旧的（只影响
+	 * 「同时按住 32 个键」这种极端情况，且丢的是状态记录不是按键事件本身）。 */
+	uint32_t pressed[32];
+	size_t pressed_len;
+
+	/* **这条按下被送去了输入法**（而不是直接给客户端）。
+	 *
+	 * 松开必须跟着**按下时**那条路走。判据 vidow_im_owns_keyboard() 看的是
+	 * 「此刻输入法有没有抓着键盘」，而按住一个键的这段时间里 fcitx5 完全可能
+	 * 抢走 / 放掉键盘 —— 现判就会让 press 和 release 分家：
+	 *
+	 *   press 时没抓 → 客户端收到按下
+	 *   release 时抓了 → 松开被送给输入法，客户端永远等不到松开
+	 *
+	 * 客户端那边这个键就卡在「按住」状态，600ms 后它按 repeat_info 开始自动
+	 * 重复 —— 屏幕上就是用户报的「按下一秒后按键反复按下释放」。
+	 *
+	 * 记的是 evdev 键码（和 pressed[] 一致）。容量同 pressed[]。 */
+	uint32_t im_keys[32];
+	size_t im_len;
 
 	struct wl_listener modifiers;
 	struct wl_listener key;
