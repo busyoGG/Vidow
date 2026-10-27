@@ -3079,9 +3079,18 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 		 * 在同一个坐标系里。 */
 		struct wlr_box clip = ov_clip ? ov_clip_box : fx->clip;
 		if (instance != NULL && !ov_clip) {
-			struct wlr_box output_clip;
-			wlr_output_layout_get_box(server->output_layout, instance->out,
-				&output_clip);
+			/* 这块屏的布局框：vidow_blur_update() 本帧开头刚写进
+			 * instance->layout_box（它先于渲染趟跑），直接拿来用。
+			 * 别再查 wlr_output_layout_get_box —— 那是链表遍历，
+			 * 而这个函数每帧 × 每个窗口都要走一遍。 */
+			struct wlr_box output_clip = instance->layout_box;
+			if (output_clip.width <= 0 || output_clip.height <= 0) {
+				/* 这个槽位还没被 vidow_blur_update 填过（刚建 / 模糊关着）：
+				 * 现查一次，别拿空框去裁 —— 空框会让下面判成「整个身子都在
+				 * 屏外」，节点被甩到 -1000000，窗口整块消失。 */
+				wlr_output_layout_get_box(server->output_layout,
+					instance->out, &output_clip);
+			}
 			/* A per-output bake must not expand the view's workspace clip.
 			 * Only an actively dragged view may span output instances. */
 			bool dragging = fx->view != NULL &&
@@ -4091,15 +4100,18 @@ static struct wlr_output *view_blur_owner(struct vidow_view *view) {
  * 报的「一半正常圆斑、另一半被拉成横条」。
  *
  * 判据用 screen_box（含动画偏移，和裁剪 / 倍率同一份几何）。 */
+/* ob = 这块屏的布局框，由调用方算好传进来。
+ *
+ * **别在这儿自己查**：这是个每帧 × 每个窗口都会走到的判据，
+ * wlr_output_layout_get_box 是一次输出布局链表遍历。以前它就在函数体里，
+ * N 个窗口每帧 N 次同样的遍历 —— 而调用方（vidow_blur_update）本来就要
+ * 这个值（它要按屏的原点算底衬 UV），算一遍传下来就行。 */
 static bool view_blur_hits_output(struct vidow_view *view,
-		struct vidow_output *output) {
+		struct vidow_output *output, const struct wlr_box *ob) {
 	if (view->mapped && view->scene_tree != NULL) {
 		struct wlr_box vb = vidow_view_screen_box(view);
-		struct wlr_box ob = {0};
-		wlr_output_layout_get_box(view->server->output_layout,
-			output->wlr_output, &ob);
 		struct wlr_box hit;
-		if (wlr_box_intersection(&hit, &vb, &ob)) {
+		if (wlr_box_intersection(&hit, &vb, ob)) {
 			return true;
 		}
 	}
@@ -4123,12 +4135,18 @@ void vidow_blur_update(struct vidow_output *output) {
 	struct vidow_server *server = output->server;
 	struct vidow_view *view;
 
+	/* 这块屏的布局框：只跟 output 有关，算一次给下面所有窗口共用
+	 * （以前每个窗口每帧各查一遍，见 view_blur_hits_output 的注释）。 */
+	struct wlr_box out_box = {0};
+	wlr_output_layout_get_box(server->output_layout,
+		output->wlr_output, &out_box);
+
 	int w = output->wlr_output->width, h = output->wlr_output->height;
 	bool usable = server->shader_ok && server->config.blur_enabled && w > 0 &&
 		h > 0 && w <= MAX_TARGET_PX && h <= MAX_TARGET_PX;
 	if (!usable) {
 		wl_list_for_each(view, &server->views, link) {
-			if (!view_blur_hits_output(view, output)) {
+			if (!view_blur_hits_output(view, output, &out_box)) {
 				continue; /* 别的屏上的窗口归那一趟收 */
 			}
 			blur_target_release(&view->fx);
@@ -4162,7 +4180,7 @@ void vidow_blur_update(struct vidow_output *output) {
 	 * retained so the first returning consumer rebuilds before sampling. */
 	bool consumer = vidow_overview_active(server);
 	wl_list_for_each(view, &server->views, link) {
-		if (view_wants_blur(view) && view_blur_hits_output(view, output)) {
+		if (view_wants_blur(view) && view_blur_hits_output(view, output, &out_box)) {
 			consumer = true;
 			break;
 		}
@@ -4237,11 +4255,10 @@ update_consumers:
 	 * 遍历）。N 个窗口就是 N 次同样的遍历，纯浪费。 */
 	double oscale_o = output->wlr_output->scale > 0.0 ?
 		output->wlr_output->scale : 1.0;
-	struct wlr_box obox = {0};
-	wlr_output_layout_get_box(server->output_layout,
-		output->wlr_output, &obox);
-	int my_out_x = (int)lround((double)obox.x * oscale_o);
-	int my_out_y = (int)lround((double)obox.y * oscale_o);
+	/* 布局框在函数开头已经查过一次了（out_box），别再查一遍。 */
+	const struct wlr_box *obox = &out_box;
+	int my_out_x = (int)lround((double)obox->x * oscale_o);
+	int my_out_y = (int)lround((double)obox->y * oscale_o);
 
 	wl_list_for_each(view, &server->views, link) {
 		/* 私有底衬是「**这块屏**上的这一块区域」，别的屏上的窗口不归这一趟管。
@@ -4265,7 +4282,7 @@ update_consumers:
 		 * 字段是单值），两块屏同帧各建一份、后写的把先写的覆盖掉，结果整窗
 		 * 都变成横条，比改之前更糟。真要走那条路，得把 fx 那组字段改成每屏
 		 * 一份，是另一层重构（见 server.h 的 blur_set 注释）。 */
-		if (!view_blur_hits_output(view, output)) {
+		if (!view_blur_hits_output(view, output, &out_box)) {
 			continue;
 		}
 		/* 这张贴图代表的是**这块屏**的视野：尺寸和布局原点跟着贴图一起记在 fx
@@ -4297,7 +4314,7 @@ update_consumers:
 					oslot->ox != my_out_x || oslot->oy != my_out_y) {
 				view->fx.blur_ver++;
 			}
-			oslot->layout_box = obox;
+			oslot->layout_box = *obox;
 			oslot->ow = output->wlr_output->width;
 			oslot->oh = output->wlr_output->height;
 			oslot->ox = my_out_x;
