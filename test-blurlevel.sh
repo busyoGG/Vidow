@@ -72,11 +72,20 @@ CFG
 	for _ in $(seq 1 40); do grep -aq "layer map wall" "$LOG" && break; sleep 0.25; done
 	sleep 1.2
 
-	local last=$(ls /tmp/vidow-fx-*.raw 2>/dev/null |
+	# 金字塔那几层的转储 tag 是 vidow-lblur（layer 底衬的半数层），
+	# 底衬整层是 vidow-lbd（fx.c:3635/3637）。早先这里找的是 vidow-fx-*.raw，
+	# 那是 VIDOW_FX_DUMP 的产物（整帧 target），跟 VIDOW_BLUR_DUMP 没交集。
+	local last=$(ls /tmp/vidow-lblur-*.raw /tmp/vidow-lbd-*.raw 2>/dev/null |
 		sed 's/.*-\([0-9]*\)\.raw/\1/' | sort -n | tail -1)
+	local pick=""
 	if [ -n "${last:-}" ]; then
-		cp "/tmp/vidow-fx-$last.raw" "$RUNDIR/blur-$levels.raw"
-		cp "/tmp/vidow-fx-$last.txt" "$RUNDIR/blur-$levels.txt"
+		for f in "/tmp/vidow-lblur-$last.raw" "/tmp/vidow-lbd-$last.raw"; do
+			[ -f "$f" ] && pick="$f" && break
+		done
+	fi
+	if [ -n "$pick" ]; then
+		cp "$pick" "$RUNDIR/blur-$levels.raw"
+		cp "${pick%.raw}.txt" "$RUNDIR/blur-$levels.txt"
 	else
 		fail "levels=$levels：没拿到模糊金字塔快照"
 	fi
