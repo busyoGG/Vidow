@@ -175,7 +175,10 @@ else
 	fail "重叠窗口的私有底衬重抓了 $OWN 次 / $FRAMES 帧 —— 屏幕另一头的重画把别处的底衬也作废了"
 fi
 
-if pgrep -x vidow >/dev/null 2>&1; then
+# 只看**测试自己起的那个**：以前这里是 `pgrep -x vidow`，而用户桌面会话也叫
+# 这个名字 —— 测试自己的 vidow 早死了，这条照样 PASS（永远测不出来的假绿）。
+if { [ -n "${VIDOW_PID:-}" ] && kill -0 "$VIDOW_PID" 2>/dev/null; } ||
+{ [ -n "${VIDOW_PGID:-}" ] && kill -0 -- "-$VIDOW_PGID" 2>/dev/null; }; then
 	pass "vidow 还活着"
 else
 	fail "vidow 死了（$(tail -3 "$LOG" | tr '\n' '|')）"
