@@ -529,8 +529,36 @@ static void x11_handle_create(xcb_create_notify_event_t *e) {
 		return;
 	}
 	s->window_id = e->window;
-	s->x = e->x;
-	s->y = e->y;
+	/* **CreateNotify 的 x/y 是相对 parent 的**，不是屏幕坐标。
+	 *
+	 * 根窗口的孩子才天然是绝对坐标；真子窗口（Steam / CEF 那批 4x2 的
+	 * or=1 窗口、菜单锚点）给的是相对值，直接当绝对坐标用会把窗口摆到
+	 * 屏幕外 —— 日志里出现过 6056,1026 而屏幕总宽只有 3840，于是菜单和
+	 * 鼠标对不上，指针一移过去就判成离开、菜单自己关掉。
+	 *
+	 * 用 xcb_translate_coordinates 一次问 X 要绝对位置：它会把整条父链
+	 * 加起来，比自己逐层累加可靠（中间层可能是重定向窗口）。
+	 * 2026-10-28 抽查注释时发现：注释早就这么写了，代码里从来没有换算过。*/
+	if (e->parent != XCB_WINDOW_NONE && g_x11->screen != NULL &&
+			e->parent != g_x11->screen->root) {
+		xcb_translate_coordinates_reply_t *tr =
+			xcb_translate_coordinates_reply(g_x11->conn,
+				xcb_translate_coordinates(g_x11->conn, e->window,
+					g_x11->screen->root, 0, 0), NULL);
+		if (tr != NULL) {
+			wlr_log(WLR_INFO, "子窗口坐标 %d,%d → 屏幕 %d,%d",
+				e->x, e->y, tr->dst_x, tr->dst_y);
+			s->x = tr->dst_x;
+			s->y = tr->dst_y;
+			free(tr);
+		} else {
+			s->x = e->x;
+			s->y = e->y;
+		}
+	} else {
+		s->x = e->x;
+		s->y = e->y;
+	}
 	s->width = e->width;
 	s->height = e->height;
 	s->override_redirect = e->override_redirect;
@@ -579,7 +607,16 @@ static void x11_handle_create(xcb_create_notify_event_t *e) {
 		 * 加上之后孙窗口的 CreateNotify 会落在这个窗口的掩码上。注意
 		 * xcb_change_window_attributes 是**整份覆盖**不是追加，所以
 		 * PROPERTY_CHANGE 必须一起写进来（否则又回到「类型晚到」那个坑）。 */
-		uint32_t pmask[] = { XCB_EVENT_MASK_PROPERTY_CHANGE };
+		/* **这两个掩码必须一起写。** 注释说的 SUBSTRUCTURE_NOTIFY 一直
+		 * 没进这个数组（2026-10-28 抽查发现：注释描述的是它，代码里只有
+		 * PROPERTY_CHANGE），于是孙窗口的 CreateNotify 一条都收不到 ——
+		 * test-child-coords.sh 里那个「父窗口里建子窗口」的用例实测日志
+		 * 只有 1 条 create（父窗口），子窗口根本没进来。
+		 * xcb_change_window_attributes 是整份覆盖，所以两个都要列。 */
+		uint32_t pmask[] = {
+			XCB_EVENT_MASK_PROPERTY_CHANGE |
+				XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY,
+		};
 		xcb_change_window_attributes(g_x11->conn, e->window,
 			XCB_CW_EVENT_MASK, pmask);
 	}
