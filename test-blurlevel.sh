@@ -45,7 +45,7 @@ chmod 700 "$RUNDIR/run"
 
 export XDG_RUNTIME_DIR="$RUNDIR/run"
 export WLR_BACKENDS=headless WLR_HEADLESS_OUTPUTS=1 WLR_LIBINPUT_NO_DEVICES=1
-export HOME="$CFGDIR" VIDOW_LOG=info VIDOW_BLUR_DUMP=4
+export HOME="$CFGDIR" VIDOW_LOG=debug VIDOW_BLUR_DUMP=4 VIDOW_WALL_LAYER=top
 export DISPLAY= WAYLAND_DISPLAY=
 
 BIN=${VIDOW_BIN:-./build/vidow}
@@ -69,7 +69,7 @@ CFG
 
 	setsid nohup python3 ./tools/wall.py > "$RUNDIR/wall-$levels.log" 2>&1 </dev/null &
 	CLIENT_PIDS="$CLIENT_PIDS $!"
-	for _ in $(seq 1 40); do grep -aq "layer map wall" "$LOG" && break; sleep 0.25; done
+	for _ in $(seq 1 40); do grep -aq "configure layer wall" "$LOG" && break; sleep 0.25; done
 	sleep 1.2
 
 	# 金字塔那几层的转储 tag 是 vidow-lblur（layer 底衬的半数层），
@@ -79,7 +79,7 @@ CFG
 		sed 's/.*-\([0-9]*\)\.raw/\1/' | sort -n | tail -1)
 	local pick=""
 	if [ -n "${last:-}" ]; then
-		for f in "/tmp/vidow-lblur-$last.raw" "/tmp/vidow-lbd-$last.raw"; do
+		for f in "/tmp/vidow-lbd-$last.raw" "/tmp/vidow-lblur-$last.raw"; do
 			[ -f "$f" ] && pick="$f" && break
 		done
 	fi

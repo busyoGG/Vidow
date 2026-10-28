@@ -17,6 +17,7 @@
 块是纯黑，看不出「跨屏前那半边有没有模糊」。
 """
 import sys
+import os
 
 import gi
 
@@ -60,7 +61,18 @@ class Wall(Gtk.Window):
     def __init__(self):
         super().__init__()
         GtkLayerShell.init_for_window(self)
-        GtkLayerShell.set_layer(self, GtkLayerShell.Layer.BACKGROUND)
+        # 层可切（VIDOW_WALL_LAYER=background/top/overlay）：
+        # test-blurlevel 要量「层模糊的金字塔」，而 vidow 明确不给 background 层
+        # 画模糊（壁纸本身就是模糊的源头，见 fx.c:3654 的「这是 background 层」），
+        # 所以那套用例得把它放到会模糊的层上才量得到东西。
+        layer = {
+            "background": GtkLayerShell.Layer.BACKGROUND,
+            "bottom": GtkLayerShell.Layer.BOTTOM,
+            "top": GtkLayerShell.Layer.TOP,
+            "overlay": GtkLayerShell.Layer.OVERLAY,
+        }.get(os.environ.get("VIDOW_WALL_LAYER", "background"),
+              GtkLayerShell.Layer.BACKGROUND)
+        GtkLayerShell.set_layer(self, layer)
         GtkLayerShell.set_namespace(self, namespace)
         # 指定输出（--output HEADLESS-1）：多屏时两个实例默认都会挑同一块
         # （GTK 的默认显示器），另一块就永远是黑的 —— 模糊到底盖没盖住
