@@ -3050,6 +3050,10 @@ void vidow_view_render_pump(struct vidow_server *server,
 			}
 			wl_event_source_timer_update(output->pump_timer, (int)delay);
 			output->pump_at_ms = next_due;
+			/* 影子调度：补帧闹钟也是一个「到时候要一帧」的来源（见
+			 * output.c 的 vidow_output_note_deadline）。 */
+			vidow_output_note_deadline(output,
+				vidow_now_ns() + delay * 1000000LL, "补帧");
 		}
 	} else if (output->pump_at_ms != 0 && output->pump_timer != NULL) {
 		wl_event_source_timer_update(output->pump_timer, 0); /* 没人被挡下：撤闹钟 */

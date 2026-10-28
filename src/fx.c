@@ -2593,6 +2593,31 @@ static void view_set_capture_visible(struct vidow_view *view, bool on) {
  * wallpaper-only backdrop: it would lose the window underneath it. Those get
  * a private capture instead. Tiled windows never overlap, so the shared one
  * covers the whole scrolling layout. */
+/* 重叠判据的实测成本（VIDOW_RENDER_STATS 里报）。
+ *
+ * 只统计 + 只在读的时候清零，不改变任何行为。为什么要有它：这个判据每帧
+ * 每个走模糊的窗口各一次，历史上被当成「可能很贵」反复讨论，但一直没有
+ * 数字。有了 ns/次 和 次/秒，谈优化才有依据。 */
+static uint64_t ov_ns;
+static uint64_t ov_n;
+
+/* 只统计开着统计时才量：每次 clock_gettime 两回，量级和判据本身同阶（实测
+ * 判据 ~20-40ns，两次 clock_gettime 再加 ~40ns），常态挂着就是白付一倍。 */
+static bool ov_stats_on(void) {
+	static int on = -1;
+	if (on < 0) {
+		on = getenv("VIDOW_RENDER_STATS") != NULL ? 1 : 0;
+	}
+	return on != 0;
+}
+
+void vidow_fx_take_overlap_cost(uint64_t *ns, uint64_t *n) {
+	*ns = ov_ns;
+	*n = ov_n;
+	ov_ns = 0;
+	ov_n = 0;
+}
+
 static bool view_overlaps_other(struct vidow_view *view) {
 	struct vidow_server *server = view->server;
 	struct wlr_box a = vidow_view_screen_box(view);
@@ -4563,7 +4588,19 @@ update_consumers:
 		struct vidow_look look;
 		vidow_view_look(&server->config, &view->rule_eff,
 			view->fullscreen, &look);
-		if (look.blur_xray || !view_overlaps_other(view)) {
+		bool overlaps = true;
+		if (ov_stats_on()) {
+			struct timespec t0, t1;
+			clock_gettime(CLOCK_MONOTONIC, &t0);
+			overlaps = view_overlaps_other(view);
+			clock_gettime(CLOCK_MONOTONIC, &t1);
+			ov_ns += (uint64_t)(t1.tv_sec - t0.tv_sec) * 1000000000ull +
+				(uint64_t)(t1.tv_nsec - t0.tv_nsec);
+			ov_n++;
+		} else {
+			overlaps = view_overlaps_other(view);
+		}
+		if (look.blur_xray || !overlaps) {
 			/* Tiled and non-overlapping floating windows all share the
 			 * wallpaper backdrop: one capture and one chain for all of them.
 			 * Only drop a private pyramid if there really is one, otherwise

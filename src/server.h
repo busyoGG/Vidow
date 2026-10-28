@@ -1449,6 +1449,11 @@ struct vidow_output {
 	uint64_t backdrop_revision;
 	/* vidow_blur_update 上一次真正跑遍历时世界的代次（早退用，见 fx.c）。 */
 	uint64_t blur_seen_scene, blur_seen_layer;
+	/* 帧截止时刻（影子模式用，见 output.c 的 vidow_output_note_deadline）：
+	 * 把所有「需要在某个时刻醒来」的来源登记进来，只取最早那个。
+	 * 现在只记账不驱动 —— 先证明「一个调度器能覆盖全部来源」，再动手拆。 */
+	int64_t sched_deadline_ns;
+	const char *sched_why;
 	int blur_levels;
 	/* 建这张金字塔时用的采样步长：改 blur_offset 也得重算（它是 kawase 着色器的
 	 * uniform，缓存的贴图不会跟着变）。blur_alpha_min 现在只进装饰着色器、不进
@@ -2458,6 +2463,9 @@ struct vidow_clipboard {
 
 /* 临时探针（VIDOW_RENDER_STATS=1）：见 src/fx.c 里的同名结构 */
 struct vidow_frame_stats {
+	uint64_t sched_notes;	/* 影子调度：登记的帧截止次数 */
+	uint64_t sched_fired;	/* 结算次数 */
+	int64_t sched_late_ns, sched_late_max_ns, sched_early_ns;
 	int shared, own, chains, bakes, tex_new, tex_del, frames, passes;
 	int64_t blur_ns, decor_ns, jelly_ns, commit_ns, bake_ns;
 	/* 探针：拖拽的「指针事件 -> 出帧」延迟 */
@@ -2484,6 +2492,8 @@ struct vidow_frame_stats {
 };
 extern struct vidow_frame_stats vidow_stats;
 void vidow_fx_dump_blur_ver_hits(void);
+/* 重叠判据的累计耗时/次数（读的时候清零）。 */
+void vidow_fx_take_overlap_cost(uint64_t *ns, uint64_t *n);
 /* 一个被 vidow.env{} / vidow.env() 动过的环境变量（见 env.c）：记着「进来之前
  * 是什么样」，退出时还原 —— vidow 是从别人的 shell / systemd 里起来的，改过的
  * 东西得还回去。 */
@@ -3179,6 +3189,10 @@ void vidow_output_apply_scale_all(struct vidow_server *server);
 /* 每块屏立刻画一帧（走 1ms 定时器）。会话切回来、输出刚建出来的时候用：这时候
  * 没有任何 damage，后端也不会主动送 frame 事件，不主动画就一直是黑的。 */
 void vidow_output_kick_all(struct vidow_server *server);
+/* 影子调度：登记一个「到时候要一帧」的时刻（定时器合并前的覆盖度验证）。 */
+void vidow_output_note_deadline(struct vidow_output *output, int64_t at_ns,
+		const char *why);
+void vidow_output_deadline_fired(struct vidow_output *output);
 /* 有人要抓帧了：把抓帧看门狗叫起来（静止的屏幕永远不提交，抓帧得自己推帧，
  * 见 output.c 的 capture_watchdog）。抓帧请求进来时调一次。 */
 void vidow_output_capture_kick(struct vidow_server *server);

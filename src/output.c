@@ -351,6 +351,52 @@ void vidow_output_render(struct vidow_output *output) {
 				vidow_stats.render_from_kick, vidow_stats.render_from_capture,
 				vidow_stats.dmg_bumps, vidow_stats.dmg_notes);
 			vidow_fx_dump_blur_ver_hits();
+			/* 影子调度：这一窗口里最早的那个「该醒时刻」离现在我们有多远。
+			 * 它和实际定时器唤醒时间对得上，才说明「四合一」不会漏来源。 */
+			if (vidow_stats.sched_notes > 0) {
+				struct vidow_output *so;
+				int64_t best = 0;
+				const char *why = "-";
+				int64_t now2 = vidow_now_ns();
+				wl_list_for_each(so, &server->outputs, link) {
+					if (so->sched_deadline_ns != 0 &&
+							(best == 0 || so->sched_deadline_ns < best)) {
+						best = so->sched_deadline_ns;
+						why = so->sched_why != NULL ? so->sched_why : "-";
+					}
+				}
+				double fired = vidow_stats.sched_fired > 0 ?
+					(double)vidow_stats.sched_fired : 1.0;
+				wlr_log(WLR_DEBUG,
+					"影子调度: 登记 %llu 次 / 结算 %llu 次，平均晚 %.2fms（最多 %.2fms）早 %.2fms｜最近截止 %.1fms 后（%s）",
+					(unsigned long long)vidow_stats.sched_notes,
+					(unsigned long long)vidow_stats.sched_fired,
+					(double)vidow_stats.sched_late_ns / 1e6 / fired,
+					(double)vidow_stats.sched_late_max_ns / 1e6,
+					(double)vidow_stats.sched_early_ns / 1e6 / fired,
+					best != 0 ? (double)(best - now2) / 1e6 : -1.0, why);
+			}
+			{
+				struct vidow_output *so;
+				wl_list_for_each(so, &server->outputs, link) {
+					so->sched_deadline_ns = 0;
+					so->sched_why = NULL;
+				}
+			}
+			/* 重叠判据实测成本：次数 × 平均每次纳秒数。加了它才能回答
+			 * 「1700 次/秒到底贵不贵」。 */
+			{
+				uint64_t ovns = 0, ovn = 0;
+				vidow_fx_take_overlap_cost(&ovns, &ovn);
+				if (ovn > 0) {
+					wlr_log(WLR_DEBUG,
+						"重叠判据: %llu 次/%.0fms，共 %.2fms，平均 %.0fns/次",
+						(unsigned long long)ovn,
+						(double)(st_t4 - win_ns) / 1e6,
+						(double)ovns / 1e6,
+						(double)ovns / (double)ovn);
+				}
+			}
 			vidow_stats = (struct vidow_frame_stats){0};
 			win_ns = st_t4;
 		}
@@ -492,6 +538,7 @@ void vidow_output_trace_commit(struct vidow_output *output) {
  * 只在这里催，不在「还没到点」的时候催 —— 那样会变成每帧都渲染却什么都不补的空转。 */
 static int pump_timer_cb(void *data) {
 	struct vidow_output *output = data;
+	vidow_output_deadline_fired(output);
 	output->pump_at_ms = 0;
 	vidow_output_schedule_frame(output->server, output->wlr_output,
 		"补帧闹钟到点");
@@ -512,6 +559,56 @@ static int pump_timer_cb(void *data) {
  * 原来这里硬编码 50（= 20fps），是「别自作聪明替后端画帧」的保守值。
  * 远程控制要跟手，20fps 的步进肉眼就是卡顿，所以改成可配：默认 60fps，
  * 想省电/省带宽就调低。下限 1ms 挡住荒谬配置（1000Hz）。 */
+/* ---- 帧截止时刻的影子记账（定时器合并的第一步） ----
+ *
+ * 背景：这块屏上「什么时候该醒」有四个来源，各自上弦各自的定时器：
+ *   anim_watchdog（动画/drag，按后端沉默时间算）
+ *   capture_watchdog（抓帧客户端要的 fps）
+ *   pump_timer（某个窗口的补帧到点，见 view.c）
+ *   kick_timer（切 tty / 输出重建，固定 1ms，属于「延后一轮」不是节拍）
+ *
+ * 前三个本质是同一件事：**某个时刻要一帧**。合并成一个调度器 = 取最早的那个
+ * 截止时刻上弦。风险不在时序，而在**漏登记一个来源**（漏了就永远不醒）。
+ *
+ * 所以先做影子：全部来源都往这里登记，只记账、只统计，不驱动任何东西。
+ * 统计行会给出「这一窗口里最早截止在多少毫秒之后、谁提的」，和实际唤醒对比，
+ * 一致了再拆。 */
+void vidow_output_note_deadline(struct vidow_output *output, int64_t at_ns,
+		const char *why) {
+	if (output == NULL || at_ns <= 0) {
+		return;
+	}
+	if (output->sched_deadline_ns == 0 || at_ns < output->sched_deadline_ns) {
+		output->sched_deadline_ns = at_ns;
+		output->sched_why = why;
+	}
+	vidow_stats.sched_notes++;
+}
+
+/* 定时器醒了：把「登记的截止」和「实际醒的时刻」对账。
+ *
+ * delta > 0 = 醒晚了，< 0 = 醒早了。合并成一个「取最早截止」的调度器之后，
+ * 每次醒来都应该是 delta ≈ 0（早一点点或正好）。这个数字是判断「能不能合并」
+ * 的直接证据：只要所有来源的 delta 都接近 0，说明没有来源被漏掉、也没有哪个
+ * 需要在「非截止时刻」被叫醒。 */
+void vidow_output_deadline_fired(struct vidow_output *output) {
+	if (output == NULL || output->sched_deadline_ns == 0) {
+		return;
+	}
+	int64_t d = vidow_now_ns() - output->sched_deadline_ns;
+	if (d > 0) {
+		vidow_stats.sched_late_ns += d;
+		if (d > vidow_stats.sched_late_max_ns) {
+			vidow_stats.sched_late_max_ns = d;
+		}
+	} else {
+		vidow_stats.sched_early_ns += -d;
+	}
+	vidow_stats.sched_fired++;
+	output->sched_deadline_ns = 0;
+	output->sched_why = NULL;
+}
+
 static int capture_interval_ms(struct vidow_server *server) {
 	int fps = server != NULL ? server->capture_fps : 0;
 	if (fps <= 0) {
@@ -608,6 +705,12 @@ static void capture_render_output(struct vidow_output *output) {
 
 static int capture_watchdog(void *data) {
 	struct vidow_server *server = data;
+	{
+		struct vidow_output *o;
+		wl_list_for_each(o, &server->outputs, link) {
+			vidow_output_deadline_fired(o);
+		}
+	}
 	/* 光标抓帧那条账是**一次性**的：这一轮用掉就清，下一次
 	 * cursor_source_request_frame 才会再记（客户端每次 capture 都会先 request_frame，
 	 * 而那时它的帧还欠着、下一轮提交就会把它发出去）。只靠它的时候看门狗转一次
@@ -627,8 +730,19 @@ static int capture_watchdog(void *data) {
 	if (!any) {
 		return 0; /* 没人等着：不续期（下一轮不会再被排上） */
 	}
-	wl_event_source_timer_update(server->capture_timer,
-		capture_interval_ms(server));
+	{
+		int ms = capture_interval_ms(server);
+		if (ms > 0) {
+			struct vidow_output *o;
+			wl_list_for_each(o, &server->outputs, link) {
+				vidow_output_note_deadline(o,
+					vidow_now_ns() + (int64_t)ms * 1000000LL,
+					"抓帧");
+			}
+		}
+		wl_event_source_timer_update(server->capture_timer,
+			capture_interval_ms(server));
+	}
 	return 0;
 }
 
@@ -689,6 +803,12 @@ static int64_t watchdog_interval_ns(struct vidow_output *output, bool dragging) 
 static int anim_watchdog(void *data) {
 	struct vidow_server *server = data;
 	server->watchdog_armed = false;
+	{
+		struct vidow_output *o;
+		wl_list_for_each(o, &server->outputs, link) {
+			vidow_output_deadline_fired(o);
+		}
+	}
 	/* 拖着窗口也算「有活在飞」：浮动拖拽的落位是推迟到帧里做的（见 float.c 的
 	 * arrange_dirty），帧一停它就**一点都不动** —— 上层合成器一旦不给帧事件
 	 * （嵌套在别的合成器里、窗口被盖住 / 那台合成器自己闲着），拖动就冻住。 */
@@ -740,8 +860,15 @@ static int anim_watchdog(void *data) {
 	/* 还有活在飞就继续自己推。这条续期是关键：不续的话看门狗只响一次，下次
 	 * 得等新的指针事件来 kick（拖动时后端要是这段时间一直不给帧，就又冻住了）。 */
 	server->watchdog_armed = true;
-	wl_event_source_timer_update(server->anim_timer,
-		(int)(wait_ms < 1 ? 1 : wait_ms));
+	{
+		int ms = wait_ms < 1 ? 1 : (int)wait_ms;
+		wl_list_for_each(output, &server->outputs, link) {
+			vidow_output_note_deadline(output, now + ms * 1000000LL,
+				"动画");
+		}
+		wl_event_source_timer_update(server->anim_timer,
+			(int)(wait_ms < 1 ? 1 : wait_ms));
+	}
 	return 0;
 }
 
