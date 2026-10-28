@@ -407,7 +407,10 @@ echo "  命中行：$(echo "$HIT" | sed 's/.*\[DEBUG\] //')  表面倍数：$SFA
 echo "$HIT" | grep -aq "局部 $((10 / SFACE)),$((10 / SFACE))" &&
 	pass "命中局部坐标 = X 侧偏移 10 / 表面倍数 $SFACE" ||
 	fail "命中坐标不对：$(echo "$HIT" | sed 's/.*\[DEBUG\] //')"
-LOC=$(echo "$HIT" | sed 's/.*局部 //')
+# 日志行是「局部 10,10| geom 760,200 ...」：竖线之后的都不要，只要坐标那两个数。
+# 以前这里没截断，后面 python 把 '10| geom 760' 当浮点数解，整个脚本崩在解析上
+# （报「有失败项」但其实是脚本自己挂了，不是合成器的问题）。
+LOC=$(echo "$HIT" | sed 's/.*局部 //; s/|.*//')
 python3 -c "
 import sys
 lx, ly = [float(v) for v in '$LOC'.split(',')]
