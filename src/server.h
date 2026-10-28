@@ -3542,9 +3542,6 @@ bool vidow_fx_draw_mesh(struct vidow_server *server, struct wlr_buffer *dst,
 	int w, int h, struct wlr_texture *src, const float *verts, int n_verts);
 /* 果冻专用：verts 每项 6 个 float [x, y, u_content, v_content, u_blur,
  * v_blur]；片元把内容叠在模糊上（content + blur * (1 - content.a)）。 */
-bool vidow_fx_render_shadow(struct vidow_server *server,
-	struct wlr_buffer *dst, struct vidow_fx_target *fx,
-	const struct vidow_look *look);
 bool vidow_fx_draw_mesh_blur(struct vidow_server *server,
 	struct wlr_buffer *dst, int w, int h, struct wlr_texture *content,
 	struct wlr_texture *blur, float blur_strength, const float *verts,
@@ -3744,8 +3741,6 @@ enum vidow_mini_toolbar_btn {
 	VIDOW_MINI_BTN_COUNT,
 };
 /* 给某个小窗摆出工具条（重复调幂等）。view == NULL = 收起来。 */
-void vidow_mini_toolbar_show(struct vidow_server *server,
-		struct vidow_view *view);
 void vidow_mini_toolbar_hide(struct vidow_server *server);
 /* 命中测试：这个点落在工具条的哪个按钮上（没有 = -1）。工具条不是表面，靠矩形。 */
 bool vidow_mini_toolbar_near(struct vidow_server *server, double lx, double ly);

@@ -4997,30 +4997,6 @@ static bool decor_pass(struct vidow_server *server,
 	end_pass(egl);
 	return true;
 }
-
-/* 屏幕那条路：几何从 fx（离屏缓冲 + 窗口在输出上的位置）来。 */
-/* 只画投影：果冻把窗口内容拉弯时，投影不能跟着拉长（否则就是用户看到的
- * 「描边外面一圈模糊」）。投影单独烘一张、挂在果冻节点下面，保持原形状。 */
-bool vidow_fx_render_shadow(struct vidow_server *server,
-		struct wlr_buffer *dst, struct vidow_fx_target *fx,
-		const struct vidow_look *look) {
-	if (server == NULL || dst == NULL || fx == NULL || look == NULL ||
-			server->decor.program == 0) {
-		return false;
-	}
-	struct decor_geo g = {
-		.dst_w = fx->w, .dst_h = fx->h,
-		.content_w = fx->content_w, .content_h = fx->content_h,
-		.off_x = (float)fx->px_pad, .off_y = (float)fx->px_pad,
-		.origin_x = 0.0f, .origin_y = 0.0f,
-		.out_size_x = 1.0f, .out_size_y = 1.0f,
-		.content_alpha = 1.0f,
-	};
-	const float no_border[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-	return decor_pass(server, fx, dst, &g, server->empty_tex, NULL, no_border,
-		1.0, fx->scale, look, true);
-}
-
 static bool decor_draw(struct vidow_server *server,
 		struct vidow_fx_target *fx, struct wlr_buffer *dst,
 		struct wlr_texture *src, struct wlr_texture *mask,

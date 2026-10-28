@@ -750,56 +750,6 @@ static void mini_toolbar_glyph_place(struct vidow_server *server) {
 		}
 	}
 }
-
-void vidow_mini_toolbar_show(struct vidow_server *server,
-		struct vidow_view *view) {
-	if (server == NULL || view == NULL || server->mini_toolbar_bg == NULL) {
-		return;
-	}
-	if (!server->config.mini_enabled || !server->config.mini_toolbar) {
-		return;
-	}
-	struct wlr_box box = mini_toolbar_layout(server, view);
-	server->mini_toolbar_box = box;
-	server->mini_toolbar_view = view;
-	for (int i = 0; i < (int)VIDOW_MINI_BTN_COUNT; i++) {
-		int bx = box.x + MINI_TOOLBAR_PAD +
-			i * (MINI_TOOLBAR_BTN_W + MINI_TOOLBAR_PAD);
-		int by = box.y + MINI_TOOLBAR_PAD;
-		server->mini_toolbar_btn_box[i] = (struct wlr_box){
-			.x = bx, .y = by,
-			.width = MINI_TOOLBAR_BTN_W,
-			.height = MINI_TOOLBAR_BTN_H,
-		};
-	}
-	wlr_scene_rect_set_size(server->mini_toolbar_bg, box.width, box.height);
-	wlr_scene_node_set_position(&server->mini_toolbar_bg->node, box.x, box.y);
-	wlr_scene_node_set_enabled(&server->mini_toolbar_bg->node, true);
-	for (int i = 0; i < (int)VIDOW_MINI_BTN_COUNT; i++) {
-		struct wlr_scene_rect *btn = server->mini_toolbar_btn[i];
-		if (btn == NULL) {
-			continue;
-		}
-		const struct wlr_box *b = &server->mini_toolbar_btn_box[i];
-		wlr_scene_rect_set_size(btn, b->width, b->height);
-		wlr_scene_node_set_position(&btn->node, b->x, b->y);
-		wlr_scene_node_set_enabled(&btn->node, true);
-		raise_node(&btn->node);
-	}
-	mini_toolbar_glyph_place(server);
-	raise_node(&server->mini_toolbar_bg->node);
-	/* 日志里把四个按钮的矩形说清楚（测试靠它注入点击；用户报「点不中」时也能
-	 * 一眼看出工具条摆在哪儿）。 */
-	wlr_log(WLR_INFO, "mini toolbar: %s 露出（整块 %d,%d %dx%d；放大 %d,%d "
-		"收图标 %d,%d 还原成列 %d,%d 关闭 %d,%d）",
-		vidow_view_title(view) != NULL ? vidow_view_title(view) : "?",
-		box.x, box.y, box.width, box.height,
-		server->mini_toolbar_btn_box[0].x, server->mini_toolbar_btn_box[0].y,
-		server->mini_toolbar_btn_box[1].x, server->mini_toolbar_btn_box[1].y,
-		server->mini_toolbar_btn_box[2].x, server->mini_toolbar_btn_box[2].y,
-		server->mini_toolbar_btn_box[3].x, server->mini_toolbar_btn_box[3].y);
-}
-
 void vidow_mini_toolbar_hide(struct vidow_server *server) {
 	if (server == NULL) {
 		return;
