@@ -42,9 +42,9 @@ cleanup() {
 	[ -n "$VIDOW_PID" ] && kill -TERM -- "-$VIDOW_PID" 2>/dev/null
 	sleep 0.4
 	[ -n "$VIDOW_PID" ] && kill -KILL -- "-$VIDOW_PID" 2>/dev/null
-	for p in $(pgrep -x vidow 2>/dev/null); do kill -TERM "$p" 2>/dev/null; done
-	sleep 0.3
-	for p in $(pgrep -x vidow 2>/dev/null); do kill -KILL "$p" 2>/dev/null; done
+	# 别按进程名全杀：用户的桌面会话也叫 vidow，跑一次测试就把桌面端掉
+	# （2026-10-28 在 test-screencast.sh 上实测踩到）。上面按 $VIDOW_PID
+	# 杀自己那个就够了。
 	[ -n "${VIDOW_TEST_KEEP:-}" ] || rm -rf "$RUNDIR"
 }
 trap cleanup EXIT

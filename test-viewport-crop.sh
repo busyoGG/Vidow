@@ -49,9 +49,11 @@ cleanup() {
 		sleep 0.3
 		kill -KILL -- "-$CHROME_PGID" 2>/dev/null
 	fi
-	for p in $(pgrep -x vidow 2>/dev/null); do kill -TERM "$p" 2>/dev/null; done
+	# 别按进程名全杀 vidow：用户桌面会话也叫这个名字（2026-10-28 实测
+	# 在 test-screencast.sh 上把整台桌面端掉过）。上面按 VIDOW_PGID 杀自己那个。
 	sleep 0.3
-	for p in $(pgrep -x vidow 2>/dev/null); do kill -KILL "$p" 2>/dev/null; done
+	# 别按进程名全杀 vidow：用户桌面会话也叫这个名字（2026-10-28 实测
+	# 在 test-screencast.sh 上把整台桌面端掉过）。上面按 VIDOW_PGID 杀自己那个。
 	if [ -z "${VIDOW_TEST_KEEP:-}" ]; then
 		rm -rf "$RUNDIR"
 	fi

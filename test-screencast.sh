@@ -46,7 +46,16 @@ fail() { echo "  FAIL  $1"; FAILED=1; }
 mark() { echo; echo "== $1 =="; }
 
 cleanup() {
-	for p in $(pgrep -x vidow 2>/dev/null); do kill "$p" 2>/dev/null; done
+	# **只杀测试自己启动的那个**（$VIDOW_PID）。
+	#
+	# 以前这里是 `for p in $(pgrep -x vidow); do kill "$p"; done` —— 按进程名
+	# 全杀。用户桌面会话的合成器也叫 vidow，于是跑一次测试就把桌面整个端掉：
+	# 所有窗口消失、Discord / kwalletd 跟着断连崩溃（coredump 里一次多两个）。
+	# 2026-10-28 实测踩到过。
+	if [ -n "${VIDOW_PID:-}" ]; then
+		kill "$VIDOW_PID" 2>/dev/null
+		wait "$VIDOW_PID" 2>/dev/null
+	fi
 	for p in $(pgrep -f bluewin.py 2>/dev/null); do kill "$p" 2>/dev/null; done
 	# 私有总线上的 portal 进程：dbus-run-session 结束时不一定跟着走，留着会占着
 	# 后面的测试（判据是「环境里的 bus 地址不是真实会话那条」）。
