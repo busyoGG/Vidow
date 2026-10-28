@@ -351,16 +351,6 @@ void vidow_output_render(struct vidow_output *output) {
 				vidow_stats.render_from_kick, vidow_stats.render_from_capture,
 				vidow_stats.dmg_bumps, vidow_stats.dmg_notes);
 			vidow_fx_dump_blur_ver_hits();
-			/* 临时探针（VIDOW_BLUR_TRACE=1）：重叠判据的调用量。
-			 * 每帧每屏每窗口各一次 → 期望值 ≈ 窗口数 × 屏数 × fps。 */
-			if (getenv("VIDOW_BLUR_TRACE") != NULL) {
-				uint64_t oc = vidow_fx_take_overlaps_calls();
-				double secs = (double)(st_t4 - win_ns) / 1e9;
-				wlr_log(WLR_INFO,
-					"重叠判定: %.0f 次/秒（%llu 次/帧窗，%.0f 次/帧）",
-					(double)oc / secs, (unsigned long long)oc,
-					(double)oc / f);
-			}
 			vidow_stats = (struct vidow_frame_stats){0};
 			win_ns = st_t4;
 		}

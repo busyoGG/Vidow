@@ -2593,20 +2593,7 @@ static void view_set_capture_visible(struct vidow_view *view, bool on) {
  * wallpaper-only backdrop: it would lose the window underneath it. Those get
  * a private capture instead. Tiled windows never overlap, so the shared one
  * covers the whole scrolling layout. */
-/* 临时探针（VIDOW_BLUR_TRACE=1）：数这个判据每秒被叫多少次。
- *
- * 它是每帧 × 每块屏 × 每个窗口各一次，每次还要遍历**全部**窗口、每个都算一次
- * vidow_view_screen_box() —— 25 个窗口就是每帧 625 次、每秒十几万次盒子计算，
- * 而「谁和谁重叠」只在窗口移动/缩放时才变。先量出真实数字再决定改不改。 */
-static uint64_t overlaps_calls;
-uint64_t vidow_fx_take_overlaps_calls(void) {
-	uint64_t n = overlaps_calls;
-	overlaps_calls = 0;
-	return n;
-}
-
 static bool view_overlaps_other(struct vidow_view *view) {
-	overlaps_calls++;
 	struct vidow_server *server = view->server;
 	struct wlr_box a = vidow_view_screen_box(view);
 	struct vidow_view *other;

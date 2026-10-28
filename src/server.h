@@ -2484,9 +2484,6 @@ struct vidow_frame_stats {
 };
 extern struct vidow_frame_stats vidow_stats;
 void vidow_fx_dump_blur_ver_hits(void);
-/* 临时探针（VIDOW_BLUR_TRACE=1）：取走上一个窗口期里 view_overlaps_other 的调用次数。 */
-uint64_t vidow_fx_take_overlaps_calls(void);
-
 /* 一个被 vidow.env{} / vidow.env() 动过的环境变量（见 env.c）：记着「进来之前
  * 是什么样」，退出时还原 —— vidow 是从别人的 shell / systemd 里起来的，改过的
  * 东西得还回去。 */
