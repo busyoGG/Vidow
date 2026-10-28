@@ -111,7 +111,9 @@ static void keyboard_modifiers(struct wl_listener *listener, void *data) {
 	/* 会话锁：修饰键也只给 lock surface。放在输入法判断**之前** —— 锁上的
 	 * 时候输入法不许再抢键盘（见 im.c 里的守卫）。 */
 	if (kb->server->locked) {
-		wlr_seat_set_keyboard(kb->server->seat, kb->wlr_keyboard);
+		if (wlr_seat_get_keyboard(kb->server->seat) != kb->wlr_keyboard) {
+			wlr_seat_set_keyboard(kb->server->seat, kb->wlr_keyboard);
+		}
 		lock_focus_keyboard(kb->server);
 		wlr_seat_keyboard_notify_modifiers(kb->server->seat,
 			&kb->wlr_keyboard->modifiers);
@@ -131,7 +133,9 @@ static void keyboard_modifiers(struct wl_listener *listener, void *data) {
 		return;
 	}
 
-	wlr_seat_set_keyboard(kb->server->seat, kb->wlr_keyboard);
+	if (wlr_seat_get_keyboard(kb->server->seat) != kb->wlr_keyboard) {
+		wlr_seat_set_keyboard(kb->server->seat, kb->wlr_keyboard);
+	}
 	wlr_seat_keyboard_notify_modifiers(kb->server->seat,
 		&kb->wlr_keyboard->modifiers);
 
@@ -596,7 +600,32 @@ static void keyboard_key(struct wl_listener *listener, void *data) {
 		 * 的兜底 —— 是死代码：上面那个 to_im 分支（同一个判据）已经把它拦住了，
 		 * 能走到这儿的必然 to_im == false。删掉，免得下次读代码时以为输入法
 		 * 有两条分发路径。 */
-		wlr_seat_set_keyboard(server->seat, kb->wlr_keyboard);
+		/* **只在 seat 上不是这把键盘时才抢。**
+		 *
+		 * wlr_seat_set_keyboard() 在键盘真的变了的时候，会给**所有客户端**
+		 * 重发 keymap + repeat_info（wlroots types/seat/wlr_seat_keyboard.c
+		 * 第 148–151 行：wl_list_for_each(client) { send_keymap;
+		 * send_repeat_info; }）。
+		 *
+		 * Xwayland 收到 wl_keyboard.repeat_info 会调
+		 * XkbSetRepeatKeys(AutoRepeatModeOn) —— **把 X server 的 autorepeat
+		 * 重新打开**。而 X 的 autorepeat 是每个键各自计时的：玩家按住 A+W
+		 * 斜走，A 和 W 各自独立重复、相位不同，游戏收到的序列就成了
+		 * A↓ W↓ A↑ W↑ …，角色在斜向和单向之间来回摆 —— 用户报的
+		 * 「aw 会反复交换触发，不是同时，游戏角色在抖动」。
+		 *
+		 * 这台机器上有 10 把键盘（物理 4 个节点 + ydotoold + Power Button ×2
+		 * + vidow-inject + 输入法虚拟键盘）。以前这里**无条件** set_keyboard，
+		 * 于是只要 seat 上停的不是正在发键的这一把（上一次可能是 vidow-inject
+		 * 发的 IPC 按键、或者 Power Button），每按一下就把 seat 抢一次、
+		 * 重发一轮 keymap + repeat_info、autorepeat 被重开一次。
+		 *
+		 * 加这个判据之后，平时按住 A+W 连发时 seat 一直就是这把 —— wlroots
+		 * 自己 early-return，一次重发都没有。注入 / 输入法那条路要换 seat 时
+		 * 自己会换（见 inject_take_seat_keyboard / im.c），不受影响。 */
+		if (wlr_seat_get_keyboard(server->seat) != kb->wlr_keyboard) {
+			wlr_seat_set_keyboard(server->seat, kb->wlr_keyboard);
+		}
 		wlr_seat_keyboard_notify_key(server->seat, event->time_msec,
 			event->keycode, event->state);
 		/* 这里**不要**再合成重复：见文件上方「按键自动重复」那段说明。
@@ -623,11 +652,30 @@ static void keyboard_destroy(struct wl_listener *listener, void *data) {
 	kb->pressed_len = 0;
 	kb->im_len = 0;
 
-	/* 别让 seat 指着一个马上要释放的键盘 */
+	/* 别让 seat 指着一个马上要释放的键盘。
+	 *
+	 * **优先交给物理键盘**，别随手拿链表头。链表头可能是输入法刚建出来的
+	 * 虚拟键盘（fcitx5 每建一个输入上下文就新建一块，实测一次会话 95 次
+	 * attach），把 seat 交给它之后，物理键盘一按又要抢回来 —— 一来一回，
+	 * 每次切换 wlr_seat_set_keyboard() 都给所有客户端重发 keymap +
+	 * repeat_info（wlroots types/seat/wlr_seat_keyboard.c:148-151），
+	 * Xwayland 收到 repeat_info 就 XkbSetRepeatKeys(AutoRepeatModeOn)，
+	 * X server 的 autorepeat 被重开 —— 玩家按着的 A/W 开始各自自动重复，
+	 * 相位不同 → 角色抖。
+	 *
+	 * 两趟：先找物理键盘（virtual == NULL && !inject && !uinput），找不到
+	 * 才退而求其次用链表头。 */
 	struct vidow_server *server = kb->server;
 	if (wlr_seat_get_keyboard(server->seat) == kb->wlr_keyboard) {
 		struct vidow_keyboard *next = NULL;
-		if (!wl_list_empty(&server->keyboards)) {
+		struct vidow_keyboard *it;
+		wl_list_for_each(it, &server->keyboards, link) {
+			if (it->virtual == NULL && !it->inject && !it->uinput) {
+				next = it;
+				break;
+			}
+		}
+		if (next == NULL && !wl_list_empty(&server->keyboards)) {
 			next = wl_container_of(server->keyboards.next, next, link);
 		}
 		wlr_seat_set_keyboard(server->seat, next != NULL ? next->wlr_keyboard : NULL);
@@ -741,7 +789,8 @@ static void server_add_keyboard(struct vidow_server *server,
 	 *
 	 * 只影响「参不参与跨键盘去重」，不影响它能不能打字：虚拟键盘那条早
 	 * 就 return true（见 input_key_share 开头）。 */
-	if (kb->virtual == NULL && !kb->inject && device != NULL) {
+	if (kb->virtual == NULL && !kb->inject && device != NULL &&
+			wlr_input_device_is_libinput(device)) {
 		struct libinput_device *li =
 			wlr_libinput_get_device_handle(device);
 		if (li != NULL) {
@@ -1455,12 +1504,20 @@ static void focus_follows_mouse(struct vidow_server *server,
 		 * 要问的是「键盘焦点那扇窗在哪块屏上」：和它比才代表真的跨屏了。 */
 		struct vidow_output *focus_out = server->focused != NULL ?
 			vidow_output_lookup(server, server->focused->output) : NULL;
-		if (hover_output != NULL &&
-				(focus_out == NULL ||
-					focus_out->wlr_output != hover_output)) {
-			wlr_log(WLR_INFO, "悬停换屏: 光标在 %s，焦点跟过去（原焦点 %s）",
-				hover_output->name,
-				focus_out != NULL ? focus_out->wlr_output->name : "无");
+		/* **焦点为「无」时不换屏。**
+		 *
+		 * focus_out == NULL 意思是「没有任何窗口拿着键盘焦点」，这时候
+		 * 没有「把焦点带过去」这回事 —— 以前这个条件算作「跨屏了」，
+		 * 于是每一趟指针位移都调一次 vidow_workspace_focus_output()，
+		 * 而且每次都打一条 INFO（实测 00:01:38 的 30 毫秒里 11 条，
+		 * 整个会话 496 条）。空转 + 刷日志，纯浪费。
+		 *
+		 * 焦点从「无」变成「有」由窗口自己那条路负责（点窗口 / 新窗口
+		 * map 时会 focus），不需要悬停来推。 */
+		if (hover_output != NULL && focus_out != NULL &&
+				focus_out->wlr_output != hover_output) {
+			wlr_log(WLR_DEBUG, "悬停换屏: 光标在 %s，焦点跟过去（原焦点 %s）",
+				hover_output->name, focus_out->wlr_output->name);
 			vidow_workspace_focus_output(server, hover_output);
 		}
 	}

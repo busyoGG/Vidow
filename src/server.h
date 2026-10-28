@@ -1289,6 +1289,24 @@ struct vidow_closing {
 
 /* ------------------------------------------------------------------ output */
 
+/* 帧调度状态（照 niri 的 RedrawState，见 output.c 的 vidow_output_request_frame）。
+ *
+ *   IDLE      没有待办的更新。这一帧内容就是上一帧的提交结果，屏幕照旧显示，
+ *             一个 GPU 命令都不发。
+ *   QUEUED    有人要帧（客户端交帧 / 动画 / 拖拽 / 布局 / 抓帧…），已经向后端
+ *             排了 frame 事件，等 vblank 回来就渲染。
+ *   RENDERING 正在 output_frame 里画这一帧（同步的，画完就回 IDLE 或再 QUEUED）。
+ *
+ * 这三态是**记账**，不是新的调度器：渲染时机仍然由 wlroots 的 frame 事件决定
+ * （DRM 上是 vblank，嵌套时是宿主给不给帧）。它解决的是「谁要的帧、要了几次、
+ * 现在到底在等什么」——以前这些散在 30 处 schedule_frame 和三个看门狗定时器里，
+ * 出问题时日志里看不出任何一条。 */
+enum vidow_redraw_state {
+	VIDOW_REDRAW_IDLE = 0,
+	VIDOW_REDRAW_QUEUED,
+	VIDOW_REDRAW_RENDERING,
+};
+
 struct vidow_output {
 	struct wl_list link; /* vidow_server.outputs */
 	struct vidow_server *server;
@@ -1310,6 +1328,11 @@ struct vidow_output {
 	 * 只能靠抓帧看门狗推这块屏一下（见 output.c 的 capture_watchdog 和
 	 * vidow_output_capture_kick_output）。一次性标记：看门狗用掉就清。 */
 	bool capture_pending;
+	/* 上一次给这块屏的 X11 视图发 frame_done 的时刻（ns，0 = 还没发过）。
+	 * 见 vidow_views_send_x11_frame_done 的节流说明：不节流的话 XWayland
+	 * 客户端收到回调就立刻重绘，交帧 → 渲染 → 又发回调，自己把自己驱成
+	 * 300fps 空转，GPU 被占满（vshot 抓帧抢不到资源就卡）。 */
+	int64_t last_x11_fd_ns;
 
 	struct wlr_box usable_area; /* layout coords, minus layer exclusive zones */
 	/* 上次已知的布局位置（逻辑坐标）。拔线时 wlr_output_layout 可能已经先把这块
@@ -1392,6 +1415,20 @@ struct vidow_output {
 	 * 屏又迟迟不出帧 = 客户端在画、屏幕不更新，正是用户报过的「停在最后一帧」。 */
 	int64_t content_ns;
 
+	/* 帧调度记账（见上面的 enum vidow_redraw_state）。
+	 *
+	 * redraw 是**状态**，redraw_requests / redraw_reason 是**账本**：这一轮
+	 * 事件派发里被要了几次、最近一次谁要的。要了很多次却迟迟不渲染 = 帧链
+	 * 断了（后端没给帧事件），VIDOW_FRAME_STATS=1 时会在渲染统计里打出来。 */
+	enum vidow_redraw_state redraw;
+	int redraw_requests;
+	const char *redraw_reason;
+	/* 渲染期间又有人要帧（模糊失效 / 视口外补帧）：这一帧画完立刻保持
+	 * QUEUED，别等下一次外部事件。 */
+	bool redraw_again;
+	/* 上一次真的渲染的时刻（记「从要帧到出帧」的延迟用）。 */
+	int64_t redraw_queued_ns;
+
 
 	/* Backdrop snapshot: the scene without the blurred windows, used as the
 	 * source for the kawase chain. */
@@ -1410,6 +1447,8 @@ struct vidow_output {
 	uint64_t blur_id;   /* identity of blur_tex, 0 = none */
 	uint64_t blur_gen;  /* Per-output backdrop revision captured by the pyramid. */
 	uint64_t backdrop_revision;
+	/* vidow_blur_update 上一次真正跑遍历时世界的代次（早退用，见 fx.c）。 */
+	uint64_t blur_seen_scene, blur_seen_layer;
 	int blur_levels;
 	/* 建这张金字塔时用的采样步长：改 blur_offset 也得重算（它是 kawase 着色器的
 	 * uniform，缓存的贴图不会跟着变）。blur_alpha_min 现在只进装饰着色器、不进
@@ -2164,13 +2203,8 @@ bool vidow_xwm_to_native_size(const struct vidow_server *server,
 bool vidow_xwm_from_native_size(const struct vidow_server *server,
 	struct wlr_output *output, double w, double h, double *lw, double *lh);
 /* 兼容旧调用：仅 X 轴长度，不可用于绝对位置或高度；新调用用上述 API。 */
-int vidow_xwm_scale(const struct vidow_view *view);
-int vidow_xwm_to_native(const struct vidow_view *view, int v);
-int vidow_xwm_from_native(const struct vidow_view *view, int v);
 bool vidow_view_surface_coords(struct vidow_view *view,
 	struct wlr_surface *surface, double lx, double ly, double *sx, double *sy);
-struct wlr_box vidow_xwm_surface_box(const struct vidow_view *view);
-void vidow_xwm_configure(struct vidow_view *view, int x, int y, int w, int h);
 
 struct vidow_xwayland_grab {
 	struct wl_list link; /* vidow_server.xwayland_grabs */
@@ -2429,8 +2463,29 @@ struct vidow_frame_stats {
 	/* 探针：拖拽的「指针事件 -> 出帧」延迟 */
 	int64_t grab_lat_ns, grab_lat_max_ns;
 	int grab_lat_n;
+	/* 探针：这一帧 scene 的损伤面积（像素）、整屏标脏的帧数。
+	 *
+	 * 「每帧都在重画整屏」是模糊 / 装饰管线最贵的那种情况，而它从外面看不出来
+	 * （帧率还是 60，只是每帧多花几毫秒）。damage_px 在 commit 前从
+	 * scene_output->damage_ring.current 读，damage_full 数「面积 >= 整屏」的帧。
+	 * 拖动时这个比例高 = damage 收敛没做到；空闲时非零 = 有东西在空转。 */
+	int64_t damage_px;
+	int64_t damage_area;
+	int damage_frames;
+	int damage_full;
+	/* 探针：这一窗口里的帧是**谁**推出来的。静止桌面 300fps 时看这四格就知道
+	 * 是后端帧事件（正常，= 刷新率）还是定时器/抓帧在空转。 */
+	int render_from_event;    /* 后端 frame 事件 */
+	int render_from_watchdog; /* anim_watchdog 补帧 */
+	int render_from_kick;     /* kick_timer（切 tty / 输出重建） */
+	int render_from_capture;  /* 抓帧看门狗 */
+	int dmg_bumps;            /* damage_bump 调用次数 */
+	int dmg_notes;            /* blur_note_damage 调用次数 */
 };
 extern struct vidow_frame_stats vidow_stats;
+void vidow_fx_dump_blur_ver_hits(void);
+/* 临时探针（VIDOW_BLUR_TRACE=1）：取走上一个窗口期里 view_overlaps_other 的调用次数。 */
+uint64_t vidow_fx_take_overlaps_calls(void);
 
 /* 一个被 vidow.env{} / vidow.env() 动过的环境变量（见 env.c）：记着「进来之前
  * 是什么样」，退出时还原 —— vidow 是从别人的 shell / systemd 里起来的，改过的
@@ -2736,6 +2791,20 @@ struct vidow_server {
 	 * 每帧推一次会让模糊金字塔每帧整块重烘，主线程打满。见
 	 * viewport_anim_update() 的说明。 */
 	bool arrange_skip_world_damage;
+	/* 这一趟 arrange 里**真实变过的世界区域**（布局逻辑坐标，并集）。
+	 *
+	 * 以前 arrange 收口时无脑 `vidow_backdrop_damage(server, false)`：整屏都
+	 * 算。可它这一趟里每个窗口的位置变化早就被 place_view 精确记过了
+	 * （vidow_backdrop_damage_box / _view）—— 整屏那一笔把「开一个窗口」也变成
+	 * 「所有窗口的底衬全部重抓」。现在只在**没有**任何精确记录、或者这一趟里
+	 * 有人标过整屏（restack / 可见性 / layer 开关）时才回退整屏。
+	 *
+	 * arrange_in_progress 让 blur_note_damage 顺手累计；arrange_force_full
+	 * 一旦置上，末尾就不再重复记一笔（那一笔已经覆盖了）。 */
+	struct wlr_box arrange_damage;
+	bool arrange_in_progress;
+	bool arrange_damage_any;
+	bool arrange_force_full;
 
 	/* 正在渲染的那个输出的物理尺寸和布局原点（物理像素），给着色器当
 	 * u_output_size / u_origin 的基准。 */
@@ -3225,7 +3294,6 @@ void vidow_im_focus(struct vidow_server *server, struct wlr_surface *surface);
 
 /* 输入法抓着键盘时的按键出口（见 im.c 的 active_grab）：抓着就发给它，否则
  * 调用方走 seat。以前 grab 只存不用，fcitx5 一抓键盘所有按键就丢了。 */
-void vidow_im_grab_send_key(uint32_t time_msec, uint32_t keycode, bool pressed);
 
 /* 把键盘焦点按到某个表面上。**surface 可能是 NULL**（Xwayland 的窗口刚建出来 /
  * 表面刚销毁但窗口还在 —— wine 那些游戏起来时会来回好几趟），所以统一从这里走：
@@ -3363,12 +3431,7 @@ void vidow_configwatch_begin(struct vidow_server *server);
 /* vidow.include() 读了一份文件就登记一份（configwatch 没起来就是空操作）。 */
 void vidow_configwatch_add(struct vidow_server *server, const char *path);
 /* vidow.include() 读了哪些路径（原样，没解析符号链接）—— IPC 上报给用户看。 */
-size_t vidow_configwatch_files(struct vidow_server *server,
-		const char *const **out);
 /* 盯着的目录（inotify）。 */
-size_t vidow_configwatch_dirs(struct vidow_server *server,
-		const char *const **out);
-
 /* ---------------------------------------------------- 自唤醒 fd 统管（fdwatch.c）
  *
  * 合成器自己的自唤醒 fd 一律走这里，不交给 wl_event_loop_add_fd：
@@ -3405,9 +3468,7 @@ bool vidow_fdwatch_register(int fd, enum vidow_fdwatch_kind kind,
 void vidow_fdwatch_deregister(int fd, enum vidow_fdwatch_kind kind, void *data);
 bool vidow_fdwatch_peek(int fd, enum vidow_fdwatch_kind kind,
 		vidow_fdwatch_poke_cb poke, void *data);
-void vidow_fdwatch_poke(struct vidow_server *server);
 bool vidow_fdwatch_tracks(int fd, enum vidow_fdwatch_kind kind);
-struct vidow_server *vidow_fdwatch_server(void);
 /* fd 泄漏看门狗（VIDOW_FD_WATCH=1 才真的建，见 fdwatch.c）。每 3 秒数一次
  * /proc/self/fd，超过软上限 80% 就打一份分类快照 —— 2026-10-21 那次 sunshine
  * 的匿名 dmabuf fd 泄漏，vidow 自己一个字都没打，等发现时现场已经过去了。 */
@@ -3582,6 +3643,9 @@ void vidow_blur_update(struct vidow_output *output);
  * repaints windows. */
 void vidow_backdrop_damage(struct vidow_server *server, bool layers);
 void vidow_backdrop_damage_output(struct vidow_output *output);
+/* 同上，但只知道变了哪一块盒子（layer 事件走这条，别整屏标脏）。 */
+void vidow_backdrop_damage_output_box(struct vidow_output *output,
+		const struct wlr_box *box);
 /* 只记一笔损伤区域（布局逻辑坐标，同 pending_damage 的说明），不动世界代次 ——
  * 给「窗口挪走之后，老位置也得让别人的底衬重抓」这种一个事件两处损伤用。 */
 /* 同上，但**只记给窗口，不记给 layer surface**。视口过渡每帧平移整条带子
@@ -3806,7 +3870,6 @@ struct vidow_screencopy *vidow_screencopy_create(struct wl_display *display,
 		struct vidow_server *server);
 /* 还有没有等着的 screencopy 帧（静止的屏幕上没有输出提交，output.c 的
  * capture_watchdog 靠它决定要不要催一帧）。 */
-bool vidow_screencopy_has_pending(struct vidow_screencopy *manager);
 /* 同上，但要的是**这一块**输出上等着的帧：capture_watchdog 现在逐屏决定推不推，
  * 别的屏不应因为这块屏有人在抓帧就被整屏标脏重画。output 为 NULL 一律 false。 */
 bool vidow_screencopy_has_pending_for_output(struct vidow_screencopy *manager,
@@ -3818,9 +3881,6 @@ struct wlr_buffer *vidow_capture_grab(struct vidow_server *server,
 		struct wlr_output *output);
 /* 抓这块屏上的任意一个矩形（box 是**布局坐标**，scale 是「逻辑 → 像素」，出图
  * 尺寸 = round(w*scale) × round(h*scale)）。按区域录屏 / 按区域截图用它。 */
-struct wlr_buffer *vidow_capture_grab_box(struct vidow_server *server,
-		struct wlr_output *output, const struct wlr_box *box, double scale);
-
 /* 抓帧的通用入口（上面两条都是它的特例）：box 为 NULL = 整块输出。
  *
  * target 非空 = **录屏 dmabuf 直通**：渲染进调用方那张 linear 交换链，出图能直接
@@ -4347,8 +4407,6 @@ double vidow_overview_scale(const struct vidow_server *server);
 
 /* 这个窗口在 overview 里画出来的框 + 它那一行的矩形（都布局坐标）。给「整块
  * 落在行矩形外就不画」这条判据用。返回 false = 不适用。 */
-bool vidow_overview_view_box(struct vidow_server *server,
-		struct vidow_view *view, struct wlr_box *out);
 /* 点一下：选中命中的那列（返回 true = 这次点击被 overview 吃掉了）。 */
 bool vidow_overview_click(struct vidow_server *server, double sx, double sy);
 /* 滚轮：滚的是工作区列表（上下预览），不是窗口。`steps` = 走几**行**（一格 = 一块
@@ -4612,7 +4670,6 @@ struct vidow_xdo_manager *vidow_xdg_output_manager_create(
 void vidow_xdg_output_set_xwayland_client(struct wl_client *client);
 /* X 专用虚拟矩形的原点（兼容接口，找不到返回 0,0）。
  * 完整的双轴仿射位置/尺寸换算使用 vidow_xwm_* API，不直接除输出 scale。 */
-void vidow_xdg_output_dev_origin(struct wlr_output *output, int *x, int *y);
 /* 配置落地后调：配置说关就把 X 服务拆掉，说开（或又打开）就建起来。 */
 bool vidow_xwayland_apply_config(struct vidow_server *server);
 /* 改完配置（scale / outputs / xwayland_scale）之后重算 X 的全局缩放并同步给
@@ -4624,8 +4681,6 @@ void vidow_xwayland_scale_recompute(struct vidow_server *server);
  * 在 X11 下就比 Wayland 下小一半。 */
 void vidow_xwayland_env(struct vidow_server *server);
 /* 从 wlr_surface 找回 X11 窗口对应的 view（输入法 / ext-background-effect 用）。 */
-struct vidow_view *vidow_view_from_xwayland_surface(struct vidow_server *server,
-		struct wlr_xwayland_surface *xsurface);
 /* 新建一个 X11 窗口的 view（xwayland.c 收到 new_surface 时调）。 */
 void vidow_view_new_x11(struct vidow_x11_surface *xsurface);
 /* 告诉 wlroots 的场景图：这个 X11 的 surface 缓冲区是按 xwayland_scale 倍画

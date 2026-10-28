@@ -31,6 +31,29 @@ extern bool wlr_egl_wait_sync(struct wlr_egl *egl, EGLSyncKHR sync);
 #define MAX_SHADER_SIZE (256 * 1024)
 #define MAX_TARGET_PX 8192
 
+/* 临时探针：blur_ver++ 是哪一个调用点推的（索引 = 源码行号）。静止桌面
+ * 每帧重烘全部装饰时，这几个计数直接指出是「贴图换了」还是「视野变了」。 */
+int blur_ver_hits[6400];
+
+void vidow_fx_dump_blur_ver_hits(void) {
+	char buf[512];
+	size_t off = 0;
+	static const int watch[] = {2665, 2686, 2695, 3276, 4415, 4431, 5360, 5954,
+		5990, 6194, 6347};
+	for (size_t i = 0; i < sizeof(watch) / sizeof(watch[0]); i++) {
+		int n = blur_ver_hits[watch[i]];
+		if (n == 0) {
+			continue;
+		}
+		off += snprintf(buf + off, sizeof(buf) - off, "%d:%d ", watch[i], n);
+		blur_ver_hits[watch[i]] = 0;
+	}
+	buf[off] = '\0';
+	if (off > 0) {
+		wlr_log(WLR_DEBUG, "BLURVER %s", buf);
+	}
+}
+
 /* ---- 渲染统计（VIDOW_RENDER_STATS=1，见 output.c）：每帧各阶段耗时 + 重建次数。
  * 计数是机器无关的硬指标 —— 「有背景时拖拽卡」这类问题，先在真机上跑
  * `VIDOW_RENDER_STATS=1 vidow` 看每帧干了多少活，再谈优化。
@@ -1603,10 +1626,49 @@ static void dmg_clear(struct vidow_dmg_set *set) {
  * 个元素自己不记（它自己的变化不该让它自己的底衬过期 —— 抓的时候它是藏着的）。
  * 记进来的盒子一直攒着，直到那个元素真的重抓一次才清掉：这样「损伤在屏幕另一头」
  * 攒再多也不会让它重抓，而一旦有一笔碰到它那一块，攒下来的这笔账仍然算数。 */
+/* 临时探针（VIDOW_DMG_WHY=1）：谁在每帧标脏、标的多大一块。
+ *
+ * 静止桌面 300fps、损伤 96%/帧，说明有一个「每帧整屏标脏」的调用者：整屏标
+ * 脏 → scene commit 有活 → 渲染 → 提交 → 又标脏，自己驱自己。日志里给的
+ * 是**调用者的返回地址**（本进程 PIE，偏移 = 地址 - /proc/<pid>/maps 里
+ * vidow 的映射起点），用 `addr2line -e build/vidow -f <偏移>` 反解。 */
+static void dmg_why_probe(const char *what, const struct wlr_box *box,
+		uintptr_t ra) {
+	static int64_t last;
+	int64_t now = vidow_now_ns();
+	if (now - last < 200000000LL) {
+		return;
+	}
+	last = now;
+	wlr_log(WLR_INFO, "DMGWHY %s box=%dx%d%+d%+d ra=%#lx", what,
+		box != NULL ? box->width : 0, box != NULL ? box->height : 0,
+		box != NULL ? box->x : 0, box != NULL ? box->y : 0,
+		(unsigned long)ra);
+}
+
 static void blur_note_damage(struct vidow_server *server,
 		const struct wlr_box *box, const struct vidow_view *skip) {
 	if (box == NULL || box->width <= 0 || box->height <= 0) {
 		return;
+	}
+	vidow_stats.dmg_notes++;
+	if (getenv("VIDOW_DMG_WHY") != NULL) {
+		dmg_why_probe("blur_note_damage", box,
+			(uintptr_t)__builtin_return_address(0));
+	}
+	/* arrange 期间顺手攒一份「这一趟真实变过的世界区域」：arrange 收口时用它
+	 * 代替整屏（见 view.c 的 vidow_arrange 和 server.h 的 arrange_damage）。
+	 * 整屏哨兵盒（blur_box_all）攒进来没意义 —— 那本来就是「不知道变哪」，
+	 * 直接置 force_full，收口时回退整屏。 */
+	if (server->arrange_in_progress) {
+		if (box->width >= 0x40000000 || box->height >= 0x40000000) {
+			server->arrange_force_full = true;
+		} else if (server->arrange_damage_any) {
+			blur_box_add(&server->arrange_damage, box);
+		} else {
+			server->arrange_damage = *box;
+			server->arrange_damage_any = true;
+		}
 	}
 	struct vidow_view *view;
 	wl_list_for_each(view, &server->views, link) {
@@ -1680,6 +1742,11 @@ struct wlr_box vidow_view_screen_box(const struct vidow_view *view) {
 
 /* 世界代次前进（损伤区域由调用方决定记哪一块）。 */
 static void damage_bump(struct vidow_server *server, bool layers) {
+	vidow_stats.dmg_bumps++;
+	if (getenv("VIDOW_DMG_WHY") != NULL) {
+		dmg_why_probe(layers ? "damage_bump(layers)" : "damage_bump(scene)",
+			NULL, (uintptr_t)__builtin_return_address(0));
+	}
 	server->gen_scene++;
 	if (layers) {
 		server->gen_layer++;
@@ -1704,6 +1771,35 @@ void vidow_backdrop_damage_output(struct vidow_output *output) {
 	struct wlr_box box = {0};
 	wlr_output_layout_get_box(server->output_layout, output->wlr_output, &box);
 	blur_note_damage(server, &box, NULL);
+}
+
+/* 只知道「哪块屏、哪一块区域」变了（layer surface 上屏 / 下屏 / 落位 / 内容重画）：
+ * 共享底衬必须整块重抓 —— 它是**整屏一份**，没有局部版本，重建判据是
+ * output->backdrop_revision（见 fx.c:4381）；但**别人的私有底衬**只在这块盒子真的
+ * 碰到它时才过期。
+ *
+ * 这是把 layer 事件从「整屏标脏」降到「一块盒子」的入口。为什么值得：一条通知
+ * 弹出、一个菜单、vshot 的冻结覆盖层上屏，原来都让整屏每个窗口的私有底衬一起
+ * 作废重抓 —— 3840x2160 上每块重抓 = 一次全屏渲染 + 一条模糊链。而实际变的只有
+ * 那个盒子底下的东西。
+ *
+ * 屏上的真实损伤（要不要重画这一帧）不归这里管：那是 wlroots scene 按节点自己
+ * 记的，layer 的 buffer 一交上去 scene 就会标脏。这里只喂模糊那套账本。 */
+void vidow_backdrop_damage_output_box(struct vidow_output *output,
+		const struct wlr_box *box) {
+	if (output == NULL || box == NULL || box->width <= 0 ||
+			box->height <= 0) {
+		/* 说不清是哪一块：退回整屏，宁可多抓一次也不能糊着旧的 */
+		if (output != NULL) {
+			vidow_backdrop_damage_output(output);
+		}
+		return;
+	}
+	struct vidow_server *server = output->server;
+	server->gen_scene++;
+	server->gen_layer++;
+	output->backdrop_revision++;
+	blur_note_damage(server, box, NULL);
 }
 
 void vidow_backdrop_damage(struct vidow_server *server, bool layers) {
@@ -2490,7 +2586,20 @@ static void view_set_capture_visible(struct vidow_view *view, bool on) {
  * wallpaper-only backdrop: it would lose the window underneath it. Those get
  * a private capture instead. Tiled windows never overlap, so the shared one
  * covers the whole scrolling layout. */
+/* 临时探针（VIDOW_BLUR_TRACE=1）：数这个判据每秒被叫多少次。
+ *
+ * 它是每帧 × 每块屏 × 每个窗口各一次，每次还要遍历**全部**窗口、每个都算一次
+ * vidow_view_screen_box() —— 25 个窗口就是每帧 625 次、每秒十几万次盒子计算，
+ * 而「谁和谁重叠」只在窗口移动/缩放时才变。先量出真实数字再决定改不改。 */
+static uint64_t overlaps_calls;
+uint64_t vidow_fx_take_overlaps_calls(void) {
+	uint64_t n = overlaps_calls;
+	overlaps_calls = 0;
+	return n;
+}
+
 static bool view_overlaps_other(struct vidow_view *view) {
+	overlaps_calls++;
 	struct vidow_server *server = view->server;
 	struct wlr_box a = vidow_view_screen_box(view);
 	struct vidow_view *other;
@@ -2619,6 +2728,7 @@ static void blur_assign(struct vidow_fx_target *fx, struct wlr_output *out,
 		slot->rw = rw;
 		slot->rh = rh;
 		fx->blur_ver++;
+		blur_ver_hits[2665]++;
 		return;
 	}
 	/* 兜底（没有输出上下文的路：layer、快照、预览）：走老的单份字段。 */
@@ -2640,6 +2750,11 @@ static void blur_assign(struct vidow_fx_target *fx, struct wlr_output *out,
 	fx->blur_tex_w = rw;
 	fx->blur_tex_h = rh;
 	fx->blur_ver++;
+	blur_ver_hits[2686]++;
+	if (getenv("VIDOW_DMG_WHY") != NULL) {
+		dmg_why_probe("blur_assign-legacy", region,
+			(uintptr_t)__builtin_return_address(0));
+	}
 }
 
 /* 剔除阈值（blur_alpha_min）只进装饰着色器，不进模糊金字塔：它变了得让帧循环知道
@@ -2649,6 +2764,7 @@ static void blur_mask_min_changed(struct vidow_fx_target *fx, double alpha_min) 
 	if (fabs((double)fx->mask_min_used - alpha_min) > 1e-6) {
 		fx->mask_min_used = (float)alpha_min;
 		fx->blur_ver++;
+		blur_ver_hits[2695]++;
 	}
 }
 
@@ -3216,9 +3332,6 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 		instance->dec_output_scale = instance->out->scale;
 		wlr_output_layout_get_box(server->output_layout, instance->out,
 			&instance->dec_output_box);
-		/* 位置也记一笔：拖拽只动 anim_off、不推进 bake_revision，
-		 * 不记这个的话拖动全程都会被判定「缓存命中」而不重烘。 */
-		instance->dec_screen_box = vidow_view_screen_box(fx->view);
 	}
 
 	/* dump_target 自己记得「dump 过几份、上限多少」（VIDOW_FX_DUMP 没设就立刻返回），
@@ -3233,6 +3346,7 @@ void vidow_view_blur_invalidate(struct vidow_view *view) {
 		return;
 	}
 	view->fx.blur_ver++;
+	blur_ver_hits[3276]++;
 	if (view->output != NULL) {
 		vidow_output_schedule_frame(view->server, view->output,
 			"装饰模糊失效");
@@ -4203,6 +4317,28 @@ void vidow_blur_update(struct vidow_output *output) {
 	int w = output->wlr_output->width, h = output->wlr_output->height;
 	bool usable = server->shader_ok && server->config.blur_enabled && w > 0 &&
 		h > 0 && w <= MAX_TARGET_PX && h <= MAX_TARGET_PX;
+
+	/* **这一帧什么都没变就直接走人。**
+	 *
+	 * gen_scene 是「世界里有多少东西动过」的计数器（damage_bump 每标一次
+	 * +1）：窗口交帧、拖动、配置重载、layer 上下屏、输出重排全都会让它前进。
+	 * 它没动 = 上一帧算好的账这一帧还成立 —— 下面那一长串遍历（views ×
+	 * layers × popups，每一项都要解几何、查槽位、比 mask）纯属每帧白跑。
+	 *
+	 * 只在 usable 这条路上早退：!usable 那条是「收回已经建出来的资源」，
+	 * 配置刚把模糊关掉的那一刻 gen_scene 不一定动过，必须每帧都能跑到。
+	 *
+	 * 记账放在判断**之后**、遍历之前：遍历中途 return 掉也已经记上了，因为
+	 * 这一帧的结论对整帧都成立。 */
+	if (usable && output->blur_seen_scene == server->gen_scene &&
+			output->blur_seen_layer == server->gen_layer) {
+		return;
+	}
+	if (usable) {
+		output->blur_seen_scene = server->gen_scene;
+		output->blur_seen_layer = server->gen_layer;
+	}
+
 	if (!usable) {
 		wl_list_for_each(view, &server->views, link) {
 			if (!view_blur_hits_output(view, output, &out_box)) {
@@ -4372,6 +4508,7 @@ update_consumers:
 					oslot->oh != output->wlr_output->height ||
 					oslot->ox != my_out_x || oslot->oy != my_out_y) {
 				view->fx.blur_ver++;
+				blur_ver_hits[4415]++;
 			}
 			oslot->layout_box = *obox;
 			oslot->ow = output->wlr_output->width;
@@ -4388,12 +4525,36 @@ update_consumers:
 				view->fx.blur_out_x != my_out_x ||
 				view->fx.blur_out_y != my_out_y)) {
 			view->fx.blur_ver++;
+			blur_ver_hits[4431]++;
 		}
 		view->fx.blur_out_w = output->wlr_output->width;
 		view->fx.blur_out_h = output->wlr_output->height;
 		view->fx.blur_out_x = my_out_x;
 		view->fx.blur_out_y = my_out_y;
-		view->fx.bake_output = output->wlr_output;
+		/* **bake_output 是「这个窗口按哪块屏的倍率烘」，不是「这一趟在哪块屏
+		 * 上画」—— 别每帧覆盖它。**
+		 *
+		 * 这里原来无条件写 output->wlr_output。两块屏同帧各跑一遍
+		 * vidow_blur_update，于是它每帧被改写两次，而它正是下面这些判据的
+		 * 一环：view_bake_for_output 里 dec_output_scale / dec_output_box
+		 * 跟着它取，vidow_fx_frame 也拿它选 instance。结果每块屏的装饰缓存
+		 * 下一帧必然对不上，dec_valid 永远「要重烘」—— 实测静止画面
+		 * 3268 次 bakeout / 6 秒，blur_ver 每秒涨 172。整机白转。
+		 *
+		 * 也让「第一次跨屏拖拽卡住」有了根：拖到两块屏中间那几帧，谁最后
+		 * 跑就把 bake_output 抢走，窗口下一帧按别的屏的倍率烘。
+		 *
+		 * 只在**归属真的变了**的时候写：判据用 view_blur_owner（跟倍率、
+		 * 底衬归属同一个真值，见它的注释）。跨屏那一半的临时借用由
+		 * view_bake_for_output 自己存/恢复，不经过这里。 */
+		struct wlr_output *owner_out = view_blur_owner(view);
+		if (owner_out != NULL) {
+			view->fx.bake_output = owner_out;
+		} else if (view->fx.bake_output == NULL) {
+			/* 没有归属（浮窗 / 弹窗）：退回「这一趟画的这块屏」——
+			 * 但只在从没设过时写一次，不跟着每帧翻。 */
+			view->fx.bake_output = output->wlr_output;
+		}
 		if (!view_wants_blur(view) || view->fx.node == NULL) {
 			if (view->fx.blur_own_tex != NULL) {
 				blur_own_drop(&view->fx);
@@ -4558,6 +4719,32 @@ static void view_bake_for_output(struct vidow_server *server,
 		/* Output instances also need updating after release and during layout
 		 * animations; otherwise the non-owner half retains an old buffer. */
 		struct wlr_box vb = vidow_view_screen_box(view);
+		/* **先问「它现在到底看得见吗」，再问「跟这块屏相交吗」。**
+		 *
+		 * 平铺窗口的 geom 里含着滚动视口的偏移，而那是**布局绝对坐标**：
+		 * DP-2 上两列宽 1909、视口滚到第二列时，第一列的
+		 * geom.x = 1920 + 0 - 1901 = 19 —— 它在 DP-2 左侧屏外（被
+		 * view_clip_box 裁光了），可那个坐标**落在 DP-3 的范围里**
+		 * （0..1920）。直接拿 vb 跟这块屏的框做交集，就会判成「这个窗口
+		 * 骑在 DP-3 上」，每帧给它白烘一份 DP-3 的装饰 —— 实测静止 6 秒
+		 * 3459 次 bakeout，view=7 明明在 DP-2 上却有 869 次 out=DP-3，
+		 * 而且 rev 永远不命中缓存（DP-2 那趟刚烘完，DP-3 这趟又把
+		 * dec_screen_box 改掉，下一帧又反过来）。
+		 *
+		 * fx->clip 就是 view_clip_box 的结果（见 view.c 的
+		 * vidow_view_apply_clip）：滚出视口的窗口裁完是空的，跟它一比
+		 * 就现原形。裁剪关着（浮窗 / 正在拖）时才退回按 vb 判。 */
+		if (view->fx.clip_on) {
+			struct wlr_box visible = {0};
+			if (!wlr_box_intersection(&visible, &vb, &view->fx.clip)) {
+				struct vidow_blur_slot *sl = blur_slot_for(&view->fx,
+					output->wlr_output, false);
+				if (sl != NULL && sl->node != NULL)
+					wlr_scene_node_set_enabled(&sl->node->node, false);
+				continue;
+			}
+			vb = visible;
+		}
 		struct wlr_box hit;
 		if (!wlr_box_intersection(&hit, &vb, &ob)) {
 			struct vidow_blur_slot *sl = blur_slot_for(&view->fx,
@@ -4578,10 +4765,7 @@ static void view_bake_for_output(struct vidow_server *server,
 				sl->dec_output_scale == output->wlr_output->scale &&
 				sl->dec_output_box.x == ob.x && sl->dec_output_box.y == ob.y &&
 				sl->dec_output_box.width == ob.width &&
-				sl->dec_output_box.height == ob.height &&
-				sl->dec_screen_box.x == vb.x && sl->dec_screen_box.y == vb.y &&
-				sl->dec_screen_box.width == vb.width &&
-				sl->dec_screen_box.height == vb.height) {
+				sl->dec_output_box.height == ob.height) {
 			if (vidow_xtrace_on()) {
 				wlr_log(WLR_INFO, "bake: %s 缓存命中跳过重烘 "
 					"rev=%u/%u blur=%u/%u",
@@ -4604,8 +4788,39 @@ static void view_bake_for_output(struct vidow_server *server,
 				view->fx.bake_revision,
 				sl != NULL ? sl->dec_blur_ver : 0, view->fx.blur_ver);
 		}
+		/* **烘完把 bake_output 还回去。**
+		 *
+		 * 这一趟是「这块屏借这个窗口再烘一份自己的那一半」，是临时的。
+		 * 可 bake_output 是单值，vidow_view_anim_bake 下一帧会拿它当
+		 * 「这个窗口该按哪块屏的倍率烘」—— 留着不回，窗口就永久按最后
+		 * 那趟借它的屏来烘了。
+		 *
+		 * 实测症状（用户 2026-10-27）：窗口在 2x 的 DP-2 上，第一次往
+		 * 1x 的 DP-3 拖，跨屏那一帧 DP-3 把 bake_output 抢过去，之后
+		 * 每帧都按 DP-3 的 1x 烘 —— 窗口卡在 DP-2 左边缘，拖得越远背景
+		 * 横条越多，超过一个窗口宽才突然跳过去；之后再拖就正常了（那时
+		 * bake_output 已经稳定在 DP-3）。 */
+		struct wlr_output *saved_bake_output = view->fx.bake_output;
 		view->fx.bake_output = output->wlr_output;
+		if (vidow_xtrace_on()) {
+			wlr_log(WLR_INFO, "bakeout: view=%d out=%s vb=%d,%d %dx%d "
+				"cached[rev=%u blur=%u scale=%.2f box=%d,%d %dx%d] "
+				"now[rev=%u blur=%u scale=%.2f box=%d,%d %dx%d]",
+				view->id, output->wlr_output->name, vb.x, vb.y,
+				vb.width, vb.height,
+				sl != NULL ? sl->dec_revision : 0,
+				sl != NULL ? sl->dec_blur_ver : 0,
+				sl != NULL ? sl->dec_output_scale : 0.0,
+				sl != NULL ? sl->dec_output_box.x : 0,
+				sl != NULL ? sl->dec_output_box.y : 0,
+				sl != NULL ? sl->dec_output_box.width : 0,
+				sl != NULL ? sl->dec_output_box.height : 0,
+				view->fx.bake_revision, view->fx.blur_ver,
+				output->wlr_output->scale,
+				ob.x, ob.y, ob.width, ob.height);
+		}
 		vidow_view_anim_bake(view);
+		view->fx.bake_output = saved_bake_output;
 	}
 }
 
@@ -4868,6 +5083,61 @@ static bool decor_draw(struct vidow_server *server,
 		.split_x = -1.0f,
 		.content_alpha = 1.0f,
 	};
+
+	/* **跨屏：窗口两半各用自己那块屏的底衬。**
+	 *
+	 * 着色器那边早就写好了（u_split / u_origin2 / u_output_size2：p.x 越过
+	 * 分界就换第二套坐标），但 CPU 这边从来没给 split_x 赋过正值 —— 它一直
+	 * 停在下面那个 -1.0f，那一整段分支永远不走。窗口骑在两块屏中间时，整窗
+	 * 都拿**这一块屏**的底衬贴图去采样：另一半落在贴图区域外面，UV 被 clamp
+	 * 到边缘像素 —— 屏幕上就是「跨屏那一半背景不对」。
+	 *
+	 * 坐标口径（和 origin_x / 着色器第 303 行对齐）：
+	 *   p          = 目标像素，原点在装饰缓冲左上角
+	 *   p.x        = off_x + (窗口内容左边 - ox) * scale   （off_x = px_pad）
+	 *   采样       = (borg - off + p * blur_scale + bias) / bsize
+	 * 所以分界 p.x = off_x + (另一屏布局左边界 - ox) * scale。
+	 * borg 同理：另一屏的设备像素原点 = 布局坐标 * 那一屏的倍率 - 那一屏原点。 */
+	if (bs != NULL && bs->out != NULL && fx->blur_slot != NULL) {
+		struct vidow_blur_slot *other = NULL;
+		for (struct vidow_blur_slot *it = fx->blur_slot; it != NULL;
+				it = it->next) {
+			if (it == bs || it->out == NULL || it->tex == NULL) {
+				continue;
+			}
+			if (it->layout_box.width <= 0 || it->layout_box.height <= 0) {
+				continue;
+			}
+			other = it;
+			break;
+		}
+		if (other != NULL) {
+			double osc = other->out->scale > 0.0 ?
+				other->out->scale : 1.0;
+			double split = (double)g.off_x +
+				((double)other->layout_box.x - (double)ox) * scale;
+			if (split > 0.0 && split < (double)dw2) {
+				g.split_x = (float)split;
+				g.origin2_x = (float)((int)lround((double)ox * osc) -
+					other->ox - other->rx);
+				g.origin2_y = (float)((int)lround((double)oy * osc) -
+					other->oy - other->ry);
+				g.out_size2_x = (float)(other->rw > 0 ?
+					other->rw : other->ow);
+				g.out_size2_y = (float)(other->rh > 0 ?
+					other->rh : other->oh);
+				if (span_trace_on()) {
+					wlr_log(WLR_INFO,
+						"split: 本屏 %s %dx%d@%d,%d 另一屏 %s "
+						"%dx%d@%d,%d 分界 %.0f/%d",
+						bs->out->name, out_w, out_h, out_x, out_y,
+						other->out->name, other->ow, other->oh,
+						other->ox, other->oy, split, dw2);
+				}
+			}
+		}
+	}
+
 	return decor_pass(server, fx, dst, &g, src, mask, border, alpha, scale, look,
 		false);
 }
@@ -5160,10 +5430,39 @@ static bool layer_blur_frame(struct vidow_server *server,
 		/* 同窗口那条路：世界代次只是粗筛，损伤盒子没碰到这一块就不重抓。 */
 		bool key_changed = ls->bd_gen_scene != server->gen_scene;
 		bool touched = key_changed && blur_damage_hits(fx, &ls->geom);
+		if (getenv("VIDOW_DMG_WHY") != NULL) {
+			static int64_t lz_last;
+			int64_t lz_now = vidow_now_ns();
+			if (lz_now - lz_last > 200000000LL) {
+				lz_last = lz_now;
+				wlr_log(WLR_INFO, "LAYERBLUR geom=%dx%d%+d%+d px=%dx%d "
+					"touched=%d key=%d out=%s", logical_w, logical_h,
+					ls->geom.x, ls->geom.y, px_w, px_h, (int)touched,
+					(int)key_changed, output->wlr_output->name);
+			}
+		}
+		/* **判据里不再看 gen_layer**（只有损伤盒子算数）。
+		 *
+		 * 原来这里还要求「抓的时候的 gen_layer == 现在的 gen_layer」，而
+		 * gen_layer 是**全局**的：任何一次 layer 变化（上屏 / 下屏 / 壁纸换 /
+		 * %background% 重画）都会让它 +1，于是屏幕上**每一块** layer 的私有
+		 * 底衬一起作废、一起重抓。
+		 *
+		 * 代价实测：noctalia 那 8 块 32x32 的角层（noctalia-screen-corner）
+		 * 每帧都在重抓 —— BLURVER 探针统计 ~2000 次/秒的 blur_ver 推进，
+		 * 渲染统计里「贴图 +12/-0」的纹理反复建删就是它，静止桌面白烧 CPU。
+		 *
+		 * 而 gen_layer 真正想表达的那些变化**都已经记了损伤**：
+		 * vidow_backdrop_damage / vidow_backdrop_damage_output 都调
+		 * blur_note_damage，把整屏（或那块屏）的盒子记到每个 layer 头上 ——
+		 * 所以 touched 那一条已经覆盖了它们。留下 gen_layer 只是纯churn。
+		 *
+		 * 换句话说：**判据必须是「我这一块底下的像素变了吗」，不是「世界
+		 * 有没有动过」**。全局代次回答的是后一个问题，用它就会把「屏幕另一头
+		 * 某个 32x32 角上什么都没变」也判成过期。 */
 		bool fresh = ls->bd != NULL && fx->blur_own_tex != NULL && !touched &&
 			ls->bd_w == px_w && ls->bd_h == px_h &&
 			ls->bd_x == rx && ls->bd_y == ry &&
-			ls->bd_gen_layer == server->gen_layer &&
 			fx->blur_set.w == px_w && fx->blur_set.h == px_h &&
 			fx->blur_set.levels == levels &&
 			fabs(fx->blur_set.offset - server->config.blur_offset) < 1e-6;
@@ -5185,6 +5484,7 @@ static bool layer_blur_frame(struct vidow_server *server,
 			 * 窗口那条路没这个问题：view_region_build 走完，blur_assign
 			 * 拿到的是新的 blur_own_id（每次重抓都换号），自然会 ++。 */
 			fx->blur_ver++;
+			blur_ver_hits[5360]++;
 		}
 		blur_assign(fx, NULL, fx->blur_own_tex, false, fx->blur_own_id,
 			&(struct wlr_box){ .x = rx, .y = ry,
@@ -5779,6 +6079,7 @@ static void popup_blur_frame(struct vidow_server *server,
 		pb->last_w = w;
 		pb->last_h = h;
 		fx->blur_ver++;
+		blur_ver_hits[5954]++;
 	}
 
 	int rx, ry, rw, rh, levels;
@@ -5796,10 +6097,13 @@ static void popup_blur_frame(struct vidow_server *server,
 	};
 	bool key_changed = pb->bd_gen_scene != server->gen_scene;
 	bool touched = key_changed && blur_damage_hits(fx, &region_logical);
+	/* 同 layer_blur_frame 上面那段：**判据里不看 gen_layer**。
+	 * 弹出物（菜单 / 输入法候选框）一样会因为「世界动过」而重抓整块底衬，
+	 * 而它真正该看的是「我底下那一块像素变没变」= touched。 */
 	bool fresh = fx->own_bd != NULL && fx->blur_own_tex != NULL && !touched &&
 		pb->bd_output == output &&
 		pb->bd_w == rw && pb->bd_h == rh && pb->bd_x == rx &&
-		pb->bd_y == ry && pb->bd_gen_layer == server->gen_layer &&
+		pb->bd_y == ry &&
 		fx->blur_set.w == rw && fx->blur_set.h == rh &&
 		fx->blur_set.levels == levels &&
 		fabs(fx->blur_set.offset - server->config.blur_offset) < 1e-6;
@@ -5815,6 +6119,7 @@ static void popup_blur_frame(struct vidow_server *server,
 		 * blur_drawn == blur_ver 立刻成立 —— 弹出物背后的模糊会一直停在
 		 * 第一次画的那张上。 */
 		fx->blur_ver++;
+		blur_ver_hits[5990]++;
 	}
 	blur_assign(fx, NULL, fx->blur_own_tex, false, fx->blur_own_id,
 		&(struct wlr_box){ .x = rx, .y = ry,
@@ -6019,6 +6324,7 @@ void vidow_popup_blur_invalidate(struct vidow_popup_blur *pb) {
 		return;
 	}
 	pb->fx.blur_ver++;
+	blur_ver_hits[6194]++;
 	struct vidow_output *out = popup_blur_owner(pb);
 	if (out != NULL) {
 		vidow_output_schedule_frame(pb->server, out->wlr_output,
@@ -6172,6 +6478,7 @@ static void layer_blur_capture_visible(struct vidow_server *server, bool on) {
  * 距离和采样坐标都在着色器里，节点自己动了也得重算。 */
 void vidow_layer_blur_invalidate(struct vidow_layer_surface *ls) {
 	ls->fx.blur_ver++;
+	blur_ver_hits[6347]++;
 	if (ls->output != NULL) {
 		vidow_output_schedule_frame(ls->server, ls->output->wlr_output,
 			"layer 模糊失效");

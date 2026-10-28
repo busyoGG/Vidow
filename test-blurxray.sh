@@ -54,7 +54,7 @@ chmod 700 "$RUNDIR/run"
 
 export XDG_RUNTIME_DIR="$RUNDIR/run"
 export WLR_BACKENDS=headless WLR_HEADLESS_OUTPUTS=1 WLR_LIBINPUT_NO_DEVICES=1
-export HOME="$CFGDIR" VIDOW_LOG=info VIDOW_RENDER_STATS=1
+export HOME="$CFGDIR" VIDOW_LOG=debug VIDOW_RENDER_STATS=1
 export DISPLAY= WAYLAND_DISPLAY=
 
 float_at() { # <标题> <x> <y> <宽> <高>

@@ -351,6 +351,43 @@ void vidow_ipc_json_window(struct jbuf *b, struct vidow_server *server,
 			view->scene_tree->node.enabled);
 		jb_kv_bool(b, "scene_parked", view->scene_parked);
 		jb_kv_bool(b, "fx_active", view->fx.active);
+		/* 装饰离屏缓冲（per-output）：窗口骑在两块屏中间时每块屏各有一份
+		 * （见 server.h 的 struct vidow_blur_slot 的 dec*）。跨屏倍率问题
+		 * 的回归判据就靠这一组 —— 以前测试靠 grep 日志里的 `fx: target`，
+		 * 那是**所有**离屏缓冲（含模糊金字塔的 480x270 中间级）的日志，
+		 * 抓到的常常是金字塔而不是窗口的装饰缓冲。
+		 *
+		 * bake_output 是「这一帧的装饰是给哪块屏烘的」：判据要连它一起看
+		 * （1 倍屏上就该 < 2500，2 倍屏上就该 > 3000）。 */
+		jb_kv_str(b, "bake_output", view->fx.bake_output != NULL ?
+			view->fx.bake_output->name : "");
+		/* **每块屏各一份**（跨屏时窗口骑在两块屏中间）：1 倍屏那份该是
+		 * ~窗口逻辑宽，2 倍屏那份该是两倍。测试就按这个判「两块屏是不是
+		 * 各按自己的倍率烘」，而不是看 cur_slot（那只代表最后烘的那块）。 */
+		jb_key(b, "dec_slots");
+		jb_arr(b);
+		for (struct vidow_blur_slot *ds = view->fx.blur_slot;
+				ds != NULL; ds = ds->next) {
+			if (ds->out == NULL) {
+				continue;
+			}
+			jb_obj(b);
+			jb_kv_str(b, "output", ds->out->name);
+			jb_kv_int(b, "width", ds->dec_w);
+			jb_kv_int(b, "height", ds->dec_h);
+			jb_kv_double(b, "scale", ds->dec_scale);
+			jb_obj_end(b);
+		}
+		jb_arr_end(b);
+		if (view->fx.cur_slot != NULL) {
+			jb_kv_int(b, "dec_width", view->fx.cur_slot->dec_w);
+			jb_kv_int(b, "dec_height", view->fx.cur_slot->dec_h);
+			jb_kv_double(b, "dec_scale", view->fx.cur_slot->dec_scale);
+		} else {
+			jb_kv_int(b, "dec_width", 0);
+			jb_kv_int(b, "dec_height", 0);
+			jb_kv_double(b, "dec_scale", 0.0);
+		}
 		if (view->scene_surface != NULL && view->scene_surface->buffer != NULL) {
 			struct wlr_scene_buffer *sb = view->scene_surface->buffer;
 			jb_kv_double(b, "node_opacity", sb->opacity);

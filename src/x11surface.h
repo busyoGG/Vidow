@@ -267,7 +267,6 @@ void vidow_x11_surface_set_maximized(struct vidow_x11_surface *s,
 	bool horz, bool vert);
 void vidow_x11_surface_set_minimized(struct vidow_x11_surface *s, bool on);
 /* _NET_WM_PID，规则匹配要用。没有就返回 0。 */
-uint32_t vidow_x11_surface_pid(const struct vidow_x11_surface *s);
 
 /* 给 X 的根窗口设光标（RGBA 像素，stride 是每行字节数）。 */
 void vidow_x11_set_cursor(const unsigned char *pixels, uint32_t stride,
@@ -302,10 +301,5 @@ void vidow_view_x11_geometry_changed(struct vidow_view *view,
 void vidow_view_x11_property_changed(struct vidow_view *view, xcb_atom_t atom);
 void vidow_view_x11_state_changed(struct vidow_view *view);
 void vidow_view_x11_activate_request(struct vidow_view *view);
-void vidow_view_x11_map_request(struct vidow_view *view);
-void vidow_view_x11_destroyed(struct vidow_view *view);
-void vidow_view_x11_request_move(struct vidow_view *view);
-void vidow_view_x11_request_resize(struct vidow_view *view);
-void vidow_view_x11_request_close(struct vidow_view *view);
 
 #endif /* VIDOW_X11SURFACE_H */

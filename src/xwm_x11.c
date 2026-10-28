@@ -538,6 +538,52 @@ static void x11_handle_create(xcb_create_notify_event_t *e) {
 	wl_list_init(&s->surface_commit.link);
 	wl_list_insert(&g_x11->surfaces, &s->link);
 
+	/* **每个客户端窗口都要自己订阅 PROPERTY_CHANGE。**
+	 *
+	 * 主循环里那次 xcb_change_window_attributes 是设在 **root** 上的，
+	 * 而 root 的 PROPERTY_CHANGE 只收 root 自己的属性变更 —— **子窗口的
+	 * 属性变更一条都不会来**。所以像 _NET_WM_WINDOW_TYPE 这种「映射之后
+	 * 才写」的属性，我们从来没收到过通知：
+	 *
+	 *   实测（tools/xpopup.c popup menu ... late=600）：
+	 *     00:00:00.251  x11: 新窗口 (无题)（?，平铺）      ← 类型还没写
+	 *     00:00:00.600  客户端写入 _NET_WM_WINDOW_TYPE_POPUP_MENU
+	 *     （Vidow 侧一条 x11-type 日志都没有）
+	 *     00:00:03.250  x11: 新窗口 ...（弹出物）          ← 那是个新窗口
+	 *
+	 * 后果是 Chromium / Steam 这类「先建窗口、后写类型」的菜单永远被判成
+	 * 普通平铺窗口，被布局摆到别处、套上边框，然后画不出来。test-xwayland-popup.sh
+	 * 的「属性晚到」那三节 FAIL 就是它。
+	 *
+	 * Hyprland 在 CXWM::createWindow 里对每个窗口都
+	 * xcb_change_property 订阅（mask 里带 XCB_EVENT_MASK_PROPERTY_CHANGE），
+	 * 这里照它补上。订阅要在建 view 之前设好：类型变更的回调要靠
+	 * view 已经存在才有地方落。 */
+	{
+		/* **SUBSTRUCTURE_NOTIFY 必须也设在每个窗口上。**
+		 *
+		 * 主循环里那份掩码设在 root 上，而 SUBSTRUCTURE_NOTIFY 只报告
+		 * **直接子窗口**的 CreateNotify / MapNotify / UnmapNotify /
+		 * DestroyNotify —— root 只报它自己的直接孩子，**孙窗口一条都
+		 * 不会来**。
+		 *
+		 * 实测（test-child-coords.sh，xpopup 用 parent= 建真子窗口）：
+		 *   xwm: create xid=0x400000 400x400 at 100,150 or=0   ← 父窗口
+		 *   （子窗口 xid=0x600000 建好了，Vidow 侧**一条 create 都没有**）
+		 * 客户端那边明明报 `expose 100x80`，屏幕上什么都没有。
+		 *
+		 * Steam / CEF 正是这么用的：一堆 4x2 的 or=1 子窗口当事件接收器
+		 * 和菜单锚点，全挂在 Steam 主窗口下面。收不到它们的 CreateNotify
+		 * 就没有 view、没有场景节点 —— 菜单画不出来，鼠标也命不中。
+		 *
+		 * 加上之后孙窗口的 CreateNotify 会落在这个窗口的掩码上。注意
+		 * xcb_change_window_attributes 是**整份覆盖**不是追加，所以
+		 * PROPERTY_CHANGE 必须一起写进来（否则又回到「类型晚到」那个坑）。 */
+		uint32_t pmask[] = { XCB_EVENT_MASK_PROPERTY_CHANGE };
+		xcb_change_window_attributes(g_x11->conn, e->window,
+			XCB_CW_EVENT_MASK, pmask);
+	}
+
 	wlr_log(WLR_INFO, "xwm: create xid=0x%x %dx%d at %d,%d or=%d",
 		e->window, e->width, e->height, e->x, e->y,
 		(int)e->override_redirect);
@@ -1425,12 +1471,6 @@ void vidow_x11_surface_set_minimized(struct vidow_x11_surface *s, bool on) {
 		xcb_flush(g_x11->conn);
 	}
 }
-
-uint32_t vidow_x11_surface_pid(const struct vidow_x11_surface *s) {
-	return s != NULL ? s->pid : 0;
-}
-
-
 void vidow_x11_surface_close(struct vidow_x11_surface *s) {
 	struct vidow_x11_server *x11 = g_x11;
 	if (x11 == NULL || s == NULL) {

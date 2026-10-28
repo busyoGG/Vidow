@@ -910,47 +910,6 @@ void vidow_overview_map(struct vidow_server *server, struct vidow_view *view,
 	*sx = wx + (x1 - wx) * ov->t;
 	*sy = wy + (y1 - wy) * ov->t;
 }
-
-/* 这个窗口在 overview 里**画出来的那块框**（布局坐标）+ 它那一行的矩形。
- * 返回 false = 不适用（不在 overview 里 / 不在这块屏 / 不在行里）。
- *
- * 行矩形现在是 fx.c 的**裁剪框**：窗口超出这一行的部分被裁掉，行内的照常显示
- * （用户：所有窗口都要显示，超出的由显示器裁）。以前它是 view.c 里「整块落在
- * 行矩形外就 alpha = 0」的判据 —— 那层整体隐藏已经撤掉了（判据和裁剪框不是
- * 同一个东西，会把该裁一半显示的窗口整个藏掉）。 */
-bool vidow_overview_view_box(struct vidow_server *server,
-		struct vidow_view *view, struct wlr_box *out) {
-	const struct vidow_overview *g = &server->overview;
-	if (g->t <= 0.0 || g->output == NULL) {
-		return false;
-	}
-	struct vidow_output *wrap =
-		view->output != NULL ? vidow_output_lookup(server, view->output) : NULL;
-	if (wrap == NULL) {
-		return false;
-	}
-	struct vidow_ov_row *row = row_of(server, wrap, view->ws);
-	if (row == NULL) {
-		return false;
-	}
-	/* 用**场景节点真实坐标 + dst**（就是这一帧画出来的那块）—— 只读，没有
-	 * 副作用。
-	 *
-	 * ⚠️ 别在这儿调 row_view_rect() / vidow_overview_map()：row_view_rect()
-	 * 会写行的视口状态（row->content_x 那些），在摆放之前调就把后面的摆放
-	 * 带歪 —— 实测 test-overview 的四象限颜色 / 没被压暗三条当场红。 */
-	struct wlr_scene_buffer *sb = view->scene_surface != NULL ?
-		view->scene_surface->buffer : NULL;
-	if (sb == NULL || sb->dst_width <= 0 || sb->dst_height <= 0) {
-		return false;
-	}
-	int cx = 0, cy = 0;
-	wlr_scene_node_coords(&sb->node, &cx, &cy);
-	*out = (struct wlr_box){.x = cx, .y = cy,
-		.width = sb->dst_width, .height = sb->dst_height};
-	return true;
-}
-
 double vidow_overview_scale(const struct vidow_server *server) {
 	const struct vidow_overview *ov = &server->overview;
 	if (ov->t <= 0.0) {

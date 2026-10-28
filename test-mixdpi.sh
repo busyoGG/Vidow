@@ -90,13 +90,29 @@ exec 9> "$RUNDIR/actions"
 act() { echo "$1" >&9; sleep "${2:-0.3}"; }
 
 # 窗口一行：标题 / 在哪块屏 / 位置尺寸
+# 某块屏那份装饰缓冲的宽度（0 = 这块屏没有）—— 跨屏时每块屏各一份。
+slot_width() {
+	./build/vidowmsg windows | python3 -c '
+import sys, json
+for w in json.load(sys.stdin):
+    if w["title"] != "w1":
+        continue
+    for s in w["surface"].get("dec_slots", []):
+        if s["output"] == sys.argv[1]:
+            print(s["width"])
+            break
+' "$1"
+}
+
 wins() {
 	./build/vidowmsg windows | python3 -c '
 import sys, json
 for w in json.load(sys.stdin):
     g = w["float_geometry"] if w["floating"] else w["geometry"]
-    print("%s %s %d %d %d %d" % (w["title"], w["output"], g["x"], g["y"],
-                                 g["width"], g["height"]))'
+    print("%s %s %d %d %d %d %d %s" % (w["title"], w["output"], g["x"], g["y"],
+                                 g["width"], g["height"],
+                                 w["surface"].get("dec_width", 0),
+                                 w["surface"].get("bake_output", "")))'
 }
 field() { wins | awk -v t="$1" '$1 == t { print $'"$2"' }'; }
 
@@ -164,11 +180,20 @@ if [ "$OUT_DRAG" = "HEADLESS-1" ]; then
 else
 	fail "拖拽中归属已经变成 $OUT_DRAG（这个测试要的是「归属没变、人已经在对面屏上」）"
 fi
-DRAG_MAX=$(target_max "$((MARK + 1))")
-if [ "$DRAG_MAX" -lt 2500 ]; then
-	pass "拖拽中仍按原工作区那块屏烘（${DRAG_MAX} 宽，1 倍）—— 窗口还没换工作区"
+# **判据用 IPC 的装饰缓冲尺寸（surface.dec_width），不是 grep 日志里的
+# `fx: target`。** 后者是**所有**离屏缓冲的日志 —— 模糊金字塔的中间级
+# （480x270 / 240x135）也在里面，target_last 常常抓到的是金字塔，于是
+# 「松手后变成 480 宽」这种 FAIL 其实什么都没测到。
+# **两块屏各有一份，各自按自己的倍率烘**（用户要的「按照窗口跨过的面积
+# 各自渲染」）。看的是 dec_slots 里两块屏各自的宽度，不是 cur_slot ——
+# cur_slot 只代表最后烘的那一块，跨屏时两块轮流烘，看它没意义。
+DRAG_W1=$(slot_width HEADLESS-1)
+DRAG_W2=$(slot_width HEADLESS-2)
+if [ "${DRAG_W1:-0}" -gt 0 ] && [ "$DRAG_W1" -lt 2500 ] &&
+		[ "${DRAG_W2:-0}" -gt 3000 ]; then
+	pass "拖拽中两块屏各按自己的倍率烘（1x 屏 ${DRAG_W1} 宽、2x 屏 ${DRAG_W2} 宽）"
 else
-	fail "拖拽中离屏缓冲变成 $DRAG_MAX 宽（窗口还没换工作区，不该跟着对面屏换倍率）"
+	fail "拖拽中两块屏的装饰缓冲不对：1x 屏 ${DRAG_W1:-无}、2x 屏 ${DRAG_W2:-无}（期望 1x<2500、2x>3000）"
 fi
 
 mark "松手：归属换成 2 倍屏"
@@ -180,11 +205,11 @@ if [ "$OUT1" = "HEADLESS-2" ]; then
 else
 	fail "松手后归属是 $OUT1（期望 HEADLESS-2）"
 fi
-AFTER=$(target_last)
-if [ "$AFTER" -gt 3000 ]; then
-	pass "松手后离屏缓冲还是 2 倍（$AFTER 宽）"
+AFTER=$(slot_width HEADLESS-2)
+if [ "${AFTER:-0}" -gt 3000 ]; then
+	pass "松手后 2 倍屏那份装饰缓冲还是 2 倍（$AFTER 宽）"
 else
-	fail "松手后离屏缓冲变成 $AFTER 宽（期望 2 倍）"
+	fail "松手后 2 倍屏那份装饰缓冲 ${AFTER:-无} 宽（期望 > 3000）"
 fi
 
 mark "再拖回 1 倍屏"
@@ -199,11 +224,11 @@ done
 act "pointer-button left release mod" 0.8
 sleep 1.5
 OUT2=$(field w1 2)
-BACK=$(target_last)
-if [ "$OUT2" = "HEADLESS-1" ] && [ "$BACK" -lt 2500 ]; then
-	pass "拖回 1 倍屏后离屏缓冲回到 1 倍（$BACK 宽，归属 $OUT2）"
+BACK=$(slot_width HEADLESS-1)
+if [ "$OUT2" = "HEADLESS-1" ] && [ "${BACK:-0}" -gt 0 ] && [ "$BACK" -lt 2500 ]; then
+	pass "拖回 1 倍屏后装饰缓冲回到 1 倍（$BACK 宽，归属 $OUT2）"
 else
-	fail "拖回 1 倍屏后：归属 $OUT2、缓冲 $BACK 宽（期望 HEADLESS-1 + < 2500）"
+	fail "拖回 1 倍屏后：归属 $OUT2、1x 屏装饰缓冲 ${BACK:-无} 宽（期望 HEADLESS-1 + < 2500）"
 fi
 
 mark "收尾"

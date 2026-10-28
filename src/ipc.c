@@ -899,69 +899,48 @@ static bool req_direction(struct jval *req, int *out, char *err, size_t errlen) 
 	return false;
 }
 
-static bool cmd_focus_column(struct vidow_server *server, struct jval *req,
-		struct jbuf *out, char *err, size_t errlen) {
+/* focus-column / focus-window / move-column / move-window 这四条只差「调哪个域函数」，
+ * 其余（解 direction、warpa 光标、回一份 focused）一模一样。抽成一个壳，四条命令各
+ * 留一行转发 —— 以前是四份逐字重复的 10 行，改一处忘三处是迟早的事。 */
+static bool direction_cmd(struct vidow_server *server, struct jval *req,
+		struct jbuf *out, char *err, size_t errlen,
+		void (*apply)(struct vidow_server *, int), bool warp) {
 	int direction = 0;
 	if (!req_direction(req, &direction, err, errlen)) {
 		return false;
 	}
-	vidow_focus_column(server, direction);
-	/* 和 keybind.c 的 focus-column 动作一样：键盘换焦点之后把光标带过去
-	 * （warp-mouse-to-focus，默认关，没开就什么都不做）。 */
-	vidow_warp_cursor_to_focus(server);
+	apply(server, direction);
+	if (warp) {
+		/* 和 keybind.c 的动作一样：键盘换焦点之后把光标带过去
+		 * （warp-mouse-to-focus，默认关，没开就什么都不做）。 */
+		vidow_warp_cursor_to_focus(server);
+	}
 	jb_obj(out);
 	jb_kv_int(out, "direction", direction);
 	jb_key(out, "focused");
 	vidow_ipc_json_window(out, server, server->focused);
 	jb_obj_end(out);
 	return true;
+}
+
+static bool cmd_focus_column(struct vidow_server *server, struct jval *req,
+		struct jbuf *out, char *err, size_t errlen) {
+	return direction_cmd(server, req, out, err, errlen, vidow_focus_column, true);
 }
 
 static bool cmd_focus_window_direction(struct vidow_server *server,
 		struct jval *req, struct jbuf *out, char *err, size_t errlen) {
-	int direction = 0;
-	if (!req_direction(req, &direction, err, errlen)) {
-		return false;
-	}
-	vidow_focus_window(server, direction);
-	/* 同上：也是键盘换焦点。 */
-	vidow_warp_cursor_to_focus(server);
-	jb_obj(out);
-	jb_kv_int(out, "direction", direction);
-	jb_key(out, "focused");
-	vidow_ipc_json_window(out, server, server->focused);
-	jb_obj_end(out);
-	return true;
+	return direction_cmd(server, req, out, err, errlen, vidow_focus_window, true);
 }
 
 static bool cmd_move_column(struct vidow_server *server, struct jval *req,
 		struct jbuf *out, char *err, size_t errlen) {
-	int direction = 0;
-	if (!req_direction(req, &direction, err, errlen)) {
-		return false;
-	}
-	vidow_move_column(server, direction);
-	jb_obj(out);
-	jb_kv_int(out, "direction", direction);
-	jb_key(out, "focused");
-	vidow_ipc_json_window(out, server, server->focused);
-	jb_obj_end(out);
-	return true;
+	return direction_cmd(server, req, out, err, errlen, vidow_move_column, false);
 }
 
 static bool cmd_move_window_direction(struct vidow_server *server,
 		struct jval *req, struct jbuf *out, char *err, size_t errlen) {
-	int direction = 0;
-	if (!req_direction(req, &direction, err, errlen)) {
-		return false;
-	}
-	vidow_move_window(server, direction);
-	jb_obj(out);
-	jb_kv_int(out, "direction", direction);
-	jb_key(out, "focused");
-	vidow_ipc_json_window(out, server, server->focused);
-	jb_obj_end(out);
-	return true;
+	return direction_cmd(server, req, out, err, errlen, vidow_move_window, false);
 }
 
 /* 把窗口从它那条列里取出来、单独成一条新列（niri 的 expel-window-from-column）。

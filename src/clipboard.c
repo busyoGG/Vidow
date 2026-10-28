@@ -2502,29 +2502,6 @@ bool vidow_clipboard_set(struct vidow_server *server, int kind, const char *mime
 	sel_emit(sel, "ipc-set");
 	return true;
 }
-
-bool vidow_clipboard_owns_xwindow(struct vidow_server *server,
-		uint32_t window) {
-	struct vidow_clipboard *clip = &server->clipboard;
-	if (clip->window == XCB_WINDOW_NONE || window == XCB_WINDOW_NONE) {
-		return false;
-	}
-	/* **只认我们自己那一个窗口 id，不按槽位猜。**
-	 *
-	 * 以前这里返回 (window & ~0x1fffff) == (clip->window & ~0x1fffff)，理由是
-	 * 「xwm 的内部窗口跟我们建在同一条连接上，槽位一样；客户端都在别的槽位」。
-	 * 这条假设是错的：X 资源槽位会随着连接轮转，xwm 重连后可能拿到一个客户端
-	 * 用过的槽位。踩过的 —— Steam 这一轮的主窗口正好是 0x2000041（槽位
-	 * 0x200000，和剪贴板代理窗口同槽），于是每次开主界面都被当成内部窗口在
-	 * xwayland.c 的 handle_new_xwayland_surface 里直接丢掉，view 根本没建，
-	 * 画面上永远不出现（`vidowmsg windows` 里也没有）。
-	 *
-	 * 内部那些窗口（selection_window 之类）本来就**不映射**，交给后面的
-	 * view_map / focus_helper 逻辑处理就够了（1x1 的第一帧会被判成辅助窗口），
-	 * 不需要在入口按槽位一刀切。 */
-	return (xcb_window_t)window == clip->window;
-}
-
 bool vidow_clipboard_mime_is_text(const char *mime) {
 	return mime != NULL && mime_is_text(mime);
 }

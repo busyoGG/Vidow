@@ -588,16 +588,6 @@ bool vidow_rule_has_field(const struct vidow_rule *rule,
 		return rule->aset[field->slot];
 	}
 }
-
-const char *vidow_rule_field_str(const struct vidow_rule *rule,
-		const struct vidow_rule_field *field) {
-	if (rule == NULL || field == NULL || field->kind != RK_STR ||
-			!vidow_rule_has_field(rule, field)) {
-		return NULL;
-	}
-	return rule->str[field->slot].pat;
-}
-
 /* ------------------------------------------------------------ 提交 */
 
 /* 一条规则的日志：匹配那一半 + 作用那一半。规则是配置里写的，出问题时日志
@@ -1189,6 +1179,18 @@ static void apply_view(struct vidow_server *server, struct vidow_view *view,
 
 	bool changed = view->force_render != force_render;
 	view->force_render = force_render;
+	/* **补帧间隔一律给真值，绝不留 0。**
+	 *
+	 * 0 在补帧循环里的语义是「不限速」（view.c 里 pump_interval_ms > 0 才
+	 * 算节流频率），所以给 0 等于把节流闸整个拆掉。我 2026-10-27 一度写成
+	 * `force_render ? interval : 0`，想让「没开 force_render 的窗口身上不挂
+	 * 间隔」—— 结果游戏滚出视口时走的是 x11 欠帧那条路（want 为真，不经过
+	 * force_render），拿到 0 就变成每 6ms 补一帧、主循环被占满，用户按键
+	 * 的队列延迟一路累积到 600ms+（日志里 lag 每 40ms 涨一次，涨到 718ms）。
+	 *
+	 * 现在回到「永远有值」：force_render 关着的时候这个值用不上（want 那条
+	 * 判据要 force_render），开着的时候按规则 / 全局频率节流，两条路都不会
+	 * 退化成不限速。 */
 	view->pump_interval_ms = interval;
 
 	/* 抓帧遮挡：模式变了才记一行（这个开关平时看不见，出问题时日志是唯一的

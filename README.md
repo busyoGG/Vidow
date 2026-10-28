@@ -571,6 +571,41 @@ grep -a "trace:" /tmp/v.log | tail
 回归判据见 `./test-frametrace.sh`（16 项，headless：健康时不误报 + 掐断帧链时点名 + 追踪
 关掉时零日志）。
 
+### 帧调度：`IDLE` / `QUEUED` / `RENDERING`
+
+「要一帧」只有一个入口（`vidow_output_schedule_frame`，`src/output.c`），每块屏记一个状态
+（`struct vidow_output` 的 `redraw`）：
+
+| 状态 | 含义 |
+| --- | --- |
+| `IDLE` | 没有待画的帧，屏幕上是上一帧提交的内容（不画 = 不耗电） |
+| `QUEUED` | 已经向后端排了一帧，等 `frame` 事件 |
+| `RENDERING` | `output_frame` 里正在画 |
+
+同一轮里第二次要帧只记账、不重复排（一帧里几十个窗口各要一次，排一次就够）。渲染期间
+又要帧（模糊失效、视口外补帧）会置 `redraw_again`：这一帧画完保持 `QUEUED`，不等下一次
+外部事件。
+
+**排了 50ms 还没出帧**（嵌套在别的合成器里、上层忙起来会吞 `frame` 事件）就强制重排一次
+—— 否则状态机会把帧链锁死在 `QUEUED`，看门狗再催也没用（就是上面那条「停在最后一帧」
+的成因之一）。
+
+`VIDOW_RENDER_STATS=1` 那行的 `损伤 %.1f%%/帧(整屏 N/M 帧)` 是每帧真正重画的面积占比
+（读 `damage_ring.current`，必须在 `wlr_scene_output_commit` **之前**读，之后它被 rotate
+清空了）。静止画面应该只有光标那一小块（几个百分点）；`整屏` 计数一直不为 0 才说明有东西
+在整屏标脏。
+
+### 底衬损伤：arrange 只推真实变过的区域
+
+`vidow_arrange()` 收口时以前无脑 `vidow_backdrop_damage(server, false)`（整屏都算），于是
+「开一个窗口」= 所有窗口的底衬全部重抓。现在这一趟里每个窗口的位置变化早就在 `place_view`
+里精确记过了（`vidow_backdrop_damage_box` / `_view`），`blur_note_damage` 顺手把并集攒进
+`server->arrange_damage`，收口时只推这块区域。
+
+回退整屏的三种情况：这一趟里有人标过整屏（`restack` 真换了层级 / layer 开关 / 背景重画）、
+`arrange_self_only`（只有被拖的那个在动）、什么都没记（纯配置变化）。宁可多抓一次，不能
+糊着旧的 —— 残影是这项目修过最多次的 bug。
+
 ## 截图 / 录屏里不出现：`capture = "hide"`（窗口规则 / layer 规则）
 
 给密码管理器、聊天窗口、内部面板这类东西用：**截图、录屏里不出现，屏幕上照常显示**
@@ -1025,7 +1060,7 @@ WLR_BACKENDS=headless WLR_HEADLESS_OUTPUTS=1 WLR_LIBINPUT_NO_DEVICES=1 ./build/v
 | `VIDOW_MASK_DUMP=N` | 前 N 份透明度剔除的 mask（layer 自己的内容）dump 成 `/tmp/vidow-mask-*` |
 | `VIDOW_BLUR_NO_PARTIAL=1` | 关掉「模糊链条只重跑受损那一小块」（强制整块重跑）。只给 A/B 比对用：局部和整块的结果必须逐像素一样，见 `./test-blurpartial.sh` |
 | `VIDOW_BLUR_NO_PARTIAL_FILE=路径` | 同上，但那个文件一出现才切过去 —— 同一个进程、同一个场景里就能比对两种方式（test-blurpartial.sh 用的就是这个） |
-| `VIDOW_RENDER_STATS=1` | 每 500ms 一行渲染统计：每帧各阶段耗时（模糊 / 装饰 / 果冻 / 提交）、私有底衬重建次数、**vidow 自己那些目标缓冲的贴图导入次数**、离屏趟数（`趟`）、装饰重烘总耗时（`重烘`）、**拖拽延迟（`拖拽延迟 平均/最大ms(次数)`：从最后一个指针移动事件到这一帧出帧）**、帧率。查「拖窗口卡」先在真机上跑这个看每帧干了多少活，再谈优化 |
+| `VIDOW_RENDER_STATS=1` | 每 500ms 一行渲染统计：每帧各阶段耗时（模糊 / 装饰 / 果冻 / 提交）、私有底衬重建次数、**vidow 自己那些目标缓冲的贴图导入次数**、离屏趟数（`趟`）、装饰重烘总耗时（`重烘`）、**拖拽延迟（`拖拽延迟 平均/最大ms(次数)`：从最后一个指针移动事件到这一帧出帧）**、**损伤占比（`损伤 %.1f%%/帧(整屏 N/M 帧)`：每帧真正重画的屏幕面积，见「帧调度」那节）**、帧率。查「拖窗口卡」先在真机上跑这个看每帧干了多少活，再谈优化 |
 
 ## 快捷键
 

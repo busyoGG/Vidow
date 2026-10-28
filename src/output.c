@@ -1,6 +1,7 @@
 #include "server.h"
 
 #include <drm_fourcc.h> /* DRM_FORMAT_XRGB8888 / XRGB2101010（输出缓冲的位深） */
+#include <pixman.h>      /* damage_ring 的损伤区域（渲染统计探针） */
 #include <strings.h> /* strcasecmp（方向的名字） */
 
 #include <math.h>
@@ -229,6 +230,17 @@ void vidow_output_render(struct vidow_output *output) {
 	struct vidow_view *view;
 	wl_list_for_each(view, &server->views, link) {
 		if (view->fx.active && view->fx.blur_drawn != view->fx.blur_ver) {
+			if (getenv("VIDOW_DMG_WHY") != NULL) {
+				static int64_t rb_last;
+				int64_t rb_now = vidow_now_ns();
+				if (rb_now - rb_last > 200000000LL) {
+					rb_last = rb_now;
+					wlr_log(WLR_INFO, "REBAKE %s drawn=%u ver=%u",
+						vidow_view_title(view) != NULL ?
+							vidow_view_title(view) : "(无题)",
+						view->fx.blur_drawn, view->fx.blur_ver);
+				}
+			}
 			if (pump_trace_on()) {
 				wlr_log(WLR_INFO, "PUMPTRACE 每帧重烘: %s drawn=%u ver=%u "
 					"rev=%u",
@@ -256,6 +268,48 @@ void vidow_output_render(struct vidow_output *output) {
 	 * （wf-recorder / 远程工具）拿不到 ready：录出来的文件 0 字节，
 	 * 前端一直「未起播」。屏幕看着正常是因为别处还有提交路径兜着，
 	 * 但抓帧这条依赖 commit 信号的链路就断了。 */
+	/* 探针：这一帧到底重画了多大面积（见 struct vidow_frame_stats 的
+	 * damage_px 说明）。damage_ring.current 是「自上次 commit 以来累积的
+	 * 损伤」，commit 内部会把 current rotate 到 buffer damage 再清空 ——
+	 * 所以必须在这行之前读，之后读到的永远是空的。 */
+	if (render_stats_on() && output->scene_output != NULL) {
+		pixman_region32_t *dmg = &output->scene_output->damage_ring.current;
+		int ndmg = 0;
+		pixman_box32_t *rects = pixman_region32_rectangles(dmg, &ndmg);
+		int64_t px = 0;
+		for (int i = 0; i < ndmg; i++) {
+			int64_t dw = (int64_t)rects[i].x2 - rects[i].x1;
+			int64_t dh = (int64_t)rects[i].y2 - rects[i].y1;
+			if (dw > 0 && dh > 0) {
+				px += dw * dh;
+			}
+		}
+		int64_t full = (int64_t)output->wlr_output->width *
+			(int64_t)output->wlr_output->height;
+		if (getenv("VIDOW_DMG_WHY") != NULL) {
+			static int dmps;
+			dmps++;
+			if (dmps > 200 && dmps % 40 == 0) {
+				char rb[512];
+				size_t ro = 0;
+				for (int i = 0; i < ndmg && ro < sizeof(rb) - 40; i++) {
+					ro += snprintf(rb + ro, sizeof(rb) - ro, "[%d,%d %dx%d]",
+						rects[i].x1, rects[i].y1,
+						rects[i].x2 - rects[i].x1,
+						rects[i].y2 - rects[i].y1);
+				}
+				rb[ro] = '\0';
+				wlr_log(WLR_INFO, "DMGRECT %s n=%d %s", output->wlr_output->name,
+					ndmg, rb);
+			}
+		}
+		vidow_stats.damage_px += px;
+		vidow_stats.damage_area += full;
+		vidow_stats.damage_frames++;
+		if (full > 0 && px >= full) {
+			vidow_stats.damage_full++;
+		}
+	}
 	wlr_scene_output_commit(output->scene_output, NULL);
 	int64_t st_t4 = vidow_now_ns();
 	if (render_stats_on()) {
@@ -274,7 +328,8 @@ void vidow_output_render(struct vidow_output *output) {
 				"渲染统计: %d 帧/帧窗(%.0fms) %.1f fps | 模糊 %.2fms/帧"
 				"(shared %d own %d chain %d) | 装饰 %.2fms/帧(%d 次重烘) | "
 				"果冻 %.2fms/帧 | 提交 %.2fms/帧 | 贴图 +%d/-%d | 趟 %d | "
-				"重烘 %.2fms/帧 | 拖拽延迟 %.2f/%.2fms(%d)",
+				"重烘 %.2fms/帧 | 拖拽延迟 %.2f/%.2fms(%d) | "
+				"损伤 %.1f%%/帧(整屏 %d/%d 帧) | 源 事件%d 狗%d 踢%d 抓%d | 标脏 bump%d note%d",
 				vidow_stats.frames, (double)(st_t4 - win_ns) / 1e6,
 				1000.0 * f / ((double)(st_t4 - win_ns) / 1e6),
 				(double)vidow_stats.blur_ns / 1e6 / f,
@@ -287,7 +342,25 @@ void vidow_output_render(struct vidow_output *output) {
 				vidow_stats.grab_lat_n > 0 ?
 					(double)vidow_stats.grab_lat_ns / 1e6 / vidow_stats.grab_lat_n : 0.0,
 				(double)vidow_stats.grab_lat_max_ns / 1e6,
-				vidow_stats.grab_lat_n);
+				vidow_stats.grab_lat_n,
+				vidow_stats.damage_area > 0 ?
+					100.0 * (double)vidow_stats.damage_px /
+						(double)vidow_stats.damage_area : 0.0,
+				vidow_stats.damage_full, vidow_stats.damage_frames,
+				vidow_stats.render_from_event, vidow_stats.render_from_watchdog,
+				vidow_stats.render_from_kick, vidow_stats.render_from_capture,
+				vidow_stats.dmg_bumps, vidow_stats.dmg_notes);
+			vidow_fx_dump_blur_ver_hits();
+			/* 临时探针（VIDOW_BLUR_TRACE=1）：重叠判据的调用量。
+			 * 每帧每屏每窗口各一次 → 期望值 ≈ 窗口数 × 屏数 × fps。 */
+			if (getenv("VIDOW_BLUR_TRACE") != NULL) {
+				uint64_t oc = vidow_fx_take_overlaps_calls();
+				double secs = (double)(st_t4 - win_ns) / 1e9;
+				wlr_log(WLR_INFO,
+					"重叠判定: %.0f 次/秒（%llu 次/帧窗，%.0f 次/帧）",
+					(double)oc / secs, (unsigned long long)oc,
+					(double)oc / f);
+			}
 			vidow_stats = (struct vidow_frame_stats){0};
 			win_ns = st_t4;
 		}
@@ -296,6 +369,15 @@ void vidow_output_render(struct vidow_output *output) {
 	struct timespec now;
 	clock_gettime(CLOCK_MONOTONIC, &now);
 	wlr_scene_output_send_frame_done(output->scene_output, &now);
+	/* **X11 视图要单独补一次。**
+	 *
+	 * 上面那句只给「场景认为可见」的节点发回调，而 FX 管线把真实表面的
+	 * opacity 强制设成 0（内容由 decor 烘焙图来画），wlroots 于是认为它
+	 * 看不见、跳过它 —— XWayland 永远等不到 frame callback，交一帧空白
+	 * 之后就停住了（实测 Steam 重开：40 秒只有 1 次 commit，屏幕全黑）。
+	 *
+	 * 照 Hyprland 的做法：画完一帧就无条件发，不看可见性。 */
+	vidow_views_send_x11_frame_done(server, output);
 	/* 这块屏画完一帧了：会话锁的锁定握手在这里记账（每块屏都画过一帧才发
 	 * locked，见 sessionlock.c）。 */
 	vidow_sessionlock_frame(output);
@@ -354,18 +436,58 @@ static int trace_timer_cb(void *data) {
 
 /* 要一帧。记账只为诊断（VIDOW_TRACE_FRAMES=1 时 trace_timer_cb 会用它），
  * 找不到对应的 vidow_output 也照样排帧 —— 诊断不许改变行为。 */
+/* 要一帧。记账只为诊断（VIDOW_TRACE_FRAMES=1 时 trace_timer_cb 会用它），
+ * 找不到对应的 vidow_output 也照样排帧 —— 诊断不许改变行为。 */
 void vidow_output_schedule_frame(struct vidow_server *server,
 		struct wlr_output *wlr_output, const char *why) {
 	if (wlr_output == NULL) {
 		return;
 	}
 	struct vidow_output *output = vidow_output_lookup(server, wlr_output);
+	bool already_queued = false;
+	/* 临时探针（VIDOW_FRAME_WHY=1）：谁在每帧要帧。静止桌面 300fps 时这行
+	 * 每 200ms 报一次，看 why 就知道是 damage / animation / cursor / timer
+	 * 哪一路在推。定位完删掉。 */
+	if (getenv("VIDOW_FRAME_WHY") != NULL) {
+		static int64_t why_last;
+		int64_t why_now = vidow_now_ns();
+		if (why_now - why_last > 200000000LL) {
+			why_last = why_now;
+			wlr_log(WLR_INFO, "帧请求 why=%s out=%s",
+				why != NULL ? why : "(null)", wlr_output->name);
+		}
+	}
 	if (output != NULL) {
 		output->want_frame = true;
 		output->want_frame_n++;
 		output->want_frame_why = why;
+		output->redraw_requests++;
+		output->redraw_reason = why;
+		/* 帧调度（见 server.h 的 enum vidow_redraw_state）：一轮里第一次
+		 * 要帧才真的向后端排，后面的只记账 —— 一帧里几十个窗口各要一次，
+		 * 排一次就够。渲染期间（RENDERING）要帧会置 redraw_again，见
+		 * output_frame 的收口。 */
+		if (output->redraw == VIDOW_REDRAW_RENDERING) {
+			output->redraw_again = true;
+		}
+		if (output->redraw == VIDOW_REDRAW_QUEUED) {
+			/* 已经排过：同一轮里只记账。但**排了 50ms 还没出帧**说明
+			 * 后端/宿主吞了 frame 事件（嵌套在别的合成器里时上层忙起来
+			 * 就是这样），这一轮必须重新排 —— 否则状态机把帧链锁死在
+			 * QUEUED，看门狗再怎么催都没用（用户报过的「停在最后一帧」）。 */
+			int64_t waited = vidow_now_ns() - output->redraw_queued_ns;
+			if (waited < 50 * 1000000LL) {
+				already_queued = true;
+			}
+		}
+		if (!already_queued) {
+			output->redraw = VIDOW_REDRAW_QUEUED;
+			output->redraw_queued_ns = vidow_now_ns();
+		}
 	}
-	wlr_output_schedule_frame(wlr_output);
+	if (!already_queued) {
+		wlr_output_schedule_frame(wlr_output);
+	}
 }
 
 /* 客户端交帧了：帧追踪记一笔（没开追踪就什么都不做，零开销）。 */
@@ -441,6 +563,44 @@ static bool capture_wants_frame(struct vidow_server *server,
  * 屏幕静止时本来就没有损伤，可这里要的恰恰是「静止也出帧」—— 抓帧兜底的全部意义
  * 就在这。所以只对**确实有人等着**的那块屏标脏：多画一帧的代价（~1ms）换一个能推
  * 的帧流，但不替别的屏付这个代价。 */
+/* **渲染只有一个入口。**
+ *
+ * 这块屏上「该画一帧了」有六个来源：后端帧事件、动画看门狗、抓帧看门狗、
+ * 切 tty / 输出重建时的 kick、输出刚建出来的首帧、以及渲染期间又有人要帧
+ * （redraw_again）。以前每处自己调 vidow_output_render()、自己加计数，于是：
+ * 「这一帧是谁推的」只有统计行能回答，加了新来源就得记着去加一处计数。
+ *
+ * 现在全部走这里，原因顺手带进统计。函数本身只做记账 + 转发，不改任何时序 ——
+ * 定时器的节奏、看门狗什么时候接管，仍旧由各自的调用点决定（那套时序在
+ * anim_watchdog 的注释里有一整段踩坑记录，别在这里动）。 */
+enum vidow_render_reason {
+	VIDOW_RENDER_EVENT,     /* 后端给的帧事件 */
+	VIDOW_RENDER_WATCHDOG,  /* 动画看门狗补帧 */
+	VIDOW_RENDER_CAPTURE,   /* 抓帧等不及了，先画一帧 */
+	VIDOW_RENDER_KICK,      /* 切 tty / 输出重建，主动画一次 */
+};
+
+static void render_for(struct vidow_output *output,
+		enum vidow_render_reason why) {
+	if (render_stats_on()) {
+		switch (why) {
+		case VIDOW_RENDER_EVENT:
+			vidow_stats.render_from_event++;
+			break;
+		case VIDOW_RENDER_WATCHDOG:
+			vidow_stats.render_from_watchdog++;
+			break;
+		case VIDOW_RENDER_CAPTURE:
+			vidow_stats.render_from_capture++;
+			break;
+		case VIDOW_RENDER_KICK:
+			vidow_stats.render_from_kick++;
+			break;
+		}
+	}
+	vidow_output_render(output);
+}
+
 static void capture_render_output(struct vidow_output *output) {
 	wlr_log(WLR_DEBUG, "capture watchdog: render %s", output->wlr_output->name);
 	if (output->scene_output != NULL) {
@@ -449,7 +609,7 @@ static void capture_render_output(struct vidow_output *output) {
 	/* vidow_output_render() 内部会 wlr_scene_output_commit()，那一句才是触发
 	 * screencopy 的 events.commit 的东西（标脏 + 提交 = 抓帧客户端拿到 ready）。
 	 * 关着的屏由它自己早退（见 vidow_output_render 开头）。 */
-	vidow_output_render(output);
+	render_for(output, VIDOW_RENDER_CAPTURE);
 }
 
 static int capture_watchdog(void *data) {
@@ -564,7 +724,8 @@ static int anim_watchdog(void *data) {
 			now - output->last_frame_ns : INT64_MAX;
 		bool backend_live = since_frame <= 2 * iv;
 		if (since >= iv && !backend_live) {
-			vidow_output_render(output); /* 后端欠着这一帧，自己补上 */
+			/* 后端欠着这一帧，自己补上 */
+			render_for(output, VIDOW_RENDER_WATCHDOG);
 			since = 0;
 			iv = watchdog_interval_ns(output, dragging);
 		}
@@ -611,7 +772,7 @@ static int kick_timer_cb(void *data) {
 	struct vidow_server *server = data;
 	struct vidow_output *output;
 	wl_list_for_each(output, &server->outputs, link) {
-		vidow_output_render(output);
+		render_for(output, VIDOW_RENDER_KICK);
 	}
 	return 0;
 }
@@ -674,7 +835,16 @@ static void output_frame(struct wl_listener *listener, void *data) {
 	/* X11 游戏退出全屏可能只改属性、不再交帧：每帧对一遍，别让状态栏一直
 	 * 被当成「还在全屏底下」藏着。 */
 	vidow_views_sync_x11_fullscreen(server);
-	vidow_output_render(output);
+	/* 帧调度：进渲染前清掉「渲染期间又有人要帧」的标记，渲染里
+	 * vidow_output_schedule_frame 会重新置它（模糊失效、视口外补帧）。 */
+	output->redraw_again = false;
+	output->redraw = VIDOW_REDRAW_RENDERING;
+	render_for(output, VIDOW_RENDER_EVENT);
+	/* 收口：这一帧没人再要就回 IDLE（下一帧直接复用这次提交的内容，一个
+	 * GPU 命令都不发）；渲染期间有人要过就保持 QUEUED，那一帧已经排上了。 */
+	if (!output->redraw_again && output->redraw == VIDOW_REDRAW_RENDERING) {
+		output->redraw = VIDOW_REDRAW_IDLE;
+	}
 
 	/* An animating node usually damages the scene, but not always (a pure
 	 * opacity change on a fully occluded window). Ask for the next frame

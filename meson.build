@@ -1,7 +1,25 @@
 project('vidow', 'c',
   version: '0.1.0',
   license: 'MIT',
-  default_options: ['c_std=c11', 'warning_level=2'])
+  # **buildtype 必须显式给成 debugoptimized**，不能靠 meson 的默认值。
+  #
+  # meson 的默认 buildtype 是 `debug`（= -O0 + -g）。README 里那条
+  # `meson setup build && ninja -C build` 于是产出一个**完全没有优化**的合成器，
+  # 而它正是被装进 /usr/local/bin 跑在真机上的那一个 —— 2026-10-28 实测：
+  # 同一个源码、同一台机器，只把 -O0 换成 -O2（debugoptimized）：
+  #
+  #   每帧「提交」耗时   1.19ms → 0.05ms   （约 24×）
+  #   每帧「模糊」耗时   0.12ms → 0.01ms
+  #   抓一帧（grim）     30ms  → 10ms
+  #   静止桌面损伤       29%   → 0.4%
+  #
+  # debugoptimized = -O2 且**保留调试符号**（b_ndebug 默认仍是不定义 NDEBUG，
+  # assert 照常生效），所以 gdb 栈、addr2line、perf 都还能用 —— 换优化级别不会
+  # 丢掉任何诊断能力，丢掉的只有「-O0 时单步能对上的行号」。
+  #
+  # 要真正的 -O0 单步调试，显式建目录：meson setup build-o0 --buildtype=debug。
+  default_options: ['c_std=c11', 'warning_level=2',
+                   'buildtype=debugoptimized'])
 
 cc = meson.get_compiler('c')
 

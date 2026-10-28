@@ -39,9 +39,30 @@ enum xwm_sync_result xwm_surface_sync(struct vidow_view *view) {
 	if (!xwm_surface_ready(view)) {
 		return XWM_SYNC_NOOP;
 	}
-	/* 弹出物走自己那条路（x11_refresh_popup + 绝对定位），不参与这套
-	 * 状态机：它们是屏幕级对象，不该被当成普通窗口收放。 */
-	if (view->popup || view->focus_helper) {
+	/* **弹出物也要把 wlr_surface 放上屏，只是不走布局那一套。**
+	 *
+	 * 这里以前是 `if (view->popup || view->focus_helper) return NOOP;` ——
+	 * 把弹出物整个排除在状态机之外。后果是**所有 X11 菜单 / 下拉框 /
+	 * 工具提示都画不出来**（实测 test-xwayland-popup.sh：18 个 FAIL，
+	 * 弹出物矩形里 24000/24000 个像素还是父窗口的颜色）。
+	 *
+	 * 为什么排除会致命：wlr_surface->mapped 不是「有没有 buffer」，而是
+	 * 「合成器认不认这块表面在屏幕上」。Xwayland 读它决定要不要把 X
+	 * pixmap 导出成 dmabuf。弹出物被排除后那句 wlr_surface_map() 一次
+	 * 都不跑，于是：
+	 *   - 日志里永远是 `buffer=1 surf_mapped=0`（表面有内容、没人认）；
+	 *   - x11_attach_surface 建完树 set_enabled(false) 之后，只有
+	 *     view_map() 会把它打开，而 view_map() 也在这套状态机里 ——
+	 *     节点就一直关着。fx 那边的日志直接写出来了：
+	 *     「弹出物节点关着（没映射 / 在 overview 里 / 工作区藏起来了）」。
+	 *
+	 * Hyprland 没有这个例外：XSurface.cpp 的 map() 对所有 X 表面都调
+	 * m_surface->map()，弹出物只是**不进布局**，不是**不上屏**。这里照它
+	 * 改：surface 该 map 就 map，布局那半边继续由 x11_refresh_popup +
+	 * 绝对定位负责。
+	 *
+	 * focus_helper 仍然整条跳过 —— 那些是辅助窗口，本来就不该显示。 */
+	if (view->focus_helper) {
 		return XWM_SYNC_NOOP;
 	}
 
@@ -136,8 +157,36 @@ enum xwm_sync_result xwm_surface_sync(struct vidow_view *view) {
 	if (vidow_xtrace_on() && want && !surf_mapped) {
 		vidow_view_probe_x11_texture(view);
 	}
-	if (want == view->mapped && (!want || surf_mapped)) {
+	/* **弹出物的位置要每次 commit 都重摆，所以它不参与「已经对齐就早退」。**
+	 *
+	 * 普通窗口早退是对的：want 和 mapped 一致、表面也在屏上了，就没有任何
+	 * 事情要做。但弹出物不一样 —— 它的坐标是**客户端随时可以改的**
+	 * （xpopup 的 move=、Qt 的下拉框跟着输入框挪、菜单被推到另一块屏）。
+	 * 位置不在 X 的 map 状态里，改位置只来一条 ConfigureNotify /
+	 * ConfigureRequest，surface 那边完全不变。
+	 *
+	 * 早退挡在前面，那些移动就一次都不生效：实测 test-xwayland-popup.sh
+	 * 「属性晚到」那节，客户端说 500,500，窗口停在 760,200 不动。 */
+	if (!view->popup && want == view->mapped && (!want || surf_mapped)) {
 		return XWM_SYNC_NOOP;
+	}
+	if (view->popup && want && view->scene_tree != NULL) {
+		struct wlr_box box = {0};
+		if (vidow_view_x11_popup_box(view, &box)) {
+			wlr_scene_node_set_position(&view->scene_tree->node,
+				box.x, box.y);
+		}
+		wlr_scene_node_set_enabled(&view->scene_tree->node, true);
+		if (view->scene_surface != NULL) {
+			vidow_view_x11_scale(view);
+		}
+		if (!surf_mapped) {
+			struct wlr_surface *psurf = vidow_view_surface(view);
+			if (psurf != NULL) {
+				wlr_surface_map(psurf);
+			}
+		}
+		return XWM_SYNC_MAPPED;
 	}
 
 	if (want) {
@@ -165,6 +214,24 @@ enum xwm_sync_result xwm_surface_sync(struct vidow_view *view) {
 		if (surf != NULL) {
 			wlr_surface_map(surf);
 		}
+		/* **弹出物到此为止。**
+		 *
+		 * 上面的 wlr_surface_map() 是它唯一需要的东西：表面被合成器
+		 * 认下来，Xwayland 才会导出 dmabuf，fx / 场景节点才有东西可画。
+		 *
+		 * 下面那整段（view_map / vidow_arrange / x11_scale / configure
+		 * 补发）是给**布局里的窗口**准备的，弹出物一概不能碰：
+		 *   - 它不进布局（x11_refresh_popup 已经把它挂到 layer_popups）；
+		 *   - 位置尺寸由客户端绝对坐标定（vidow_view_x11_popup_box），
+		 *     跑一遍 arrange 会被浮窗/平铺规则摆到别处去；
+		 *   - view_map() 里有工作区、焦点、开窗动画一整套，弹出物不该有。
+		 *
+		 * 但节点必须在这里显式打开：x11_attach_surface 建完树是
+		 * set_enabled(false) 的，而弹出物不会走 view_map()，没人会替它
+		 * 打开 —— 这就是「弹出物节点关着」那条日志的来源。 */
+		/* 弹出物在上面那条专用分支里已经处理完（surface map + 摆位 +
+		 * 打开节点），走不到这里。 */
+
 		/* view_map() 头一句就是 if (view->mapped) return; —— 复用窗口
 		 * 重开时 view->mapped 本来就是 1，它会直接返回，布局那边一次都
 		 * 不刷新。可场景树在 dissociate 时被拆过（x11_drop_surface 把

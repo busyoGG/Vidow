@@ -146,21 +146,6 @@ static void output_update(struct vidow_xdo_output *o) {
 	}
 	wlr_output_schedule_done(o->layout_output->output);
 }
-
-/* Compatibility origin accessor; compute live rather than using event caches. */
-void vidow_xdg_output_dev_origin(struct wlr_output *output, int *x, int *y) {
-	struct wlr_box native = {0};
-	if (xdo_mgr != NULL) {
-		vidow_xwm_output_boxes(xdo_mgr->server, output, NULL, &native);
-	}
-	if (x != NULL) {
-		*x = native.x;
-	}
-	if (y != NULL) {
-		*y = native.y;
-	}
-}
-
 void vidow_xdg_output_set_xwayland_client(struct wl_client *client) {
 	if (xdo_mgr == NULL) {
 		return;

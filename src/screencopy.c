@@ -813,11 +813,6 @@ static void manager_handle_display_destroy(struct wl_listener *listener,
 	wl_global_destroy(manager->global);
 	free(manager);
 }
-
-bool vidow_screencopy_has_pending(struct vidow_screencopy *manager) {
-	return manager != NULL && !wl_list_empty(&manager->frames);
-}
-
 /* 「这一块屏上有没有还没出完的帧」。和上面那个（只看「全局有没有」）的区别：
  * capture_watchdog 现在按屏推帧，全局有一条就整屏标脏重画所有输出的话，
  * 双屏时抓 A 屏会把 B 屏也白白重画一遍（B 屏上根本没有客户端在等）。

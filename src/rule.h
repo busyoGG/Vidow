@@ -340,9 +340,6 @@ void vidow_rule_anim(const struct vidow_config *cfg,
 bool vidow_rule_has_field(const struct vidow_rule *rule,
 		const struct vidow_rule_field *field);
 /* 字符串字段的模式串，原样（带取反的 !；没写 = NULL）。 */
-const char *vidow_rule_field_str(const struct vidow_rule *rule,
-		const struct vidow_rule_field *field);
-
 /* 编译正则 + 检查「至少写一个作用」，然后挂进 server->rules（成功时返回 true，
  * 之后 rule 归 server 管）。失败填 err，调用方负责 vidow_rule_discard。 */
 bool vidow_rule_commit(struct vidow_server *server, struct vidow_rule *rule,

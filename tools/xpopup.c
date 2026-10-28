@@ -2,7 +2,8 @@
  * 纯色窗口，然后待着不动。窗口 id 打到 stdout 第一行（bash 拿它当 parent=）。
  *
  *   xpopup owner <x> <y> <w> <h>
- *   xpopup popup <kind> <x> <y> <w> <h> [parent=<winid>] [late=<ms>]
+ *   xpopup popup <kind> <x> <y> <w> <h> [parent=<winid>] [child-of=<winid>]
+ *                                  [late=<ms>]
  *                                             [fixed] [move=<dx>,<dy>[,<ms>]]
  *
  * kind 决定它是什么窗口，覆盖 X11 里弹出物的两种做法：
@@ -86,7 +87,8 @@ static void usage(void) {
 	fprintf(stderr,
 		"用法：xpopup owner <x> <y> <w> <h>\n"
 		"      xpopup popup <or|tooltip|menu|combo|utility|normal>"
-		" <x> <y> <w> <h> [parent=<winid>] [late=<ms>] [move=<dx>,<dy>]\n");
+		" <x> <y> <w> <h> [parent=<winid>] [child-of=<winid>]"
+		" [late=<ms>] [move=<dx>,<dy>]\n");
 	exit(2);
 }
 
@@ -123,8 +125,11 @@ int main(int argc, char **argv) {
 	int grow_ms = 0;
 	int want_scale = 0;
 	int paint_mode = 0;
+	xcb_window_t child_of = XCB_WINDOW_NONE;
 	for (int i = arg; i < argc; i++) {
-		if (strncmp(argv[i], "parent=", 7) == 0) {
+		if (strncmp(argv[i], "child-of=", 9) == 0) {
+			child_of = (xcb_window_t)strtoul(argv[i] + 9, NULL, 0);
+		} else if (strncmp(argv[i], "parent=", 7) == 0) {
 			parent = (xcb_window_t)strtoul(argv[i] + 7, NULL, 0);
 		} else if (strncmp(argv[i], "late=", 5) == 0) {
 			late_ms = atoi(argv[i] + 5);
@@ -204,7 +209,13 @@ int main(int argc, char **argv) {
 	 * 到点再 configure 到声明的尺寸。 */
 	int grow_w = grow_ms > 0 ? 1 : w;
 	int grow_h = grow_ms > 0 ? 1 : h;
-	xcb_create_window(conn, XCB_COPY_FROM_PARENT, win, screen->root,
+	/* child-of= 用来建**真正的子窗口**（Steam / CEF 那种：坐标相对父窗口）。
+	 * 和 parent= 分开：parent= 是 ICCCM 的 WM_TRANSIENT_FOR 属性（「我属于
+	 * 谁」），窗口仍然挂在 root 上、坐标是屏幕坐标；child-of= 才是真子窗口，
+	 * 坐标相对父窗口。两件事混在一起会把 test-xwayland-popup.sh 的 combo
+	 * 场景（它传 parent= 只是为了设 transient）算错坐标。 */
+	xcb_window_t host = child_of != XCB_WINDOW_NONE ? child_of : screen->root;
+	xcb_create_window(conn, XCB_COPY_FROM_PARENT, win, host,
 		(int16_t)x, (int16_t)y, (uint16_t)grow_w, (uint16_t)grow_h, 0,
 		XCB_WINDOW_CLASS_INPUT_OUTPUT, screen->root_visual, mask, values);
 

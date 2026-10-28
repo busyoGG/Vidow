@@ -69,7 +69,4 @@ bool vidow_clipboard_mime_is_text(const char *mime);
 
 /* 这个 X 窗口是不是剪贴板桥自己的（它永远不映射，但 xwm 会给它建一个 surface，
  * 别当成客户端窗口收进视图模型 —— 否则会白占一个布局位置）。 */
-bool vidow_clipboard_owns_xwindow(struct vidow_server *server,
-	uint32_t window);
-
 #endif

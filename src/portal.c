@@ -131,9 +131,20 @@ static void capture_request(struct wl_listener *listener, void *data) {
 
 /* ------------------------------------------------------------ public API */
 
+/* 前向声明：定义在下面 view_new 那一节。 */
+static void portal_register_toplevel(struct vidow_view *view);
+
 void vidow_portal_view_title(struct vidow_view *view) {
 	const char *title = or_empty(vidow_view_title(view));
 	const char *app_id = or_empty(vidow_view_app_id(view));
+
+	/* 标题 / app_id 到齐了才注册（见 view_new 里那段说明）。这里是补注册
+	 * 的那条路：正常窗口在 view_new 时还没有 WM_NAME，第一次 commit 之后
+	 * 才会有，那时才该出现在任务栏里。已经注册过的幂等跳过。 */
+	if (vidow_view_title(view) == NULL && vidow_view_app_id(view) == NULL) {
+		return;
+	}
+	portal_register_toplevel(view);
 
 	if (view->ftm_handle != NULL) {
 		wlr_foreign_toplevel_handle_v1_set_title(view->ftm_handle, title);
@@ -189,24 +200,48 @@ void vidow_portal_view_output(struct vidow_view *view) {
 }
 
 void vidow_portal_view_mapped(struct vidow_view *view, bool mapped) {
-	if (view->ftm_handle == NULL) {
-		return;
-	}
-
 	if (mapped) {
+		/* 上屏了才算数（判据同 Hyprland 的 validMapped && !overrideRedirect，
+		 * 见 vidow_portal_view_new 里的说明）。popup / 没上屏的辅助窗口
+		 * 都在 portal_register_toplevel 里挡掉。 */
+		if (view->popup) {
+			return;
+		}
+		portal_register_toplevel(view);
+		vidow_portal_view_title(view);
+		vidow_portal_view_parent(view);
+		if (view->ftm_handle == NULL) {
+			return;
+		}
 		vidow_portal_view_output(view);
 		return;
 	}
 
-	if (view->portal_output != NULL && view->portal_entered) {
+	/* **顺序不能反**：先给 output 发 leave、先收 activated，最后才销毁
+	 * handle。反过来的话 handle 已经是 NULL，output_leave 直接段错误
+	 * （2026-10-27 实测 SIGSEGV，栈顶就是
+	 * wlr_foreign_toplevel_handle_v1_output_leave）。 */
+	/* **handle 可能是 NULL，必须先判。** 这条函数会被走两遍：
+	 * x11_drop_surface() 调一次、vidow_view_x11_gone() 里的
+	 * vidow_portal_view_drop_toplevel() 之后状态已经清过。第一遍把
+	 * ftm_handle 置 NULL 之后，如果 portal_output / portal_entered 还留着，
+	 * 第二遍进来就拿着 NULL handle 调 output_leave —— 2026-10-27 两次
+	 * SIGSEGV（02:15:12 那次栈顶就是这里，关 Steam 好友列表时触发）。 */
+	if (view->ftm_handle != NULL && view->portal_output != NULL &&
+			view->portal_entered) {
 		wlr_foreign_toplevel_handle_v1_output_leave(view->ftm_handle,
 			view->portal_output);
 		view->portal_entered = false;
 	}
+	view->portal_entered = false;
 	view->portal_output = NULL;
 	/* 窗口下了屏就不再是"当前窗口"。焦点转移不一定经过这里（最后一个窗口
 	 * 关掉时没有下一个窗口来接手），所以显式收一次。 */
 	vidow_portal_view_activated(view, false);
+
+	/* 最后摘掉条目：辅助窗口 unmap 之后不该继续占着列表。真窗口重新 map
+	 * 时会再注册回来。 */
+	vidow_portal_view_drop_toplevel(view);
 }
 
 void vidow_portal_view_activated(struct vidow_view *view, bool activated) {
@@ -228,8 +263,23 @@ void vidow_portal_view_activated(struct vidow_view *view, bool activated) {
 		view->fullscreen);
 }
 
-void vidow_portal_view_new(struct vidow_view *view) {
+/* 把窗口挂进 foreign-toplevel（两份协议都挂）。view_new 和「标题后来才到」
+ * 两条路共用 —— 后者见 vidow_portal_view_title()。幂等：已经挂过就直接返回。 */
+static void portal_register_toplevel(struct vidow_view *view) {
 	struct vidow_server *server = view->server;
+
+	/* **必须 mapped。** 这是 Hyprland 的 validMapped（见 view_new 里的
+	 * 说明），也是这里唯一的闸：vidow_portal_view_title() 会在属性变化时
+	 * 被反复调用，那时候窗口**可能还没上屏**（Steam / fcitx 的辅助窗口
+	 * create 完先写属性、再决定 map 不 map，很多永远不 map）。
+	 *
+	 * 少了这道闸就会漏：实测 2026-10-27 的注册日志里
+	 *   `Steam popup=0 mapped=0`、`QQ popup=0 mapped=0`
+	 * 都是没上屏就登记了，顶栏于是摆着它们。 */
+	if (view->popup || !view->mapped || view->ftm_handle != NULL ||
+			view->ftl_handle != NULL) {
+		return;
+	}
 
 	if (server->ftm != NULL) {
 		view->ftm_handle = wlr_foreign_toplevel_handle_v1_create(server->ftm);
@@ -261,11 +311,46 @@ void vidow_portal_view_new(struct vidow_view *view) {
 			view->ftl_handle->data = view;
 		}
 	}
+}
 
-	/* 标题多半还是空的（第一个 commit 之前），先同步一次状态，之后靠
-	 * set_title / set_parent 事件补。 */
-	vidow_portal_view_title(view);
-	vidow_portal_view_parent(view);
+void vidow_portal_view_new(struct vidow_view *view) {
+	/* **这里不注册。** 注册推迟到 map，见 vidow_portal_view_mapped()。
+	 *
+	 * 照抄 Hyprland 的判据（src/protocols/ForeignToplevelWlr.cpp:409）：
+	 *   validMapped(w) && !overrideRedirect
+	 * 关键是 **mapped** —— 只有真上了屏的窗口才算「任务栏里该有的窗口」。
+	 *
+	 * 以前这里无条件注册，实测（2026-10-27，254 次注册里 223 次）全都是
+	 * Steam / CEF 的辅助窗口：10x10 的 `steam`、200x200 的 `steamwebhelper`、
+	 * `default` / `ime` 这类输入法小窗。它们 `Map State: IsUnMapped`、永远
+	 * 不上屏，却有名字，于是 noctalia 顶栏摆出一串谁也点不动的条目，还会
+	 * 在 Steam 弹消息时把焦点抢过去（用户实测「steam消息弹窗也会抢焦点」）。
+	 *
+	 * 排除判据只看 mapped，不看标题 —— 那批窗口**是有名字的**，按标题挡
+	 * 挡不住（上一版就是这么漏的）。 */
+	(void)view;
+}
+
+/* 窗口从「普通窗口」改判成弹出物（_NET_WM_WINDOW_TYPE 晚到那条路，见
+ * view.c 的 x11_refresh_popup）：把已经注册上去的 foreign-toplevel 条目撤掉。
+ * 不撤的话列表里会留一个没有名字、点不动的幽灵条目 —— 胶囊一冒出来就再也
+ * 不消失。 */
+void vidow_portal_view_drop_toplevel(struct vidow_view *view) {
+	if (view == NULL) {
+		return;
+	}
+	if (view->ftm_handle != NULL) {
+		wl_list_remove(&view->ftm_request_activate.link);
+		wl_list_remove(&view->ftm_request_close.link);
+		wl_list_remove(&view->ftm_request_fullscreen.link);
+		wl_list_remove(&view->ftm_request_minimize.link);
+		wlr_foreign_toplevel_handle_v1_destroy(view->ftm_handle);
+		view->ftm_handle = NULL;
+	}
+	if (view->ftl_handle != NULL) {
+		wlr_ext_foreign_toplevel_handle_v1_destroy(view->ftl_handle);
+		view->ftl_handle = NULL;
+	}
 }
 
 void vidow_portal_view_free(struct vidow_view *view) {

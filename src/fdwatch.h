@@ -53,6 +53,5 @@ struct vidow_fdwatch {
 };
 
 /* 已经起来了吗（没起来 = register/peek 一律 false）。 */
-bool vidow_fdwatch_ready(struct vidow_server *server);
 
 #endif /* VIDOW_FDWATCH_H */

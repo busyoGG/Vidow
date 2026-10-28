@@ -37,9 +37,16 @@ cleanup() {
 		sleep 0.4
 		kill -KILL -- "-$VIDOW_PGID" 2>/dev/null
 	fi
-	for p in $(pgrep -x vidow 2>/dev/null); do kill -TERM "$p" 2>/dev/null; done
-	sleep 0.3
-	for p in $(pgrep -x vidow 2>/dev/null); do kill -KILL "$p" 2>/dev/null; done
+	# **只杀测试自己启动的那个进程组**（$VIDOW_PGID），绝不 pgrep -x vidow。
+	#
+	# 以前这里是 `for p in $(pgrep -x vidow); do kill "$p"; done`，它会把
+	# 用户正在用的会话进程一起杀掉 —— 实测代价：2026-10-27 00:55 跑这个
+	# 脚本，整个 SDDM 会话被拆掉（QQ / Discord / Vivaldi / Steam 全没）。
+	# 那也是「收尾还剩 1 个 vidow」那条 FAIL 一直存在的原因：剩下的那个
+	# 就是用户的会话进程，它本来就不该被杀。
+	if [ -n "$VIDOW_PGID" ]; then
+		kill -KILL -- "-$VIDOW_PGID" 2>/dev/null
+	fi
 	[ -n "${VIDOW_TEST_KEEP:-}" ] || rm -rf "$RUNDIR"
 }
 trap cleanup EXIT
@@ -89,7 +96,11 @@ stop_vidow() {
 	fi
 }
 
-vidow_alive() { [ "$(pgrep -x vidow | wc -l)" -ge 1 ]; }
+# 只看**测试自己启动的那个进程**，不看全局 pgrep -x vidow —— 用户会话里
+# 本来就有 vidow 在跑，数全局会把别人的进程算成自己的。
+vidow_alive() {
+	[ -n "$VIDOW_PGID" ] && kill -0 -- "-$VIDOW_PGID" 2>/dev/null
+}
 
 win_geom() { # <标题> -> "x y w h"
 	./build/vidowmsg windows | python3 -c '
@@ -197,11 +208,12 @@ run_case stalled-off "3/3 掐断帧链 + 追踪关（零开销，症状一样）
 	VIDOW_TEST_STALL_OUTPUT=HEADLESS-1
 
 mark "收尾"
-LEFT=$(pgrep -x vidow 2>/dev/null | wc -l)
-if [ "$LEFT" = "0" ]; then
-	pass "收尾干净：一个 vidow 都不剩"
+# 判据是「测试自己启动的那个进程组没了」，不是「全局一个 vidow 都不剩」：
+# 用户会话里的 vidow 一直都在，拿全局计数判会永远 FAIL（以前就是这样）。
+if [ -n "$VIDOW_PGID" ] && kill -0 -- "-$VIDOW_PGID" 2>/dev/null; then
+	fail "收尾还剩测试启动的 vidow（进程组 $VIDOW_PGID）"
 else
-	fail "收尾还剩 $LEFT 个 vidow"
+	pass "收尾干净：测试启动的 vidow 已经没了"
 fi
 
 echo

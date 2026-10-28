@@ -59,7 +59,7 @@ EOF
 
 export XDG_RUNTIME_DIR="$RUNDIR/run"
 export WLR_BACKENDS=headless WLR_HEADLESS_OUTPUTS=1
-export HOME="$CFGDIR" VIDOW_LOG=debug
+export HOME="$CFGDIR" VIDOW_LOG=debug VIDOW_X11_TRACE=1
 export DISPLAY= WAYLAND_DISPLAY=
 
 start_vidow() {

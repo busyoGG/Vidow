@@ -320,38 +320,6 @@ void vidow_configwatch_begin(struct vidow_server *server) {
 	w->nfiles = 0;
 	file_add(w, w->main_file);
 }
-
-/* 给 IPC 用：把「现在盯着的文件清单」拷出来（是配置内容，不涉及 fd 细节）。 */
-size_t vidow_configwatch_files(struct vidow_server *server,
-		const char *const **out) {
-	static char *buf[WATCH_MAX_FILES];
-	struct vidow_configwatch *w = server != NULL ? server->configwatch : NULL;
-	if (w == NULL) {
-		*out = NULL;
-		return 0;
-	}
-	for (size_t i = 0; i < w->nfiles; i++) {
-		buf[i] = w->files[i].path;
-	}
-	*out = (const char *const *)buf;
-	return w->nfiles;
-}
-
-size_t vidow_configwatch_dirs(struct vidow_server *server,
-		const char *const **out) {
-	static char *buf[WATCH_MAX_DIRS];
-	struct vidow_configwatch *w = server != NULL ? server->configwatch : NULL;
-	if (w == NULL) {
-		*out = NULL;
-		return 0;
-	}
-	for (size_t i = 0; i < w->ndirs; i++) {
-		buf[i] = w->dirs[i].path;
-	}
-	*out = (const char *const *)buf;
-	return w->ndirs;
-}
-
 void vidow_configwatch_add(struct vidow_server *server, const char *path) {
 	struct vidow_configwatch *w = server->configwatch;
 	if (w == NULL || path == NULL || path[0] == '\0') {

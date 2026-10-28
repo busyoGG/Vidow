@@ -399,15 +399,6 @@ static void im_grab_destroy(struct wl_listener *listener, void *data);
  * 于是 fcitx5 一抓键盘所有按键就被丢掉（用户报的「启动了 Fcitx5 之后键盘都不能
  * 用了」）。这里存一份静态指针，键 / 修饰键的出口在 input.c 里查它。 */
 static struct wlr_input_method_keyboard_grab_v2 *active_grab;
-
-void vidow_im_grab_send_key(uint32_t time_msec, uint32_t keycode, bool pressed) {
-	if (active_grab == NULL) {
-		return;
-	}
-	wlr_input_method_keyboard_grab_v2_send_key(active_grab, time_msec, keycode,
-		pressed ? WL_KEYBOARD_KEY_STATE_PRESSED : WL_KEYBOARD_KEY_STATE_RELEASED);
-}
-
 static void im_grab_keyboard(struct wl_listener *listener, void *data) {
 	struct vidow_im *im = wl_container_of(listener, im, grab_keyboard);
 	struct wlr_input_method_keyboard_grab_v2 *grab = data;

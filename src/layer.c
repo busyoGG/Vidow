@@ -195,7 +195,16 @@ void vidow_layers_update_fullscreen(struct vidow_server *server) {
 					ls->layer_surface->current.exclusive_zone <= 0) {
 				continue;
 			}
+			if (ls->scene->tree->node.enabled == !full) {
+				continue; /* 已经是想要的状态：别每趟都碰节点 */
+			}
 			wlr_scene_node_set_enabled(&ls->scene->tree->node, !full);
+			/* 状态栏被藏掉 / 放回来：底衬里那一块变了，而且这条变化不经过
+			 * blur_note_damage（它改的是节点可见性）—— 让 arrange 收口回退
+			 * 整屏。低频（进出全屏那一下），不值得为它算精确区域。 */
+			if (server->arrange_in_progress) {
+				server->arrange_force_full = true;
+			}
 		}
 	}
 }
@@ -372,6 +381,37 @@ static void layer_anim_update(void *data, double t, double linear) {
 	layer_apply_anim(ls);
 }
 
+/* layer 自己变了：只标**它经过的那一块**，不整屏。
+ *
+ * 整屏标脏的代价：3840x2160 那块屏上，每个窗口的私有底衬都要重抓一次（一次全屏
+ * 渲染 + 一条模糊链），而实际变的只有这一块 layer 底下的东西。一条通知弹出、
+ * 一个菜单收起、vshot 的冻结覆盖层上屏，原来都是整屏。
+ *
+ * box == NULL 或空 → 退回整屏（管不了的时候宁可多抓一次）。
+ * 传入的是 layer 在布局坐标系里的**当前**几何；正在滑动的那些调用点自己把「动
+ * 之前那块」并进来再传。 */
+/* wlr_box_union 在 0.20 的头里没导出（wlr_box.h 只给了 empty/intersection/
+ * contains），自己写一个：一次并集，别为它拉个头文件依赖。 */
+static void layer_box_union(struct wlr_box *a, const struct wlr_box *b) {
+	if (b->width <= 0 || b->height <= 0) {
+		return;
+	}
+	if (a->width <= 0 || a->height <= 0) {
+		*a = *b;
+		return;
+	}
+	int x1 = a->x < b->x ? a->x : b->x;
+	int y1 = a->y < b->y ? a->y : b->y;
+	int x2 = a->x + a->width > b->x + b->width ? a->x + a->width : b->x + b->width;
+	int y2 = a->y + a->height > b->y + b->height ? a->y + a->height : b->y + b->height;
+	*a = (struct wlr_box){ .x = x1, .y = y1, .width = x2 - x1, .height = y2 - y1 };
+}
+
+static void layer_damage_box(struct vidow_layer_surface *ls,
+		const struct wlr_box *box) {
+	vidow_backdrop_damage_output_box(ls->output, box);
+}
+
 static void layer_anim_done(void *data, bool cancelled) {
 	struct vidow_layer_surface *ls = data;
 	ls->anim = NULL;
@@ -380,8 +420,15 @@ static void layer_anim_done(void *data, bool cancelled) {
 		ls->anim_off_y = 0.0;
 		ls->anim_alpha = 1.0;
 	}
-	/* 动画停在最终位置上了，现在重做一次模糊，把这一帧的底衬固化下来 */
-	vidow_backdrop_damage(ls->server, true);
+	/* 动画停在最终位置上了，现在重做一次模糊，把这一帧的底衬固化下来。
+	 *
+	 * 脏的是**整条走过的带子**，不只是停下的那块：起点和终点并起来。 */
+	struct wlr_box anim_box = ls->geom;
+	struct wlr_box from = ls->geom;
+	from.x += (int)lround(ls->anim_off_x);
+	from.y += (int)lround(ls->anim_off_y);
+	layer_box_union(&anim_box, &from);
+	layer_damage_box(ls, &anim_box);
 	layer_apply_anim(ls);
 }
 
@@ -520,9 +567,12 @@ static void layer_surface_map(struct wl_listener *listener, void *data) {
 	 * 动画已经跑上了）。 */
 	vidow_rule_apply_layer(server, ls);
 
-	/* 一块 layer surface 上屏：底衬里多了一个东西 */
-	vidow_backdrop_damage(server, true);
+	/* 一块 layer surface 上屏：底衬里多了一个东西。
+	 *
+	 * 标脏挪到 arrange_layers **之后**：那块盒子的几何就是在这儿算出来的，
+	 * 之前只有 0 —— 那才是原来只能整屏标脏的原因。 */
 	vidow_arrange_layers(server); /* gives ls->geom, used to pick the slide */
+	layer_damage_box(ls, &ls->geom);
 	layer_open_anim(ls);
 	vidow_arrange_layers(server);
 	vidow_arrange(server);
@@ -552,7 +602,8 @@ static void layer_surface_unmap(struct wl_listener *listener, void *data) {
 
 	layer_snapshot_close(ls);
 	layer_unfocus(ls);
-	vidow_backdrop_damage(server, true);
+	/* 下屏：它原来占的那块底下露出来了。geom 还是下屏前的值（arrange 在下面）。 */
+	layer_damage_box(ls, &ls->geom);
 	vidow_arrange_layers(server);
 	vidow_arrange(server);
 	vidow_ipc_emit_layer(server, "layer-unmapped", ls);
@@ -568,8 +619,12 @@ static void layer_surface_commit(struct wl_listener *listener, void *data) {
 	/* The first configure must reflect the state the client just committed
 	 * (anchor, exclusive zone, desired size). */
 	if (ls->layer_surface->initial_commit) {
-		vidow_backdrop_damage(server, true);
+		/* 首次 configure：形状从「站着的地方」变成「该站的地方」，
+		 * 两块的并集才是真脏的那一片。 */
+		struct wlr_box before = ls->geom;
 		vidow_arrange_layers(server);
+		layer_box_union(&before, &ls->geom);
+		layer_damage_box(ls, &before);
 		vidow_arrange(server);
 	}
 
@@ -626,9 +681,12 @@ static void layer_surface_destroy(struct wl_listener *listener, void *data) {
 	wl_list_remove(&ls->new_popup.link);
 	wl_list_remove(&ls->destroy.link);
 	wl_list_remove(&ls->link);
+	/* geom 在 free 之后就没了：先抄一份，标脏用 */
+	struct wlr_box gone = ls->geom;
+	struct vidow_output *gone_out = ls->output;
 	free(ls);
 
-	vidow_backdrop_damage(server, true);
+	vidow_backdrop_damage_output_box(gone_out, &gone);
 	vidow_arrange_layers(server);
 	vidow_arrange(server);
 	if (was_background) {

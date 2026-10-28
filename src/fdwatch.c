@@ -296,15 +296,6 @@ static int snapshot(struct vidow_server *server, int report_no) {
  *     （配置监听在这里读取并筛选 inotify 事件，再启动去抖 stat）。
  *   重试在下一次周期节拍处理。 */
 static struct vidow_server *fdwatch_server;
-
-struct vidow_server *vidow_fdwatch_server(void) {
-	return fdwatch_server;
-}
-
-bool vidow_fdwatch_ready(struct vidow_server *server) {
-	return server != NULL && server->fdwatch != NULL;
-}
-
 bool vidow_fdwatch_register(int fd, enum vidow_fdwatch_kind kind,
 		vidow_fdwatch_handler handler, void *data) {
 	struct vidow_server *server = fdwatch_server;
@@ -371,13 +362,6 @@ bool vidow_fdwatch_peek(int fd, enum vidow_fdwatch_kind kind,
 	wl_list_insert(&server->fdwatch->peeks, &p->link);
 	return true;
 }
-
-void vidow_fdwatch_poke(struct vidow_server *server) {
-	if (server != NULL && server->fdwatch != NULL) {
-		server->fdwatch->wake = true;
-	}
-}
-
 /* 这个 fd 在不在册（同一种 kind 至少挂了一份）。 */
 bool vidow_fdwatch_tracks(int fd, enum vidow_fdwatch_kind kind) {
 	struct vidow_server *server = fdwatch_server;

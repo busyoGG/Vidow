@@ -304,13 +304,6 @@ struct wlr_buffer *vidow_capture_grab_into(struct vidow_server *server,
 	vidow_capturemask_release(server);
 	return buffer;
 }
-
-/* 抓一块屏幕上的任意矩形（布局坐标）。给「按区域录屏 / 截图」用。 */
-struct wlr_buffer *vidow_capture_grab_box(struct vidow_server *server,
-		struct wlr_output *output, const struct wlr_box *box, double scale) {
-	return vidow_capture_grab_into(server, output, box, scale, NULL);
-}
-
 /* --------------------------------------------------------------- 光标 */
 
 /* 光标的两种用法都从 wlr_output_cursor 取状态（硬件平面上的那个也是它），所以放大
@@ -724,8 +717,18 @@ static void source_request_frame(struct wlr_ext_image_capture_source_v1 *base,
 	struct vidow_capture_source *src = wl_container_of(base, src, base);
 	(void)schedule_frame;
 
+	/* 这一帧是**当场同步渲染**的（不等 commit），所以客户端感到的「卡一下」
+	 * 里有多少是这笔钱，得量出来 —— VIDOW_CAPTURE_TRACE=1。 */
+	bool trace = getenv("VIDOW_CAPTURE_TRACE") != NULL;
+	int64_t t0 = trace ? vidow_now_ns() : 0;
+
 	wlr_buffer_unlock(src->pending);
 	src->pending = vidow_capture_grab(src->cap->server, src->cap->output);
+	if (trace) {
+		wlr_log(WLR_INFO, "CAPTRACE ext-request_frame %s: 场景渲染 %.2fms",
+			src->cap->output->name,
+			(vidow_now_ns() - t0) / 1e6);
+	}
 
 	/* 没渲染出来也要发事件：客户端还在等 ready / failed，闷着就是卡死。
 	 * copy_frame 看到 pending 为空会回一个 failed。 */
@@ -757,8 +760,14 @@ static void source_copy_frame(struct wlr_ext_image_capture_source_v1 *base,
 			src->pending);
 	}
 
+	int64_t c0 = getenv("VIDOW_CAPTURE_TRACE") != NULL ? vidow_now_ns() : 0;
 	if (wlr_ext_image_copy_capture_frame_v1_copy_buffer(frame, src->pending,
 			src->cap->output->renderer)) {
+		if (c0 != 0) {
+			wlr_log(WLR_INFO, "CAPTRACE ext-copy_buffer %s: 拷进客户端缓冲"
+				" %.2fms", src->cap->output->name,
+				(vidow_now_ns() - c0) / 1e6);
+		}
 		struct timespec now;
 		clock_gettime(CLOCK_MONOTONIC, &now);
 		/* 我们渲染出来的图是正立的，所以报 NORMAL（不是输出的 transform）。 */

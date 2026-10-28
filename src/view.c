@@ -749,18 +749,6 @@ void vidow_view_close(struct vidow_view *view) {
 	}
 	wlr_xdg_toplevel_send_close(view->xdg_toplevel);
 }
-
-struct vidow_view *vidow_view_from_xwayland_surface(struct vidow_server *server,
-		struct wlr_xwayland_surface *xsurface) {
-	struct vidow_view *view;
-	wl_list_for_each(view, &server->views, link) {
-		if (view->kind == VIDOW_VIEW_X11 && view->x11 == xsurface) {
-			return view;
-		}
-	}
-	return NULL;
-}
-
 /* 场景单位 -> surface 局部坐标的倍数。**这是「往客户端发坐标」的唯一口子**
  * （vidow_view_at 在返回前乘它，指针 motion / button / view-at / overview 点击
  * 全走那儿）—— 场景里节点占的位置和表面自己的坐标空间不一样大时，只有这里知道
@@ -2862,6 +2850,26 @@ void vidow_views_send_x11_frame_done(struct vidow_server *server,
 	}
 	struct timespec now;
 	clock_gettime(CLOCK_MONOTONIC, &now);
+	/* **按这块屏的刷新率节流**（见 server.h 的 last_x11_fd_ns 说明）。
+	 *
+	 * 这一句以前是无条件每帧发的：XWayland 客户端拿到 frame callback 就立刻
+	 * 画下一帧 → commit → 我们渲染 → 又发回调 → 自激。静止桌面实测 300fps、
+	 * 损伤 97%/帧、GPU 一直满转，抓帧（vshot）抢不到 GPU，比 grim 慢 4 倍 /
+	 * 卡半秒。上限取输出刷新率：比显示刷新率更快的帧本来就看不到。refresh
+	 * 单位是 mHz，<=0 表示没报，按 60 兜底。 */
+	int refresh_mhz = output->wlr_output->refresh;
+	int refresh_hz = refresh_mhz > 0 ? refresh_mhz / 1000 : 60;
+	if (refresh_hz <= 0) {
+		refresh_hz = 60;
+	}
+	int64_t fd_budget_ns = 1000000000LL / refresh_hz;
+	int64_t fd_now_ns = (int64_t)now.tv_sec * 1000000000LL + now.tv_nsec;
+	if (getenv("VIDOW_X11_FD_UNTHROTTLED") == NULL &&
+			output->last_x11_fd_ns != 0 &&
+			fd_now_ns - output->last_x11_fd_ns < fd_budget_ns) {
+		return;
+	}
+	output->last_x11_fd_ns = fd_now_ns;
 	struct vidow_view *view;
 	wl_list_for_each(view, &server->views, link) {
 		if (view->kind != VIDOW_VIEW_X11 || view->x11 == NULL ||
@@ -3785,9 +3793,33 @@ void vidow_view_anim_bake(struct vidow_view *view) {
 	int64_t bake_t0 = vidow_now_ns();
 	/* 这里以前有一行每次重烘就打的 DEBUG（node/geom/screen_box），日常使用是
 	 * 每帧 × 每个在动的窗口一行 —— 排查摆放错位时临时加回来，别常驻。 */
+	/* **这张装饰图是给哪块屏烘的，就按那块屏的倍率烘**（不是 view_scale）。
+	 *
+	 * view_scale 是「客户端 surface 该按几倍画」的答案，一块 wl_surface 只能有
+	 * 一个 buffer_scale，所以跨屏拖拽时必须取两块屏里高的那个（选低的必然糊）。
+	 * 装饰缓冲不一样：它是 per-output 的（见 server.h 的 struct vidow_blur_slot
+	 * 的 dec* / dec_scale），每块屏各有一份。
+	 *
+	 * 以前这里无条件用 view_scale：窗口骑在 1x 的 DP-3 和 2x 的 DP-2 中间时，
+	 * 两块屏的装饰都按 2 倍烘 —— 而底衬贴图的原点 / 尺寸（blur_out_*）是按
+	 * **这块屏自己的设备像素**记的。2 倍的装饰去采 1 倍的底衬，UV 的除数和
+	 * 实际贴图对不上，屏幕上就是：
+	 *   - 屏交界处一条模糊彩色带（1x 那半的底衬被按 2 倍采样）；
+	 *   - 跨屏那一半忽明忽暗（两块屏轮流烘、各自的 dec_scale 又都是 2，
+	 *     缓存判据在两边来回失效 → 底衬闪烁）；
+	 *   - 拖回来之后窗口丢半透明（装饰图被当成 2 倍尺寸贴到 1 倍节点上，
+	 *     alpha 那一项被拉伸）。
+	 *
+	 * bake_output 是「这次烘是给哪块屏的」：归属屏（vidow_blur_update 里设）
+	 * 或这一趟临时借的那块屏（view_bake_for_output 里设）。有它就按它的倍率，
+	 * 没有（layer / 预览 / 关闭快照那些老路径）才退回 view_scale。 */
+	double bake_scale = view_scale(view);
+	if (view->fx.bake_output != NULL && view->fx.bake_output->scale > 0.0) {
+		bake_scale = view->fx.bake_output->scale;
+	}
 	bool fx_drawn = vidow_fx_frame(view->server, &view->fx, src, &geo,
 		mini_cx, mini_cy, x, y, alpha, view->server->focused == view,
-		view->fullscreen, view_scale(view) * fx_ov, fx_ov, &view->rule_eff);
+		view->fullscreen, bake_scale * fx_ov, fx_ov, &view->rule_eff);
 	/* 探针：整块窗口那么大的离屏渲染一共多少钱（见统计行的「重烘」；次数由
 	 * vidow_fx_frame 的 vidow_stats.bakes 记）。拖动 / 滚动动画里每个在动的
 	 * 窗口每帧都要烘一次，所以这项随窗口数线性涨。 */
@@ -4932,6 +4964,14 @@ static void output_arrange(struct vidow_server *server,
 
 void vidow_arrange(struct vidow_server *server) {
 	struct vidow_output *output;
+	/* 这一趟的精确损伤从零开始攒（见 fx.c 的 blur_note_damage 和 server.h 的
+	 * arrange_damage）：每个窗口位置变化时 place_view 已经记过新旧位置，收口
+	 * 时不必再整屏算一遍。整屏标脏（restack 真换了层级 / layer 开关 / 背景
+	 * 重画）会把 arrange_force_full 置上，收口时回退整屏 —— 宁可多抓一次，
+	 * 不能糊着旧的。设置 VIDOW_NO_ARRANGE_REGION=1 可强制回到整屏（A/B 对比）。 */
+	server->arrange_in_progress = true;
+	server->arrange_damage_any = false;
+	server->arrange_force_full = false;
 	/* 先把住址对齐一遍：窗口 / 列住哪块屏只能由它们所在的工作区说了算。
 	 * 切工作区、规则搬屏、热插拔、拖动跨屏都会改到一半，漏一处就会让滚动
 	 * 越界的窗口按几何框算到隔壁屏的工作区里。 */
@@ -4970,7 +5010,46 @@ void vidow_arrange(struct vidow_server *server) {
 	 * vidow_restack —— 没人站错队时它一个节点都不碰）。 */
 	vidow_restack(server, NULL);
 
-	if (!server->arrange_self_only && !server->arrange_skip_world_damage) {
+	/* 收口：这一趟攒下来的精确区域已经在各自调用点记给每个底衬了
+	 * （blur_note_damage），这里只负责「世界代次」和「有没有漏网的」：
+	 *
+	 *   force_full  这一趟里有人标过整屏（restack 真换了层级 / layer 开关 /
+	 *               背景重画）—— 那一笔已经覆盖了，别重复；
+	 *   有累计区域   开窗 / 关窗 / 切工作区这类「窗口位置变了」：只把真实
+	 *               变过的并集推一遍，别的窗口的底衬不受影响；
+	 *   什么都没有   纯配置变化（gap / 规则）：保守整屏。
+	 *
+	 * VIDOW_NO_ARRANGE_REGION=1 强制整屏（A/B 对比 / 出事时的逃生口）。 */
+	bool use_region = !server->arrange_self_only &&
+		!server->arrange_skip_world_damage &&
+		getenv("VIDOW_NO_ARRANGE_REGION") == NULL;
+	bool force_full = server->arrange_force_full;
+	bool any_damage = server->arrange_damage_any;
+	struct wlr_box region = server->arrange_damage;
+	server->arrange_in_progress = false;
+	server->arrange_damage_any = false;
+	server->arrange_force_full = false;
+	if (use_region) {
+		if (force_full) {
+			/* 已经有人标过整屏。 */
+		} else if (any_damage) {
+			vidow_backdrop_damage_region(server, &region);
+		} else {
+			/* **这一趟什么都没变** —— 窗口位置 / 尺寸 / 层级都没动，只是
+			 * 有人顺手调了一次 arrange。
+			 *
+			 * 以前这里保守推整屏，于是「谁每帧调一次 arrange」就自动变成
+			 * 「每帧整屏重绘」：实测静止桌面 190fps、损伤 99%/帧、layer
+			 * 模糊每帧重建（它挂在 gen_scene 上），GPU 一直被占满，抓帧
+			 * （vshot）抢不到资源就慢 4 倍 / 卡半秒 —— 用户报的「vshot 截
+			 * 显示器还是卡」的真正来源就是这里，不是抓帧本身。
+			 *
+			 * 真正的配置变化（gap / 规则 / output 参数）在改动的那一处自己
+			 * 标 arrange_force_full，走上面第一支；开窗 / 关窗 / 切工作区
+			 * 会累计到 any_damage。所以「没变化」就该什么都不做。 */
+		}
+	} else if (!server->arrange_self_only &&
+			!server->arrange_skip_world_damage) {
 		vidow_backdrop_damage(server, false);
 	}
 	server->arrange_self_only = false;
@@ -7812,6 +7891,19 @@ static void view_commit(struct wl_listener *listener, void *data) {
 	 * 放在最前面：后面的记账不影响「有新内容」这个事实。 */
 	if (view->server != NULL && view->output != NULL &&
 			!view->server->locked) {
+		/* 临时探针（VIDOW_COMMIT_WHY=1）：谁在每帧交帧。静止桌面 300fps
+		 * 时每 150ms 抽一行，看 title 就知道是哪个客户端在空转重绘。 */
+		if (getenv("VIDOW_COMMIT_WHY") != NULL) {
+			static int64_t cw_last;
+			int64_t cw_now = vidow_now_ns();
+			if (cw_now - cw_last > 150000000LL) {
+				cw_last = cw_now;
+				wlr_log(WLR_INFO, "交帧 view=%s out=%s",
+					vidow_view_title(view) != NULL ?
+						vidow_view_title(view) : "(无题)",
+					view->output->name);
+			}
+		}
 		vidow_output_schedule_frame(view->server, view->output,
 			"客户端交帧");
 		/* **X11 表面要额外多推几帧**。
@@ -9033,14 +9125,6 @@ void vidow_view_x11_gone(struct vidow_view *view) {
 	 * 一个都搜不到，条目却还在，顶栏就一直摆着它们。 */
 	vidow_portal_view_drop_toplevel(view);
 }
-
-void vidow_view_x11_map_request(struct vidow_view *view) {
-	/* 交给统一的状态机：它只认「客户端有没有交 buffer」，不看 X 这时候
-	 * 报的是什么状态。map 请求常常早于 associate 到（Steam 重开主窗口
-	 * 实测就是这样），这时候还判不了，等 associate / commit 再来说话。 */
-	xwm_surface_sync(view);
-}
-
 static void view_x11_title_changed(struct vidow_view *view) {
 	/* Xwayland can emit the first property update in the same batch as
 	 * association. If the association was already complete when this view was
@@ -9086,13 +9170,6 @@ static void view_x11_geometry_changed(struct vidow_view *view) {
 	}
 	vidow_arrange(view->server);
 }
-
-static void view_x11_override_redirect_changed(struct vidow_view *view) {
-	x11_refresh_popup(view);
-	vidow_float_update_mode(view);
-	vidow_arrange(view->server);
-}
-
 static void view_x11_hints_changed(struct vidow_view *view) {
 	/* min/max 提示要等到这里才齐，浮动判断得重跑一遍。 */
 	x11_refresh_popup(view);
@@ -9193,36 +9270,11 @@ static void view_x11_configure_request(struct vidow_view *view,
 	 * configure 告诉它最终的几何，免得它一直等。 */
 		vidow_arrange(view->server);
 }
-static void view_x11_request_move(struct vidow_view *view) {
-	struct vidow_server *server = view->server;
-	if (view->float_mode == VIDOW_FLOAT_NONE) {
-		vidow_float_set_mode(view, VIDOW_FLOAT_FIXED);
-	}
-	/* X11 的 _NET_WM_MOVERESIZE：客户端的标题栏拖拽。按下已经转给它了（X 的
-	 * 隐式抓取就是这么来的），松手也得转回去，否则它停在「按住」状态。 */
-	/* 拖标题栏 = 平移视图（用户点名的那条）；想移动浮窗用 Mod+左键。 */
-	vidow_pan_begin(server, view);
-}
-
-static void view_x11_request_resize(struct vidow_view *view) {
-	struct vidow_server *server = view->server;
-	if (view->float_mode == VIDOW_FLOAT_NONE) {
-		vidow_float_set_mode(view, VIDOW_FLOAT_FIXED);
-	}
-	vidow_float_begin_grab(server, view, true, true);
-}
-
 static void view_x11_request_activate(struct vidow_view *view) {
 	/* X11 的 _NET_ACTIVE_WINDOW（wmctrl、Electron 的通知、任务栏都在用）：
 	 * 跟 Wayland 的激活请求走同一条路（先把工作区端出来，再给焦点）。 */
 	vidow_view_activate(view);
 }
-
-static void view_x11_request_close(struct vidow_view *view) {
-	/* 客户端（或者 wmctrl 之类）要求关自己：我们只负责把请求传下去。 */
-	vidow_view_close(view);
-}
-
 static void view_x11_request_fullscreen(struct vidow_view *view) {
 	if (view->x11 == NULL) {
 		return;
@@ -9283,105 +9335,6 @@ static void view_x11_request_maximize(struct vidow_view *view) {
 static void view_x11_request_minimize(struct vidow_view *view, bool minimize) {
 	vidow_view_set_minimized(view, minimize);
 }
-
-static void view_x11_destroyed(struct vidow_view *view) {
-	x11_trace_view("destroy", view, NULL);
-	struct vidow_server *server = view->server;
-	struct wlr_output *output = view->output;
-
-	vidow_ipc_emit_window_closed(server, view->id,
-		view->last_title[0] != '\0' ? view->last_title :
-			vidow_view_title(view),
-		view->last_app_id[0] != '\0' ? view->last_app_id :
-			vidow_view_app_id(view));
-
-	/* 以前这里还要撤掉「尺寸抖动」那个闹钟（重映射时抖 +1 像素逼 Xwayland
-	 * 重建 pixmap）—— 那个机制在 621282f 里删掉了，实测对 Steam 黑屏无效，
-	 * 真原因是帧债务和 X11 侧没重建渲染。现在没有闹钟要撤。
-	 *
-	 * 以前这里要摘掉 20 个 wlroots 信号的监听器。现在窗口对象归我们自己
-	 * （见 src/x11surface.h），X 侧销毁时由 xwm_x11.c 的
-	 * x11_handle_destroy() 调进来，没有信号要摘 —— 只把反向指针断开，
-	 * 免得 X 那边还攥着已经释放的 view。 */
-	if (view->x11 != NULL) {
-		view->x11->view = NULL;
-		view->x11 = NULL;
-	}
-
-	x11_drop_surface(view);
-	/* 弹出物可能还攥着键盘（它从来不当焦点窗口），窗口没了就得还回去。 */
-	view_popup_release_keyboard(view);
-	vidow_portal_view_free(view);
-	vidow_mru_forget(server, view);
-	/* 动画回调的 data 就是这个 view（view_move_update / view_move_done）：
-	 * 窗口在动画没跑完时没了，必须先把动画取消掉，否则下一次 anim tick
-	 * 会拿着已释放的 view 调 vidow_view_apply_anim() —— 那就是 2026-10-12
-	 * 23:20–23:47 那 5 个 SIGSEGV 核心转储（栈：#0 野地址 <- #1
-	 * vidow_output_render <- output_frame <- 帧回调）。 */
-	if (view->anim_move != NULL) {
-		vidow_anim_cancel(view->anim_move);
-		view->anim_move = NULL;
-	}
-	if (view->anim_open != NULL) {
-		vidow_anim_cancel(view->anim_open);
-		view->anim_open = NULL;
-	}
-	wl_list_remove(&view->link);
-	/* 同上：果冻先收掉，别留一个攥着野指针的场景节点。 */
-	vidow_jelly_view_gone(view);
-
-	if (server->grab_view == view) {
-		vidow_float_end_grab(server);
-	}
-	vidow_float_detach_children(server, view);
-	/* 图标态那块快照挂在 layer_toplevels 上，不跟着 scene_tree 走：窗口没了
-	 * 就得自己收（不收 = 屏上冻着一块「窗口已经没了」的鬼影）。 */
-	mini_snapshot_free(view);
-	wlr_buffer_unlock(view->last_buffer);
-	view->last_buffer = NULL;
-	vidow_fx_release(&view->fx);
-	vidow_anim_cancel(view->anim_move);
-	view->anim_move = NULL;
-	vidow_anim_cancel(view->anim_open);
-	view->anim_open = NULL;
-	/* 小窗形态转换的补间（S5）data 也是这个 view。 */
-	vidow_anim_cancel(view->mini_anim);
-	view->mini_anim = NULL;
-	/* 悬停预览（S5）挂在 server 上、指着的却是这个 view：先收掉，别留一个
-	 * 攥着已释放窗口的镜面节点。 */
-	if (server->mini_preview_view == view) {
-		vidow_mini_preview_hide(server);
-	}
-
-	bool was_focused = server->focused == view;
-	/* 邻居要在摘列（和 free(view)）之前找（见 focus_after_close）。 */
-	struct vidow_view *next = was_focused ?
-		focus_after_close(server, view, output) : NULL;
-	if (was_focused) {
-		server->focused = NULL;
-	}
-	vidow_view_leave_column(view);
-	vidow_workspace_cleanup(server);
-
-	free(view);
-
-	if (was_focused) {
-		if (next != NULL) {
-			vidow_focus_view(next);
-		} else {
-			focus_nearest_column(server, output);
-		}
-	} else {
-		vidow_arrange(server);
-	}
-}
-
-static void x11_add_listener(struct wl_listener *listener,
-		struct wl_signal *signal, void (*notify)(struct wl_listener *, void *)) {
-	listener->notify = notify;
-	wl_signal_add(signal, listener);
-}
-
 void vidow_view_new_x11(struct vidow_x11_surface *xsurface) {
 	struct vidow_server *server = vidow_x11_server_owner();
 	if (server == NULL || xsurface == NULL) {
@@ -9568,24 +9521,6 @@ void vidow_view_x11_configure_request(struct vidow_view *view,
 	}
 	view_x11_configure_request(view, x, y, w, h, 0);
 }
-
-void vidow_view_x11_destroyed(struct vidow_view *view) {
-	view_x11_destroyed(view);
-}
-
-void vidow_view_x11_request_move(struct vidow_view *view) {
-	view_x11_request_move(view);
-}
-
-void vidow_view_x11_request_resize(struct vidow_view *view) {
-	view_x11_request_resize(view);
-}
-
-void vidow_view_x11_request_close(struct vidow_view *view) {
-	view_x11_request_close(view);
-}
-
-
 static void server_new_toplevel(struct wl_listener *listener, void *data) {
 	struct vidow_server *server = wl_container_of(listener, server, new_toplevel);
 	struct wlr_xdg_toplevel *xdg_toplevel = data;
