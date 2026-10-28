@@ -151,7 +151,10 @@ run_case() { # <slug> <标题> <内容该上屏: yes|no> <该有追踪行: yes|n
 	if [ "$want" = "yes" ]; then
 		grim "$RUNDIR/$slug.png" 2>/dev/null
 		local got
-		got=$(sample_is_pattern "$RUNDIR/$slug.png" $((WX + WW / 2)) $((WY + WH / 2)))
+		# 采样点要落在**某一个象限内部**，不能取正中心：tools/pattern.py 画的是
+		# 四象限红/绿/蓝/白，正中心正好是四种颜色的交汇处，抗锯齿混出来是
+		# (125,189,61) 这种中间色，判据于是把「上屏了」误判成「没上屏」。
+		got=$(sample_is_pattern "$RUNDIR/$slug.png" $((WX + WW / 4)) $((WY + WH / 4)))
 		[ "${got%% *}" = "yes" ] &&
 			pass "窗口内容上屏了（中心采样到图案色）" ||
 			fail "窗口内容没上屏：$got"
