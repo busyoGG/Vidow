@@ -60,16 +60,33 @@ blur_offset = 1.5
 blur_alpha_min = 0.0
 window_opacity = 0.5
 CFG
-	rm -f /tmp/vidow-fx-*.raw /tmp/vidow-blur-*.txt
+	# 每一轮都得把上一轮的转储清干净：只删 vidow-fx / vidow-blur 的话，
+	# vidow-lbd-* 会一轮轮攒下来，`last` 取到的还是上一轮那份，三组数据
+	# 于是完全一样（最大梯度 0.7551 三遍相同就是这么来的）。
+	rm -f /tmp/vidow-fx-*.raw /tmp/vidow-fx-*.txt /tmp/vidow-blur-*.txt \
+		/tmp/vidow-bd-*.raw /tmp/vidow-bd-*.txt \
+		/tmp/vidow-lbd-*.raw /tmp/vidow-lbd-*.txt \
+		/tmp/vidow-lblur-*.raw /tmp/vidow-lblur-*.txt
 	setsid "$BIN" > "$LOG" 2>&1 &
 	VIDOW_PID=$!
 	for _ in $(seq 1 60); do grep -aq "vidow ready" "$LOG" && break; sleep 0.25; done
 	grep -aq "vidow ready" "$LOG" || { echo "test-blurlevel.sh: vidow 没起来（levels=$levels）"; exit 1; }
 	export WAYLAND_DISPLAY=$(grep -ao "WAYLAND_DISPLAY=[a-z0-9-]*" "$LOG" | tail -1 | cut -d= -f2)
 
-	setsid nohup python3 ./tools/wall.py > "$RUNDIR/wall-$levels.log" 2>&1 </dev/null &
+	# 先垫一层 bottom（会被模糊的内容），再起 top（要模糊的那层）。
+	# 只起 top 的话它底下什么都没有，层底衬抓出来是全透明的 —— 测试判据
+	# 「金字塔是空的（alpha < 0.5）」就是空在这里，不是合成器没画。
+	VIDOW_WALL_LAYER=bottom setsid nohup python3 ./tools/wall.py \
+		>"$RUNDIR/wallb-$levels.log" 2>&1 </dev/null &
 	CLIENT_PIDS="$CLIENT_PIDS $!"
 	for _ in $(seq 1 40); do grep -aq "configure layer wall" "$LOG" && break; sleep 0.25; done
+	sleep 0.6
+	setsid nohup python3 ./tools/wall.py > "$RUNDIR/wall-$levels.log" 2>&1 </dev/null &
+	CLIENT_PIDS="$CLIENT_PIDS $!"
+	for _ in $(seq 1 40); do
+		[ "$(grep -ac "configure layer wall" "$LOG")" -ge 2 ] && break
+		sleep 0.25
+	done
 	sleep 1.2
 
 	# 金字塔那几层的转储 tag 是 vidow-lblur（layer 底衬的半数层），
@@ -79,7 +96,9 @@ CFG
 		sed 's/.*-\([0-9]*\)\.raw/\1/' | sort -n | tail -1)
 	local pick=""
 	if [ -n "${last:-}" ]; then
-		for f in "/tmp/vidow-lbd-$last.raw" "/tmp/vidow-lblur-$last.raw"; do
+		# 优先金字塔第 0 层（vidow-lblur）：层底衬（vidow-lbd）是模糊**之前**
+		# 那张图，和 blur_levels 无关，三组抓出来必然一模一样。
+		for f in "/tmp/vidow-lblur-$last.raw" "/tmp/vidow-lbd-$last.raw"; do
 			[ -f "$f" ] && pick="$f" && break
 		done
 	fi
