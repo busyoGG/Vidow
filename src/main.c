@@ -19,6 +19,7 @@
 
 #include <wayland-server-core.h>
 #include <wlr/types/wlr_linux_drm_syncobj_v1.h>
+#include <wlr/xwayland/shell.h>
 #include <wlr/types/wlr_presentation_time.h>
 #include <wlr/render/wlr_renderer.h>
 #include <wlr/types/wlr_export_dmabuf_v1.h>
@@ -543,8 +544,36 @@ static void server_finish(struct vidow_server *server) {
 		wl_list_remove(&server->new_capture_request.link);
 	}
 	if (server->xwayland_server != NULL) {
+		/* **start 也必须摘**，不然退出时必定 abort。
+		 *
+		 * wlr_xwayland_server_destroy() 开头就断言 start / ready 两个信号
+		 * 的监听链表是空的（wlroots 的 server.c），而 events.destroy 的
+		 * 回调是在那之后才发的 —— 这里漏摘 start，每次退出都是
+		 *   vidow: xwayland/server.c:462: wlr_xwayland_server_destroy:
+		 *   Assertion `wl_list_empty(&server->events.start.listener_list)' failed.
+		 * 然后 SIGABRT + core dump。实测攒了 557 个 vidow 的 core（4.0G），
+		 * 每跑一次 headless 测试就多一个。
+		 *
+		 * 为什么以前没人发现：非 debug 会话下它就是安静地退出码异常，
+		 * 只有嵌套/测试那种「刚好在 X 起来之前就 TERM」的时序才稳定复现。 */
+		wl_list_remove(&server->xwayland_start.link);
 		wl_list_remove(&server->xwayland_ready.link);
 		wl_list_remove(&server->xwayland_destroy.link);
+		/* **X 侧的收尾要在 wl_display_destroy() 之前做完。**
+		 *
+		 * 同一个坑的第二层：XWM 挂在 xwayland_shell->events.new_surface 上
+		 * （见 xwm_x11.c 的 handle_shell_new_surface），而
+		 * wlr_xwayland_shell_v1_destroy() 同样断言那条链表是空的。以前
+		 * 只有 xwayland 的 destroy 回调会去拆 XWM，那个回调和 display
+		 * 的销毁顺序不保证 —— 现在显式先拆，顺序就定死了。 */
+		if (server->xwm != NULL) {
+			vidow_x11_server_destroy(server->xwm);
+			server->xwm = NULL;
+		}
+		if (server->xwayland_shell != NULL) {
+			wlr_xwayland_shell_v1_destroy(server->xwayland_shell);
+			server->xwayland_shell = NULL;
+		}
 	}
 	wl_list_remove(&server->cursor_motion.link);
 	wl_list_remove(&server->cursor_motion_absolute.link);

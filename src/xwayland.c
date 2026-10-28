@@ -619,22 +619,14 @@ static void xwayland_destroy(struct wl_listener *listener, void *data) {
 	wl_list_remove(&server->xwayland_destroy.link);
 	/* 我们自己的 XWM 也要收干净：拆事件源、释放窗口对象。
 	 * 必须在 xcb_disconnect 之前 —— 它读的是同一条连接。 */
-	vidow_x11_server_destroy(server->xwm);
-	server->xwm = NULL;
+	/* 退出时 main.c 已经先拆过了（它在 display destroy 之前就得动手，见那里的
+	 * 注释），这里可能已经是 NULL。 */
+	if (server->xwm != NULL) {
+		vidow_x11_server_destroy(server->xwm);
+		server->xwm = NULL;
+	}
 	server->xwayland_server = NULL;
 }
-
-/* 以前这里是 wlroots 的 new_surface 信号：X 窗口由 wlroots 建对象、我们再
- * 包一层 view。现在窗口对象归我们自己（src/x11surface.h），CreateNotify 到了
- * 就由 xwm_x11.c 直接调 vidow_view_new_x11() —— 这个回调已经没有用处，
- * 保留成空函数只是为了让下面的监听器注册代码暂时不用大改。 */
-static void handle_new_xwayland_surface(struct wl_listener *listener,
-		void *data) {
-	(void)listener;
-	(void)data;
-}
-
-
 bool vidow_xwayland_init(struct vidow_server *server) {
 	return vidow_xwayland_apply_config(server);
 }
