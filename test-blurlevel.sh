@@ -30,7 +30,7 @@ cleanup() {
 	[ -n "${VIDOW_TEST_KEEP:-}" ] || rm -rf "$RUNDIR"
 	# vidow 的调试转储写死在 /tmp（vidow-blur-N.raw 那些）：它们是我们自己丢的，
 	# 收尾一起带走，别在 /tmp 里堆着。
-	rm -f /tmp/vidow-blur-*.raw /tmp/vidow-blur-*.txt \
+	rm -f /tmp/vidow-fx-*.raw /tmp/vidow-blur-*.txt \
 		/tmp/vidow-bd-*.raw /tmp/vidow-bd-*.txt \
 		/tmp/vidow-lblur-*.raw /tmp/vidow-lblur-*.txt \
 		/tmp/vidow-lbd-*.raw /tmp/vidow-lbd-*.txt
@@ -60,7 +60,7 @@ blur_offset = 1.5
 blur_alpha_min = 0.0
 window_opacity = 0.5
 CFG
-	rm -f /tmp/vidow-blur-*.raw /tmp/vidow-blur-*.txt
+	rm -f /tmp/vidow-fx-*.raw /tmp/vidow-blur-*.txt
 	setsid "$BIN" > "$LOG" 2>&1 &
 	VIDOW_PID=$!
 	for _ in $(seq 1 60); do grep -aq "vidow ready" "$LOG" && break; sleep 0.25; done
@@ -72,11 +72,11 @@ CFG
 	for _ in $(seq 1 40); do grep -aq "layer map wall" "$LOG" && break; sleep 0.25; done
 	sleep 1.2
 
-	local last=$(ls /tmp/vidow-blur-*.raw 2>/dev/null |
+	local last=$(ls /tmp/vidow-fx-*.raw 2>/dev/null |
 		sed 's/.*-\([0-9]*\)\.raw/\1/' | sort -n | tail -1)
 	if [ -n "${last:-}" ]; then
-		cp "/tmp/vidow-blur-$last.raw" "$RUNDIR/blur-$levels.raw"
-		cp "/tmp/vidow-blur-$last.txt" "$RUNDIR/blur-$levels.txt"
+		cp "/tmp/vidow-fx-$last.raw" "$RUNDIR/blur-$levels.raw"
+		cp "/tmp/vidow-fx-$last.txt" "$RUNDIR/blur-$levels.txt"
 	else
 		fail "levels=$levels：没拿到模糊金字塔快照"
 	fi
