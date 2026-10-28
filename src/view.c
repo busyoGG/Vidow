@@ -227,6 +227,38 @@ void vidow_view_note_initial_names(struct vidow_view *view) {
 
 /* X 像素 <-> 逻辑坐标（定义见下面 vidow_view_x11_scale_int 之后）。 */
 
+/* 规则里显式写了 x11_scale 的，几何按它修正。
+ *
+ * 背景：X 屏幕是设备像素，vidow 的逻辑坐标要按「这块屏的 native:logical 比」
+ * 换算。规则里的 x11_scale 是给**这个客户端**的声明（它按几倍画），两者不一致
+ * 时几何得跟着规则走，否则声明和画面各走一半：声明 1 倍、画面按 2 倍缩小，
+ * 窗口在屏上小一半（test-x11scale.sh 的「带规则」就是量这个）。
+ *
+ * 只在规则显式给了 x11_scale 时修正；没给就保持按输出换算 —— 混合 DPI 下每块
+ * 屏的比不一样，全局 xwayland_scale 不该拿来当基准（右屏 2x、左屏 1x）。 */
+static void x11_apply_rule_scale(const struct vidow_view *view,
+		double *w, double *h) {
+	if (view == NULL || !(view->x11_scale > 0.0) || w == NULL || h == NULL) {
+		return;
+	}
+	int sc = vidow_view_x11_scale_int(view);
+	/* output 还没指派时按 X 侧坐标找屏 —— 弹窗尤其常见（先建视图、后挂屏），
+	 * 这里要是直接 return，规则就静默失效，菜单和父窗口一大一小。 */
+	struct wlr_output *out = view->output;
+	if (out == NULL && view->x11 != NULL) {
+		out = vidow_xwm_output_at_native(view->server, view->x11->x,
+			view->x11->y);
+	}
+	struct wlr_box nb = {0}, lb = {0};
+	if (sc <= 0 || out == NULL || !vidow_xwm_output_boxes(view->server, out,
+			&lb, &nb) || nb.width <= 0 || lb.width <= 0) {
+		return;
+	}
+	double k = ((double)nb.width / (double)lb.width) / (double)sc;
+	*w *= k;
+	*h *= k;
+}
+
 struct wlr_box vidow_view_geometry(const struct vidow_view *view) {
 	if (view->kind == VIDOW_VIEW_X11) {
 		/* X11 窗口没有「窗口几何」和「表面」的区别：整块就是内容。 */
@@ -234,6 +266,7 @@ struct wlr_box vidow_view_geometry(const struct vidow_view *view) {
 		if (view->x11 != NULL) {
 			double w = view->x11->width, h = view->x11->height;
 			vidow_xwm_from_native_size(view->server, view->output, w, h, &w, &h);
+			x11_apply_rule_scale(view, &w, &h);
 			box.width = (int)lround(w);
 			box.height = (int)lround(h);
 		}
@@ -420,6 +453,12 @@ void vidow_view_client_size(const struct vidow_view *view, int *w, int *h) {
 		if (view->x11 != NULL && view->x11->width > 0 &&
 				view->x11->height > 0) {
 			double w = view->x11->width, h = view->x11->height;
+			/* 这里**故意**不吃规则里的 x11_scale：它的返回值被平铺 / 浮动
+			 * 布局当「客户端想要的尺寸」用，按规则放大后固定尺寸的 X 窗口
+			 * 会被当成「想占大地方」，在 628x348 的工作区上直接铺满
+			 * （实测 place 序列 300 → 150 → 600x348 → 628x348）。
+			 * 场景尺寸、布局几何、弹窗盒子三处已经按规则修好，这里保持
+			 * 按输出换算。 */
 			vidow_xwm_from_native_size(view->server, view->output, w, h, &w, &h);
 			width = (int)lround(w);
 			height = (int)lround(h);
@@ -825,7 +864,18 @@ void vidow_view_x11_scale(struct vidow_view *view) {
 	}
 	/* X buffer pixels are mapped through the output's virtual rectangle.
 	 * DPI and wl_surface.buffer_scale do not define this geometry transform. */
-	int scale = vidow_view_x11_scale_int(view); /* preferred buffer-scale hint only */
+	/* 规则里显式写了 x11_scale 的，几何也要照它走。
+	 *
+	 * 这条以前只当 buffer-scale 提示用（下面的注释写着 "never this DPI-related
+	 * integer"），结果 x11_scale=1 的窗口缓冲区声明成 1 倍、物理尺寸 300，
+	 * 场景尺寸却照样被按输出的 native:logical 比（2）除成 150 —— 声明和几何
+	 * 各走一半，窗口在屏上小一半。test-x11scale.sh 的「带规则」三条全红就是它。
+	 *
+	 * 只在规则显式给了 x11_scale 时才按它修正；没给的时候保持按输出换算
+	 * （混合 DPI 下每块屏的 native:logical 不一样，全局 xwayland_scale 不该
+	 * 拿来当基准）。 */
+	int scale = vidow_view_x11_scale_int(view);
+	bool scale_from_rule = view->x11_scale > 0.0;
 	double dw = bw, dh = bh;
 	/* ⚠️ output 缺失时换算会**静默失败**（transform() 查不到布局框就原样返回），
 	 * dest 于是等于缓冲像素数（2 倍大），窗口在屏上被放大两倍、右下一半跑到屏外。
@@ -840,6 +890,17 @@ void vidow_view_x11_scale(struct vidow_view *view) {
 			view->x11->x, view->x11->y);
 	}
 	vidow_xwm_from_native_size(view->server, conv_out, bw, bh, &dw, &dh);
+	if (scale_from_rule) {
+		struct wlr_box nb = {0}, lb = {0};
+		if (vidow_xwm_output_boxes(view->server, conv_out, &lb, &nb) &&
+				nb.width > 0 && lb.width > 0 && scale > 0) {
+			double out_scale = (double)nb.width / (double)lb.width;
+			double k = out_scale / (double)scale;
+			dw *= k;
+			dh *= k;
+		}
+	}
+	(void)scale_from_rule;
 	if (vidow_xtrace_on()) {
 		struct wlr_box nb = {0}, lb = {0};
 		vidow_xwm_output_boxes(view->server, conv_out, &lb, &nb);
@@ -8681,6 +8742,9 @@ bool vidow_view_x11_popup_box(struct vidow_view *view, struct wlr_box *box) {
 	double w = view->x11->width, h = view->x11->height;
 	vidow_xwm_from_native_point(view->server, view->output, x, y, &x, &y);
 	vidow_xwm_from_native_size(view->server, view->output, w, h, &w, &h);
+	/* 弹窗也要吃规则里的 x11_scale，否则场景 / 布局按规则放大、弹窗还是
+	 * 按输出缩小，菜单和它的子菜单会一大一小对不上。 */
+	x11_apply_rule_scale(view, &w, &h);
 	box->x = (int)floor(x);
 	box->y = (int)floor(y);
 	box->width = (int)lround(w);

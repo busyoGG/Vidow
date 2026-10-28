@@ -49,7 +49,7 @@ mkdir -p "$CFGDIR/.config/vidow" "$RUNDIR/run"
 chmod 700 "$RUNDIR/run"
 export XDG_RUNTIME_DIR="$RUNDIR/run"
 export WLR_BACKENDS=headless WLR_HEADLESS_OUTPUTS=1 WLR_LIBINPUT_NO_DEVICES=1
-export HOME="$CFGDIR" VIDOW_LOG=debug
+export HOME="$CFGDIR" VIDOW_LOG=debug VIDOW_X11_TRACE=1
 export DISPLAY= WAYLAND_DISPLAY=
 
 # 光标落点：故意选在两遍里都落在窗口里面的位置（窗口是居中的，位置会变）
