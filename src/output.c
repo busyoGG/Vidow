@@ -703,8 +703,8 @@ static void capture_render_output(struct vidow_output *output) {
 	render_for(output, VIDOW_RENDER_CAPTURE);
 }
 
-static int capture_watchdog(void *data) {
-	struct vidow_server *server = data;
+/* 抓帧看门狗的本体：有屏在等帧就推一帧并返回下次间隔，没人等就返回 0。 */
+static int capture_watchdog_body(struct vidow_server *server) {
 	{
 		struct vidow_output *o;
 		wl_list_for_each(o, &server->outputs, link) {
@@ -740,23 +740,86 @@ static int capture_watchdog(void *data) {
 					"抓帧");
 			}
 		}
-		wl_event_source_timer_update(server->capture_timer,
-			capture_interval_ms(server));
+		return ms;
 	}
+}
+
+static int64_t anim_watchdog_body(struct vidow_server *server);
+
+/* ---- 帧调度器：动画看门狗 + 抓帧看门狗合成一个 event source ----
+ *
+ * 两条路本质是同一件事：**某个时刻要一帧**。以前各排各的定时器，event loop 里
+ * 两套到期判断、两处续期、两处「什么时候该撤」的语义。现在各记一个截止时刻，
+ * 这里取最早的排一次。
+ *
+ * 没并进来的两个（有意）：
+ *   pump_timer  每块屏一个闹钟（某个窗口的补帧到点），天然 per-output，并进来
+ *               反而要维护 per-output 的堆；
+ *   kick_timer  是「延后一轮事件派发」，不是帧节拍。
+ *
+ * 两条路都到期（或者都没有）时的行为要和原来逐个定时器时完全一致：
+ * 到期的那条跑本体、本体返回下次间隔（0 = 不再排），然后重新取最早。 */
+static void frame_rearm(struct vidow_server *server) {
+	if (server->frame_timer == NULL) {
+		return;
+	}
+	int64_t now = vidow_now_ns();
+	int64_t best = 0;
+	if (server->frame_anim_at_ns > 0) {
+		best = server->frame_anim_at_ns;
+	}
+	if (server->frame_capture_at_ns > 0 &&
+			(best == 0 || server->frame_capture_at_ns < best)) {
+		best = server->frame_capture_at_ns;
+	}
+	if (best == 0) {
+		wl_event_source_timer_update(server->frame_timer, 0); /* 撤 */
+		return;
+	}
+	int64_t ms = (best - now) / 1000000;
+	if (ms < 1) {
+		ms = 1; /* 已到期也要排一次，不能 0 —— 0 是「撤除」 */
+	}
+	wl_event_source_timer_update(server->frame_timer, (int)ms);
+}
+
+static int frame_timer_cb(void *data) {
+	struct vidow_server *server = data;
+	int64_t now = vidow_now_ns();
+	/* 先取走再跑：本体里可能重新安排自己（动画续期 / 抓帧下一轮），
+	 * 也可能把另一条路的时刻改掉。 */
+	if (server->frame_anim_at_ns > 0 && server->frame_anim_at_ns <= now) {
+		server->frame_anim_at_ns = 0;
+		int64_t ms = anim_watchdog_body(server);
+		if (ms > 0) {
+			server->frame_anim_at_ns = vidow_now_ns() + ms * 1000000LL;
+		}
+	}
+	if (server->frame_capture_at_ns > 0 &&
+			server->frame_capture_at_ns <= now) {
+		server->frame_capture_at_ns = 0;
+		int ms = capture_watchdog_body(server);
+		if (ms > 0) {
+			server->frame_capture_at_ns = vidow_now_ns() +
+				(int64_t)ms * 1000000LL;
+		}
+	}
+	frame_rearm(server);
 	return 0;
 }
 
 /* 有人要抓帧了：把上面的看门狗叫起来（它是「静止的屏幕永远不提交」的兜底，
  * 见 capture_watchdog）。请求进来时踢一次就够 —— 它会自己续期到抓完。 */
 void vidow_output_capture_kick(struct vidow_server *server) {
-	if (server == NULL || server->capture_timer == NULL) {
+	if (server == NULL || server->frame_timer == NULL) {
 		return;
 	}
 	int ms = capture_interval_ms(server);
 	if (ms <= 0) {
 		return; /* 兜底关着：只靠后端自己的提交 */
 	}
-	wl_event_source_timer_update(server->capture_timer, ms);
+	server->frame_capture_at_ns = vidow_now_ns() + (int64_t)ms * 1000000LL;
+	frame_rearm(server);
 }
 
 void vidow_output_capture_kick_output(struct vidow_server *server,
@@ -800,8 +863,9 @@ static int64_t watchdog_interval_ns(struct vidow_output *output, bool dragging) 
  * compositor has presented our surface, and the host only presents on damage:
  * that deadlocks an animation that is waiting for its next frame. If frames
  * dry up while an animation is in flight, drive it from a timer instead. */
-static int anim_watchdog(void *data) {
-	struct vidow_server *server = data;
+/* 动画看门狗的本体：算出「下一次该醒在多少毫秒后」，0 = 不用再醒。
+ * 上弦交给 frame_timer（见 frame_timer_cb 的说明）。 */
+static int64_t anim_watchdog_body(struct vidow_server *server) {
 	server->watchdog_armed = false;
 	{
 		struct vidow_output *o;
@@ -866,10 +930,8 @@ static int anim_watchdog(void *data) {
 			vidow_output_note_deadline(output, now + ms * 1000000LL,
 				"动画");
 		}
-		wl_event_source_timer_update(server->anim_timer,
-			(int)(wait_ms < 1 ? 1 : wait_ms));
+		return ms;
 	}
-	return 0;
 }
 
 /* Armed whenever an animation starts or a frame is presented, so the
@@ -877,11 +939,12 @@ static int anim_watchdog(void *data) {
  * 已经排上就不再排 —— 拖动时每个指针事件都会调到这儿（见 server.h 的
  * watchdog_armed）。 */
 void vidow_output_kick_watchdog(struct vidow_server *server) {
-	if (server->anim_timer == NULL || server->watchdog_armed) {
+	if (server->frame_timer == NULL || server->watchdog_armed) {
 		return;
 	}
 	server->watchdog_armed = true;
-	wl_event_source_timer_update(server->anim_timer, 8);
+	server->frame_anim_at_ns = vidow_now_ns() + 8 * 1000000LL;
+	frame_rearm(server);
 }
 
 /* 立刻给每块屏画一帧。切 tty 切回来的路上（DRM 后端会把所有输出销毁再重建）
@@ -2343,10 +2406,10 @@ static void vidow_output_test_hook(struct vidow_server *server) {
 }
 
 bool vidow_output_init(struct vidow_server *server) {
-	server->anim_timer = wl_event_loop_add_timer(
-		wl_display_get_event_loop(server->display), anim_watchdog, server);
-	if (server->anim_timer == NULL) {
-		wlr_log(WLR_ERROR, "failed to create the animation watchdog");
+	server->frame_timer = wl_event_loop_add_timer(
+		wl_display_get_event_loop(server->display), frame_timer_cb, server);
+	if (server->frame_timer == NULL) {
+		wlr_log(WLR_ERROR, "failed to create the frame timer");
 	}
 	/* 抓帧兜底节奏：**配置先落**（config.lua 的 capture_fps，默认 60），
 	 * 环境变量覆盖它（临时调试 / 脚本场景不用改配置文件）。 */
@@ -2367,11 +2430,9 @@ bool vidow_output_init(struct vidow_server *server) {
 				"用配置值 %d fps", fps_env, server->capture_fps);
 		}
 	}
-	server->capture_timer = wl_event_loop_add_timer(
-		wl_display_get_event_loop(server->display), capture_watchdog, server);
-	if (server->capture_timer == NULL) {
-		wlr_log(WLR_ERROR, "failed to create the capture watchdog");
-	}
+	/* 抓帧这一路不再是独立定时器：它登记到 frame_timer 的截止时刻里
+	 * （见上面的 frame_rearm）。这里**不**排第一次 —— 没人在抓帧的时候
+	 * 它一次都不该醒，由 vidow_output_capture_kick 按需叫起来。 */
 	/* 这里**不**排第一次：没人在抓帧的时候它一次都不该醒（见 capture_watchdog，
 	 * 由 vidow_output_capture_kick 按需叫起来）。 */
 	server->kick_timer = wl_event_loop_add_timer(

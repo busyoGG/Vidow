@@ -609,13 +609,9 @@ static void server_finish(struct vidow_server *server) {
 	}
 
 	/* 事件源（定时器 / 信号 / FIFO）：loop 没了它们也活不成，主动撤掉干净。 */
-	if (server->anim_timer != NULL) {
-		wl_event_source_remove(server->anim_timer);
-		server->anim_timer = NULL;
-	}
-	if (server->capture_timer != NULL) {
-		wl_event_source_remove(server->capture_timer);
-		server->capture_timer = NULL;
+	if (server->frame_timer != NULL) {
+		wl_event_source_remove(server->frame_timer);
+		server->frame_timer = NULL;
 	}
 	if (server->reload_sig != NULL) {
 		wl_event_source_remove(server->reload_sig);

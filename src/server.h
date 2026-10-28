@@ -2864,8 +2864,7 @@ struct vidow_server {
 	/* 见过的每一块屏都留一条记忆（拔了也不删），热插拔按它还原工作区。 */
 	struct wl_list output_memories; /* vidow_output_memory.link */
 	struct wl_list execs;     /* vidow_exec.link, config commands in flight */
-	struct wl_event_source *exec_timer; /* one shared timeout timer */
-	struct wl_event_source *capture_timer; /* drives pending screen captures */
+	struct wl_event_source *exec_timer; /* one shared timeout timer */ /* drives pending screen captures */
 	/* 抓帧节奏（Hz）。录屏 / 远程控制靠它推进：屏幕静止时没有输出提交，
 	 * 全靠 capture_watchdog 按这个频率催帧（见 output.c）。
 	 *
@@ -3128,7 +3127,17 @@ struct vidow_server {
 
 	/* Fallback clock: advances animations when the backend stops delivering
 	 * frame events (a nested Wayland output stalls while the host is idle). */
-	struct wl_event_source *anim_timer;
+	/* 帧调度：动画看门狗和抓帧看门狗合成**一个** event source（原来的
+	 * anim_timer / capture_timer 已删）。两者本质是同一件事 —— 「某个时刻
+	 * 要一帧」—— 各排一个定时器等于同一个循环里两套到期判断。现在各记一个
+	 * 截止时刻（0 = 这一路不上弦），由 frame_timer 按最早那个上弦。
+	 *
+	 * pump_timer 没并进来：它是**每块屏**一个闹钟（某个窗口的补帧到点），
+	 * 天然按屏分账，并进全局调度器反而要维护 per-output 的堆。
+	 * kick_timer 也没并：它是「延后一轮派发」的 defer，不是帧节拍。 */
+	struct wl_event_source *frame_timer;
+	int64_t frame_anim_at_ns;
+	int64_t frame_capture_at_ns;
 	/* 看门狗正在跑（定时器已经排上，还没回调）。拖动时每个指针事件都会来
 	 * kick 一下，而 wl_event_source_timer_update 是「重排」不是「没排就排」——
 	 * 1000Hz 的鼠标每 1ms 把 24ms 的闹钟往后推一次，闹钟永远不响，拖动就又冻住了
