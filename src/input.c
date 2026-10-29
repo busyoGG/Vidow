@@ -133,6 +133,24 @@ static void keyboard_modifiers(struct wl_listener *listener, void *data) {
 		return;
 	}
 
+	/* **虚拟 / 注入键盘不是 seat 当前那把时，它的修饰位变化跟客户端无关。**
+	 *
+	 * fcitx5 每建一个输入上下文就新挂一块虚拟键盘（用户这份日志里 520 次
+	 * 接入）。接入时 server_add_keyboard() 会先把它的修饰位清零（清历史残留
+	 * 的 Ctrl），清零就触发这个回调 —— 原来这里会把 seat **抢到虚拟键盘上**
+	 * 再推一份「一个修饰位都没锁」的状态给客户端，NumLock 就是这么被抹掉的：
+	 * 客户端以为小键盘是导航键，用户报的「点进输入框后小键盘打不出数字，
+	 * 按两下 NumLock 才恢复」就是这条（第一下只是把我们这边真实状态按灭，
+	 * 第二下才重新点亮）。
+	 *
+	 * 真键盘照旧：它一按键就会在 keyboard_key 里自己抢回 seat。输入法真在
+	 * 回注时（IM 抢着键盘、或虚拟键盘已经是 seat 那把）也不受影响，走的是
+	 * 上面那条分支。 */
+	if ((kb->virtual != NULL || kb->inject || kb->uinput) &&
+			wlr_seat_get_keyboard(kb->server->seat) != kb->wlr_keyboard) {
+		return;
+	}
+
 	if (wlr_seat_get_keyboard(kb->server->seat) != kb->wlr_keyboard) {
 		wlr_seat_set_keyboard(kb->server->seat, kb->wlr_keyboard);
 	}
