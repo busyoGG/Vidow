@@ -335,8 +335,8 @@ check "类型是 UTF-8 文本" '{"cmd":"clipboard-get"}' 'resp["result"]["mime"]
 	'text/plain;charset=utf-8'
 check "状态里 origin=x11" '{"cmd":"clipboard"}' \
 	'resp["result"]["clipboard"]["origin"]' 'x11'
-check "X 侧 owner 是 xwm 的代理窗口（请求因此归我们答）" '{"cmd":"clipboard"}' \
-	'resp["result"]["clipboard"]["x_owner_is_xwm_proxy"]' 'True'
+check "X 侧 owner 是我们自己的桥接窗口（请求因此归我们答）" '{"cmd":"clipboard"}' \
+	'resp["result"]["clipboard"]["x_owner_is_ours"]' 'True'
 check "类型取全了" '{"cmd":"clipboard"}' \
 	'resp["result"]["clipboard"]["types_complete"] >= 1' 'True'
 ck_has "日志记了取到几个类型" "$(cat "$LOG")" "从 X11 取到 clipboard 的"
@@ -489,13 +489,13 @@ check "关掉后 IPC 报 enabled=false" '{"cmd":"clipboard"}' \
 	'resp["result"]["enabled"]' 'False'
 check "关掉后拿不到内容" '{"cmd":"clipboard-get"}' 'resp["ok"]' 'False'
 
-# 关掉之后退回 wlroots 那套：它自己的 selection 代码又动起来了
+# 关掉之后桥要放掉 X 选区（现在 X 侧是我们自己的 XWM，没有 wlroots 那套可以退回）
 G1="disabled-$$"
 printf '%s' "$G1" > "$RUNDIR/in.txt"
 start_holder "$RUNDIR/in.txt" xclip -selection clipboard -in
 sleep 1.2
-ck_has "wlroots 那套接手了（日志里能看到它自己处理 XFixes）" \
-	"$(since "$OFF_LINE")" "xwayland/selection/incoming.c"
+check "关掉后桥不再占着 X 选区" '{"cmd":"clipboard"}' \
+	'resp["result"]["clipboard"]["x_owner"]' '0'
 
 check "再打开" '{"cmd":"set-config","key":"clipboard","value":"1"}' \
 	'resp["ok"]' 'True'

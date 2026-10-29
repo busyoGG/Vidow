@@ -302,9 +302,20 @@ static void sel_emit(struct vidow_clip_selection *sel, const char *what) {
 /* 把一份内容写进 fd。写不完（管道满）就挂个可写事件接着写；对面关了就当写完。 */
 static void fd_write_some(struct vidow_clip_waiter *w) {
 	struct vidow_clip_mime *m = sel_find(w->sel, w->mime);
-	if (m == NULL || !m->complete || m->overflow) {
-		/* 类型没了 / 取不全：空管道就是「没有」，客户端会当作空剪贴板 */
+	if (m == NULL && mime_is_text(w->mime)) {
+		m = sel_pick(w->sel, NULL);
+		if (m != NULL && !mime_is_text(m->mime)) {
+			m = NULL;
+		}
+	}
+	if (m == NULL || m->overflow) {
+		/* 类型没了 / 超过上限：空管道就是「没有」。 */
 		waiter_destroy(w);
+		return;
+	}
+	if (!m->complete) {
+		/* Wayland 客户端可能在我们拉取源数据完成前就来粘；保留 fd，
+		 * pull_finish() 会通过 sel_flush_waiters() 继续写。 */
 		return;
 	}
 	while (w->offset < m->len) {
@@ -389,6 +400,12 @@ static void serve_to_fd(struct vidow_clip_selection *sel, const char *mime,
 	}
 
 	struct vidow_clip_mime *m = sel_find(sel, mime);
+	if (m == NULL && mime_is_text(mime)) {
+		m = sel_pick(sel, NULL);
+		if (m != NULL && !mime_is_text(m->mime)) {
+			m = NULL;
+		}
+	}
 	if (m == NULL || m->overflow) {
 		close(fd); /* 没有这个类型 = 空 */
 		return;
@@ -479,6 +496,30 @@ static void sel_shutdown_selection(struct vidow_clip_selection *sel) {
 	}
 }
 
+/* Wayland/IPC 内容也必须成为 X selection owner，否则 X11 客户端的
+ * SelectionRequest 不会进入我们的 event hook。 */
+static void x11_claim_selection(struct vidow_clip_selection *sel) {
+	struct vidow_clipboard *clip = sel->clip;
+	xcb_connection_t *conn = x11_conn(clip);
+	if (conn == NULL) {
+		return;
+	}
+	xcb_set_selection_owner(conn, clip->window, sel->atom, XCB_CURRENT_TIME);
+	sel->x_owner = clip->window;
+	xcb_flush(conn);
+}
+
+static void x11_release_selection(struct vidow_clip_selection *sel) {
+	struct vidow_clipboard *clip = sel->clip;
+	xcb_connection_t *conn = x11_conn(clip);
+	if (conn == NULL || sel->x_owner != clip->window) {
+		return;
+	}
+	xcb_set_selection_owner(conn, XCB_WINDOW_NONE, sel->atom, XCB_CURRENT_TIME);
+	sel->x_owner = XCB_WINDOW_NONE;
+	xcb_flush(conn);
+}
+
 /* 把当前缓存发布到 seat 上（Wayland 客户端就能粘了）。类型表为空 = 撤掉。 */
 static void sel_publish_serial(struct vidow_clip_selection *sel,
 		uint32_t serial) {
@@ -493,6 +534,7 @@ static void sel_publish_serial(struct vidow_clip_selection *sel,
 		sel_unpublish(sel);
 		return;
 	}
+	x11_claim_selection(sel);
 	wlr_log(WLR_DEBUG, "剪贴板: 把 %s 的 %d 个类型发布到 Wayland", sel->name,
 		sel->nmimes);
 
@@ -545,6 +587,7 @@ static void sel_publish(struct vidow_clip_selection *sel) {
 /* 撤掉我们发布的那一份（seat 上的选择清空）。 */
 static void sel_unpublish(struct vidow_clip_selection *sel) {
 	struct vidow_server *server = sel->server;
+	x11_release_selection(sel);
 	wlr_log(WLR_DEBUG, "剪贴板: 撤掉 %s 发布的源（%p/%p）", sel->name,
 		(void *)sel->published, (void *)sel->published_primary);
 	if (sel->primary) {
@@ -694,12 +737,13 @@ static void pull_all(struct vidow_clip_selection *sel, struct wlr_data_source *d
 			continue;
 		}
 		struct vidow_clip_mime *m = sel_find(sel, mime);
+		if (m != NULL) {
+			continue; /* wl-copy 常重复 offer 同一 MIME，只拉一次 */
+		}
+		m = sel_add(sel, mime, XCB_ATOM_NONE);
 		if (m == NULL) {
-			m = sel_add(sel, mime, XCB_ATOM_NONE);
-			if (m == NULL) {
-				wlr_log(WLR_INFO, "剪贴板: 类型太多，%s 不跟了", mime);
-				continue;
-			}
+			wlr_log(WLR_INFO, "剪贴板: 类型太多，%s 不跟了", mime);
+			continue;
 		}
 		pull_start(sel, ds, ps, mime);
 	}
@@ -745,6 +789,7 @@ static void sel_handle_seat(struct vidow_clip_selection *sel) {
 		}
 		sel_reset(sel);
 		sel->from_x11 = false;
+		x11_claim_selection(sel);
 		pull_all(sel, NULL, src);
 		sel_emit(sel, "wayland-set");
 		return;
@@ -769,6 +814,7 @@ static void sel_handle_seat(struct vidow_clip_selection *sel) {
 	}
 	sel_reset(sel);
 	sel->from_x11 = false;
+	x11_claim_selection(sel);
 	pull_all(sel, src, NULL);
 	sel_emit(sel, "wayland-set");
 }
@@ -1715,6 +1761,17 @@ static void x11_attach(struct vidow_server *server) {
 			"（退回 wlroots 那套：只有 X11 窗口聚焦时才同步）");
 		return;
 	}
+	xcb_xfixes_query_version_cookie_t version_cookie =
+		xcb_xfixes_query_version(conn, 2, 0);
+	xcb_xfixes_query_version_reply_t *version =
+		xcb_xfixes_query_version_reply(conn, version_cookie, NULL);
+	if (version == NULL || version->major_version < 2) {
+		wlr_log(WLR_INFO, "剪贴板: XFixes 2.0 不可用，不接管 X11 剪贴板");
+		free(version);
+		return;
+	}
+	wlr_log(WLR_DEBUG, "剪贴板: XFixes %u.%u", version->major_version, version->minor_version);
+	free(version);
 	clip->xfixes_first = xfixes->first_event;
 	clip->conn = conn;
 
