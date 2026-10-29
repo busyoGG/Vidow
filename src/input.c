@@ -736,7 +736,18 @@ static void keyboard_apply_config(struct vidow_server *server,
 	if (wlr_seat_get_keyboard(server->seat) == kb) {
 		wlr_seat_keyboard_notify_modifiers(server->seat, &kb->modifiers);
 	}
-	wlr_log(WLR_INFO, "键盘: numlock = true，NumLock 起手点亮");
+	/* 每次接入都会走到这儿（fcitx5 一个输入上下文挂一块虚拟键盘，实测一次
+	 * 会话 520 次），只在第一次打一行 INFO，其余降成 DEBUG —— 这条 INFO 原来
+	 * 能把日志刷掉 520 行，真正要看的东西全被冲走。 */
+	static bool numlock_logged;
+	static int numlock_attaches;
+	if (!numlock_logged) {
+		numlock_logged = true;
+		wlr_log(WLR_INFO, "键盘: numlock = true，NumLock 起手点亮");
+	} else {
+		wlr_log(WLR_DEBUG, "键盘: 起手点亮 NumLock（第 %d 次接入）",
+			++numlock_attaches);
+	}
 }
 
 static void server_add_keyboard(struct vidow_server *server,
