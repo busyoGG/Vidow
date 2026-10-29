@@ -2904,6 +2904,31 @@ static bool view_on_screen(struct vidow_server *server,
  *
  * 唯一保留的判据是 `view->output == output`：frame_done 应该按屏发，一块屏
  * 一帧一次，不能两块屏各发一次（那会让 X11 客户端被催着跑双倍帧率）。 */
+/* frame_done 的**最小间隔**：这块屏的刷新周期，减去一点容差。
+ *
+ * 为什么要减：原来的判据是「间隔 < 1/刷新率 就整帧不发」，**零容差**。而渲染
+ * 循环的一帧本来就是围绕刷新周期抖的 —— 160Hz 屏预算 6.25ms，客户端跑
+ * 148fps（6.76ms/帧），只要某一帧早到 0.1ms，这一帧的 frame_done 就整个丢掉：
+ * 客户端多等一拍、下一帧连收两个，屏幕上就是「前后两帧反复拉扯」（实测每秒
+ * 丢 12 个 = 160−148，正好是用户看到的抖动频率）。
+ *
+ * 容差取周期的 1/8、上限 2ms：160Hz → 5.47ms（上限约 183fps），60Hz → 14.6ms
+ * （上限约 68fps）。既保住「别被客户端顶成 300fps 空转」那条初衷，又不会因为
+ * 零点几毫秒的调度抖动漏帧。 */
+static int64_t fd_min_interval_ns(const struct wlr_output *wlr_output) {
+	int refresh_mhz = wlr_output != NULL ? wlr_output->refresh : 0;
+	int refresh_hz = refresh_mhz > 0 ? refresh_mhz / 1000 : 60;
+	if (refresh_hz <= 0) {
+		refresh_hz = 60;
+	}
+	int64_t budget = 1000000000LL / refresh_hz;
+	int64_t slack = budget / 8;
+	if (slack > 2000000LL) {
+		slack = 2000000LL;
+	}
+	return budget - slack;
+}
+
 void vidow_views_send_x11_frame_done(struct vidow_server *server,
 		struct vidow_output *output) {
 	if (server == NULL || output == NULL) {
@@ -2917,17 +2942,15 @@ void vidow_views_send_x11_frame_done(struct vidow_server *server,
 	 * 画下一帧 → commit → 我们渲染 → 又发回调 → 自激。静止桌面实测 300fps、
 	 * 损伤 97%/帧、GPU 一直满转，抓帧（vshot）抢不到 GPU，比 grim 慢 4 倍 /
 	 * 卡半秒。上限取输出刷新率：比显示刷新率更快的帧本来就看不到。refresh
-	 * 单位是 mHz，<=0 表示没报，按 60 兜底。 */
-	int refresh_mhz = output->wlr_output->refresh;
-	int refresh_hz = refresh_mhz > 0 ? refresh_mhz / 1000 : 60;
-	if (refresh_hz <= 0) {
-		refresh_hz = 60;
-	}
-	int64_t fd_budget_ns = 1000000000LL / refresh_hz;
+	 * 单位是 mHz，<=0 表示没报，按 60 兜底。
+	 *
+	 * 间隔留了容差（见 fd_min_interval_ns）：零容差会在刷新率边缘把 callbell
+	 * 整帧吃掉，那正是「Xwayland 游戏一抖一抖」的根。 */
+	int64_t fd_min_ns = fd_min_interval_ns(output->wlr_output);
 	int64_t fd_now_ns = (int64_t)now.tv_sec * 1000000000LL + now.tv_nsec;
 	if (getenv("VIDOW_X11_FD_UNTHROTTLED") == NULL &&
 			output->last_x11_fd_ns != 0 &&
-			fd_now_ns - output->last_x11_fd_ns < fd_budget_ns) {
+			fd_now_ns - output->last_x11_fd_ns < fd_min_ns) {
 		return;
 	}
 	output->last_x11_fd_ns = fd_now_ns;

@@ -1971,6 +1971,11 @@ void vidow_pointer_motion(struct vidow_server *server, uint32_t time_msec) {
 				return;
 			}
 		}
+		/* 指针落回 Xwayland 的表面：把「客户端要求不画光标」补设回去。放在
+		 * notify_enter 之前 —— enter 一过客户端可能立刻 set_cursor，晚一步
+		 * 就被我们刚设上的箭头盖住（见 cursorfx.c 的
+		 * vidow_cursor_fx_entered）。 */
+		vidow_cursor_fx_entered(server, surface);
 		wlr_seat_pointer_notify_enter(server->seat, surface, sx, sy);
 		wlr_seat_pointer_notify_motion(server->seat, time_msec, sx, sy);
 	} else {
@@ -2696,6 +2701,7 @@ static void server_request_cursor(struct wl_listener *listener, void *data) {
 	}
 	/* 先告诉摇晃放大「光标图要换了」，再设上去，最后让它把新图重新放大一遍
 	 * —— 放大期间客户端换光标（焦点切到别的窗口就会）不再把放大缩回去。 */
+	vidow_cursor_fx_note_set_cursor(server, event->surface == NULL);
 	vidow_cursor_fx_set_surface(server, event->surface, event->hotspot_x,
 		event->hotspot_y);
 	vidow_cursor_set_client_surface(server, event->surface, event->hotspot_x,

@@ -4120,6 +4120,12 @@ bool vidow_cursor_set_client_surface(struct vidow_server *server,
 void vidow_cursor_fx_reapply(struct vidow_server *server);
 void vidow_cursor_fx_set_surface(struct vidow_server *server,
 		struct wlr_surface *surface, int32_t hx, int32_t hy);
+/* 客户端 set_cursor 的内容变了（none = 它给的是 NULL，即「别画光标」）。 */
+void vidow_cursor_fx_note_set_cursor(struct vidow_server *server, bool none);
+/* 指针进到一个表面上（input.c 的 notify_enter 之前调）：X11 客户端要求不画
+ * 光标时，把那张「不画」补设回去（见 cursorfx.c 的说明）。 */
+void vidow_cursor_fx_entered(struct vidow_server *server,
+		struct wlr_surface *surface);
 /* 指针底下没窗口了，该显示主题默认箭头。放大期间不动真图，只记状态。 */
 void vidow_cursor_fx_default_cursor(struct vidow_server *server);
 /* 光标图换了（客户端 set_cursor / 焦点切换）：放大中就换成新图，别缩回去。 */

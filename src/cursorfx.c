@@ -124,9 +124,20 @@ struct vidow_cursor_fx {
 	 * vidow_cursor_fx_set_hidden）：藏的时候图在 wlroots 那边是 NULL，上面那
 	 * 三个字段留着「显示回来该给哪张」。 */
 	bool hidden;
+	/* Xwayland 明确要求**不画光标**（set_cursor(NULL)：游戏自己画准星）。
+	 *
+	 * 和 hidden 不是一回事：hidden 是「用户没动鼠标」，这里是客户端的选择。
+	 * 没有这一位的话，指针一离开游戏窗口，input.c 那条「底下没窗口 = 主题
+	 * 箭头」就把光标换成箭头；再回到游戏里，Xwayland 不会再发一次 NULL（它
+	 * 认为光标没变），于是游戏里永远顶着一个 Wayland 箭头（用户报的
+	 * 「鼠标离开窗口就无法重新渲染游戏光标」）。见
+	 * vidow_cursor_fx_entered。 */
+	bool x11_none;
 };
 
 static void shake_count_flip(struct vidow_cursor_fx *fx, int64_t now);
+static void restore_shown_cursor(struct vidow_server *server);
+static bool seat_over_x11(const struct vidow_server *server);
 
 /* 记一次「换向」：同一串里还要管「隔太久算断」和「这一串从哪开始计时」。 */
 static void shake_count_flip(struct vidow_cursor_fx *fx, int64_t now) {
@@ -255,12 +266,7 @@ static void shake_restore(struct vidow_server *server) {
 	fx->animating = false;
 	fx->refresh_retry = 0;
 	wl_event_source_timer_update(fx->timer, 0);
-	if (fx->surface != NULL) {
-		vidow_cursor_set_client_surface(server, fx->surface, fx->hx, fx->hy);
-	} else {
-		wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr,
-			fx_cursor_name(fx));
-	}
+	restore_shown_cursor(server);
 	drop_images(fx);
 	wlr_log(WLR_DEBUG, "摇晃: 光标还原（%.2fx 收起）", fx->factor);
 	fx->factor = 1.0;
@@ -672,6 +678,83 @@ static void forget_surface(struct vidow_cursor_fx *fx) {
 	fx->surface = NULL;
 }
 
+/* 指针焦点那个表面是不是 Xwayland 的（X11 窗口）。判据和
+ * vidow_cursor_set_client_surface 里那条一样：看 surface 的 wl_client。
+ * 用来回答「现在这块 X11 窗口要求不画光标」—— 请求里 surface == NULL 时
+ * 看不出是谁发的，只能看指针焦点落在谁身上。 */
+static bool seat_over_x11(const struct vidow_server *server) {
+	if (server == NULL || server->seat == NULL ||
+			server->xwayland_server == NULL) {
+		return false;
+	}
+	struct wlr_surface *focused = server->seat->pointer_state.focused_surface;
+	if (focused == NULL) {
+		return false;
+	}
+	return wl_resource_get_client(focused->resource) ==
+		server->xwayland_server->client;
+}
+
+/* 「现在该显示的那张图」：客户端 surface > （X11 要求不画）> 主题形状。
+ * 三处还原（摇晃收摊 / 隐藏后显示回来 / 主题重建）共用这一份，别各写一套 ——
+ * 少一处就会在某个时机把箭头漏回游戏里。 */
+static void restore_shown_cursor(struct vidow_server *server) {
+	struct vidow_cursor_fx *fx = server->cursor_fx;
+	if (fx == NULL) {
+		return;
+	}
+	if (fx->surface != NULL) {
+		vidow_cursor_set_client_surface(server, fx->surface, fx->hx, fx->hy);
+		return;
+	}
+	if (fx->x11_none && seat_over_x11(server)) {
+		wlr_cursor_set_surface(server->cursor, NULL, 0, 0);
+		return;
+	}
+	wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr,
+		fx_cursor_name(fx));
+}
+
+/* 客户端 set_cursor 的内容变了：只有「Xwayland 要求不画」需要记，别的一律清掉
+ * （换回一张真实的光标图就说明它又想要光标了）。 */
+void vidow_cursor_fx_note_set_cursor(struct vidow_server *server, bool none) {
+	struct vidow_cursor_fx *fx = server->cursor_fx;
+	if (fx == NULL) {
+		return;
+	}
+	if (!none) {
+		fx->x11_none = false;
+		return;
+	}
+	fx->x11_none = seat_over_x11(server);
+}
+
+/* 指针进到一个表面上（input.c 的 notify_enter 之前调）。
+ *
+ * X11 客户端把光标藏起来之后（set_cursor(NULL)，游戏自己画准星），指针一离开
+ * 窗口，input.c 那条「底下没窗口 = 主题箭头」就把图换成箭头；再回到游戏里，
+ * Xwayland 认为光标没变、不会再发一次 NULL —— 游戏里就永远顶着 Wayland 箭头
+ * （用户报的「鼠标离开窗口就无法重新渲染游戏光标」）。
+ *
+ * 这里在每次 enter 时把「不画」补回去。放大中先收摊：底下那张本来就是「不画」，
+ * 留着一个放大的箭头在游戏里没有意义（也解释不了「缩回去时光标消失」那半截）。 */
+void vidow_cursor_fx_entered(struct vidow_server *server,
+		struct wlr_surface *surface) {
+	struct vidow_cursor_fx *fx = server->cursor_fx;
+	if (fx == NULL || fx->hidden || !fx->x11_none || surface == NULL ||
+			server->xwayland_server == NULL ||
+			wl_resource_get_client(surface->resource) !=
+				server->xwayland_server->client) {
+		return;
+	}
+	if (fx->active) {
+		shake_restore(server); /* 里面会按 x11_none 收成「不画」 */
+		return;
+	}
+	forget_surface(fx);
+	wlr_cursor_set_surface(server->cursor, NULL, 0, 0);
+}
+
 /* 客户端换了光标图（request_set_cursor）。放大中**不收摊**：新图由调用方设上
  * 去，紧接着调用方会调 vidow_cursor_fx_cursor_changed()，我们把新图重新放大
  * 一遍、倍数照旧。早先这里直接把放大整个收掉 —— 后果就是「晃大了光标，一切
@@ -730,12 +813,7 @@ void vidow_cursor_fx_set_hidden(struct vidow_server *server, bool hidden) {
 		cursor_refresh(server);
 		return;
 	}
-	if (fx->surface != NULL) {
-		vidow_cursor_set_client_surface(server, fx->surface, fx->hx, fx->hy);
-	} else {
-		wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr,
-			fx_cursor_name(fx));
-	}
+	restore_shown_cursor(server);
 }
 
 /* 把放大图的**源**换成「光标图当前那张」，并照现在的倍数重画一遍。
@@ -852,12 +930,7 @@ void vidow_cursor_fx_reapply(struct vidow_server *server) {
 	if (fx == NULL || fx->active || fx->hidden) {
 		return;
 	}
-	if (fx->surface != NULL) {
-		vidow_cursor_set_client_surface(server, fx->surface, fx->hx, fx->hy);
-	} else {
-		wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr,
-			fx_cursor_name(fx));
-	}
+	restore_shown_cursor(server);
 }
 
 void vidow_cursor_fx_json(struct jbuf *b, struct vidow_server *server) {
