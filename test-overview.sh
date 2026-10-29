@@ -11,7 +11,8 @@
 #      这里踩过一次：遮罩层建了两次跑到窗口上面去了）
 #   5) Esc 退出：日志 `overview: 退出`，画面**逐像素**回到进 overview 之前那张
 #   6) 点选：点某个窗口 → `overview: 选中 X` + 退出 + 焦点换成它（那一列被滚进视野）
-#   7) 两块屏时只看当前那块：另一块屏上的窗口淡出（那片区域不是 pattern 的颜色）
+#   7) 两块屏：**每块屏各摆自己的一份**（所有显示器一起进 overview），右屏的窗口
+#      缩在右屏上、左屏的缩在左屏上，溢出的列不画到隔壁屏（数图案像素）
 #   8) 退出不反弹：Esc 之后 t 单调从 1 降到 0（动画引擎的 t 永远 0→1，方向得由
 #      on 决定；以前直接把 t 当进度用，退出会把「进入」重放一遍再瞬间跳回去）
 #   9) 遮罩颜色可配（overview_dim_color）：默认压暗、alpha 0 = 不压暗、换色就染色，
@@ -37,11 +38,16 @@ mark() { echo; echo "== $1 =="; }
 
 cleanup() {
 	stop_clients
-	if [ -n "$VIDOW_PGID" ]; then
-		kill -TERM -- "-$VIDOW_PGID" 2>/dev/null
-		sleep 0.4
-		kill -KILL -- "-$VIDOW_PGID" 2>/dev/null
-	fi
+	# **每一段起过的都收**：以前只收最后那台（VIDOW_PGID），前面那些一直跑着 ——
+	# 实测一轮跑完留下 8 台 headless vidow 在同一个 XDG_RUNTIME_DIR 里空转，
+	# 既烧 CPU 把后面别的测试的时序搞抖，也要手动去杀。
+	for pid in $VIDOW_PIDS; do
+		kill -TERM -- "-$pid" 2>/dev/null
+	done
+	sleep 0.4
+	for pid in $VIDOW_PIDS; do
+		kill -KILL -- "-$pid" 2>/dev/null
+	done
 	rm -rf "$RUNDIR"
 }
 trap cleanup EXIT
@@ -79,6 +85,16 @@ export HOME="$CFGDIR" VIDOW_LOG=debug
 export DISPLAY= WAYLAND_DISPLAY=
 
 start_vidow() { # start_vidow <outputs>
+	# 上一段起的那台先收掉：段与段之间不是每处都写了 kill，漏一处前一台就一直
+	# 跑着（空转的 headless 合成器），后面时序敏感的判据跟着抖。
+	if [ -n "$VIDOW_PGID" ] && kill -0 "$VIDOW_PGID" 2>/dev/null; then
+		kill -TERM -- "-$VIDOW_PGID" 2>/dev/null
+		for _ in $(seq 1 20); do
+			kill -0 "$VIDOW_PGID" 2>/dev/null || break
+			sleep 0.1
+		done
+		kill -KILL -- "-$VIDOW_PGID" 2>/dev/null
+	fi
 	export WLR_HEADLESS_OUTPUTS=$1
 	rm -f "$LOG"
 	setsid ./build/vidow > "$LOG" 2>&1 &
@@ -372,7 +388,7 @@ kill -TERM -- "-$VIDOW_PGID" 2>/dev/null
 sleep 0.6
 
 # ---------------------------------------------------------------- 双屏
-mark "双屏：只缩当前那块屏，另一块的窗口淡出"
+mark "双屏：两块屏各缩自己的一块，互不重叠"
 start_vidow 2
 # 光标放左边那块屏 → 窗口开在那儿；然后把光标挪到右边，再开一个
 point_at 640 2560 720
@@ -650,18 +666,38 @@ if m and picked:
               "没选的列滚出画面了（还是那条带，没有重新排）")
 
 print()
-print("== 双屏 ==")
-m = re.search(r"overview: 进入（(\S+) 上 (\d+) 个窗口", two)
-check(m is not None, "进入 overview（只看当前那块屏 %s）" % (m.group(1) if m else "?"))
-m2 = re.search(r"overview: 窗口 (\S+) -> 屏幕 (-?\d+),(-?\d+) (\d+)x(\d+)", two)
-check(m2 is not None and m2.group(1).startswith("left"),
-      "只报了当前那块屏上的窗口：%s" % (m2.group(1) if m2 else "无"))
-check(re.search(r"overview: 窗口 right-1 -> ", two) is None,
-      "另一块屏上的窗口不进 overview 的清单")
+print("== 双屏：两块屏各进 overview ==")
+# 现在的模型：**每块屏各摆自己的一份**（overview_apply 对每个 output 各跑一次），
+# 每块屏报一次「进入」，各报自己那块屏上的窗口。以前是「只缩光标那块屏、别的屏
+# 上的窗口淡出」—— 那样非激活显示器上什么都看不到，用户 2026-10-25 报过。
+ins = re.findall(r"overview: 进入（(\S+) 上 (\d+) 个窗口", two)
+check(len(ins) >= 2, "两块屏各进一次 overview（%s）"
+      % " ".join("%s:%s" % (n, c) for n, c in ins))
+check(all(int(c) >= 1 for _, c in ins),
+      "每块屏都报了自己那块屏上的窗口（%s）"
+      % " ".join("%s:%s" % (n, c) for n, c in ins))
+# 哪块屏叫哪个名字由 wlroots 决定（HEADLESS-1 / -2 的顺序不可靠），所以按**坐标**
+# 认屏：左屏的窗口缩在 0..1280，右屏的在 1280..2560。
+def ov_rect(text, title):
+    mm = re.search(r"overview: 窗口 %s -> 屏幕 (-?\d+),(-?\d+) (\d+)x(\d+)"
+                   % re.escape(title), text)
+    return tuple(int(v) for v in mm.groups()) if mm else None
+
+m2 = ov_rect(two, "left-1")
+check(m2 is not None, "左屏上的窗口也报了位置（left-1）")
+if m2:
+    check(m2[0] + m2[2] <= 1280,
+          "左屏的窗口缩在左屏里（%d,%d %dx%d）" % m2)
+m3 = ov_rect(two, "right-1")
+check(m3 is not None, "右屏上的窗口也报了位置（right-1）")
+if m3:
+    check(m3[0] >= 1280,
+          "右屏的窗口缩在右屏里（%d,%d %dx%d）" % m3)
 
 im_two = image("two-overview")
 im_two_norm = image("two-normal")
-# 另一块屏的窗口在 normal 里是 pattern 的颜色，overview 里应该被淡掉（只剩壁纸/遮罩）
+# 另一块屏上的窗口在 normal 里是 pattern 的颜色，overview 里应该是**它自己那块屏
+# 上缩小的格子**（窗口在遮罩之上，颜色还是纯色）。
 def find_pattern(im, x0, x1):
     for y in range(120, 700, 7):
         for x in range(x0, x1, 7):
@@ -673,7 +709,10 @@ def find_pattern(im, x0, x1):
 right_before = find_pattern(im_two_norm, 1300, 2560)
 right_after = find_pattern(im_two, 1300, 2560)
 check(right_before is not None, "另一块屏上本来有窗口（%s）" % (right_before,))
-check(right_after is None, "overview 里另一块屏上的窗口淡出了（现在只剩壁纸）")
+check(right_after is not None,
+      "overview 里另一块屏上的窗口也画出来了（缩小的格子，%s）" % (right_after,))
+left_after = find_pattern(im_two, 0, 1280)
+check(left_after is not None, "左屏自己的窗口也画着（%s）" % (left_after,))
 
 print()
 print("== 退出不反弹 ==")
@@ -1088,19 +1127,24 @@ else
 	fail "退不出概览（active=$(ovfield active)）"
 fi
 # ---------------------------------------------------------------- overview 不跨屏
-mark "overview 不跨屏：开 overview 前后，隔壁屏的非背景像素不增加"
+mark "overview 不跨屏：溢出的列不画到隔壁屏上"
 # 用户：「overview 窗口太多会跨屏」。条带比屏宽的那些列本来就在行矩形外（场景没有
-# 裁剪节点，见 overview.c 里 row->rect_x 那段注释），不裁就画到隔壁显示器上 ——
-# 全景开在**左屏**（光标在哪块屏，全景锁哪块屏），溢出的列会落到右屏地界。
-# 亮像素数（任一通道 > 200）：预览里的图案是纯色高亮，壁纸 / 压暗遮罩都是暗的。
-# 不能按「非洋红」数 —— 右屏没铺壁纸（wall.py 只画光标那块屏），整屏都算「非背景」。
-bright() {
+# 裁剪节点，见 overview.c 里 row->rect_x 那段注释），不裁就画到隔壁显示器上。
+#
+# 判据不能用「亮像素」：全景现在**每块屏都压暗**（所有显示器一起进 overview），
+# 右屏壁纸的亮像素本来就会从 135168 掉到两万多 —— 那不是漏，是遮罩。
+# 该数的是**窗口图案的颜色**：pattern.py 画的是纯红 / 绿 / 蓝 / 白，右屏上一个窗口
+# 都没有，壁纸（渐变 + 金色块）压暗之后一个都撞不上。
+pattern_px() {
 	python3 - "$1" <<'PYNB'
 import sys
 from PIL import Image
 import numpy as np
 a = np.asarray(Image.open(sys.argv[1]).convert('RGB'), dtype=np.int16)
-print(int((a.max(axis=2) > 200).sum()))
+pat = np.zeros(a.shape[:2], dtype=bool)
+for c in ((255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 255)):
+    pat |= (a == np.array(c, dtype=np.int16)).all(axis=2)
+print(int(pat.sum()))
 PYNB
 }
 stop_clients
@@ -1129,16 +1173,15 @@ sleep 0.6
 if [ ! -s "$RUNDIR/ov-before.ppm" ] || [ ! -s "$RUNDIR/ov-after.ppm" ]; then
 	fail "截图是空的（before/after）"
 else
-	B=$(bright "$RUNDIR/ov-before.ppm")
-	A=$(bright "$RUNDIR/ov-after.ppm")
-	echo "  右屏亮像素：开全景前 $B → 开全景后 $A"
-	# 断言**完全相等**：右屏只该有壁纸，开全景不该动它一个像素。漏过去的
-	# 预览会把洋红换成别的颜色（计数涨）或盖住金色方块（计数跌）—— 两头都能
-	# 抓到；而压暗只是把洋红变暗洋红，计数不变。
-	if [ "$A" = "$B" ]; then
-		pass "overview 没往隔壁屏画东西（右屏 $B 个亮像素，前后一致）"
+	B=$(pattern_px "$RUNDIR/ov-before.ppm")
+	A=$(pattern_px "$RUNDIR/ov-after.ppm")
+	echo "  右屏的窗口图案像素：开全景前 $B → 开全景后 $A"
+	# 断言「一个图案像素都没有」：右屏上没有窗口，全景点亮的东西只能是漏过去的
+	# 预览（纯色图案）。壁纸 / 遮罩再怎么变也撞不上纯红绿蓝白。
+	if [ "$A" -le 0 ] && [ "$B" -le 0 ]; then
+		pass "overview 没往隔壁屏画窗口（右屏 $B → $A 个图案像素）"
 	else
-		fail "overview 漏到隔壁屏：右屏亮像素 $B → $A（差 $((A - B))）"
+		fail "overview 漏到隔壁屏：右屏图案像素 $B → $A"
 	fi
 fi
 stop_clients

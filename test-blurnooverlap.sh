@@ -68,7 +68,9 @@ CFG
 
 export XDG_RUNTIME_DIR="$RUNDIR/run"
 export WLR_BACKENDS=headless WLR_HEADLESS_OUTPUTS=1 WLR_LIBINPUT_NO_DEVICES=1
-export HOME="$CFGDIR" VIDOW_LOG=debug
+# VIDOW_BLUR_TRACE：`blur: own region …` 那行日志归它管（见 fx.c 的
+# blur_trace_on），不开的话下面「前提：A 真的建过私有区域底衬」永远读不到。
+export HOME="$CFGDIR" VIDOW_LOG=debug VIDOW_BLUR_TRACE=1
 export DISPLAY= WAYLAND_DISPLAY=
 
 mark "窗口不重叠时的模糊底衬，必须和「从没重叠过」时一致"
