@@ -801,9 +801,6 @@ struct vidow_decor_prog {
 		u_alpha;
 	int u_origin, u_output_size, u_flip_y;
 	int u_blur_scale, u_blur_bias;
-	/* 跨屏分段采样（见 fx.c 的 decor_fragment_src）：u_split 是分界在窗口内的 x，
-	 * 小于 0 表示不跨屏；u_origin2 / u_output_size2 是第二块屏那套坐标。 */
-	int u_split, u_origin2, u_output_size2;
 	int u_blur_strength;
 	int u_blur_region, u_blur_region_on;
 	/* 内容贴图在装饰矩形里的采样映射（见 fx.c 的 decor_fragment_src）。 */

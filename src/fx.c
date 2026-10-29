@@ -241,14 +241,8 @@ static const char *decor_fragment_src =
 	 * 也要按同一倍率展开，否则背景跟着窗口一起放大 / 回弹。 */
 	"uniform vec2 u_blur_scale;\n"
 	"uniform vec2 u_blur_bias;\n"
-	/* **跨屏**：窗口骑在两块屏中间时，这两半各自采自己那块屏的底衬。
-	 * u_split 是分界在**窗口内**的 x（像素，< 0 表示不跨屏，整窗用下面那组
-	 * u_origin2 / u_output_size2 就等同于上面那组）。
-	 * 窗口装饰是烘出来的一张图，上面只能烘死一套采样坐标；两块屏的原点差着
-	 * 一整屏，所以只能把两块屏的坐标**都**烘进去、按像素位置选。 */
-	"uniform float u_split;\n"
-	"uniform vec2 u_origin2;\n"
-	"uniform vec2 u_output_size2;\n"
+	/* 跨屏不在这里做：一次装饰渲染只认一张底衬贴图（见 decor_draw 的说明），
+	 * 两块屏各烘各的一份装饰缓冲、各裁到自己那块屏。 */
 	"uniform float u_flip_y;\n"
 	"uniform float u_blur_strength;\n"
 	/* ext-background-effect：客户端指定的模糊区域（窗口局部坐标）。
@@ -320,10 +314,7 @@ static const char *decor_fragment_src =
 	"		return;\n"
 	"	}\n"
 	"\n"
-	/* 跨屏：p.x 落在分界右边就用第二块屏那套坐标（见 u_split 的说明）。 */
-	"	vec2 borg = u_split > 0.0 && p.x >= u_split ? u_origin2 : u_origin;\n"
-	"	vec2 bsize = u_split > 0.0 && p.x >= u_split ? u_output_size2 : u_output_size;\n"
-	"	vec2 o = (borg - u_content_off + p * u_blur_scale + u_blur_bias) / bsize;\n"
+	"	vec2 o = (u_origin - u_content_off + p * u_blur_scale + u_blur_bias) / u_output_size;\n"
 	"	vec4 blurred = texture2D(u_blur, clamp(o, 0.0, 1.0));\n"
 	/* 元素自己的 alpha（「透明度剔除」）：模糊只画在元素真的有内容的地方 —— 透明
 	 * 内边距、圆角外面、弹窗自带的半透明阴影边都不再透出一圈模糊。窗口 / 弹窗那条
@@ -643,9 +634,6 @@ static void load_decor_program(struct vidow_server *server) {
 	LOC(u_output_size, "u_output_size");
 	LOC(u_blur_scale, "u_blur_scale");
 	LOC(u_blur_bias, "u_blur_bias");
-	LOC(u_split, "u_split");
-	LOC(u_origin2, "u_origin2");
-	LOC(u_output_size2, "u_output_size2");
 	LOC(u_flip_y, "u_flip_y");
 	LOC(u_blur_strength, "u_blur_strength");
 	LOC(u_blur_region, "u_blur_region");
@@ -2729,7 +2717,16 @@ static void blur_assign(struct vidow_fx_target *fx, struct wlr_output *out,
 	 * 窗口骑在两块屏中间时，两块屏的采样原点和区域都不一样，共用一份字段就是
 	 * 互相覆盖 —— 先渲染的那块屏拿到后渲染那块屏的坐标，屏幕上一半正常、一半
 	 * 被拉成横条。 */
-	struct vidow_blur_slot *slot = blur_slot_for(fx, out, true);
+	/* **只有真有「这次烘给哪块屏」上下文的目标才分格。**
+	 *
+	 * 格子是给窗口装饰用的：ensure_targets 按 bake_output 选缓冲，fx_blur_tex_now
+	 * 也按 bake_output 取贴图 —— 两边必须是同一个判据。layer 的底衬、overview
+	 * 那张糊壁纸、关闭快照这些路没有 bake_output（它们一次只用一份贴图），
+	 * 写成格子的话 fx_blur_tex_now 永远找不到它（查的是 bake_output 那一格），
+	 * 着色器拿不到贴图 → u_blur_strength 归零 → 整块画成全透明
+	 * （实测 overview_blur 开了和没开一个像素都不差）。 */
+	struct vidow_blur_slot *slot = fx->bake_output != NULL ?
+		blur_slot_for(fx, out, true) : NULL;
 	if (slot != NULL) {
 		if (slot->id == id && slot->rx == rx && slot->ry == ry &&
 				slot->rw == rw && slot->rh == rh &&
@@ -3247,25 +3244,22 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 				wlr_output_layout_get_box(server->output_layout,
 					instance->out, &output_clip);
 			}
-			/* **正在拖的窗口不裁到这块屏里。**
+			/* **每块屏只画自己那一半**（照 Hyprland 的 renderMonitor）。
 			 *
-			 * 拖拽期间窗口本来就该两块屏各画一半、拼起来是完整的（见
-			 * view.c 的 view_is_being_dragged：浮窗和平铺拖拽都算）。
-			 * 这里再裁到 output_clip，越界那半块就被切掉 —— 屏幕上就是
-			 * 「卡在屏交界处过不去」。
+			 * 装饰缓冲是按屏各一份的（slot->dec*），每份都用**那块屏自己**
+			 * 的模糊底衬烘好，所以这里的裁剪框必须是**这一格自己的屏框**，
+			 * 不是布局总框。
 			 *
-			 * 不裁的时候得有个边界：用布局总框（所有屏并起来），既不
-			 * 切掉任何一块，也不会让节点跑到无穷远。 */
-			bool dragging = fx->view != NULL &&
-				(fx->view->dragging || server->grab_view == fx->view) &&
-				server->grab_mode != VIDOW_GRAB_RESIZE &&
-				server->grab_mode != VIDOW_GRAB_RESIZE_TILE;
-			if (dragging) {
-				struct wlr_box all = {0};
-				wlr_output_layout_get_box(server->output_layout,
-					NULL, &all);
-				clip = all.width > 0 ? all : output_clip;
-			} else if (fx->clip_on) {
+			 * 用布局总框的话两份装饰会整窗重叠在同一个位置、只是倍率不同：
+			 * 最后画的那份把另一份盖住 —— 2x 屏上看到 1x 烘的图（放大糊），
+			 * 1x 屏上看到 2x 烘的图（缩下去倒是清楚）。两块屏轮流重烘时，
+			 * 盖在上面的那一份每帧换人，就是「高分辨率那块屏背景一直闪」。
+			 *
+			 * 拖拽中也一样：另一半由**对面那块屏**自己那份节点画（它裁在
+			 * 对面那块屏里），拼起来才是完整窗口。以前这条豁免是给「只有
+			 * 一份装饰缓冲」的旧模型留的，现在每屏一份，豁免反而把两份叠
+			 * 在一起。 */
+			if (fx->clip_on) {
 				struct wlr_box visible = {0};
 				wlr_box_intersection(&visible, &clip, &output_clip);
 				clip = visible;
@@ -4747,6 +4741,31 @@ static void view_bake_for_output(struct vidow_server *server,
 				!view->fx.active || view->fx.node == NULL) {
 			continue;
 		}
+		/* **overview 里没有「跨屏的另一半」。**
+		 *
+		 * 全景把每一行画成一块缩小版的屏，行本身就在窗口自己那块屏里；
+		 * 一份装饰缓冲就够了。更不能拿下面那个 vb（**布局坐标**的 geom）
+		 * 去判「跟这块屏相不相交」：overview 里节点画的是**行坐标**
+		 * （vidow_overview_map：行的 content_x/y + 局部 × scale），和布局
+		 * 里的 geom 差着视口 / 缩放。窗口在屏幕上明明还露着半块，vb 却落在
+		 * 屏外 —— 这一趟就把槽位节点关掉，窗口整个消失（用户报的
+		 * 「overview 的窗口超出一点显示器就消失」）。
+		 *
+		 * 归属那块屏的那一份由 vidow_view_apply_anim 每帧烘好、摆好
+		 * （overview_apply 对每个窗口都调一次），这里只把**别的屏上残留**
+		 * 的槽位收掉：进 overview 之前跨屏拖过的话，对面那格还停在老位置，
+		 * 不收就是一块残影。归属不明的（owner == NULL）别动 —— 收错了就是
+		 * 整块不画。 */
+		if (vidow_overview_active(server)) {
+			struct wlr_output *own = view_blur_owner(view);
+			struct vidow_blur_slot *sl = blur_slot_for(&view->fx,
+				output->wlr_output, false);
+			if (own != NULL && own != output->wlr_output &&
+					sl != NULL && sl->node != NULL) {
+				wlr_scene_node_set_enabled(&sl->node->node, false);
+			}
+			continue;
+		}
 		/* Output instances also need updating after release and during layout
 		 * animations; otherwise the non-owner half retains an old buffer. */
 		struct wlr_box vb = vidow_view_screen_box(view);
@@ -4875,10 +4894,6 @@ struct decor_geo {
 	float off_x, off_y;
 	float origin_x, origin_y;
 	float out_size_x, out_size_y;
-	/* 跨屏：窗口内分界（像素，< 0 = 不跨屏）和右边那半用的第二块屏坐标。 */
-	float split_x;
-	float origin2_x, origin2_y;
-	float out_size2_x, out_size2_y;
 	/* 内容那一项的乘子：屏幕那条路是 1，窗口抓帧那条路是 0（内容由场景节点
 	 * 画，这张图里只要底衬 / 画框，但剔除仍按内容 alpha 走）。 */
 	float content_alpha;
@@ -4985,20 +5000,14 @@ static bool decor_pass(struct vidow_server *server,
 	/* 底衬采样的映射：全部由调用方算好（屏幕那条路按窗口在输出上的位置算，
 	 * 窗口抓帧那条路按取景框算）—— 两边共用这一份 uniform，别在这儿现场读
 	 * 全局量（跨屏底衬采样的坑，见 server.h 的 blur_out_*）。 */
+	/* 跨屏没有「分界 / 第二套坐标」：一次渲染只采这一块屏的底衬，另一半由
+	 * 对面那块屏自己那份装饰缓冲画（见 vidow_fx_frame 的按屏裁剪）。 */
 	glUniform2f(d->u_origin, g->origin_x, g->origin_y);
 	glUniform2f(d->u_output_size, g->out_size_x, g->out_size_y);
 	float bsx = fx->blur_scale_x > 0.0f ? fx->blur_scale_x : 1.0f;
 	float bsy = fx->blur_scale_y > 0.0f ? fx->blur_scale_y : 1.0f;
 	glUniform2f(d->u_blur_scale, bsx, bsy);
 	glUniform2f(d->u_blur_bias, fx->blur_bias_x, fx->blur_bias_y);
-	/* 跨屏分段：不跨屏时 u_split = -1，着色器那一整段分支都不走。 */
-	glUniform1f(d->u_split, g->split_x > 0.0f ? g->split_x : -1.0f);
-	glUniform2f(d->u_origin2,
-		g->split_x > 0.0f ? g->origin2_x : g->origin_x,
-		g->split_x > 0.0f ? g->origin2_y : g->origin_y);
-	glUniform2f(d->u_output_size2,
-		g->split_x > 0.0f ? g->out_size2_x : g->out_size_x,
-		g->split_x > 0.0f ? g->out_size2_y : g->out_size_y);
 	glUniform1f(d->u_flip_y, cfg->shader_flip_y ? 1.0f : 0.0f);
 	/* 模糊那层要不要叠：除了「有贴图」（fx->blur_tex）和全局开关（fx->blur），
 	 * 还得看**这一次渲染自己的 look** —— 预览（缩略图）那一趟在
@@ -5087,63 +5096,27 @@ static bool decor_draw(struct vidow_server *server,
 		 * 只要两者不同时为 0 就看不出来，一旦某帧只设了其中一个，
 		 * V 方向的除数就成了 0 —— UV 恒定，「全是横条」。 */
 		.out_size_y = (float)(rg_h > 0 ? rg_h : out_h),
-		.split_x = -1.0f,
 		.content_alpha = 1.0f,
 	};
 
-	/* **跨屏：窗口两半各用自己那块屏的底衬。**
+	/* **跨屏两半各自采自己那块屏的底衬 —— 但不是在这一次渲染里。**
 	 *
-	 * 着色器那边早就写好了（u_split / u_origin2 / u_output_size2：p.x 越过
-	 * 分界就换第二套坐标），但 CPU 这边从来没给 split_x 赋过正值 —— 它一直
-	 * 停在下面那个 -1.0f，那一整段分支永远不走。窗口骑在两块屏中间时，整窗
-	 * 都拿**这一块屏**的底衬贴图去采样：另一半落在贴图区域外面，UV 被 clamp
-	 * 到边缘像素 —— 屏幕上就是「跨屏那一半背景不对」。
+	 * 这里曾经按「另一块屏的布局左边界」算一个分界，越过它就把 origin /
+	 * output_size 换成另一块屏那套。那套只有在**一张装饰图能同时拿到两块屏
+	 * 的底衬贴图**时才成立，而装饰着色器一次只绑一张 u_blur —— 换了坐标换
+	 * 不了贴图，右半边只是拿这一张贴图按另一块屏的原点 / 尺寸去采，UV 直接
+	 * 飞出区域，clamp 到边缘像素（「跨屏那一半是横条 / 整块糊」的来源）。
 	 *
-	 * 坐标口径（和 origin_x / 着色器第 303 行对齐）：
+	 * 现在跨屏是**每块屏各烘一份装饰缓冲**（view_bake_for_output + 每屏一个
+	 * vidow_blur_slot，各自带自己那块屏的私有模糊贴图），每份只画自己那块屏
+	 * 那一半（见 vidow_fx_frame 里按 instance->layout_box 的裁剪）。一次渲染
+	 * 只认一张底衬，采样坐标也就只需要这一组。
+	 *
+	 * 坐标口径：
 	 *   p          = 目标像素，原点在装饰缓冲左上角
 	 *   p.x        = off_x + (窗口内容左边 - ox) * scale   （off_x = px_pad）
-	 *   采样       = (borg - off + p * blur_scale + bias) / bsize
-	 * 所以分界 p.x = off_x + (另一屏布局左边界 - ox) * scale。
-	 * borg 同理：另一屏的设备像素原点 = 布局坐标 * 那一屏的倍率 - 那一屏原点。 */
-	if (bs != NULL && bs->out != NULL && fx->blur_slot != NULL) {
-		struct vidow_blur_slot *other = NULL;
-		for (struct vidow_blur_slot *it = fx->blur_slot; it != NULL;
-				it = it->next) {
-			if (it == bs || it->out == NULL || it->tex == NULL) {
-				continue;
-			}
-			if (it->layout_box.width <= 0 || it->layout_box.height <= 0) {
-				continue;
-			}
-			other = it;
-			break;
-		}
-		if (other != NULL) {
-			double osc = other->out->scale > 0.0 ?
-				other->out->scale : 1.0;
-			double split = (double)g.off_x +
-				((double)other->layout_box.x - (double)ox) * scale;
-			if (split > 0.0 && split < (double)dw2) {
-				g.split_x = (float)split;
-				g.origin2_x = (float)((int)lround((double)ox * osc) -
-					other->ox - other->rx);
-				g.origin2_y = (float)((int)lround((double)oy * osc) -
-					other->oy - other->ry);
-				g.out_size2_x = (float)(other->rw > 0 ?
-					other->rw : other->ow);
-				g.out_size2_y = (float)(other->rh > 0 ?
-					other->rh : other->oh);
-				if (span_trace_on()) {
-					wlr_log(WLR_INFO,
-						"split: 本屏 %s %dx%d@%d,%d 另一屏 %s "
-						"%dx%d@%d,%d 分界 %.0f/%d",
-						bs->out->name, out_w, out_h, out_x, out_y,
-						other->out->name, other->ow, other->oh,
-						other->ox, other->oy, split, dw2);
-				}
-			}
-		}
-	}
+	 *   采样       = (origin - off + p * blur_scale + bias) / out_size
+	 */
 
 	return decor_pass(server, fx, dst, &g, src, mask, border, alpha, scale, look,
 		false);
