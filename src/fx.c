@@ -2409,6 +2409,22 @@ static bool view_wants_blur(struct vidow_view *view) {
 		view_blur_visible(view);
 }
 
+/* 直通诊断：环境变量 VIDOW_SCANOUT_TRACE=1，或者 /tmp/vidow-scanout-trace 这个
+ * 文件出现（文件方式不用重启会话，见 xtrace.c 那一套）。开着的时候每秒给每个
+ * 窗口一行：判据卡在哪一项。游戏到底有没有直通扫屏，看这个就知道 —— 没直通
+ * 就是每帧一次整屏合成 + 一次装饰离屏渲染，那才是游戏里真正的浪费。 */
+static bool scanout_trace_on(void) {
+	static int64_t last_ns = 0;
+	static bool on = false;
+	int64_t now = vidow_now_ns();
+	if (last_ns == 0 || now - last_ns > 1000 * 1000000LL) {
+		last_ns = now;
+		on = getenv("VIDOW_SCANOUT_TRACE") != NULL ||
+			access("/tmp/vidow-scanout-trace", F_OK) == 0;
+	}
+	return on;
+}
+
 /* VIDOW_NO_SCANOUT=1：一律走合成那条路（探针，见 vidow_view_scanout_ok）。 */
 static bool scanout_off(void) {
 	static int off = -1;
@@ -2561,6 +2577,29 @@ bool vidow_view_scanout_ok(struct vidow_view *view) {
 	 * 但声明整块不透明）。后者 wlroots 判「这个节点盖住了下面的东西」用的也是它
 	 * （见 wlr_scene.c 的 scene_node_opaque_region）—— 它不认，直通也轮不到。 */
 	bool ok = view_content_opaque(view, &geo);
+	if (scanout_trace_on()) {
+		static int64_t last_ns = 0;
+		int64_t now = vidow_now_ns();
+		if (now - last_ns > 1000 * 1000000LL) {
+			last_ns = now;
+			wlr_log(WLR_INFO, "直通: %s -> %s | 全屏=%d mini=%d 停放=%d "
+				"overview=%d 动画=%d 果冻=%d 遮罩=%d shader=%d 裁剪=%d "
+				"look(r=%.1f bw=%.1f sr=%.1f noise=%.1f op=%.2f) "
+				"留白=%d,%d 几何=%dx%d 缓冲=%dx%d 输出=%s %dx%d 不透明=%d",
+				vidow_view_title(view) != NULL ? vidow_view_title(view) : "(无题)",
+				ok ? "直通" : "合成",
+				view->fullscreen, (int)view->mini, view->scene_parked,
+				vidow_overview_active(view->server),
+				view->anim_open != NULL || view->anim_move != NULL,
+				view->jelly != NULL, view->mask_opacity,
+				view->fx.shader != NULL, view->fx.clip_on,
+				look.corner_radius, look.border_width, look.shadow_radius,
+				look.noise, look.opacity, geo.off_x, geo.off_y,
+				geo.w, geo.h, src->buffer->width, src->buffer->height,
+				out->name != NULL ? out->name : "?",
+				out->width, out->height, ok);
+		}
+	}
 	if (vidow_xtrace_on()) {
 		wlr_log(WLR_INFO, "scanout: %s 结果=%d（走%s）clip_on=%d "
 			"look: r=%.1f bw=%.1f sr=%.1f noise=%.1f",
