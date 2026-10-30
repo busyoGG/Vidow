@@ -177,6 +177,8 @@ sources = files(
   'src/cursorfx.c',
   'src/capturemask.c',
   'src/layer.c',
+  'src/float-drag.c',
+  'src/float-mini.c',
   'src/float.c',
   'src/drag.c',
   'src/pointerconstraint.c',
