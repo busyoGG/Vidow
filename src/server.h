@@ -1651,6 +1651,13 @@ struct vidow_view {
 	int home_dx, home_dy;
 
 	struct wlr_box geom; /* last arranged geometry, layout coords */
+	/* debug 每窗口帧率叠层（debug_show_refresh，见 debugrate.c）：
+	 * 这个窗口过去一秒提交了多少帧（commit 率 —— 应用自己的渲染节奏）。 */
+	uint32_t dbg_frames;
+	int64_t dbg_window_ns;
+	double dbg_fps;
+	struct wlr_scene_buffer *dbg_node;
+	int dbg_buf_w, dbg_buf_h;
 	/* 最后已知的标题 / app_id（IPC 的 window-closed 事件要带它们，而客户端的
 	 * 字符串在销毁信号之后就没了）。map / 标题变化时刷新。 */
 	char last_title[128];

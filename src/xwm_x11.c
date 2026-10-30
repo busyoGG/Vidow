@@ -659,8 +659,14 @@ static void x11_handle_destroy(xcb_destroy_notify_event_t *e) {
 		if (s->view->x11 == s) {
 			s->view->x11 = NULL;
 		}
-		vidow_view_x11_gone(s->view);
+		struct vidow_view *dead = s->view;
 		s->view = NULL;
+		/* 先把表面 / 列 / fx 全摘干净（vidow_view_x11_gone 只摘这些、故意
+		 * 不销毁 view），再真正销毁 view 结构本身。DestroyNotify 是「这个
+		 * X 窗口不会回来了」，不是 unmap —— 少了这一步 view 会永远躺在
+		 * server->views 里（用户翻到的「windows 快八百个」）。 */
+		vidow_view_x11_gone(dead);
+		vidow_view_x11_destroy(dead);
 	}
 	wl_list_remove(&s->link);
 	wl_list_init(&s->link);

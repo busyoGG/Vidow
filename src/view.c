@@ -7100,11 +7100,22 @@ static void view_set_parent(struct wl_listener *listener, void *data) {
 	vidow_portal_view_parent(view);
 }
 
-static void view_destroy(struct wl_listener *listener, void *data) {
-	(void)data;
-	struct vidow_view *view = wl_container_of(listener, view, destroy);
+/* 销毁一个 view 的公共体（Wayland 的 destroy 信号、X11 的窗口永久销毁都走这里）。
+ *
+ * 只做「摘账 + 释放」，不读 listener —— 调用方保证 view 已经不再被任何客户端
+ * 信号引用（X11 那边 vidow_view_x11_gone 已把挂在 wl_surface 上的 map/unmap/
+ * commit 摘干净）。view 里的 .link 全部是 wl_list_init 成自环的（见 X11 创建
+ * 处），所以下面逐个 wl_list_remove 重复调用也安全。 */
+static void view_destroy_common(struct vidow_view *view) {
 	struct vidow_server *server = view->server;
 	struct wlr_output *output = view->output;
+
+	/* debug 每窗口帧率叠层是独立挂在 layer_overlay 上的，不随 scene_tree 走，
+	 * 得手动收掉，否则窗口没了还留个数字在屏上。 */
+	if (view->dbg_node != NULL) {
+		wlr_scene_node_destroy(&view->dbg_node->node);
+		view->dbg_node = NULL;
+	}
 
 	/* 悬停记录会变成悬空指针。 */
 	if (server->hovered_view == view) {
@@ -7239,6 +7250,32 @@ static void view_destroy(struct wl_listener *listener, void *data) {
 	} else {
 		vidow_arrange(server);
 	}
+}
+
+/* Wayland 的 destroy 信号入口。 */
+static void view_destroy(struct wl_listener *listener, void *data) {
+	(void)data;
+	struct vidow_view *view = wl_container_of(listener, view, destroy);
+	view_destroy_common(view);
+}
+
+/* X11 窗口**永久销毁**（DestroyNotify）时由 xwm 调用。
+ *
+ * X11 的 view 没有 wlroots destroy 信号可挂（窗口对象是 Vidow 自己的），所以
+ * 以前它永远不会被摘出 server->views、也从没 free —— 用户翻到的「state 里
+ * windows 快八百个、实际只有 7 个映射」就是这堆僵尸 view。X 窗口先 unmap
+ * 再重映射（同一 X id）走的是另一个入口（vidow_view_x11_gone，不销毁 view），
+ * 只有 DestroyNotify 才代表这个窗口不会回来了，才走这里。
+ *
+ * 调用前 xwm 已经做过 vidow_view_x11_gone（摘表面、摘列、清 fx），这里只负责
+ * 把 view 结构本身摘链释放。 */
+void vidow_view_x11_destroy(struct vidow_view *view) {
+	if (view == NULL) {
+		return;
+	}
+	/* 防御：还在被别处引用（录屏源 / 借焦点）就别硬释放 —— 那些路径自己
+	 * 会调 vidow_view_x11_gone 再回到这里。这里只处理「已经没表面」的。 */
+	view_destroy_common(view);
 }
 
 static void view_set_title(struct wl_listener *listener, void *data) {
@@ -8274,6 +8311,24 @@ void vidow_view_new_x11(struct vidow_x11_surface *xsurface) {
 	view->id = ++server->next_view_id;
 	wl_list_init(&view->ws_link);
 	wl_list_init(&view->capture_sources);
+	/* **X11 的 view 不走 wlroots 信号，大部分 .link 从来没 insert 过。**
+	 * calloc 出来全零（link.next / prev 都是 NULL），view_destroy() 会逐个
+	 * wl_list_remove() —— 对 NULL 节点解引用就崩。先把它们 init 成自环，
+	 * 既让 view_destroy() 能在「X 窗口永久销毁」时安全复用，也让「这个 link
+	 * 挂没挂东西」的判据统一（自环 = 空）。map/unmap/commit 三个真的会挂
+	 * （见 x11_attach_surface），另外 init。 */
+	wl_list_init(&view->set_title.link);
+	wl_list_init(&view->set_parent.link);
+	wl_list_init(&view->request_fullscreen.link);
+	wl_list_init(&view->request_maximize.link);
+	wl_list_init(&view->request_minimize.link);
+	wl_list_init(&view->surface_commit.link);
+	wl_list_init(&view->request_move.link);
+	wl_list_init(&view->request_resize.link);
+	wl_list_init(&view->destroy.link);
+	wl_list_init(&view->map.link);
+	wl_list_init(&view->unmap.link);
+	wl_list_init(&view->commit.link);
 
 	wl_list_insert(&server->views, &view->link);
 	vidow_portal_view_new(view);
