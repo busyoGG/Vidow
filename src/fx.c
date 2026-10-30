@@ -2404,9 +2404,72 @@ static bool view_blur_visible(struct vidow_view *view) {
 
 /* 这个窗口现在要不要采样模糊底衬。上面那份不看 fx 开没开 —— 全屏直通的判据要在
  * 「fx 已经被收掉」的时候也能问出答案（见 vidow_view_scanout_ok），所以分开。 */
+/* 被一个**内容不透明**的窗口整块盖住了吗（z 序在上、把它的框完全盖住）。
+ *
+ * 完全盖住 = 它的模糊一个像素都透不出来：装饰着色器只在内容 alpha < 1 的地方
+ * 采样底衬，而那些地方上面那个不透明的窗口挡着。最有用的现场是「全屏游戏盖住
+ * 底下一排浮窗」—— 以前那些窗口的私有底衬每帧照抓、kawase 照跑，重叠的 N 个
+ * 窗口各抓一份本来就是 O(n²)，这条把「根本看不见的那些」直接摘掉。
+ *
+ * 判据宁严：不透明 + 完全覆盖 + z 序在上，三条都成立才算。判错的代价是「本该
+ * 模糊的地方不糊」，拿不准一律当没被盖住。 */
+static struct vidow_view *view_from_scene_node(struct wlr_scene_node *node) {
+	if (node == NULL || node->data == NULL) {
+		return NULL;
+	}
+	struct vidow_view_tag *tag = node->data;
+	if (tag->magic != VIDOW_VIEW_TAG_MAGIC) {
+		return NULL;
+	}
+	return tag->view;
+}
+
+static bool view_fully_occluded(struct vidow_view *view) {
+	struct vidow_server *server = view->server;
+	if (!view->mapped || !view->placed || view->popup ||
+			view->scene_tree == NULL || view->mini != VIDOW_MINI_NONE) {
+		return false;
+	}
+	if (server->layer_toplevels == NULL) {
+		return false;
+	}
+	struct wlr_box mine = vidow_view_screen_box(view);
+	struct wlr_scene_node *n;
+	/* wlroots 的 children 是「先画在下、后画在上」（raise_to_top 是 append），
+	 * 所以倒着走就是从最上面往下：**碰到自己之前**走过的那些才在自己上层。
+	 * 碰到自己就停 —— 后面都是被自己挡住的，盖不盖住自己都看不见。 */
+	wl_list_for_each_reverse(n, &server->layer_toplevels->children, link) {
+		if (n == &view->scene_tree->node) {
+			break;
+		}
+		if (!n->enabled) {
+			continue;
+		}
+		struct vidow_view *o = view_from_scene_node(n);
+		if (o == NULL || !o->mapped || !o->placed ||
+				o->mini != VIDOW_MINI_NONE || o->anim_alpha < 1.0 ||
+				o->mask_opacity || o->jelly != NULL) {
+			continue;
+		}
+		struct wlr_box b = vidow_view_screen_box(o);
+		if (b.x > mine.x || b.y > mine.y ||
+				b.x + b.width < mine.x + mine.width ||
+				b.y + b.height < mine.y + mine.height) {
+			continue;
+		}
+		struct vidow_fx_geo geo = vidow_view_fx_geo(o);
+		if (view_content_opaque(o, &geo)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/* 这个窗口现在要不要采样模糊底衬。上面那份不看 fx 开没开 —— 全屏直通的判据要在
+ * 「fx 已经被收掉」的时候也能问出答案（见 vidow_view_scanout_ok），所以分开。 */
 static bool view_wants_blur(struct vidow_view *view) {
 	return view->fx.active && view_wants_blur_ever(view) &&
-		view_blur_visible(view);
+		view_blur_visible(view) && !view_fully_occluded(view);
 }
 
 /* 直通诊断：环境变量 VIDOW_SCANOUT_TRACE=1，或者 /tmp/vidow-scanout-trace 这个
