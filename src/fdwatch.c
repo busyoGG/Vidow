@@ -541,9 +541,12 @@ static int fd_watch_tick(void *data) {
 
 /* ------------------------------------------------------------- 节拍 */
 
-/* 多久扫一遍。16ms ≈ 60Hz：idle 唤醒的代价是「一拍内起来的活儿」，16ms 的粒度
- * 够快，又不至于空闲时每毫秒都醒一次。 */
-#define FDWATCH_INTERVAL_NS 16000000LL
+/* 多久扫一遍。原来 16ms（60Hz）—— 调试功能在真机常开（16-env.lua 的
+ * VIDOW_FD_WATCH=1）时白占 ~60 次/秒的空闲唤醒（实测空闲总唤醒 371/s，
+ * 它一家占 1/6）。这个 tick 的工作只是「看看有没有新东西可读」，250ms
+ * 的粒度对诊断足够（16-env.lua 注释里说的也是「每 3 秒数一次」的量级），
+ * 抓 IPC / 钩子的突发照样抓得住。 */
+#define FDWATCH_INTERVAL_NS 250000000LL
 
 void vidow_fdwatch_init(struct vidow_server *server) {
 	/* 全局指针：不用在每个回调的数据里各揣一份 server。进程里只有一个合成器。 */
