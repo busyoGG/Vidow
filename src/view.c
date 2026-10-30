@@ -3940,8 +3940,26 @@ static void output_arrange(struct vidow_server *server,
 			if (output->viewport_want_slide && target != viewport &&
 					server->config.window_move_ms > 0) {
 				output->viewport_want_slide = false;
+				/* **先摘掉 field，再 cancel。**
+				 *
+				 * vidow_anim_cancel() 在 tick 回调里（现在就是从
+				 * output_render → vidow_anim_tick 进来的）只标 cancelled、
+				 * 不调 done，所以"先 cancel 后置 NULL"在 tick 里是安全的；
+				 * 但这条路径随时可能从 tick 外面进来（arrange 也会被 IPC /
+				 * 输入事件直接调到），那时 cancel 会同步调 done，done 里
+				 * 又 arrange 一遍，重入的 arrange 看到 viewport_anim 还是
+				 * 非 NULL 就走"别覆盖"分支。摘 field 再 cancel 两头都对：
+				 * done 先看到 NULL，不会再回 arrange，cancel 那条也只是把
+				 * 这一帧剩下的活收掉。 */
+				struct vidow_anim *old = output->viewport_anim;
+				output->viewport_anim = NULL;
 				viewport_slide(server, output, viewport, target,
 					server->config.window_move_ms);
+				/* viewport_slide 已经起好新动画；这里一帧最多一行
+				 * INFO，看见"一串 tween"才用得上。 */
+				if (old != NULL) {
+					vidow_anim_cancel(old);
+				}
 				viewport = output->viewport_x;
 			} else {
 				output->viewport_want_slide = false;
