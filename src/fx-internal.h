@@ -82,6 +82,8 @@ void dmg_clear(struct vidow_dmg_set *set);
 void damage_bump(struct vidow_server *server, bool layers);
 bool blur_damage_hits(const struct vidow_fx_target *fx,
 	const struct wlr_box *region);
+/* VIDOW_DMG_WHY 探针：这一笔损伤是谁标的（ra = 调用点返回地址）。 */
+void dmg_why_probe(const char *what, const struct wlr_box *box, uintptr_t ra);
 
 /* ------------------------------------------------------------ 目标与模糊链 */
 
