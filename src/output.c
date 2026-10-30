@@ -627,15 +627,31 @@ static int output_watchdog_tick(void *data) {
 			pending += wl_list_length(&surface->current.frame_callback_list);
 		}
 	}
-	if (pending == 0) {
+	/* **补帧泵该管着的窗口也算「有人等」**，哪怕它此刻没挂 callback：
+	 * 滚出视口 / 藏起来的窗口靠补帧泵续命，而泵只在渲染里跑、跑完才上弦
+	 * —— 渲染链死过一次（watchdog 修过 2026-10-30 18:0x 那次）泵就再也
+	 * 不转，这些窗口的 callback 恰好是空的（客户端自己也在等）的话，上面
+	 * 的 pending 数出来是 0，这里就永远不管了。Element 停了 19 小时没人
+	 * 喂就是这么漏掉的。有这种窗口在，链子就得活着。 */
+	int parked_want = 0;
+	wl_list_for_each(view, &server->views, link) {
+		if (view->output == output->wlr_output && view->mapped &&
+				view->scene_parked && !view->popup &&
+				view->kind != VIDOW_VIEW_X11 &&
+				!vidow_mini_uses_snapshot(view)) {
+			parked_want++;
+		}
+	}
+	if (pending == 0 && parked_want == 0) {
 		return 1000; /* 没人等帧：静默待机是正常状态 */
 	}
 	wlr_log(WLR_INFO,
-		"watchdog: %s 已 %.1fs 没渲染，还有 %d 个 frame callback 在等 —— 强制排一帧",
+		"watchdog: %s 已 %.1fs 没渲染，还有 %d 个 frame callback 在等、"
+		"%d 个补帧窗口要喂 —— 强制排一帧",
 		output->wlr_output->name,
 		output->last_render_ns != 0 ?
 			(double)(now - output->last_render_ns) / 1e9 : -1.0,
-		pending);
+		pending, parked_want);
 	vidow_output_schedule_frame(server, output->wlr_output, "watchdog");
 	return 1000;
 }

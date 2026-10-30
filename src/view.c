@@ -2274,6 +2274,25 @@ void vidow_view_set_parked(struct vidow_view *view, bool park) {
 	 * 滚回来时同样排一帧（下面 park == false 那条也走这里），立刻恢复。 */
 	vidow_output_schedule_frame(view->server, view->output,
 		park ? "窗口滚出视口" : "窗口回到屏上");
+	if (!park && view->kind == VIDOW_VIEW_XDG &&
+			view->xdg_toplevel != NULL &&
+			vidow_view_configure_ready(view)) {
+		/* **滚回来补一发 configure，把睡死的 Electron 戳醒。**
+		 *
+		 * Chromium 按 frame callback 的节奏判断自己可不可见：滚出视口太久
+		 * 收不到 frame_done，它就认定自己被遮挡，**不再挂 callback** ——
+		 * 而合成器的所有喂帧路径（场景、补帧泵、兜底）都只喂「挂着
+		 * callback」的表面（ pump_surface 空列表直接跳过，帧回调协议本身
+		 * 也只能应答已挂的 callback），从此两边互等：它等一个不存在的
+		 * frame_done，我们等它交帧。用户 2026-10-31 02:0x 的 Element
+		 * 就是这个形态：快照里 frame_callbacks = 0、mapped/configured 全
+		 * 正常、滚回来就是画不动，只能杀掉重开。
+		 *
+		 * configure 是唯一的协议级唤醒手段：客户端收到 configure 会重新
+		 * 评估自己的状态、重画、重新挂上 callback —— 补帧链从此接得上。
+		 * 只在「滚回来」这一拍发一次，静止桌面零额外开销。 */
+		wlr_xdg_surface_schedule_configure(view->xdg_toplevel->base);
+	}
 wlr_log(WLR_DEBUG, "workspace: %s %s（%s）",
 		vidow_view_title(view) != NULL ? vidow_view_title(view) : "(无题)",
 		park ? "藏起（停到屏外）" : "显示",
