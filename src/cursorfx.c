@@ -133,6 +133,17 @@ struct vidow_cursor_fx {
 	 * 「鼠标离开窗口就无法重新渲染游戏光标」）。见
 	 * vidow_cursor_fx_entered。 */
 	bool x11_none;
+	/* **Xwayland 客户端最后一次的光标请求**（surface 可为 NULL = 不画）。
+	 *
+	 * 为什么单独记一份：x11_none 以前是全局 bool，指针从游戏移到**任何**
+	 * Wayland 窗口上，那个窗口的 set_cursor(真图) 都会把它清掉 —— 回到
+	 * 游戏时补回逻辑看到 false 直接跳过，游戏里就顶着别家的光标（用户
+	 * 2026-10-30：「移出去再回来会是 Wayland 光标」）。改成只有 Xwayland
+	 * 自己的请求能改这份账：别家的 set_cursor 碰不到它，回进 X11 窗口时
+	 * 照它补回（surface NULL = 补「不画」，非 NULL = 补那张图）。 */
+	struct wlr_surface *x11_last_surface;
+	int32_t x11_last_hx, x11_last_hy;
+	struct wl_listener x11_surface_destroy;
 };
 
 static void shake_count_flip(struct vidow_cursor_fx *fx, int64_t now);
@@ -711,48 +722,87 @@ static void restore_shown_cursor(struct vidow_server *server) {
 		wlr_cursor_set_surface(server->cursor, NULL, 0, 0);
 		return;
 	}
+	if (fx->x11_last_surface != NULL && seat_over_x11(server)) {
+		/* 指针在某个 X11 窗口上、而 fx->surface 是别家（Wayland 窗口）的：
+		 * 补回 Xwayland 自己要的那张 —— 摇晃收尾 / 隐藏恢复落到 X11 窗口
+		 * 上时，别把上一家的图带进游戏里。 */
+		vidow_cursor_set_client_surface(server, fx->x11_last_surface,
+			fx->x11_last_hx, fx->x11_last_hy);
+		return;
+	}
 	wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr,
 		fx_cursor_name(fx));
 }
 
-/* 客户端 set_cursor 的内容变了：只有「Xwayland 要求不画」需要记，别的一律清掉
- * （换回一张真实的光标图就说明它又想要光标了）。 */
-void vidow_cursor_fx_note_set_cursor(struct vidow_server *server, bool none) {
+/* Xwayland 记账里那份 surface 销毁了：清账（悬空指针不能留），「不画」的
+ * 请求也一并作废 —— 那扇窗口都没了，补回没有意义。 */
+static void x11_cursor_gone(struct wl_listener *listener, void *data) {
+	(void)data;
+	struct vidow_cursor_fx *fx =
+		wl_container_of(listener, fx, x11_surface_destroy);
+	wl_list_remove(&fx->x11_surface_destroy.link);
+	wl_list_init(&fx->x11_surface_destroy.link);
+	fx->x11_last_surface = NULL;
+	fx->x11_none = false;
+}
+
+/* Xwayland 客户端发来 set_cursor（input.c 的 server_request_cursor，只把
+ * **来自 Xwayland** 的请求交进来 —— 别家窗口的请求碰不到这份账，见字段
+ * 说明）。surface NULL = 游戏要自己画准星。 */
+void vidow_cursor_fx_note_x11_cursor(struct vidow_server *server,
+		struct wlr_surface *surface, int32_t hx, int32_t hy) {
 	struct vidow_cursor_fx *fx = server->cursor_fx;
 	if (fx == NULL) {
 		return;
 	}
-	if (!none) {
-		fx->x11_none = false;
-		return;
+	if (fx->x11_last_surface != NULL) {
+		wl_list_remove(&fx->x11_surface_destroy.link);
+		wl_list_init(&fx->x11_surface_destroy.link);
 	}
-	fx->x11_none = seat_over_x11(server);
+	fx->x11_last_surface = surface;
+	fx->x11_last_hx = hx;
+	fx->x11_last_hy = hy;
+	fx->x11_none = surface == NULL;
+	if (surface != NULL) {
+		fx->x11_surface_destroy.notify = x11_cursor_gone;
+		wl_signal_add(&surface->events.destroy, &fx->x11_surface_destroy);
+	}
 }
 
 /* 指针进到一个表面上（input.c 的 notify_enter 之前调）。
  *
  * X11 客户端把光标藏起来之后（set_cursor(NULL)，游戏自己画准星），指针一离开
  * 窗口，input.c 那条「底下没窗口 = 主题箭头」就把图换成箭头；再回到游戏里，
- * Xwayland 认为光标没变、不会再发一次 NULL —— 游戏里就永远顶着 Wayland 箭头
- * （用户报的「鼠标离开窗口就无法重新渲染游戏光标」）。
+ * Xwayland 认为光标没变、不会再发一次请求 —— 游戏里就永远顶着别家的光标
+ * （用户报的「鼠标离开窗口就无法重新渲染游戏光标」「移出去再回来会是
+ * Wayland 光标」）。
  *
- * 这里在每次 enter 时把「不画」补回去。放大中先收摊：底下那张本来就是「不画」，
- * 留着一个放大的箭头在游戏里没有意义（也解释不了「缩回去时光标消失」那半截）。 */
+ * 这里在每次 enter 一个 X11 表面时把 Xwayland 自己最后一次的请求补回去
+ * （x11_last_surface，NULL = 补「不画」）。放大中先收摊：底下那张本来就是
+ * X11 要的状态，留着一个放大的别家箭头在游戏里没有意义。 */
 void vidow_cursor_fx_entered(struct vidow_server *server,
 		struct wlr_surface *surface) {
 	struct vidow_cursor_fx *fx = server->cursor_fx;
-	if (fx == NULL || fx->hidden || !fx->x11_none || surface == NULL ||
+	if (fx == NULL || fx->hidden || surface == NULL ||
 			server->xwayland_server == NULL ||
 			wl_resource_get_client(surface->resource) !=
 				server->xwayland_server->client) {
 		return;
 	}
 	if (fx->active) {
-		shake_restore(server); /* 里面会按 x11_none 收成「不画」 */
+		shake_restore(server); /* 里面会按 X11 的账收成该有的状态 */
 		return;
 	}
-	forget_surface(fx);
-	wlr_cursor_set_surface(server->cursor, NULL, 0, 0);
+	if (fx->x11_none) {
+		forget_surface(fx);
+		wlr_cursor_set_surface(server->cursor, NULL, 0, 0);
+		return;
+	}
+	if (fx->x11_last_surface != NULL) {
+		forget_surface(fx);
+		vidow_cursor_set_client_surface(server, fx->x11_last_surface,
+			fx->x11_last_hx, fx->x11_last_hy);
+	}
 }
 
 /* 客户端换了光标图（request_set_cursor）。放大中**不收摊**：新图由调用方设上
@@ -978,6 +1028,7 @@ void vidow_cursor_fx_init(struct vidow_server *server) {
 	}
 	wl_list_init(&fx->surface_destroy.link);
 	wl_list_init(&fx->surface_commit.link);
+	wl_list_init(&fx->x11_surface_destroy.link);
 	fx->server = server;
 	fx->last_x = server->cursor->x;
 	fx->last_y = server->cursor->y;

@@ -2796,7 +2796,14 @@ static void server_request_cursor(struct wl_listener *listener, void *data) {
 	}
 	/* 先告诉摇晃放大「光标图要换了」，再设上去，最后让它把新图重新放大一遍
 	 * —— 放大期间客户端换光标（焦点切到别的窗口就会）不再把放大缩回去。 */
-	vidow_cursor_fx_note_set_cursor(server, event->surface == NULL);
+	/* 只把**来自 Xwayland** 的请求记进 X11 光标账：别家（Wayland 窗口）的
+	 * set_cursor 不许冲掉它 —— 冲掉了，回到游戏时就补不回「游戏要的那张 /
+	 * 不画」（用户 2026-10-30：「移出去再回来会是 Wayland 光标」）。 */
+	if (server->xwayland_server != NULL && event->seat_client->client ==
+			server->xwayland_server->client) {
+		vidow_cursor_fx_note_x11_cursor(server, event->surface,
+			event->hotspot_x, event->hotspot_y);
+	}
 	vidow_cursor_fx_set_surface(server, event->surface, event->hotspot_x,
 		event->hotspot_y);
 	vidow_cursor_set_client_surface(server, event->surface, event->hotspot_x,
