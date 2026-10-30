@@ -3162,6 +3162,19 @@ struct vidow_server {
 	 * 焦点只在这一格「从别的窗口换过来」时才跟着走 —— 键盘刚把焦点切走、指针
 	 * 还停在同一窗口里的时候，挪一下鼠标不该把焦点抢回来。 */
 	struct vidow_view *hovered_view;
+	/* 全屏窗口拿着焦点时，悬停聚焦的「放行阀」（input.c 的
+	 * focus_follows_mouse）。
+	 *
+	 * 为什么需要：全屏游戏周期性释放指针约束，光标会被弹回它记住的位置 ——
+	 * 那里往往压着另一块屏的窗口，悬停把焦点抢走，游戏丢键盘、XWayland
+	 * 重开 autorepeat，按着的 A/W 开始各自重复（角色原地抖动，
+	 * 2026-10-2x 实测 2.5 秒一轮）。所以「光标还没回到游戏窗口上」时
+	 * 悬停不跟。
+	 *
+	 * 放行规则：光标压在焦点窗口（游戏）上就置 true；约束激活置 true；
+	 * 约束解除 / 销毁置 false。没玩过指针约束的全屏窗口（视频、演示）
+	 * 从头就是 true，悬停照常。 */
+	bool fullscreen_hover_armed;
 	struct vidow_view *focused;
 	/* 辅助窗口（wl-clipboard 那种 1x1）**借走键盘之前**，焦点在哪个窗口上。
 	 *

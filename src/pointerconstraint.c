@@ -162,6 +162,9 @@ static void handle_constraint_destroy(struct wl_listener *listener, void *data) 
 			&server->active_constraint->current);
 	}
 	constraint_clear(server);
+	/* 同 constraint_deactivate：约束没了，悬停聚焦关上（光标马上要被
+	 * 弹回去，防那一跳把焦点抢走）。 */
+	server->fullscreen_hover_armed = false;
 	wlr_log(WLR_INFO, "指针约束: 客户端销毁了约束，光标恢复");
 }
 
@@ -194,6 +197,10 @@ static void constraint_deactivate(struct vidow_server *server) {
 		apply_cursor_hint(server, c, &c->current);
 	}
 	constraint_clear(server);
+	/* 约束没了：光标下一刻会被弹回它记住的位置（cursor_hint / confine 收尾），
+	 * 那里往往压着别的窗口 —— 悬停聚焦关上，等光标回到游戏窗口上再放行
+	 * （input.c 的 focus_follows_mouse）。 */
+	server->fullscreen_hover_armed = false;
 	/* 这一句可能当场把约束销毁（oneshot 的 lifetime）—— 监听已经摘干净了。 */
 	wlr_pointer_constraint_v1_send_deactivated(c);
 	wlr_log(WLR_INFO, "指针约束: %s 解除", locked ? "锁定" : "夹住");
@@ -202,6 +209,9 @@ static void constraint_deactivate(struct vidow_server *server) {
 static void constraint_activate(struct vidow_server *server,
 		struct wlr_pointer_constraint_v1 *c) {
 	server->active_constraint = c;
+	/* 游戏锁上鼠标了：悬停聚焦放行（光标被夹在游戏里本来就出不去；
+	 * 解除的那一刻会重新关上，见 constraint_deactivate）。 */
+	server->fullscreen_hover_armed = true;
 	server->pointer_lock_x = server->cursor->x;
 	server->pointer_lock_y = server->cursor->y;
 	constraint_region_update(server);

@@ -748,6 +748,9 @@ int main(int argc, char *argv[]) {
 	wlr_log_init(log_level_from_env(), NULL);
 
 	struct vidow_server server = {0};
+	/* 悬停聚焦的全屏放行阀（server.h 字段说明）：默认放行 —— 没玩过指针
+	 * 约束的全屏窗口（视频 / 演示）悬停照常；约束的激活 / 解除会改它。 */
+	server.fullscreen_hover_armed = true;
 	wl_list_init(&server.outputs);
 	wl_list_init(&server.views);
 	wl_list_init(&server.popup_scenes);
