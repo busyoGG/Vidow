@@ -2393,6 +2393,13 @@ struct vidow_clip_fetch {
 	bool incr;
 	xcb_atom_t property;   /* 当前取数用的属性名 */
 	uint64_t started_ms;   /* 兜底超时用 */
+	/* 当前在等的 target（convert_selection 刚发的那个）。X11 的回复不排队
+	 * 对号：一个迟到 / 重复的 SelectionNotify（比如上一次复制在途的
+	 * chromium/x-source-url，那里面是 app:// 链接）落进来，字节就会追加进
+	 * 这一次**别的**类型的条目里 —— 用户 2026-10-30 报的「复制出
+	 * 『app://…链接 + 我复制的内容』拼在一起」就是这么来的。回复对不上
+	 * 这个 atom 就当野的丢掉。 */
+	xcb_atom_t expect_atom;
 };
 
 /* 一次「我们 -> X11」的应答（对某个 SelectionRequest）。数据没取全时先挂着

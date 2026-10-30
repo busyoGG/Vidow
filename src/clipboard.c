@@ -919,6 +919,7 @@ static void sel_tick_arm(struct vidow_clip_selection *sel) {
 static void fetch_reset(struct vidow_clip_selection *sel) {
 	sel->fetch.active = false;
 	sel->fetch.next = -1;
+	sel->fetch.expect_atom = XCB_ATOM_NONE;
 	free(sel->fetch.targets);
 	sel->fetch.targets = NULL;
 	sel->fetch.ntargets = 0;
@@ -934,6 +935,7 @@ static void fetch_next(struct vidow_clip_selection *sel) {
 			continue;
 		}
 		sel->fetch.incr = false;
+		sel->fetch.expect_atom = m->atom;
 		xcb_convert_selection(clip->conn, clip->window, sel->atom, m->atom,
 			sel->property, sel->timestamp);
 		xcb_flush(clip->conn);
@@ -978,6 +980,8 @@ static void fetch_start(struct vidow_clip_selection *sel, xcb_timestamp_t time) 
 	sel->fetch.active = true;
 	sel->fetch.next = -1;
 	sel->fetch.incr = false;
+	/* 在等 TARGETS 这一份 */
+	sel->fetch.expect_atom = clip->atom_targets;
 	sel->fetch.started_ms = now_ms();
 	wlr_log(WLR_DEBUG, "剪贴板: 向 X11 要 %s 的 TARGETS（requestor=%u "
 		"selection=%u target=%u property=%u time=%u）", sel->name,
@@ -1035,6 +1039,15 @@ static void fetch_data(struct vidow_clip_selection *sel,
 		m = &sel->staging[sel->fetch.next];
 	}
 	if (m == NULL) {
+		return;
+	}
+
+	if (!is_property_notify && m->complete) {
+		/* 这个 target 已经收完一份完整数据，又来一份完整回复：重复（owner
+		 * 答了两遍 / 队列里剩的旧回复），追加就是把两份内容拼在一起 ——
+		 * 丢掉。 */
+		wlr_log(WLR_INFO, "剪贴板: %s 的 %s 重复回复，丢掉后到的", sel->name,
+			m->mime);
 		return;
 	}
 
@@ -1383,6 +1396,8 @@ static bool event_is_ours(struct vidow_clipboard *clip, xcb_generic_event_t *eve
 				clip->server->config.clipboard_primary) {
 			sel = &clip->primary;
 		}
+		/* 野回复的甄别在 x11_event 的取数分支里做（那里有日志和丢包），
+		 * 这里只按 selection 路由。 */
 		break;
 	}
 	case XCB_PROPERTY_NOTIFY: {
@@ -1459,6 +1474,17 @@ static bool x11_event(void *data, xcb_generic_event_t *event) {
 	case XCB_SELECTION_NOTIFY: {
 		xcb_selection_notify_event_t *ev =
 			(xcb_selection_notify_event_t *)event;
+		if (ev->requestor == clip->window && sel->fetch.active &&
+				ev->target != sel->fetch.expect_atom) {
+			/* 野回复：上一次复制在途的 convert 现在才应答（典型：
+			 * chromium/x-source-url，那里面是 app:// 链接）。它的字节要是
+			 * 落进这一次的 staging，就是「链接拼着我复制的内容」一起粘
+			 * 出去（用户 2026-10-30 报的那个多余前缀）。直接丢。 */
+			wlr_log(WLR_INFO, "剪贴板: %s 丢一份野回复（target 对不上：等 %u "
+				"来了 %u）", sel->name,
+				(unsigned)sel->fetch.expect_atom, (unsigned)ev->target);
+			return true;
+		}
 		if (ev->property == XCB_ATOM_NONE) {
 			wlr_log(WLR_INFO, "剪贴板: %s 从 X11 取数失败（convert 被拒）",
 				sel->name);
@@ -1486,6 +1512,13 @@ static bool x11_event(void *data, xcb_generic_event_t *event) {
 		xcb_property_notify_event_t *ev = (xcb_property_notify_event_t *)event;
 		if (ev->window == clip->window) {
 			if (!sel->fetch.active) {
+				return true;
+			}
+			if (!sel->fetch.incr) {
+				/* 非 INCR 阶段的属性通知不是取数的数据：正常流程是 owner
+				 * 写好属性再发 SelectionNotify，数据在那一趟读。野的往里
+				 * 拼就是又一个「多余前缀」的来源（上一次 INCR 的尾巴掉进
+				 * 这一次的新条目）。 */
 				return true;
 			}
 			xcb_get_property_reply_t *reply =
