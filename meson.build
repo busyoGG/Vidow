@@ -192,6 +192,7 @@ sources = files(
   'src/mru.c',
   'src/anim.c',
   'src/fx.c',
+  'src/view-access.c',
   'src/fx-closing.c',
   'src/fx-dmg.c',
   'src/fx-gl.c',
