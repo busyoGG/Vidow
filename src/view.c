@@ -3557,6 +3557,22 @@ static void viewport_slide(struct vidow_server *server,
 	if (output == NULL) {
 		return;
 	}
+	/* **改道就重起一条：从当前位置出发，时长给足 ms。**
+	 *
+	 * 这里先后试过两版「不重起、接着跑」，都不可行：
+	 *   1. 只换目标、反解起点保位置连续 —— e(t0) 接近 1 时 (1-e(t0))→0，
+	 *      反解出的起点炸成几万像素，视口**飞出屏幕**；
+	 *   2. 按「距离 / 时长」估速度，把剩余距离折算成时间加到总时长上 ——
+	 *      估速用的是整段平均速度，改道后该段变短、速度被低估，而时长
+	 *      只许变长，连按几次就累加成几十秒，观感是「快速滚动**极慢**」。
+	 *
+	 * 现在回到可预测的语义：每次改道 = 一条**完整时长**的新动画，起点是
+	 * 当前位置（调用方传进来的 from 就是 output->viewport_x），所以位置
+	 * 不跳、时长不累积、速度恒定。
+	 *
+	 * 代价：快速连按时每小段都从 t=0 起步（停在曲线加速段），过冲幅度按
+	 * 该段距离算，比单次慢速切要小。这是「幅度」与「可预测」之间的取舍，
+	 * 这里选后者 —— 极慢和飞出屏幕是故障，幅度偏小只是观感。 */
 	if (output->viewport_anim != NULL) {
 		vidow_anim_cancel(output->viewport_anim);
 		output->viewport_anim = NULL;
@@ -3570,13 +3586,26 @@ static void viewport_slide(struct vidow_server *server,
 		output->viewport_x = to;
 		return;
 	}
+	/* 曲线跟着配置走（`viewport_easing`），默认是弹簧。
+	 *
+	 * 弹簧和固定时长曲线的差别是根本性的：它的时长 T = −ln(ε)/β 由包络
+	 * 衰减决定，**与距离无关** —— 走 100px 和走 3000px 是同一条曲线、同一个
+	 * 时长；而 out_back 时长固定、过冲幅度按距离算，距离一短回弹就看不见
+	 * （用户报「快速切换的幅度不如慢速」），拉长时长又会变成「快速滚动极慢」。
+	 *
+	 * 换成固定时长的曲线（out_back / bezier / linear…）时，时长仍取
+	 * window_move_ms —— 也就是回到老行为，配置说了算。 */
+	struct vidow_ease curve = server->config.viewport_easing;
+	int dur = vidow_ease_duration_ms(&curve);
+	if (dur <= 0) {
+		dur = ms;
+	}
 	a->server = server;
 	a->output = output;
 	output->viewport_anim_from = from;
 	output->viewport_anim_to = to;
-	output->viewport_anim = vidow_anim_start(server, "视口滚动", ms,
-		server->config.window_move_easing, viewport_anim_update,
-		viewport_anim_done, a);
+	output->viewport_anim = vidow_anim_start(server, "视口滚动", dur, curve,
+		viewport_anim_update, viewport_anim_done, a);
 	if (output->viewport_anim == NULL) {
 		output->viewport_x = to;
 		free(a);
@@ -3585,8 +3614,10 @@ static void viewport_slide(struct vidow_server *server,
 	/* INFO 级：这条一帧最多打一行，而「滚动被打断成一段一段」这种问题只有
 	 * 看见「一次预期 → 一串 tween」才能判断。用户报「每滚到一个窗口回弹一次」
 	 * 时就是靠它定位的。 */
-	wlr_log(WLR_INFO, "viewport tween: %.0f -> %.0f（%dms，want_slide=%d）",
-		from, to, ms, (int)output->viewport_want_slide);
+	wlr_log(WLR_INFO, "viewport tween: %.0f -> %.0f（%dms，%s，want_slide=%d）",
+		from, to, dur,
+		curve.kind == VIDOW_EASE_SPRING ? "弹簧" : "定时长",
+		(int)output->viewport_want_slide);
 }
 
 static bool viewport_sliding(struct vidow_server *server,
@@ -3657,13 +3688,23 @@ static void output_arrange(struct vidow_server *server,
 	}
 	int total_width = cursor > 0 ? cursor - inner : 0;
 
-	/* 切工作区的过渡里先把这条视口滚动掐掉：新工作区要整块滑进来，视口这时
-	 * 还在自己滚的话，窗口会跟着它横着飘一段 —— 又变成「窗口自己动」。
-	 * 必须在 Pass 2 读视口**之前**做，不然这一帧先按滚动中的视口摆了一次。 */
-	if (server->workspace_slide_n > 0 && output->viewport_anim != NULL) {
-		vidow_anim_cancel(output->viewport_anim);
-		output->viewport_anim = NULL;
-	}
+	/* **视口滚动归谁管：切工作区那条过渡开始时清一次，之后不再掐。**
+	 *
+	 * 以前这里是每帧无条件掐掉：只要 workspace_slide_n > 0，正在跑的视口滚动
+	 * 就取消。用意是「新工作区要整块滑进来，视口还在自己滚的话窗口会横着飘
+	 * 一段」—— 那个顾虑只在**滑动开始那一帧**成立（视口里还留着切工作区之前
+	 * 那次聚焦的残留滚动）。
+	 *
+	 * 但无条件掐的代价是：**滑动期间切窗口焦点，横向过渡动画完全消失**。
+	 * 焦点换列要横向滚动 → viewport_want_slide 置位 → viewport_slide() 刚起
+	 * 一条动画，下一帧走到这儿就被掐掉；同时 view_anim_place 的
+	 * `workspace_slide_n > 0` 分支又把窗口位移补间清零。两条叠加 = 窗口直接
+	 * 瞬移到终点（用户 2026-10-29：「切换工作区动画没结束的时候进行窗口焦点
+	 * 切换，会失去几乎失去窗口过渡动画」）。
+	 *
+	 * 现在改成：残留滚动在 slide_start 里清一次（见 workspace.c），这里不再
+	 * 干预。滑动期间新起的视口滚动照常跑 —— 纵向归 slide_y、横向归视口，
+	 * 两者本来就不冲突。 */
 
 	/* Pass 2: scroll the minimum amount that makes the focused column fully
 	 * visible. Focus moves, the view follows. */

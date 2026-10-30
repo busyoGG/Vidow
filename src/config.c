@@ -257,6 +257,9 @@ static const struct entry entries[] = {
 		"切工作区的缓动曲线（默认 out_cubic；out_back 会回弹）" },
 	{ "window_move_easing", K_EASING, OFF(window_move_easing), SZ(window_move_easing), 3,
 		"普通布局重排的位移补间曲线（默认 out_cubic；out_back 会回弹）" },
+	{ "viewport_easing", K_EASING, OFF(viewport_easing), SZ(viewport_easing), 3,
+		"视口横向滚动（换焦点列）的曲线（默认 \"spring 0.6 800\"；"
+		"弹簧的时长与距离无关，快慢节奏一致）" },
 	{ "layer_open_ms",   K_INT,    OFF(layer_open_ms),   SZ(layer_open_ms), 3,
 		"layer-shell（状态栏、通知、挂件）出现的动画时长" },
 	{ "layer_close_ms",  K_INT,    OFF(layer_close_ms),  SZ(layer_close_ms), 3,
@@ -1195,6 +1198,50 @@ static bool parse_easing(const char *value, struct vidow_ease *out) {
 		return true;
 	}
 
+	/* spring（阻尼谐振子）：`spring <damping_ratio> <stiffness> [epsilon]`。
+	 * 和别的曲线最根本的区别是**时长与距离无关**（T = −ln(ε)/β），所以
+	 * 快速连按和单次慢速的节奏一致 —— 视口横向滚动的默认值就是它。
+	 * 只写名字不合法：参数全 0 时 β = 0，弹簧永远收敛不了（ease() 会退回
+	 * 线性），那是静默的错误行为，不如当场报错。 */
+	if (head_len == 6 && strncmp(head, "spring", 6) == 0) {
+		double ratio = 0.0, stiffness = 0.0, eps = 0.0001;
+		if (!parse_number(&p, &ratio) || !parse_number(&p, &stiffness)) {
+			wlr_log(WLR_ERROR, "config: easing '%s' 不对：spring 至少要两个数"
+				"（阻尼比、劲度），比如 \"spring 0.6 800\"", value);
+			return false;
+		}
+		if (!parse_at_end(p)) {
+			if (!parse_number(&p, &eps) || !parse_at_end(p)) {
+				wlr_log(WLR_ERROR, "config: easing '%s' 不对：spring 最多三个数"
+					"（阻尼比、劲度、epsilon），比如 \"spring 0.6 800 0.0001\"",
+					value);
+				return false;
+			}
+		}
+		if (ratio < 0.0 || ratio > 2.0) {
+			wlr_log(WLR_ERROR, "config: easing '%s' 不对：阻尼比要在 0..2"
+				"（1.0 = 临界阻尼、不冲过头；0.6 ≈ 过冲 9%%；0 = 永远不收敛）",
+				value);
+			return false;
+		}
+		if (stiffness < 1.0 || stiffness > 100000.0) {
+			wlr_log(WLR_ERROR, "config: easing '%s' 不对：劲度要在 1..100000"
+				"（800 约 543ms，越大越快）", value);
+			return false;
+		}
+		if (eps < 1e-8 || eps > 0.5) {
+			wlr_log(WLR_ERROR, "config: easing '%s' 不对：epsilon 要在 "
+				"1e-8..0.5（越小尾巴越长，0.0001 是默认）", value);
+			return false;
+		}
+		ease_set(&ease, VIDOW_EASE_SPRING);
+		ease.damping_ratio = ratio;
+		ease.stiffness = stiffness;
+		ease.epsilon = eps;
+		*out = ease;
+		return true;
+	}
+
 	if (head_len == 8 && strncmp(head, "out_back", 8) == 0) {
 		ease_set(&ease, VIDOW_EASE_OUT_BACK);
 		if (parse_at_end(p)) {
@@ -1222,7 +1269,8 @@ static bool parse_easing(const char *value, struct vidow_ease *out) {
 	}
 
 	wlr_log(WLR_ERROR, "config: 没有 '%s' 这条缓动曲线（能写：%s / %s / %s / "
-		"%s / %s / %s，或者 \"bezier x1 y1 x2 y2\"、\"out_back 0.15\"）",
+		"%s / %s / %s，或者 \"bezier x1 y1 x2 y2\"、\"out_back 0.15\"、"
+		"\"spring 0.6 800\"）",
 		value, easing_names[0], easing_names[1], easing_names[2],
 		easing_names[3], easing_names[4], easing_names[5]);
 	return false;
@@ -1235,8 +1283,9 @@ static bool parse_easing(const char *value, struct vidow_ease *out) {
  * 顺手把幅度反解成 ease() 要用的常数（每帧反解一次太亏，见 anim.c）。
  * 改完三个 easing 键、改完 back_overshoot 都要过一遍（见 apply()）。 */
 static void sync_easings(struct vidow_config *cfg) {
-	struct vidow_ease *all[10] = {
+	struct vidow_ease *all[11] = {
 		&cfg->easing, &cfg->workspace_easing, &cfg->window_move_easing,
+		&cfg->viewport_easing,
 		&cfg->open_easing, &cfg->close_easing, &cfg->window_anim_easing,
 		&cfg->layer_anim_easing, &cfg->layer_open_easing,
 		&cfg->layer_close_easing, &cfg->column_width_easing,
@@ -2282,6 +2331,14 @@ static void defaults(struct vidow_config *cfg) {
 	ease_set(&cfg->easing, VIDOW_EASE_OUT_CUBIC);
 	ease_set(&cfg->workspace_easing, VIDOW_EASE_OUT_CUBIC);
 	ease_set(&cfg->window_move_easing, VIDOW_EASE_OUT_CUBIC);
+	/* 视口横向滚动默认用弹簧（照 niri 的 horizontal_view_movement）。
+	 * ease_set 会把参数清零，所以三个参数得单独写。
+	 * ζ=0.6 保留约 9% 过冲（接近原来 out_back 的观感）；写 1.0 完全不冲过头。
+	 * 时长 = −ln(ε)/β ≈ 543ms，**与距离无关**。 */
+	ease_set(&cfg->viewport_easing, VIDOW_EASE_SPRING);
+	cfg->viewport_easing.damping_ratio = 0.6;
+	cfg->viewport_easing.stiffness = 800.0;
+	cfg->viewport_easing.epsilon = 0.0001;
 	ease_set(&cfg->window_anim_easing, VIDOW_EASE_OUT_CUBIC);
 	ease_set(&cfg->layer_anim_easing, VIDOW_EASE_OUT_CUBIC);
 	ease_set(&cfg->layer_open_easing, VIDOW_EASE_OUT_CUBIC);

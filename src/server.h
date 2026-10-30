@@ -110,6 +110,15 @@ enum vidow_easing {
 	 * 过冲幅度都从两个控制点来，见 anim.c 的 bezier_at()。追加在最后：前面那几个
 	 * 的值会经 IPC 露出去（vidowmsg anims 的 easing），别插在中间把老值挪了。 */
 	VIDOW_EASE_BEZIER,
+	/* 阻尼谐振子（弹簧）。和上面那几条的根本区别：**时长与距离无关** ——
+	 * 由包络 e^(-βt) 衰减到 epsilon 的时刻定死，走 100px 和走 3000px 用的
+	 * 是同一条曲线、同一个时长。所以快速连按换焦点时，每一段的节奏和单次
+	 * 慢速完全一致，不会出现「短距离爬半天」或者「时长累积成几十秒」。
+	 *
+	 * 出处是 niri 的 src/animation/spring.rs（基于 libadwaita），niri 的
+	 * horizontal_view_movement 默认就用它。参数见 struct vidow_ease 的
+	 * damping_ratio / stiffness / epsilon。 */
+	VIDOW_EASE_SPRING,
 };
 
 /* 一条缓动曲线的完整描述：曲线名 + 它的参数。
@@ -130,6 +139,15 @@ struct vidow_ease {
 	/* 上面那个幅度反解出来的常数（见 vidow_ease_out_back_c1()）：配置解析时算
 	 * 一次放在这儿，ease() 每帧直接用 —— 每帧反解一次不值当。 */
 	double back_c1;
+	/* kind == VIDOW_EASE_SPRING：阻尼谐振子的三个参数（质量固定为 1）。
+	 *
+	 * damping_ratio = 1.0 是临界阻尼，**完全不冲过头**（niri 的默认）；
+	 * 越小回摆越明显：0.6 ≈ 9% 过冲、0.75 ≈ 3%、0.5 ≈ 16%。
+	 * stiffness 越大越快（时长 ≈ -ln(epsilon) / (damping_ratio·√stiffness)）。
+	 * epsilon 是「算到位了」的阈值，越小尾巴越长。 */
+	double damping_ratio;
+	double stiffness;
+	double epsilon;
 };
 
 /* Alt+Tab 切换器（见 mru.c）的两个枚举：配置里写字符串
@@ -300,6 +318,14 @@ struct vidow_config {
 	 * 和 workspace_easing 分开：工作区过渡是整条带子，普通布局是各窗口
 	 * 自己的补间。默认 out_cubic，和原来一致。 */
 	struct vidow_ease window_move_easing;
+
+	/* 视口横向滚动（换焦点列时整条带子平移）的曲线，和上面那条分开 ——
+	 * niri 也是这样分的（horizontal-view-movement / window-movement）。
+	 *
+	 * 默认是弹簧：VIDOW_EASE_SPRING，ζ=0.6、k=800、ε=1e-4（约 543ms、
+	 * 9% 过冲）。**弹簧的时长与距离无关**，所以快速连按和单次慢速节奏一致；
+	 * 换成 out_back / bezier 这类固定时长的曲线时，时长取 window_move_ms。 */
+	struct vidow_ease viewport_easing;
 
 	double open_alpha_from; /* opacity at t=0 while opening */
 	int open_slide_px;      /* slide-in distance while opening */
@@ -3524,6 +3550,9 @@ double vidow_ease_out_back_c1(double overshoot);
 /* 取一条缓动曲线在 t（0..1 的**线性**进度）处的值。一条 anim 里要用两条曲线
  * （小窗转换：位置单调、缩放可过冲）时用这个 —— 别为第二条曲线再起一条 anim。 */
 double vidow_ease_value(const struct vidow_ease *ease, double t);
+/* 曲线的「自然时长」（毫秒）：固定时长的曲线返回 0（用调用方给的 ms），
+ * 弹簧返回 −ln(epsilon)/β。见 anim.c 的 spring_value()。 */
+int vidow_ease_duration_ms(const struct vidow_ease *curve);
 void vidow_anim_cancel(struct vidow_anim *anim);
 void vidow_anim_tick(struct vidow_server *server);
 void vidow_output_render(struct vidow_output *output);

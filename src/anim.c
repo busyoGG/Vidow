@@ -75,6 +75,74 @@ double vidow_ease_out_back_c1(double overshoot) {
 	return 0.5 * (lo + hi);
 }
 
+/* 弹簧（阻尼谐振子）的归一化曲线：from = 0、to = 1、初速度 0。
+ *
+ * 解 m·ẍ + b·ẋ + k·x = 0（取 m = 1，和 niri / libadwaita 一致）：
+ *   ω₀ = √k                （无阻尼角频率）
+ *   β  = ζ·ω₀              （ζ = damping_ratio，1.0 = 临界阻尼）
+ * 三种阻尼情形都写成「1 − 包络 × 形状」，只是形状里的三角函数不同。
+ *
+ * **这条曲线最关键的性质**：归一化之后形状与距离无关，收敛时长
+ *   T = −ln(ε)/β
+ * 也与距离无关（包络衰减到 ε 的时刻由 β 定死）。所以走 100px 和走 3000px
+ * 用的是同一个时长、同一条节奏 —— 快速连按换焦点时每一段都和单次慢速一致。
+ * 这正是要换掉 out_back 的原因：out_back 时长固定但过冲按距离算，距离一短
+ * 回弹就看不见了（用户报「快速切换的幅度不如慢速」）。
+ *
+ * 出处：niri 的 src/animation/spring.rs（其本身基于 libadwaita 的
+ * adw-spring-animation.c / RBBSpringAnimation）。 */
+static double spring_value(const struct vidow_ease *e, double t) {
+	double k = e->stiffness > 1.0 ? e->stiffness : 1.0;
+	double ratio = e->damping_ratio > 0.0 ? e->damping_ratio : 0.0;
+	double eps = e->epsilon > 0.0 ? e->epsilon : 0.0001;
+	double omega0 = sqrt(k);
+	double beta = ratio * omega0;
+	if (beta <= 0.0) {
+		/* 阻尼为 0：永远收敛不了，没有可用的时长，退回线性。 */
+		return t;
+	}
+	double ts = t * (-log(eps) / beta);
+	double env = exp(-beta * ts);
+	double diff = omega0 - beta;
+	if (fabs(diff) <= 1e-4 * omega0) {
+		/* 临界阻尼（ζ = 1，niri 的默认）：单调逼近，**不冲过头**。 */
+		return 1.0 - env * (1.0 + beta * ts);
+	}
+	if (beta < omega0) {
+		/* 欠阻尼（ζ < 1）：会冲过终点再回摆 —— 「q 弹」就来自这一支。
+		 * 第一次过冲的幅度约 e^(−βπ/ω₁)，ζ=0.6 时 ≈ 9%。 */
+		double w1 = sqrt(omega0 * omega0 - beta * beta);
+		return 1.0 - env * (cos(w1 * ts) + (beta / w1) * sin(w1 * ts));
+	}
+	/* 过阻尼（ζ > 1）：不振荡，慢慢爬过去。 */
+	double w2 = sqrt(beta * beta - omega0 * omega0);
+	return 1.0 - env * (cosh(w2 * ts) + (beta / w2) * sinh(w2 * ts));
+}
+
+/* 一条曲线的「自然时长」（毫秒）。固定时长的曲线返回 0（= 用调用方给的 ms）；
+ * 弹簧返回它自己的 −ln(ε)/β。*/
+int vidow_ease_duration_ms(const struct vidow_ease *curve) {
+	if (curve == NULL || curve->kind != VIDOW_EASE_SPRING) {
+		return 0;
+	}
+	double k = curve->stiffness > 1.0 ? curve->stiffness : 1.0;
+	double ratio = curve->damping_ratio > 0.0 ? curve->damping_ratio : 0.0;
+	double eps = curve->epsilon > 0.0 ? curve->epsilon : 0.0001;
+	double beta = ratio * sqrt(k);
+	if (beta <= 0.0) {
+		return 0;
+	}
+	double ms = -log(eps) / beta * 1000.0;
+	/* 兜底：配置写错（stiffness 极小 / epsilon 极小）时别把动画拖成几十秒 ——
+	 * 那正是上一版「快速滚动极慢」的观感。 */
+	if (ms < 1.0) {
+		ms = 1.0;
+	} else if (ms > 3000.0) {
+		ms = 3000.0;
+	}
+	return (int)(ms + 0.5);
+}
+
 static double ease(const struct vidow_ease *ease, double t) {
 	if (t <= 0.0) {
 		return 0.0;
@@ -112,6 +180,8 @@ static double ease(const struct vidow_ease *ease, double t) {
 		return 1.0 - exp(-5.5 * t) * cos(7.0 * t);
 	case VIDOW_EASE_BEZIER:
 		return bezier_at(ease, t);
+	case VIDOW_EASE_SPRING:
+		return spring_value(ease, t);
 	}
 	return t;
 }
