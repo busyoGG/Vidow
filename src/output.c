@@ -441,6 +441,17 @@ void vidow_output_render(struct vidow_output *output) {
 	 *
 	 * 照 Hyprland 的做法：画完一帧就无条件发，不看可见性。 */
 	vidow_views_send_x11_frame_done(server, output);
+	/* **native Wayland 视图也要兜一次**（同一条病，见 view.c 的
+	 * vidow_views_send_wayland_frame_done）。
+	 *
+	 * 场景那句同样会漏发：抓帧遮挡把 opacity 压成 0、窗口被裁到输出外、FX
+	 * 烘焙节点顶替真实表面 —— 这几种情况下 wlroots 认为节点不可见就跳过。
+	 * 而 Chromium/Electron（Element、Discord）严格按 frame_done 节流，漏一次
+	 * 就彻底停摆：0fps、主线程睡在 poll 里、输入堵在 socket（用户报的「卡死」）。
+	 * Hyprland 不依赖场景可见性，它显式遍历 surface 树发 frame，所以没这问题。
+	 *
+	 * 幂等：只给有 pending callback 的表面发，场景已发过的这里 no-op。 */
+	vidow_views_send_wayland_frame_done(server, output);
 	/* 这块屏画完一帧了：会话锁的锁定握手在这里记账（每块屏都画过一帧才发
 	 * locked，见 sessionlock.c）。 */
 	vidow_sessionlock_frame(output);

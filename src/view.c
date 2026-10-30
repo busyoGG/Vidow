@@ -1027,8 +1027,45 @@ static void pump_surface(struct wlr_surface *surface, int sx, int sy, void *data
 	(void)sx;
 	(void)sy;
 	struct pump_ctx *ctx = data;
+	/* 只有在等帧的表面才发，也只有它才计入 keep_going。
+	 *
+	 * 以前无条件 +1：滚出视口的窗口哪怕静止（没有 pending frame callback）
+	 * 也会把 keep_going 顶成真，每帧 schedule_frame —— 静止桌面被推着出帧、
+	 * GPU 空转。send_frame_done 对没有 callback 的表面本来就是 no-op，计数
+	 * 也该跟着它走。 */
+	if (wl_list_empty(&surface->current.frame_callback_list)) {
+		return;
+	}
 	wlr_surface_send_frame_done(surface, ctx->now);
 	ctx->surfaces++;
+}
+
+/* 数一下这棵 surface 树上还有多少个 frame callback 在等（只数，不发）。
+ *
+ * 用途只有一个：诊断「客户端 0fps / 卡死」时，一眼看出它到底是不是在等
+ * frame_done。数出来 > 0 而输出又在正常出帧，那就是合成器漏发了；数出来 0
+ * 说明客户端根本没请求下一帧，问题不在合成器这边。见 ipcstate.c 的
+ * window 输出（frame_callbacks 字段）。 */
+static void count_pending_frames(struct wlr_surface *surface, int sx, int sy,
+		void *data) {
+	(void)sx;
+	(void)sy;
+	int *n = data;
+	*n += wl_list_length(&surface->current.frame_callback_list);
+}
+
+int vidow_view_pending_frame_callbacks(const struct vidow_view *view) {
+	if (view == NULL) {
+		return 0;
+	}
+	struct wlr_surface *surface = vidow_view_surface(
+		(struct vidow_view *)view);
+	if (surface == NULL) {
+		return 0;
+	}
+	int n = 0;
+	wlr_surface_for_each_surface(surface, count_pending_frames, &n);
+	return n;
 }
 
 /* 这个窗口的矩形和它自己那块屏有交集吗（都是布局坐标）。
@@ -1781,6 +1818,81 @@ void vidow_views_send_x11_frame_done(struct vidow_server *server,
 	}
 }
 
+/* **每帧给 native Wayland 视图兜底发一次 frame_done。**
+ *
+ * 这是照 Hyprland 的 sendFrameEventsToWorkspace() 抄的模型：它显式遍历每个窗口
+ * 的整棵 surface 树发 frame（`breadthfirst([](r,...){ r->frame(now); })`），
+ * **不依赖场景的可见性判定**。Vidow 原来完全靠
+ * wlr_scene_output_send_frame_done()，而它只给「场景认为可见」的节点发回调。
+ *
+ * 场景会跳过一些**明明该画**的窗口：
+ *   - 抓帧遮挡把真实表面的 opacity 压成 0（fx.c: fx->masked ? 0.0f : 1.0f），
+ *     内容由 decor 烘焙图来画 —— wlroots 认为这块表面看不见；
+ *   - 窗口有一部分被裁到输出框外；
+ *   - FX 烘焙节点顶替了真实表面。
+ *
+ * 被跳过的后果是那个客户端永远等不到 frame_done。**Chromium / Electron
+ * （Element、Discord）严格按 frame_done 节流**：拿不到就彻底停摆 —— 0fps、
+ * 主线程睡在 do_sys_poll 里、输入全堵在 socket 里，用户看到的就是「卡死」。
+ * 不按 frame_done 驱动的客户端（多数 GTK/Qt 程序）不受影响，所以只有 Electron
+ * 这类出问题。
+ *
+ * **为什么不会自激**：pump_surface 只在 surface->current.frame_callback_list
+ * 非空时才发，发完 wlroots 就把 list 清空 —— 场景已经发过的那些，这里再发是
+ * no-op。没有 pending callback 的静止窗口一个字节都不发。所以这条兜底只补
+ * 「场景漏发的」，不会多喂帧，也不会把输出顶成满刷新率空转。
+ *
+ * 节流和 X11 那条同源（按输出刷新率限速，比显示刷新率更快的帧本来也看不到），
+ * 但用独立的时间戳：两条兜底互不影响。 */
+void vidow_views_send_wayland_frame_done(struct vidow_server *server,
+		struct vidow_output *output) {
+	if (server == NULL || output == NULL) {
+		return;
+	}
+	struct timespec now;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	int64_t fd_min_ns = fd_min_interval_ns(output->wlr_output);
+	int64_t fd_now_ns = (int64_t)now.tv_sec * 1000000000LL + now.tv_nsec;
+	if (output->last_wl_fd_ns != 0 &&
+			fd_now_ns - output->last_wl_fd_ns < fd_min_ns) {
+		return;
+	}
+	output->last_wl_fd_ns = fd_now_ns;
+	struct vidow_view *view;
+	wl_list_for_each(view, &server->views, link) {
+		/* **不按 view->output 过滤。**
+		 *
+		 * 这条兜底要回答的问题是「谁在等帧、没人给它发」。而
+		 * view->output 是个会漂的字段：拖动 / 换工作区 / 拔插屏之后它可能
+		 * 变 NULL、或者停在旧屏上（view.c 的 view_on_screen 那段注释记着
+		 * 这个分叉）。一旦它不匹配，这个 view 就**两条路都收不到**
+		 * frame_done（render_pump 的 want 也按它过滤），客户端永久停摆 ——
+		 * 而且只在某次操作之后才发生，表现就是「用一阵子才卡死」。
+		 *
+		 * 按 output 过滤本来也换不来什么：frame_done 是幂等的，谁先发谁把
+		 * callback list 清空，第二块屏再遍历到就是 no-op。所以宁可每块屏都
+		 * 遍历一遍所有 view（几十个，微秒级），也不要留下「某个 view 谁都
+		 * 不管」的死角。 */
+		if (view->kind == VIDOW_VIEW_X11 || !view->mapped) {
+			continue;
+		}
+		/* 图标态画的是最后一张快照，就该停帧（补帧会把它推活，和
+		 * 「静止的最后一帧」自相矛盾）。 */
+		if (vidow_mini_uses_snapshot(view)) {
+			continue;
+		}
+		struct wlr_surface *surface = vidow_view_surface(view);
+		if (surface == NULL) {
+			continue;
+		}
+		/* 整棵 surface 树（主子表面都发）：Chromium 的合成器进程可能挂在
+		 * 子表面上。popup 也在这里发 —— 它是独立的 view，之前被 popup
+		 * 判据排除在外，弹菜单 / tooltip 卡住时同样会拖死宿主程序。 */
+		struct pump_ctx ctx = { .now = &now, .surfaces = 0 };
+		wlr_surface_for_each_surface(surface, pump_surface, &ctx);
+	}
+}
+
 /* 每帧调一次：把「规则要求保活」或者「正被人拿着（录屏 / 预览）」但**没画到**的
  * 窗口补上帧回调，并且让输出继续出帧 —— 不然补帧链自己就断了（没东西要画的时候
  * wlroots 不会给帧事件）。
@@ -1802,18 +1914,25 @@ void vidow_view_render_pump(struct vidow_server *server,
 		if (view->mini == VIDOW_MINI_ICON || view->mini_snapshot != NULL) {
 			vidow_mini_frames_recheck(view);
 		}
-		bool want = view->mapped && !view->popup && view->output ==
-			output->wlr_output &&
-			(view->force_render || vidow_view_capture_held(view) ||
-				/* 小窗（S3）：被停到屏外（图标暂停出帧那条路）/ 所在屏关了
-				 * 的时候也要保活，否则游戏自己停帧，点开是一张死画面。
-				 * 下面 view_on_screen() 为真时会 continue，所以这条只在
-				 * 「真的没画到」时才生效 —— 正常情况一分钱不花。 */
-				/* 但**走快照那条路的图标不算**（S5）：它就该停帧（屏上画的是
-				 * 最后一帧快照），保活会把它又推活、和「静止的最后一帧」
-				 * 自相矛盾。 */
-				(view->mini != VIDOW_MINI_NONE &&
-					!vidow_mini_uses_snapshot(view)));
+		/* 所有 native Wayland 窗口都进来判一次，是否真补由下面的
+		 * view_on_screen() 决定：在屏上的由场景那边正常发 frame_done
+		 * （这里 continue，不重复发），不在屏上的（滚出视口 / 工作区藏起来 /
+		 * 最小化）才补。
+		 *
+		 * 以前这里还多要一道 `force_render || 录屏 || mini` 的许可，普通
+		 * 窗口被挡在门外 —— 一旦滚出视口就再没人给它发 frame_done，
+		 * Chromium（Element）交完一帧就停摆：拿不回 buffer，合成器不提交，
+		 * 主线程睡死，输入全堵在 socket 里（现场 fd 写缓冲 213504 字节 =
+		 * socket 满）。这跟 X11 那条「照 Hyprland 无条件发」是同一个病。
+		 *
+		 * X11 不走这条路：vidow_views_send_x11_frame_done()（output.c）
+		 * 已经无条件兜底，这里再发一遍就是重复催帧。
+		 * 走快照的图标仍然排除（S5：屏上画的是最后一帧快照，就该停帧，
+		 * 补帧会把它又推活、和「静止的最后一帧」自相矛盾）。 */
+		bool want = view->mapped && !view->popup &&
+			view->kind != VIDOW_VIEW_X11 &&
+			view->output == output->wlr_output &&
+			!vidow_mini_uses_snapshot(view);
 		if (!want) {
 			view->pump_hidden_frames = 0;
 			view->pump_shown_frames = 0;
@@ -2136,6 +2255,25 @@ void vidow_view_set_parked(struct vidow_view *view, bool park) {
 	/* 它自己进/出画面了：底衬的合成结果变了。账记在它头上（它自己的私有底衬
 	 * 不受影响），别的窗口因为世界代次前进而重抓。 */
 	vidow_backdrop_damage_view(view);
+	/* **必须在这儿排一帧，否则补帧链永远启动不了。**
+	 *
+	 * 补帧（vidow_view_render_pump）只在 vidow_output_render 里跑，而
+	 * vidow_output_render 只在有帧事件时跑 —— 输出静止就没有帧事件。补帧
+	 * 闹钟（output->pump_timer）又只在 render_pump 内部才会被设上。于是：
+	 *
+	 *   窗口滚出视口 → 拿不到 frame_done → 客户端停止提交 → 不再产生损伤
+	 *   → 输出静止 → render_pump 不跑 → 闹钟从没设过 → 永远没人再推一帧
+	 *
+	 * 这就是「Element / Discord 滚出视口后 0fps + 不可交互」的死锁：客户端
+	 * 在等 frame_done，合成器在等损伤，两边互等。Hyprland 不会这样，因为它
+	 * 每块屏每帧无条件渲染（vsync 驱动），sendFrameEventsToWorkspace 每帧都
+	 * 跑，补帧这件事根本不需要额外的触发源。
+	 *
+	 * Vidow 是按需渲染，就得自己制造这个触发点：窗口一进「停到屏外」这个
+	 * 状态就排一帧，让 render_pump 跑一次、把补帧闹钟设上，链子就接起来了。
+	 * 滚回来时同样排一帧（下面 park == false 那条也走这里），立刻恢复。 */
+	vidow_output_schedule_frame(view->server, view->output,
+		park ? "窗口滚出视口" : "窗口回到屏上");
 wlr_log(WLR_DEBUG, "workspace: %s %s（%s）",
 		vidow_view_title(view) != NULL ? vidow_view_title(view) : "(无题)",
 		park ? "藏起（停到屏外）" : "显示",

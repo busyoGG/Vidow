@@ -351,6 +351,18 @@ void vidow_ipc_json_window(struct jbuf *b, struct vidow_server *server,
 			view->scene_tree->node.enabled);
 		jb_kv_bool(b, "scene_parked", view->scene_parked);
 		jb_kv_bool(b, "fx_active", view->fx.active);
+		/* **还在等几个 frame callback**（诊断「0fps / 卡死」的决定性数字）。
+		 *
+		 * > 0 = 客户端请求了下一帧、正在等合成器发 frame_done。此时如果
+		 * 输出在正常出帧，就是合成器漏发了（bug 在我们这边）；如果输出
+		 * 静止不出帧，就是没人推那一帧（补帧链断了）。
+		 * 0 = 客户端根本没请求下一帧，它不打算画 —— 卡死不在渲染路径上，
+		 * 要去查输入 / 客户端自己。
+		 *
+		 * 用户报「Element 用一阵子后 0fps + 不可交互」时，卡住的那一刻跑
+		 * 一次 `vidowmsg windows`，这个数就够定性了。 */
+		jb_kv_int(b, "frame_callbacks",
+			vidow_view_pending_frame_callbacks(view));
 		/* 装饰离屏缓冲（per-output）：窗口骑在两块屏中间时每块屏各有一份
 		 * （见 server.h 的 struct vidow_blur_slot 的 dec*）。跨屏倍率问题
 		 * 的回归判据就靠这一组 —— 以前测试靠 grep 日志里的 `fx: target`，
