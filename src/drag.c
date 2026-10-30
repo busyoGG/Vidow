@@ -28,6 +28,7 @@
 #include "server.h"
 #include "ipc.h"
 #include "workspace.h"
+#include "xtrace.h"
 
 #include <limits.h>
 #include <math.h>
@@ -1013,6 +1014,21 @@ void vidow_tile_grab_update(struct vidow_server *server, double lx, double ly) {
 	/* 只改「画在哪」：布局（geom）一个字都不动，所以别的窗口不会跟着抖。 */
 	view->anim_off_x = (lx - view->drag_dx) - view->geom.x;
 	view->anim_off_y = (ly - view->drag_dy) - view->geom.y;
+	/* 跟手探针（touch /tmp/vidow-x11-trace 开）：每个指针事件一行，看偏移到底
+	 * 有没有写进来、写进来之后窗口自己那块屏是哪块。 */
+	if (vidow_xtrace_on()) {
+		struct wlr_output *cur_out = output_under_cursor(server);
+		vidow_gtrace("grab v=%d lx=%.0f ly=%.0f off=%.0f,%.0f "
+			"geom=%d,%d %dx%d det=%d alpha=%.2f mode=%d cur_out=%s "
+			"view_out=%s",
+			view->id, lx, ly, view->anim_off_x, view->anim_off_y,
+			view->geom.x, view->geom.y,
+			view->geom.width, view->geom.height,
+			view->drag_detached ? 1 : 0, view->anim_alpha,
+			(int)server->grab_mode,
+			cur_out != NULL ? cur_out->name : "-",
+			view->output != NULL ? view->output->name : "-");
+	}
 	/* niri 的 INTERACTIVE_MOVE_START_THRESHOLD = 16px（256 px²）：走够
 	 * 才真的摘列 / 降透明度；之前窗口只做一点跟手（布局不动）。 */
 	if (!view->drag_detached) {
@@ -1173,9 +1189,20 @@ bool vidow_tile_drag_scroll_step(struct vidow_server *server) {
 void vidow_tile_grab_end(struct vidow_server *server) {
 	struct vidow_view *view = server->grab_view;
 	/* 还没摆出来的那个位置屏幕上没出现过，不用管；**已经画出来**的那个位置得记
-	 * 一笔 —— 松手之后窗口就离开那儿了，别人底衬里那一块得重抓。 */
+	 * 一笔 —— 松手之后窗口就离开那儿了，别人底衬里那一块得重抓。
+	 *
+	 * 盒子要按**果冻**实际占过的那块算：拖拽期间屏幕上画的是果冻节点（整窗
+	 * 装饰 + 四周形变余量），它比窗口框大一圈。只报窗口框的话那一圈没人擦，
+	 * 拖完一回位就留在底衬里（用户 2026-10-30：「窗口释放的时候 背景模糊
+	 * 更新会有滞留像素」）。 */
 	if (view != NULL) {
-		vidow_backdrop_damage_box(server, &server->grab_last_box);
+		struct wlr_box box = server->grab_last_box;
+		int pad = (int)ceil(vidow_jelly_pad(view)) + 8;
+		box.x -= pad;
+		box.y -= pad;
+		box.width += 2 * pad;
+		box.height += 2 * pad;
+		vidow_backdrop_damage_box(server, &box);
 	}
 	/* 预览块收掉（落点算不算得出来都得收）。小窗（S4）落点区同理 —— 松手那一刻
 	 * 光标在不在里面，先记下来再收（收掉之后 rect 就关了）。 */

@@ -7,6 +7,7 @@
 #include <math.h>
 #include <stdlib.h>
 #include <time.h>
+#include <unistd.h> /* access()：统计探针的文件开关 */
 
 #include "ipc.h"
 #include "workspace.h"
@@ -20,12 +21,28 @@
  * 这两个变量以前是**每帧**问一遍（渲染统计两次、帧追踪钩子一次），而 getenv 要
  * 遍历 environ 做 strcmp —— 实测 profile 里它占 0.39%，比我们自己一帧的模糊代码
  * （vidow_blur_update 0.26%）还显眼。进程起来之后环境不会变，缓存住就行。 */
+/* 文件开关：/tmp/vidow-stats-on 一出现就当 VIDOW_RENDER_STATS=1，而且统计行用
+ * INFO 级打出去（真会话的日志只收 INFO 以上；环境变量那条路是 DEBUG，只有
+ * --debug 跑的时候才看得见）。这样不用改登录环境就能在真实会话里量基线。
+ *
+ * 每 500ms 才 stat 一次：这个函数一帧要问好几遍，而 stat 也是 syscall。 */
+static bool render_stats_file_on(void) {
+	static int64_t last_ns = 0;
+	static bool on = false;
+	int64_t now = vidow_now_ns();
+	if (last_ns == 0 || now - last_ns > 500 * 1000000LL) {
+		last_ns = now;
+		on = access("/tmp/vidow-stats-on", F_OK) == 0;
+	}
+	return on;
+}
+
 static bool render_stats_on(void) {
 	static int on = -1;
 	if (on < 0) {
 		on = getenv("VIDOW_RENDER_STATS") != NULL ? 1 : 0;
 	}
-	return on != 0;
+	return on != 0 || render_stats_file_on();
 }
 
 /* 卡顿探针：VIDOW_STUTTER=1 开，VIDOW_STUTTER_MS 改阈值（默认 100ms）。
@@ -152,7 +169,16 @@ void vidow_output_render(struct vidow_output *output) {
 	if (server->grab_dirty && server->grab_view != NULL) {
 		struct vidow_view *gv = server->grab_view;
 		server->grab_dirty = false;
-		vidow_backdrop_damage_box(server, &server->grab_last_box);
+		/* 果冻画的是整窗 + 四周形变余量，比窗口框大一圈：上一帧那块按果冻
+		 * 实际占过的范围记（grab_last_box 存的是窗口框，扩在用的地方）。
+		 * 漏了这圈，松开、收尾之后留白 / 投影那一圈没人擦。 */
+		struct wlr_box old = server->grab_last_box;
+		int jpad = (int)ceil(vidow_jelly_pad(gv)) + 8;
+		old.x -= jpad;
+		old.y -= jpad;
+		old.width += 2 * jpad;
+		old.height += 2 * jpad;
+		vidow_backdrop_damage_box(server, &old);
 		/* 只有这个窗口自己动了：记在它头上，它自己的私有底衬（抓的时候它藏着）
 		 * 不该因为这一笔就过期。 */
 		vidow_backdrop_damage_view(gv);
@@ -324,7 +350,7 @@ void vidow_output_render(struct vidow_output *output) {
 		}
 		if (st_t4 - win_ns >= 500 * 1000000LL) {
 			double f = vidow_stats.frames > 0 ? (double)vidow_stats.frames : 1.0;
-			wlr_log(WLR_DEBUG,
+			wlr_log(render_stats_file_on() ? WLR_INFO : WLR_DEBUG,
 				"渲染统计: %d 帧/帧窗(%.0fms) %.1f fps | 模糊 %.2fms/帧"
 				"(shared %d own %d chain %d) | 装饰 %.2fms/帧(%d 次重烘) | "
 				"果冻 %.2fms/帧 | 提交 %.2fms/帧 | 贴图 +%d/-%d | 趟 %d | "

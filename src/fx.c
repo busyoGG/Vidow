@@ -1822,6 +1822,16 @@ void vidow_backdrop_damage_region(struct vidow_server *server,
 void vidow_backdrop_damage_view_rect(struct vidow_view *view,
 		const struct wlr_box *box) {
 	struct wlr_box b = box != NULL ? *box : vidow_view_screen_box(view);
+	/* 果冻在画的时候，屏幕上这一块比窗口框大一圈（留白 + 形变 + 投影）：
+	 * 报小了，别人底衬里那一圈就一直是上一版的，松手 / 收尾之后看着像
+	 * 滞留像素（见 jelly.c 的 vidow_jelly_pad）。 */
+	if (view->jelly != NULL) {
+		int pad = (int)ceil(vidow_jelly_pad(view)) + 8;
+		b.x -= pad;
+		b.y -= pad;
+		b.width += 2 * pad;
+		b.height += 2 * pad;
+	}
 	view->self_gen++;
 	damage_bump(view->server, false);
 	/* 变的是它自己这一块：别人（底衬里画着它）得重抓，它自己不用。 */
@@ -3226,7 +3236,21 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 		 * 只是不再当裁剪框。 */
 		(void)ov_clip_box;
 	}
-	if (instance != NULL || fx->clip_on || ov_clip) {
+	/* **果冻（拖拽形变）期间不裁这一份。**
+	 *
+	 * 这个节点的显示范围被裁到「这块屏里那一半」时，裁剪会把**节点位置**
+	 * 改成可见部分的起点（下面 `node_x = inter.x`）：窗口往左拖出屏幕，
+	 * 节点就被钉在这块屏的左边框上。可果冻（jelly.c）正是拿这个节点的
+	 * 坐标当「窗口左上角」去摆它那张整窗的形变图 —— 于是整块窗口被画到
+	 * 屏的左边缘、不再跟着光标（用户 2026-10-30 报的「第一次完全跨过去
+	 * 之前会卡在 DP-2」，探针实测：tree=1287 而 src=1920 = DP-2 左边缘，
+	 * rel=633 全是这一刀裁出来的偏移）。
+	 *
+	 * 果冻期间这一份本来就不显示：`vidow_fx_frame` 末尾把它的透明度压成 0
+	 * （内容由果冻节点画）。所以这里跳过裁剪只影响「节点坐标」这一个用途，
+	 * 显示的按屏裁仍然由果冻那一层 + 输出自己的裁剪完成 —— 两块屏各画
+	 * 自己那一半的效果不变。 */
+	if ((instance != NULL || fx->clip_on || ov_clip) && !fx->jelly) {
 		/* fx->clip 是**布局坐标**里的那块屏；这个节点的位置是相对父树的
 		 * （父树就是窗口的场景树，摆在窗口的位置上）—— 减掉父树的原点才
 		 * 在同一个坐标系里。 */
@@ -3311,9 +3335,30 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 			node_y = -1000000;
 			dst_w = 1;
 			dst_h = 1;
+			/* 跟手探针（touch /tmp/vidow-x11-trace 开）：拖拽期间把这一步的决定
+			 * 打出来 —— 用的是哪块屏自己的那一格（instance）、裁剪到哪个框、
+			 * 最后把装饰节点摆到哪儿、有没有被裁成 1x1 甩到屏外。 */
+			if (vidow_xtrace_on() && fx->view != NULL &&
+					(fx->view->dragging ||
+					fx->view->server->grab_view == fx->view)) {
+				vidow_gtrace("fx v=%d out=%s node=%d,%d %dx%d inst=%s "
+					"clip_on=%d clip=%d,%d %dx%d outclip=%d,%d %dx%d "
+					"crop=%d jelly=%d op=%.2f",
+					fx->view->id,
+					instance != NULL && instance->out != NULL ?
+						instance->out->name : "-",
+					node_x, node_y, dst_w, dst_h,
+					instance != NULL ? "yes" : "no",
+					fx->clip_on, fx->clip.x, fx->clip.y,
+					fx->clip.width, fx->clip.height,
+					clip.x, clip.y, clip.width, clip.height,
+					cropped ? 1 : 0, fx->jelly ? 1 : 0,
+					(fx->masked || fx->jelly) ? 0.0 : 1.0);
+			}
 		}
 	}
 	wlr_scene_node_set_position(&node->node, node_x, node_y);
+
 	wlr_scene_buffer_set_dest_size(node, dst_w, dst_h);
 	/* 被抓帧遮挡压着的窗口，这一帧也照样压着（抓帧随时可能在两帧之间渲染）。
 	 * 正在被拖出果冻形变的窗口也一样：内容由 jelly.c 那个节点画（同一块缓冲，
@@ -3510,30 +3555,192 @@ static bool layer_blur_wanted(struct vidow_server *server,
 	return true;
 }
 
+/* 私有底衬那块区域按这个格对齐（设备像素）：窗口 / layer 在格子里挪动时区域一个字
+ * 都不变，缓存才真的能命中 —— 否则拖窗口时区域每帧跟着平移，每帧都得重抓。 */
+#define VIDOW_BLUR_REGION_GRID 128
+
+/* 这两个定义在本文件下面（模糊那一段）；layer 的区域计算要先用到。 */
+static int blur_levels_for(struct vidow_server *server, int w, int h);
+static int blur_reach_px(struct vidow_server *server, int levels);
+
+/* 这块 layer 真正需要模糊的那一块（设备像素，相对这块屏）。
+ *
+ * **别再按整块 geom 抓。** quickshell 的 bar / dock 是「给菜单预留几百像素」的
+ * 透明画布：实测 bar 1920x438 里只有顶上 38px 有内容、dock 1920x372 里只有
+ * 56px —— 按整块算就是把抓取、kawase 金字塔和显存一起放大 5~11 倍（DP-2 是
+ * 2 倍屏：3840x876 → 49MB 一块，两块加起来近百兆）。判据按可信度从高到低：
+ *
+ *   1. 客户端用 ext-background-effect 自己声明的模糊区域 —— 协议就是为这个
+ *      存在的，以前只有窗口那条路读它（见 view.c），layer 这条路根本没看；
+ *   2. 否则取 surface 的 input region 外接框。quickshell 的 mask 就落在这里
+ *      （自己写的「多出来的部分不绘制也不吃鼠标」），它比 opaque region 可靠：
+ *      透明画布通常压根不声明 opaque region；
+ *   3. 都没有（空区域 / 还没提交过）：退回整块 geom，跟以前一样。
+ *
+ * 再往外放一圈模糊半径（链要采到区域外的像素），原点对齐到 128 的网格 ——
+ * 和窗口那条路（view_region_rect）同一个理由：区域在格子里挪动时缓冲尺寸不变，
+ * 金字塔那几块 GBM 缓冲才能一直复用。 */
+static bool layer_region_rect(struct vidow_server *server,
+		struct vidow_output *output, struct vidow_layer_surface *ls,
+		int *rx, int *ry, int *rw, int *rh, int *levels) {
+	double scale = output->wlr_output->scale;
+	if (!(scale > 0.0)) {
+		scale = 1.0;
+	}
+	struct wlr_box box = ls->geom; /* 布局坐标 */
+	if (box.width <= 0 || box.height <= 0) {
+		return false;
+	}
+
+	/* 可见部分（surface 局部坐标），默认整块。 */
+	struct wlr_box vis = { .x = 0, .y = 0,
+		.width = box.width, .height = box.height };
+	struct wlr_box want;
+	bool have = false;
+	if (ls->layer_surface != NULL &&
+			vidow_bgeffect_blur_box(server,
+				ls->layer_surface->surface, &want)) {
+		have = true; /* 客户端自己说的，最准 */
+	} else if (ls->layer_surface != NULL) {
+		pixman_box32_t *e = pixman_region32_extents(
+			&ls->layer_surface->surface->input_region);
+		if (e != NULL && e->x2 > e->x1 && e->y2 > e->y1) {
+			want = (struct wlr_box){ .x = e->x1, .y = e->y1,
+				.width = e->x2 - e->x1, .height = e->y2 - e->y1 };
+			have = true;
+		}
+	}
+	if (have) {
+		struct wlr_box inter;
+		if (wlr_box_intersection(&inter, &want, &vis)) {
+			vis = inter;
+		}
+	}
+	int out_x = (int)lround((double)box.x * scale);
+	int out_y = (int)lround((double)box.y * scale);
+	/* 这块屏自己在布局里的原点（设备像素），不是 server->output_x/y。 */
+	int my_out_x = (int)lround((double)output->box.x * scale);
+	int my_out_y = (int)lround((double)output->box.y * scale);
+	int my_out_w = output->wlr_output->width;
+	int my_out_h = output->wlr_output->height;
+
+	int lv = blur_levels_for(server,
+		(int)lround((double)vis.width * scale),
+		(int)lround((double)vis.height * scale));
+	int margin = blur_reach_px(server, lv);
+	int left = out_x + (int)lround((double)vis.x * scale) - my_out_x - margin;
+	int top = out_y + (int)lround((double)vis.y * scale) - my_out_y - margin;
+	int span_w = (int)lround((double)vis.width * scale) + 2 * margin;
+	int span_h = (int)lround((double)vis.height * scale) + 2 * margin;
+	const int grid = VIDOW_BLUR_REGION_GRID;
+	int gx1 = (int)floor((double)left / grid) * grid;
+	int gy1 = (int)floor((double)top / grid) * grid;
+	int size_w = (int)ceil((double)(span_w + grid) / grid) * grid;
+	int size_h = (int)ceil((double)(span_h + grid) / grid) * grid;
+	if (size_w < 1 || size_h < 1 || size_w > MAX_TARGET_PX ||
+			size_h > MAX_TARGET_PX) {
+		return false;
+	}
+	int max_x = my_out_w - size_w;
+	int max_y = my_out_h - size_h;
+	if (max_x < 0) {
+		max_x = 0;
+	}
+	if (max_y < 0) {
+		max_y = 0;
+	}
+	if (gx1 < 0) {
+		gx1 = 0;
+	} else if (gx1 > max_x) {
+		gx1 = max_x;
+	}
+	if (gy1 < 0) {
+		gy1 = 0;
+	} else if (gy1 > max_y) {
+		gy1 = max_y;
+	}
+	*rx = gx1;
+	*ry = gy1;
+	*rw = size_w;
+	*rh = size_h;
+	*levels = lv;
+	return true;
+}
+
 /* 抓一块「这个 layer 盖住的东西」，含窗口。
  *
  * 只抓它自己那块区域（rx, ry 是它在输出里的位置，设备像素）：基座从共享底衬上
  * 1:1 拷一块过来，再把窗口画上去 —— 壁纸那么大的贴图不用每帧重新上传，代价跟区域
  * 面积成正比而不是整屏。区域外没有像素可抓，所以只抓屏内那一块（缓冲仍按整块
- * layer 分配，屏内那块画在自己的偏移上），采样坐标由 fx->blur_tex_* 负责对齐。 */
+ * layer 分配，屏内那块画在自己的偏移上），采样坐标由 fx->blur_tex_* 负责对齐。
+ *
+ * partial != NULL：只有这块（**区域局部设备像素**）的内容变了，其余像素保留上一版
+ * —— 抓也只抓这一块、链条也只重跑这一块（和窗口那条路 view_region_build 一样）。
+ * 以前 layer 这条路没有局部更新：面板底下一条 20px 的进度条在动，整块 3840x876
+ * 的抓取 + 5 趟 kawase 每帧重跑一遍。 */
 
 static bool layer_region_build(struct vidow_server *server,
 		struct vidow_output *output, struct vidow_layer_surface *ls,
-		int rx, int ry, int rw, int rh, int levels) {
+		int rx, int ry, int rw, int rh, int levels,
+		const struct wlr_box *partial) {
 	double scale = output->wlr_output->scale;
 	if (!(scale > 0.0)) {
 		scale = 1.0;
 	}
+	int out_w = output->wlr_output->width;
+	int out_h = output->wlr_output->height;
+	int px = 0, py = 0, pw = rw, ph = rh;
+	if (partial != NULL) {
+		px = partial->x < 0 ? 0 : partial->x;
+		py = partial->y < 0 ? 0 : partial->y;
+		int px2 = partial->x + partial->width;
+		int py2 = partial->y + partial->height;
+		if (px2 > rw) {
+			px2 = rw;
+		}
+		if (py2 > rh) {
+			py2 = rh;
+		}
+		if (px2 <= px || py2 <= py) {
+			return false;
+		}
+		pw = px2 - px;
+		ph = py2 - py;
+	}
 	int x1 = rx < 0 ? 0 : rx, y1 = ry < 0 ? 0 : ry;
 	int x2 = rx + rw, y2 = ry + rh;
-	if (x2 > server->output_w) {
-		x2 = server->output_w;
+	if (x2 > out_w) {
+		x2 = out_w;
 	}
-	if (y2 > server->output_h) {
-		y2 = server->output_h;
+	if (y2 > out_h) {
+		y2 = out_h;
 	}
 	if (x2 <= x1 || y2 <= y1) {
 		return false; /* 整块在屏外，没东西可抓 */
+	}
+	if (partial != NULL) {
+		/* 要抓的那一块也得夹进屏内（区域原点可能被夹过）。 */
+		int cx1 = rx + px, cy1 = ry + py;
+		int cx2 = cx1 + pw, cy2 = cy1 + ph;
+		if (cx1 < x1) {
+			cx1 = x1;
+		}
+		if (cy1 < y1) {
+			cy1 = y1;
+		}
+		if (cx2 > x2) {
+			cx2 = x2;
+		}
+		if (cy2 > y2) {
+			cy2 = y2;
+		}
+		if (cx2 <= cx1 || cy2 <= cy1) {
+			return false;
+		}
+		px = cx1 - rx;
+		py = cy1 - ry;
+		pw = cx2 - cx1;
+		ph = cy2 - cy1;
 	}
 
 	if (ls->bd == NULL || ls->bd_w != rw || ls->bd_h != rh) {
@@ -3558,23 +3765,38 @@ static bool layer_region_build(struct vidow_server *server,
 		return false;
 	}
 	struct wlr_render_rect_options clear = {
-		.box = { .x = 0, .y = 0, .width = rw, .height = rh },
+		.box = { .x = px, .y = py, .width = pw, .height = ph },
 		.color = { .r = 0.0f, .g = 0.0f, .b = 0.0f, .a = 0.0f },
 		.blend_mode = WLR_RENDER_BLEND_MODE_NONE,
 	};
 	wlr_render_pass_add_rect(pass, &clear);
 
-	/* 基座：共享底衬里对应的那一块，1:1 捞过来（别插值）。 */
+	/* 基座：共享底衬里对应的那一块，1:1 捞过来（别插值）。源框必须夹在底衬
+	 * 里面（wlroots 的 render pass 会断言越界），伸到屏外的那圈只能留透明。 */
+	int bx1 = rx + px, by1 = ry + py;
+	if (bx1 < x1) {
+		bx1 = x1;
+	}
+	if (by1 < y1) {
+		by1 = y1;
+	}
+	int bx2 = bx1 + pw, by2 = by1 + ph;
+	if (bx2 > x2) {
+		bx2 = x2;
+	}
+	if (by2 > y2) {
+		by2 = y2;
+	}
 	float one = 1.0f;
 	struct wlr_render_texture_options base = {
 		.texture = output->backdrop_tex,
 		.src_box = {
-			.x = (float)x1, .y = (float)y1,
-			.width = (float)(x2 - x1), .height = (float)(y2 - y1),
+			.x = (float)bx1, .y = (float)by1,
+			.width = (float)(bx2 - bx1), .height = (float)(by2 - by1),
 		},
 		.dst_box = {
-			.x = x1 - rx, .y = y1 - ry,
-			.width = x2 - x1, .height = y2 - y1,
+			.x = (float)(bx1 - rx), .y = (float)(by1 - ry),
+			.width = (float)(bx2 - bx1), .height = (float)(by2 - by1),
 		},
 		.alpha = &one,
 		.transform = WL_OUTPUT_TRANSFORM_NORMAL,
@@ -3584,17 +3806,18 @@ static bool layer_region_build(struct vidow_server *server,
 	wlr_render_pass_add_texture(pass, &base);
 
 	/* 窗口画在基座上：绘制顺序上它们就在 top / overlay 层底下，连窗口的弹出物
-	 * 一起（窗口树 → 窗口弹出物树）。 */
+	 * 一起（窗口树 → 窗口弹出物树）。只画要抓的那一块（partial 时就是损伤
+	 * 那一小块），底衬别的像素一个都不碰。 */
 	struct backdrop_ctx ctx = {
 		.pass = pass,
 		.server = server,
 		.scale = scale,
 		.ox = (int)lround((double)output->box.x * scale) + x1,
 		.oy = (int)lround((double)output->box.y * scale) + y1,
-		.clip_x = x1 - rx,
-		.clip_y = y1 - ry,
-		.clip_w = x2 - x1,
-		.clip_h = y2 - y1,
+		.clip_x = bx1 - rx,
+		.clip_y = by1 - ry,
+		.clip_w = bx2 - bx1,
+		.clip_h = by2 - by1,
 	};
 	struct wlr_scene_tree *trees[] = {
 		server->layer_toplevels,
@@ -3613,7 +3836,14 @@ static bool layer_region_build(struct vidow_server *server,
 	if (!blur_set_alloc(server, &ls->fx.blur_set, rw, rh, levels)) {
 		return false;
 	}
-	blur_chain(server, &ls->fx.blur_set, ls->bd_tex, rw, rh);
+	if (partial != NULL) {
+		blur_chain_rect(server, &ls->fx.blur_set, ls->bd_tex, rw, rh,
+			&(struct wlr_box){ .x = px, .y = py,
+				.width = pw, .height = ph },
+			blur_reach_px(server, levels));
+	} else {
+		blur_chain(server, &ls->fx.blur_set, ls->bd_tex, rw, rh);
+	}
 	ls->fx.blur_own_tex = ls->fx.blur_set.up_tex[0];
 	if (ls->fx.blur_own_tex == NULL) {
 		return false;
@@ -3621,6 +3851,7 @@ static bool layer_region_build(struct vidow_server *server,
 	ls->fx.blur_own_id = server->blur_serial++;
 	ls->bd_x = rx;
 	ls->bd_y = ry;
+	ls->bd_levels = levels;
 	ls->bd_gen_scene = server->gen_scene;
 	ls->bd_gen_layer = server->gen_layer;
 
@@ -3766,10 +3997,6 @@ static bool shared_blur_rebuild(struct vidow_server *server,
 		output->wlr_output->name, w, h, levels, output->blur_offset);
 	return true;
 }
-
-/* 私有底衬那块区域按这个格对齐（设备像素）：窗口在格子里挪动时区域一个字都不
- * 变，缓存才真的能命中 —— 否则拖窗口时区域每帧跟着平移，每帧都得重抓。 */
-#define VIDOW_BLUR_REGION_GRID 128
 
 /* 链条采样到底能摸到多远（原始像素）：降采样每一趟的抽样半径是 blur_offset 个
  * **源** texel，源每降一级尺寸减半，换算回原图每级翻倍（offset * (2^levels - 1)）；
@@ -3929,14 +4156,14 @@ static bool blur_no_partial(void) {
  * 调用方整块重跑：
  *   - 一笔都没相交（不该走到这儿，防御）；
  *   - 损伤盖住了区域的一大半（>= 60%）：局部省不了多少，整块重跑还简单些。 */
-static bool region_update_rect(struct vidow_output *output,
-		struct vidow_view *view,
+static bool region_update_rect(struct vidow_server *server,
+		struct vidow_fx_target *fx, struct vidow_output *output,
 		int rx, int ry, int rw, int rh, struct wlr_box *out) {
 	double scale = output->wlr_output->scale;
 	if (!(scale > 0.0)) {
 		scale = 1.0;
 	}
-	const struct vidow_dmg_set *set = &view->fx.pending_damage;
+	const struct vidow_dmg_set *set = &fx->pending_damage;
 	struct wlr_box u = {0};
 	for (int i = 0; i < set->n; i++) {
 		const struct wlr_box *b = &set->box[i];
@@ -3957,7 +4184,7 @@ static bool region_update_rect(struct vidow_output *output,
 		return false;
 	}
 	bool clip_ok = true;
-	wlr_scene_node_for_each_buffer(&view->server->layer_toplevels->node,
+	wlr_scene_node_for_each_buffer(&server->layer_toplevels->node,
 		backdrop_clip_check, &clip_ok);
 	if (!clip_ok) {
 		return false;
@@ -4657,7 +4884,8 @@ update_consumers:
 		if (!fresh) {
 			struct wlr_box upd;
 			bool partial = shape_ok && !blur_no_partial() &&
-				region_update_rect(output, view, rx, ry, rw, rh, &upd);
+				region_update_rect(view->server, &view->fx, output,
+					rx, ry, rw, rh, &upd);
 			if (!view_region_build(server, output, view, rx, ry, rw, rh,
 					rlevels, partial ? &upd : NULL)) {
 				blur_assign(&view->fx, NULL, NULL, false, 0, NULL);
@@ -4852,6 +5080,15 @@ static void view_bake_for_output(struct vidow_server *server,
 		 * bake_output 已经稳定在 DP-3）。 */
 		struct wlr_output *saved_bake_output = view->fx.bake_output;
 		view->fx.bake_output = output->wlr_output;
+		/* 跟手探针：跨屏那一半到底有没有被对面那块屏烘一次（一行 = 一次重烘）。 */
+		if (vidow_xtrace_on() &&
+				(view->dragging || server->grab_view == view)) {
+			vidow_gtrace("bake v=%d out=%s vb=%d,%d %dx%d vm=%d,%d -> bake_scale=%.2f",
+				view->id, output->wlr_output->name, vb.x, vb.y,
+				vb.width, vb.height,
+				(int)lround(view->anim_off_x), (int)lround(view->anim_off_y),
+				output->wlr_output->scale);
+		}
 		if (vidow_xtrace_on()) {
 			wlr_log(WLR_INFO, "bakeout: view=%d out=%s vb=%d,%d %dx%d "
 				"cached[rev=%u blur=%u scale=%.2f box=%d,%d %dx%d] "
@@ -5402,14 +5639,31 @@ static bool layer_blur_frame(struct vidow_server *server,
 	}
 
 	if (with_windows) {
-		int rx = (int)lround((double)ls->geom.x * scale) - server->output_x;
-		int ry = (int)lround((double)ls->geom.y * scale) - server->output_y;
-		int levels = blur_levels_for(server, px_w, px_h);
+		/* **区域只取真正要模糊的那一块**（见 layer_region_rect）：以前是整块
+		 * geom —— quickshell 给菜单预留的透明画布也一起抓、一起跑金字塔。
+		 * rx/ry 是**这块屏**的设备像素（减的是这块屏自己的布局原点，不是
+		 * server->output_x/y：后者是最后渲染那块屏留下的全局量）。 */
+		int rx = 0, ry = 0, rw_px = px_w, rh_px = px_h, levels = 0;
+		if (!layer_region_rect(server, output, ls, &rx, &ry, &rw_px,
+				&rh_px, &levels)) {
+			return layer_blur_bail(ls, 6, "模糊区域算不出来（整块在屏外 / 太大）");
+		}
 		/* 缓存键：区域（含输出原点，多屏下会动）、世界代次（窗口重画 / layer
 		 * 变动）、级数、还有那两套直接影响结果的参数。 */
-		/* 同窗口那条路：世界代次只是粗筛，损伤盒子没碰到这一块就不重抓。 */
+		/* 同窗口那条路：世界代次只是粗筛，损伤盒子没碰到这一块就不重抓。
+		 *
+		 * 碰的是**区**域那块（rx/ry/rw/rh），不是整块 geom：quickshell 的
+		 * bar 画布 438 高、真正有内容的只有顶上 38px —— 拿 geom 判的话，
+		 * 菜单预留区里有窗口动一下照样整块重抓，区域收窄就白做了。 */
+		struct wlr_box region_logical = {
+			.x = output->box.x + (int)floor((double)rx / scale),
+			.y = output->box.y + (int)floor((double)ry / scale),
+			.width = (int)ceil((double)rw_px / scale) + 1,
+			.height = (int)ceil((double)rh_px / scale) + 1,
+		};
 		bool key_changed = ls->bd_gen_scene != server->gen_scene;
-		bool touched = key_changed && blur_damage_hits(fx, &ls->geom);
+		bool touched = key_changed &&
+			blur_damage_hits(fx, &region_logical);
 		if (getenv("VIDOW_DMG_WHY") != NULL) {
 			static int64_t lz_last;
 			int64_t lz_now = vidow_now_ns();
@@ -5440,15 +5694,32 @@ static bool layer_blur_frame(struct vidow_server *server,
 		 * 换句话说：**判据必须是「我这一块底下的像素变了吗」，不是「世界
 		 * 有没有动过」**。全局代次回答的是后一个问题，用它就会把「屏幕另一头
 		 * 某个 32x32 角上什么都没变」也判成过期。 */
+		/* 区域和缓冲尺寸都是**块感**（按 128 对齐），尺寸跟内容大小有关、跟位置
+		 * 无关：移动面板不会让缓冲重建（见 layer_region_rect）。 */
 		bool fresh = ls->bd != NULL && fx->blur_own_tex != NULL && !touched &&
-			ls->bd_w == px_w && ls->bd_h == px_h &&
+			ls->bd_w == rw_px && ls->bd_h == rh_px &&
 			ls->bd_x == rx && ls->bd_y == ry &&
-			fx->blur_set.w == px_w && fx->blur_set.h == px_h &&
+			ls->bd_levels == levels &&
+			fx->blur_set.w == rw_px && fx->blur_set.h == rh_px &&
 			fx->blur_set.levels == levels &&
 			fabs(fx->blur_set.offset - server->config.blur_offset) < 1e-6;
 		if (!fresh) {
-			if (!layer_region_build(server, output, ls, rx, ry, px_w,
-					px_h, levels)) {
+			/* 形状（区域位置尺寸 / 级数）没变：只重算受损的那一小块（见
+			 * region_update_rect）。以前 layer 这条路没有局部更新，面板底下
+			 * 一条 20px 的进度条在动，整块区域每帧重抓 + 5 趟 kawase。 */
+			bool shape_ok = ls->bd != NULL && !touched &&
+				ls->bd_w == rw_px && ls->bd_h == rh_px &&
+				ls->bd_x == rx && ls->bd_y == ry &&
+				ls->bd_levels == levels &&
+				fx->blur_set.w == rw_px && fx->blur_set.h == rh_px &&
+				fx->blur_set.levels == levels &&
+				fabs(fx->blur_set.offset - server->config.blur_offset) < 1e-6;
+			struct wlr_box upd;
+			bool partial = shape_ok && !blur_no_partial() &&
+				region_update_rect(server, fx, output, rx, ry, rw_px, rh_px,
+					&upd);
+			if (!layer_region_build(server, output, ls, rx, ry, rw_px,
+					rh_px, levels, partial ? &upd : NULL)) {
 				/* 抓不出来就留着上一帧那张，别闪 */
 				return layer_blur_bail(ls, 4, "私有底衬抓不出来");
 			}
@@ -5468,7 +5739,7 @@ static bool layer_blur_frame(struct vidow_server *server,
 		}
 		blur_assign(fx, NULL, fx->blur_own_tex, false, fx->blur_own_id,
 			&(struct wlr_box){ .x = rx, .y = ry,
-				.width = px_w, .height = px_h });
+				.width = rw_px, .height = rh_px });
 	} else {
 		/* bottom 层：用共享的那张。`set_layer` 把层改过来的话，之前抓的区域底衬
 		 * 就没用了 —— 连着金字塔一起放掉，别攥着几 MB 不放。
@@ -5486,6 +5757,15 @@ static bool layer_blur_frame(struct vidow_server *server,
 		}
 		blur_assign(fx, output->wlr_output, output->blur_tex, false, output->blur_id, NULL);
 	}
+	/* 采样原点必须记**这块屏自己**的（设备像素）：装饰着色器拿 out_* 和
+	 * blur_tex_* 算 UV，而 server->output_* 是「最后渲染的那块屏」留下的全局
+	 * 量 —— 两块屏上各有一块 bar 的时候，后渲染的那块会把原点写给先渲染的，
+	 * 先渲染那块屏上的模糊就整体错一屏宽。区域收窄之后这里错一下更明显
+	 * （会采到区域外面去），所以跟着一起补上。 */
+	fx->blur_out_w = output->wlr_output->width;
+	fx->blur_out_h = output->wlr_output->height;
+	fx->blur_out_x = (int)lround((double)output->box.x * scale);
+	fx->blur_out_y = (int)lround((double)output->box.y * scale);
 	if (ls->blur_fail != 0) {
 		ls->blur_fail = 0; /* 又能画了：下次出问题要重新报 */
 	}

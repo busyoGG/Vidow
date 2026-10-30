@@ -2084,6 +2084,9 @@ struct vidow_layer_surface {
 	struct wlr_texture *bd_tex;
 	int bd_w, bd_h;      /* 设备像素 */
 	int bd_x, bd_y;      /* 相对输出原点的位置，设备像素 */
+	/* 抓这一版时用的 kawase 级数：级数只影响链条（不影响缓冲尺寸），换了级数
+	 * 得整块重跑一遍，局部更新不能沿用上一版的像素。 */
+	int bd_levels;
 	uint64_t bd_gen_scene, bd_gen_layer; /* 抓的时候的世界代次 */
 };
 
@@ -3544,6 +3547,10 @@ void vidow_jelly_view_gone(struct vidow_view *view);
 void vidow_jelly_tick(struct vidow_server *server, int64_t now_ns);
 /* 还有窗口在弯 -> 帧循环得继续排帧（不然静止屏幕上晃到一半就停了）。 */
 bool vidow_jelly_pending(struct vidow_server *server);
+/* 果冻画出来的那块东西，比窗口本身（含阴影）大出去多少（**逻辑**像素）。
+ * 形变 + 缓冲里那圈留白都在这个数以内：擦旧位置 / 报损伤的地方按窗口框
+ * 外扩这么多才不会留下半截残影。 */
+double vidow_jelly_pad(const struct vidow_view *view);
 /* 正在显示形变结果的那个场景节点（没有就是 NULL）。抓帧遮挡要用：藏着不露的
  * 窗口拖起来的时候，画在屏幕上的其实是这个节点。 */
 struct wlr_scene_buffer *vidow_jelly_node(struct vidow_view *view);

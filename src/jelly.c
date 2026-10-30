@@ -24,9 +24,11 @@
  * （见 JELLY_DT），上限 JELLY_MAX_SUB 个子步，防止卡一下之后一次积太多。 */
 
 #include "server.h"
+#include "xtrace.h"
 
 #include <math.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include <wlr/render/pass.h>
 #include <wlr/types/wlr_scene.h>
@@ -70,6 +72,10 @@
 #define JELLY_DT        (1.0 / 240.0)
 #define JELLY_MAX_SUB   48          /* 一帧最多积分 200ms 的物理 */
 #define JELLY_STILL     1.0         /* 所有偏移小于这个 = 已经静止（逻辑像素） */
+/* 源换了一块屏的倍率之后，隔这么久才允许再换一次。跨屏那一刻两块屏各烘一份
+ * 装饰，归属屏可能在光标压边界时来回翻 —— 不加这个底线就是每帧重建一张
+ * 整窗的网格。 */
+#define JELLY_REBASE_MS 100
 #define JELLY_SETTLE_MS 700         /* 松手后最多再晃这么久 */
 #define JELLY_KILL_MS   60.0        /* 超时之后偏移按这个时间常数收掉 */
 
@@ -111,6 +117,10 @@ struct vidow_jelly {
 
 	int last_rel_x, last_rel_y; /* 源缓冲左上角在场景树里的相对位置 */
 
+	/* 上一次「按新源重建」的时刻：跨屏时归属屏的倍率一变就要重建一次（见
+	 * jelly_rebase），两块屏来回翻的瞬间别跟着每帧重建。 */
+	int64_t rebase_ns;
+
 	double strength;         /* 形变倍率（配置 jelly_strength） */
 	/* 客户端上一帧提交的表面缓冲：换了就说明内容变了，得让 fx 那条管线重画
 	 * 一次（松手之后没有指针事件，没人去催它，果冻会一直采样旧图）。 */
@@ -125,6 +135,12 @@ struct vidow_jelly {
 	struct wlr_texture *shadow_tex;
 	double base_x, base_y;   /* 上一帧底座（场景树）位置 */
 	int64_t last_ns;
+	/* 上一帧果冻在屏幕上占的那一整块（布局逻辑坐标，已按 vidow_jelly_pad
+	 * 外扩）。形变把它掰出窗口框之外，下一帧只从「窗口上一次画在哪」算损伤
+	 * 的话，掰出去又收回来的那几像素永远不会被擦 —— 拖完一回位就成了滞留
+	 * 像素。每帧**先把上一帧这块擦掉**，再记这一帧的。 */
+	struct wlr_box screen_box;
+	bool screen_box_valid;
 	int64_t release_ns;      /* 松手时刻，0 = 还在拖 */
 	double last_max_off;     /* 上一帧的最大偏移：没动就不重画 */
 	double last_sum_off;     /* 上一帧的偏移总量（形状变了也得重画） */
@@ -155,6 +171,21 @@ static struct wlr_scene_buffer *jelly_source_node(struct vidow_view *view,
 		return NULL;
 	}
 	struct vidow_blur_slot *fallback = NULL;
+	/* **先看 fx->bake_output 那一份。** 跨屏时两块屏各烘一份（按各自倍率），
+	 * 果冻的源必须和「这个窗口此刻按哪块屏的倍率画」一致 —— 那就是
+	 * bake_output（见 fx.c 里它的说明）。按 view->output 找的话，窗口刚跨到
+	 * 对面、归属还没变的那几帧取到的是旧屏那份（倍率不同），源一换果冻就
+	 * 被判成「失效」。 */
+	for (struct vidow_blur_slot *sl = fx->blur_slot; sl; sl = sl->next) {
+		if (sl->node == NULL || !sl->node->node.enabled ||
+				sl->node->buffer == NULL || !sl->dec_valid) {
+			continue;
+		}
+		if (sl->out == fx->bake_output) {
+			*scale = sl->dec_scale;
+			return sl->node;
+		}
+	}
 	for (struct vidow_blur_slot *sl = fx->blur_slot; sl; sl = sl->next) {
 		if (sl->node == NULL || !sl->node->node.enabled ||
 				sl->node->buffer == NULL || !sl->dec_valid) {
@@ -253,6 +284,12 @@ static void jelly_free(struct vidow_jelly *jelly) {
 		}
 	}
 	if (view != NULL) {
+		/* 果冻这一版在别人底衬里是「窗外多一圈」的：它没了（或者换成不弯的
+		 * 装饰节点）之后那一圈也得重抓，否则拖完 / 收尾之后屏幕上留着半截
+		 * 滞留像素。损伤盒子按**最后画过的那一整块**报。 */
+		if (!jelly->dying && jelly->screen_box_valid) {
+			vidow_backdrop_damage_box(view->server, &jelly->screen_box);
+		}
 		if (view->jelly == jelly) {
 			view->jelly = NULL;
 		}
@@ -263,6 +300,10 @@ static void jelly_free(struct vidow_jelly *jelly) {
 		view->fx.jelly = false;
 		if (!jelly->dying) {
 			vidow_view_apply_anim(view);
+			/* 它自己的私有底衬里也焊着那一版（抓的时候藏着的是这个窗口，
+			 * 形变本身不在底衬里）—— 不用重抓，但「这一块变了」得记给人
+			 * 别的窗口，下一帧它们才会把这里重新烘一遍。 */
+			vidow_backdrop_damage_view(view);
 		}
 	}
 	if (jelly->mask_owned && jelly->mask_tex != NULL) {
@@ -330,6 +371,24 @@ void vidow_jelly_view_gone(struct vidow_view *view) {
 }
 
 /* ---------------------------------------------------------------- 起手 */
+
+/* 果冻画出来的那块东西比窗口本身大多少（**逻辑**像素）。
+ *
+ * 果冻节点显示的是「整窗装饰 + 四周 JELLY_MARGIN 的形变余量」，网格弯出去
+ * 也不会超过这圈余量（jelly_step 里把偏移夹在 ±JELLY_MARGIN）。所以擦旧位置、
+ * 报「这一块变了」时按窗口框外扩这么多才是果冻真正占过的地方；只报窗口框的话
+ * 那一圈半透明留白 / 投影没人重抓，留在别的窗口底衬里就是滞留像素（用户
+ * 2026-10-30：「窗口释放的时候 背景模糊更新会有滞留像素」）。 */
+double vidow_jelly_pad(const struct vidow_view *view) {
+	if (view == NULL || view->jelly == NULL) {
+		return 0.0;
+	}
+	double pad = JELLY_MARGIN;
+	if (view->server != NULL) {
+		pad += vidow_fx_pad(view->server);
+	}
+	return pad;
+}
 
 bool vidow_jelly_begin(struct vidow_view *view) {
 	struct vidow_server *server = view->server;
@@ -490,10 +549,11 @@ bool vidow_jelly_begin(struct vidow_view *view) {
 	{
 		/* 形变范围比窗口那块大一圈（见上面 tick 里的说明）。 */
 		struct wlr_box box = vidow_view_screen_box(view);
-		box.x -= 32;
-		box.y -= 32;
-		box.width += 64;
-		box.height += 64;
+		int pad = (int)ceil(vidow_jelly_pad(view)) + 8;
+		box.x -= pad;
+		box.y -= pad;
+		box.width += 2 * pad;
+		box.height += 2 * pad;
 		vidow_backdrop_damage_box(server, &box);
 	}
 	vidow_backdrop_damage_view(view); /* 只有它自己在形变 */
@@ -788,6 +848,53 @@ static void jelly_advance(struct vidow_jelly *jelly, double base_x,
 	}
 }
 
+/* 源换了（跨屏：两块屏各烘一份装饰，倍率不同 → 缓冲尺寸 / UV 全都不一样）。
+ *
+ * 以前这里直接 vidow_jelly_end()，用户看到的就是「拖到另一块屏，果冻没了」。
+ * 现在按新源重建一张网格：网格尺寸没变的话把上一帧的弹簧状态整份搬过去
+ * （偏移 / 滞后都是**逻辑**像素，跟倍率无关），抓点也保持同一个 —— 跨屏那一刻
+ * 只是换了块源缓冲，形变看不出接缝。
+ *
+ * 两次重建之间至少隔 JELLY_REBASE_MS：光标压在屏边界上时归属屏可能来回翻。 */
+static bool jelly_rebase(struct vidow_view *view) {
+	struct vidow_jelly *old = view->jelly;
+	if (old == NULL) {
+		return false;
+	}
+	int onx = old->nx, ony = old->ny, opin = old->pin;
+	size_t on = (size_t)onx * (size_t)ony;
+	float *state = malloc(on * 6 * sizeof(float));
+	if (state == NULL) {
+		return false;
+	}
+	float *src[6] = {old->ox, old->oy, old->vx, old->vy, old->lx, old->ly};
+	for (int a = 0; a < 6; a++) {
+		memcpy(state + (size_t)a * on, src[a], on * sizeof(float));
+	}
+	double omax = old->last_max_off, osum = old->last_sum_off;
+	int64_t orel = old->release_ns;
+
+	bool ok = vidow_jelly_begin(view);
+	struct vidow_jelly *nj = view->jelly;
+	if (ok && nj != NULL && nj->nx == onx && nj->ny == ony) {
+		float *dst[6] = {nj->ox, nj->oy, nj->vx, nj->vy, nj->lx, nj->ly};
+		for (int a = 0; a < 6; a++) {
+			memcpy(dst[a], state + (size_t)a * on, on * sizeof(float));
+		}
+		if (opin >= 0 && (size_t)opin < on) {
+			nj->pin = opin;
+		}
+		nj->last_max_off = omax;
+		nj->last_sum_off = osum;
+		nj->release_ns = orel;
+	}
+	free(state);
+	if (nj != NULL) {
+		nj->rebase_ns = vidow_now_ns();
+	}
+	return nj != NULL;
+}
+
 void vidow_jelly_tick(struct vidow_server *server, int64_t now_ns) {
 	struct vidow_view *view, *tmp;
 	wl_list_for_each_safe(view, tmp, &server->views, link) {
@@ -798,11 +905,21 @@ void vidow_jelly_tick(struct vidow_server *server, int64_t now_ns) {
 		double source_scale = 1.0;
 		struct wlr_scene_buffer *source = jelly_source_node(view, &source_scale);
 		/* Validate the same instance we sample, not the last output baked. */
-		if (!view->mapped || view->scene_tree == NULL || source == NULL ||
-				source->buffer->width != jelly->src_w ||
+		if (!view->mapped || view->scene_tree == NULL || source == NULL) {
+			vidow_jelly_end(view);
+			continue;
+		}
+		if (source->buffer->width != jelly->src_w ||
 				source->buffer->height != jelly->src_h ||
 				fabs(source_scale - jelly->scale) > 1e-3) {
-			vidow_jelly_end(view);
+			/* 源换了一块屏的倍率（跨屏）：按新源重建，别把果冻收掉
+			 * （见 jelly_rebase）。刚重建过就再换 = 光标压在边界上、
+			 * 归属屏在翻，这时候重建也是每帧白费，直接收手。 */
+			if (now_ns - jelly->rebase_ns <
+					(int64_t)JELLY_REBASE_MS * 1000000LL ||
+					!jelly_rebase(view)) {
+				vidow_jelly_end(view);
+			}
 			continue;
 		}
 
@@ -849,6 +966,19 @@ void vidow_jelly_tick(struct vidow_server *server, int64_t now_ns) {
 		wlr_scene_node_set_position(&jelly->node->node,
 			jelly->last_rel_x - (int)lround(JELLY_MARGIN),
 			jelly->last_rel_y - (int)lround(JELLY_MARGIN));
+		/* 跟手探针（touch /tmp/vidow-x11-trace 开）：果冻节点到底摆在哪、
+		 * 源节点在哪、树在哪。拖动时窗口看着不动就是这三者里有一个没跟上。 */
+		if (vidow_xtrace_on()) {
+			int jn_x = 0, jn_y = 0, tr_x = 0, tr_y = 0;
+			wlr_scene_node_coords(&jelly->node->node, &jn_x, &jn_y);
+			wlr_scene_node_coords(&view->scene_tree->node, &tr_x, &tr_y);
+			vidow_gtrace("jelly v=%d tree=%d,%d src=%d,%d rel=%d,%d "
+				"node=%d,%d rel_now=%d,%d off=%.0f,%.0f scale=%.2f",
+				view->id, tx, ty, fx_x, fx_y,
+				jelly->last_rel_x, jelly->last_rel_y, jn_x, jn_y,
+				jelly->node->node.x, jelly->node->node.y,
+				view->anim_off_x, view->anim_off_y, jelly->scale);
+		}
 
 		/* 客户端提交了新内容：让装饰那趟重画一次，果冻采到的才是新图。 */
 		struct wlr_buffer *cur =
@@ -858,6 +988,22 @@ void vidow_jelly_tick(struct vidow_server *server, int64_t now_ns) {
 			jelly->src_surface_buffer = cur;
 			vidow_view_apply_anim(view);
 		}
+
+		/* 上一帧占过的地方先擦一遍：窗口移动时，形变掰出去的像素可能比这一帧
+		 * 更靠外，只从「窗口现在在这」算损伤那块擦不到（见 struct 里
+		 * screen_box 的说明）。盒子没变就不用报。 */
+		struct wlr_box sbox = vidow_view_screen_box(view);
+		int spad = (int)ceil(vidow_jelly_pad(view)) + 8;
+		sbox.x -= spad;
+		sbox.y -= spad;
+		sbox.width += 2 * spad;
+		sbox.height += 2 * spad;
+		if (jelly->screen_box_valid &&
+				!wlr_box_equal(&jelly->screen_box, &sbox)) {
+			vidow_backdrop_damage_box(server, &jelly->screen_box);
+		}
+		jelly->screen_box = sbox;
+		jelly->screen_box_valid = true;
 
 		jelly_advance(jelly, (double)tx, (double)ty, dt);
 
@@ -906,10 +1052,12 @@ void vidow_jelly_tick(struct vidow_server *server, int64_t now_ns) {
 		jelly->base_drawn_y = ty;
 		if (moved) {
 			/* 网格在动 -> 别的窗口背后的模糊底衬要重抓（和拖拽时那一下一样）；
-			 * 它自己的私有底衬不受影响（抓的时候它藏着）。损伤范围比窗口那块大
-			 * 一圈：内容被掰弯了，最远弯出去 max_off 那么多。 */
+			 * 它自己的私有底衬不受影响（抓的时候它藏着）。损伤范围按「果冻
+			 * 实际占过的那一整块」报（窗口框外扩 vidow_jelly_pad）—— 只按
+			 * max_off 外扩的话，那圈留白 / 投影从来没被擦过：拖完一回位，
+			 * 曾过界过的点上就留着半截像素。 */
 			struct wlr_box box = vidow_view_screen_box(view);
-			int pad = (int)max_off + 8;
+			int pad = (int)ceil(vidow_jelly_pad(view)) + 8;
 			box.x -= pad;
 			box.y -= pad;
 			box.width += 2 * pad;

@@ -3961,6 +3961,13 @@ static void view_move_update(void *data, double t, double linear) {
 	struct vidow_view *view = data;
 	/* 滑动两端都算损伤：漏了老位置，别的窗口底衬里会留着它上一帧的残影。 */
 	struct wlr_box rest = view->geom;
+	/* 果冻还在收尾（松手之后那几百毫秒）：屏幕上画的是果冻节点，比窗口框
+	 * 大一圈 —— 损伤得按它算（见 jelly.c 的 vidow_jelly_pad）。 */
+	double rest_pad = vidow_jelly_pad(view) + 8.0;
+	rest.x -= (int)rest_pad;
+	rest.y -= (int)rest_pad;
+	rest.width += 2 * (int)rest_pad;
+	rest.height += 2 * (int)rest_pad;
 	view->anim_off_x = view->anim_from_x * (1.0 - t);
 	view->anim_off_y = view->anim_from_y * (1.0 - t);
 	vidow_backdrop_damage_box(view->server, &rest);
@@ -4249,7 +4256,15 @@ void vidow_place_view(struct vidow_view *view, int x, int y, int w, int h) {
 	 * 只记新位置的话，一步跳出去老远（拖得快、或者工作区切换）就漏掉了老位置
 	 * 那一块，别的窗口底衬里会留着它的残影。 */
 	if (moved || resized || !view->placed) {
-		vidow_backdrop_damage_box(view->server, &before);
+		/* 果冻还在收尾（拖完松手那一小段）：屏幕上画的是果冻节点，比窗口
+		 * 框大一圈，老位置要按它算（见 jelly.c 的 vidow_jelly_pad）。 */
+		double bpad = vidow_jelly_pad(view) + 8.0;
+		struct wlr_box old = before;
+		old.x -= (int)bpad;
+		old.y -= (int)bpad;
+		old.width += 2 * (int)bpad;
+		old.height += 2 * (int)bpad;
+		vidow_backdrop_damage_box(view->server, &old);
 		vidow_backdrop_damage_view(view);
 	}
 	wlr_log(WLR_DEBUG, "place %s -> %d,%d %dx%d",

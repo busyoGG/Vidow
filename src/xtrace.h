@@ -13,6 +13,15 @@
 /* X11/XWM 全链路追踪。 */
 bool vidow_xtrace_on(void);
 
+/* 拖拽跟手探针：位置这条链（grab -> place -> bake -> fx 摆节点）逐帧写进
+ *     /tmp/vidow-grab-trace.log
+ * **不走 wlr_log**：这个会话的 stderr 重定向到 wayland-session.log，stdio 全缓冲
+ * —— 拖动时那几十行可能很久都不落盘，排查时看着像「什么都没发生」（实测 03:39
+ * 之后一行没有）。这里每次 append 打开 / 关闭，写完就在文件里，tail -f 就能看。
+ * 调用点自己判 vidow_xtrace_on()，所以 touch /tmp/vidow-x11-trace 就是全开。 */
+void vidow_gtrace(const char *fmt, ...)
+	__attribute__((format(printf, 1, 2)));
+
 /* 客户端交帧探针（view_commit 里每 60 次 commit 一行）。
  *
  * 原神这类满速提交的 X11 游戏跑 160fps，无条件打就是每秒 2.7 行、一天

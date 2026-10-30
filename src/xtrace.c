@@ -1,5 +1,7 @@
 #include "xtrace.h"
 
+#include <stdarg.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -39,3 +41,22 @@ bool vidow_xtrace_on(void) {
 	cached = stat(VIDOW_XTRACE_FILE, &st) == 0;
 	return cached;
 }
+
+/* 拖拽跟手探针（见头文件里的说明）：单独一个文件，写完就落盘。 */
+void vidow_gtrace(const char *fmt, ...) {
+	FILE *f = fopen("/tmp/vidow-grab-trace.log", "a");
+	if (f == NULL) {
+		return;
+	}
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	fprintf(f, "%ld.%03ld ", (long)ts.tv_sec,
+		(long)(ts.tv_nsec / 1000000));
+	va_list ap;
+	va_start(ap, fmt);
+	vfprintf(f, fmt, ap);
+	va_end(ap);
+	fputc('\n', f);
+	fclose(f);
+}
+
