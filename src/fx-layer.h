@@ -9,6 +9,10 @@
 
 #include <stdbool.h>
 
+/* 每帧入口：这块 layer 的模糊要不要画、画哪一份（缓存命中就只摆节点）。 */
+bool layer_blur_frame(struct vidow_server *server,
+	struct vidow_output *output, struct vidow_layer_surface *ls);
+
 /* 这块 layer 现在要不要模糊（配置 + 规则 + 可见性）。 */
 bool layer_blur_wanted(struct vidow_server *server,
 	struct vidow_layer_surface *ls);

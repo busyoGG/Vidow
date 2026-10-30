@@ -371,3 +371,109 @@ void vidow_backdrop_damage_view_rect(struct vidow_view *view,
 void vidow_backdrop_damage_view(struct vidow_view *view) {
 	vidow_backdrop_damage_view_rect(view, NULL);
 }
+
+/* ------------------------------------------------------- 局部重跑的范围 */
+
+/* 「只重跑受损那一小块」的开关：默认开。设了 VIDOW_BLUR_NO_PARTIAL 就整块重跑；
+ * VIDOW_BLUR_NO_PARTIAL_FILE 指的文件一出现也整块重跑（跑着跑着切过去，用来比对
+ * 「同一个场景、同一个客户端、同一个进程」下局部和整块的输出 —— 见
+ * test-blurpartial.sh）。都只给 A/B 比对用。
+ *
+ * 两个 getenv 各只问一次（每次重抓都要问一遍：一帧里四五个元素重抓就是十来次；
+ * getenv 在 profile 里比我们自己的模糊代码还显眼）。**文件存在性每次都看** ——
+ * test-blurpartial.sh 就是跑着跑着把文件建出来切过去的。 */
+/* 渲染热路径上的两个探针开关，只问一次环境变量。
+ *
+ * 它们都在「每帧 × 每个窗口」的函数里（view_region_build 的模糊重跑、
+ * decor_draw 的 span），原神那种 160fps 满速提交下 getenv 的 environ
+ * 线性扫描每秒上千次。环境变量进程起来之后不会变，缓存住就行 —— 和
+ * 本文件上面 scanout_off / blur_no_partial 一个规矩。 */
+
+bool blur_trace_on(void) {
+	static int done = 0, on = 0;
+	if (!done) {
+		on = getenv("VIDOW_BLUR_TRACE") != NULL ? 1 : 0;
+		done = 1;
+	}
+	return on != 0;
+}
+
+bool span_trace_on(void) {
+	static int done = 0, on = 0;
+	if (!done) {
+		on = getenv("VIDOW_SPAN_TRACE") != NULL ? 1 : 0;
+		done = 1;
+	}
+	return on != 0;
+}
+
+bool blur_no_partial(void) {
+	static int on = -1;
+	static int file_read = 0;
+	static const char *file = NULL;
+	if (on < 0) {
+		on = getenv("VIDOW_BLUR_NO_PARTIAL") != NULL ? 1 : 0;
+	}
+	if (!file_read) {
+		file = getenv("VIDOW_BLUR_NO_PARTIAL_FILE");
+		file_read = 1;
+	}
+	if (on != 0) {
+		return true;
+	}
+	return file != NULL && access(file, F_OK) == 0;
+}
+
+/* 这次重抓**只需要动**的那一块（区域局部设备像素）：攒下来的损伤盒子跟区域相交
+ * 的那部分的并集（往外放 2 像素，抵掉逻辑->设备的取整）。返回 false = 用不上，
+ * 调用方整块重跑：
+ *   - 一笔都没相交（不该走到这儿，防御）；
+ *   - 损伤盖住了区域的一大半（>= 60%）：局部省不了多少，整块重跑还简单些。 */
+bool region_update_rect(struct vidow_server *server,
+		struct vidow_fx_target *fx, struct vidow_output *output,
+		int rx, int ry, int rw, int rh, struct wlr_box *out) {
+	double scale = output->wlr_output->scale;
+	if (!(scale > 0.0)) {
+		scale = 1.0;
+	}
+	const struct vidow_dmg_set *set = &fx->pending_damage;
+	struct wlr_box u = {0};
+	for (int i = 0; i < set->n; i++) {
+		const struct wlr_box *b = &set->box[i];
+		/* 布局逻辑坐标 -> 这块屏的设备像素（减去这块屏的布局原点）-> 区域局部 */
+		double lx = (double)(b->x - output->box.x) * scale;
+		double ly = (double)(b->y - output->box.y) * scale;
+		double hx = (double)(b->x + b->width - output->box.x) * scale;
+		double hy = (double)(b->y + b->height - output->box.y) * scale;
+		struct wlr_box one = {
+			.x = (int)floor(lx) - rx - 2,
+			.y = (int)floor(ly) - ry - 2,
+			.width = (int)ceil(hx) - (int)floor(lx) + 4,
+			.height = (int)ceil(hy) - (int)floor(ly) + 4,
+		};
+		blur_box_add(&u, &one);
+	}
+	if (u.width <= 0 || u.height <= 0) {
+		return false;
+	}
+	bool clip_ok = true;
+	wlr_scene_node_for_each_buffer(&server->layer_toplevels->node,
+		backdrop_clip_check, &clip_ok);
+	if (!clip_ok) {
+		return false;
+	}
+	int x1 = u.x < 0 ? 0 : u.x;
+	int y1 = u.y < 0 ? 0 : u.y;
+	int x2 = u.x + u.width > rw ? rw : u.x + u.width;
+	int y2 = u.y + u.height > rh ? rh : u.y + u.height;
+	if (x2 <= x1 || y2 <= y1) {
+		return false;
+	}
+	if ((int64_t)(x2 - x1) * (y2 - y1) * 10 >= (int64_t)rw * rh * 6) {
+		return false; /* 盖住大半了：整块重跑 */
+	}
+	*out = (struct wlr_box){
+		.x = x1, .y = y1, .width = x2 - x1, .height = y2 - y1,
+	};
+	return true;
+}

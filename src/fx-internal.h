@@ -120,6 +120,21 @@ void blur_mask_min_changed(struct vidow_fx_target *fx, double alpha_min);
 void blur_drop(struct vidow_output *output);
 void layer_bd_drop(struct vidow_layer_surface *ls);
 
+/* ------------------------------------------------------------ 局部重跑的范围 */
+
+/* 只重跑受损那一小块（VIDOW_BLUR_NO_PARTIAL / _FILE 关掉就整块重跑）。 */
+bool blur_no_partial(void);
+bool blur_trace_on(void);
+bool span_trace_on(void);
+/* 损伤账本里落在 (rx,ry,rw,rh) 这块私有底衬上的那一块（设备像素，底衬坐标系）。
+ * 返回 false = 整个盒子都得重跑（损伤盖住大半 / 没有账）。 */
+bool region_update_rect(struct vidow_server *server,
+	struct vidow_fx_target *fx, struct vidow_output *output,
+	int rx, int ry, int rw, int rh, struct wlr_box *out);
+
+/* 0..1 的夹取（透明度这类「过冲会崩」的值走它）。 */
+float clamp01(double v);
+
 /* ---------------------------------------------------------------- 调试探针 */
 
 int blur_dump_limit(void);

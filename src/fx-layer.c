@@ -8,6 +8,7 @@
 #include "server.h"
 #include "fx-internal.h"
 #include "fx-layer.h"
+#include "fx-gl.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -820,4 +821,269 @@ void vidow_layer_blur_release(struct vidow_layer_surface *ls) {
 	ls->fx.blur_tex_h = 0;
 	/* 抓来的那块区域底衬也得跟着走，否则 layer 没了还占着一张整块大小的缓冲。 */
 	layer_bd_drop(ls);
+}
+
+bool layer_blur_frame(struct vidow_server *server,
+		struct vidow_output *output, struct vidow_layer_surface *ls) {
+	struct vidow_fx_target *fx = &ls->fx;
+
+	if (ls->scene == NULL) {
+		return layer_blur_bail(ls, 1, "没有场景节点");
+	}
+
+	/* 恒等映射：layer 的元素就是整块缓冲，没有「窗口几何」那层偏移（窗口那一
+	 * 路走 vidow_fx_frame，每帧按可见窗口覆盖这几个字段）。这一路不经过
+	 * vidow_fx_begin，字段默认是 0 —— 不设就是拿 texel (0,0) 当整块用。 */
+	fx->tex_off_x = 0.0f;
+	fx->tex_off_y = 0.0f;
+	fx->tex_scale_x = 1.0f;
+	fx->tex_scale_y = 1.0f;
+	fx->mask_off_x = 0.0f;
+	fx->mask_off_y = 0.0f;
+	fx->mask_scale_x = 1.0f;
+	fx->mask_scale_y = 1.0f;
+	fx->mask_min = 0.0f;
+	blur_mask_min_changed(fx, server->config.blur_alpha_min);
+	/* bottom 层先于窗口画，它底下没有窗口：共享的那张底衬就是它要的全部。top /
+	 * overlay 层底下有窗口，得自己抓一小块（见 layer_region_build）。 */
+	bool with_windows = ls->layer != ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM;
+	if (with_windows ? output->backdrop_tex == NULL : output->blur_tex == NULL) {
+		return layer_blur_bail(ls, 2, with_windows ?
+			"这块屏的共享底衬（backdrop_tex）还没建" :
+			"这块屏的壁纸底衬（blur_tex）还没建");
+	}
+	double scale = output->wlr_output->scale;
+	if (!(scale > 0.0)) {
+		scale = 1.0;
+	}
+	int logical_w = ls->geom.width, logical_h = ls->geom.height;
+	int px_w = (int)lround((double)logical_w * scale);
+	int px_h = (int)lround((double)logical_h * scale);
+	if (px_w < 1 || px_h < 1 || px_w > MAX_TARGET_PX || px_h > MAX_TARGET_PX) {
+		return layer_blur_bail(ls, 3, "设备像素尺寸越界");
+	}
+
+	if (fx->node == NULL) {
+		fx->node = wlr_scene_buffer_create(ls->scene->tree, NULL);
+		if (fx->node == NULL) {
+			return false;
+		}
+		fx->node->point_accepts_input = fx_node_rejects_input;
+		/* 垫在 layer surface 自己那个节点下面。 */
+		wlr_scene_node_lower_to_bottom(&fx->node->node);
+	}
+	fx->blur_only = true;
+	fx->active = true;
+	/* 着色器里 u_blur_strength 看的是 fx->blur（窗口那条路是 vidow_fx_begin
+	 * 设的），这儿得自己开：不开就是垫了一张全透明的东西，什么都看不见。 */
+	fx->blur = true;
+
+	if (fx->buf[0] == NULL || fx->w != px_w || fx->h != px_h ||
+			fabs(fx->scale - scale) > 1e-3) {
+		drop_targets(fx);
+		for (int i = 0; i < 2; i++) {
+			fx->buf[i] = vidow_alloc_target(server, px_w, px_h);
+			if (fx->buf[i] == NULL) {
+				drop_targets(fx);
+				return layer_blur_bail(ls, 5, "分配离屏目标失败");
+			}
+		}
+		fx->w = px_w;
+		fx->h = px_h;
+		fx->content_w = px_w;
+		fx->content_h = px_h;
+		fx->px_pad = 0;
+		fx->dst_w = logical_w;
+		fx->dst_h = logical_h;
+		fx->scale = scale;
+		fx->blur_drawn = 0; /* 尺寸变了，必须重画 */
+	}
+
+	if (with_windows) {
+		/* **区域只取真正要模糊的那一块**（见 layer_region_rect）：以前是整块
+		 * geom —— quickshell 给菜单预留的透明画布也一起抓、一起跑金字塔。
+		 * rx/ry 是**这块屏**的设备像素（减的是这块屏自己的布局原点，不是
+		 * server->output_x/y：后者是最后渲染那块屏留下的全局量）。 */
+		int rx = 0, ry = 0, rw_px = px_w, rh_px = px_h, levels = 0;
+		if (!layer_region_rect(server, output, ls, &rx, &ry, &rw_px,
+				&rh_px, &levels)) {
+			return layer_blur_bail(ls, 6, "模糊区域算不出来（整块在屏外 / 太大）");
+		}
+		/* 缓存键：区域（含输出原点，多屏下会动）、世界代次（窗口重画 / layer
+		 * 变动）、级数、还有那两套直接影响结果的参数。 */
+		/* 同窗口那条路：世界代次只是粗筛，损伤盒子没碰到这一块就不重抓。
+		 *
+		 * 碰的是**区**域那块（rx/ry/rw/rh），不是整块 geom：quickshell 的
+		 * bar 画布 438 高、真正有内容的只有顶上 38px —— 拿 geom 判的话，
+		 * 菜单预留区里有窗口动一下照样整块重抓，区域收窄就白做了。 */
+		struct wlr_box region_logical = {
+			.x = output->box.x + (int)floor((double)rx / scale),
+			.y = output->box.y + (int)floor((double)ry / scale),
+			.width = (int)ceil((double)rw_px / scale) + 1,
+			.height = (int)ceil((double)rh_px / scale) + 1,
+		};
+		bool key_changed = ls->bd_gen_scene != server->gen_scene;
+		bool touched = key_changed &&
+			blur_damage_hits(fx, &region_logical);
+		if (getenv("VIDOW_DMG_WHY") != NULL) {
+			static int64_t lz_last;
+			int64_t lz_now = vidow_now_ns();
+			if (lz_now - lz_last > 200000000LL) {
+				lz_last = lz_now;
+				wlr_log(WLR_INFO, "LAYERBLUR geom=%dx%d%+d%+d px=%dx%d "
+					"touched=%d key=%d out=%s", logical_w, logical_h,
+					ls->geom.x, ls->geom.y, px_w, px_h, (int)touched,
+					(int)key_changed, output->wlr_output->name);
+			}
+		}
+		/* **判据里不再看 gen_layer**（只有损伤盒子算数）。
+		 *
+		 * 原来这里还要求「抓的时候的 gen_layer == 现在的 gen_layer」，而
+		 * gen_layer 是**全局**的：任何一次 layer 变化（上屏 / 下屏 / 壁纸换 /
+		 * %background% 重画）都会让它 +1，于是屏幕上**每一块** layer 的私有
+		 * 底衬一起作废、一起重抓。
+		 *
+		 * 代价实测：noctalia 那 8 块 32x32 的角层（noctalia-screen-corner）
+		 * 每帧都在重抓 —— BLURVER 探针统计 ~2000 次/秒的 blur_ver 推进，
+		 * 渲染统计里「贴图 +12/-0」的纹理反复建删就是它，静止桌面白烧 CPU。
+		 *
+		 * 而 gen_layer 真正想表达的那些变化**都已经记了损伤**：
+		 * vidow_backdrop_damage / vidow_backdrop_damage_output 都调
+		 * blur_note_damage，把整屏（或那块屏）的盒子记到每个 layer 头上 ——
+		 * 所以 touched 那一条已经覆盖了它们。留下 gen_layer 只是纯churn。
+		 *
+		 * 换句话说：**判据必须是「我这一块底下的像素变了吗」，不是「世界
+		 * 有没有动过」**。全局代次回答的是后一个问题，用它就会把「屏幕另一头
+		 * 某个 32x32 角上什么都没变」也判成过期。 */
+		/* 区域和缓冲尺寸都是**块感**（按 128 对齐），尺寸跟内容大小有关、跟位置
+		 * 无关：移动面板不会让缓冲重建（见 layer_region_rect）。 */
+		bool fresh = ls->bd != NULL && fx->blur_own_tex != NULL && !touched &&
+			ls->bd_w == rw_px && ls->bd_h == rh_px &&
+			ls->bd_x == rx && ls->bd_y == ry &&
+			ls->bd_levels == levels &&
+			fx->blur_set.w == rw_px && fx->blur_set.h == rh_px &&
+			fx->blur_set.levels == levels &&
+			fabs(fx->blur_set.offset - server->config.blur_offset) < 1e-6;
+		if (!fresh) {
+			/* 形状（区域位置尺寸 / 级数）没变：只重算受损的那一小块（见
+			 * region_update_rect）。以前 layer 这条路没有局部更新，面板底下
+			 * 一条 20px 的进度条在动，整块区域每帧重抓 + 5 趟 kawase。 */
+			bool shape_ok = ls->bd != NULL && !touched &&
+				ls->bd_w == rw_px && ls->bd_h == rh_px &&
+				ls->bd_x == rx && ls->bd_y == ry &&
+				ls->bd_levels == levels &&
+				fx->blur_set.w == rw_px && fx->blur_set.h == rh_px &&
+				fx->blur_set.levels == levels &&
+				fabs(fx->blur_set.offset - server->config.blur_offset) < 1e-6;
+			struct wlr_box upd;
+			bool partial = shape_ok && !blur_no_partial() &&
+				region_update_rect(server, fx, output, rx, ry, rw_px, rh_px,
+					&upd);
+			if (!layer_region_build(server, output, ls, rx, ry, rw_px,
+					rh_px, levels, partial ? &upd : NULL)) {
+				/* 抓不出来就留着上一帧那张，别闪 */
+				return layer_blur_bail(ls, 4, "私有底衬抓不出来");
+			}
+			/* **底衬重抓了 = 内容变了，必须重画这一版。**
+			 *
+			 * 别指望下面的 blur_assign() 顺手把 blur_ver 推上去：它只在
+			 * 「贴图 / id / 区域」变了时才 ++，而重抓底衬恰恰不换这两样
+			 * （同一张 blur_own_tex、同一块区域，只是里面的像素是新的）。
+			 * 不在这儿显式 ++ 的话，后面 blur_drawn == blur_ver 立刻成立、
+			 * 直接 return true —— 底下窗口 / 壁纸变了，layer 背后的模糊还是
+			 * 旧的那一张（用户报的「layer 的 blur 好像很容易不更新」）。
+			 *
+			 * 窗口那条路没这个问题：view_region_build 走完，blur_assign
+			 * 拿到的是新的 blur_own_id（每次重抓都换号），自然会 ++。 */
+			fx->blur_ver++;
+			blur_ver_hits[5360]++;
+		}
+		blur_assign(fx, NULL, fx->blur_own_tex, false, fx->blur_own_id,
+			&(struct wlr_box){ .x = rx, .y = ry,
+				.width = rw_px, .height = rh_px });
+	} else {
+		/* bottom 层：用共享的那张。`set_layer` 把层改过来的话，之前抓的区域底衬
+		 * 就没用了 —— 连着金字塔一起放掉，别攥着几 MB 不放。
+		 *
+		 * 加 if 守卫：这个分支**每帧**都走，无守卫就是每帧白跑一遍 6 次赋值
+		 * （把已经归零的字段再写一遍）。它真正要干的只有「刚从 top/overlay
+		 * 切过来」那一次。 */
+		if (fx->blur_own_tex != NULL) {
+			blur_own_drop(fx);
+		}
+		/* 缓冲和包着它的贴图要一起收：只 drop buffer 会把 ls->bd_tex
+		 * 留成一张悬空贴图（layer 从 top/overlay 切到 bottom 时漏的就是它）。 */
+		if (ls->bd != NULL || ls->bd_tex != NULL) {
+			layer_bd_drop(ls);
+		}
+		blur_assign(fx, output->wlr_output, output->blur_tex, false, output->blur_id, NULL);
+	}
+	/* 采样原点必须记**这块屏自己**的（设备像素）：装饰着色器拿 out_* 和
+	 * blur_tex_* 算 UV，而 server->output_* 是「最后渲染的那块屏」留下的全局
+	 * 量 —— 两块屏上各有一块 bar 的时候，后渲染的那块会把原点写给先渲染的，
+	 * 先渲染那块屏上的模糊就整体错一屏宽。区域收窄之后这里错一下更明显
+	 * （会采到区域外面去），所以跟着一起补上。 */
+	fx->blur_out_w = output->wlr_output->width;
+	fx->blur_out_h = output->wlr_output->height;
+	fx->blur_out_x = (int)lround((double)output->box.x * scale);
+	fx->blur_out_y = (int)lround((double)output->box.y * scale);
+	if (ls->blur_fail != 0) {
+		ls->blur_fail = 0; /* 又能画了：下次出问题要重新报 */
+	}
+	if (fx->blur_drawn == fx->blur_ver) {
+		return true; /* 已经画的就是这一版 */
+	}
+
+	struct wlr_buffer *target = pick_free(fx->buf);
+	if (target == NULL) {
+		return false;
+	}
+	static const float no_border[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+	/* 元素自己的内容，给透明度剔除当 mask：模糊只画在 layer surface 真的有内容的
+	 * 地方，它自己透明的内边距 / 圆角外不再透出一圈模糊。取的是 surface 当前的
+	 * 缓冲；层的 geom 就是 surface 的尺寸（layer.c 的 arrange 就那么算的），所以
+	 * uv 跟内容那趟完全一致，不用另算映射。拿不到（还没 commit 过）就让 mask_min
+	 * 归零 —— 也就是整块都糊，退回老行为而不是把模糊整块剔没。
+	 *
+	 * 代价：这是 surface 的**主**缓冲，不含子表面 —— 一个用子表面画内容的层，那
+	 * 部分会被剔掉（少见；要精确就得像 niri 那样把整棵子树离屏渲一张 alpha 纹理）。 */
+	struct wlr_texture *mask = NULL;
+	struct wlr_client_buffer *cbuf = ls->layer_surface->surface->buffer;
+	if (cbuf != NULL) {
+		mask = wlr_texture_from_buffer(server->renderer,
+			render_source(&cbuf->base));
+	}
+	/* VIDOW_MASK_DUMP=N：把前 N 份 mask（就是下面递给着色器的这张 layer 自己的
+	 * 内容）dump 成裸数据，用来量「元素自己透明的地方到底剔没剔」。 */
+	static int mask_dumped = 0;
+	static int mask_limit = -1;
+	if (mask_limit < 0) {
+		const char *env = getenv("VIDOW_MASK_DUMP");
+		mask_limit = env != NULL ? atoi(env) : 0;
+	}
+	if (mask != NULL && mask_dumped < mask_limit) {
+		dump_buffer(server, &cbuf->base, px_w, px_h, "vidow-mask",
+			mask_dumped);
+		mask_dumped++;
+	}
+	struct vidow_look ls_look;
+	vidow_rule_look(&server->config, &ls->rule_eff, &ls_look);
+	decor_draw(server, fx, target, server->empty_tex, mask, no_border,
+		ls->geom.x, ls->geom.y, 1.0, scale, &ls_look);
+	if (mask != NULL) {
+		wlr_texture_destroy(mask);
+	}
+
+	wlr_scene_node_set_position(&fx->node->node, 0, 0);
+	wlr_scene_buffer_set_dest_size(fx->node, logical_w, logical_h);
+	/* 同上：layer surface 也会被抓帧遮挡压着。 */
+	wlr_scene_buffer_set_opacity(fx->node, fx->masked ? 0.0f : 1.0f);
+	pixman_region32_t damage;
+	pixman_region32_init_rect(&damage, 0, 0, logical_w, logical_h);
+	wlr_scene_buffer_set_buffer_with_damage(fx->node, target, &damage);
+	pixman_region32_fini(&damage);
+	wlr_scene_node_set_enabled(&fx->node->node, true);
+
+	fx->blur_drawn = fx->blur_ver;
+	return true;
 }
