@@ -3629,6 +3629,14 @@ int vidow_workspace_preview_layout(struct vidow_server *server,
 struct vp_anim {
 	struct vidow_server *server;
 	struct vidow_output *output;
+	/* 自己这条动画（vidow_anim_start 的返回值）。done 回调要靠它判断
+	 * 「field 里挂的还是不是我」：改道路径（见 output_arrange 的
+	 * viewport_want_slide 分支）是先把 field 换成新动画再 cancel 旧的，
+	 * 而在动画 tick 外面 cancel 会**同步**调 done —— 无条件清 field 会把
+	 * 刚起好的新动画的引用抹掉，之后 arrange 看到 NULL 就把视口瞬移到
+	 * 终点（用户 2026-10-30：「没有完成过渡动画的时候再切换聚焦会直接
+	 * 瞬移」）。 */
+	struct vidow_anim *anim;
 };
 
 static void viewport_anim_update(void *data, double t, double linear) {
@@ -3699,7 +3707,12 @@ static void viewport_anim_done(void *data, bool cancelled) {
 		if (!cancelled) {
 			vidow_arrange(a->server);
 		}
-		a->output->viewport_anim = NULL;
+		/* 只在 field 还挂着**自己**的时候清：改道路径已经把 field 换成
+		 * 新动画了（cancel 旧的会同步走到这里），清掉就是抹掉新动画 ——
+		 * 之后 arrange 视口瞬移到终点。 */
+		if (a->output->viewport_anim == a->anim) {
+			a->output->viewport_anim = NULL;
+		}
 	}
 	free(a);
 }
@@ -3759,6 +3772,7 @@ static void viewport_slide(struct vidow_server *server,
 	output->viewport_anim_to = to;
 	output->viewport_anim = vidow_anim_start(server, "视口滚动", dur, curve,
 		viewport_anim_update, viewport_anim_done, a);
+	a->anim = output->viewport_anim;
 	if (output->viewport_anim == NULL) {
 		output->viewport_x = to;
 		free(a);
