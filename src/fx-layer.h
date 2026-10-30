@@ -18,6 +18,14 @@ bool layer_blur_visible(struct vidow_layer_surface *ls);
 bool layer_region_rect(struct vidow_server *server,
 	struct vidow_output *output, struct vidow_layer_surface *ls,
 	int *rx, int *ry, int *rw, int *rh, int *levels);
+/* 抓底衬时把每块 layer 的模糊节点 / 它本体一起藏起来（on=false），画完再回填。
+ * 不藏就是「自己糊自己」：半透明的地方透出这块面板自己的糊版。 */
+void layer_blur_capture_visible(struct vidow_server *server, bool on);
+
+/* overview 里那张糊掉的壁纸（整屏，垫在压暗遮罩下面）。 */
+void vidow_overview_blur_frame(struct vidow_server *server,
+	struct vidow_output *output);
+
 /* 这一帧要不要把「layer 之下」抓一次给所有层共用（区域互相压住才值得）。 */
 void layer_under_plan(struct vidow_server *server,
 	struct vidow_output *output);

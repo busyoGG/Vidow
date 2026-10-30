@@ -56,6 +56,24 @@ bool backdrop_render(struct vidow_server *server, struct vidow_output *output,
 struct wlr_texture *stat_tex_new(struct wlr_texture *t);
 void stat_tex_del(struct wlr_texture *t);
 
+/* 一行 buffer → 贴图。客户端缓冲自己带纹理时直接借（*owned = false），
+ * 否则导入一张（*owned = true，调用方负责销毁）。 */
+struct wlr_texture *client_texture(struct wlr_renderer *renderer,
+	struct wlr_buffer *buffer, bool *owned);
+
+/* 装饰着色器那一趟：把 src 按 look 画进 dst，配上模糊纹理 / 圆角 / 边框。
+ *
+ * 名字叫「装饰」，但三份消费者都用它来出图：窗口装饰、layer 背后的模糊、
+ * 弹出物背后的模糊、overview 壁纸。mask 非空时按它的 alpha 剔。 */
+bool decor_draw(struct vidow_server *server, struct vidow_fx_target *fx,
+	struct wlr_buffer *dst, struct wlr_texture *src,
+	struct wlr_texture *mask, const float border[4], int ox, int oy,
+	double alpha, double scale, const struct vidow_look *look);
+
+/* 模糊节点不吃输入（点了要穿到下面的窗口）。 */
+bool fx_node_rejects_input(struct wlr_scene_buffer *buffer, double *sx,
+	double *sy);
+
 /* ---------------------------------------------------------------- 损伤账本 */
 
 void blur_box_add(struct wlr_box *dst, const struct wlr_box *src);
@@ -109,6 +127,8 @@ bool ov_stats_on(void);
 bool scanout_off(void);
 
 extern uint64_t blur_frame_seq;
+/* 「谁让 blur_ver 涨的」计数器（下标是调用点行号，见 vidow_fx_dump_blur_ver_hits）。 */
+extern int blur_ver_hits[6400];
 extern uint64_t ov_n, ov_ns;
 
 #endif

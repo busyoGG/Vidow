@@ -193,6 +193,7 @@ sources = files(
   'src/anim.c',
   'src/fx.c',
   'src/fx-layer.c',
+  'src/fx-popup.c',
   'src/exec.c',
   'src/script.c',
   'src/configwatch.c',
