@@ -2478,28 +2478,43 @@ static void view_anim_place(struct vidow_view *view) {
 	}
 
 	wlr_scene_node_set_position(&view->scene_tree->node, x, y);
-	if (vidow_xtrace_on() && view->kind == VIDOW_VIEW_X11 &&
-			(view != NULL && vidow_view_title(view) != NULL &&
-			strcmp(vidow_view_title(view), "Steam") == 0)) {
-		struct wlr_scene_node *n;
-		int i = 0;
+	/* 跟手探针（touch /tmp/vidow-x11-trace 开）：只在拖拽期间、每次摆位一行。
+	 * 看的就是「摆出去的这一下到底是什么」—— 偏移是不是被别处抹成 0、是不是
+	 * 被停在停车位上、算出来的 xy 有没有跟着光标走。 */
+	if (vidow_xtrace_on() && (server->grab_view == view || view->dragging)) {
+		vidow_gtrace("place v=%d geom=%d,%d %dx%d off=%.0f,%.0f -> %d,%d "
+			"park=%d alpha=%.2f ov_t=%.2f",
+			view->id, view->geom.x, view->geom.y,
+			view->geom.width, view->geom.height,
+			view->anim_off_x, view->anim_off_y, x, y,
+			view->scene_parked ? 1 : 0, alpha,
+			vidow_overview_scale(server) < 1.0 ? 1.0 : 0.0);
+	}
+	struct wlr_scene_node *probe_n;
+	int probe_i = 0;
+	if (vidow_xtrace_on() && (server->grab_view == view || view->dragging)) {
 		wlr_log(WLR_INFO, "place-set: %s 节点摆在 %d,%d（en=%d）",
-			vidow_view_title(view), x, y,
+			vidow_view_title(view) != NULL ?
+				vidow_view_title(view) : "(无题)", x, y,
 			view->scene_tree->node.enabled);
-		wl_list_for_each(n, &view->scene_tree->children, link) {
-			if (i++ > 5) {
-				break;
-			}
-			if (n->type == WLR_SCENE_NODE_BUFFER) {
-				struct wlr_scene_buffer *sb = wlr_scene_buffer_from_node(n);
-				wlr_log(WLR_DEBUG, "place-set:   子 buf en=%d off=%d,%d "
-					"dst=%dx%d op=%.2f buf=%d", n->enabled, n->x, n->y,
-					sb->dst_width, sb->dst_height, sb->opacity,
-					sb->buffer != NULL);
-			} else {
-				wlr_log(WLR_DEBUG, "place-set:   子 type=%d en=%d off=%d,%d",
-					n->type, n->enabled, n->x, n->y);
-			}
+	}
+	wl_list_for_each(probe_n, &view->scene_tree->children, link) {
+		if (probe_i++ > 5) {
+			break;
+		}
+		if (!vidow_xtrace_on() ||
+				!(server->grab_view == view || view->dragging)) {
+			break;
+		}
+		if (probe_n->type == WLR_SCENE_NODE_BUFFER) {
+			struct wlr_scene_buffer *sb = wlr_scene_buffer_from_node(probe_n);
+			wlr_log(WLR_DEBUG, "place-set:   子 buf en=%d off=%d,%d "
+				"dst=%dx%d op=%.2f buf=%d", probe_n->enabled, probe_n->x,
+				probe_n->y, sb->dst_width, sb->dst_height, sb->opacity,
+				sb->buffer != NULL);
+		} else {
+			wlr_log(WLR_DEBUG, "place-set:   子 type=%d en=%d off=%d,%d",
+				probe_n->type, probe_n->enabled, probe_n->x, probe_n->y);
 		}
 	}
 	vidow_fx_set_alpha(&view->scene_tree->node, alpha);
