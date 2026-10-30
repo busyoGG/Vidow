@@ -1037,6 +1037,13 @@ int main(int argc, char *argv[]) {
 	vidow_cursor_apply(&server);
 
 	server.seat = wlr_seat_create(server.display, "seat0");
+	/* 反向指针：wlr_seat 是 wlr_seat_create() 独立分配的，不在
+	 * struct vidow_server 里面，所以「从 seat 拿回 server」只能靠这个
+	 * （见 input.c 的 server_of_seat）。用 wl_container_of 会算出野指针 ——
+	 * 2026-10-29 那串 SIGSEGV 就是它。 */
+	if (server.seat != NULL) {
+		server.seat->data = &server;
+	}
 	vidow_cursor_shape_init(&server);
 
 	if (!vidow_output_init(&server) || !vidow_input_init(&server) ||

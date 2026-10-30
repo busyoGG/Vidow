@@ -168,13 +168,8 @@ static void grab_restore_focus(struct vidow_server *server,
 		wlr_seat_keyboard_notify_clear_focus(seat);
 		return;
 	}
-	struct wlr_keyboard *kb = wlr_seat_get_keyboard(seat);
-	if (kb != NULL) {
-		wlr_seat_keyboard_notify_enter(seat, back, kb->keycodes,
-			kb->num_keycodes, &kb->modifiers);
-	} else {
-		wlr_seat_keyboard_notify_enter(seat, back, NULL, 0, NULL);
-	}
+	/* 统一入口：补松开 / 清残留修饰位 / 干净进入（见 vidow_seat_focus_surface）。 */
+	vidow_seat_focus_surface(seat, back);
 }
 
 /* 从名单上摘掉（列表 + 表面监听），可以重复调：表面先死那条路会先摘一次，

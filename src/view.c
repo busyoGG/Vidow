@@ -6186,13 +6186,9 @@ static void view_popup_grab_keyboard(struct vidow_view *view) {
 		/* 独占层拿着键盘：跟 vidow_focus_view 一样，不去抢。 */
 		return;
 	}
-	struct wlr_keyboard *kb = wlr_seat_get_keyboard(seat);
-	if (kb != NULL) {
-		wlr_seat_keyboard_notify_enter(seat, surface, kb->keycodes,
-			kb->num_keycodes, &kb->modifiers);
-	} else {
-		wlr_seat_keyboard_notify_enter(seat, surface, NULL, 0, NULL);
-	}
+	/* 统一入口：焦点离开旧表面时补松开、清残留修饰位，新表面以干净状态
+	 * 进入（见 vidow_seat_focus_surface）。 */
+	vidow_seat_focus_surface(seat, surface);
 }
 
 /* 弹出物收起来了：键盘还给焦点窗口；连焦点窗口都没了就当没人要键盘。 */
@@ -6212,13 +6208,9 @@ static void view_popup_release_keyboard(struct vidow_view *view) {
 		wlr_seat_keyboard_notify_clear_focus(seat);
 		return;
 	}
-	struct wlr_keyboard *kb = wlr_seat_get_keyboard(seat);
-	if (kb != NULL) {
-		wlr_seat_keyboard_notify_enter(seat, back, kb->keycodes,
-			kb->num_keycodes, &kb->modifiers);
-	} else {
-		wlr_seat_keyboard_notify_enter(seat, back, NULL, 0, NULL);
-	}
+	/* 统一入口：焦点离开旧表面时补松开、清残留修饰位，新表面以干净状态
+	 * 进入（见 vidow_seat_focus_surface）。 */
+	vidow_seat_focus_surface(seat, back);
 }
 
 /* 「表面还没提交缓冲区」的窗口：等第一帧到了再补一次归属判定。

@@ -17,6 +17,9 @@
 #include <linux/input-event-codes.h>
 #include <wayland-server-protocol.h>
 #include <wlr/backend/libinput.h>
+/* wlr_keyboard_notify_modifiers()：键盘接入时清零虚拟/注入设备的残留修饰位，
+ * 见 server_add_keyboard 里那段注释。 */
+#include <wlr/interfaces/wlr_keyboard.h>
 #include <wlr/util/log.h>
 
 #include <libinput.h>
@@ -909,6 +912,29 @@ static void server_add_keyboard(struct vidow_server *server,
 	 * server->keyboards 里就行，它的 key 事件照样会被分发到。 */
 	if (virtual == NULL && !inject) {
 		wlr_seat_set_keyboard(server->seat, wlr_keyboard);
+	}
+	/* **接入时把这些键盘的修饰位清零。**
+	 *
+	 * virtual / inject / uinput 的 xkb_state 可能带着上一次会话留下的修饰位：
+	 * fcitx5 回注 Ctrl 之后没发 release、ydotoold 的宏跑到一半被打断
+	 * （~/.config/vidow 的输入法切换就是走 ydotool）、或者进程被杀时
+	 * 按键事件只发了一半。这些键盘一接入就会参与 keyboard_for_enter /
+	 * pointer_modifiers / keyboard_modifiers 的取值，于是第一个拿到焦点的
+	 * 窗口「莫名其妙 Ctrl 一直是按下状态」—— 用户根本没按过 Ctrl
+	 * （2026-10-29 报）。
+	 *
+	 * 接入这一刻它们不可能有真实按键（虚拟键盘还没有客户端、注入键盘刚建、
+	 * uinput 设备刚开），清干净是安全的。物理键盘不清：热插拔时用户可能
+	 * 正按着键，清了就是丢按键。
+	 *
+	 * 清完会触发 events.modifiers → keyboard_modifiers → 推给 seat，
+	 * 客户端收到的就是干净状态。 */
+	if (virtual != NULL || kb->inject || kb->uinput) {
+		/* 第 4 个参数是 group（键盘布局）：传 0 会把布局切回第一个 ——
+		 * fcitx5 每次新建虚拟键盘都接一次，布局就会被反复重置。保留
+		 * 当前 group，只清修饰位。 */
+		wlr_keyboard_notify_modifiers(wlr_keyboard, 0, 0, 0,
+			wlr_keyboard->modifiers.group);
 	}
 	/* 输入法正抢着键盘时，得让它知道键盘换了，否则它拿不到 keymap */
 	vidow_im_set_keyboard(server, wlr_keyboard);
@@ -2160,6 +2186,29 @@ static void server_cursor_button(struct wl_listener *listener, void *data) {
 		false);
 }
 
+/* 这把 wlr_keyboard 是「可信的物理键盘」吗（不是虚拟 / 注入 / 外部 uinput）。
+ *
+ * **uinput（ydotoold）也算不可信。** server.h 的 kb->uinput 那段写着：它的按键
+ * 状态可能永远留着一条没配对的 press（宏跑一半被打断、设备重建、或者干脆就是
+ * 「按住不放」的语义），「那条记录没有任何路径会清掉」。把它算进合成器的修饰位，
+ * 表现就是「没按 Alt，裸滚轮也在切工作区」—— Alt 卡在那块设备上，永远松不开。
+ *
+ * 虚拟键盘（fcitx5）同理：它的修饰位是 fcitx5 说了算，合成器只保证自己转发，
+ * 保证不了它一定回注 release。 */
+static bool keyboard_is_trusted_physical(struct vidow_server *server,
+		const struct wlr_keyboard *k) {
+	if (server == NULL || k == NULL) {
+		return false;
+	}
+	struct vidow_keyboard *kb;
+	wl_list_for_each(kb, &server->keyboards, link) {
+		if (kb->wlr_keyboard == k) {
+			return kb->virtual == NULL && !kb->inject && !kb->uinput;
+		}
+	}
+	return false;
+}
+
 /* 合成器自己的指针绑定（Mod+左键 / Mod+滚轮）要看的修饰键。
  *
  * **不能读 seat 上那个键盘设备**：输入法（fcitx5 一启动就会抢）抢走键盘之后，
@@ -2169,14 +2218,23 @@ static void server_cursor_button(struct wl_listener *listener, void *data) {
  * 认了，得松开重按」（用户报的，a3d4dc9 修过一次，但那条只补了通知、没改这里
  * 的取值）。
  *
- * 所以直接找一把**物理键盘**（virtual == NULL、也不是我们自己的注入键盘）读
- * 它的 xkb 状态；没有物理键盘
- * （纯 headless / 只有注入）时退回 seat 上那把，再没有就是 0。 */
+ * 所以直接找**物理键盘**（virtual == NULL、不是注入、也不是外部 uinput）读它
+ * 的 xkb 状态。
+ *
+ * **退回 seat 那把必须加可信判据。** 以前只要「所有物理键盘都没有修饰位」就退回
+ * 读 seat 上那把，而 seat 上那把经常是输入法的虚拟键盘（vidow_im_key 回注时切
+ * 过去就不再切回来，见 server_add_keyboard 里那段「虚拟键盘接入时不要抢 seat
+ * 键盘」）。fcitx5 只要漏回注一次 Alt 的 release，虚拟键盘的 xkb_state 就永远
+ * 带着 Alt —— 于是「没按 Alt，裸滚轮也在切工作区」（用户 2026-10-29 报的）。
+ * 退回只在「seat 那把确实是物理键盘」时才允许，否则就当没有修饰键。
+ *
+ * 这条退回本来就只服务「纯 headless / 只有注入」的场景，那种场景下不该有任何
+ * 修饰键，返回 0 才是对的。 */
 static uint32_t pointer_modifiers(struct vidow_server *server) {
 	uint32_t mods = 0;
 	struct vidow_keyboard *kb;
 	wl_list_for_each(kb, &server->keyboards, link) {
-		if (kb->virtual == NULL && !kb->inject) {
+		if (kb->virtual == NULL && !kb->inject && !kb->uinput) {
 			mods |= wlr_keyboard_get_modifiers(kb->wlr_keyboard);
 		}
 	}
@@ -2184,7 +2242,10 @@ static uint32_t pointer_modifiers(struct vidow_server *server) {
 		return mods;
 	}
 	struct wlr_keyboard *seat_kb = wlr_seat_get_keyboard(server->seat);
-	return seat_kb != NULL ? wlr_keyboard_get_modifiers(seat_kb) : 0;
+	if (seat_kb != NULL && keyboard_is_trusted_physical(server, seat_kb)) {
+		return wlr_keyboard_get_modifiers(seat_kb);
+	}
+	return 0;
 }
 
 /* 指针按下 / 松开。测试注入（VIDOW_TEST_ACTION 里的 pointer-button）也走这里，
@@ -3386,39 +3447,88 @@ bool vidow_inject_pointer_button(struct vidow_server *server, const char *name,
  * 传 NULL 不是「不给焦点」而是直接把合成器 abort —— 实测崩在这儿的场景是 wine /
  * Proton 的游戏起来时：X11 的窗口已经建出来、也拿到了焦点，但表面还没到（或者
  * 刚销毁），这时候滚一下滚轮（Mod+滚轮 = focus-column）就 abort 了。NULL 的语义
- * 就是「没人该拿键盘」，所以清掉焦点。 */
+ * 就是「没人该拿键盘」，所以清掉焦点。
+ *
+ * **切焦点时只做 enter，不补发按键松开。**
+ *
+ * 这里曾经在切焦点前把 kb->keycodes 逐个补发 release（88266fb，为治
+ * 「Xwayland 收不到 KeyRelease 就一直按着、autorepeat 抖」）。那个根因后来查明
+ * 是 Fcitx5 劫持输入（见 im.c 的 c87dfcc），补发是照着错误的假设打的补丁，而且
+ * 它自己会制造更糟的不一致：
+ *
+ *   - 补发的 release 只走 seat 层（wlr_seat_keyboard_notify_key 只是转发给
+ *     grab，不动 kb->keycodes / kb->modifiers），设备状态仍是「按着」；
+ *   - 用户真松手时那个 release 照常转发出去，客户端收到一个**没按过的键的
+ *     松开** —— Chromium / Electron 据此把修饰键标成按下；
+ *   - 滚轮 / 键位绑定读的 pointer_modifiers() 又是「所有物理键盘的修饰位并集」，
+ *     残留一位 Alt 就变成「不按 Alt，滚轮也在切工作区」（用户报的）。
+ *
+ * 协议本来就把这件事交给客户端：wl_keyboard.leave 不带按键状态，收到 leave
+ * 自己清。Xwayland 的 X server 也吃这一套（它在 leave 时会处理自己的状态机），
+ * 不需要合成器伪造 release。所以这里保持干净：状态是物理状态，enter 带什么就是
+ * 什么。 */
+/* 从 seat 反查 server（vidow_seat_focus_surface 只拿得到 seat）。
+ *
+ * ⚠️ **不能用 wl_container_of。** `server->seat` 是个指针，`wlr_seat` 由
+ * wlr_seat_create() 独立 malloc，**并不嵌在 struct vidow_server 里** ——
+ * container_of 的前提（对象是宿主结构体的成员）根本不成立，算出来的是野
+ * 指针（2026-10-29 02:33 起连续 5 次 SIGSEGV：kb=0，遍历垃圾链表）。
+ *
+ * 改用 seat->data 存反向指针（wlr_seat 的 data 字段留给应用自由使用，
+ * 建 seat 之后在 main.c 里赋值）。取不到就返回 NULL，调用方退回旧行为，
+ * 绝不解引用可疑指针。 */
+static struct vidow_server *server_of_seat(struct wlr_seat *seat) {
+	if (seat == NULL) {
+		return NULL;
+	}
+	return seat->data;
+}
+
+/* **enter 该带哪把键盘的状态。**
+ *
+ * seat 上那把经常是输入法 / 注入的虚拟键盘（见 server_add_keyboard 里
+ * 「虚拟键盘接入时不要抢 seat 键盘」那段：回注那一刻切过去就不再切回来）。
+ * 它的 modifiers 是 fcitx5 说了算的 —— 启动时若残留一个 Ctrl，第一个拿到焦点
+ * 的窗口就会「莫名其妙 Ctrl 一直按着」（用户 2026-10-29 报的），而且之后每个
+ * 新窗口都会继承这份状态。
+ *
+ * 所以优先用**可信的物理键盘**（排除 virtual / inject / uinput，判据和
+ * pointer_modifiers 同一套）。选哪一把：真有键按着的那把优先 —— 切换窗口时
+ * 按着 Ctrl 的正是它；都没有就取第一把物理键盘（状态是空的，等价于「没按」）。
+ * 一把物理键盘都没有（纯 headless / 只有注入）时返回 NULL，调用方传空数组。 */
+static struct wlr_keyboard *keyboard_for_enter(struct wlr_seat *seat) {
+	struct wlr_keyboard *seat_kb = wlr_seat_get_keyboard(seat);
+	struct vidow_server *server = server_of_seat(seat);
+	/* 拿不到 server（seat->data 没设）就保持旧行为：直接用 seat 上那把。
+	 * 宁可带着可能的残留修饰位，也不能崩。 */
+	if (server == NULL) {
+		return seat_kb;
+	}
+	if (seat_kb != NULL && keyboard_is_trusted_physical(server, seat_kb)) {
+		return seat_kb;
+	}
+	struct wlr_keyboard *first = NULL;
+	struct vidow_keyboard *kb;
+	wl_list_for_each(kb, &server->keyboards, link) {
+		if (kb->virtual != NULL || kb->inject || kb->uinput) {
+			continue;
+		}
+		if (first == NULL) {
+			first = kb->wlr_keyboard;
+		}
+		if (kb->wlr_keyboard->num_keycodes > 0 ||
+				kb->wlr_keyboard->modifiers.depressed != 0 ||
+				kb->wlr_keyboard->modifiers.latched != 0) {
+			return kb->wlr_keyboard;
+		}
+	}
+	return first;
+}
+
 void vidow_seat_focus_surface(struct wlr_seat *seat,
 		struct wlr_surface *surface) {
 	if (seat == NULL) {
 		return;
-	}
-	/* **焦点离开时，把还按着的键给旧表面补上松开。**
-	 *
-	 * Wayland 协议里 wl_keyboard.leave 不带按键状态，客户端收到 leave 自己
-	 * 该把「按着」清掉 —— 原生 Wayland 客户端确实这么做。**Xwayland 不这么
-	 * 做**：X server 那边是一套独立的按键状态机，收不到 KeyRelease 就认为键
-	 * 一直按着，然后按 X 自己的 autorepeat（XkbSetRepeatKeys，来自
-	 * wl_keyboard.repeat_info）开始不停重复 —— 屏幕上就是「按住一个键，焦点
-	 * 一走开它就开始反复按下释放」。
-	 *
-	 * 触发场景就是用户报的那个：全屏 X11 游戏里按住方向键 / Alt 呼出鼠标，
-	 * 光标移出窗口 → 悬停换屏把焦点切给别的窗口 → 游戏收不到松开 → 人物
-	 * 一直朝那个方向跑，直到点回游戏。
-	 *
-	 * kb->keycodes 是 wlroots 维护的「此刻按着哪些键」（evdev 键码），正好
-	 * 就是要补的那批。必须在 notify_enter **之前**发：enter 会把
-	 * focused_surface 换掉，之后就不知道该往哪个表面发了。 */
-	struct wlr_keyboard *kb = wlr_seat_get_keyboard(seat);
-	struct wlr_surface *prev = seat->keyboard_state.focused_surface;
-	if (kb != NULL && prev != NULL && prev != surface &&
-			kb->num_keycodes > 0) {
-		uint32_t now = inject_now_ms();
-		for (size_t i = 0; i < kb->num_keycodes; i++) {
-			wlr_seat_keyboard_notify_key(seat, now, kb->keycodes[i],
-				WL_KEYBOARD_KEY_STATE_RELEASED);
-		}
-		wlr_log(WLR_DEBUG, "键盘焦点: 离开时给旧表面补了 %zu 个松开",
-			kb->num_keycodes);
 	}
 	if (surface == NULL) {
 		wlr_log(WLR_DEBUG, "键盘焦点: 目标窗口还没有表面（NULL），先清掉焦点"
@@ -3426,6 +3536,7 @@ void vidow_seat_focus_surface(struct wlr_seat *seat,
 		wlr_seat_keyboard_notify_clear_focus(seat);
 		return;
 	}
+	struct wlr_keyboard *kb = keyboard_for_enter(seat);
 	if (kb != NULL) {
 		wlr_seat_keyboard_notify_enter(seat, surface, kb->keycodes,
 			kb->num_keycodes, &kb->modifiers);

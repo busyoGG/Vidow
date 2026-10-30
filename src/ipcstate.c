@@ -1240,6 +1240,19 @@ void vidow_ipc_json_input(struct jbuf *b, struct vidow_server *server) {
 		jb_kv_int(b, "repeat_rate", k->repeat_info.rate);
 		jb_kv_int(b, "repeat_delay", k->repeat_info.delay);
 		jb_kv_uint(b, "leds", k->leds);
+		/* 修饰键状态（排错用）：depressed 是这块键盘物理按着的修饰位
+		 * （xkb mask），wm_mods 是 wlr 那套（WL_MODIFIER）编码 —— 滚轮 /
+		 * 键位绑定读的就是它。「Alt+滚轮切完工作区，不按 Alt 也能切」= 这里
+		 * 残留了 Alt 位，一眼能看出来是哪块键盘。 */
+		jb_kv_uint(b, "depressed", (unsigned)k->modifiers.depressed);
+		jb_kv_uint(b, "locked_mods", (unsigned)k->modifiers.locked);
+		jb_kv_uint(b, "wm_mods", (unsigned)wlr_keyboard_get_modifiers(k));
+		jb_key(b, "keys");
+		jb_arr(b);
+		for (size_t i = 0; i < k->num_keycodes; i++) {
+			jb_uint(b, k->keycodes[i]);
+		}
+		jb_arr_end(b);
 		jb_obj_end(b);
 	}
 	jb_arr_end(b);

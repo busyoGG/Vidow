@@ -283,19 +283,13 @@ void vidow_arrange_layers(struct vidow_server *server) {
 static void layer_focus(struct vidow_layer_surface *ls) {
 	struct vidow_server *server = ls->server;
 	struct wlr_seat *seat = server->seat;
-	struct wlr_keyboard *kb = wlr_seat_get_keyboard(seat);
 
 	if (server->keyboard_layer == NULL) {
 		server->focus_before_layer = server->focused;
 	}
 	server->keyboard_layer = ls;
-	if (kb != NULL) {
-		wlr_seat_keyboard_notify_enter(seat, ls->layer_surface->surface,
-			kb->keycodes, kb->num_keycodes, &kb->modifiers);
-	} else {
-		wlr_seat_keyboard_notify_enter(seat, ls->layer_surface->surface,
-			NULL, 0, NULL);
-	}
+	/* 统一入口：补松开 / 清残留修饰位 / 干净进入（见 vidow_seat_focus_surface）。 */
+	vidow_seat_focus_surface(seat, ls->layer_surface->surface);
 	vidow_im_focus(server, ls->layer_surface->surface);
 }
 

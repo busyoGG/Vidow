@@ -427,12 +427,11 @@ static void im_grab_destroy(struct wl_listener *listener, void *data) {
 	 * 抓完放掉，放掉之后没人还给客户端。 */
 	{
 		struct vidow_server *server = im->server;
-		struct wlr_keyboard *kb = wlr_seat_get_keyboard(server->seat);
 		struct wlr_surface *focused =
 			server->seat->keyboard_state.focused_surface;
-		if (kb != NULL && focused != NULL) {
-			wlr_seat_keyboard_notify_enter(server->seat, focused,
-				kb->keycodes, kb->num_keycodes, &kb->modifiers);
+		if (focused != NULL) {
+			/* 统一入口（prev == focused，等价于带当前修饰键重新 enter）。 */
+			vidow_seat_focus_surface(server->seat, focused);
 		}
 	}
 	wlr_log(WLR_DEBUG, "input method released the keyboard");
@@ -454,6 +453,28 @@ static void im_detach_method(struct vidow_im *im,
 		wl_list_remove(&im->grab_destroy.link);
 		im->grab = NULL;
 		active_grab = NULL;
+		/* **这里也得把键盘还给客户端。**
+		 *
+		 * 上面 im_grab_destroy() 那条路已经做了（带当前修饰键重新
+		 * notify_enter）。但 method 被销毁时 grab 往往还挂着 —— fcitx5
+		 * 重载 / 重建输入上下文就是这种，而那条路只摘 listener，不走
+		 * im_grab_destroy，于是客户端永远收不到 enter，修饰键状态永远
+		 * 停在 grab 之前那一份。
+		 *
+		 * 用户 2026-10-29 报的「切换输入法之后 Ctrl 一直是按下状态」就是
+		 * 它：Ctrl+Space 按下 Ctrl（grab 期间 release 只发给输入法、
+		 * 不发给客户端），切换完 method 一销毁，客户端手里还留着
+		 * 「Ctrl 按着」这份快照，后续每次点击都成了 Ctrl+点击。
+		 *
+		 * 用统一入口重发一次 enter，状态就回到物理键盘的真实状态。 */
+		{
+			struct vidow_server *server = im->server;
+			struct wlr_surface *focused =
+				server->seat->keyboard_state.focused_surface;
+			if (focused != NULL) {
+				vidow_seat_focus_surface(server->seat, focused);
+			}
+		}
 	}
 	wl_list_remove(&im->commit.link);
 	wl_list_remove(&im->new_popup.link);
