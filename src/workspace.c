@@ -1204,6 +1204,21 @@ static void slide_start(struct vidow_server *server, struct vidow_output *output
 		vidow_anim_cancel(output->slide_anim);
 		output->slide_anim = NULL;
 	}
+	/* **切工作区那一刻把残留的视口滚动清掉（只清这一次）。**
+	 *
+	 * 视口里可能还留着切工作区之前那次聚焦的滚动；不清的话，新工作区整块
+	 * 滑进来的同时窗口还横着飘一段。以前这条是在 output_arrange 里每帧做
+	 * 的（只要 workspace_slide_n > 0 就掐），代价是**滑动期间切焦点就再也
+	 * 起不了横向过渡** —— 焦点换列要滚视口，刚起一条就被掐掉，窗口直接瞬移
+	 * （用户 2026-10-29：「切换工作区动画没结束的时候进行窗口焦点切换，会
+	 * 失去几乎失去窗口过渡动画」）。
+	 *
+	 * 残留只在滑动开始这一帧存在，所以清一次就够；之后滑动期间新起的视口
+	 * 滚动照常跑（纵向归 slide_y、横向归视口，互不冲突）。 */
+	if (output->viewport_anim != NULL) {
+		vidow_anim_cancel(output->viewport_anim);
+		output->viewport_anim = NULL;
+	}
 	if (server->config.workspace_switch_ms <= 0 || !ws_has_something(from)) {
 		return;
 	}
