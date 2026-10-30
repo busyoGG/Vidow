@@ -1364,6 +1364,12 @@ struct vidow_output {
 	 * 两条兜底各自按刷新率限速，互不影响。 */
 	int64_t last_wl_fd_ns;
 
+	/* 出帧死锁的看门狗（output.c 的 output_watchdog_tick，1Hz）：
+	 * 超过 2 秒没渲染、而屏上还有表面挂着未发的 frame callback 时强制排
+	 * 一帧 —— 客户端等 frame_done 才画 → 没人出帧 → 没有损伤 → 永远等帧
+	 * 的自锁就靠它拆。（渲染时刻本身用下面的 last_render_ns，已有字段。） */
+	struct wl_event_source *watchdog_timer;
+
 	/* debug 刷新率显示（debug_show_refresh，见 src/debugrate.c）：
 	 * 过去一秒这块屏实际出了多少帧。dbg_fps 是上个统计窗口的值。 */
 	uint32_t dbg_frames;

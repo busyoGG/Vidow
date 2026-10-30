@@ -586,6 +586,60 @@ static int pump_timer_cb(void *data) {
 	return 0;
 }
 
+/* 出帧链的自锁死锁看门狗（1Hz）。
+ *
+ * 出帧链是自锁的：客户端（Chromium 系 / 面板）等 frame_done 才肯画下一帧，
+ * 而 wlroots 只在有损伤时才出帧 —— 某一帧没排上（比如客户端要帧那一刻
+ * 上一帧刚好排完），等帧的人不再产生损伤，就没有任何东西再排下一帧，
+ * 整块屏永久冻结（实测 2026-10-30 18:0x：DP-3 整屏 0 变化、面板时钟停摆、
+ * 五个客户端的 frame callback 全部挂起，output-power off/on 才救回来）。
+ *
+ * 两条兜底（X11 / native Wayland 的 frame_done）都只在「正在渲染」时跑，
+ * 救不了「根本不再渲染」的死锁。所以每秒查一趟账：这块屏超过 2 秒没渲染、
+ * 而屏上还有表面挂着未发的 frame callback，就强制排一帧。排上后兜底会把
+ * callback 发出去，客户端恢复交帧，链条自己接上。正常时只是每秒遍历一次
+ * 列表，零渲染开销。 */
+static int output_watchdog_tick(void *data) {
+	struct vidow_output *output = data;
+	struct vidow_server *server = output->server;
+	int64_t now = vidow_now_ns();
+	if (output->wlr_output == NULL || !output->wlr_output->enabled) {
+		return 1000;
+	}
+	if (output->last_render_ns != 0 &&
+			now - output->last_render_ns < 2000000000LL) {
+		return 1000; /* 渲染活着，不查了 */
+	}
+	int pending = 0;
+	struct vidow_view *view;
+	wl_list_for_each(view, &server->views, link) {
+		if (view->output == output->wlr_output) {
+			pending += vidow_view_pending_frame_callbacks(view);
+		}
+	}
+	struct vidow_layer_surface *ls;
+	wl_list_for_each(ls, &server->layers, link) {
+		if (ls->output != output->wlr_output || ls->layer_surface == NULL) {
+			continue;
+		}
+		struct wlr_surface *surface = ls->layer_surface->surface;
+		if (surface != NULL) {
+			pending += wl_list_length(&surface->current.frame_callback_list);
+		}
+	}
+	if (pending == 0) {
+		return 1000; /* 没人等帧：静默待机是正常状态 */
+	}
+	wlr_log(WLR_INFO,
+		"watchdog: %s 已 %.1fs 没渲染，还有 %d 个 frame callback 在等 —— 强制排一帧",
+		output->wlr_output->name,
+		output->last_render_ns != 0 ?
+			(double)(now - output->last_render_ns) / 1e9 : -1.0,
+		pending);
+	vidow_output_schedule_frame(server, output->wlr_output, "watchdog");
+	return 1000;
+}
+
 /* A screen capture is answered on an output commit, and a still screen never
  * commits: the nested backend will not even send us a frame callback, because
  * the host only composites on damage. Poll gently while a capture is
@@ -1940,6 +1994,10 @@ static void output_destroy(struct wl_listener *listener, void *data) {
 		wl_event_source_remove(output->pump_timer);
 		output->pump_timer = NULL;
 	}
+	if (output->watchdog_timer != NULL) {
+		wl_event_source_remove(output->watchdog_timer);
+		output->watchdog_timer = NULL;
+	}
 	wl_list_remove(&output->frame.link);
 	wl_list_remove(&output->request_state.link);
 	wl_list_remove(&output->commit.link);
@@ -2089,6 +2147,11 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 	/* 视口外补帧的到点闹钟（见 view.c 的 vidow_view_render_pump） */
 	output->pump_timer = wl_event_loop_add_timer(
 		wl_display_get_event_loop(server->display), pump_timer_cb, output);
+
+	/* 出帧死锁的看门狗（1Hz，见 output_watchdog_tick） */
+	output->watchdog_timer = wl_event_loop_add_timer(
+		wl_display_get_event_loop(server->display), output_watchdog_tick,
+		output);
 
 	wl_list_insert(&server->outputs, &output->link);
 
