@@ -192,6 +192,7 @@ sources = files(
   'src/mru.c',
   'src/anim.c',
   'src/fx.c',
+  'src/fx-layer.c',
   'src/exec.c',
   'src/script.c',
   'src/configwatch.c',
