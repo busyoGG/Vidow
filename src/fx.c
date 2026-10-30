@@ -2377,6 +2377,11 @@ static bool view_blur_visible(struct vidow_view *view) {
 	if (view->anim_open != NULL || view->anim_move != NULL) {
 		return true;
 	}
+	/* alpha 恰好 0 = 一个像素都画不出来：整条抓取 + 链条都是白烧的。
+	 * 0 和 0.001 不一样 —— 后者还要留（模糊会从里面透出来一点）。 */
+	if (view->anim_alpha <= 0.0) {
+		return false;
+	}
 	if (view->anim_alpha < 1.0) {
 		return true;
 	}
@@ -2384,6 +2389,9 @@ static bool view_blur_visible(struct vidow_view *view) {
 	vidow_view_look(&view->server->config, &view->rule_eff, view->fullscreen,
 		&look);
 	/* 整个窗口被画淡了（window_opacity）：模糊从里面透出来。 */
+	if (look.opacity <= 0.0) {
+		return false;
+	}
 	if (look.opacity < 1.0) {
 		return true;
 	}
@@ -3501,12 +3509,20 @@ static struct wlr_scene_surface *layer_scene_surface(
  *
  * 判据保守：拿不准就当看得见。 */
 static bool layer_blur_visible(struct vidow_layer_surface *ls) {
-	/* 入场 / 退场动画期间内容在淡入淡出（layer.c 把 anim_alpha 乘在内容上）。 */
+	/* 入场 / 退场动画期间内容在淡入淡出（layer.c 把 anim_alpha 乘在内容上）。
+	 * 淡到 0 就是完全看不见：底下垫的模糊一个像素都透不出来。 */
+	if (ls->anim_alpha <= 0.0) {
+		return false;
+	}
 	if (ls->anim != NULL || ls->anim_alpha < 1.0) {
 		return true;
 	}
-	/* 图层规则写了 opacity：内容被画淡，模糊从里面透出来。 */
-	if (vidow_rule_opacity(&ls->rule_eff) < 1.0) {
+	/* 图层规则写了 opacity：内容被画淡，模糊从里面透出来。0 同上是白烧。 */
+	double rule_opacity = vidow_rule_opacity(&ls->rule_eff);
+	if (rule_opacity <= 0.0) {
+		return false;
+	}
+	if (rule_opacity < 1.0) {
 		return true;
 	}
 	/* 抓图遮挡正盖着这一块（画出来的不是客户端的内容）。 */

@@ -763,7 +763,11 @@ print("%d %d %d %d %d %d" % (self_mixed, self_green, green_mag,
                              under_green, under_mag, len(files)))
 PY
 )"
-	if grep -aq "jelly: green 起手" "$LOG" && grep -aq "blur: own region" "$LOG"; then
+	# 这里要的只是「底衬抓取真的在跑」：平铺不重叠的窗口走的是共享底衬
+	# （"blur: shared"），只有重叠的才会建私有区域（"blur: own region"）。
+	# 原来只认后者，而这个场景根本没有重叠窗口 —— 判据永远不成立。
+	if grep -aq "jelly: green 起手" "$LOG" &&
+			{ grep -aq "blur: own region" "$LOG" || grep -aq "blur: shared" "$LOG"; }; then
 		pass "底衬抓取和果冻都真的在跑（$NDUMP 份 dump）"
 	else
 		fail "果冻或底衬抓取没跑（$NDUMP 份 dump），这条测不到东西"
