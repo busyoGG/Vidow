@@ -1060,7 +1060,7 @@ bool vidow_fx_draw_mesh_blur(struct vidow_server *server,
 		struct wlr_texture *shadow_tex,
 		int shadow_off_x, int shadow_off_y, int shadow_w, int shadow_h,
 		float shadow_dx, float shadow_dy, float shadow_radius,
-		const float shadow_color[4], bool shadow_on) {
+		const float shadow_color[4], bool shadow_on, bool clear) {
 	struct vidow_mesh_blur_prog *m = &server->mesh_blur;
 	if (m->program == 0 || content == NULL || blur == NULL || verts == NULL ||
 			n_verts < 3) {
@@ -1091,7 +1091,12 @@ bool vidow_fx_draw_mesh_blur(struct vidow_server *server,
 	wlr_gles2_texture_get_attribs(blur, &ba);
 
 	struct wlr_egl *egl = NULL;
-	if (begin_pass(server, dst, w, h, &egl) == 0) {
+	/* clear = false：接着上一趟往下画（跨屏果冻的第二块屏那一半），不清屏。
+	 * begin_pass_rect 传个非 NULL 的 rect 就跳过 glClear（scissor 是关的，
+	 * 不会真的裁）。 */
+	static const struct wlr_box no_clear_hint = {1, 1, 1, 1};
+	if (begin_pass_rect(server, dst, w, h,
+			clear ? NULL : &no_clear_hint, &egl) == 0) {
 		return false;
 	}
 	glUseProgram(m->program);

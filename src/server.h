@@ -3646,7 +3646,7 @@ bool vidow_fx_draw_mesh_blur(struct vidow_server *server,
 	struct wlr_texture *shadow_tex,
 	int shadow_off_x, int shadow_off_y, int shadow_w, int shadow_h,
 	float shadow_dx, float shadow_dy, float shadow_radius,
-	const float shadow_color[4], bool shadow_on);
+	const float shadow_color[4], bool shadow_on, bool clear);
 
 /* eff = 这个目标的规则作用（rule.c 的 vidow_rule_eff，NULL = 没规则）。
  * fullscreen = 这是不是一块全屏窗口：全屏不画服务端装饰（边框 / 圆角 / 阴影 /

@@ -26,6 +26,10 @@
 #include "server.h"
 #include "xtrace.h"
 
+/* fx.c：按屏取模糊底衬的那一格（见 server.h 的 struct vidow_blur_slot）。 */
+struct vidow_blur_slot *blur_slot_for(struct vidow_fx_target *fx,
+	struct wlr_output *out, bool need);
+
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -97,6 +101,10 @@ struct vidow_jelly {
 	/* 模糊顶点：[x, y, u_content, v_content, u_blur, v_blur] × rows*cols*6。
 	 * 位置和内容层共用，内容 UV 共用；只有 blur UV 是按屏幕坐标另算的。 */
 	float *blur_verts;
+	/* 跨屏骑边界时第二趟（另一块屏那一半）的顶点：内容层 + 模糊层。只在
+	 * 窗口同时压着两块屏时用（见 jelly_render 里拆两趟的说明）。 */
+	float *verts2;
+	float *blur_verts2;
 	float *ox, *oy;      /* 每个节点的偏移（逻辑像素） */
 	float *vx, *vy;      /* 每个节点的速度 */
 	float *lx, *ly;      /* 每个节点的「滞后位置」（跟底座跟得慢的那个版本） */
@@ -324,6 +332,8 @@ static void jelly_free(struct vidow_jelly *jelly) {
 	}
 	free(jelly->verts);
 	free(jelly->blur_verts);
+	free(jelly->verts2);
+	free(jelly->blur_verts2);
 	free(jelly->ox);
 	free(jelly->oy);
 	free(jelly->vx);
@@ -456,6 +466,10 @@ bool vidow_jelly_begin(struct vidow_view *view) {
 		sizeof(float));
 	jelly->blur_verts = calloc((size_t)jelly->rows * (size_t)jelly->cols * 36,
 		sizeof(float));
+	jelly->verts2 = calloc((size_t)jelly->rows * (size_t)jelly->cols * 24,
+		sizeof(float));
+	jelly->blur_verts2 = calloc((size_t)jelly->rows * (size_t)jelly->cols * 36,
+		sizeof(float));
 	jelly->ox = calloc(n, sizeof(float));
 	jelly->oy = calloc(n, sizeof(float));
 	jelly->vx = calloc(n, sizeof(float));
@@ -470,6 +484,7 @@ bool vidow_jelly_begin(struct vidow_view *view) {
 			jelly->buf_h);
 	}
 	if (jelly->verts == NULL || jelly->blur_verts == NULL ||
+			jelly->verts2 == NULL || jelly->blur_verts2 == NULL ||
 			jelly->ox == NULL || jelly->oy == NULL || jelly->vx == NULL ||
 			jelly->vy == NULL || jelly->gw2 == NULL || jelly->gcc == NULL ||
 			jelly->gtau == NULL || jelly->lx == NULL || jelly->ly == NULL ||
@@ -685,7 +700,44 @@ static void jelly_render(struct vidow_jelly *jelly) {
 		wlr_scene_node_coords(&jelly->node->node, &node_x, &node_y);
 	}
 	double s = jelly->scale > 0.0 ? jelly->scale : 1.0;
-	int n = 0;
+
+	/* 跨屏骑边界：底衬按屏各存一份（server.h 的 struct vidow_blur_slot），
+	 * 窗口两半各压在一块屏上时，每一半都得采**自己压着的那块屏**的底衬 ——
+	 * 只按归属屏算一份 UV 的话，旧屏那一半采到的是新屏的底衬坐标（
+	 * 2026-10-30 用户报的「跨界的时候背景出错」）。判出两块屏就拆两趟画：
+	 * 每个三角形按静止位置归到它压着的那块屏，第二趟不清屏、画进同一块
+	 * 目标缓冲。单屏（绝大多数情况）照旧一条路；三块屏骑一窗回退单份。 */
+	struct vidow_blur_slot *rpass[2] = {NULL, NULL};
+	int npass = 0;
+	if (blur_ok) {
+		struct wlr_box jrect = {node_x, node_y, jelly->dst_w, jelly->dst_h};
+		struct vidow_output *out;
+		wl_list_for_each(out, &server->outputs, link) {
+			if (!out->wlr_output->enabled) {
+				continue;
+			}
+			struct wlr_box ob = {0}, hit;
+			wlr_output_layout_get_box(server->output_layout,
+				out->wlr_output, &ob);
+			if (ob.width < 1 || ob.height < 1 ||
+					!wlr_box_intersection(&hit, &jrect, &ob)) {
+				continue;
+			}
+			if (npass >= 2) {
+				npass = 0;
+				break;
+			}
+			rpass[npass++] = blur_slot_for(fx, out->wlr_output, false);
+		}
+		if (npass != 2 || rpass[0] == NULL || rpass[1] == NULL ||
+				rpass[0]->tex == NULL || rpass[1]->tex == NULL ||
+				rpass[0]->rw < 1 || rpass[1]->rw < 1) {
+			npass = 0; /* 哪一块还没烘出底衬：这一帧退回单份（旧行为） */
+		}
+	}
+
+	int n1 = 0;          /* 第 1 趟（单份模式 = 全部）顶点数 */
+	int n2 = 0;          /* 第 2 趟顶点数（仅两份模式） */
 	for (int i = 0; i < jelly->rows; i++) {
 		for (int j = 0; j < jelly->cols; j++) {
 			float xs[6] = {
@@ -710,42 +762,81 @@ static void jelly_render(struct vidow_jelly *jelly) {
 			float v1 = (float)(i + 1) / (float)jelly->rows;
 			float us[6] = { u0, u1, u0, u1, u1, u0 };
 			float vs[6] = { v0, v0, v1, v0, v1, v1 };
-			for (int k = 0; k < 6; k++) {
-				float *w = jelly->verts + (size_t)(n + k) * 4;
-				w[0] = xs[k];
-				w[1] = ys[k];
-				w[2] = us[k];
-				w[3] = vs[k];
-				if (blur_ok) {
-					/* 模糊 UV 必须用**这一格没形变时的静止位置**，不能用 xs[]：
-					 * xs[] 里含形变位移（jelly_node_xf 的
-					 * `+ ox[k] * scale * strength * kill`），拿它算 UV 就等于
-					 * 让底衬跟着网格一起弯 —— 用户报的「背景跟着窗口扭曲」。
-					 *
-					 * 底衬是从**屏幕上**采的（同一帧烘好的背景），它不参与形变：
-					 * 顶点在屏幕上滑到哪，就该去采样它此刻压住的那块背景像素。
-					 * 所以位置用形变后的（w[0]/w[1]，照常弯），UV 用静止的
-					 * （margin + step*col/row，不含位移）。 */
-					/* 6 个顶点依次是：(i,j) (i,j+1) (i+1,j) (i,j+1)
-					 * (i+1,j+1) (i+1,j) —— 和上面 xs[]/ys[] 的顺序一一对应。 */
-					static const int dx6[6] = {0, 1, 0, 1, 1, 0};
-					static const int dy6[6] = {0, 0, 1, 0, 1, 1};
-					float sx = (float)((double)node_x * s) +
+			/* 6 个顶点依次是：(i,j) (i,j+1) (i+1,j) (i,j+1)
+			 * (i+1,j+1) (i+1,j) —— 两个三角形：0-2 和 3-5。 */
+			static const int dx6[6] = {0, 1, 0, 1, 1, 0};
+			static const int dy6[6] = {0, 0, 1, 0, 1, 1};
+			/* 每个顶点的静止屏幕位置（设备像素）：模糊 UV 和跨屏归堆
+			 * 都用它。**不能用形变后的 xs[]**：xs 里含弹簧位移，拿它算
+			 * UV 等于让底衬跟着网格一起弯 —— 用户报的「背景跟着窗口
+			 * 扭曲」。底衬是屏幕上烘好的背景，不参与形变：顶点滑到哪，
+			 * 就采它此刻压住的那块背景像素。 */
+			float sx6[6], sy6[6];
+			if (blur_ok) {
+				for (int k = 0; k < 6; k++) {
+					sx6[k] = (float)((double)node_x * s) +
 						(float)jelly_rest_xf(jelly, j + dx6[k]);
-					float sy = (float)((double)node_y * s) +
+					sy6[k] = (float)((double)node_y * s) +
 						(float)jelly_rest_yf(jelly, i + dy6[k]);
-					float *b = jelly->blur_verts + (size_t)(n + k) * 6;
-					b[0] = xs[k];
-					b[1] = ys[k];
-					b[2] = us[k];
-					b[3] = vs[k];
-					b[4] = (sx - (float)out_x -
-						(float)fx->blur_tex_x) / (float)bw;
-					b[5] = (sy - (float)out_y -
-						(float)fx->blur_tex_y) / (float)bh;
 				}
 			}
-			n += 6;
+			for (int t = 0; t < 2; t++) {
+				/* 这个三角形归哪块屏：3 个顶点静止位置的均值落进哪块屏
+				 * 的视野框（设备像素布局坐标），就用那块屏的底衬。 */
+				struct vidow_blur_slot *sl = NULL;
+				if (npass == 2) {
+					float cx = 0.0f, cy = 0.0f;
+					for (int k = 0; k < 3; k++) {
+						cx += sx6[t * 3 + k];
+						cy += sy6[t * 3 + k];
+					}
+					cx /= 3.0f;
+					cy /= 3.0f;
+					for (int p = 0; p < 2 && sl == NULL; p++) {
+						if (cx >= (float)rpass[p]->ox &&
+								cx < (float)(rpass[p]->ox + rpass[p]->ow) &&
+								cy >= (float)rpass[p]->oy &&
+								cy < (float)(rpass[p]->oy + rpass[p]->oh)) {
+							sl = rpass[p];
+						}
+					}
+					if (sl == NULL) {
+						sl = rpass[0]; /* 缝隙上：归第 1 趟，别丢顶点 */
+					}
+				}
+				bool second = sl != NULL && sl == rpass[1];
+				float *dv = second ? jelly->verts2 : jelly->verts;
+				float *db = second ? jelly->blur_verts2 : jelly->blur_verts;
+				int *cnt = second ? &n2 : &n1;
+				/* 这一趟的底衬原点 / 区域（设备像素）：两份模式按各自
+				 * 的屏，单份模式照旧用 fx 里 bake_output 那一份。 */
+				int uo_x = npass == 2 ? sl->ox : out_x;
+				int uo_y = npass == 2 ? sl->oy : out_y;
+				int ut_x = npass == 2 ? sl->rx : fx->blur_tex_x;
+				int ut_y = npass == 2 ? sl->ry : fx->blur_tex_y;
+				int ut_w = npass == 2 ? sl->rw : bw;
+				int ut_h = npass == 2 ? sl->rh : bh;
+				for (int k = 0; k < 3; k++) {
+					int kk = t * 3 + k;
+					float *w = dv + (size_t)*cnt * 4;
+					w[0] = xs[kk];
+					w[1] = ys[kk];
+					w[2] = us[kk];
+					w[3] = vs[kk];
+					if (blur_ok) {
+						float *b = db + (size_t)*cnt * 6;
+						b[0] = xs[kk];
+						b[1] = ys[kk];
+						b[2] = us[kk];
+						b[3] = vs[kk];
+						b[4] = (sx6[kk] - (float)uo_x -
+							(float)ut_x) / (float)ut_w;
+						b[5] = (sy6[kk] - (float)uo_y -
+							(float)ut_y) / (float)ut_h;
+					}
+					(*cnt)++;
+				}
+			}
 		}
 	}
 	bool ok = false;
@@ -802,9 +893,48 @@ static void jelly_render(struct vidow_jelly *jelly) {
 			look.shadow_color[3],
 		};
 
+		if (npass == 2) {
+			/* 两趟：每趟只画自己那一半三角形，用那块屏自己的底衬贴图和
+			 * 原点；第二趟不清屏（clear=false），接着第一趟画进同一块
+			 * 目标缓冲。 */
+			ok = vidow_fx_draw_mesh_blur(server, target, jelly->buf_w,
+				jelly->buf_h, tex, rpass[0]->tex,
+				(float)server->config.blur_strength, jelly->blur_verts, n1,
+				fx->px_pad, fx->px_pad, fx->content_w, fx->content_h,
+				fx->w, fx->h, (float)(look.corner_radius * s),
+				(float)vidow_corner_n_clamp(look.corner_n),
+				jelly->mask_tex, fx->tex_off_x, fx->tex_off_y,
+				fx->tex_scale_x, fx->tex_scale_y, 1.0f / 255.0f,
+				jelly->shadow_tex,
+				(int)jelly->margin_px + fx->px_pad,
+				(int)jelly->margin_px + fx->px_pad,
+				fx->content_w, fx->content_h,
+				(float)(look.shadow_offset_x * s),
+				(float)(look.shadow_offset_y * s),
+				(float)(look.shadow_radius * s), shadow_pm, false, true);
+			if (ok) {
+				ok = vidow_fx_draw_mesh_blur(server, target, jelly->buf_w,
+					jelly->buf_h, tex, rpass[1]->tex,
+					(float)server->config.blur_strength,
+					jelly->blur_verts2, n2,
+					fx->px_pad, fx->px_pad, fx->content_w, fx->content_h,
+					fx->w, fx->h, (float)(look.corner_radius * s),
+					(float)vidow_corner_n_clamp(look.corner_n),
+					jelly->mask_tex, fx->tex_off_x, fx->tex_off_y,
+					fx->tex_scale_x, fx->tex_scale_y, 1.0f / 255.0f,
+					jelly->shadow_tex,
+					(int)jelly->margin_px + fx->px_pad,
+					(int)jelly->margin_px + fx->px_pad,
+					fx->content_w, fx->content_h,
+					(float)(look.shadow_offset_x * s),
+					(float)(look.shadow_offset_y * s),
+					(float)(look.shadow_radius * s), shadow_pm, false,
+					false);
+			}
+		} else {
 		ok = vidow_fx_draw_mesh_blur(server, target, jelly->buf_w,
 			jelly->buf_h, tex, fx->blur_tex,
-			(float)server->config.blur_strength, jelly->blur_verts, n,
+			(float)server->config.blur_strength, jelly->blur_verts, n1,
 			fx->px_pad, fx->px_pad, fx->content_w, fx->content_h,
 			fx->w, fx->h, (float)(look.corner_radius * s),
 			(float)vidow_corner_n_clamp(look.corner_n),
@@ -816,11 +946,12 @@ static void jelly_render(struct vidow_jelly *jelly) {
 			fx->content_w, fx->content_h,
 			(float)(look.shadow_offset_x * s),
 			(float)(look.shadow_offset_y * s),
-			(float)(look.shadow_radius * s), shadow_pm, false);
+			(float)(look.shadow_radius * s), shadow_pm, false, true);
+		}
 	}
 	if (!ok) {
 		ok = vidow_fx_draw_mesh(server, target, jelly->buf_w, jelly->buf_h,
-			tex, jelly->verts, n);
+			tex, jelly->verts, n1);
 	}
 	wlr_texture_destroy(tex);
 	if (!ok) {
@@ -913,12 +1044,15 @@ void vidow_jelly_tick(struct vidow_server *server, int64_t now_ns) {
 				source->buffer->height != jelly->src_h ||
 				fabs(source_scale - jelly->scale) > 1e-3) {
 			/* 源换了一块屏的倍率（跨屏）：按新源重建，别把果冻收掉
-			 * （见 jelly_rebase）。刚重建过就再换 = 光标压在边界上、
-			 * 归属屏在翻，这时候重建也是每帧白费，直接收手。 */
-			if (now_ns - jelly->rebase_ns <
-					(int64_t)JELLY_REBASE_MS * 1000000LL ||
-					!jelly_rebase(view)) {
-				vidow_jelly_end(view);
+			 * （见 jelly_rebase）。节流期内（光标压在边界上、归属屏来回翻）
+			 * **等一等**，别收手 —— 收了手果冻就没了，等归属稳定下来再重建，
+			 * 用户看到的就是「跨过去之后果冻丢了」（2026-10-30）。重建真的
+			 * 失败（起手条件不满足）才收。 */
+			if (now_ns - jelly->rebase_ns >=
+					(int64_t)JELLY_REBASE_MS * 1000000LL) {
+				if (!jelly_rebase(view)) {
+					vidow_jelly_end(view);
+				}
 			}
 			continue;
 		}
