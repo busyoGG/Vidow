@@ -1436,6 +1436,16 @@ struct vidow_output {
 	 * 一遍壁纸便宜太多。跟着 backdrop 一起重建。 */
 	struct wlr_texture *backdrop_tex;
 
+	/* 「layer 之下」的共享抓取：壁纸（backdrop）+ 窗口，抓一次，这一帧里
+	 * 每块 top / overlay 层都从它上面 1:1 裁自己那块 —— 窗口绘制从「每块层
+	 * 一遍」变成「每帧一遍」。只在那些区域互相压住时才启用（见 fx.c 的
+	 * layer_under_plan）：不重叠时并集包围盒比各自加起来大好几倍，纯亏。 */
+	struct wlr_buffer *under_bd;
+	struct wlr_texture *under_tex;
+	struct wlr_box under_box;   /* 共享抓取在屏上的位置（设备像素，已夹屏内） */
+	uint64_t under_seq;         /* 抓它的时候是第几帧（0 = 没有） */
+	bool under_share;           /* 这一帧要不要走共享（每帧重算） */
+
 	/* Wallpaper-only blurred backdrop for this output: the scene below the
 	 * toplevels with every window hidden, so it survives client repaints,
 	 * window moves and viewport scrolling. */
@@ -2466,7 +2476,7 @@ struct vidow_frame_stats {
 	uint64_t sched_notes;	/* 影子调度：登记的帧截止次数 */
 	uint64_t sched_fired;	/* 结算次数 */
 	int64_t sched_late_ns, sched_late_max_ns, sched_early_ns;
-	int shared, own, chains, bakes, tex_new, tex_del, frames, passes;
+	int shared, own, under, chains, bakes, tex_new, tex_del, frames, passes;
 	int64_t blur_ns, decor_ns, jelly_ns, commit_ns, bake_ns;
 	/* 探针：拖拽的「指针事件 -> 出帧」延迟 */
 	int64_t grab_lat_ns, grab_lat_max_ns;

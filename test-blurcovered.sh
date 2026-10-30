@@ -199,10 +199,19 @@ print(bakes, own, chain, passes, f)
 PY
 )
 echo "  半透明：重烘 $BAKES2 次 own $OWN2 chain $CHAIN2 趟 $PASSES2"
-if [ "$OWN2" -ge 10 ] 2>/dev/null; then
-	pass "半透明窗口照旧每帧抓私有底衬（own $OWN2）—— 判据没把该模糊的一起砍掉"
+# 半透明窗口的底衬有两个来源：自己的私有抓取（own），或者「layer 之下」的共享
+# 抓取（under，见 test-layershare.sh）。只要有一边在抓，它的模糊就是新鲜的。
+SPENT2=$(grep -a "渲染统计" "$LOG" | tail -3 | python3 -c '
+import re, sys
+u = o = 0
+for l in sys.stdin:
+    m = re.search(r"own (\d+) under (\d+)", l)
+    if m: o += int(m.group(1)); u += int(m.group(2))
+print(o + u)')
+if [ "$SPENT2" -ge 10 ] 2>/dev/null; then
+	pass "半透明窗口照旧每帧有底衬可采（own $OWN2 + under 合计 $SPENT2）—— 判据没把该模糊的一起砍掉"
 else
-	fail "半透明窗口的私有底衬只剩 $OWN2 次 —— 判据砍多了，半透明窗口的模糊也没了"
+	fail "半透明窗口的底衬只剩 $SPENT2 次（own $OWN2）—— 判据砍多了，半透明窗口的模糊也没了"
 fi
 if python3 -c "import sys; sys.exit(0 if $BAKES2 >= 1.5 * max($VFRAMES2, 1) else 1)"; then
 	pass "半透明窗口自己也每帧重烘（重烘 $(python3 -c "print('%.2f' % ($BAKES2 / max($VFRAMES2, 1)))") 次/帧 ≥ 1.5）"

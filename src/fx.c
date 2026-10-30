@@ -826,8 +826,14 @@ struct wlr_buffer *vidow_alloc_target(struct vidow_server *server, int w,
 				struct wlr_buffer *buf = wlr_allocator_create_buffer(
 					server->allocator, w, h, &set->formats[i]);
 				if (buf != NULL) {
-					wlr_log(WLR_DEBUG, "fx: target %dx%d format 0x%08x",
-						w, h, set->formats[i].format);
+					uint64_t mod = 0;
+					struct wlr_dmabuf_attributes attrs;
+					if (wlr_buffer_get_dmabuf(buf, &attrs)) {
+						mod = attrs.modifier;
+					}
+					wlr_log(WLR_DEBUG, "fx: target %dx%d format 0x%08x mod 0x%llx",
+						w, h, set->formats[i].format,
+						(unsigned long long)mod);
 					return buf;
 				}
 			}
@@ -1887,7 +1893,26 @@ int vidow_fx_pad(struct vidow_server *server) {
 	return pad;
 }
 
+/* 这一帧的序号：共享的 layer 底衬「同一帧只抓一次」。每跑一遍 blur update（每块屏
+ * 每帧一次）加一。 */
+static uint64_t blur_frame_seq = 0;
+
+static void layer_under_drop(struct vidow_output *output) {
+	if (output->under_tex != NULL) {
+		stat_tex_del(output->under_tex);
+		output->under_tex = NULL;
+	}
+	if (output->under_bd != NULL) {
+		wlr_buffer_drop(output->under_bd);
+		output->under_bd = NULL;
+	}
+	output->under_seq = 0;
+	output->under_box = (struct wlr_box){0};
+	output->under_share = false;
+}
+
 static void blur_drop(struct vidow_output *output) {
+	layer_under_drop(output);
 	if (output->backdrop_tex != NULL) {
 		stat_tex_del(output->backdrop_tex);
 		output->backdrop_tex = NULL;
@@ -3785,6 +3810,163 @@ static bool layer_region_rect(struct vidow_server *server,
 	return true;
 }
 
+/* 同一帧里那些要抓底衬的 layer，区域有没有压在一起 —— 压在一起才值得共享
+ * （见 server.h 的 under_share）。
+ *
+ * 判定用「并集包围盒的面积 <= 各自面积之和」：两块区域重叠时并集不会比加起来
+ * 大多少，共享省下的是重复的窗口绘制；bar 在上、dock 在下这种分离布局，并集
+ * 包围盒比各自加起来的几倍还大，等于把两次小抓取换成一次大抓取，纯亏。
+ *
+ * 并集里每一块都**先夹进屏内**：后面抓取要拿它当 src_box，超出屏的框会让
+ * wlroots 的 render pass 断言越界（也采不到东西）。 */
+static void layer_under_plan(struct vidow_server *server,
+		struct vidow_output *output) {
+	output->under_share = false;
+	if (output->backdrop_tex == NULL) {
+		return;
+	}
+	/* A/B 探针：文件一出现就走老路（各层各自抓），拿来比对同一画面。 */
+	if (access("/tmp/vidow-no-layer-share", F_OK) == 0) {
+		return;
+	}
+	int out_w = output->wlr_output->width;
+	int out_h = output->wlr_output->height;
+	struct wlr_box uni = {0};
+	int64_t sum = 0;
+	int n = 0;
+	struct vidow_layer_surface *ls;
+	wl_list_for_each(ls, &server->layers, link) {
+		if (ls->output != output ||
+				ls->layer == ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM ||
+				!layer_blur_wanted(server, ls)) {
+			continue;
+		}
+		int rx, ry, rw, rh, lv;
+		if (!layer_region_rect(server, output, ls, &rx, &ry, &rw, &rh, &lv)) {
+			continue;
+		}
+		int x1 = rx < 0 ? 0 : rx, y1 = ry < 0 ? 0 : ry;
+		int x2 = rx + rw, y2 = ry + rh;
+		if (x2 > out_w) {
+			x2 = out_w;
+		}
+		if (y2 > out_h) {
+			y2 = out_h;
+		}
+		if (x2 <= x1 || y2 <= y1) {
+			continue; /* 整块在屏外 */
+		}
+		blur_box_add(&uni, &(struct wlr_box){ .x = x1, .y = y1,
+			.width = x2 - x1, .height = y2 - y1 });
+		sum += (int64_t)(x2 - x1) * (y2 - y1);
+		n++;
+	}
+	if (n < 2) {
+		return;
+	}
+	if ((int64_t)uni.width * uni.height > sum) {
+		return;
+	}
+	output->under_share = true;
+	output->under_box = uni;
+}
+
+/* 这一帧的共享抓取：壁纸底衬 + 窗口，一次画完。同一帧里后面的层直接裁它。
+ *
+ * 和 layer_region_build 默认那条路画的东西**逐像素一样**（同样的 backdrop_tex
+ * 作基座、同样的窗口树、同样的 clip），区别只是画一次还是画 N 次。 */
+static bool layer_under_ensure(struct vidow_server *server,
+		struct vidow_output *output) {
+	if (!output->under_share) {
+		return false;
+	}
+	if (output->under_seq == blur_frame_seq && output->under_tex != NULL) {
+		return true;
+	}
+	struct wlr_box b = output->under_box;
+	if (b.width < 1 || b.height < 1) {
+		return false;
+	}
+	double scale = output->wlr_output->scale;
+	if (!(scale > 0.0)) {
+		scale = 1.0;
+	}
+	if (output->under_bd == NULL || output->under_bd->width != b.width ||
+			output->under_bd->height != b.height) {
+		if (output->under_tex != NULL) {
+			stat_tex_del(output->under_tex);
+			output->under_tex = NULL;
+		}
+		if (output->under_bd != NULL) {
+			wlr_buffer_drop(output->under_bd);
+			output->under_bd = NULL;
+		}
+		output->under_bd = vidow_alloc_target(server, b.width, b.height);
+		if (output->under_bd == NULL) {
+			return false;
+		}
+		output->under_tex = stat_tex_new(
+			wlr_texture_from_buffer(server->renderer, output->under_bd));
+		if (output->under_tex == NULL) {
+			wlr_buffer_drop(output->under_bd);
+			output->under_bd = NULL;
+			return false;
+		}
+	}
+	struct wlr_render_pass *pass = wlr_renderer_begin_buffer_pass(
+		server->renderer, output->under_bd, NULL);
+	if (pass == NULL) {
+		return false;
+	}
+	struct wlr_render_rect_options clear = {
+		.box = { .x = 0, .y = 0, .width = b.width, .height = b.height },
+		.color = { .r = 0.0f, .g = 0.0f, .b = 0.0f, .a = 0.0f },
+		.blend_mode = WLR_RENDER_BLEND_MODE_NONE,
+	};
+	wlr_render_pass_add_rect(pass, &clear);
+
+	float one = 1.0f;
+	struct wlr_render_texture_options base = {
+		.texture = output->backdrop_tex,
+		.src_box = {
+			.x = (float)b.x, .y = (float)b.y,
+			.width = (float)b.width, .height = (float)b.height,
+		},
+		.dst_box = { .x = 0, .y = 0,
+			.width = b.width, .height = b.height },
+		.alpha = &one,
+		.transform = WL_OUTPUT_TRANSFORM_NORMAL,
+		.filter_mode = WLR_SCALE_FILTER_NEAREST,
+		.blend_mode = WLR_RENDER_BLEND_MODE_PREMULTIPLIED,
+	};
+	wlr_render_pass_add_texture(pass, &base);
+
+	struct backdrop_ctx ctx = {
+		.pass = pass,
+		.server = server,
+		.scale = scale,
+		.ox = (int)lround((double)output->box.x * scale) + b.x,
+		.oy = (int)lround((double)output->box.y * scale) + b.y,
+		.clip_x = 0,
+		.clip_y = 0,
+		.clip_w = b.width,
+		.clip_h = b.height,
+	};
+	struct wlr_scene_tree *trees[] = {
+		server->layer_toplevels,
+		server->layer_popups,
+	};
+	for (size_t i = 0; i < sizeof(trees) / sizeof(trees[0]); i++) {
+		wlr_scene_node_for_each_buffer(&trees[i]->node, backdrop_iter, &ctx);
+	}
+	if (!wlr_render_pass_submit(pass)) {
+		return false;
+	}
+	output->under_seq = blur_frame_seq;
+	vidow_stats.under++;
+	return true;
+}
+
 /* 抓一块「这个 layer 盖住的东西」，含窗口。
  *
  * 只抓它自己那块区域（rx, ry 是它在输出里的位置，设备像素）：基座从共享底衬上
@@ -3861,6 +4043,30 @@ static bool layer_region_build(struct vidow_server *server,
 		ph = cy2 - cy1;
 	}
 
+	bool use_under = layer_under_ensure(server, output);
+	if (use_under) {
+		/* **共享这一路完全不碰 ls->bd。**
+		 *
+		 * 底衬直接从「layer 之下」那张屏大的图里拷一块过来，窗口不用再画
+		 * 一遍 —— 这就是省下来的那部分。 */
+	}
+	/* 基座在屏幕上的那一块（夹进屏内）。两条路都用这几个数：老路当底衬缓冲
+	 * 里的源框 / 窗口裁剪框，共享路当共享图里的采样框。 */
+	int bx1 = rx + px, by1 = ry + py;
+	if (bx1 < x1) {
+		bx1 = x1;
+	}
+	if (by1 < y1) {
+		by1 = y1;
+	}
+	int bx2 = bx1 + pw, by2 = by1 + ph;
+	if (bx2 > x2) {
+		bx2 = x2;
+	}
+	if (by2 > y2) {
+		by2 = y2;
+	}
+
 	if (ls->bd == NULL || ls->bd_w != rw || ls->bd_h != rh) {
 		layer_bd_drop(ls);
 		ls->bd = vidow_alloc_target(server, rw, rh);
@@ -3876,76 +4082,69 @@ static bool layer_region_build(struct vidow_server *server,
 		ls->bd_w = rw;
 		ls->bd_h = rh;
 	}
-
 	struct wlr_render_pass *pass = wlr_renderer_begin_buffer_pass(
 		server->renderer, ls->bd, NULL);
 	if (pass == NULL) {
 		return false;
 	}
-	struct wlr_render_rect_options clear = {
-		.box = { .x = px, .y = py, .width = pw, .height = ph },
-		.color = { .r = 0.0f, .g = 0.0f, .b = 0.0f, .a = 0.0f },
-		.blend_mode = WLR_RENDER_BLEND_MODE_NONE,
-	};
-	wlr_render_pass_add_rect(pass, &clear);
+	{
+		struct wlr_render_rect_options clear = {
+			.box = { .x = px, .y = py, .width = pw, .height = ph },
+			.color = { .r = 0.0f, .g = 0.0f, .b = 0.0f, .a = 0.0f },
+			.blend_mode = WLR_RENDER_BLEND_MODE_NONE,
+		};
+		wlr_render_pass_add_rect(pass, &clear);
 
-	/* 基座：共享底衬里对应的那一块，1:1 捞过来（别插值）。源框必须夹在底衬
-	 * 里面（wlroots 的 render pass 会断言越界），伸到屏外的那圈只能留透明。 */
-	int bx1 = rx + px, by1 = ry + py;
-	if (bx1 < x1) {
-		bx1 = x1;
+		/* 基座：共享图（layer 之下，屏大）或这块屏的壁纸底衬里 1:1 捞一块。
+		 * 源框必须夹在纹理里面（wlroots 的 render pass 会断言越界）。 */
+		int usx = use_under ? output->under_box.x : 0;
+		int usy = use_under ? output->under_box.y : 0;
+		int dw = bx2 - bx1, dh = by2 - by1;
+		float one = 1.0f;
+		struct wlr_render_texture_options base = {
+			.texture = use_under ? output->under_tex : output->backdrop_tex,
+			.src_box = {
+				.x = (float)(bx1 - usx), .y = (float)(by1 - usy),
+				.width = (float)(bx2 - bx1), .height = (float)(by2 - by1),
+			},
+			.dst_box = {
+				.x = bx1 - rx, .y = by1 - ry,
+				.width = dw, .height = dh,
+			},
+			.alpha = &one,
+			.transform = WL_OUTPUT_TRANSFORM_NORMAL,
+			.filter_mode = WLR_SCALE_FILTER_NEAREST,
+			.blend_mode = WLR_RENDER_BLEND_MODE_PREMULTIPLIED,
+		};
+		wlr_render_pass_add_texture(pass, &base);
 	}
-	if (by1 < y1) {
-		by1 = y1;
-	}
-	int bx2 = bx1 + pw, by2 = by1 + ph;
-	if (bx2 > x2) {
-		bx2 = x2;
-	}
-	if (by2 > y2) {
-		by2 = y2;
-	}
-	float one = 1.0f;
-	struct wlr_render_texture_options base = {
-		.texture = output->backdrop_tex,
-		.src_box = {
-			.x = (float)bx1, .y = (float)by1,
-			.width = (float)(bx2 - bx1), .height = (float)(by2 - by1),
-		},
-		.dst_box = {
-			.x = (float)(bx1 - rx), .y = (float)(by1 - ry),
-			.width = (float)(bx2 - bx1), .height = (float)(by2 - by1),
-		},
-		.alpha = &one,
-		.transform = WL_OUTPUT_TRANSFORM_NORMAL,
-		.filter_mode = WLR_SCALE_FILTER_NEAREST,
-		.blend_mode = WLR_RENDER_BLEND_MODE_PREMULTIPLIED,
-	};
-	wlr_render_pass_add_texture(pass, &base);
+	if (!use_under) {
 
-	/* 窗口画在基座上：绘制顺序上它们就在 top / overlay 层底下，连窗口的弹出物
-	 * 一起（窗口树 → 窗口弹出物树）。只画要抓的那一块（partial 时就是损伤
-	 * 那一小块），底衬别的像素一个都不碰。 */
-	struct backdrop_ctx ctx = {
-		.pass = pass,
-		.server = server,
-		.scale = scale,
-		.ox = (int)lround((double)output->box.x * scale) + x1,
-		.oy = (int)lround((double)output->box.y * scale) + y1,
-		.clip_x = bx1 - rx,
-		.clip_y = by1 - ry,
-		.clip_w = bx2 - bx1,
-		.clip_h = by2 - by1,
-	};
-	struct wlr_scene_tree *trees[] = {
-		server->layer_toplevels,
-		server->layer_popups,
-	};
-	for (size_t i = 0; i < sizeof(trees) / sizeof(trees[0]); i++) {
-		wlr_scene_node_for_each_buffer(&trees[i]->node, backdrop_iter, &ctx);
-	}
-	if (!wlr_render_pass_submit(pass)) {
-		return false;
+		/* 窗口画在基座上：绘制顺序上它们就在 top / overlay 层底下，连窗口的
+		 * 弹出物一起（窗口树 → 窗口弹出物树）。只画要抓的那一块（partial 时
+		 * 就是损伤那一小块），底衬别的像素一个都不碰。 */
+		struct backdrop_ctx ctx = {
+			.pass = pass,
+			.server = server,
+			.scale = scale,
+			.ox = (int)lround((double)output->box.x * scale) + x1,
+			.oy = (int)lround((double)output->box.y * scale) + y1,
+			.clip_x = bx1 - rx,
+			.clip_y = by1 - ry,
+			.clip_w = bx2 - bx1,
+			.clip_h = by2 - by1,
+		};
+		struct wlr_scene_tree *trees[] = {
+			server->layer_toplevels,
+			server->layer_popups,
+		};
+		for (size_t i = 0; i < sizeof(trees) / sizeof(trees[0]); i++) {
+			wlr_scene_node_for_each_buffer(&trees[i]->node, backdrop_iter,
+				&ctx);
+		}
+		if (!wlr_render_pass_submit(pass)) {
+			return false;
+		}
 	}
 
 	dmg_clear(&ls->fx.pending_damage); /* 这一版的账已经算清了 */
@@ -4666,6 +4865,10 @@ void vidow_blur_update(struct vidow_output *output) {
 	struct vidow_server *server = output->server;
 	struct vidow_view *view;
 
+	/* 这一帧的序号（共享抓取按它判断「同一帧只抓一次」）。放在最前面：早退
+	 * 的那一帧也往前走一格，下一帧真要画时就不会复用上一帧的共享图。 */
+	blur_frame_seq++;
+
 	/* 这块屏的布局框：只跟 output 有关，算一次给下面所有窗口共用
 	 * （以前每个窗口每帧各查一遍，见 view_blur_hits_output 的注释）。 */
 	struct wlr_box out_box = {0};
@@ -5020,6 +5223,9 @@ update_consumers:
 	/* layer surface 背后的模糊（状态栏 / 面板那层）。bottom 层用共享的那份底衬
 	 * （壁纸 + background 层），一次抓取都不用；top / overlay 层底下有窗口，各
 	 * 自抓自己那一小块（见 layer_region_build）。 */
+	/* 这一帧要不要把「layer 之下」抓一次给所有层共用（只有区域互相压住才
+	 * 值得，见 layer_under_plan）。 */
+	layer_under_plan(server, output);
 	struct vidow_layer_surface *ls;
 	wl_list_for_each(ls, &server->layers, link) {
 		if (ls->output != output) {

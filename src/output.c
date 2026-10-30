@@ -352,14 +352,15 @@ void vidow_output_render(struct vidow_output *output) {
 			double f = vidow_stats.frames > 0 ? (double)vidow_stats.frames : 1.0;
 			wlr_log(render_stats_file_on() ? WLR_INFO : WLR_DEBUG,
 				"渲染统计: %d 帧/帧窗(%.0fms) %.1f fps | 模糊 %.2fms/帧"
-				"(shared %d own %d chain %d) | 装饰 %.2fms/帧(%d 次重烘) | "
+				"(shared %d own %d under %d chain %d) | 装饰 %.2fms/帧(%d 次重烘) | "
 				"果冻 %.2fms/帧 | 提交 %.2fms/帧 | 贴图 +%d/-%d | 趟 %d | "
 				"重烘 %.2fms/帧 | 拖拽延迟 %.2f/%.2fms(%d) | "
 				"损伤 %.1f%%/帧(整屏 %d/%d 帧) | 源 事件%d 狗%d 踢%d 抓%d | 标脏 bump%d note%d",
 				vidow_stats.frames, (double)(st_t4 - win_ns) / 1e6,
 				1000.0 * f / ((double)(st_t4 - win_ns) / 1e6),
 				(double)vidow_stats.blur_ns / 1e6 / f,
-				vidow_stats.shared, vidow_stats.own, vidow_stats.chains,
+				vidow_stats.shared, vidow_stats.own, vidow_stats.under,
+				vidow_stats.chains,
 				(double)vidow_stats.decor_ns / 1e6 / f, vidow_stats.bakes,
 				(double)vidow_stats.jelly_ns / 1e6 / f,
 				(double)vidow_stats.commit_ns / 1e6 / f,
