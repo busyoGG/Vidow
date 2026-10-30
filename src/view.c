@@ -6787,6 +6787,8 @@ static void view_commit(struct wl_listener *listener, void *data) {
 	(void)data;
 	struct vidow_view *view = wl_container_of(listener, view, commit);
 	struct wlr_surface *surface = vidow_view_surface(view);
+	/* debug 每窗口帧率：每次 commit 记一笔（应用自己的渲染节奏）。 */
+	vidow_debugrate_view_commit(view);
 	/* 有界探针：每 60 次 commit 一行。用来判断「重开之后 XWayland 还在不在
 	 * 交帧」—— 交帧停了，bake_revision 就永远不涨，装饰图停在第一张空图上。
 	 *
@@ -7434,6 +7436,8 @@ static void view_surface_commit(struct wl_listener *listener, void *data) {
 	if (view->server == NULL || view->output == NULL || view->server->locked) {
 		return;
 	}
+	/* 帧率计数只在 view_commit 里做（Wayland 这个 listener 和 view_commit 都挂在
+	 * 同一个主 surface commit 上，两边都数会翻倍）。这里只管补帧。 */
 	vidow_output_schedule_frame(view->server, view->output, "客户端交帧");
 }
 

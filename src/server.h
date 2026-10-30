@@ -253,6 +253,9 @@ struct vidow_config {
 	/* 视口外强制渲染（窗口规则 / 录屏预览）每秒补多少帧，0 = 不限。
 	 * 补帧会主动排下一帧，不节流的话在没 vsync 的后端上会空转到几千 fps。 */
 	int force_render_hz;
+	/* debug：在每块屏右上角叠一个实测帧率（过去一秒出了多少帧）。
+	 * 用来回答「静止桌面到底有没有被推着空转」——见 src/debugrate.c。 */
+	bool debug_show_refresh;
 	/* xdg-activation 的令牌多久作废（秒，0 = 永不作废）。wlroots 默认 30 秒，
 	 * 而通知往往是「几十分钟前弹的、现在才点」—— 令牌早没了，客户端顶不上来
 	 * （点了通知窗口不动）。所以默认不过期。 */
@@ -1356,6 +1359,18 @@ struct vidow_output {
 	 * 客户端收到回调就立刻重绘，交帧 → 渲染 → 又发回调，自己把自己驱成
 	 * 300fps 空转，GPU 被占满（vshot 抓帧抢不到资源就卡）。 */
 	int64_t last_x11_fd_ns;
+	/* native Wayland 那条兜底的节流（见 view.c 的
+	 * vidow_views_send_wayland_frame_done）。和 X11 那条分开记：
+	 * 两条兜底各自按刷新率限速，互不影响。 */
+	int64_t last_wl_fd_ns;
+
+	/* debug 刷新率显示（debug_show_refresh，见 src/debugrate.c）：
+	 * 过去一秒这块屏实际出了多少帧。dbg_fps 是上个统计窗口的值。 */
+	uint32_t dbg_frames;
+	int64_t dbg_window_ns;      /* 统计窗口起点（ns） */
+	double dbg_fps;             /* 上窗口的实测帧率 */
+	struct wlr_scene_buffer *dbg_node; /* 右上角那个小贴图 */
+	int dbg_buf_w, dbg_buf_h;   /* 上次 buffer 尺寸（变了要重建） */
 
 	struct wlr_box usable_area; /* layout coords, minus layer exclusive zones */
 	/* 上次已知的布局位置（逻辑坐标）。拔线时 wlr_output_layout 可能已经先把这块
@@ -4393,6 +4408,21 @@ void vidow_view_render_pump(struct vidow_server *server,
  * 和 render_pump 不同：这里没有任何判据，画完一帧就发一次。 */
 void vidow_views_send_x11_frame_done(struct vidow_server *server,
 		struct vidow_output *output);
+/* 每帧给 native Wayland 视图兜底发 frame_done（照 Hyprland 的模型：显式遍历
+ * surface 树，不依赖场景可见性）。解决 Electron/Chromium 拿不到 frame_done
+ * 就 0fps 卡死的问题。幂等：只给有 pending callback 的表面发。 */
+void vidow_views_send_wayland_frame_done(struct vidow_server *server,
+		struct vidow_output *output);
+/* 这个窗口的 surface 树上还有几个 frame callback 在等（只数不发）。
+ * 诊断 0fps / 卡死：> 0 说明客户端在等 frame_done（合成器漏发或没人推帧），
+ * 0 说明客户端根本没请求下一帧。见 ipcstate.c 的 frame_callbacks 字段。 */
+int vidow_view_pending_frame_callbacks(const struct vidow_view *view);
+/* debug 刷新率叠层（见 src/debugrate.c）：每帧在 output_frame 末尾调一次。
+ * 统计实测帧率；debug_show_refresh 打开时在屏右上角贴一个 "xxx FPS"。 */
+void vidow_debugrate_tick(struct vidow_server *server,
+		struct vidow_output *output);
+/* debug 每窗口帧率：view 每次 commit 调一次（只有 debug_show_refresh 开着才计数）。 */
+void vidow_debugrate_view_commit(struct vidow_view *view);
 /* 记一笔「有人拿着这个窗口的画面」（窗口截图源）。源销毁或者客户端跑掉就自动不再
  * 算持有；拿着期间窗口一直强制渲染。 */
 void vidow_view_capture_hold(struct vidow_view *view,

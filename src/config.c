@@ -316,6 +316,9 @@ static const struct entry entries[] = {
 	{ "force_render_hz", K_INT,    OFF(force_render_hz), SZ(force_render_hz), 5,
 		"滚出视口 / 被藏起来 / 最小化的窗口每秒补多少帧（0 = 不限），配合规则的 force_render" },
 
+	{ "debug_show_refresh", K_BOOL, OFF(debug_show_refresh), SZ(debug_show_refresh), 5,
+		"在每块屏右上角显示实测帧率（debug 用；静止桌面应接近 0，顶到刷新率说明有空转）" },
+
 	{ "clipboard",       K_BOOL,   OFF(clipboard),       SZ(clipboard), 6,
 		"接管 X11(XWayland) ↔ Wayland 的剪贴板同步" },
 	{ "clipboard_primary", K_BOOL, OFF(clipboard_primary),
@@ -2157,6 +2160,7 @@ static void defaults(struct vidow_config *cfg) {
 	memset(cfg, 0, sizeof(*cfg));
 
 	cfg->force_render_hz = 60; /* 视口外补帧：跟屏幕刷新率差不多就够 */
+	cfg->debug_show_refresh = false; /* 右上角帧率叠层，默认不显示 */
 	/* 激活令牌不过期：wlroots 默认 30 秒，而「弹通知」和「点通知」之间常常隔着
 	 * 几分钟 —— 令牌过期了 wlroots 直接把激活请求丢掉，我们连信号都收不到
 	 * （点了通知窗口不动，看着像客户端坏了）。 */

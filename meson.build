@@ -206,6 +206,7 @@ sources = files(
   'src/fdwatch.c',
   'src/im.c',
   'src/bgeffect.c',
+  'src/debugrate.c',
   'src/portal.c',
   'src/decoration.c',
   'src/activation.c',

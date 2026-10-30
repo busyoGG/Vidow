@@ -450,6 +450,9 @@ void vidow_output_render(struct vidow_output *output) {
 	vidow_view_render_pump(server, output,
 		(uint32_t)(now.tv_sec * 1000 + now.tv_nsec / 1000000));
 
+	/* debug：右上角实测帧率（debug_show_refresh，默认关）。放最后——它只读
+	 * 本帧统计、不动任何客户端状态。 */
+	vidow_debugrate_tick(server, output);
 }
 
 /* ---------------------------------------------------------------- 帧追踪
