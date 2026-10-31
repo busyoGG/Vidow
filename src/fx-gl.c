@@ -771,6 +771,29 @@ struct wlr_buffer *vidow_alloc_target(struct vidow_server *server, int w,
 					wlr_log(WLR_DEBUG, "fx: target %dx%d format 0x%08x mod 0x%llx",
 						w, h, set->formats[i].format,
 						(unsigned long long)mod);
+					/* **GBM 的 bo 缓存会把刚 drop 掉的同尺寸缓冲原样还回来**
+					 * —— 里面是上一任的内容，可能是任何一块屏的旧帧。而
+					 * 这里的调用方全是「只重画损伤区、不整块清」的增量渲染
+					 * （begin_pass_rect 注释：没碰过的地方保住上一版），
+					 * 那个前提只对「同一张缓冲」成立；reason 15/16 的
+					 * 释放重建循环让同尺寸的 drop+realloc 高频发生，旧帧
+					 * 残片就从模糊节点漏到屏幕上（2026-10-31：悬停 vshell
+					 * UI，两块屏随机浮出别的窗口的内容、位置不定、直到
+					 * 整块重画才消失 —— 就是它）。分配出来先整块清成透明，
+					 * 增量渲染的「上一版」从全透明起步。 */
+					struct wlr_egl *clear_egl = NULL;
+					GLuint clear_fbo =
+						wlr_gles2_renderer_get_buffer_fbo(server->renderer,
+							buf);
+					if (clear_fbo != 0 && gl_make_current(server, &clear_egl)) {
+						glBindFramebuffer(GL_FRAMEBUFFER, clear_fbo);
+						glViewport(0, 0, w, h);
+						glDisable(GL_BLEND);
+						glDisable(GL_SCISSOR_TEST);
+						glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+						glClear(GL_COLOR_BUFFER_BIT);
+						end_pass(clear_egl);
+					}
 					return buf;
 				}
 			}
