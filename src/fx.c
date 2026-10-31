@@ -1000,10 +1000,24 @@ void vidow_fx_take_overlap_cost(uint64_t *ns, uint64_t *n) {
 
 static bool view_overlaps_other(struct vidow_view *view) {
 	struct vidow_server *server = view->server;
-	struct wlr_box a = vidow_view_screen_box(view);
+	/* **判据走 place**：只有「在屏上」的窗口才需要私有底衬（I1：不在屏上的不
+	 * 参与任何渲染流程）。以前这里自己查 mapped + placed，和 should_park 是两
+	 * 份判断 —— 停泊掉的窗口几何框还在场景坐标系里，拿它判重叠，正在屏上的
+	 * 那个窗口就凭空多出一份私有底衬，糊的是停泊窗口的旧内容。 */
+	struct vidow_place mine;
+	vidow_place_of_view(server, view, &mine);
+	if (!mine.resident) {
+		return false;
+	}
+	struct wlr_box a = mine.world;
 	struct vidow_view *other;
 	wl_list_for_each(other, &server->views, link) {
-		if (other == view || !other->mapped || !other->placed) {
+		if (other == view) {
+			continue;
+		}
+		struct vidow_place theirs;
+		vidow_place_of_view(server, other, &theirs);
+		if (!theirs.resident) {
 			continue;
 		}
 		/* **不能按「归属哪块屏」筛**：跨屏拖动时窗口已经画在对面那块屏上了，
@@ -1014,7 +1028,7 @@ static bool view_overlaps_other(struct vidow_view *view) {
 		 *
 		 * vidow_view_screen_box() 给的本来就是**场景全局坐标**，跨屏天然可比，
 		 * 直接判相交就够了。 */
-		struct wlr_box b = vidow_view_screen_box(other);
+		struct wlr_box b = theirs.world;
 		if (a.x < b.x + b.width && b.x < a.x + a.width &&
 				a.y < b.y + b.height && b.y < a.y + a.height) {
 			return true;
@@ -1946,7 +1960,23 @@ static bool view_region_rect(struct vidow_server *server,
 		scale = 1.0;
 	}
 	int pad = vidow_fx_pad(server);
-	struct wlr_box box = vidow_view_screen_box(view);
+	/* **模糊的那一块 = 这块屏上看得见的那一块**（place 的 hit），不是整个几何框：
+	 * 窗口骑在两块屏中间时，各自的区域只算自己那一半（以前按整框算，区域跨过
+	 * 屏边界、被下面的夹取截成半条 —— 跨屏那一半就只有一条横道）；滚出屏 /
+	 * 藏起来的工作区更是连一块都没有，压根不该走到这儿。 */
+	struct vidow_place place;
+	vidow_place_of_view(server, view, &place);
+	const struct vidow_place_hit *hit = NULL;
+	for (int i = 0; i < place.n; i++) {
+		if (place.hits[i].out == output->wlr_output) {
+			hit = &place.hits[i];
+			break;
+		}
+	}
+	if (!place.resident || hit == NULL) {
+		return false;
+	}
+	struct wlr_box box = hit->box;
 	int lv = blur_levels_for(server,
 		output->wlr_output->width, output->wlr_output->height);
 	int margin = blur_reach_px(server, lv);
@@ -2337,13 +2367,20 @@ static struct wlr_output *view_blur_owner(struct vidow_view *view) {
  * 这个值（它要按屏的原点算底衬 UV），算一遍传下来就行。 */
 static bool view_blur_hits_output(struct vidow_view *view,
 		struct vidow_output *output, const struct wlr_box *ob) {
-	if (view->mapped && view->scene_tree != NULL) {
-		struct wlr_box vb = vidow_view_screen_box(view);
-		struct wlr_box hit;
-		if (wlr_box_intersection(&hit, &vb, ob)) {
-			return true;
+	/* **判据走 place**：在这块屏上有没有像素，看 place 的 hits 里有没有这一块
+	 * （不是「归属是不是这一块」—— 浮窗骑在边界上时两块屏各有一半，各自都要
+	 * 管自己那半的底衬）。resident 为假（停泊 / 藏起来 / 最小化）时直接落到
+	 * 下面的归属收尾那一条。 */
+	struct vidow_place place;
+	vidow_place_of_view(view->server, view, &place);
+	if (place.resident) {
+		for (int i = 0; i < place.n; i++) {
+			if (place.hits[i].out == output->wlr_output) {
+				return true;
+			}
 		}
 	}
+	(void)ob;
 	/* 不相交的窗口仍旧归它自己那块屏管（收尾 / 释放），否则跨屏结束那一下
 	 * 没人来把已经用不上的底衬收掉。 */
 	struct wlr_output *own = view_blur_owner(view);

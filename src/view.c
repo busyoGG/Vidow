@@ -437,8 +437,6 @@ struct wlr_output *vidow_view_owner_output(const struct vidow_view *view) {
 	return NULL;
 }
 
-bool view_clip_box(struct vidow_view *view, struct wlr_box *out);
-
 /* 「看得见的那一块」在布局坐标里的框（哪块屏上都没画着时是空的）。判据走 place
  * （src/place.c）：resident 为假的直接空；平铺 / 全屏取归属那块屏上的那一片
  * （裁掉越界部分）；浮窗 / 拖拽 / overview 取世界框。
