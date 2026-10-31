@@ -2091,6 +2091,15 @@ static void capture_hold_drop(struct vidow_capture_hold *hold,
 		wlr_log(WLR_INFO, "portal: %s，%s 不再强制渲染", why,
 			vidow_view_title(hold->view) != NULL ?
 				vidow_view_title(hold->view) : "(无题)");
+		/* 最后一个录屏源放掉了：窗口如果正停着，把子树关回去（见
+		 * vidow_view_set_parked 的说明 —— 停泊的窗口不该留节点在渲染流程
+		 * 里）。还停着说明它在屏外 / 被藏起来，关掉没有视觉影响。 */
+		if (hold->view->scene_parked && hold->view->scene_tree != NULL &&
+				!hold->view->popup &&
+				wl_list_empty(&hold->view->capture_sources)) {
+			wlr_scene_node_set_enabled(&hold->view->scene_tree->node,
+				false);
+		}
 	}
 	free(hold);
 }
@@ -2252,6 +2261,25 @@ void vidow_view_set_parked(struct vidow_view *view, bool park) {
 		vidow_flip_note("park", view, park);
 	}
 	view->scene_parked = park;
+	/* **停泊 = 看不见 = 关掉整棵子树**（用户 2026-10-31 原则：看不见的一律
+	 * 不参与任何渲染流程）。
+	 *
+	 * 以前只把节点挪到停车位（-65536 一带），节点照样 enabled —— 主渲染按
+	 * 坐标裁掉、看着没事，但凡是「按坐标遍历场景树再自己算位置」的路径
+	 * （私有底衬抓取 backdrop_iter、跨屏重烘、快照、以后任何一条新的），
+	 * 坐标换算错一点就把屏外窗口的内容画到屏上。2026-10-31 实锤：停泊的
+	 * QQ 头部出现在邻屏左缘，持续几十秒直到整块重画。关掉子树之后
+	 * wlr_scene 的绘制和 wlr_scene_node_for_each_buffer 的遍历都跳过它 ——
+	 * 这一类漏画从源头断掉，不用每条路径各修一遍。
+	 *
+	 * **例外：有人正在录它 / 预览它**（portal 的窗口截图源渲染的就是这棵
+	 * 子树，关了是黑的 —— 这正是当初「停到屏外而不是关节点」的唯一理由，
+	 * 见 workspace.c 的同款说明）。弹出物不在这里管：它在 workspace.c 里
+	 * 按自己的判据关（见那边的注释）。 */
+	if (view->scene_tree != NULL && !view->popup) {
+		wlr_scene_node_set_enabled(&view->scene_tree->node,
+			!park || vidow_view_capture_held(view));
+	}
 	/* 它自己进/出画面了：底衬的合成结果变了。账记在它头上（它自己的私有底衬
 	 * 不受影响），别的窗口因为世界代次前进而重抓。 */
 	vidow_backdrop_damage_view(view);
@@ -6592,8 +6620,10 @@ void view_map(struct wl_listener *listener, void *data) {
 	if (view->popup) {
 		wlr_scene_node_set_enabled(&view->scene_tree->node, show);
 	} else {
+		/* set_parked 现在自己管子树的开关（停泊 = 关整棵树，见那里的
+		 * 说明）—— 这里不能再无条件 set_enabled(true)，否则刚停泊的
+		 * 窗口又被点亮，整条路白做。 */
 		vidow_view_set_parked(view, !show);
-		wlr_scene_node_set_enabled(&view->scene_tree->node, true);
 	}
 	vidow_backdrop_damage_view(view);
 

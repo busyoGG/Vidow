@@ -956,7 +956,12 @@ static void view_set_capture_visible(struct vidow_view *view, bool on) {
 				on && sl->capture_enabled);
 		}
 	} else if (view->scene_tree != NULL) {
-		wlr_scene_node_set_enabled(&view->scene_tree->node, on && view->mapped);
+		/* 恢复时要尊重停泊状态：停着的窗口子树本来就该是关的（见
+		 * vidow_view_set_parked），抓帧这一趟临时点亮，抓完得关回去 ——
+		 * 以前无条件 on && mapped 会把停泊窗口的树永久点亮。 */
+		wlr_scene_node_set_enabled(&view->scene_tree->node,
+			on && view->mapped &&
+			(!view->scene_parked || vidow_view_capture_held(view)));
 	}
 	/* 拖着果冻的时候，窗口的内容由果冻节点画 —— 它也得跟着藏，否则抓出来的
 	 * 底衬里带着这个窗口自己上一帧的形变图（透明窗口一拖：背景里错位的竖线、
