@@ -1038,6 +1038,24 @@ static bool view_overlaps_other(struct vidow_view *view) {
 		return false;
 	}
 	struct wlr_box a = mine.world;
+	/* **重叠判「看得见的部分」，不判几何框**（2026-11-01）：
+	 *
+	 * 平铺窗口裁到自己那块屏（view_clip_box），滚出视口的窗口 world 框可以
+	 * 横到隔壁屏的布局范围里 —— 但越界的部分一个像素都没画。拿 world 判的
+	 * 后果：贴着 DP-3 右缘只剩 3px 的窗口，world 框和 DP-2 的全屏游戏相交，
+	 * 被判「压着别人」→ 走私有底衬 → 邻居每交一帧它就重抓+重烘+推
+	 * blur_ver（实测 QQ 一小时里带崩一套格子链：每秒上百次重烘）。它 3px
+	 * 的可见条和游戏的可见区域根本不相交，私有底衬属于白养。
+	 *
+	 * 浮动 / 拖拽中的窗口 clip_on = false（浮窗是屏级之上的一层，允许骑在
+	 * 两块屏上），这里拿到的还是完整 world 框，语义不变。 */
+	if (view->fx.clip_on) {
+		struct wlr_box va;
+		if (!wlr_box_intersection(&va, &a, &view->fx.clip)) {
+			return false; /* 整个可见部分都被裁光：不压任何东西 */
+		}
+		a = va;
+	}
 	struct vidow_view *other;
 	wl_list_for_each(other, &server->views, link) {
 		if (other == view) {
@@ -1057,6 +1075,13 @@ static bool view_overlaps_other(struct vidow_view *view) {
 		 * vidow_view_screen_box() 给的本来就是**场景全局坐标**，跨屏天然可比，
 		 * 直接判相交就够了。 */
 		struct wlr_box b = theirs.world;
+		if (other->fx.clip_on) {
+			struct wlr_box vb;
+			if (!wlr_box_intersection(&vb, &b, &other->fx.clip)) {
+				continue; /* 对面整个都被裁光了：看不见就不用算 */
+			}
+			b = vb;
+		}
 		if (a.x < b.x + b.width && b.x < a.x + a.width &&
 				a.y < b.y + b.height && b.y < a.y + a.height) {
 			return true;
