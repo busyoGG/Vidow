@@ -8622,7 +8622,7 @@ void vidow_view_new_x11(struct vidow_x11_surface *xsurface) {
 			vidow_view_title(view) != NULL ? vidow_view_title(view) : "(无题)");
 	}
 
-	wlr_log(WLR_INFO, "x11: 新窗口 %s（%s%s，%s%s）",
+	wlr_log(WLR_DEBUG, "x11: 新窗口 %s（%s%s，%s%s）",
 		vidow_view_title(view) != NULL ? vidow_view_title(view) : "(无题)",
 		vidow_view_app_id(view) != NULL ? vidow_view_app_id(view) : "?",
 		xsurface->override_redirect ? "，override-redirect" : "",
@@ -8667,7 +8667,7 @@ void vidow_view_new_x11(struct vidow_x11_surface *xsurface) {
 		vidow_x11_surface_configure(xsurface,
 			(int16_t)xsurface->x, (int16_t)xsurface->y,
 			(uint16_t)xsurface->width, (uint16_t)xsurface->height);
-		wlr_log(WLR_INFO, "x11: 新窗口先回 configure %d,%d %dx%d"
+		wlr_log(WLR_DEBUG, "x11: 新窗口先回 configure %d,%d %dx%d"
 			"（不等布局，破 map/configure 死锁）",
 			xsurface->x, xsurface->y,
 			xsurface->width, xsurface->height);

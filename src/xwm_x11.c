@@ -621,7 +621,7 @@ static void x11_handle_create(xcb_create_notify_event_t *e) {
 			XCB_CW_EVENT_MASK, pmask);
 	}
 
-	wlr_log(WLR_INFO, "xwm: create xid=0x%x %dx%d at %d,%d or=%d",
+	wlr_log(WLR_DEBUG, "xwm: create xid=0x%x %dx%d at %d,%d or=%d",
 		e->window, e->width, e->height, e->x, e->y,
 		(int)e->override_redirect);
 
@@ -633,7 +633,7 @@ static void x11_handle_destroy(xcb_destroy_notify_event_t *e) {
 	if (s == NULL) {
 		return;
 	}
-	wlr_log(WLR_INFO, "xwm: destroy xid=0x%x", e->window);
+	wlr_log(WLR_DEBUG, "xwm: destroy xid=0x%x", e->window);
 	x11_dissociate(s);
 	if (s->view != NULL) {
 		/* **先把这个 view 的 x11 反向指针断掉，再释放 s。**

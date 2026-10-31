@@ -311,7 +311,10 @@ bool vidow_fdwatch_register(int fd, enum vidow_fdwatch_kind kind,
 	e->handler = handler;
 	e->data = data;
 	wl_list_insert(&server->fdwatch->entries, &e->link);
-	wlr_log(WLR_INFO, "fdwatch: 接管 fd %d（kind %d），改由定时器轮询",
+	/* **别刷屏**。IPC 这类 fd 一秒来去几十个（vshot 的回放待机每 250ms 问
+	 * 一次窗口列表、portal 连一次 dbus 就是一对 fd），每次接管都打一行
+	 * INFO，一天就是几十万行 —— 日志本身变成最大的 IO。降到 DEBUG。 */
+	wlr_log(WLR_DEBUG, "fdwatch: 接管 fd %d（kind %d），改由定时器轮询",
 		fd, (int)kind);
 	return true;
 }
