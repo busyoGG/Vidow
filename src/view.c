@@ -968,10 +968,16 @@ static void view_sync_surface_outputs(struct vidow_view *view) {
 	if (surface == NULL) {
 		return;
 	}
-	/* 拖拽中（平铺 / 浮窗都算）：表面要 enter 到它压着的每块屏，见上面
-	 * view_sync_drag_outputs 的说明。 */
-	if (view_drag_output(view) != NULL) {
+	/* 拖拽中（平铺 / 浮窗都算）**和浮动窗口**：表面要 enter 到它压着的每块
+	 * 屏。浮窗是「屏级之上的一层」，不受工作区 / 显示器限制（用户
+	 * 2026-10-31），跨在两块屏中间时两块屏都得画它 —— 表面没 enter 过的屏
+	 * 根本不画这个表面（见 view_sync_drag_outputs 的说明），裁剪再怎么对
+	 * 也是空的：屏幕上就是「另一半不出现」。 */
+	if (view_drag_output(view) != NULL ||
+			view->float_mode != VIDOW_FLOAT_NONE) {
 		view_sync_drag_outputs(view, surface);
+		view_pin_scale(view);
+		vidow_portal_view_output(view);
 		return;
 	}
 	struct wlr_output *owner = vidow_view_owner_output(view);
@@ -1198,60 +1204,19 @@ bool view_clip_box(struct vidow_view *view, struct wlr_box *out) {
 			view->geom.width <= 0 || view->geom.height <= 0) {
 		return false;
 	}
-	/* **浮动窗口一律裁到自己那块屏**（2026-10-23 用户明确要求）。
+	/* **浮动窗口不裁**（2026-10-31 用户重新定的模型）：「浮动窗口与拖拽路径
+	 * 一致，不受工作区 / 显示器限制，显示所有交集背景」。它跨在两块屏中间时，
+	 * 两块屏各画自己那一半，拼起来是完整的窗口 —— 每块屏用自己那份装饰缓冲
+	 * 和底衬（view_bake_for_output + 每屏一格 blur_slot）。
 	 *
-	 * 以前这里对 float_mode != NONE 直接放过 —— 语义是「浮窗允许跨屏」，代价
-	 * 是浮窗骑在两块屏中间时那半块会画到隔壁显示器上，而且两块屏的缩放不同时
-	 * 那半块的模糊底衬只能选一块屏来采（一片横条）。用户的原话：「算了浮动
-	 * 窗口也不要越界」。
+	 * 2026-10-23 这里曾经改成「浮窗也裁到自己那块屏」，理由是当时还没有按屏
+	 * 绘制：跨屏那半块只能拿一块屏的底衬来采，看着就是一条横纹。现在按屏
+	 * 绘制的基础设施齐了（place 的 hits 决定每块屏画哪一半），那条权宜之计
+	 * 撤销 —— 用户的模型是「浮窗是屏级之上的一层」，不是「被关在自己屏里」。
 	 *
-	 * 小窗（mini）在上面已经单独处理，走的是自己那条更强的「强制裁」；这里只
-	 * 剩下普通浮窗 / X11 的浮动窗口。判据和下面平铺那条完全一样，只是不参与
-	 * 「拖拽中按画在哪块屏算」那一段 —— 浮窗**拖拽中**仍然按它此刻画在哪块屏
-	 * 裁（view_drag_output），这样松手前对面那块屏本来就在画它，只是裁到那块
-	 * 屏自己的工作区里。 */
+	 * 小窗（mini）在上面已经单独处理：它是屏级对象，仍然强制裁到自己那块屏。 */
 	if (view->float_mode != VIDOW_FLOAT_NONE) {
-		/* **拖拽中的浮窗不裁**（和平铺窗口下面那条同一个理由）。
-		 *
-		 * 用户 2026-10-27 报的「拖拽窗口到另一个显示器，第一次高分辨率拖
-		 * 低分辨率，像是被窗口大小卡住一样过不去」就是这条：浮窗在拖拽时
-		 * 仍然被裁到「当前那块屏」，而下面 view_drag_output() 又按光标换屏，
-		 * 于是窗口越过边界那一刻被切掉，屏幕上就是「停在屏交界过不去」。
-		 *
-		 * 拖拽期间 view_sync_drag_outputs() 已经让表面 enter 到所有相交的
-		 * 屏（没 enter 的屏根本不画它），所以这里再裁只剩「切掉一半」这一个
-		 * 效果 —— 跨屏拖拽本来就该两块屏各画一半、拼起来是完整的窗口。
-		 * 松手之后归到新工作区，裁剪自然恢复，不会留下永久越界的窗口。
-		 *
-		 * 只豁免移动：改大小（RESIZE）照旧裁。 */
-		if (view_is_being_dragged(view)) {
-			return false;
-		}
-		struct wlr_output *fout = vidow_view_display_output(view);
-		if (fout == NULL) {
-			fout = view_home_output(view);
-		}
-		if (fout == NULL) {
-			fout = wlr_output_layout_output_at(server->output_layout,
-				view->geom.x + view->geom.width / 2,
-				view->geom.y + view->geom.height / 2);
-		}
-		if (fout == NULL) {
-			return false;
-		}
-		struct wlr_box fbox = {0};
-		wlr_output_layout_get_box(server->output_layout, fout, &fbox);
-		if (fbox.width < 1 || fbox.height < 1) {
-			return false;
-		}
-		struct wlr_box fat = vidow_view_screen_box(view);
-		struct wlr_box fhit;
-		if (wlr_box_intersection(&fhit, &fat, &fbox) &&
-				fhit.width == fat.width && fhit.height == fat.height) {
-			return false; /* 整块都在自己那块屏里：不用裁 */
-		}
-		*out = fbox;
-		return true;
+		return false;
 	}
 	/* **拖拽中的窗口不裁**：窗口跟着光标越过边界时，它真的已经（也应该）
 	 * 同时出现在两块屏上 —— 裁到自己原来那块屏就把跨过去的那半块整块切掉，
