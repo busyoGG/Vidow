@@ -1675,6 +1675,24 @@ void vidow_ipc_json_state(struct jbuf *b, struct vidow_server *server) {
 	vidow_ipc_json_clipboard(b, server, &server->clipboard.clip, "state");
 	jb_key(b, "primary_selection");
 	vidow_ipc_json_clipboard(b, server, &server->clipboard.primary, "state");
+	/* 渲染统计（VIDOW_RENDER_STATS=1 时才计；没开就全 0）。用来从外面量
+	 * 「这一块屏多久出一次帧、几乎没损伤的帧占多少」—— 视频 / 光标那种
+	 * 「看得见、但没重画多少东西」的帧就藏在这个比例里。 */
+	jb_key(b, "render_stats");
+	jb_obj(b);
+	jb_kv_uint(b, "frames", (unsigned long long)vidow_stats.frames);
+	jb_kv_uint(b, "empty_frames",
+		(unsigned long long)vidow_stats.damage_empty);
+	jb_kv_uint(b, "lifted_frames",
+		(unsigned long long)vidow_stats.damage_lifted);
+	jb_kv_uint(b, "full_frames", (unsigned long long)vidow_stats.damage_full);
+	jb_kv_int(b, "damage_px", (long long)vidow_stats.damage_px);
+	jb_kv_int(b, "damage_area", (long long)vidow_stats.damage_area);
+	jb_kv_int(b, "from_event", vidow_stats.render_from_event);
+	jb_kv_int(b, "from_watchdog", vidow_stats.render_from_watchdog);
+	jb_kv_int(b, "from_kick", vidow_stats.render_from_kick);
+	jb_kv_int(b, "from_capture", vidow_stats.render_from_capture);
+	jb_obj_end(b);
 	jb_key(b, "shaders");
 	jb_arr(b);
 	struct vidow_shader *shader;

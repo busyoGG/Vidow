@@ -335,6 +335,13 @@ void vidow_output_render(struct vidow_output *output) {
 		if (full > 0 && px >= full) {
 			vidow_stats.damage_full++;
 		}
+		/* 损伤形状：一个像素都没脏 = 这帧是被「要帧」叫醒的空转；
+		 * 有损伤但很碎 = 视频 / 光标那种（抬起来的帧回调也在 damage 里）。 */
+		if (px <= 0) {
+			vidow_stats.damage_empty++;
+		} else if (full > 0 && px <= full / 20) {
+			vidow_stats.damage_lifted++;
+		}
 	}
 	wlr_scene_output_commit(output->scene_output, NULL);
 	int64_t st_t4 = vidow_now_ns();

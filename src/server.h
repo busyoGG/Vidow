@@ -2575,6 +2575,10 @@ struct vidow_frame_stats {
 	int render_from_watchdog; /* anim_watchdog 补帧 */
 	int render_from_kick;     /* kick_timer（切 tty / 输出重建） */
 	int render_from_capture;  /* 抓帧看门狗 */
+	/* 损伤形状：damage_empty = 场景一个像素都没脏就出帧的（后端帧事件 / 空转），
+	 * damage_lifted = 有帧回调被抬起来的（视频那种「看得见、但几乎没重画」）。 */
+	int damage_empty;
+	int damage_lifted;
 	int dmg_bumps;            /* damage_bump 调用次数 */
 	int dmg_notes;            /* blur_note_damage 调用次数 */
 };
