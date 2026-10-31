@@ -9,6 +9,7 @@
 #include <time.h>
 #include <unistd.h> /* access()：统计探针的文件开关 */
 
+#include "fx-internal.h"
 #include "ipc.h"
 #include "workspace.h"
 #include "sessionlock.h"
@@ -255,7 +256,29 @@ void vidow_output_render(struct vidow_output *output) {
 	 * moves behind the windows, so this loop does no work at all. */
 	struct vidow_view *view;
 	wl_list_for_each(view, &server->views, link) {
-		if (view->fx.active && view->fx.blur_drawn != view->fx.blur_ver) {
+		if (!view->fx.active) {
+			continue;
+		}
+		/* **跨屏重烘判据要带上「这块屏自己那一格」**（第 6 步）：
+		 *
+		 * blur_ver 是单值，两块屏各一格的底衬过期共用一个号。拖一半时
+		 * 对面那块屏的格子更新（blur_assign 推 blur_ver），这一屏那一格
+		 * 的 dec 明明还是旧的，可 blur_drawn 跟着被推过 —— 单看
+		 * blur_drawn != blur_ver 就跳过，DP-3 上的半截底衬停在拖起来之前
+		 * 的那一版（用户报的「拖一半 DP-3 的背景不画，还是从 DP-2 错位」）。
+		 *
+		 * 所以这里加一条：这一屏那一格的 dec_blur_ver 落后于全局 blur_ver
+		 * 也算要重烘。格子还没建（没跟这块屏碰过）不归这趟管。 */
+		bool stale_here = false;
+		if (view->fx.blur_drawn != view->fx.blur_ver) {
+			stale_here = true;
+		} else if (view->fx.bake_output == output->wlr_output) {
+			struct vidow_blur_slot *sl = blur_slot_for(&view->fx,
+				output->wlr_output, false);
+			stale_here = sl != NULL && sl->node != NULL &&
+				sl->dec_blur_ver != view->fx.blur_ver;
+		}
+		if (stale_here) {
 			if (getenv("VIDOW_DMG_WHY") != NULL) {
 				static int64_t rb_last;
 				int64_t rb_now = vidow_now_ns();

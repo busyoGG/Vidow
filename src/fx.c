@@ -1162,9 +1162,16 @@ void blur_assign(struct vidow_fx_target *fx, struct wlr_output *out,
 	 * 那张糊壁纸、关闭快照这些路没有 bake_output（它们一次只用一份贴图），
 	 * 写成格子的话 fx_blur_tex_now 永远找不到它（查的是 bake_output 那一格），
 	 * 着色器拿不到贴图 → u_blur_strength 归零 → 整块画成全透明
-	 * （实测 overview_blur 开了和没开一个像素都不差）。 */
-	struct vidow_blur_slot *slot = fx->bake_output != NULL ?
-		blur_slot_for(fx, out, true) : NULL;
+	 * （实测 overview_blur 开了和没开一个像素都不差）。
+	 *
+	 * **out 参数优先于 bake_output**（第 6 步）：拖拽中 bake_output 不再被
+	 * vidow_blur_update 钉死（见那里），而调用方 vidow_blur_update 明确知道
+	 * 「这一趟是给哪块屏更新的」—— 就按 out 写格子。否则拖一半时两块屏的
+	 * 更新都写进 bake_output 那一格，另一格永远停在旧底衬（用户报的
+	 * 「拖一半 DP-3 的背景不画、还从 DP-2 错位」）。layer / 预览那些没有
+	 * bake_output 的路两者都是 NULL，行为不变。 */
+	struct vidow_blur_slot *slot = (fx->bake_output != NULL || out != NULL) ?
+		blur_slot_for(fx, out != NULL ? out : fx->bake_output, true) : NULL;
 	if (slot != NULL) {
 		if (slot->id == id && slot->rx == rx && slot->ry == ry &&
 				slot->rw == rw && slot->rh == rh &&
@@ -2659,42 +2666,53 @@ update_consumers:
 		}
 		/* Per-output instances already checked their own geometry above.
 		 * Updating legacy fallback fields must not invalidate both instances
-		 * whenever two different outputs take turns rendering this view. */
-		if (oslot == NULL &&
-				(view->fx.blur_out_w != output->wlr_output->width ||
-				view->fx.blur_out_h != output->wlr_output->height ||
-				view->fx.blur_out_x != my_out_x ||
-				view->fx.blur_out_y != my_out_y)) {
-			view->fx.blur_ver++;
-			blur_ver_hits[4431]++;
+		 * whenever two different outputs take turns rendering this view.
+		 *
+		 * **拖拽中这四个单值字段干脆不写**（第 6 步）：窗口两半各压一块屏，
+		 * 两趟更新每帧互相覆盖。读取端（decor_draw / jelly）在 cur_slot /
+		 * rpass 里取的都是每屏那格，单值只在「没有格子上下文」的兜底路上
+		 * 用 —— 拖拽中把单值钉在最后写的那块屏上，兜底路（jelly 单份模式）
+		 * 就会用错屏的原点。松手后归属稳定，照旧写回。 */
+		if (!(view->dragging || server->grab_view == view)) {
+			if (oslot == NULL &&
+					(view->fx.blur_out_w != output->wlr_output->width ||
+					view->fx.blur_out_h != output->wlr_output->height ||
+					view->fx.blur_out_x != my_out_x ||
+					view->fx.blur_out_y != my_out_y)) {
+				view->fx.blur_ver++;
+				blur_ver_hits[4431]++;
+			}
+			view->fx.blur_out_w = output->wlr_output->width;
+			view->fx.blur_out_h = output->wlr_output->height;
+			view->fx.blur_out_x = my_out_x;
+			view->fx.blur_out_y = my_out_y;
 		}
-		view->fx.blur_out_w = output->wlr_output->width;
-		view->fx.blur_out_h = output->wlr_output->height;
-		view->fx.blur_out_x = my_out_x;
-		view->fx.blur_out_y = my_out_y;
-		/* **bake_output 是「这个窗口按哪块屏的倍率烘」，不是「这一趟在哪块屏
-		 * 上画」—— 别每帧覆盖它。**
-		 *
-		 * 这里原来无条件写 output->wlr_output。两块屏同帧各跑一遍
-		 * vidow_blur_update，于是它每帧被改写两次，而它正是下面这些判据的
-		 * 一环：view_bake_for_output 里 dec_output_scale / dec_output_box
-		 * 跟着它取，vidow_fx_frame 也拿它选 instance。结果每块屏的装饰缓存
-		 * 下一帧必然对不上，dec_valid 永远「要重烘」—— 实测静止画面
-		 * 3268 次 bakeout / 6 秒，blur_ver 每秒涨 172。整机白转。
-		 *
-		 * 也让「第一次跨屏拖拽卡住」有了根：拖到两块屏中间那几帧，谁最后
-		 * 跑就把 bake_output 抢走，窗口下一帧按别的屏的倍率烘。
+		/* **bake_output 归属：每屏一格模型下的「这一格跟谁烘」。**
 		 *
 		 * 只在**归属真的变了**的时候写：判据用 view_blur_owner（跟倍率、
 		 * 底衬归属同一个真值，见它的注释）。跨屏那一半的临时借用由
-		 * view_bake_for_output 自己存/恢复，不经过这里。 */
-		struct wlr_output *owner_out = view_blur_owner(view);
-		if (owner_out != NULL) {
-			view->fx.bake_output = owner_out;
-		} else if (view->fx.bake_output == NULL) {
-			/* 没有归属（浮窗 / 弹窗）：退回「这一趟画的这块屏」——
-			 * 但只在从没设过时写一次，不跟着每帧翻。 */
-			view->fx.bake_output = output->wlr_output;
+		 * view_bake_for_output 自己存/恢复，不经过这里。
+		 *
+		 * **例外：正被拖的窗口不写**（第 6 步）。拖一半时窗口画在两块屏
+		 * 上，两块屏的格子都在用；把它钉到 owner（= 布局归属，要等松手
+		 * 才换）上，DP-3 那一趟的 ensure_targets / fx_blur_tex_now 就都查
+		 * 到 DP-2 的格子 —— DP-3 画的还是 DP-2 的底衬，正是「拖一半 DP-3
+		 * 背景不画、还从 DP-2 错位」。拖拽期间 bake_output 由
+		 * view_bake_for_output 的借用机制按屏切换，这里不碰。 */
+		if (view->dragging || server->grab_view == view) {
+			/* 拖拽中且从未有过归属（浮窗起拖）：给它按当前屏起一格。 */
+			if (view->fx.bake_output == NULL) {
+				view->fx.bake_output = output->wlr_output;
+			}
+		} else {
+			struct wlr_output *owner_out = view_blur_owner(view);
+			if (owner_out != NULL) {
+				view->fx.bake_output = owner_out;
+			} else if (view->fx.bake_output == NULL) {
+				/* 没有归属（浮窗 / 弹窗）：退回「这一趟画的这块屏」——
+				 * 但只在从没设过时写一次，不跟着每帧翻。 */
+				view->fx.bake_output = output->wlr_output;
+			}
 		}
 		if (!view_wants_blur(view) || view->fx.node == NULL) {
 			if (view->fx.blur_own_tex != NULL) {
