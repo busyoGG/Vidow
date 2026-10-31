@@ -2141,6 +2141,16 @@ void vidow_view_capture_hold(struct vidow_view *view,
 		wl_client_add_destroy_listener(client, &hold->client_destroy);
 	}
 	wl_list_insert(view->capture_sources.prev, &hold->link);
+	/* 停泊的窗口也照样有画面：有人要录它，就把子树点亮（并一直开着，
+	 * vidow_view_set_parked 的停泊判据里有 capture_held 这条例外）。
+	 *
+	 * 另外记一笔现状：**按窗口录屏（wincapture.c）根本不用这棵子树** ——
+	 * 它在私有场景里用 wlr_scene_subsurface_tree_create() 从 wlr_surface
+	 * 另建一份镜像，真实节点的开关影响不到它。这里点亮是给「渲染真实场景
+	 * 再裁一块」那类抓帧路径兜底的，别让它们拿到黑帧。 */
+	if (view->scene_tree != NULL && !view->popup) {
+		wlr_scene_node_set_enabled(&view->scene_tree->node, true);
+	}
 }
 
 /* 窗口要没了：把持有记录清干净（源自己会跟着场景节点销毁，这里只管我们这份）。 */
