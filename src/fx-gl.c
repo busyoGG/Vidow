@@ -763,6 +763,8 @@ struct wlr_buffer *vidow_alloc_target(struct vidow_server *server, int w,
 				struct wlr_buffer *buf = wlr_allocator_create_buffer(
 					server->allocator, w, h, &set->formats[i]);
 				if (buf != NULL) {
+					wlr_log(WLR_DEBUG, "fx-target-alloc: %dx%d fmt=0x%08x -> %p",
+						w, h, set->formats[i].format, (void*)buf);
 					uint64_t mod = 0;
 					struct wlr_dmabuf_attributes attrs;
 					if (wlr_buffer_get_dmabuf(buf, &attrs)) {
@@ -903,10 +905,18 @@ bool ensure_targets(struct vidow_server *server,
 	}
 	/* The scene node owns a lock on its current decoration buffer. Detach it
 	 * before replacing the target pair, otherwise the old buffer remains locked
-	 * while the new pair is allocated and pick_free can never make progress. */
+	 * while the new pair is allocated and pick_free can never make progress.
+	 *
+	 * **两条路径的显示节点都要摘**：跨屏（1x/2x）拖拽时尺寸来回跳，每换一次
+	 * 尺寸就把旧的一对 dec/anim 丢掉重建。节点上还挂着旧缓冲（n_locks > 0）
+	 * 的话 drop 只减生产者引用、块本身不还 —— 每跳一次漏一批全屏大的 dmabuf
+	 * （实测 Steam 会话攒出 34 MiB × 150、游戏 128 MiB × 192 无限涨）。 */
 	if (sl != NULL && sl->node != NULL) {
 		wlr_scene_node_set_enabled(&sl->node->node, false);
 		wlr_scene_buffer_set_buffer(sl->node, NULL);
+	}
+	if (fx->node != NULL && (sl == NULL || fx->node->buffer != NULL)) {
+		wlr_scene_buffer_set_buffer(fx->node, NULL);
 	}
 	for (int i = 0; i < 2; i++) {
 		if (sl != NULL && sl->anim[i] != NULL) {

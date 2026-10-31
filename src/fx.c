@@ -1094,6 +1094,10 @@ static void instance_node_destroy(struct wl_listener *listener, void *data) {
 
 void instance_drop(struct vidow_blur_slot *sl) {
 	if (sl->node != NULL) {
+		/* 先摘缓冲再销毁节点：节点销毁本身会放掉它挂着的 buffer，但显式
+		 * 先 set NULL 让那把锁在最前面就还掉 —— dec/anim 里任何一块还挂着
+		 * 的目标都能立刻归还（n_locks 归零），不等节点析构的顺序。 */
+		wlr_scene_buffer_set_buffer(sl->node, NULL);
 		wlr_scene_node_destroy(&sl->node->node);
 	}
 	for (int i = 0; i < 2; i++) {
@@ -1477,12 +1481,22 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 	 * 好像一块大矩形一闪一闪。 */
 	struct wlr_buffer *anim = NULL;
 	if (fx->shader != NULL) {
+		struct wlr_buffer **abufs = instance != NULL ?
+			instance->anim : fx->anim_buf;
 		for (int i = 0; i < 2; i++) {
-			if ((instance != NULL ? instance->anim : fx->anim_buf)[i] == NULL) {
-				(instance != NULL ? instance->anim : fx->anim_buf)[i] = vidow_alloc_target(server, fx->w, fx->h);
+			/* 尺寸跟不上（跨屏换了倍率、dec 那对刚按新尺寸重建）：旧的先放。
+			 * 不放的话旧尺寸那块一直攥在手里，新分配的又按 fx->w/h 来 ——
+			 * 缓冲尺寸和烘图尺寸对不上，画出来错位，旧的也永远还不掉。 */
+			if (abufs[i] != NULL && (abufs[i]->width != fx->w ||
+					abufs[i]->height != fx->h)) {
+				wlr_buffer_drop(abufs[i]);
+				abufs[i] = NULL;
+			}
+			if (abufs[i] == NULL) {
+				abufs[i] = vidow_alloc_target(server, fx->w, fx->h);
 			}
 		}
-		anim = pick_free(instance != NULL ? instance->anim : fx->anim_buf);
+		anim = pick_free(abufs);
 	}
 
 	vidow_stats.bakes++;
