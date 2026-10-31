@@ -2104,6 +2104,23 @@ struct vidow_layer_surface {
 	char probe_exe[128];
 	char probe_cmdline[256];
 
+	/* **内容包围盒**（surface 局部逻辑坐标）：合成器自己读回这块面板的缓冲，
+	 * 量出「真正画出东西」的那一块（见 fx-layer.c 的 layer_content_scan）。
+	 *
+	 * 为什么不信客户端申报：vshell 的 bar / dock 是给菜单预留几百像素的透明
+	 * 画布（bar 1920x438 里只有顶上 38px 有内容），它申报的区域就是整块。
+	 * 模糊的区域按这个盒子收窄 —— 只在真有可见像素的地方做模糊。
+	 *
+	 * content_invisible：-1 = 还没测过（照旧画模糊，不闪）；1 = 一个像素都
+	 * 没有（模糊整块跳过）；0 = 有内容。 */
+	struct wl_event_source *content_idle;
+	uint64_t content_check_ns;
+	int content_invisible;
+	/* 上次读回之后客户端又交过帧 —— 只有为真才值得再读一遍（vshell 每秒交
+	 * 几十帧，不设这个就是每 200ms 无条件读一块整面板缓冲）。 */
+	bool content_dirty;
+	int content_x, content_y, content_w, content_h;
+
 	/* animation */
 	struct vidow_anim *anim;
 	double anim_off_x, anim_off_y;

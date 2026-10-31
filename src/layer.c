@@ -652,6 +652,15 @@ static void layer_surface_commit(struct wl_listener *listener, void *data) {
 	 * 由 fx.c 的 fresh 判据自己决定（世界代次 + 损伤盒子 + 区域尺寸 + 级数），
 	 * 跟这次 invalidate 无关 —— blur_ver 不在 fresh 的任何一项里。 */
 	vidow_layer_blur_invalidate(ls);
+
+	/* 新的一版内容到了：上一次读回的内容包围盒（/ 全透明判定）说的已经是
+	 * 旧内容。标成「还没测过」（-1），等下一次节流窗口到了再读一遍。
+	 *
+	 * **不是**每次 commit 都立刻读回：vshell 每秒交几十帧，那样等于每帧读
+	 * 一遍整块缓冲（2026-10-31 现场：渲染趟数 26→600+，模糊 0.14→4.7ms/帧）。
+	 * 标 -1 只是让 layer_content_invisible 别再拿旧结论做判定。 */
+	ls->content_invisible = -1;
+	ls->content_dirty = true;
 }
 
 static void layer_surface_destroy(struct wl_listener *listener, void *data) {
@@ -672,6 +681,11 @@ static void layer_surface_destroy(struct wl_listener *listener, void *data) {
 	ls->anim = NULL;
 	wlr_buffer_unlock(ls->last_buffer);
 	ls->last_buffer = NULL;
+	/* 排着的内容读回 idle 摘掉：它拿的是这个 ls，free 之后再跑就是 use-after-free。 */
+	if (ls->content_idle != NULL) {
+		wl_event_source_remove(ls->content_idle);
+		ls->content_idle = NULL;
+	}
 
 	wl_list_remove(&ls->map.link);
 	wl_list_remove(&ls->unmap.link);
@@ -801,6 +815,8 @@ static void server_new_layer_surface(struct wl_listener *listener, void *data) {
 	ls->layer_surface = layer_surface;
 	ls->id = ++server->next_layer_id;
 	ls->layer = layer_surface->pending.layer;
+	/* -1 = 内容还没测过（照旧画模糊，不闪）。见 fx-layer.c 的 layer_content_scan。 */
+	ls->content_invisible = -1;
 	wlr_log(WLR_DEBUG, "new layer surface %s layer=%u out=%p",
 		layer_surface->namespace ?: "?", ls->layer, (void *)layer_surface->output);
 

@@ -10,6 +10,7 @@
 #include "fx-layer.h"
 #include "fx-gl.h"
 
+#include <drm_fourcc.h>
 #include <math.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -117,6 +118,230 @@ bool layer_blur_visible(struct vidow_layer_surface *ls) {
 		&want) != PIXMAN_REGION_IN;
 }
 
+/* **内容包围盒**：合成器自己把这块面板的缓冲读回来，量出「真正画出东西」
+ * 的那一块。返回 -1 = 没测成（照旧画模糊），1 = 一个像素都没有，0 = 有内容。
+ *
+ * 为什么要有：vshell 的 bar / dock 是「给菜单预留几百像素」的透明画布 ——
+ * bar 1920x438 里只有顶上 38px 有内容、dock 1920x372 里只有 56px。它的申报
+ * （input region / ext-background-effect）就是整块画布，照它抓底衬 + 跑
+ * Kawase 金字塔，DP-2 上是 3840x876 一块 49MB、每帧白算 5~11 倍的量。
+ *
+ * 判据是合成器自己渲染出来的像素，不信客户端申报（用户原则）。看的是
+ * **alpha 通道**：ARGB 缓冲里 alpha=0 的像素照样可以有非零 RGB（清屏色、
+ * 上一帧残色），把它们当内容的话包围盒永远等于整块。
+ *
+ * 阈值 8/255（≈3%）：着色器按 blur_alpha_min（默认 0.15）剔，这里松一档 ——
+ * 宁可盒子大一点，不能把真的要画的地方裁掉。采样每 32 像素一跳，命中点前后
+ * 最多差 31 像素，盒子再往外补一个步长。
+ *
+ * 二分开关：/tmp/vidow-no-alpha-scan 存在就整个跳过（不读回、永远「没测成」），
+ * 用来现场确认「画面上的怪东西是不是这次读回引起的」。 */
+static int layer_content_scan(struct vidow_server *server,
+		struct vidow_layer_surface *ls) {
+	if (access("/tmp/vidow-no-alpha-scan", F_OK) == 0) {
+		return -1;
+	}
+	if (ls->layer_surface == NULL || ls->layer_surface->surface == NULL ||
+			ls->layer_surface->surface->buffer == NULL) {
+		return -1;
+	}
+	/* 借 wlr_client_buffer 自己那张贴图（dmabuf 客户端每帧重画同一个缓冲，
+	 * 另建一张源图导出的一直是第一次那版 —— 见 client_texture 的说明）。
+	 * 借来的不许 destroy，owned 标记决定。 */
+	bool owned = false;
+	struct wlr_texture *tex = client_texture(server->renderer,
+		&ls->layer_surface->surface->buffer->base, &owned);
+	if (tex == NULL) {
+		return -1;
+	}
+	uint32_t format = wlr_texture_preferred_read_format(tex);
+	int w = tex->width, h = tex->height;
+	/* 没有 alpha 通道（XRGB）：内容必然可见，不读回。 */
+	if (format != DRM_FORMAT_ARGB8888 && format != DRM_FORMAT_ABGR8888 &&
+			format != DRM_FORMAT_RGBA8888 && format != DRM_FORMAT_BGRA8888) {
+		if (getenv("VIDOW_DMG_WHY") != NULL) {
+			wlr_log(WLR_INFO, "ALPHASCAN ns=%s fmt=%#x %dx%d -> 不可读",
+				ls->layer_surface->namespace ?: "?", format, w, h);
+		}
+		if (owned) {
+			wlr_texture_destroy(tex);
+		}
+		return format == 0 ? -1 : 0;
+	}
+	size_t stride = (size_t)w * 4;
+	void *data = malloc(stride * (size_t)h);
+	if (data == NULL) {
+		if (owned) {
+			wlr_texture_destroy(tex);
+		}
+		return -1;
+	}
+	struct wlr_texture_read_pixels_options opts = {
+		.data = data,
+		.format = format,
+		.stride = (uint32_t)stride,
+		.src_box = { .x = 0, .y = 0, .width = w, .height = h },
+	};
+	bool ok = wlr_texture_read_pixels(tex, &opts);
+	if (owned) {
+		wlr_texture_destroy(tex);
+	}
+	if (!ok) {
+		free(data);
+		return -1;
+	}
+	/* alpha 在哪个字节：ARGB / ABGR 在最高位，RGBA / BGRA 在最低位。 */
+	uint32_t alpha_shift = 24;
+	uint32_t alpha_mask = 0xff000000u;
+	if (format == DRM_FORMAT_RGBA8888 || format == DRM_FORMAT_BGRA8888) {
+		alpha_shift = 0;
+		alpha_mask = 0x000000ffu;
+	}
+	const uint32_t visible_alpha = 8;
+	int invisible = 1;
+	int bx0 = 0x3fffffff, by0 = 0x3fffffff, bx1 = -1, by1 = -1;
+	for (int y = 0; y < h; y += 32) {
+		const uint32_t *row = (const uint32_t *)((const uint8_t *)data +
+			(size_t)y * stride);
+		for (int x = 0; x < w; x += 32) {
+			uint32_t a = (row[x] & alpha_mask) >> alpha_shift;
+			if (a == 0) {
+				continue;
+			}
+			invisible = 0;
+			if (a < visible_alpha) {
+				continue;
+			}
+			if (x < bx0) {
+				bx0 = x;
+			}
+			if (y < by0) {
+				by0 = y;
+			}
+			if (x > bx1) {
+				bx1 = x;
+			}
+			if (y > by1) {
+				by1 = y;
+			}
+		}
+	}
+	free(data);
+	if (invisible || bx1 < 0) {
+		/* 全透明：盒子没意义，清掉（下次有内容要从整块重新算）。
+		 *
+		 * bx1 < 0 但 !invisible：有 alpha 但都低于门槛 —— 照样要画模糊，
+		 * 只是盒子不可信，退回整块。别返回 1（那是「整块跳过」的意思，
+		 * 会让这块面板的模糊反复删掉又建回来）。 */
+		ls->content_w = 0;
+		ls->content_h = 0;
+		return invisible ? 1 : 0;
+	}
+	bx0 -= 32;
+	by0 -= 32;
+	bx1 += 32;
+	by1 += 32;
+	if (bx0 < 0) {
+		bx0 = 0;
+	}
+	if (by0 < 0) {
+		by0 = 0;
+	}
+	if (bx1 > w) {
+		bx1 = w;
+	}
+	if (by1 > h) {
+		by1 = h;
+	}
+	/* 缓冲像素 -> 逻辑（surface 局部）：geom 就是这块 surface 的逻辑尺寸。 */
+	double sx = (double)ls->geom.width / (double)w;
+	double sy = (double)ls->geom.height / (double)h;
+	int cx = (int)floor((double)bx0 * sx);
+	int cy = (int)floor((double)by0 * sy);
+	int cx2 = (int)ceil((double)bx1 * sx);
+	int cy2 = (int)ceil((double)by1 * sy);
+	if (cx2 > ls->geom.width) {
+		cx2 = ls->geom.width;
+	}
+	if (cy2 > ls->geom.height) {
+		cy2 = ls->geom.height;
+	}
+	if (cx2 > cx && cy2 > cy) {
+		ls->content_x = cx;
+		ls->content_y = cy;
+		ls->content_w = cx2 - cx;
+		ls->content_h = cy2 - cy;
+	}
+	if (getenv("VIDOW_DMG_WHY") != NULL) {
+		wlr_log(WLR_INFO, "ALPHASCAN ns=%s buf=%dx%d box=%d,%d %dx%d geom=%dx%d",
+			ls->layer_surface->namespace ?: "?", w, h, ls->content_x,
+			ls->content_y, ls->content_w, ls->content_h,
+			ls->geom.width, ls->geom.height);
+	}
+	return 0;
+}
+
+/* 读回排到事件循环空闲时跑（见下面 layer_content_invisible 的说明）。 */
+static void layer_content_idle(void *data) {
+	struct vidow_layer_surface *ls = data;
+	ls->content_idle = NULL;
+	if (ls->layer_surface == NULL || ls->server == NULL) {
+		return;
+	}
+	int old_verdict = ls->content_invisible;
+	int old_x = ls->content_x, old_y = ls->content_y;
+	int old_w = ls->content_w, old_h = ls->content_h;
+	ls->content_dirty = false;
+	ls->content_invisible = layer_content_scan(ls->server, ls);
+	ls->content_check_ns = vidow_now_ns();
+	/* **只有结果真的变了才推帧。** 读回本身每 500ms 跑一次是便宜的，但
+	 * gen_scene++ 会让所有底衬（窗口的、每块面板的）整体作废、下一帧全价
+	 * 重抓 —— 读回结果没变还推，就是「空闲时也每 500ms 整屏重画」。 */
+	if (ls->content_invisible != old_verdict || ls->content_x != old_x ||
+			ls->content_y != old_y || ls->content_w != old_w ||
+			ls->content_h != old_h) {
+		ls->server->gen_scene++;
+		if (ls->output != NULL) {
+			vidow_output_schedule_frame(ls->server, ls->output->wlr_output,
+				"layer 内容判定");
+		}
+	}
+}
+
+/* 内容是不是一个像素都没有（模糊整块跳过）。带 200ms 节流，读回走 idle。
+ *
+ * **读回绝不能跑在渲染路径里。** wlr_texture_read_pixels 自己会 begin 一趟
+ * render pass（GLES2 上还要建临时 FBO），在渲染途中干这个会把后面要画的东西
+ * 搅乱 —— 2026-10-31 现场：「趟」从 26~38 涨到 608~966 / 500ms，模糊
+ * 0.14ms/帧 → 4.7ms/帧，画面跟着花。所以这里只排 idle，渲染路径只用上一次的
+ * 结果（-1 = 还没测过，照旧画，不闪）。
+ *
+ * 节流不看 content_invisible 是不是 -1：commit 会把它置 -1 当「未测」，而
+ * vshell 每秒交几十次帧 —— 那等于每次 commit 都读一遍。 */
+static bool layer_content_invisible(struct vidow_server *server,
+		struct vidow_layer_surface *ls) {
+	if (ls->content_dirty && ls->content_idle == NULL &&
+			vidow_now_ns() - ls->content_check_ns >= 200000000LL &&
+			server->display != NULL) {
+		ls->content_idle = wl_event_loop_add_idle(
+			wl_display_get_event_loop(server->display),
+			layer_content_idle, ls);
+	}
+	if (ls->content_invisible < 0) {
+		return false; /* 还没测过：别闪，照旧画 */
+	}
+	if (ls->content_invisible == 1 && ls->blur_fail != 16) {
+		ls->blur_fail = 16;
+		wlr_log(WLR_INFO, "layer %s: 内容全透明，模糊跳过（200ms 复查）",
+			ls->layer_surface != NULL &&
+				ls->layer_surface->namespace != NULL ?
+				ls->layer_surface->namespace : "?");
+	} else if (ls->content_invisible == 0 && ls->blur_fail == 16) {
+		ls->blur_fail = 0;
+	}
+	return ls->content_invisible == 1;
+}
+
 bool layer_blur_wanted(struct vidow_server *server,
 		struct vidow_layer_surface *ls) {
 	if (!server->shader_ok || !server->config.blur_enabled) {
@@ -129,6 +354,18 @@ bool layer_blur_wanted(struct vidow_server *server,
 	/* 壁纸自己（background 层）不模糊：模糊的底衬里就有它，垫一层等于画重。 */
 	if (ls->layer == ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND) {
 		return layer_blur_bail(ls, 12, "这是 background 层（壁纸自己）");
+	}
+	/* **场景树被关掉的（全屏窗口自动隐藏）不模糊**：节点关了，内容一个像素
+	 * 都不出现在屏上，模糊垫了也看不见 —— 可客户端还在交帧，模糊循环照样
+	 * 跑全价的抓取 + 金字塔。树开着才算「看得见」。 */
+	if (ls->scene != NULL && !ls->scene->tree->node.enabled) {
+		return layer_blur_bail(ls, 15, "场景树被关（全屏自动隐藏中）");
+	}
+	/* **内容全透明的不糊**（合成器自己判定，不信客户端申报）：树开着、几何
+	 * 正常，但当前这次提交里一个不透明像素都没有（滑出式 dock / opacity=0
+	 * 的 OSD），垫模糊纯白烧。 */
+	if (layer_content_invisible(server, ls)) {
+		return layer_blur_bail(ls, 16, "内容全透明（客户端自己藏了内容）");
 	}
 	if (!(ls->geom.width > 0 && ls->geom.height > 0)) {
 		return layer_blur_bail(ls, 13, "几何还是 0（没提交过 / 还没摆）");
@@ -199,6 +436,21 @@ bool layer_region_rect(struct vidow_server *server,
 	if (have) {
 		struct wlr_box inter;
 		if (wlr_box_intersection(&inter, &want, &vis)) {
+			vis = inter;
+		}
+	}
+	/* **再用合成器自己读回的内容包围盒收一圈**（见 layer_content_scan）：
+	 * 客户端声明的区域只是上界 —— vshell 的 bar / dock 给的是整块预留画布
+	 * （1920x438 / 1920x372），真正画出来的只有顶上那几十像素。照它抓底衬
+	 * 就是白付 5~11 倍的抓取 + 金字塔。
+	 *
+	 * 盒子 0（还没测过 / 读回失败）就照旧走上面那条；盒子跟声明区域求交，
+	 * 不让任何一方单独把要画的地方裁掉。 */
+	if (ls->content_w > 0 && ls->content_h > 0) {
+		struct wlr_box c = { .x = ls->content_x, .y = ls->content_y,
+			.width = ls->content_w, .height = ls->content_h };
+		struct wlr_box inter;
+		if (wlr_box_intersection(&inter, &c, &vis)) {
 			vis = inter;
 		}
 	}
@@ -920,6 +1172,25 @@ bool layer_blur_frame(struct vidow_server *server,
 				&rh_px, &levels)) {
 			return layer_blur_bail(ls, 6, "模糊区域算不出来（整块在屏外 / 太大）");
 		}
+		/* **抓的框和画的框必须是同一个。**
+		 *
+		 * 上面只抓了 rx/ry/rw×rh 那一块（bar 的顶栏、dock 的图标行），而着色器
+		 * **不知道**这件事：u_blur_region_on 一直是 0，于是 cover 恒为 1 ——
+		 * 模糊按整块 geom 铺满（bar 的 438 高预留画布、dock 的 372），区域外
+		 * 采的是贴图边缘 clamp 出来的那几个像素，屏幕上就是一条条别的窗口的
+		 * 颜色糊在面板上（用户 2026-10-31 说的「UI 带出别的窗口内容」）。
+		 *
+		 * 这里把「真抓了哪一块」告诉着色器（surface 局部逻辑坐标）：模糊只在
+		 * 这块里面画，外面一个像素都不碰。 */
+		int obx = (int)lround((double)output->box.x * scale);
+		int oby = (int)lround((double)output->box.y * scale);
+		int gx = (int)lround((double)ls->geom.x * scale) - obx;
+		int gy = (int)lround((double)ls->geom.y * scale) - oby;
+		fx->blur_region_on = true;
+		fx->blur_region[0] = (float)(rx - gx) / (float)scale;
+		fx->blur_region[1] = (float)(ry - gy) / (float)scale;
+		fx->blur_region[2] = (float)rw_px / (float)scale;
+		fx->blur_region[3] = (float)rh_px / (float)scale;
 		/* 缓存键：区域（含输出原点，多屏下会动）、世界代次（窗口重画 / layer
 		 * 变动）、级数、还有那两套直接影响结果的参数。 */
 		/* 同窗口那条路：世界代次只是粗筛，损伤盒子没碰到这一块就不重抓。
@@ -1019,6 +1290,9 @@ bool layer_blur_frame(struct vidow_server *server,
 		 * 加 if 守卫：这个分支**每帧**都走，无守卫就是每帧白跑一遍 6 次赋值
 		 * （把已经归零的字段再写一遍）。它真正要干的只有「刚从 top/overlay
 		 * 切过来」那一次。 */
+		/* 共享底衬是整屏的，没有「区域外」这回事：把区域限制关掉。
+		 * （从 top / overlay 切到 bottom 时不清，屏幕上就只剩顶上那一条糊。） */
+		fx->blur_region_on = false;
 		if (fx->blur_own_tex != NULL) {
 			blur_own_drop(fx);
 		}

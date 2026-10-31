@@ -3074,7 +3074,16 @@ static bool decor_pass(struct vidow_server *server,
 	 * 也就是不剔。 */
 	float mask_min = fx->mask_min > 0.0f ?
 		fx->mask_min : (float)cfg->blur_alpha_min;
-	if (fx->blur_region_on || (mask == NULL && fx->blur_only)) {
+	/* region_on 时「区域边界就是画出来的边界」，不再按元素 alpha 剔 —— **只对
+	 * 没递 mask 的那条路成立**（窗口 / 弹窗：区域是客户端 ext-background-effect
+	 * 声明的，精确）。
+	 *
+	 * layer 这条路递了 mask（面板自己的缓冲），而区域是**抓底衬的框**（比内容
+	 * 大一圈：往外放了模糊半径、对齐到 128 网格，bar 是 949x438 里的 0,0 949x64
+	 * 再放一圈 → 好几百像素高）。区域一放行就按整框糊，bar 底下会糊出一条
+	 * 别的窗口的色带（用户 2026-10-31：「UI 带出别的窗口内容」）。所以这里必须
+	 * 继续按 mask 的 alpha 剔。 */
+	if (mask == NULL && (fx->blur_region_on || fx->blur_only)) {
 		mask_min = 0.0f;
 	}
 	glUniform1f(d->u_mask_min, mask_min);
