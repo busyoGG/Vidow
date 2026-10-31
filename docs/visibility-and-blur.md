@@ -90,6 +90,8 @@ IPC；单 fd 一天 2000+ 行）、`x11: 新窗口 / 先回 configure`、
 | `/tmp/vidow-no-alpha-scan` | 跳过内容包围盒读回（区域回退到声明区域） |
 | `/tmp/vidow-no-arrange-region` | arrange 收口回退整屏损伤 |
 | `/tmp/vidow-place-check` | place 与旧判据对账探针（不一致打 PLACECHK） |
+| `/tmp/vidow-span` | span 探针：跨屏骑边界时两趟的底衬归属 / 区域（`fx-dmg.c`） |
+| `/tmp/vidow-x11-trace` | 跨屏拖拽跟手探针：格子归属 / 裁剪 / 节点落点（bakeout/fx trace） |
 | `VIDOW_DMG_WHY=1` | 损伤从哪来 / LAYERBLUR / ALPHASCAN 探针 |
 | `VIDOW_FRAME_WHY=1` / `VIDOW_COMMIT_WHY=1` | 谁在要帧 / 谁在交帧 |
 
