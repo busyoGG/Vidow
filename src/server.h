@@ -3765,6 +3765,63 @@ void vidow_backdrop_damage_box(struct vidow_server *server,
 		const struct wlr_box *box);
 /* 窗口「现在画在哪」：布局几何 + 动画偏移（拖拽 / 开合 / overview 都算在这上面）。 */
 struct wlr_box vidow_view_screen_box(const struct vidow_view *view);
+
+/* ---------------------------------------------------------------- place
+
+ * **「这块 surface 现在算不算在屏上、在哪几块屏的哪一块」的唯一答案**（见
+ * src/place.c）。别的可见性判据（view_shows / should_park / view_on_screen /
+ * in_output_box / view_visible_box / sliding_out / workspace_view_visible /
+ * scene_parked，以及 layer 自己那一套）最终都要读这一份，不许各写一套 ——
+ * 2026-10-31 用户：「相同的判断需要统一在一个逻辑里面，不要碎片化」。
+ *
+ * 现在（第 1 步）只算几何事实，行为不变；策略（工作区可见 / 最小化 /
+ * overview / 停泊）第 2 步收进来。 */
+#define VIDOW_PLACE_MAX_HITS 4
+
+struct vidow_place_hit {
+	struct wlr_output *out;
+	/* 这块 surface 落在这块屏上的那一块（布局坐标）；也是该屏的裁剪框。 */
+	struct wlr_box box;
+	/* 这块屏自己的框（算倍率 / 夹取用）。 */
+	struct wlr_box output_box;
+};
+
+struct vidow_place {
+	/* 归属：谁负责它的工作区 / 倍率 / 补帧。浮窗、拖拽中可以不等同于
+	 * hits 里那块屏（I6）。 */
+	struct wlr_output *home;
+	/* 世界坐标框（含视口 / 动画 / 拖拽偏移）。 */
+	struct wlr_box world;
+	/* 和几块屏有交集。0 = 逻辑和渲染上都不存在（I1）。 */
+	int n;
+	struct vidow_place_hit hits[VIDOW_PLACE_MAX_HITS];
+};
+
+/* hits 是**纯几何**：和哪几块屏有交集就算几块。消费者只挑「看哪一行」：
+ *   平铺 / 全屏渲染 → 只认 home（I3：不许溢出到隔壁屏）
+ *   补帧 / 冻结     → 认任意一块（画在谁那儿都算在屏上）
+ *   浮窗 / 拖拽     → 认全部（I6）
+ * 判据只有一份，差别只在访问器 —— 不许再各写一遍几何相交。 */
+static inline const struct vidow_place_hit *vidow_place_home_hit(
+		const struct vidow_place *place) {
+	for (int i = 0; i < place->n; i++) {
+		if (place->hits[i].out == place->home) {
+			return &place->hits[i];
+		}
+	}
+	return NULL;
+}
+static inline bool vidow_place_any(const struct vidow_place *place) {
+	return place->n > 0;
+}
+
+void vidow_place_of_view(struct vidow_server *server, struct vidow_view *view,
+		struct vidow_place *place);
+void vidow_place_of_layer(struct vidow_server *server,
+		struct vidow_layer_surface *ls, struct vidow_place *place);
+/* 对账探针：/tmp/vidow-place-check 存在时，在 arrange 收口处比较「place 的结论」
+ * 和旧判据，把不一致逐条打出来（第 1 步用来找碎片 / 残影的真来源）。 */
+void vidow_place_check(struct vidow_server *server, const char *tag);
 /* 同上，但世界代次也前进：这次变的**就是** box 这一块（关窗动画那种）。 */
 void vidow_backdrop_damage_region(struct vidow_server *server,
 		const struct wlr_box *box);

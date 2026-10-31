@@ -168,6 +168,7 @@ sources = files(
   'src/output.c',
   'src/outputconf.c',
   'src/view.c',
+  'src/place.c',
   'src/xtrace.c',
   'src/flipprobe.c',
   'src/xwm.c',

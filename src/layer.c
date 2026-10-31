@@ -276,6 +276,9 @@ void vidow_arrange_layers(struct vidow_server *server) {
 
 		output->usable_area = usable_area;
 	}
+	/* 对账：layer 的几何有没有越出它自己那块屏（现在只靠 wlroots 每屏裁剪
+	 * 兜着；「逻辑上也不许溢出」是第 3 步）。 */
+	vidow_place_check(server, "layers");
 }
 
 /* ------------------------------------------------------------- keyboard */

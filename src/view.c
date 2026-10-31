@@ -1102,9 +1102,13 @@ bool vidow_view_in_output_box(struct vidow_server *server,
 	if (box.width < 1 || box.height < 1) {
 		return true;
 	}
-	struct wlr_box at = vidow_view_screen_box(view);
-	return at.x < box.x + box.width && at.x + at.width > box.x &&
-		at.y < box.y + box.height && at.y + at.height > box.y;
+	/* **几何这件事只有 place 一个答案**（见 src/place.c）：平铺 / 全屏只跟
+	 * 归属那块屏算交集，浮窗 / 拖拽 / 弹窗跟所有屏算。这里以前自己抄了一份
+	 * 相交判断 —— 就是「同样的判据两份实现」最典型的例子，改了一边忘了另一边
+	 * 就是窗口画到隔壁屏 / 滚出屏还在画。 */
+	struct vidow_place place;
+	vidow_place_of_view(server, (struct vidow_view *)view, &place);
+	return vidow_place_home_hit(&place) != NULL;
 }
 
 /* **这个窗口现在是不是「正被手拖着」。**
@@ -1711,24 +1715,13 @@ static bool view_on_screen(struct vidow_server *server,
 	 *
 	 * 所以这里改成问「有没有落在任意一块屏里」。判据本身还是几何相交，
 	 * 只是不再相信 view->output 这一个字段。 */
-	bool on = false;
-	struct vidow_output *o;
-	wl_list_for_each(o, &server->outputs, link) {
-		struct wlr_box box = {0};
-		wlr_output_layout_get_box(server->output_layout, o->wlr_output, &box);
-		if (box.width < 1 || box.height < 1) {
-			continue;
-		}
-		if (view->geom.x < box.x + box.width &&
-				view->geom.x + view->geom.width > box.x &&
-				view->geom.y < box.y + box.height &&
-				view->geom.y + view->geom.height > box.y) {
-			on = true;
-			break;
-		}
-	}
+	/* 判据走 place（src/place.c）：这里要的是「画在任意一块屏上都算在屏上」，
+	 * 所以用 vidow_place_any —— 不再信 view->output 那个字段（它和 geom 会
+	 * 短暂分叉，分叉一次就变成每 5ms 强制补帧，整机卡）。 */
+	struct vidow_place place;
+	vidow_place_of_view(server, view, &place);
 	(void)output;
-	return on;
+	return vidow_place_any(&place);
 }
 
 /* **每帧给 X11 视图无条件发一次 frame_done。**
@@ -2256,8 +2249,21 @@ bool vidow_view_should_park(struct vidow_server *server,
 		return false;
 	}
 	/* 其余窗口（有工作区的）只在自己的屏里画：越界就停到停车位，别让几何框
-	 * 落进隔壁屏的坐标范围（否则场景图是全局坐标，会画到隔壁显示器上）。 */
-	return !vidow_view_in_output_box(server, view);
+	 * 落进隔壁屏的坐标范围（否则场景图是全局坐标，会画到隔壁显示器上）。
+	 *
+	 * 判据走 place（src/place.c）：平铺 / 全屏只跟归属那块屏算交集 ——
+	 * 「滚到屏外 = 逻辑和渲染上都不存在，滚回来就恢复；只要和屏有交集就算
+	 * 在屏上」（用户 2026-10-31）。以前这里还留着一份自己的几何判断，
+	 * 和 view_visible_box / view_on_screen 各算各的。 */
+	struct vidow_place place;
+	vidow_place_of_view(server, view, &place);
+	/* 浮窗 / 拖拽的窗口：交集一块都没有才算不在（I6）；平铺 / 全屏：
+	 * 只看归属那块屏（滚出屏 = 不存在）。 */
+	if (view->float_mode != VIDOW_FLOAT_NONE || view->dragging ||
+			server->grab_view == view) {
+		return !vidow_place_any(&place);
+	}
+	return vidow_place_home_hit(&place) == NULL;
 }
 
 /* 停到屏外 / 放回屏里。**只有这一个入口**改这个标志：日志和损伤都在这儿 ——
@@ -4263,6 +4269,11 @@ void vidow_arrange(struct vidow_server *server) {
 		vidow_backdrop_damage(server, false);
 	}
 	server->arrange_self_only = false;
+
+	/* 第 1 步的对账探针（/tmp/vidow-place-check）：摆完之后把 place 的结论
+	 * 和旧可见性判据比一遍，不一致的逐条打出来 —— 那些就是碎片 / 残影 /
+	 * 「滚出屏还在画」的真来源。**不参与判断，只打日志。** */
+	vidow_place_check(server, "arrange");
 }
 
 /* ------------------------------------------------------------- 热插拔 */
