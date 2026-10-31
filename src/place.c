@@ -149,8 +149,16 @@ void vidow_place_of_layer(struct vidow_server *server,
 		.height = ls->geom.height,
 	};
 	place_hits(server, p);
-	/* layer：没 map / 没 configure 过的层不画；其余只要跟自己那块屏有交集就画
-	 * （layer 物理上不跨屏，geom 溢出隔壁屏那部分不画 —— 见第 3 步的夹取）。 */
+	/* layer：没 map / 没 configure 过的层不画；其余只要跟自己那块屏有交集就画。
+	 *
+	 * **layer 的 hits 只跟自己那块屏求交**（layer 物理上不跨屏：它挂在某块
+	 * 输出的 scene 节点下，wlroots 每屏一条树）。所以 hits[i].box 就是「这一层
+	 * 在这块屏上真正画出来的那一块」—— 面板自己溢出到隔壁屏的那半截**不属于
+	 * 任何一块屏**，逻辑和渲染上都不存在（用户 2026-10-31：「layer 属于某显示器
+	 * 也不许溢出」）。
+	 *
+	 * 还不去改节点的显示范围（wlr_scene 每屏一条树，本来就裁掉了）：那要新增一份
+	 * 「裁到哪」的状态、在几何变化时作废底衬，收益只是省几个像素的填充。 */
 	if (ls->layer_surface->surface == NULL ||
 			!ls->layer_surface->surface->mapped ||
 			ls->geom.width <= 0 || ls->geom.height <= 0) {
@@ -246,8 +254,9 @@ void vidow_place_check(struct vidow_server *server, const char *tag) {
 			}
 		}
 	}
-	/* layer：geom 有没有越出它那块屏（现在只靠 wlroots 每屏裁剪兜着；
-	 * 「逻辑上也不许溢出」是第 3 步）。 */
+	/* layer：geom 有没有越出它那块屏。place 的结论是「只算自己那块屏上的那一
+	 * 块」，所以越界部分在逻辑上不存在；这里只是报条数，让人知道界面上有几层
+	 * 是靠 wlroots 每屏的树兜住的。 */
 	struct vidow_layer_surface *ls;
 	wl_list_for_each(ls, &server->layers, link) {
 		if (ls->output == NULL || ls->geom.width <= 0 ||
