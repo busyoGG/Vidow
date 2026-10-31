@@ -15,6 +15,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <wlr/types/wlr_scene.h>
@@ -401,8 +402,13 @@ bool blur_trace_on(void) {
 bool span_trace_on(void) {
 	static int done = 0, on = 0;
 	if (!done) {
-		on = getenv("VIDOW_SPAN_TRACE") != NULL ? 1 : 0;
+		on = getenv("VIDOW_SPAN_TRACE") != NULL;
 		done = 1;
+	}
+	if (!on) {
+		/* 文件开关（运行时可开）：查跨屏两半的底衬归属就用它，不用重启。 */
+		struct stat st;
+		on = stat("/tmp/vidow-span", &st) == 0;
 	}
 	return on != 0;
 }
