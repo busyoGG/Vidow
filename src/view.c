@@ -2285,7 +2285,20 @@ void vidow_view_set_parked(struct vidow_view *view, bool park) {
 	 * **例外：有人正在录它 / 预览它**（portal 的窗口截图源渲染的就是这棵
 	 * 子树，关了是黑的 —— 这正是当初「停到屏外而不是关节点」的唯一理由，
 	 * 见 workspace.c 的同款说明）。弹出物不在这里管：它在 workspace.c 里
-	 * 按自己的判据关（见那边的注释）。 */
+	 * 按自己的判据关（见那边的注释）。
+	 *
+	 * **三条「会显示停泊窗口」的路都查过，都不靠这棵树**（2026-10-31）：
+	 * - 按窗口录屏（wincapture.c）：私有场景里 wlr_scene_subsurface_tree_create
+	 *   从 wlr_surface 另建的镜像；
+	 * - MRU 卡片缩略图（mru.c 的 mru_card_thumb）：直接把客户端的 buffer
+	 *   挂到自己的 wlr_scene_buffer 上；
+	 * - 小窗悬停预览（view.c 的 preview_show）：同样是另建的镜面 / 快照，
+	 *   挂在 layer_top；
+	 * - overview 不一样：它渲染的就是真实场景树，所以 overview 期间
+	 *   should_park 一律返回 false（见 vidow_view_should_park）—— 进
+	 *   overview 时 set_parked(false) 会把树重新点亮，退出时再关。
+	 * 以后再加「显示不可见窗口」的路径，要么走上面这份「另建节点」，要么
+	 * 记得在 should_park 里开豁免。 */
 	if (view->scene_tree != NULL && !view->popup) {
 		wlr_scene_node_set_enabled(&view->scene_tree->node,
 			!park || vidow_view_capture_held(view));
