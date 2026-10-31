@@ -439,34 +439,41 @@ struct wlr_output *vidow_view_owner_output(const struct vidow_view *view) {
 
 bool view_clip_box(struct vidow_view *view, struct wlr_box *out);
 
-/* 「看得见的那一块」在布局坐标里的框（哪块屏上都没画着时是空的）：
- *   停到停车位（滚出视口 / 藏起来的工作区）→ 空；
- *   裁着（平铺窗口有一部分越出自己那块屏）→ 几何框 ∩ 自己那块屏的框；
- *   其余（浮窗 / 正被拖的窗口 / 整块都在自己屏里）→ 几何框本身。
+/* 「看得见的那一块」在布局坐标里的框（哪块屏上都没画着时是空的）。判据走 place
+ * （src/place.c）：resident 为假的直接空；平铺 / 全屏取归属那块屏上的那一片
+ * （裁掉越界部分）；浮窗 / 拖拽 / overview 取世界框。
  *
  * 为什么不能直接用几何框：平铺窗口的几何框里含着**滚动视口的偏移**，滚出视口之后
  * 会跨到隔壁屏的布局范围里 —— 照它算，倍率就落到隔壁那块屏上：2 倍屏上的窗口在
  * 录屏 / 预览里一直按 1 倍糊着，滚回视口才清楚（用户报的「窗口滚动出去后，又按照
- * 另一个屏幕的缩放变化了」）。裁剪（view_clip_box）裁掉的正是越界那一块，所以
- * 「看得见的」= 几何框 ∩ 那块屏的框。 */
+ * 另一个屏幕的缩放变化了」）。 */
 static void view_visible_box(const struct vidow_view *view, struct wlr_box *out) {
 	*out = (struct wlr_box){0};
-	if (!view->mapped) {
+	/* **判据走 place**（src/place.c）：resident 为假（未 map / 小窗快照 /
+	 * 工作区藏着 / 最小化 / 滚出自己那块屏）= 哪块屏上都没有它，框是空的。
+	 *
+	 *   overview          → 世界框（所有窗口都缩进画面，不裁）
+	 *   浮窗 / 拖拽 / 弹窗 → 世界框（物理上能跨屏，倍率由调用方按交集挑最大的）
+	 *   平铺 / 全屏        → 归属那块屏上的那一片（hits 里的 home），就是被裁到
+	 *                        自己屏里的可见部分 —— 不许溢出到隔壁（I3）
+	 *
+	 * 以前这里自己写：mapped → should_park → 几何框 ∩ view_clip_box。同一件事
+	 * 第三份实现。 */
+	struct vidow_place place;
+	vidow_place_of_view(view->server, (struct vidow_view *)view, &place);
+	if (!place.resident) {
 		return;
 	}
-	if (vidow_view_should_park(view->server, (struct vidow_view *)view)) {
-		return; /* 停到停车位：哪块屏上都没有它，判据回退到「它属于哪块屏」 */
+	if (vidow_overview_active(view->server) ||
+			view->float_mode != VIDOW_FLOAT_NONE || view->dragging ||
+			view->server->grab_view == view) {
+		*out = place.world;
+		return;
 	}
-	struct wlr_box box = vidow_view_screen_box(view);
-	struct wlr_box clip = {0};
-	if (view_clip_box((struct vidow_view *)view, &clip)) {
-		struct wlr_box hit;
-		if (!wlr_box_intersection(&hit, &box, &clip)) {
-			return; /* 裁完不剩什么 */
-		}
-		box = hit;
+	const struct vidow_place_hit *hit = vidow_place_home_hit(&place);
+	if (hit != NULL) {
+		*out = hit->box;
 	}
-	*out = box;
 }
 
 /* 这块窗口**算在哪块屏上**（倍率 / 模糊底衬都按它）：**看得见的那一块**画在哪块
@@ -2166,7 +2173,7 @@ static void view_capture_holds_clear(struct vidow_view *view) {
  * 只放行「画」：可见性本身不含它，所以 pick-window / 切换器清单 / 录屏判据都
  * 不会被过渡里那半屏旧窗口带偏（test-ipc.sh 的「空工作区上 pick-window 是
  * null」就是这个坑）。 */
-static bool view_sliding_out(struct vidow_server *server,
+bool vidow_view_sliding_out(struct vidow_server *server,
 		const struct vidow_view *view) {
 	if (view->ws == NULL) {
 		return false;
@@ -2199,71 +2206,21 @@ bool vidow_view_should_park(struct vidow_server *server,
 	if (view->popup || view->scene_tree == NULL) {
 		return false; /* 弹出物：各有各的路（见 workspace.c） */
 	}
-	/* 还没上屏的（从没 commit 过 buffer）：**也 park**。
+	/* **判据只有 place 一份**（src/place.c 的 place_view_policy）：未 map /
+	 * 小窗快照 / 工作区藏着（overview 例外）/ 最小化 / 几何上不在自己那块屏 ——
+	 * 全都合成在那里，这里只读结论。
 	 *
-	 * 原来这里还有 `!view->mapped` 一条，理由是「各有各的路」—— 但没上屏的
-	 * 窗口根本没有路：它留在场景里、留在布局原点，每帧都要渲染一遍。实测一个
-	 * 会话里 41 个 view 有 40 个是这种（vivaldi 一个就开一堆子表面），全都
-	 * 在画，于是**所有应用都卡**（桌面是静态背景，不重画，所以不卡）。
-	 * 第一次 map 时 view_map 会调 vidow_view_set_parked(false) 放回来。 */
-	if (!view->mapped) {
-		return true;
-	}
-	/* 小窗（S5）：图标态 + 该窗口不保活 + 手里有最后一帧 → 真实节点停到停车位
-	 * （它不在任何输出上，客户端于是停帧），屏上由快照节点画（见
-	 * mini_snapshot_place）—— 这就是「图标是静止的最后一帧」那条路。 */
-	if (vidow_mini_uses_snapshot(view)) {
-		return true;
-	}
-	if (!vidow_workspace_view_visible(server, view) &&
-			!view_sliding_out(server, view)) {
-		/* overview 里**所有屏、每块屏上所有工作区都要画**（它们各自上下排成
-		 * 一列，见 overview.c）—— 平时「藏起来的工作区不画」，全景里得放回来，
-		 * 不然那一行是空的。最小化的照旧不画（它连列里都不占位置，摆不出坐标）。
-		 *
-		 * 以前这里还要求 view->output == server->overview.output（唯一那块
-		 * 「进来时聚焦的屏」），别的屏上的窗口一律停着 —— 于是非激活显示器
-		 * 上什么都看不到（用户 2026-10-25：「overview 触发的时候应该所有
-		 * 显示器都进 overview，现在虽然都进了但非激活显示器不显示内容」）。
-		 * 现在每块屏各有一份行表，所有屏上的窗口都该摊开。 */
-		bool in_overview = vidow_overview_active(server) && !view->minimized;
-		if (!in_overview) {
-			return true; /* 最小化 / 工作区被藏起来：也不画 */
-		}
-	}
-	if (vidow_overview_active(server)) {
-		return false; /* overview 全缩进画面 */
-	}
-	/* 浮窗 / **正被拖的**窗口允许跨屏，照旧画。
+	 * 以前这个函数自己写了一长串：mapped → mini → 工作区可见 → sliding_out →
+	 * overview → 浮窗/拖拽跨屏 → 几何相交。同样这一串在
+	 * vidow_workspace_view_visible / view_on_screen / view_visible_box /
+	 * vidow_view_in_output_box 里各有一份变体，顺序还不完全一样 —— 用户
+	 * 2026-10-31：「相同的判断需要统一在一个逻辑里面，不要碎片化」。
 	 *
-	 * 为什么要放行：拖拽的时候窗口就是该跟着光标走到隔壁屏上 —— 用户
-	 * 2026-10-20 的原话「拖拽窗口的时候应该允许显示在另一个屏幕」。不放行的
-	 * 话几何框一越过屏边界就整块停到停车位，屏上表现为「拖到边上窗口就没了」，
-	 * 跨屏拖动直接抄作不出来。
-	 *
-	 * 「正在拖」的两个来源都得认：平铺窗口拖拽走 drag.c（view->dragging），
-	 * 浮窗拖动 / 列宽拖动走 input.c 那条抓取（server->grab_view）。只看前者
-	 * 漏掉浮窗，只看后者漏掉还没起拖阈值的平铺窗口。 */
-	if (view->float_mode != VIDOW_FLOAT_NONE || view->dragging ||
-			server->grab_view == view) {
-		return false;
-	}
-	/* 其余窗口（有工作区的）只在自己的屏里画：越界就停到停车位，别让几何框
-	 * 落进隔壁屏的坐标范围（否则场景图是全局坐标，会画到隔壁显示器上）。
-	 *
-	 * 判据走 place（src/place.c）：平铺 / 全屏只跟归属那块屏算交集 ——
-	 * 「滚到屏外 = 逻辑和渲染上都不存在，滚回来就恢复；只要和屏有交集就算
-	 * 在屏上」（用户 2026-10-31）。以前这里还留着一份自己的几何判断，
-	 * 和 view_visible_box / view_on_screen 各算各的。 */
+	 * **每帧现算**的语义保留：滚动 / 开窗动画帧会自己摆位置（不经过 arrange），
+	 * 存下来的标志会过期（窗口摆回屏里之后还停在停车位上，再也不出现）。 */
 	struct vidow_place place;
 	vidow_place_of_view(server, view, &place);
-	/* 浮窗 / 拖拽的窗口：交集一块都没有才算不在（I6）；平铺 / 全屏：
-	 * 只看归属那块屏（滚出屏 = 不存在）。 */
-	if (view->float_mode != VIDOW_FLOAT_NONE || view->dragging ||
-			server->grab_view == view) {
-		return !vidow_place_any(&place);
-	}
-	return vidow_place_home_hit(&place) == NULL;
+	return !place.resident;
 }
 
 /* 停到屏外 / 放回屏里。**只有这一个入口**改这个标志：日志和损伤都在这儿 ——

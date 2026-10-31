@@ -68,6 +68,58 @@ static void place_hits(struct vidow_server *server, struct vidow_place *p) {
 
 struct wlr_box vidow_view_screen_box(const struct vidow_view *view);
 
+/* 浮窗 / 正被拖的窗口 / 弹窗：物理上能跨屏（I6）。两类「正在拖」都得认 ——
+ * 平铺窗口拖拽走 drag.c（view->dragging），浮窗拖动 / 列宽拖动走 input.c 那条
+ * 抓取（server->grab_view）。只看其中一个会漏掉另一半。 */
+static bool place_rides_outputs(const struct vidow_server *server,
+		const struct vidow_view *view) {
+	return view->popup || view->float_mode != VIDOW_FLOAT_NONE ||
+		view->dragging || server->grab_view == view;
+}
+
+/* **策略层**：所有「该不该画」的原因在这儿合成成 resident + reason。
+ *
+ * 顺序照依赖：越早成立的理由越硬（未 map 的谈不上工作区；小窗快照根本不是这棵
+ * 树在画；overview 能豁免工作区隐藏，但豁免不了最小化）。以前这些原因散在
+ * vidow_view_should_park / workspace_view_visible / view_on_screen 三处，各自的
+ * 顺序还不一样 —— 那正是碎片来源。 */
+static void place_view_policy(struct vidow_server *server,
+		struct vidow_view *view, struct vidow_place *p) {
+	if (!view->mapped) {
+		p->resident = false;
+		p->reason = VIDOW_PLACE_UNMAPPED;
+		return;
+	}
+	if (vidow_mini_uses_snapshot(view)) {
+		/* 图标态：真实节点停到停车位，屏上由快照节点画（mini_snapshot_place）。 */
+		p->resident = false;
+		p->reason = VIDOW_PLACE_MINI;
+		return;
+	}
+	bool visible = vidow_workspace_view_visible(server, view);
+	if (!visible && !vidow_view_sliding_out(server, view) &&
+			!(vidow_overview_active(server) && !view->minimized)) {
+		p->resident = false;
+		p->reason = view->minimized ? VIDOW_PLACE_MINIMIZED :
+			VIDOW_PLACE_WS_HIDDEN;
+		return;
+	}
+	/* 策略上要画。几何：overview 把窗口全缩进画面，再按几何框判会把「缩之前的
+	 * 位置在屏外」的窗口误停；浮窗 / 拖拽看全部 hits（I6）；平铺 / 全屏只认
+	 * 归属那块屏（I3：不许溢出到隔壁）。 */
+	if (!vidow_overview_active(server) || view->minimized) {
+		bool here = place_rides_outputs(server, view) ?
+			vidow_place_any(p) : vidow_place_home_hit(p) != NULL;
+		if (!here) {
+			p->resident = false;
+			p->reason = VIDOW_PLACE_OFFSCREEN;
+			return;
+		}
+	}
+	p->resident = true;
+	p->reason = VIDOW_PLACE_OK;
+}
+
 void vidow_place_of_view(struct vidow_server *server, struct vidow_view *view,
 		struct vidow_place *p) {
 	place_reset(p);
@@ -81,6 +133,7 @@ void vidow_place_of_view(struct vidow_server *server, struct vidow_view *view,
 	 *   浮窗 / 拖拽      → 认全部（I6）
 	 * 判据只有这一份，差的只是「看哪一行」。 */
 	place_hits(server, p);
+	place_view_policy(server, view, p);
 }
 
 void vidow_place_of_layer(struct vidow_server *server,
@@ -96,6 +149,20 @@ void vidow_place_of_layer(struct vidow_server *server,
 		.height = ls->geom.height,
 	};
 	place_hits(server, p);
+	/* layer：没 map / 没 configure 过的层不画；其余只要跟自己那块屏有交集就画
+	 * （layer 物理上不跨屏，geom 溢出隔壁屏那部分不画 —— 见第 3 步的夹取）。 */
+	if (ls->layer_surface->surface == NULL ||
+			!ls->layer_surface->surface->mapped ||
+			ls->geom.width <= 0 || ls->geom.height <= 0) {
+		p->resident = false;
+		p->reason = VIDOW_PLACE_UNMAPPED;
+	} else if (vidow_place_home_hit(p) == NULL) {
+		p->resident = false;
+		p->reason = VIDOW_PLACE_OFFSCREEN;
+	} else {
+		p->resident = true;
+		p->reason = VIDOW_PLACE_OK;
+	}
 }
 
 /* ------------------------------------------------------------ 对账（第 1 步）
@@ -103,10 +170,10 @@ void vidow_place_of_layer(struct vidow_server *server,
  * 开关：/tmp/vidow-place-check（文件存在就开）。只在 arrange 收口时跑，2 秒最多
  * 一组日志 —— 它要做的是**找出新旧判据不一致的地方**，不是在线上做判断。
  *
- * 期望的不一致（策略层，第 2 步会收进 place）：
- *   - 工作区被藏着 / 最小化 / 未 map / mini 快照：几何上有交集，但「不画」；
- *   - overview：几何上在屏外也要画。
- * 除了这几类，还有不一致就是真 bug —— 那正是碎片 / 残影的来源。 */
+ * 第 2 步之后策略已经收进 place，vidow_view_should_park / view_on_screen /
+ * vidow_view_in_output_box / view_visible_box 全都改读 place —— 探针改成断言
+ * **不变量**：scene_parked 必须等于 !resident；resident 必须有交集（overview
+ * 例外）。任何一条不成立都是真 bug（碎片 / 残影的来源）。 */
 static bool place_check_on(void) {
 	static int64_t last;
 	static bool on;
@@ -143,7 +210,7 @@ void vidow_place_check(struct vidow_server *server, const char *tag) {
 	if (server == NULL || !place_check_on()) {
 		return;
 	}
-	int n_view = 0, n_mismatch = 0, n_layer = 0, n_overflow = 0;
+	int n_view = 0, n_bad = 0, n_resident = 0, n_layer = 0, n_overflow = 0;
 	struct vidow_view *view;
 	wl_list_for_each(view, &server->views, link) {
 		if (view->popup || view->scene_tree == NULL) {
@@ -152,20 +219,35 @@ void vidow_place_check(struct vidow_server *server, const char *tag) {
 		struct vidow_place p;
 		vidow_place_of_view(server, view, &p);
 		n_view++;
-		bool old_park = vidow_view_should_park(server, view);
-		bool new_off = p.n == 0;
-		if (old_park != new_off) {
-			n_mismatch++;
-			if (n_mismatch <= 6) {
+		if (p.resident) {
+			n_resident++;
+		}
+		/* 不变量：场景节点的开关必须**就是** place 的结论（vidow_view_set_parked
+		 * 的入口只该由它驱动）。不一致 = 场景里画着 place 说「不存在」的东西，
+		 * 或者反过来 —— 碎片 / 残影就是这样来的。 */
+		bool parked = view->scene_parked;
+		if (parked == p.resident) {
+			n_bad++;
+			if (n_bad <= 8) {
 				wlr_log(WLR_INFO, "PLACECHK %s: view %s geom=%dx%d%+d%+d "
-					"hits=%d park=%d → 旧判据「%s」",
-					tag, vidow_view_title(view) != NULL ? vidow_view_title(view) : "?",
+					"hits=%d resident=%d reason=%d 但 parked=%d",
+					tag, vidow_view_title(view) ?: "?",
 					p.world.width, p.world.height, p.world.x, p.world.y,
-					p.n, (int)old_park, place_why(server, view));
+					p.n, (int)p.resident, (int)p.reason, (int)parked);
+			}
+		}
+		/* 不变量：resident 就必须在至少一块屏上有像素（overview 例外：那时
+		 * 窗口被缩进画面，几何框还是缩之前的位置）。 */
+		if (p.resident && p.n == 0 && !vidow_overview_active(server)) {
+			n_bad++;
+			if (n_bad <= 8) {
+				wlr_log(WLR_INFO, "PLACECHK %s: view %s resident 但 hits=0",
+					tag, vidow_view_title(view) ?: "?");
 			}
 		}
 	}
-	/* layer：geom 有没有越出它那块屏（现在只靠 wlroots 每屏裁剪兜着）。 */
+	/* layer：geom 有没有越出它那块屏（现在只靠 wlroots 每屏裁剪兜着；
+	 * 「逻辑上也不许溢出」是第 3 步）。 */
 	struct vidow_layer_surface *ls;
 	wl_list_for_each(ls, &server->layers, link) {
 		if (ls->output == NULL || ls->geom.width <= 0 ||
@@ -194,8 +276,9 @@ void vidow_place_check(struct vidow_server *server, const char *tag) {
 			}
 		}
 	}
-	if (n_mismatch > 0 || n_overflow > 0) {
-		wlr_log(WLR_INFO, "PLACECHK %s: views=%d 不一致=%d | layers=%d 溢出=%d",
-			tag, n_view, n_mismatch, n_layer, n_overflow);
+	if (n_bad > 0 || n_overflow > 0) {
+		wlr_log(WLR_INFO, "PLACECHK %s: views=%d 在屏=%d 不一致=%d | "
+			"layers=%d 溢出=%d", tag, n_view, n_resident, n_bad,
+			n_layer, n_overflow);
 	}
 }

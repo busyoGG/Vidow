@@ -3786,15 +3786,31 @@ struct vidow_place_hit {
 	struct wlr_box output_box;
 };
 
+/* 为什么 resident 是现在这个值（日志 / 探针 / 测试用；也让「策略」和「几何」
+ * 在同一处被读出来，不用去别处猜）。 */
+enum vidow_place_reason {
+	VIDOW_PLACE_OK = 0,      /* 在屏上，画 */
+	VIDOW_PLACE_UNMAPPED,    /* 还没 map：不画 */
+	VIDOW_PLACE_MINI,        /* 小窗图标态，屏上由快照节点画：真实节点不画 */
+	VIDOW_PLACE_WS_HIDDEN,   /* 工作区没显示（含切工作区过渡之外的情况） */
+	VIDOW_PLACE_MINIMIZED,   /* 最小化 */
+	VIDOW_PLACE_OFFSCREEN,   /* 几何上跟该算的屏没有交集：滚出去了 */
+};
+
 struct vidow_place {
 	/* 归属：谁负责它的工作区 / 倍率 / 补帧。浮窗、拖拽中可以不等同于
 	 * hits 里那块屏（I6）。 */
 	struct wlr_output *home;
 	/* 世界坐标框（含视口 / 动画 / 拖拽偏移）。 */
 	struct wlr_box world;
-	/* 和几块屏有交集。0 = 逻辑和渲染上都不存在（I1）。 */
+	/* 和几块屏有交集。0 = 几何上哪块屏都没有（I1）。 */
 	int n;
 	struct vidow_place_hit hits[VIDOW_PLACE_MAX_HITS];
+	/* **最终结论**：这块 surface 现在要不要参与渲染流程（I1）。策略
+	 * （未 map / 小窗快照 / 工作区藏着 / 最小化 / overview）和几何（hits）
+	 * 都在 place 里合成完了，消费者只读这一个 bool。 */
+	bool resident;
+	enum vidow_place_reason reason;
 };
 
 /* hits 是**纯几何**：和哪几块屏有交集就算几块。消费者只挑「看哪一行」：
@@ -4479,6 +4495,11 @@ bool vidow_view_in_output_box(struct vidow_server *server,
  * 按窗口录屏渲染的是窗口自己的一份镜像（wincapture.c），不在这棵树上。浮窗 /
  * 正被拖的窗口 / overview / 停到屏外的窗口不裁（它们本来就允许跨屏）。 */
 void vidow_view_apply_clip(struct vidow_view *view);
+/* 切工作区的过渡里「正被推开的那一块」上的窗口：它不属于现在显示着的工作区，
+ * 但过渡期间照样得画（它正从屏上滑出去）。只放行「画」，可见性本身不含它。
+ * 只有 place 的策略层该读它（见 src/place.c）。 */
+bool vidow_view_sliding_out(struct vidow_server *server,
+		const struct vidow_view *view);
 /* 「它现在该停到所有输出框外面吗」：滚出自己那块屏 / 工作区藏起来 / 最小化 → 该停。
  * 判据只有这一份（view_anim_place 每帧现算，workspace.c 的可见性那一趟也问它）。 */
 bool vidow_view_should_park(struct vidow_server *server,
