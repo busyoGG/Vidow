@@ -45,6 +45,12 @@ struct backdrop_ctx {
 	int clip_x, clip_y, clip_w, clip_h;
 	/* 抓私有底衬时明确跳过这个窗口自己的节点（即使节点开关有漏网）。 */
 	struct vidow_view *skip;
+	/* 只画**这一层以下**的 layer surface（层号比它高的 / 它自己都不画）。
+	 * < 0 = 不限制（窗口那条路抓整屏时用）。layer 的底衬是「我底下是什么」：
+	 * 层号更高的面板（和它自己）画进去就是「自己的影子浮在自己的模糊里」，
+	 * 而 getenv 那条开关（layer_blur_capture_visible）只能整趟全藏或全放，
+	 * 分不出「比我高」和「比我低」—— 这里按层号挑。 */
+	int below_layer;
 };
 
 void backdrop_iter(struct wlr_scene_buffer *sb, int sx, int sy, void *data);

@@ -415,6 +415,32 @@ void backdrop_iter(struct wlr_scene_buffer *sb, int sx, int sy,
 	if (sb->buffer == NULL) {
 		return;
 	}
+	/* 抓某一层的底衬时，只要「它底下」的层（见 backdrop_ctx.below_layer）。 */
+	if (ctx->below_layer >= 0) {
+		struct vidow_layer_surface *ls;
+		const struct vidow_layer_surface *owner = NULL;
+		wl_list_for_each(ls, &ctx->server->layers, link) {
+			if (ls->scene == NULL) {
+				continue;
+			}
+			/* 这个 buffer 是不是挂在这块 layer surface 的树底下（一路往上
+			 * 找父节点直到那棵树）。场景图里子表面 / 装饰都挂在下面。 */
+			for (struct wlr_scene_node *n = &sb->node; n != NULL;
+					n = n->parent != NULL ? &n->parent->node : NULL) {
+				if (n == &ls->scene->tree->node) {
+					owner = ls;
+					break;
+				}
+			}
+			if (owner != NULL) {
+				break;
+			}
+		}
+		/* 挂在这一层或更高的层上 → 不画（它自己也是「更高或等于」）。 */
+		if (owner != NULL && (int)owner->layer >= ctx->below_layer) {
+			return;
+		}
+	}
 	bool skip_self = false;
 	if (ctx->skip != NULL && ctx->skip->scene_tree != NULL) {
 		for (struct wlr_scene_node *n = &sb->node; n != NULL;
@@ -549,6 +575,8 @@ bool backdrop_render(struct vidow_server *server,
 		.scale = scale,
 		.ox = (int)lround((double)output->box.x * scale),
 		.oy = (int)lround((double)output->box.y * scale),
+		/* -1 = 不按层号筛：窗口的底衬要整屏（含壁纸那一层）。 */
+		.below_layer = -1,
 	};
 	struct wlr_scene_tree *trees[] = {
 		server->layer_background, server->layer_bottom, server->layer_toplevels,
@@ -2222,6 +2250,8 @@ static bool view_region_build(struct vidow_server *server,
 		.clip_w = bx2 - bx1,
 		.clip_h = by2 - by1,
 		.skip = view,
+		/* -1 = 不按层号筛。 */
+		.below_layer = -1,
 	};
 	wlr_scene_node_for_each_buffer(&server->layer_toplevels->node, backdrop_iter,
 		&ctx);

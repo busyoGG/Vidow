@@ -394,6 +394,15 @@ static bool layer_under_ensure(struct vidow_server *server,
 		.clip_y = 0,
 		.clip_w = b.width,
 		.clip_h = b.height,
+		/* **面板自己不能进自己的底衬**：这张图是「我底下是什么」，层号
+		 * 0 起全都不要 —— 包括 bar / dock / osd 自己和它们的模糊节点。
+		 * 以前整趟遍历把面板自己画进去，半透明处透出「自己的糊版」，
+		 * 窗口一动重抓一次、每版都不一样（用户：「纹理全脏」）。
+		 *
+		 * 用这一个字段挑，而不是 layer_blur_capture_visible() 去开关场景
+		 * 节点：开关节点每次都记一笔损伤，面板区域于是永远有损伤、永远
+		 * 重画 —— 那就变成「每帧整屏脏」。 */
+		.below_layer = 0,
 	};
 	struct wlr_scene_tree *trees[] = {
 		server->layer_toplevels,
@@ -576,6 +585,8 @@ bool layer_region_build(struct vidow_server *server,
 			.clip_y = by1 - ry,
 			.clip_w = bx2 - bx1,
 			.clip_h = by2 - by1,
+			/* 同上：面板自己不进自己的底衬。 */
+			.below_layer = 0,
 		};
 		struct wlr_scene_tree *trees[] = {
 			server->layer_toplevels,
