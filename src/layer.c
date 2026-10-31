@@ -162,6 +162,38 @@ static void layer_apply_anim(struct vidow_layer_surface *ls) {
 	}
 }
 
+/* 两路「这块 layer 该不该画」汇成一个节点开关（见 server.h 的声明）。
+ *
+ * 键盘交互的 layer 例外：内容全透明时不关 —— 它多半在等键盘 / 当冻结覆盖层，
+ * 藏掉风险大于收益。 */
+void vidow_layer_node_update_visible(struct vidow_layer_surface *ls) {
+	if (ls == NULL || ls->scene == NULL || ls->scene->tree == NULL ||
+			ls->layer_surface == NULL) {
+		return;
+	}
+	if (ls->capture_hidden) {
+		return; /* 底衬抓帧临时接管了节点开关：它恢复时走下面同一个入口重算 */
+	}
+	bool want = !ls->hide_fullscreen && !ls->hide_content;
+	if (ls->hide_content &&
+			ls->layer_surface->current.keyboard_interactive !=
+				ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE) {
+		want = true;
+	}
+	if (ls->scene->tree->node.enabled == want) {
+		return; /* 已经是想要的状态：别每趟都碰节点 */
+	}
+	wlr_scene_node_set_enabled(&ls->scene->tree->node, want);
+	wlr_log(WLR_INFO, "layer %s: 节点%s（content=%d fullscreen=%d）",
+		ls->layer_surface->namespace ?: "?", want ? "开" : "关",
+		ls->hide_content, ls->hide_fullscreen);
+	/* 节点可见性变化不走 blur_note_damage：底衬里那一块变了，让 arrange
+	 * 收口回退整屏（低频事件，不值得算精确区域）。 */
+	if (ls->server != NULL && ls->server->arrange_in_progress) {
+		ls->server->arrange_force_full = true;
+	}
+}
+
 /* 全屏窗口底下那条「看不见但还在吃输入」的状态栏：layer 节点关掉，
  * 场景命中测试就不会再落它头上。只动 top 层且 exclusive_zone > 0 的
  * （状态栏 / dock 那类占位的）；通知、截图 overlay（exclusive_zone = -1）
@@ -189,22 +221,18 @@ void vidow_layers_update_fullscreen(struct vidow_server *server) {
 		}
 		struct vidow_layer_surface *ls;
 		wl_list_for_each(ls, &server->layers, link) {
-			if (ls->output != output ||
-					ls->layer != ZWLR_LAYER_SHELL_V1_LAYER_TOP ||
-					ls->scene == NULL ||
-					ls->layer_surface->current.exclusive_zone <= 0) {
+			if (ls->output != output) {
 				continue;
 			}
-			if (ls->scene->tree->node.enabled == !full) {
-				continue; /* 已经是想要的状态：别每趟都碰节点 */
+			bool hide = full &&
+				ls->layer == ZWLR_LAYER_SHELL_V1_LAYER_TOP &&
+				ls->scene != NULL &&
+				ls->layer_surface->current.exclusive_zone > 0;
+			if (ls->hide_fullscreen == hide) {
+				continue;
 			}
-			wlr_scene_node_set_enabled(&ls->scene->tree->node, !full);
-			/* 状态栏被藏掉 / 放回来：底衬里那一块变了，而且这条变化不经过
-			 * blur_note_damage（它改的是节点可见性）—— 让 arrange 收口回退
-			 * 整屏。低频（进出全屏那一下），不值得为它算精确区域。 */
-			if (server->arrange_in_progress) {
-				server->arrange_force_full = true;
-			}
+			ls->hide_fullscreen = hide;
+			vidow_layer_node_update_visible(ls);
 		}
 	}
 }
@@ -554,6 +582,14 @@ static void layer_surface_map(struct wl_listener *listener, void *data) {
 		ls->layer_surface->current.keyboard_interactive);
 	layer_pin_scale(ls);
 
+	/* 重新上屏：上一次的全透明判定作废（-1 = 未测，照旧画），节点开回来
+	 * —— 不能带着上一世的 hide_content 上屏，否则一块全透明的 layer
+	 * 销毁重建后直接隐身。 */
+	ls->content_invisible = -1;
+	ls->content_dirty = true;
+	ls->hide_content = false;
+	vidow_layer_node_update_visible(ls);
+
 	if (ls->layer_surface->current.keyboard_interactive !=
 			ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE) {
 		layer_focus(ls);
@@ -661,6 +697,16 @@ static void layer_surface_commit(struct wl_listener *listener, void *data) {
 	 * 标 -1 只是让 layer_content_invisible 别再拿旧结论做判定。 */
 	ls->content_invisible = -1;
 	ls->content_dirty = true;
+	/* 复检的调度在这里（原来只挂在 blur 路径的 layer_content_invisible 里）：
+	 * 节点被关掉（hide_content）之后 blur 那条路在「场景树被关」就提前退出，
+	 * 不会再调它 —— 不在这里排，滑出去的 dock 就永远等不到复检、永远回不来。
+	 * 节流照旧 200ms（vshell 每秒几十帧 commit，不节流等于每帧读回整块缓冲，
+	 * 2026-10-31 现场：渲染趟数 26→600+）。
+	 *
+	 * 注意这里**不**清 hide_content：commit 只说明「新内容到了」，是不是还
+	 * 全透明要等读回。清了的话每帧 commit 都把节点开回来，直通扫屏永远回
+	 * 不来。代价：内容从全透明变可见，最多晚一个节流窗口（200ms）出现。 */
+	vidow_layer_content_check_schedule(server, ls);
 }
 
 static void layer_surface_destroy(struct wl_listener *listener, void *data) {

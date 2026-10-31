@@ -306,6 +306,11 @@ static void layer_content_idle(void *data) {
 				"layer 内容判定");
 		}
 	}
+	/* 全透明 / 变回可见：节点跟着判据走（关掉退出渲染列表，还直通给全屏
+	 * 游戏；开回来恢复画）。verdict 没变也调一次：commit 只标脏不清
+	 * hide_content，恢复这个动作只能在读回之后发生。 */
+	ls->hide_content = ls->content_invisible == 1;
+	vidow_layer_node_update_visible(ls);
 }
 
 /* 内容是不是一个像素都没有（模糊整块跳过）。带 200ms 节流，读回走 idle。
@@ -316,16 +321,15 @@ static void layer_content_idle(void *data) {
  * 0.14ms/帧 → 4.7ms/帧，画面跟着花。所以这里只排 idle，渲染路径只用上一次的
  * 结果（-1 = 还没测过，照旧画，不闪）。
  *
- * 节流不看 content_invisible 是不是 -1：commit 会把它置 -1 当「未测」，而
- * vshell 每秒交几十次帧 —— 那等于每次 commit 都读一遍。 */
+ * 2026-11-01 起这个判定多了一个用途：**内容全透明的 layer 把场景节点整个
+ * 关掉**（vidow_layer_node_update_visible）—— 树开着时全透明缓冲照样进渲染
+ * 列表，全屏游戏的直通扫屏就被顶掉了（实测绝区零开 vshell 40 帧、关掉 53
+ * 帧，GPU busy 才 45~58% 没吃饱）。vshell 的 dock / osd 全透明时每帧交帧，
+ * 每帧都是一次全 4K 合成。 */
 static bool layer_content_invisible(struct vidow_server *server,
 		struct vidow_layer_surface *ls) {
-	if (ls->content_dirty && ls->content_idle == NULL &&
-			vidow_now_ns() - ls->content_check_ns >= 200000000LL &&
-			server->display != NULL) {
-		ls->content_idle = wl_event_loop_add_idle(
-			wl_display_get_event_loop(server->display),
-			layer_content_idle, ls);
+	if (ls->content_dirty && ls->content_idle == NULL) {
+		vidow_layer_content_check_schedule(server, ls);
 	}
 	if (ls->content_invisible < 0) {
 		return false; /* 还没测过：别闪，照旧画 */
@@ -340,6 +344,27 @@ static bool layer_content_invisible(struct vidow_server *server,
 		ls->blur_fail = 0;
 	}
 	return ls->content_invisible == 1;
+}
+
+/* 排一次内容读回：有排着的 / 节流窗口没到就什么都不做。
+ *
+ * 两个调用方：blur 路径（layer_content_invisible）和 commit（layer.c）。
+ * 节点被关掉之后 blur 路径在「场景树被关」提前退出，commit 必须自己排，
+ * 否则滑出去的 dock 永远等不到复检。 */
+void vidow_layer_content_check_schedule(struct vidow_server *server,
+		struct vidow_layer_surface *ls) {
+	if (ls->content_idle != NULL || !ls->content_dirty ||
+			server->display == NULL) {
+		return;
+	}
+	uint64_t now = vidow_now_ns();
+	if (ls->content_check_ns != 0 &&
+			now - ls->content_check_ns < 200000000LL) {
+		return;
+	}
+	ls->content_idle = wl_event_loop_add_idle(
+		wl_display_get_event_loop(server->display),
+		layer_content_idle, ls);
 }
 
 bool layer_blur_wanted(struct vidow_server *server,
@@ -1044,12 +1069,14 @@ void layer_blur_capture_visible(struct vidow_server *server, bool on) {
 		if (!on) {
 			if (ls->scene != NULL && layer_blur_wanted(server, ls) &&
 					ls->scene->tree->node.enabled) {
-				wlr_scene_node_set_enabled(&ls->scene->tree->node, false);
 				ls->capture_hidden = true;
+				wlr_scene_node_set_enabled(&ls->scene->tree->node, false);
 			}
 		} else if (ls->capture_hidden) {
 			ls->capture_hidden = false;
-			wlr_scene_node_set_enabled(&ls->scene->tree->node, true);
+			/* 走统一入口重算：hide_content / hide_fullscreen 说该藏的，
+			 * 抓帧结束也不能给它点亮。 */
+			vidow_layer_node_update_visible(ls);
 		}
 	}
 }

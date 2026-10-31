@@ -2116,6 +2116,13 @@ struct vidow_layer_surface {
 	 * 几十帧，不设这个就是每 200ms 无条件读一块整面板缓冲）。 */
 	bool content_dirty;
 	int content_x, content_y, content_w, content_h;
+	/* 节点开关的两路来源（汇合在 vidow_layer_node_update_visible）：
+	 * hide_content = 内容全透明（fx-layer.c 的读回判定）—— 树开着时全透明
+	 *   缓冲也进渲染列表，全屏游戏的直通扫屏就被顶掉了（实测游戏 40 帧，
+	 *   关 vshell 53 帧）；
+	 * hide_fullscreen = 全屏窗口藏 top+exclusive 的状态栏 / dock（layer.c）。 */
+	bool hide_content;
+	bool hide_fullscreen;
 
 	/* animation */
 	struct vidow_anim *anim;
@@ -4779,6 +4786,14 @@ void vidow_arrange_layers(struct vidow_server *server);
 /* 全屏窗口亮着的时候，把这块屏上「占着 exclusive zone 的 top 层」（状态栏）
  * 藏掉：不然它看不见、却还挡着一条输入死区。退出全屏再放回来。 */
 void vidow_layers_update_fullscreen(struct vidow_server *server);
+/* 这块 layer 的场景节点开 / 关的唯一入口：hide_content（内容全透明）和
+ * hide_fullscreen（全屏遮挡）两路条件汇在这里，谁也不许绕过它直接碰
+ * ls->scene->tree->node.enabled —— 各写各的就会互相覆盖（一边藏、一边开回来）。 */
+void vidow_layer_node_update_visible(struct vidow_layer_surface *ls);
+/* 排一次内容读回（200ms 节流，见 fx-layer.c）。commit 路径也要调：节点被
+ * 关掉之后 blur 那条路提前退出，不在这里排就没有人复检了。 */
+void vidow_layer_content_check_schedule(struct vidow_server *server,
+	struct vidow_layer_surface *ls);
 /* 桌面底色（background_color）落到场景里：颜色 + 整个布局的包围盒。配置重载、
  * 输出变化、启动时各调一次（幂等）。 */
 void vidow_background_apply(struct vidow_server *server);
