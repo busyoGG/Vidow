@@ -2240,6 +2240,22 @@ bool vidow_view_should_park(struct vidow_server *server,
  * 写一行（view_map 里那次翻转也算）。 */
 void vidow_view_set_parked(struct vidow_view *view, bool park) {
 	if (view->scene_parked == park) {
+		/* **状态没变也要对齐一次节点。** 新窗口的场景树建出来是
+		 * set_enabled(false) 的（x11_attach_surface / xdg 那条路），map 时
+		 * set_parked(false) 命中这里的早退——3732826（停泊 = 关整棵子树）
+		 * 之前有下面那句无条件 set_enabled(true) 兜底，删了它之后这个
+		 * false→false 早退就成了「没有任何人点亮新窗口的树」的死角：
+		 * 窗口占着布局的列、屏幕上却没有，滚出视口再滚回来（park 翻两轮、
+		 * 第二轮真正走下面的开关）才显示。QQ 每个新窗口都踩。 */
+		if (!view->popup && view->scene_tree != NULL) {
+			bool want_on = !park || vidow_view_capture_held(view);
+			if (view->scene_tree->node.enabled != want_on) {
+				wlr_scene_node_set_enabled(&view->scene_tree->node, want_on);
+				wlr_log(WLR_INFO, "workspace: %s 节点补点亮（park=%d）",
+					vidow_view_title(view) != NULL ?
+						vidow_view_title(view) : "(无题)", park);
+			}
+		}
 		return;
 	}
 	if (vidow_flip_on()) {
