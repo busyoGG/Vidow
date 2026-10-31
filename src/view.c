@@ -959,6 +959,44 @@ static void view_sync_drag_outputs(struct vidow_view *view,
 		}
 		wlr_surface_send_enter(surface, wlr_output);
 	}
+	/* **enter 集合要跟着收缩，不能只进不出。**
+	 *
+	 * send_enter 自己去重（进过的屏不会重发），但上面没人发 leave：拖过 /
+	 * 骑过一次的屏就永远挂在 surface->current_outputs 里。Chromium 一类客户端
+	 * 自己从「进了哪些输出」推倍率，里面挂着一块 2 倍屏，它就按 2 倍交缓冲
+	 * —— 而我们的 preferred_buffer_scale 又钉 1 倍，两套信号打架；下面只好
+	 * 在剪裁一变时强制重发倍率去「拉回来」，动画期间剪裁每帧一变就是一串
+	 * 重发。实测后果（2026-10-31）：Element（Electron）一次工作区切换吃
+	 * 2~6 次重发、两分钟内吃了 8 次，然后进程自己死掉（libwayland 只留一句
+	 * error in client communication）。
+	 *
+	 * 所以补上：已经 enter、但现在不再相交的屏，发 leave。集合真的变过才清
+	 * pref_scale，让紧接着的 view_pin_scale 重发一次 —— 强制重发从此只在
+	 * 「enter 集合真的变了」时发生，动画期间的剪裁抖动不再打给客户端。 */
+	bool entered_changed = false;
+	struct wlr_surface_output *so, *so_tmp;
+	wl_list_for_each_safe(so, so_tmp, &surface->current_outputs, link) {
+		bool keep = false;
+		struct vidow_output *o2;
+		wl_list_for_each(o2, &server->outputs, link) {
+			if (o2->wlr_output != so->output) {
+				continue;
+			}
+			struct wlr_box obox;
+			wlr_output_layout_get_box(server->output_layout,
+				so->output, &obox);
+			struct wlr_box hit;
+			keep = wlr_box_intersection(&hit, &box, &obox);
+			break;
+		}
+		if (!keep) {
+			wlr_surface_send_leave(surface, so->output);
+			entered_changed = true;
+		}
+	}
+	if (entered_changed) {
+		view->pref_scale = 0;
+	}
 }
 
 static void view_sync_surface_outputs(struct vidow_view *view) {
@@ -1642,9 +1680,19 @@ void vidow_view_apply_clip(struct vidow_view *view) {
 	view_apply_clip_impl(view);
 	bool clip_changed = view->fx.clip_on != was_on ||
 		!wlr_box_equal(&view->fx.clip, &was_clip);
-	if (clip_changed) {
-		view->pref_scale = 0;
-	}
+	(void)clip_changed;
+	/* 剪裁变化**不再**强制重发 preferred_buffer_scale（2026-10-31）：
+	 *
+	 * 这个强制重发是给「表面 enter 集合里挂着一块 2 倍屏、客户端自己按 2 倍
+	 * 交」擦屁股的——根子在 view_sync_drag_outputs 只进不出，stale enter
+	 * 一直在。那里补上 leave 之后，客户端的 enter 集合就永远等于真实相交
+	 * 集合，倍率信息一致，不需要动不动强制拉一遍。
+	 *
+	 * 而无条件的强制重发有实测代价：工作区切换的滑动动画里剪裁每帧在
+	 * 「裁 / 不裁」之间翻（窗口滑过屏幕边缘的那几帧），每翻一次就给客户端
+	 * 发一对 preferred_buffer_scale + fractional_scale 同值事件。Electron
+	 * 对这两个事件按「倍率变了」处理、重配缓冲——Element 两分钟吃 8 次
+	 * 重发后进程死掉。修完 enter 收缩，这里保留干净路径：值变了才发。 */
 	view_sync_surface_outputs(view);
 	view_pin_scale(view);
 }
