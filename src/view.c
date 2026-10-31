@@ -8162,8 +8162,11 @@ static void x11_drop_surface(struct vidow_view *view) {
 	/* 一次性日志（不受 trace 开关控制）：重开时这条到底有没有走到，是
 	 * 「新 surface 的 commit 监听挂不上」那个死结的关键判据 —— 不走的话
 	 * scene_tree 留着，下一次 associate 被 x11_attach_surface 的
-	 * `scene_tree != NULL` 挡掉，新内容永远进不来。 */
-	wlr_log(WLR_INFO, "drop-surface: %s scene_tree=%p surf=%p",
+	 * `scene_tree != NULL` 挡掉，新内容永远进不来。排查那个死结时开
+	 * VIDOW_LOG=debug 看这一行 —— 平时它跟着 X11 窗口的成对闪现
+	 * （见 xwm_x11.c 的 create/destroy）每秒刷好几行，留在 INFO 就是
+	 * 日志噪音。 */
+	wlr_log(WLR_DEBUG, "drop-surface: %s scene_tree=%p surf=%p",
 		vidow_view_title(view) != NULL ? vidow_view_title(view) : "(无题)",
 		(void *)view->scene_tree,
 		(void *)(view->x11 != NULL ? view->x11->surface : NULL));

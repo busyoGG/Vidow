@@ -1013,7 +1013,6 @@ struct vidow_blur_slot {
 	struct wl_listener node_destroy;
 	struct wlr_buffer *anim[2];
 	struct wlr_buffer *dec[2];
-	int dec_index;
 	int dec_w, dec_h;        /* 渲染目标尺寸，设备像素 */
 	int dec_content_w, dec_content_h;
 	int dec_px_pad;
@@ -1044,7 +1043,6 @@ struct vidow_fx_target {
 	struct wlr_scene_buffer *node;
 	/* decoration pass */
 	struct wlr_buffer *buf[2];
-	int buf_index;
 	int w, h;                 /* 渲染目标（物理像素），内容加阴影内边距 */
 	int content_w, content_h; /* 内容，物理像素 */
 	int dst_w, dst_h;         /* 场景节点尺寸（逻辑单位）= w/h 除以 scale */
@@ -1059,7 +1057,6 @@ struct vidow_fx_target {
 	float blur_bias_x, blur_bias_y;
 	/* animation pass, only used when a shader is configured */
 	struct wlr_buffer *anim_buf[2];
-	int anim_index;
 	struct vidow_shader *shader;
 	enum vidow_shader_phase phase;
 	double progress;
@@ -1516,7 +1513,6 @@ struct vidow_output {
 
 	/* 抓帧遮挡：这块屏上一次看到的抓帧状态。只在翻转时记一行日志 —— 这个功能
 	 * 平时完全看不见，出问题时日志是唯一的线索（见 capturemask.c）。 */
-	bool capture_active;
 
 	/* 视口外补帧的到点闹钟：节流到 30Hz / 15Hz 的时候，光靠客户端提交来推进
 	 * 是不行的（提交一次之后就没人再推了，链子断在半路）—— 到点了由它叫醒一次。 */
@@ -2520,7 +2516,6 @@ struct vidow_clip_selection {
 struct vidow_clipboard {
 	struct vidow_server *server;
 	bool active;   /* 接管中（配置开着 + X 侧就绪） */
-	bool have_x11; /* xwm 的连接可用 */
 
 	xcb_connection_t *conn;
 	xcb_window_t window; /* 我们自己的代理窗口（XFixes 的监听点） */
@@ -2983,7 +2978,6 @@ struct vidow_server {
 	 * 「光标隐藏」段）：指针静止到这个闹钟响就把光标藏起来；hidden 记着当前
 	 * 藏没藏（指针一动 / 按键来的时候要显示回来）。 */
 	struct wl_event_source *cursor_hide_timer;
-	bool cursor_hidden;
 	struct wl_listener cursor_button;
 	struct wl_listener cursor_axis;
 	struct wl_listener cursor_frame;
