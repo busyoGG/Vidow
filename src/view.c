@@ -14,6 +14,7 @@
 
 #include <math.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 #include <wlr/types/wlr_buffer.h>
 #include <wlr/types/wlr_fractional_scale_v1.h>
@@ -6971,6 +6972,41 @@ enum vidow_surface_damage vidow_view_surface_damage(struct vidow_view *view,
 	return VIDOW_SURFACE_DAMAGE_BOX;
 }
 
+/* 这块窗口「值得为它排一帧渲染」吗。
+ *
+ * 用户原则：看不见的一律不参与任何渲染流程（含成本）。客户端交帧是「排一帧」
+ * 的最大来源 —— 隐藏工作区里的 Discord / 浏览器 / X11 客户端照样每秒交几十
+ * 帧，以前每一帧都把合成器叫醒跑一整趟（实测两块屏都切到空工作区，vidow 仍
+ * 然 240~296 fps，损伤恒为 0%）。
+ *
+ * 判据只读 place（第 2 步起策略也收在里面，不许另写一套）：
+ *   resident   → 要帧；
+ *   UNMAPPED   → 要帧（第一帧可能触发 map / 兑现 configure，别把客户端饿死）；
+ *   其余       → 不要：工作区没显示 / 最小化 / 小窗图标态 / 滚出屏外。
+ *
+ * 变回可见时不用在这里补：arrange（切工作区、滚动、还原）会给那块屏推帧，
+ * 场景的损伤也由 place 那条路重新记。 */
+static bool view_commit_needs_frame(struct vidow_server *server,
+		struct vidow_view *view) {
+	/* 二分开关（A/B 对比 / 出事时的逃生口）：/tmp/vidow-no-commit-skip 存在
+	 * 就退回老行为（任何客户端交帧都排一帧）。 */
+	if (access("/tmp/vidow-no-commit-skip", F_OK) == 0) {
+		return true;
+	}
+	if (view->output == NULL) {
+		return false;
+	}
+	if (view->scene_tree == NULL) {
+		return true; /* 还没建场景节点：说不准，保守排 */
+	}
+	struct vidow_place place;
+	vidow_place_of_view(server, view, &place);
+	if (place.resident || place.reason == VIDOW_PLACE_UNMAPPED) {
+		return true;
+	}
+	return false;
+}
+
 static void view_commit(struct wl_listener *listener, void *data) {
 	(void)data;
 	struct vidow_view *view = wl_container_of(listener, view, commit);
@@ -7027,7 +7063,8 @@ static void view_commit(struct wl_listener *listener, void *data) {
 	 * telegram / Element）走的是这个 view_commit，一直没人排帧。
 	 * 放在最前面：后面的记账不影响「有新内容」这个事实。 */
 	if (view->server != NULL && view->output != NULL &&
-			!view->server->locked) {
+			!view->server->locked &&
+			view_commit_needs_frame(view->server, view)) {
 		/* 临时探针（VIDOW_COMMIT_WHY=1）：谁在每帧交帧。静止桌面 300fps
 		 * 时每 150ms 抽一行，看 title 就知道是哪个客户端在空转重绘。 */
 		if (getenv("VIDOW_COMMIT_WHY") != NULL) {
@@ -7621,7 +7658,8 @@ static void view_request_minimize(struct wl_listener *listener, void *data) {
 static void view_surface_commit(struct wl_listener *listener, void *data) {
 	(void)data;
 	struct vidow_view *view = wl_container_of(listener, view, surface_commit);
-	if (view->server == NULL || view->output == NULL || view->server->locked) {
+	if (view->server == NULL || view->output == NULL || view->server->locked ||
+			!view_commit_needs_frame(view->server, view)) {
 		return;
 	}
 	/* 帧率计数只在 view_commit 里做（Wayland 这个 listener 和 view_commit 都挂在
