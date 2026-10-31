@@ -1198,11 +1198,20 @@ bool layer_blur_frame(struct vidow_server *server,
 		 * 碰的是**区**域那块（rx/ry/rw/rh），不是整块 geom：quickshell 的
 		 * bar 画布 438 高、真正有内容的只有顶上 38px —— 拿 geom 判的话，
 		 * 菜单预留区里有窗口动一下照样整块重抓，区域收窄就白做了。 */
+		/* 右 / 下边界 ceil((rx+rw)/scale) 精确盖住，不多加 1 —— 理由同
+		 * fx.c view_region_build：贴屏边的区域多 1px 会探进隔壁屏的布局
+		 * 范围，被隔壁屏的损伤流拖着每帧重抓。 */
+		int lg_x = output->box.x + (int)floor((double)rx / scale);
+		int lg_y = output->box.y + (int)floor((double)ry / scale);
+		int lg_r = output->box.x +
+			(int)ceil((double)(rx + rw_px) / scale);
+		int lg_b = output->box.y +
+			(int)ceil((double)(ry + rh_px) / scale);
 		struct wlr_box region_logical = {
-			.x = output->box.x + (int)floor((double)rx / scale),
-			.y = output->box.y + (int)floor((double)ry / scale),
-			.width = (int)ceil((double)rw_px / scale) + 1,
-			.height = (int)ceil((double)rh_px / scale) + 1,
+			.x = lg_x,
+			.y = lg_y,
+			.width = lg_r - lg_x,
+			.height = lg_b - lg_y,
 		};
 		bool key_changed = ls->bd_gen_scene != server->gen_scene;
 		bool touched = key_changed &&

@@ -2778,11 +2778,24 @@ update_consumers:
 		if (!(oscale > 0.0)) {
 			oscale = 1.0;
 		}
+		/* 换算成布局逻辑坐标跟损伤账本比对（账本记的是逻辑坐标）。
+		 *
+		 * 右 / 下边界用 ceil((rx+rw)/scale) 精确盖住，**别多加 1**：贴着
+		 * 屏边缘的区域多 1 个逻辑像素就越进隔壁屏的布局范围，隔壁屏上
+		 * 全屏游戏每交一帧，这边静止窗口的底衬就被判「受损」重抓一遍
+		 * （2026-10-31 实测：DP-3 右缘露 3px 的 btop，被 DP-2 的游戏拖着
+		 * 每秒重抓 120 次 + 重烘装饰 + 把整块屏拉起来陪跑）。 */
+		int lg_x = output->box.x + (int)floor((double)rx / oscale);
+		int lg_y = output->box.y + (int)floor((double)ry / oscale);
+		int lg_r = output->box.x +
+			(int)ceil((double)(rx + rw) / oscale);
+		int lg_b = output->box.y +
+			(int)ceil((double)(ry + rh) / oscale);
 		struct wlr_box region_logical = {
-			.x = output->box.x + (int)floor((double)rx / oscale),
-			.y = output->box.y + (int)floor((double)ry / oscale),
-			.width = (int)ceil((double)rw / oscale) + 1,
-			.height = (int)ceil((double)rh / oscale) + 1,
+			.x = lg_x,
+			.y = lg_y,
+			.width = lg_r - lg_x,
+			.height = lg_b - lg_y,
 		};
 		bool key_changed =
 			oslot->blur_set.gen != server->gen_scene - view->self_gen;
