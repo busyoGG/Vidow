@@ -311,6 +311,52 @@ static void layer_content_idle(void *data) {
 	 * hide_content，恢复这个动作只能在读回之后发生。 */
 	ls->hide_content = ls->content_invisible == 1;
 	vidow_layer_node_update_visible(ls);
+	if (ls->hide_content) {
+		vidow_layer_frame_pump_kick(ls->server);
+	}
+}
+
+/* 补帧泵：给节点被关掉的 layer surface 发 frame_done。
+ *
+ * wlr_scene_output_send_frame_done 只走「可见」节点，hide_content 的树是关的
+ * —— quickshell（bar / dock / osd）拿不到帧回调就再也不画：bar 起不来、
+ * dock 缩回去之后热区触发了也没帧可渲染、200ms 复检读到的永远是那张旧的全
+ * 透明缓冲 —— 节点永远点不回来（2026-11-01 实测：dec9bba 之后 bar / dock
+ * 全部卡死）。这里 16ms 一拍手动补发，客户端有了帧就会交新内容，复检看到
+ * 内容把节点点亮、泵自动停（回调返回 0）。 */
+static int layer_frame_pump(void *data) {
+	struct vidow_server *server = data;
+	struct timespec now;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	bool any = false;
+	struct vidow_layer_surface *ls;
+	wl_list_for_each(ls, &server->layers, link) {
+		if (!ls->hide_content || ls->scene == NULL ||
+				ls->scene->tree->node.enabled ||
+				ls->layer_surface == NULL ||
+				ls->layer_surface->surface == NULL ||
+				!ls->layer_surface->surface->mapped) {
+			continue;
+		}
+		any = true;
+		wlr_surface_send_frame_done(ls->layer_surface->surface, &now);
+	}
+	return any ? 16 : 0;
+}
+
+void vidow_layer_frame_pump_kick(struct vidow_server *server) {
+	if (server == NULL || server->display == NULL) {
+		return;
+	}
+	if (server->layer_pump_timer == NULL) {
+		server->layer_pump_timer = wl_event_loop_add_timer(
+			wl_display_get_event_loop(server->display),
+			layer_frame_pump, server);
+		if (server->layer_pump_timer == NULL) {
+			return;
+		}
+	}
+	wl_event_source_timer_update(server->layer_pump_timer, 16);
 }
 
 /* 内容是不是一个像素都没有（模糊整块跳过）。带 200ms 节流，读回走 idle。

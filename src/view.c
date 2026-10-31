@@ -2240,22 +2240,6 @@ bool vidow_view_should_park(struct vidow_server *server,
  * 写一行（view_map 里那次翻转也算）。 */
 void vidow_view_set_parked(struct vidow_view *view, bool park) {
 	if (view->scene_parked == park) {
-		/* **状态没变也要对齐一次节点。** 新窗口的场景树建出来是
-		 * set_enabled(false) 的（x11_attach_surface / xdg 那条路），map 时
-		 * set_parked(false) 命中这里的早退——3732826（停泊 = 关整棵子树）
-		 * 之前有下面那句无条件 set_enabled(true) 兜底，删了它之后这个
-		 * false→false 早退就成了「没有任何人点亮新窗口的树」的死角：
-		 * 窗口占着布局的列、屏幕上却没有，滚出视口再滚回来（park 翻两轮、
-		 * 第二轮真正走下面的开关）才显示。QQ 每个新窗口都踩。 */
-		if (!view->popup && view->scene_tree != NULL) {
-			bool want_on = !park || vidow_view_capture_held(view);
-			if (view->scene_tree->node.enabled != want_on) {
-				wlr_scene_node_set_enabled(&view->scene_tree->node, want_on);
-				wlr_log(WLR_INFO, "workspace: %s 节点补点亮（park=%d）",
-					vidow_view_title(view) != NULL ?
-						vidow_view_title(view) : "(无题)", park);
-			}
-		}
 		return;
 	}
 	if (vidow_flip_on()) {
@@ -6640,9 +6624,19 @@ void view_map(struct wl_listener *listener, void *data) {
 		wlr_scene_node_set_enabled(&view->scene_tree->node, show);
 	} else {
 		/* set_parked 现在自己管子树的开关（停泊 = 关整棵树，见那里的
-		 * 说明）—— 这里不能再无条件 set_enabled(true)，否则刚停泊的
-		 * 窗口又被点亮，整条路白做。 */
+		 * 说明）—— 但 false→false 早退不会点亮：新窗口的树建出来是关的
+		 * （x11_attach_surface / xdg 那条路），没人替它开。3732826 删掉
+		 * 下面这句之后，开在可见工作区的窗口占着列画不出来（QQ 2026-11-01）。
+		 *
+		 * 点亮必须**只在 view_map 这里**做，不能挪进 set_parked 的早退
+		 * 分支（f7e10b1 试过）：set_parked 每帧都跑，提前点亮会踩 X11
+		 * attach 时 dest 还是 surface 逻辑尺寸的竞态 —— Steam 内容往下
+		 * 偏、二次打开黑屏（2026-11-01 实测回归）。arrange / x11_scale
+		 * 都在这之后跑，时机是对的。 */
 		vidow_view_set_parked(view, !show);
+		if (show && view->scene_tree != NULL) {
+			wlr_scene_node_set_enabled(&view->scene_tree->node, true);
+		}
 	}
 	vidow_backdrop_damage_view(view);
 

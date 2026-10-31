@@ -261,6 +261,15 @@ enum xwm_sync_result xwm_surface_sync(struct vidow_view *view) {
 			if (view->scene_tree == NULL) {
 				vidow_view_attach_x11_surface(view);
 			}
+			/* attach 重建的树是关着的（x11_attach_surface 末尾
+			 * set_enabled(false)），点亮交给这里而不是 set_parked：
+			 * 复用窗口重开不过 view_map（view->mapped 已是 1），而
+			 * set_parked 的 false→false 早退没人点亮 —— Steam 二次打开
+			 * 黑屏。dest 的校正在下面 x11_scale，同一个调用栈里跑完，
+			 * 中间不出帧，不会闪出错尺寸的一帧。 */
+			if (view->scene_tree != NULL) {
+				wlr_scene_node_set_enabled(&view->scene_tree->node, true);
+			}
 			/* 场景树重建后节点是禁用状态（x11_attach_surface 末尾
 			 * set_enabled(false)），得让布局重新算一遍把它打开、
 			 * 摆到正确位置。 */

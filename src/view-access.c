@@ -1138,6 +1138,53 @@ struct vidow_view *vidow_view_at(struct vidow_server *server,
 		}
 		return mini;
 	}
+	/* **内容全透明被关节点的 layer：命中兜底**（dec9bba 的另一半）。
+	 *
+	 * wlr_scene_node_at 不看关掉的节点 —— quickshell 的 dock 缩下去之后，
+	 * 它底边那条热区（MouseArea，NoButton，专吃 hover 把 dock 叫出来，
+	 * Dock.qml 的 hotZoneArea）就永远收不到指针事件，触发死了。热区是
+	 * layer surface 自己 input region 里的一块，客户端明说「这里要输入」，
+	 * 只是这块恰好全透明。top / overlay 层本来就压在窗口上面，所以这个
+	 * 兜底放在场景命中**之前**：节点关着 + 指针在 geom 里 +
+	 * wlr_surface_point_accepts_input 认这点 → 按它命中。input region
+	 * 为空 / 不含这点（osd 之类全屏透明画布）→ 照旧落到场景命中，桌面
+	 * 输入不受影响。 */
+	{
+		struct vidow_layer_surface *hot = NULL;
+		int hx = 0, hy = 0;
+		struct vidow_layer_surface *ls;
+		wl_list_for_each(ls, &server->layers, link) {
+			if (!ls->hide_content || ls->scene == NULL ||
+					ls->scene->tree->node.enabled ||
+					ls->layer_surface == NULL ||
+					ls->layer_surface->surface == NULL ||
+					!ls->layer_surface->surface->mapped) {
+				continue;
+			}
+			int nx = ls->geom.x + (int)lround(ls->anim_off_x);
+			int ny = ls->geom.y + (int)lround(ls->anim_off_y);
+			double px = lx - nx, py = ly - ny;
+			if (!wlr_surface_point_accepts_input(
+					ls->layer_surface->surface, px, py)) {
+				continue;
+			}
+			hot = ls; /* 列表后面的在上层（后创建的压着先创建的） */
+			hx = nx;
+			hy = ny;
+		}
+		if (hot != NULL) {
+			if (surface != NULL) {
+				*surface = hot->layer_surface->surface;
+			}
+			if (sx != NULL) {
+				*sx = lx - hx;
+			}
+			if (sy != NULL) {
+				*sy = ly - hy;
+			}
+			return NULL;
+		}
+	}
 	struct wlr_scene_node *node =
 		wlr_scene_node_at(&server->scene->tree.node, lx, ly, sx, sy);
 	if (getenv("VIDOW_PICK_TRACE") != NULL) {
