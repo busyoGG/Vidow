@@ -3556,6 +3556,18 @@ void vidow_place_view(struct vidow_view *view, int x, int y, int w, int h) {
 		wlr_log(WLR_DEBUG, "move tween %s: %d,%d -> %d,%d（%dms）",
 			vidow_view_title(view) != NULL ? vidow_view_title(view) : "?",
 			drawn_x, drawn_y, x, y, cfg->window_move_ms);
+		/* **补间需要帧才能走，这里主动排第一帧。**
+		 *
+		 * vidow_anim_start 只挂链表 + 催看门狗；后续帧靠 anim_pending 的
+		 * 续帧链（output_frame 尾部「动画/果冻在跑」）。但**链头**得有人排：
+		 * 关窗重排这条路上，关闭动画的快照节点 210ms 后销毁，之后如果这块屏
+		 * 没有任何损伤（剩下的窗口尺寸没变 → cfg_sent 去重不发 configure →
+		 * 客户端不 commit），就没有帧来 tick 补间 —— 它冻在起点，窗口停在
+		 * 旧位置（用户报的「关掉半宽窗口后布局不归位」，切一次工作区 =
+		 * slide 期间强制落位才归位）。补间自己每帧记底衬损伤，但那也得先有
+		 * 一帧让它跑起来。 */
+		vidow_output_schedule_frame(view->server, view->output,
+			"位移补间起跑");
 	} else {
 		view->anim_off_x = 0.0;
 		view->anim_off_y = 0.0;

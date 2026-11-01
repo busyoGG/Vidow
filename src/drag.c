@@ -1218,13 +1218,29 @@ void vidow_tile_grab_end(struct vidow_server *server) {
 	server->grab_view = NULL;
 	/* 贴边自动滚的接管到此为止：视口交回 arrange（按新的焦点列重算 = 滚到刚
 	 * 落下的那个窗口）。放在下面那些提前返回之前 —— 哪条路走不通都不能把视口
-	 * 留在拖拽手里。 */
-	if (view != NULL) {
-		struct vidow_output *out = vidow_output_lookup(server, view->output);
-		if (out != NULL) {
-			out->drag_scroll = false;
-			out->drag_scroll_speed = 0.0;
-			out->drag_scroll_ns = 0;
+	 * 留在拖拽手里。
+	 *
+	 * **必须清所有的屏，不能只清 view->output 那块。**
+	 *
+	 * 接管视口的是**光标底下**那块屏（vidow_tile_drag_autoscroll：
+	 * output_under_cursor），跨屏拖拽时它和 view->output（拖拽前那块）不是同一
+	 * 块 —— 这里按 view->output 清就漏掉了真正接管着的那块，drag_scroll 残留
+	 * 成 true，arrange 的 Pass 2 从此一直走 `viewport = drag_viewport` 分支
+	 * （view.c 4008），视口冻在松手那一刻的值：焦点列滚不回来、点窗口命中不到
+	 * 摆到位的节点 —— 用户看到的「跨屏拖拽之后焦点切不动、布局不归位」，切一次
+	 * 工作区（全屏重摆 + 排帧让 step 的自愈跑起来）才恢复。
+	 *
+	 * 和 vidow_tile_drag_scroll_step 的自愈循环同款：一次全清，宁可多清几块
+	 * 空的（本来就没接管的清了也无害）。 */
+	{
+		struct vidow_output *o;
+		wl_list_for_each(o, &server->outputs, link) {
+			if (o->drag_scroll) {
+				o->drag_scroll = false;
+				o->drag_scroll_speed = 0.0;
+				o->drag_scroll_ns = 0;
+				server->arrange_dirty = true;
+			}
 		}
 	}
 	wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "left_ptr");
