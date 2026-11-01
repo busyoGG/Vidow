@@ -1518,6 +1518,10 @@ struct vidow_output {
 	 * 是不行的（提交一次之后就没人再推了，链子断在半路）—— 到点了由它叫醒一次。 */
 	struct wl_event_source *pump_timer;
 	int64_t pump_at_ms; /* 闹钟定在什么时候（0 = 没定） */
+	/* 隐藏 layer（内容全透明被关节点，见 fx-layer.c）下一次该补 frame_done 的
+	 * 时刻。和上面的泵共用同一只闹钟与节流循环 —— 那些 layer 的 frame_done
+	 * 走不了 wlr_scene（只发可见节点），在 render_pump 里按同一套节流补。 */
+	int64_t layer_pump_next_ms;
 
 	struct wl_listener frame;
 	struct wl_listener request_state;
@@ -3205,12 +3209,6 @@ struct vidow_server {
 	 * 从头就是 true，悬停照常。 */
 	bool fullscreen_hover_armed;
 	struct vidow_view *focused;
-	/* 内容全透明被关节点的 layer 的补帧泵（fx-layer.c）：wlr_scene 的
-	 * frame_done 只走可见节点，关掉的 quickshell 面板（bar / dock）会饿死
-	 * —— 画不出内容、热区动画跑不起来，200ms 复检读到的永远是那张旧的
-	 * 全透明缓冲，节点永远点不回来。16ms 一拍给隐藏 layer 发 frame_done，
-	 * 没有隐藏 layer 时回调返回 0 自动停，零开销。 */
-	struct wl_event_source *layer_pump_timer;
 	/* 辅助窗口（wl-clipboard 那种 1x1）**借走键盘之前**，焦点在哪个窗口上。
 	 *
 	 * 这是「粘贴一次，焦点跳到下一个窗口」的修法，抄 Hyprland 单点存焦点的
@@ -4800,10 +4798,6 @@ void vidow_layer_node_update_visible(struct vidow_layer_surface *ls);
  * 关掉之后 blur 那条路提前退出，不在这里排就没有人复检了。 */
 void vidow_layer_content_check_schedule(struct vidow_server *server,
 	struct vidow_layer_surface *ls);
-/* 内容全透明被关节点的 layer 的补帧泵：有隐藏 layer 就 16ms 一拍地给它们发
- * frame_done（客户端要帧回调才肯画），没有就自动停。hide_content 置真时
- * kick 一次。 */
-void vidow_layer_frame_pump_kick(struct vidow_server *server);
 /* 桌面底色（background_color）落到场景里：颜色 + 整个布局的包围盒。配置重载、
  * 输出变化、启动时各调一次（幂等）。 */
 void vidow_background_apply(struct vidow_server *server);

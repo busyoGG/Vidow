@@ -2061,6 +2061,60 @@ void vidow_view_render_pump(struct vidow_server *server,
 		}
 	}
 
+	/* **内容全透明被关节点的 layer 也在这里补帧**（dec9bba 的死角）。
+	 *
+	 * wlr_scene_output_send_frame_done 只走「可见」节点：hide_content 关掉的
+	 * quickshell 面板（bar / dock / osd）拿不到帧回调就再也不画 —— bar 起不
+	 * 来、dock 缩回去之后热区触发了也没帧可渲染，200ms 复检读到的永远是那张
+	 * 旧的全透明缓冲，节点永远点不回来（2026-11-01 实测 bar / dock 卡死）。
+	 *
+	 * 判据是**真的有 pending frame callback**（客户端正在等帧 = 它在画 /
+	 * 在跑动画），不是「有隐藏 layer」：静态的隐藏面板没人等帧，这里一帧都
+	 * 不催，和补帧泵「只在有人等着的时候转」同一个原则。热区 hover 把
+	 * dock 叫出来 → 动画请求帧回调 → 这里按 16ms 节流补给它 → 动画跑起来
+	 * → 交出新内容 → 复检点亮节点。
+	 *
+	 * 节流和窗口补帧共用同一套：layer_pump_next_ms 记到点时刻，收尾的
+	 * pump_timer 闹钟统一上弦 —— 不另开定时器。 */
+	{
+		struct vidow_layer_surface *ls, *waiting = NULL;
+		wl_list_for_each(ls, &server->layers, link) {
+			if (!ls->hide_content || ls->output != output->wlr_output ||
+					ls->layer_surface == NULL ||
+					ls->layer_surface->surface == NULL ||
+					!ls->layer_surface->surface->mapped ||
+					wl_list_empty(&ls->layer_surface->surface->
+						current.frame_callback_list)) {
+				continue;
+			}
+			waiting = ls;
+			break;
+		}
+		if (waiting == NULL) {
+			output->layer_pump_next_ms = 0;
+		} else if (msec < (uint32_t)output->layer_pump_next_ms) {
+			if (next_due == 0 || output->layer_pump_next_ms < next_due) {
+				next_due = output->layer_pump_next_ms;
+			}
+		} else {
+			output->layer_pump_next_ms = (int64_t)msec + 16;
+			wl_list_for_each(ls, &server->layers, link) {
+				if (!ls->hide_content ||
+						ls->output != output->wlr_output ||
+						ls->layer_surface == NULL ||
+						ls->layer_surface->surface == NULL ||
+						!ls->layer_surface->surface->mapped ||
+						wl_list_empty(&ls->layer_surface->surface->
+							current.frame_callback_list)) {
+					continue;
+				}
+				wlr_surface_send_frame_done(
+					ls->layer_surface->surface, &now);
+			}
+			keep_going = true;
+		}
+	}
+
 	/* 补帧得有人推：不主动排下一帧的话，画面没变化时 wlroots 就不给帧事件了。 */
 	if (keep_going) {
 		vidow_output_schedule_frame(output->server, output->wlr_output,
