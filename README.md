@@ -5590,6 +5590,29 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
      - 未做：niri 的 `fixed 1920`（固定像素档）、`preset-window-heights`、`default-column-width {}`（让客户端自己定宽）、
        `always-center-single-column`；窗口规则级的 per-rule 预设覆盖。
 
+292. **Steam 窗口偏低 + 顶部一条黑带：map 前那条 echo configure 的位置归零**（用户：「Steam 窗口内容偏低，顶部一条黑带」；2026-11-01）
+     - **根因**：Steam（CEF）把 init 期收到的**第一条 configure 的 x/y** 当成自己 frame 子窗口（标题栏那层，`0x22xxxxx`）的**父内相对
+       偏移**写死，之后挪窗 / 换屏 / 改尺寸都不更新。`5509e3d` 加的 map 前 echo 回的是创建坐标（Steam 的 `USPosition`，当天是 `16,92`）
+       —— 相对偏移恰好等于窗口的绝对坐标，叠出来就是「标题栏低 46 逻辑像素 + 顶部露一条黑带」，黑带高度永远等于首摆位置 y。
+     - **修法**：这条 echo 只为破「客户端等 configure 才 XMapWindow → 不 map 就没 surface → 没 surface 就进不了布局」的死锁，尺寸照
+       客户端要的给，**位置固定 `(0,0)`**。窗口此刻还没映射，没有视觉影响；map 之后 `vidow_place_view` 照常把它 configure 到瓦片位置，
+       那时 init 已结束，不会再冻进子窗口。
+     - 判据（同机 A/B，只换这一行）：回创建坐标 → 窗口 `(16,92)`、frame 子窗口相对 `+16+92`、黑带复现；回 `(0,0)` → frame 子窗口
+       `+0+0`、内容子窗口 `+1+184`、截图贴顶。两种启动方式都验过（`/usr/bin/steam`；登录自启的 `-silent` + `steam steam://open/main`，
+       等于点托盘）。
+     - **别把它误读成回归**：`-silent` 启动时主窗口本来就留在 `IsUnMapped`（等托盘打开才 map），两种二进制都一样。
+     - 落点：`src/view.c`（`vidow_view_new_x11` 里那条 echo）。
+291. **`grab_pointer_on_hover`：光标第一次压到全屏窗口上就补一次指针焦点**（用户：「游戏拿光标时，有时候光标会从全屏画面里漏出去到隔壁屏 / 别的窗口」；2026-11-01）
+     - **根因**：游戏的指针约束只在「指针焦点 == 约束那个表面」时激活（`vidow_pointer_constraint_focus`）；光标刚划进全屏画面、指针焦点
+       还留在上一个表面的那段时间里约束没激活、位移继续发给旧焦点，划快一点就漏出窗口。
+     - **修法**：`vidow_pointer_motion` 里挂在那句激活之前 —— 压到全屏窗口、而 `focused_surface != surface` 时先补一次 `notify_enter`，
+       让 locked / confined 在同一趟 motion 里生效；wlroots 对同表面的重复 enter 复用 serial，后面正常路径再 enter 是 no-op。
+     - **只在进入的那一次抓**（用户明确要求）：判据就是「焦点不在它身上」，enter 发完就不会再有后续 motion 进这个分支；游戏自己放开
+       约束（开菜单 / 切窗口）之后光标照常出得去。守卫：按着键不抓（不许断隐式抓取）、键盘 warp 带过去的那一趟不抓、弹出物不抓。
+     - 开关：`input.grab_pointer_on_hover`，默认 **true**（`configs/19-input.lua` 里能关，想退回纯客户端约束就配 false）；
+       `vidowmsg config grab_pointer_on_hover` 读回。
+     - 落点：`src/config.c`（键 + 默认值）、`src/input.c`（`vidow_pointer_motion`）、`src/server.h`、
+       `config.example/configs/19-input.lua`。
 290. **媒体键能绑了：键名解析加 keysym 兜底；裸键开 XF86 段 + `{ bare = true }`；锁屏放行 `{ locked = true }`**（用户：「媒体键怎么解决」；2026-10-15）
      - **根因**：键名只有一张固定表 + `F1..F35` + `XF86Switch_VT_1..12`，`XF86AudioRaiseVolume` 这种名字落在表外 → 报
        `unknown token`；就算解出来，紧接着还有一道**裸键拒绝**（不带修饰键的键盘触发一律不抢），媒体键天生没修饰键，照样绑不上。

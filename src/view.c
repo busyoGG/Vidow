@@ -8761,9 +8761,10 @@ void vidow_view_new_x11(struct vidow_x11_surface *xsurface) {
 	 * `xwm: create xid=0x2000041`，一条 x11-cfg 都没有。手动
 	 * `xdotool windowmap` 之后 Vidow 立刻 associate 并正常显示（截图确认）。
 	 *
-	 * 所以这一步必须**脱离布局**独立做：用 X 侧报上来的几何（就是客户端
-	 * 自己要的尺寸，create 时从 XGetWindowAttributes 读的）原样回给它。
-	 * ICCCM 允许这样做，Hyprland 在 XSurface 建好时同样会先发一次。
+	 * 所以这一步必须**脱离布局**独立做：**尺寸**用 X 侧报上来的（就是客户端
+	 * 自己要的尺寸，create 时从 XGetWindowAttributes 读的）原样回给它 ——
+	 * 位置不原样回，见下面那条。ICCCM 允许这样做，Hyprland 在 XSurface
+	 * 建好时同样会先发一次。
 	 *
 	 * **但位置必须回 (0,0)，绝不能回创建坐标**（2026-11-01，用户报的
 	 * 「Steam 窗口偏低、顶部一条黑带」）：

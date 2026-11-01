@@ -91,7 +91,8 @@ IPC；单 fd 一天 2000+ 行）、`x11: 新窗口 / 先回 configure`、
 | `/tmp/vidow-no-arrange-region` | arrange 收口回退整屏损伤 |
 | `/tmp/vidow-place-check` | place 与旧判据对账探针（不一致打 PLACECHK） |
 | `/tmp/vidow-span` | span 探针：跨屏骑边界时两趟的底衬归属 / 区域（`fx-dmg.c`） |
-| `/tmp/vidow-x11-trace` | 跨屏拖拽跟手探针：格子归属 / 裁剪 / 节点落点（bakeout/fx trace） |
+| `/tmp/vidow-x11-trace` | 跨屏拖拽跟手探针：格子归属 / 裁剪 / 节点落点（bakeout/fx trace）；同时打 `x11-cfg-create`（map 前那条 echo configure 的尺寸 / 是否已映射，查 X11 窗口卡在 IsUnMapped） |
+| `/tmp/vidow-cursor-trace` | 光标链路专属探针（`vidow_cursor_trace_on`）：set_cursor 请求是否被收、fx 补画走了哪一支、默认箭头什么时候盖上去（查「光标出去回来不重绘」） |
 | `VIDOW_DMG_WHY=1` | 损伤从哪来 / LAYERBLUR / ALPHASCAN 探针 |
 | `VIDOW_FRAME_WHY=1` / `VIDOW_COMMIT_WHY=1` | 谁在要帧 / 谁在交帧 |
 
