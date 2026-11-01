@@ -495,31 +495,51 @@ static void xwayland_ready(struct wl_listener *listener, void *data) {
 	 * xwm，用来判选区归属。现在 xwm 是我们自己的，选区事件走
 	 * x11->event_hook（见 clipboard.c），不需要这一步。 */
 
-	/* X clients without their own cursor inherit the root cursor. Seed it on
-	 * every Xwayland start, otherwise they inherit X's default cross. The image
-	 * buffer is borrowed from cursor_mgr; Xwayland retains it as needed. */
-	/* Scale 1 is wrong on a HiDPI output: Xwayland hands this buffer to X
-	 * clients as their inherited root cursor, and a 1x 24px image inside a
-	 * 2x desktop is drawn small but its hotspot/clear area still covers a
-	 * 2x cursor box, so the pointer comes out clipped (reported on the 2x
-	 * output while the 1x one looked fine). Use the largest output scale,
-	 * which is what the cursor manager preloads for. */
-	double cursor_scale = 1.0;
-	struct vidow_output *o;
-	wl_list_for_each(o, &server->outputs, link) {
-		double sc = o->wlr_output->scale;
-		if (sc > cursor_scale) {
-			cursor_scale = sc;
+	/* **根光标设成「透明 1x1」，不再设主题的 left_ptr。**
+	 *
+	 * 这条以前是 Hyprland 的做法：给「自己不设光标的 X 客户端」一个像样
+	 * 的默认光标，不然它们继承 X 自带的十字。但那个做法有个更糟的副作用
+	 * —— **全屏游戏藏不住系统光标**。
+	 *
+	 * 游戏藏光标的典型做法是 SetCursor(NULL)（Wine 侧就是把窗口的 cursor
+	 * 设成 None，自己在画面里画光标）。窗口 cursor 是 None 时 X 按继承链
+	 * 往上找，最后落到 root window 的 cursor 上；root 上摆着一支可见的
+	 * left_ptr，于是 Xwayland 报给合成器的不是「不画」，而是「这支主题
+	 * 箭头」，vidow 老实画上去 —— 用户看到的就是「游戏里顶着一支普通白色
+	 * 箭头」。
+	 *
+	 * 现场对得上（2026-11-01）：游戏里报上来的 cursor 图是 **64x64、热点
+	 * 13,4**，和 Bibata-Modern-Ice 的 left_ptr 64 那张完全一致（热点 13,4
+	 * 是那张图自己的热点），而 64 正是本函数按 2 倍屏预加载的尺寸。把 root
+	 * 换成透明之后，同一条继承链报上来的立刻变成 NULL（vidow 日志
+	 * 「set_cursor surface=(nil)」），游戏里那支箭头就没了。
+	 *
+	 * rootless 下 root window 一个像素都不显示，这里唯一的作用就是「没设
+	 * 光标的窗口继承到什么」：继承到透明 = 「没设 = 不画」。游戏要显示什么
+	 * 光标就自己 set_cursor，那条路照客户端给的图画（vidow_cursor_set_
+	 * client_surface）。真遇到从不设光标的 X11 程序，它本来也是没有光标，
+	 * 不会比继承一支不属于它的箭头更糟。
+	 *
+	 * 逃生口：VIDOW_XROOT_CURSOR=theme 退回老行为（root 上摆主题 left_ptr），
+	 * 万一某个 X11 程序非要靠继承才有光标，改这一个环境变量就行。 */
+	const char *xroot_cursor = getenv("VIDOW_XROOT_CURSOR");
+	if (xroot_cursor != NULL && strcmp(xroot_cursor, "theme") == 0) {
+		double cursor_scale = 1.0;
+		struct vidow_output *o;
+		wl_list_for_each(o, &server->outputs, link) {
+			double sc = o->wlr_output->scale;
+			if (sc > cursor_scale) {
+				cursor_scale = sc;
+			}
 		}
-	}
-	struct wlr_xcursor *cursor = wlr_xcursor_manager_get_xcursor(
-		server->cursor_mgr, "left_ptr", (float)cursor_scale);
-	if (cursor != NULL && cursor->image_count > 0) {
-		struct wlr_xcursor_image *image = cursor->images[0];
-		/* 自己把像素读出来交给 XWM —— 以前这是 wlr_xwayland_set_cursor()
-		 * 的活，它内部也是这么做的（见 src/xwm_x11.c 的
-		 * vidow_x11_set_cursor）。 */
-		xwayland_set_root_cursor(server, image);
+		struct wlr_xcursor *cursor = wlr_xcursor_manager_get_xcursor(
+			server->cursor_mgr, "left_ptr", (float)cursor_scale);
+		if (cursor != NULL && cursor->image_count > 0) {
+			xwayland_set_root_cursor(server, cursor->images[0]);
+		}
+	} else {
+		static const unsigned char blank_px[4] = {0, 0, 0, 0};
+		vidow_x11_set_cursor(blank_px, 4, 1, 1, 0, 0);
 	}
 
 	/* New Xwayland instance: recheck its root against the virtual union. */
