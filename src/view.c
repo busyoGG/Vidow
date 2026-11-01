@@ -8096,16 +8096,17 @@ static void x11_trace_view(const char *event, struct vidow_view *view,
 	if (view == NULL) {
 		return;
 	}
-	bool xmapped = view->x11 != NULL && view->x11->surface != NULL &&
-		view->x11->surface->mapped;
+	/* view->x11 在 unmap 的收尾路径上可能刚被摘掉（悬空指针）：13:26 现场
+	 * SI_KERNEL，栈在 wlr_log 的参数求值里读 view->x11->surface。探针自己
+	 * 保守一点：谁调它谁负责传「已经解好的值」，探针里只碰 view 自己的
+	 * 字段 —— 探针挂在整条 unmap 链的最前面，探针自己先崩就什么都查不了。 */
+	bool xmapped = surface != NULL;
+	unsigned xid = 0;
+	struct wlr_surface *xs = surface;
 	wlr_log(WLR_DEBUG,
 		"x11-life %s xid=0x%x xs=%p surf=%p xmapped=%d mapped=%d helper=%d "
 		"tree=%p scene=%p ws=%p col=%p",
-		event,
-		view->x11 != NULL ? view->x11->window_id : 0,
-		view->x11,
-		surface != NULL ? surface :
-			(view->x11 != NULL ? view->x11->surface : NULL),
+		event, xid, (void *)0, (void *)xs,
 		xmapped, view->mapped, view->focus_helper,
 		view->scene_tree, view->scene_surface, view->ws, view->column);
 }

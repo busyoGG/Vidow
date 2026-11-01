@@ -162,6 +162,31 @@ static void layer_apply_anim(struct vidow_layer_surface *ls) {
 	}
 }
 
+/* 这块屏上现在有没有一块真的画着的全屏窗口。
+ *
+ * 和 vidow_layers_update_fullscreen 同一套判据 —— 那边只拿它盖 exclusive_zone
+ * > 0 的 layer（顶栏），dock 的 exclusive_zone 是 0，从那个标记上什么都读不
+ * 到。这里只在节点状态要重算时问一次，不在每帧路径上。 */
+static bool layer_output_fullscreen(const struct vidow_layer_surface *ls) {
+	if (ls->server == NULL || ls->output == NULL) {
+		return false;
+	}
+	struct vidow_view *view;
+	wl_list_for_each(view, &ls->server->views, link) {
+		if (view->popup || !view->fullscreen || !view->mapped ||
+				view->scene_parked) {
+			continue;
+		}
+		struct wlr_output *want = view->ws != NULL &&
+			view->ws->output != NULL ? view->ws->output : view->output;
+		if (want == ls->output->wlr_output &&
+				vidow_workspace_view_visible(ls->server, view)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 /* 两路「这块 layer 该不该画」汇成一个节点开关（见 server.h 的声明）。
  *
  * 键盘交互的 layer 例外：内容全透明时不关 —— 它多半在等键盘 / 当冻结覆盖层，
@@ -179,6 +204,25 @@ void vidow_layer_node_update_visible(struct vidow_layer_surface *ls) {
 			ls->layer_surface->current.keyboard_interactive !=
 				ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE) {
 		want = true;
+	}
+	/* **客户端还在申报输入区就不能关。**
+	 *
+	 * 场景节点一关，指针命中测试也一起没了：收起来的 dock / 顶栏是全透明的
+	 * （画面上什么都没有），但它在 mask 里留了一条热区等 hover —— 节点关掉
+	 * 之后热区收不到任何事件，dock 就再也弹不回来（2026-11-01 现场：
+	 * `节点关（content=1）` 之后鼠标贴在屏幕底边一动不动）。
+	 *
+	 * input region 是空的（真正什么都不画的 layer，比如静态装饰、走完动画的
+	 * osd）照旧关掉 —— 这条不推翻「全透明的 layer 不进渲染列表、把直通扫屏
+	 * 让给全屏游戏」那个优化：那种 layer 本来就没有输入区，全屏时也不留。 */
+	if (ls->hide_content && !ls->hide_fullscreen &&
+			ls->layer_surface->surface != NULL &&
+			!layer_output_fullscreen(ls)) {
+		pixman_box32_t *e = pixman_region32_extents(
+			&ls->layer_surface->surface->input_region);
+		if (e != NULL && e->x1 < e->x2 && e->y1 < e->y2) {
+			want = true;
+		}
 	}
 	if (ls->scene->tree->node.enabled == want) {
 		return; /* 已经是想要的状态：别每趟都碰节点 */

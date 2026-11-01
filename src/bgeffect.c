@@ -179,8 +179,25 @@ static void manager_get_background_effect(struct wl_client *client,
 		struct wl_resource *resource, uint32_t id,
 		struct wl_resource *surface_resource) {
 	struct vidow_server *server = wl_resource_get_user_data(resource);
+	/* **surface_resource 必须先验明正身再用。**
+	 *
+	 * wlr_surface_from_resource 文档写着 "asserts ... never return NULL"，
+	 * 但那是「resource 真是 wlroots 建的 wl_surface」时才成立。会话拆掉
+	 * （systemctl restart sddm）的那一刻客户端会收到 socket 关闭前最后一
+	 * 段请求，里面可能带着已销毁 / 别的接口的 resource —— 直接拿它当
+	 * wlr_surface 解引用就是野指针，三次现场 SIGSEGV 全在这个点上
+	 * （18:24 / 15:44 / 15:49，栈都是 wlr_addon_find ← 本函数）。
+	 *
+	 * wl_resource_get_class 不解引用对象，只看 resource 自己的头 —— 安全。
+	 * 不是 wl_surface（或已经死了拿不到 server 端实现）就当没看见：客户端
+	 * 眼看着要断，不值得为它 post_error。 */
+	if (server == NULL || surface_resource == NULL ||
+			strcmp(wl_resource_get_class(surface_resource),
+				wl_surface_interface.name) != 0) {
+		return;
+	}
 	struct wlr_surface *surface = wlr_surface_from_resource(surface_resource);
-	if (server == NULL || surface == NULL) {
+	if (surface == NULL) {
 		return;
 	}
 	if (wlr_addon_find(&surface->addons, server, &addon_impl) != NULL) {
