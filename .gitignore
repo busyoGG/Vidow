@@ -19,3 +19,14 @@ OBSERVATION_CHECKLIST.md
 TROUBLESHOOTING.md
 steam-*.patch
 steam-*-report.md
+
+# 媒体 / 截图 / 录像 / 日志：仓库只放代码（2026-11-01 清历史时一并定下）
+*.mkv
+*.mp4
+*.gif
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.log
+*.bundle
