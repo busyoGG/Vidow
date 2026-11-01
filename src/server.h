@@ -2130,6 +2130,9 @@ struct vidow_layer_surface {
 	 * 几十帧，不设这个就是每 200ms 无条件读一块整面板缓冲）。 */
 	bool content_dirty;
 	int content_x, content_y, content_w, content_h;
+	/* LAYERBOX 探针（/tmp/vidow-layer-box）的节流时刻：每块 layer 自己一秒
+	 * 一行，共用全局时间戳的话一次只轮得到一块。 */
+	uint64_t box_log_ns;
 	/* 节点开关的两路来源（汇合在 vidow_layer_node_update_visible）：
 	 * hide_content = 内容全透明（fx-layer.c 的读回判定）—— 树开着时全透明
 	 *   缓冲也进渲染列表，全屏游戏的直通扫屏就被顶掉了（实测游戏 40 帧，

@@ -88,6 +88,7 @@ IPC；单 fd 一天 2000+ 行）、`x11: 新窗口 / 先回 configure`、
 | `/tmp/vidow-stats-on` | 打开 render_stats 计数（运行时，不用重启） |
 | `/tmp/vidow-no-commit-skip` | 退回「任何交帧都排帧」 |
 | `/tmp/vidow-no-alpha-scan` | 跳过内容包围盒读回（区域回退到声明区域） |
+| `/tmp/vidow-layer-box` | LAYERBOX 探针：每块 layer 每秒一行 `src/want/input/content/vis/geom`（查「模糊区域为什么比面板小」） |
 | `/tmp/vidow-no-arrange-region` | arrange 收口回退整屏损伤 |
 | `/tmp/vidow-place-check` | place 与旧判据对账探针（不一致打 PLACECHK） |
 | `/tmp/vidow-span` | span 探针：跨屏骑边界时两趟的底衬归属 / 区域（`fx-dmg.c`） |

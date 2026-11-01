@@ -464,6 +464,47 @@ bool layer_region_rect(struct vidow_server *server,
 			vis = inter;
 		}
 	}
+	/* **探针（2026-11-01）**：`touch /tmp/vidow-layer-box` 或
+	 * `VIDOW_LAYER_BOX_LOG=1` → 每块 layer 一秒一行。回答「模糊区域为什么比
+	 * 面板小」：`want` 是客户端申报的（bgeffect 优先，否则 input region），
+	 * `content` 是合成器读回的内容包围盒，`vis` 是两者求交之后的最终可见区。
+	 * want_src 标出来的是哪一种申报（bgeffect / input / none）。 */
+	{
+		int64_t bx_now = vidow_now_ns();
+		if (bx_now - (int64_t)ls->box_log_ns > 1000000000LL &&
+				(getenv("VIDOW_LAYER_BOX_LOG") != NULL ||
+					access("/tmp/vidow-layer-box", F_OK) == 0)) {
+			struct wlr_box in_ext = {0};
+			bool bg_have = false;
+			struct wlr_box bg = {0};
+			if (ls->layer_surface != NULL) {
+				pixman_box32_t *e = pixman_region32_extents(
+					&ls->layer_surface->surface->input_region);
+				if (e != NULL && e->x2 > e->x1 && e->y2 > e->y1) {
+					in_ext = (struct wlr_box){ .x = e->x1, .y = e->y1,
+						.width = e->x2 - e->x1,
+						.height = e->y2 - e->y1 };
+				}
+				bg_have = vidow_bgeffect_blur_box(server,
+					ls->layer_surface->surface, &bg);
+			}
+			ls->box_log_ns = (uint64_t)bx_now;
+			wlr_log(WLR_INFO, "LAYERBOX ns=%s src=%s want=%d,%d %dx%d "
+				"input=%d,%d %dx%d content=%d,%d %dx%d vis=%d,%d %dx%d "
+				"geom=%dx%d",
+				ls->layer_surface != NULL &&
+					ls->layer_surface->namespace != NULL ?
+					ls->layer_surface->namespace : "?",
+				bg_have ? "bgeffect" : (have ? "input" : "none"),
+				bg_have ? bg.x : -1, bg_have ? bg.y : -1,
+				bg_have ? bg.width : -1, bg_have ? bg.height : -1,
+				in_ext.x, in_ext.y, in_ext.width, in_ext.height,
+				ls->content_x, ls->content_y,
+				ls->content_w, ls->content_h,
+				vis.x, vis.y, vis.width, vis.height,
+				box.width, box.height);
+		}
+	}
 	/* **再用合成器自己读回的内容包围盒收一圈**（见 layer_content_scan）：
 	 * 客户端声明的区域只是上界 —— vshell 的 bar / dock 给的是整块预留画布
 	 * （1920x438 / 1920x372），真正画出来的只有顶上那几十像素。照它抓底衬
