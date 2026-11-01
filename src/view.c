@@ -8765,6 +8765,37 @@ void vidow_view_new_x11(struct vidow_x11_surface *xsurface) {
 	 * 自己要的尺寸，create 时从 XGetWindowAttributes 读的）原样回给它。
 	 * ICCCM 允许这样做，Hyprland 在 XSurface 建好时同样会先发一次。
 	 *
+	 * **但位置必须回 (0,0)，绝不能回创建坐标**（2026-11-01，用户报的
+	 * 「Steam 窗口偏低、顶部一条黑带」）：
+	 *
+	 *   Steam（CEF）初始化时把收到的**第一条 configure 的 x/y** 当成自己
+	 *   frame 子窗口（标题栏那层，0x22xxxxx）的**父内相对偏移**写下去，
+	 *   之后再也不更新（挪窗 / 换屏 / 改尺寸都不动）。我们回创建坐标
+	 *   (16,92)，它就把标题栏画到 (16,92) —— 相对偏移恰好等于窗口的绝对
+	 *   坐标，叠出来就是「标题栏整体低 46 逻辑像素 + 顶部一条黑带」，黑带
+	 *   高度永远等于首摆位置 y。窗口挪到哪都不变，因为它冻结在 init 期。
+	 *
+	 *   对照实验（2026-11-01）：同一个 Steam 在 Xvfb（无 WM，没有任何
+	 *   init 期 configure）里 frame 子窗口偏移 +0+0 完全正常；vidow headless
+	 *   首摆在 (0,0) 时也正常。触发条件就是这条 map 前的 configure 带了
+	 *   非零坐标。
+	 *
+	 *   窗口此刻还没映射，摆到 (0,0) 没有任何视觉影响；map 之后 arrange
+	 *   会把它 configure 到真正的瓦片位置（跟所有 WM 的摆窗流程一样），
+	 *   那时 Steam 的 init 已经结束，不会再把位置写进 frame 子窗口。
+	 *
+	 *   A/B 实测（2026-11-01，同一台机器，只换这一行）：
+	 *     回创建坐标 → 窗口在 (16,92)，frame 子窗口相对也是 +16+92，
+	 *       标题栏低 46 逻辑像素 + 顶部黑带，用户报的现象复现。
+	 *     回 (0,0) → 窗口摆在 (16,92)，frame 子窗口 +0+0、内容子窗口
+	 *       +1+184，画面正常。
+	 *
+	 *   **别把「Steam 不 map」算在这条上**：`-silent` 启动（登录自启，
+	 *   ~/.local/share/applications/steam.desktop 里就是 -silent）本来就把
+	 *   主窗口留在 IsUnMapped，等托盘点开才 map —— 两种二进制都一样。
+	 *   正常启动（/usr/bin/steam，不带 -silent）带着这条 fix 也能自己
+	 *   map 并显示。
+	 *
 	 * 已经 mapped 的不发：那种窗口走正常 arrange 那条路（vidow_place_view），
 	 * 这里再发一次会和布局抢几何。
 	 *
@@ -8779,12 +8810,11 @@ void vidow_view_new_x11(struct vidow_x11_surface *xsurface) {
 	if (!xsurface->override_redirect && !view->popup &&
 			xsurface->width > 0 && xsurface->height > 0 &&
 			!xsurface->mapped) {
-		vidow_x11_surface_configure(xsurface,
-			(int16_t)xsurface->x, (int16_t)xsurface->y,
+		vidow_x11_surface_configure(xsurface, 0, 0,
 			(uint16_t)xsurface->width, (uint16_t)xsurface->height);
-		wlr_log(WLR_DEBUG, "x11: 新窗口先回 configure %d,%d %dx%d"
-			"（不等布局，破 map/configure 死锁）",
-			xsurface->x, xsurface->y,
+		wlr_log(WLR_DEBUG, "x11: 新窗口先回 configure 0,0 %dx%d"
+			"（不等布局，破 map/configure 死锁；位置归零，"
+			"防 Steam 把 init 期坐标冻进 frame 子窗口）",
 			xsurface->width, xsurface->height);
 	}
 }
