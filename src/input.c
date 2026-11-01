@@ -1955,6 +1955,35 @@ void vidow_pointer_motion(struct vidow_server *server, uint32_t time_msec) {
 		return;
 	}
 
+	/* **光标第一次压到全屏窗口（游戏）上，先把指针焦点抓给它**（grab_pointer_on_hover，
+	 * 默认开）。
+	 *
+	 * 游戏的指针约束只在「指针焦点 == 约束那个表面」时激活（下面那句
+	 * vidow_pointer_constraint_focus）。光标刚划进全屏画面、焦点还留在上一个
+	 * 表面上的时候，约束没激活、位移继续送给旧焦点 —— 光标会从全屏画面里
+	 * 漏出去到隔壁屏 / 别的窗口上（用户 2026-11-01）。这里当场补一次 enter，
+	 * 让约束在同一趟 motion 里就生效，把这条时间窗关掉。
+	 *
+	 * **只抓进入的那一次**：判据是「指针焦点不在这个表面上」—— enter 发完
+	 * 焦点就换过来了，后续 motion 不再进这个分支。游戏自己解除约束（开菜单、
+	 * 切窗口）之后指针焦点仍在它身上，这里不会反复重抓，光标照常出得去；
+	 * 划出去再划回来才算又一次进入。enter 只补一次，之后照旧走下面正常的
+	 * enter / motion / cursor_fx 路径（notify_enter 对同表面幂等，wlroots
+	 * 对 focused_surface == surface 直接复用 enter serial）。
+	 *
+	 * 守卫：按着键不抓（Wayland 隐式抓取不许断，和下面 notify_enter 的守卫
+	 * 同一个理由）；键盘 warp 带过去的那一趟不抓（warp_in_progress —— 那不是
+	 * 用户把鼠标挪进游戏，别把光标半路钉在路过的全屏窗口上）；弹出物不抓。 */
+	if (server->config.grab_pointer_on_hover && hit != NULL && hit->fullscreen &&
+			!hit->popup && surface != NULL &&
+			server->pointer_button_count == 0 && !warp_in_progress &&
+			server->seat->pointer_state.focused_surface != surface) {
+		wlr_seat_pointer_notify_enter(server->seat, surface, sx, sy);
+		wlr_log(WLR_INFO, "指针焦点: 光标压到全屏窗口 %s 上，先抓一次指针焦点"
+			"（约束跟着激活）",
+			vidow_view_title(hit) != NULL ? vidow_view_title(hit) : "(无题)");
+	}
+
 	/* 约束跟着指针焦点走：指针底下的表面 == 约束那个表面才生效，移开就解除。 */
 	vidow_pointer_constraint_focus(server, surface);
 

@@ -416,6 +416,12 @@ static const struct entry entries[] = {
 		SZ(warp_mouse_to_focus), 12,
 		"键盘换焦点时把光标挪到新窗口上（niri 的 input { warp-mouse-to-focus }）；"
 		"鼠标悬停聚焦不挪（光标本来就在那儿）。默认 false" },
+	{ "grab_pointer_on_hover", K_BOOL, OFF(grab_pointer_on_hover),
+		SZ(grab_pointer_on_hover), 12,
+		"光标第一次压到全屏窗口（游戏）上、而指针焦点还不在它身上时，立刻把指针"
+		"焦点补给它一次，让游戏的指针约束（锁鼠标 / 夹光标）当场生效 —— 不然光标"
+		"会从全屏画面里漏出去到隔壁屏 / 别的窗口。**只在进入的那一次抓**：指针"
+		"焦点已经在它身上之后什么都不做，游戏自己放出的光标照常出得去。默认 true" },
 	{ "warp_mouse_to_focus_mode", K_STRING, OFF(warp_mouse_to_focus_mode),
 		SZ(warp_mouse_to_focus_mode), 12,
 		"光标挪到哪，照 niri 的 mode：留空 = X / Y 分别判断（只往需要的那个轴挪）；"
@@ -2272,6 +2278,10 @@ static void defaults(struct vidow_config *cfg) {
 	 * = 不限滚动量，mode 留空 = X / Y 分别判断。 */
 	cfg->focus_follows_mouse = false;
 	cfg->warp_mouse_to_focus = false;
+	/* 全屏窗口（游戏）的指针焦点抓取：默认**开**（和上面两个相反）——
+	 * 这是修「光标漏出全屏游戏」的兜底，不改任何可见行为，只在进入时补一次
+	 * enter。想退回老样子（光标完全按客户端请求走）配 false。 */
+	cfg->grab_pointer_on_hover = true;
 	/* libinput 设备配置（configs/19-input.lua）：**一个都不设**（三态 = AUTO、
 	 * accel_profile / scroll_method / click_method 留空、accel_speed 没设）——
 	 * vidow 以前一个 libinput 设置都不碰，libinput 的默认值又随设备和 udev

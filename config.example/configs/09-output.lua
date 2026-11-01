@@ -7,6 +7,8 @@
 -- ================== 缩放与输出
 -- 所有输出的默认缩放：auto = 按 EDID 的 ppi 推，也可以写死 "1" / "1.5"；单块屏点名用 vidow.output{ name = …, scale = … }
 scale = "auto"
+-- 所有屏的逻辑分辨率对齐到最大那块（1080p 屏被虚拟放大/超采样）
+logical_uniform = false
 -- 按需可变刷新率（niri 的 variable-refresh-rate on-demand=true）：默认 false = 不碰 VRR。true = 这块屏「有窗口要 VRR 才提刷新率」（窗口规则写 vrr = true，见 14-keys.lua），静止就降回来；每块屏可以用 vidow.output{ name="eDP-1", vrr_on_demand=true } 单独覆盖
 vrr_on_demand = false
 -- 指针一动就把「关着的屏」打开（Hyprland 的 misc { mouse_move_enables_dpms }）；默认 false = 不唤醒（以前的样子：关掉的屏只有再发一条 vidowmsg output-power 才回来）

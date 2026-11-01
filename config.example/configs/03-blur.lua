@@ -16,7 +16,11 @@ blur_levels = 3
 blur_strength = 1
 -- 窗口内容透明度低于这个值的地方不参与模糊（省 GPU）
 blur_alpha_min = 0.15
+-- 弹出物（菜单 / tooltip / 输入法候选框）背后的模糊开关
+popup_blur_enabled = true
+-- 弹出物模糊的透明度剔除阈值（0 = 菜单 1/255、输入法 0.35）
+popup_blur_alpha_min = 0
 -- 模糊采样偏移，越大越散
 blur_offset = 1.5
--- 这一族也能写成一张表，只写要改的项（blur = { enabled = true, all = true, xray = false, levels = 3, strength = 1, alpha_min = 0.15, offset = 1.5 }）
+-- 这一族也能写成一张表，只写要改的项（blur = { enabled = true, all = true, xray = false, levels = 3, strength = 1, alpha_min = 0.15, popup_enabled = true, popup_alpha_min = 0, offset = 1.5 }）
 --     不写表也行：blur = true（一个值管全部）

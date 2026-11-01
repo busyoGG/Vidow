@@ -4,6 +4,10 @@
 -- 下面每行都是内置默认值：改哪行哪行才生效，删掉那行就回到默认值。
 
 -- ================== 指针
+-- 光标主题（xcursor 主题名）。空 = 先看 XCURSOR_THEME、再 gsettings、最后 Adwaita。改了立刻生效（运行中重建 cursor manager）
+cursor_theme = ""
+-- 光标逻辑尺寸（24 = 常规，2 倍屏上自动翻倍）。0 = 先看 XCURSOR_SIZE、再 gsettings、最后 24。改了立刻生效；vidowmsg cursor-size N 也能改
+cursor_size = 0
 -- 摇晃指针就放大一下（快速来回晃几下，指针变大一会儿，好找）
 cursor_shake = true
 -- 每一圈加多少倍：2 = 第一圈就到大一倍，之后每圈再 +1（2x → 3x → 4x …，线性加不是乘）。放大走硬件光标那条路（放得下就不进截图），放不下会被降级成软光标，所以实际倍数会先按硬件光标尺寸上限夹住
@@ -14,6 +18,8 @@ focus_follows_mouse = false
 focus_follows_mouse_max_scroll_amount = ""
 -- 键盘换焦点时把光标挪到新窗口上（niri 的 input { warp-mouse-to-focus }）；鼠标悬停聚焦不挪（光标本来就在那儿）。默认 false
 warp_mouse_to_focus = false
+-- 光标第一次压到全屏窗口（游戏）上、而指针焦点还不在它身上时，立刻把指针焦点补给它一次，让游戏的指针约束（锁鼠标 / 夹光标）当场生效 —— 不然光标会从全屏画面里漏出去到隔壁屏 / 别的窗口。**只在进入的那一次抓**：指针焦点已经在它身上之后什么都不做，游戏自己放出的光标照常出得去。默认 true
+grab_pointer_on_hover = true
 -- 光标挪到哪，照 niri 的 mode：留空 = X / Y 分别判断（只往需要的那个轴挪）；center-xy = 光标在窗口外就挪到窗口正中；center-xy-always = 永远挪到正中
 warp_mouse_to_focus_mode = ""
 -- 打字的时候把光标藏起来，指针一动就回来（niri 的 cursor { hide-when-typing }）；默认 false = 不藏，和以前一样

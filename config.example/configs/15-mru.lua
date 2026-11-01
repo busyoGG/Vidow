@@ -29,6 +29,12 @@ mru_max_height = 480
 mru_min_scale = 0.05
 -- 切换器后面那层压暗的浓度（0 = 不压暗）
 mru_backdrop_alpha = 0.6
+-- 面板显形 / 收起时的过渡时长（毫秒）：卡片按 t 从 92% 长到原位、压暗跟着淡入，0 = 不做过渡（瞬间摆上去）
+mru_open_ms = 120
+-- 收起的过渡时长（毫秒），含义同 mru_open_ms；0 = 关掉时瞬间消失
+mru_close_ms = 90
+-- 换选中项时卡片位移的过渡时长（毫秒）：按 Tab 之后卡片从旧位置滑到新位置，0 = 瞬间跳过去
+mru_slide_ms = 110
 -- 每一项背后那张卡片比预览大多少（逻辑像素）：预览到卡片边缘那圈。比 mru_card_radius 小时按半径算（不然窗口会把圆角盖掉）
 mru_card_padding = 8
 -- 卡片的圆角半径（逻辑像素，超椭圆 —— 和 portal 的选择器同一种圆角）。半径会把内边距顶到至少这么大，圆弧才不会被窗口盖住
@@ -47,5 +53,5 @@ mru_hover_color = "#3daee980"
 mru_highlight_border = 2
 -- 强调色：选中那张卡片的描边、以及它的底色（底 = 卡片底混 12% 这个色）
 mru_highlight_color = "#3daee9ff"
--- 这一族也能写成一张表，只写要改的项（mru = { enabled = true, debounce_ms = 750, open_delay_ms = 150, scope = "workspace", layout = "strip", per_row = 5, gap = 16, row_gap = 16, max_scale = 0.5, max_height = 480, min_scale = 0.05, backdrop_alpha = 0.6, card_padding = 8, card_radius = 12, card_color = "#2f3336e6", card_border = 1, card_border_color = "#3b4045ff", hover_border = 2, hover_color = "#3daee980", highlight_border = 2, highlight_color = "#3daee9ff" }）
+-- 这一族也能写成一张表，只写要改的项（mru = { enabled = true, debounce_ms = 750, open_delay_ms = 150, scope = "workspace", layout = "strip", per_row = 5, gap = 16, row_gap = 16, max_scale = 0.5, max_height = 480, min_scale = 0.05, backdrop_alpha = 0.6, open_ms = 120, close_ms = 90, card_padding = 8, card_radius = 12, card_color = "#2f3336e6", card_border = 1, card_border_color = "#3b4045ff", hover_border = 2, hover_color = "#3daee980", highlight_border = 2, highlight_color = "#3daee9ff" }）
 --     不写表也行：mru = true（一个值管全部）

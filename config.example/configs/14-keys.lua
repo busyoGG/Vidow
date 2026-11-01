@@ -155,6 +155,9 @@ end
 --     focus_on_open = false      它开窗的时候不抢焦点（Electron 系那种看不见的
 --                                辅助窗口会开个窗口把自己顶上来）
 --     focus_on_activate = false  别人请求激活它（点通知 / 任务栏按钮）时不理
+--     fake_focus = true          焦点移走时也让客户端以为它还激活（xdg activated /
+--                                X11 focused）。给那种一失焦就暂停 / 收 UI 的程序用；
+--                                键盘焦点和任务栏仍是真实的，不抢别人的输入。
 --     honor_invalid_serial = true  它的激活请求即使令牌 serial 校验不过也照样理
 --     x11_scale = 1              X11 缩放桥：1 = 这个客户端没按 GDK_SCALE 画，
 --                                缓冲区不除（只对 X11 窗口有意义）

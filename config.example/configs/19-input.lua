@@ -27,4 +27,6 @@ scroll_method = ""
 click_method = ""
 -- 滚动倍率（niri 的 scroll-factor）：0.5 = 半速，负数反向。libinput 没有这个接口，是 vidow 自己在滚轮事件上乘的；1.0（默认）= 不缩放，跟以前一样
 scroll_factor = 1
+-- 客户端请求最大化（xdg_toplevel.request_maximize）时要不要兑现。默认 false = 不响应 —— Qt/KDE/Electron 应用会恢复「上次是最大化」，兑现了就会「一开就占满整列」（用户报的）。想用客户端自己的记忆就设 true
+honor_maximize_request = false
 -- 这一族也能写成一张表，只写要改的项（touchpad = { tap = "auto", dwt = "auto", natural_scroll = "auto", left_handed = "auto", middle_emulation = "auto", drag_lock = "auto", accel_profile = "", accel_speed = "auto", scroll_method = "", click_method = "", scroll_factor = 1 }）
