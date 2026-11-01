@@ -853,6 +853,25 @@ static void pin_scale_surface(struct wlr_surface *surface, int sx, int sy,
  *
  * 只在真的变了的时候发（滚动每帧都摆位置，不判一下就是每帧一个协议事件）。 */
 static void view_pin_scale(struct vidow_view *view) {
+	/* **停泊中的窗口：协议面整个冻结，一个事件都别再发。**
+	 *
+	 * 2026-11-02 Element（pid 319170）带着 WAYLAND_DEBUG 死了一次，现场：
+	 * 指针扫过屏幕底缘 → dock 热区 → 工作区滑动，窗口半路被停泊（y=-1034），
+	 * 同一毫秒 vidow 还在给它翻倍率（pref_scale != want → 发 preferred_scale）
+	 * 、推 keymap / 选区 offer / keyboard enter（全会话 42 次 enter、25+ 次
+	 * keymap、95 个服务端分配的 offer）。客户端在这批 churn 中途被静默掐断：
+	 * 全程零 wl_display.error，最后一条日志就是「连接被对方重置」——
+	 * libwayland handle_array 置 client->error 的那条无声路径。之前 9 具
+	 * 尸体全部同签名（死前同一毫秒「钉住 preferred_buffer_scale」+ 停泊
+	 * 几何 y=-1034）。
+	 *
+	 * 停泊期间 enter 集合和 pref_scale 都不动（各自留在停泊前一刻的值），
+	 * 回屏时 owner != surface_output / pref_scale != want 的补发路径自己
+	 * 会补一次。既断了 churn，也不破坏「停泊窗口钉住倍率不糊」的初衷 ——
+	 * 钉过的值原样保留，客户端不用重算缓冲。 */
+	if (view->scene_parked) {
+		return;
+	}
 	struct wlr_surface *surface = vidow_view_surface(view);
 	if (surface == NULL) {
 		return;
@@ -1000,8 +1019,10 @@ static void view_sync_drag_outputs(struct vidow_view *view,
 }
 
 static void view_sync_surface_outputs(struct vidow_view *view) {
-	if (view->popup || !view->mapped) {
-		return; /* 弹窗 / 还没上屏：各自由场景和自己的输出管 */
+	/* 停泊中的窗口同样冻结（见 view_pin_scale 的死亡现场注释）：不进不出、
+	 * 不重发倍率，回屏时自然走 owner != surface_output 的补发路径。 */
+	if (view->popup || !view->mapped || view->scene_parked) {
+		return; /* 弹窗 / 还没上屏 / 停泊中：各自由场景和自己的输出管 */
 	}
 	struct wlr_surface *surface = vidow_view_surface(view);
 	if (surface == NULL) {
