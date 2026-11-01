@@ -42,12 +42,22 @@ static void closing_update(void *data, double t, double linear) {
 	closing->fx.anim_scale = 1.0 + (closing->anim_scale_to - 1.0) * t;
 	closing->fx.progress = t;
 	/* 变的就是这张快照（滑下去 + 缩放），别整屏都算损伤 —— 关窗动画每帧都在动，
-	 * 整屏都算的话别人的底衬会跟着每帧重抓。 */
+	 * 整屏都算的话别人的底衬会跟着每帧重抓。
+	 *
+	 * 盒子要盖住**整段动画范围**：快照往下滑，底缘每帧新露出来的那条在原始盒
+	 * 外面；回弹把缩放顶过 1 时四周也会探出几像素。局部重抓（
+	 * region_update_rect 只补账本里有的盒子，账本每次重抓后就清空）补不到
+	 * 没记的那块 —— 别人底衬里这条带就停在「快照还没盖到」的上一版。 */
 	{
 		struct wlr_box box = {
 			.x = closing->x, .y = closing->y,
 			.width = closing->w, .height = closing->h,
 		};
+		int slack = closing->slide_px + 24;
+		box.x -= slack;
+		box.y -= slack;
+		box.width += 2 * slack;
+		box.height += 2 * slack;
 		vidow_backdrop_damage_region(closing->server, &box);
 	}
 

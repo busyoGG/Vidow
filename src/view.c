@@ -3043,11 +3043,29 @@ struct vidow_view *vidow_view_from_surface(struct vidow_server *server,
 static void view_move_update(void *data, double t, double linear) {
 	(void)linear;
 	struct vidow_view *view = data;
-	/* 滑动两端都算损伤：漏了老位置，别的窗口底衬里会留着它上一帧的残影。 */
-	struct wlr_box rest = view->geom;
 	/* 果冻还在收尾（松手之后那几百毫秒）：屏幕上画的是果冻节点，比窗口框
 	 * 大一圈 —— 损伤得按它算（见 jelly.c 的 vidow_jelly_pad）。 */
 	double rest_pad = vidow_jelly_pad(view) + 8.0;
+	/* **上一帧画着的位置先记一笔**（必须在更新 anim_off 之前取，那才是
+	 * 「上一帧」）。窗口这一帧从那里挪走 = 那一块的世界变了，别人 / 面板的
+	 * 底衬里画着它。
+	 *
+	 * 局部重抓（region_update_rect）只补**账本里有的**盒子，而账本每次重抓
+	 * 之后就地清空（view_region_build 的 dmg_clear）—— 不记这一笔，每帧让出
+	 * 的那一条在底衬里永远停在「窗口还在那儿」的上一版：窗口拖过的地方留下
+	 * 一串残影，模糊区域看着比窗口慢半拍。原来只记 {终点 geom, 当前位置}：
+	 * 两端有了，中间每一帧的「上一帧位置」漏了 —— 整块重抓的年代每次全量
+	 * 重画，这个洞不存在；按损伤局部重抓的优化让它显形。擦老位置是果冻
+	 * （jelly.c 的 screen_box）和拖拽（output.c 的 grab_last_box）都在做的
+	 * 事，位移补间是唯一漏掉的一条。 */
+	struct wlr_box was = view->geom;
+	was.x += (int)lround(view->anim_off_x) - (int)rest_pad;
+	was.y += (int)lround(view->anim_off_y) - (int)rest_pad;
+	was.width += 2 * (int)rest_pad;
+	was.height += 2 * (int)rest_pad;
+	vidow_backdrop_damage_box(view->server, &was);
+	/* 滑动两端都算损伤：漏了老位置，别的窗口底衬里会留着它上一帧的残影。 */
+	struct wlr_box rest = view->geom;
 	rest.x -= (int)rest_pad;
 	rest.y -= (int)rest_pad;
 	rest.width += 2 * (int)rest_pad;
@@ -3090,9 +3108,21 @@ static void view_open_update(void *data, double t, double linear) {
 	view->anim_scale = cfg->open_scale_from +
 		(1.0 - cfg->open_scale_from) * t;
 	view->fx.progress = t;
-	/* 开窗动画（缩放 + 滑入）：静止那一块（缩放 1、偏移 0）也算损伤。 */
+	/* 开窗动画（缩放 + 滑入）：静止那一块（缩放 1、偏移 0）也算损伤。
+	 *
+	 * 盒子要盖住**整段动画范围**：窗口从 open_slide_px 底下往上滑，每帧在下
+	 * 缘让出的那条在 geom 盒外面；回弹曲线把缩放顶过 1 时两侧也会探出几像素。
+	 * 漏了的话，局部重抓（region_update_rect 只补账本里有的盒子，而账本每次
+	 * 重抓后就清空）补不到那儿 —— 底衬里窗口的下缘停在上一帧的位置，模糊
+	 * 区域看着比窗口慢半拍。损伤盒放宽只是局部重抓的面积大一点，盖漏了就是
+	 * 残影。 */
 	{
 		struct wlr_box rest = view->geom;
+		int slack = (int)cfg->open_slide_px + 24;
+		rest.x -= slack;
+		rest.y -= slack;
+		rest.width += 2 * slack;
+		rest.height += 2 * slack;
 		vidow_backdrop_damage_box(view->server, &rest);
 	}
 	vidow_backdrop_damage_view(view); /* 只有它自己在动 */
