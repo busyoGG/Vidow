@@ -12,6 +12,12 @@
 
 /* X11/XWM 全链路追踪。 */
 bool vidow_xtrace_on(void);
+/* 光标链路的专属探针（文件 /tmp/vidow-cursor-trace 或环境变量
+ * VIDOW_CURSOR_TRACE）。和 X11 全量 trace 分开：那个开着的时候游戏里每次
+ * pointer motion 都写一行，复现「出去回来光标不重绘」这种几秒钟的事会被
+ * 淹掉。这个只记光标账本的进出（set_cursor 请求是否被收、fx 补画走了哪
+ * 一支、默认箭头什么时候盖上去）。 */
+bool vidow_cursor_trace_on(void);
 
 /* 拖拽跟手探针：位置这条链（grab -> place -> bake -> fx 摆节点）逐帧写进
  *     /tmp/vidow-grab-trace.log

@@ -42,6 +42,7 @@
 
 #include "json.h"
 #include "server.h"
+#include "xtrace.h"
 
 /* 摇晃判定：SHAKE_WINDOW_MS 里至少换向 SHAKE_FLIPS 次，每次换向前至少走
  * SHAKE_MIN_TRAVEL 个逻辑像素，**而且**从这一串摇晃的第一次换向起至少过了
@@ -794,14 +795,25 @@ void vidow_cursor_fx_entered(struct vidow_server *server,
 		return;
 	}
 	if (fx->x11_none) {
+		if (vidow_cursor_trace_on()) {
+			wlr_log(WLR_INFO, "cursor-fx: enter X11 表面 → 补「不画」");
+		}
 		forget_surface(fx);
 		wlr_cursor_set_surface(server->cursor, NULL, 0, 0);
 		return;
 	}
 	if (fx->x11_last_surface != NULL) {
+		if (vidow_cursor_trace_on()) {
+			wlr_log(WLR_INFO, "cursor-fx: enter X11 表面 → 补 X11 上次的光标 %p",
+				(void *)fx->x11_last_surface);
+		}
 		forget_surface(fx);
 		vidow_cursor_set_client_surface(server, fx->x11_last_surface,
 			fx->x11_last_hx, fx->x11_last_hy);
+		return;
+	}
+	if (vidow_cursor_trace_on()) {
+		wlr_log(WLR_INFO, "cursor-fx: enter X11 表面 → 账本空（不补画）");
 	}
 }
 
@@ -965,6 +977,10 @@ void vidow_cursor_fx_default_cursor(struct vidow_server *server) {
 			}
 			return;
 		}
+	}
+	if (fx != NULL && vidow_cursor_trace_on()) {
+		wlr_log(WLR_INFO, "cursor-fx: 指针底下没窗口 → 主题箭头（X11 账本留着："
+			"none=%d last=%p）", fx->x11_none, (void *)fx->x11_last_surface);
 	}
 	wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr,
 		fx_cursor_name(fx));

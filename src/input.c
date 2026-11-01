@@ -1978,6 +1978,11 @@ void vidow_pointer_motion(struct vidow_server *server, uint32_t time_msec) {
 			!hit->popup && surface != NULL &&
 			server->pointer_button_count == 0 && !warp_in_progress &&
 			server->seat->pointer_state.focused_surface != surface) {
+		/* 先补光标图、再 enter —— 和下面正常路径同一个顺序。Xwayland 收到
+		 * enter 会重发 set_cursor（Xwayland 24.1 的 pointer_handle_enter
+		 * 会 invalidate sprite），补画放后面就成了「先 enter、再拿旧账
+		 * 盖掉客户端刚发的新图」。 */
+		vidow_cursor_fx_entered(server, surface);
 		wlr_seat_pointer_notify_enter(server->seat, surface, sx, sy);
 		wlr_log(WLR_INFO, "指针焦点: 光标压到全屏窗口 %s 上，先抓一次指针焦点"
 			"（约束跟着激活）",
@@ -1985,7 +1990,20 @@ void vidow_pointer_motion(struct vidow_server *server, uint32_t time_msec) {
 	}
 
 	/* 约束跟着指针焦点走：指针底下的表面 == 约束那个表面才生效，移开就解除。 */
+	double ccx = server->cursor->x, ccy = server->cursor->y;
 	vidow_pointer_constraint_focus(server, surface);
+	if (server->cursor->x != ccx || server->cursor->y != ccy) {
+		/* **约束激活/解除按 cursor_hint 挪了光标。**
+		 *
+		 * wlr_cursor_warp 会同步回调到本函数（cursor_motion 监听），也就是
+		 * 上面那句里已经嵌套跑完了一整趟 motion：按新位置重算了命中、
+		 * enter、motion、光标补画。外层手里的 surface / sx / sy / hit 都是
+		 * 挪之前那次命中算的，再往下发就是「拿旧坐标给旧表面补一声 enter +
+		 * motion」—— 光标在 A 点、事件按 B 点发，回来那一下（约束重新激活
+		 * 会把光标摆回游戏的 hint 位置）最容易踩。收工，让嵌套那趟的结果
+		 * 说话。 */
+		return;
+	}
 
 	/* 焦点跟随光标（默认关）：压在哪个窗口上就聚焦哪个。放在命中测试之后、
 	 * 指针焦点通知之前 —— 悬停聚焦只动键盘焦点，指针焦点还是按老样子发给
@@ -2810,7 +2828,7 @@ static void server_request_cursor(struct wl_listener *listener, void *data) {
 	struct wlr_seat_pointer_request_set_cursor_event *event = data;
 
 	struct wlr_seat_client *focused = server->seat->pointer_state.focused_client;
-	if (vidow_xtrace_on()) {
+	if (vidow_cursor_trace_on()) {
 		wlr_log(WLR_INFO, "cursor-trace: set_cursor surface=%p %dx%d "
 			"hotspot=%d,%d focused=%p event_client=%p %s",
 			(void *)event->surface,

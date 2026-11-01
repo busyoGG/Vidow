@@ -42,6 +42,23 @@ bool vidow_xtrace_on(void) {
 	return cached;
 }
 
+/* 光标链路探针：同一套（环境变量或文件、按秒缓存）。 */
+bool vidow_cursor_trace_on(void) {
+	if (getenv("VIDOW_CURSOR_TRACE") != NULL) {
+		return true;
+	}
+	static bool cached = false;
+	static time_t checked = 0;
+	time_t now = time(NULL);
+	if (now == checked) {
+		return cached;
+	}
+	checked = now;
+	struct stat st;
+	cached = stat("/tmp/vidow-cursor-trace", &st) == 0;
+	return cached;
+}
+
 /* 拖拽跟手探针（见头文件里的说明）：单独一个文件，写完就落盘。 */
 void vidow_gtrace(const char *fmt, ...) {
 	FILE *f = fopen("/tmp/vidow-grab-trace.log", "a");
