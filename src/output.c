@@ -380,9 +380,9 @@ void vidow_output_render(struct vidow_output *output) {
 	 * 不能用 wlr_scene_output_commit() —— 它内部建完 state 就直接提交了，没有
 	 * 插队的地方。另外它「没有损伤」时直接返回，而改 LUT 时画面可以一点没脏，
 	 * 所以上面先 schedule 一帧。 */
-	/* 改 LUT 或切换 HDR 状态时画面可以一点没脏，「没有损伤就不出帧」会把变更吞掉 ——
+	/* 改 LUT 时画面可以一点没脏，「没有损伤就不出帧」会把变更吞掉 ——
 	 * 所以改过之后主动要一帧（只一次，不是每帧：否则设了就永远满帧空转）。 */
-	if ((output->gamma_lut_dirty || output->hdr_metadata_dirty) &&
+	if (output->gamma_lut_dirty &&
 			!wlr_scene_output_needs_frame(output->scene_output)) {
 		wlr_output_schedule_frame(output->wlr_output);
 	}
@@ -437,41 +437,14 @@ void vidow_output_render(struct vidow_output *output) {
 			if (output->gamma_lut_dirty) {
 				output_color_apply(output, &state);
 			}
-			/* HDR 模式与元数据向 KMS 下发（只对 DRM 后端下发，切换时下发一次） */
-			if (output->hdr_metadata_dirty) {
-				if (wlr_output_is_drm(output->wlr_output)) {
-					if (output->hdr) {
-						static const struct wlr_output_image_description desc = {
-							.primaries = WLR_COLOR_NAMED_PRIMARIES_BT2020,
-							.transfer_function = WLR_COLOR_TRANSFER_FUNCTION_ST2084_PQ,
-							.mastering_display_primaries = {
-								.red = { 0.708, 0.292 },
-								.green = { 0.170, 0.797 },
-								.blue = { 0.131, 0.046 },
-								.white = { 0.3127, 0.3290 },
-							},
-							.mastering_luminance = {
-								.min = 0.0001,
-								.max = 1000.0,
-							},
-							.max_cll = 1000.0,
-							.max_fall = 400.0,
-						};
-						wlr_output_state_set_image_description(&state, &desc);
-					} else {
-						wlr_output_state_set_image_description(&state, NULL);
-					}
-				}
-			}
 			if (post_failed) {
 				wlr_log(WLR_ERROR, "color: %s 后处理失败，丢掉这一帧",
 					output->wlr_output->name);
 			} else if (!wlr_output_commit_state(output->wlr_output, &state)) {
-				wlr_log(WLR_DEBUG, "output %s: 提交失败（含校色 LUT / HDR）",
+				wlr_log(WLR_DEBUG, "output %s: 提交失败（含校色 LUT）",
 					output->wlr_output->name);
 			} else {
 				output->gamma_lut_dirty = false;
-				output->hdr_metadata_dirty = false;
 			}
 		}
 		wlr_output_state_finish(&state);
@@ -2442,7 +2415,55 @@ static bool output_post_blit(struct vidow_output *output,
 }
 
 /* 打开 / 关掉这块屏的输出端 HDR。重复调用幂等；开的时候加一把 attach_render
- * 锁（禁 direct scanout），关的时候放掉，成对平衡。 */
+ * 锁（禁 direct scanout），关的时候放掉，成对平衡。
+ *
+ * 切换 HDR 时同时向 KMS 下发 image_description（Colorspace=BT2020_RGB +
+ * ST2084 PQ 元数据）。必须单独提交一次（和 gamma_apply 一样，带 allow_reconfiguration
+ * 模式重设），不能塞进常规帧渲染提交：常规页面翻转（page flip）不带 MODESET 标志，
+ * 内核 amdgpu 会直接返回 EINVAL（Atomic commit failed: Invalid argument）。 */
+static void output_hdr_metadata_apply(struct vidow_output *output) {
+	struct wlr_output *wlr_output = output->wlr_output;
+	if (!wlr_output->enabled || !wlr_output_is_drm(wlr_output)) {
+		output->hdr_metadata_dirty = false;
+		return;
+	}
+	struct wlr_output_state state;
+	wlr_output_state_init(&state);
+	if (output->hdr) {
+		static const struct wlr_output_image_description desc = {
+			.primaries = WLR_COLOR_NAMED_PRIMARIES_BT2020,
+			.transfer_function = WLR_COLOR_TRANSFER_FUNCTION_ST2084_PQ,
+			.mastering_display_primaries = {
+				.red = { 0.708, 0.292 },
+				.green = { 0.170, 0.797 },
+				.blue = { 0.131, 0.046 },
+				.white = { 0.3127, 0.3290 },
+			},
+			.mastering_luminance = {
+				.min = 0.0001,
+				.max = 1000.0,
+			},
+			.max_cll = 1000.0,
+			.max_fall = 400.0,
+		};
+		wlr_output_state_set_image_description(&state, &desc);
+	} else {
+		wlr_output_state_set_image_description(&state, NULL);
+	}
+	/* 带模式构成 modeset，允许内核重训或修改 Colorspace / HDR 元数据 */
+	output_state_add_mode(output->server, wlr_output, &state);
+	bool ok = wlr_output_commit_state(wlr_output, &state);
+	wlr_output_state_finish(&state);
+	output->hdr_metadata_dirty = !ok;
+	if (ok) {
+		wlr_log(WLR_INFO, "color: %s HDR 元数据下发成功（Colorspace=%s）",
+			wlr_output->name, output->hdr ? "BT2020_RGB" : "Default");
+	} else {
+		wlr_log(WLR_ERROR, "color: %s KMS 拒绝接受 HDR 元数据（modeset 失败）",
+			wlr_output->name);
+	}
+}
+
 static void output_set_hdr(struct vidow_output *output, bool on) {
 	if (output->hdr == on) {
 		return;
@@ -2459,6 +2480,7 @@ static void output_set_hdr(struct vidow_output *output, bool on) {
 		wlr_log(WLR_INFO, "color: %s 输出端 HDR 关（回到直通路径）",
 			output->wlr_output->name);
 	}
+	output_hdr_metadata_apply(output);
 	wlr_output_schedule_frame(output->wlr_output);
 }
 
