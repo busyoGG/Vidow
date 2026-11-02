@@ -125,6 +125,21 @@ struct vidow_x11_server {
 	/* 我们自己创建的辅助窗口：_NET_SUPPORTING_WM_CHECK 指向它。 */
 	xcb_window_t wm_window;
 
+	/* XSETTINGS（_XSETTINGS_S0）的属主窗口与上次发布的值。
+	 *
+	 * 为什么合成器自己发布：GTK3 的 X11 后端**不**从 Xft.dpi 推窗口倍率
+	 * （只把它当字体 DPI），它听 XSETTINGS 的 Gdk/WindowScalingFactor。没有
+	 * XSETTINGS 属主时 GTK 按 1 倍画，vidow 又按输出的 native:logical 除 2
+	 * —— 窗口内容在屏上只剩一半（2x 屏上是四分之一面积）。KDE 的 kded6
+	 * 会通过 DBus 激活 xsettingsd，用 kwinrc 里那份过期的 Scale=1 把
+	 * Gdk/WindowScalingFactor 写成 1，正好把这半缩落实。见 xsettings_publish。
+	 *
+	 * xsettings_scale 是最近一次发布的倍率；被别的程序抢走选区
+	 * （SelectionClear）时按它重新发一份，见 x11_handle_selection_clear。 */
+	xcb_window_t xsettings_xid;
+	int xsettings_scale;
+	uint32_t xsettings_serial;
+
 	/* 给 root 设的光标，以及做它用的 32 位 ARGB render format。 */
 	xcb_cursor_t cursor_xid;
 	xcb_render_pictformat_t render_format_id;
@@ -171,6 +186,10 @@ struct vidow_x11_server {
 		/* 声明「我是 X 合成器」。别的客户端（截图、录屏、DRI3 探测）靠它
 		 * 判断有没有合成器在跑。 */
 		xcb_atom_t net_wm_cm_s0;
+		/* XSETTINGS 协议：选区 / 属性 / 通知消息。 */
+		xcb_atom_t xsettings_s0;
+		xcb_atom_t xsettings_settings;
+		xcb_atom_t manager;
 	} atoms;
 
 	/* 所有活着的 X11 窗口。 */
@@ -271,6 +290,14 @@ void vidow_x11_surface_set_minimized(struct vidow_x11_surface *s, bool on);
 /* 给 X 的根窗口设光标（RGBA 像素，stride 是每行字节数）。 */
 void vidow_x11_set_cursor(const unsigned char *pixels, uint32_t stride,
 	int width, int height, int hotspot_x, int hotspot_y);
+
+/* 发布 XSETTINGS（Gdk/WindowScalingFactor = scale，其余设置照抄当前属主）。
+ *
+ * Xft.dpi 只覆盖「字体密度」和 Chromium/CEF；GTK3 的窗口倍率听 XSETTINGS。
+ * 合成器既然定了 X 世界的密度（xwayland_scale），就得自己当这个属主，
+ * 否则任何后起的 xsettingsd（KDE 的 kded6 就会）都能用一份过期配置把
+ * 所有 X11 窗口缩成一半。 */
+void vidow_x11_xsettings_update(struct vidow_x11_server *x11, int scale);
 
 /* 当前那份 X 连接（剪贴板桥、缩放探测用）。没有 X 时返回 NULL。 */
 xcb_connection_t *vidow_x11_connection(void);

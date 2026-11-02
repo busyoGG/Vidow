@@ -268,6 +268,14 @@ static void x11_apply_scale_props(struct vidow_server *server) {
 	 * global output-scale property would multiply them again and change
 	 * surface buffer_scale (breaking 1x1 helper surfaces), so never set it. */
 	x11_set_xft_dpi(conn, (int)(scale * 96));
+
+	/* **XSETTINGS 也要跟着写。**
+	 *
+	 * Xft.dpi 只够 Chromium/CEF（它直接读 X 资源）和字体密度；GTK3 的
+	 * X11 后端用 XSETTINGS 的 Gdk/WindowScalingFactor 决定窗口倍率，没有
+	 * 属主就当 1 倍 —— 而 vidow 把 X 缓冲除 2，内容只剩一半。详见
+	 * xwm_x11.c 的 xsettings 段。 */
+	vidow_x11_xsettings_update(server->xwm, scale);
 }
 
 /* Xwayland handles xdg-output asynchronously. Bound the root-size probe

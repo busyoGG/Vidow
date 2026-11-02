@@ -547,6 +547,13 @@ executable('xgrab',
   dependencies: [xcb_dep],
   install: false)
 
+# 测试工具：读 XSETTINGS（Gdk/WindowScalingFactor）。X11 的窗口倍率只认它，
+# Xft.dpi 只够字体 / Chromium；没有属主时 GTK3 按 1 倍画（内容半缩）。
+executable('xsettingsget',
+  ['tools/xsettingsget.c'],
+  dependencies: [xcb_dep],
+  install: false)
+
 # 测试工具：指针约束客户端（锁鼠标 / 夹光标 + 相对位移）
 pc_xml = 'protocols/pointer-constraints-unstable-v1.xml'
 pc_header = custom_target('pointer-constraints-unstable-v1-client-protocol.h',

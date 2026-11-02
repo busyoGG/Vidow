@@ -40,12 +40,14 @@ CFGDIR="$RUNDIR/home"
 FAILED=0
 VIDOW_PGID=""
 XEV_PID=""
+XS_PID=""
 
 pass() { echo "  PASS  $1"; }
 mark() { echo; echo "== $1 =="; }
 
 cleanup() {
 	[ -n "$XEV_PID" ] && kill "$XEV_PID" 2>/dev/null
+	[ -n "$XS_PID" ] && kill "$XS_PID" 2>/dev/null
 	if [ -n "$VIDOW_PGID" ]; then
 		kill -TERM -- "-$VIDOW_PGID" 2>/dev/null
 		sleep 0.4
@@ -98,7 +100,57 @@ done
 xenv "启动后" > "$RUNDIR/xenv-start.txt" 2>&1
 cat "$RUNDIR/xenv-start.txt"
 
-# 端到端：xev 的窗口（平铺）点一下，看它收到的 root 坐标
+# XSETTINGS：GTK3 的窗口倍率只认 Gdk/WindowScalingFactor，不看 Xft.dpi。
+# 没有属主时 GTK 按 1 倍画，vidow 又按 native:logical 除 2 → 内容半缩。
+# 2026-11-02 的现场就是 KDE 的 kded6 后来拉了个 xsettingsd，用 kwinrc 的
+# Scale=1 把倍率盖成 1。这里两条都验：自己发布、被抢之后抢回来。
+mark "1c) XSETTINGS：Gdk/WindowScalingFactor = 2，且被 xsettingsd 抢走后能抢回来"
+for _ in $(seq 1 40); do
+	[ "$(./build/xsettingsget 2>/dev/null)" = "2" ] && break
+	sleep 0.1
+done
+XSVAL=$(./build/xsettingsget 2>/dev/null)
+if [ "$XSVAL" = "2" ]; then
+	pass "启动后 XSETTINGS 的 Gdk/WindowScalingFactor = 2"
+else
+	echo "  FAIL  启动后 XSETTINGS 的 Gdk/WindowScalingFactor = ${XSVAL:-（没有属主）}" >&2
+	FAILED=1
+fi
+
+XS_PID=""
+if command -v xsettingsd >/dev/null; then
+	cat > "$RUNDIR/xs.conf" <<'XS'
+Gdk/WindowScalingFactor 1
+Net/ThemeName "kde-stale"
+XS
+	DISPLAY=$DISPLAY setsid xsettingsd -c "$RUNDIR/xs.conf" \
+		> "$RUNDIR/xs.log" 2>&1 < /dev/null &
+	XS_PID=$!
+	sleep 0.8
+	XSVAL=$(./build/xsettingsget 2>/dev/null)
+	XSTHEME=$(./build/xsettingsget Net/ThemeName 2>/dev/null)
+	kill "$XS_PID" 2>/dev/null
+	wait "$XS_PID" 2>/dev/null
+	XS_PID=""
+	if [ "$XSVAL" = "2" ]; then
+		pass "xsettingsd 抢走 _XSETTINGS_S0 之后 vidow 按 2 倍抢回来了"
+	else
+		echo "  FAIL  xsettingsd 抢走之后倍率变成 ${XSVAL:-（没有属主）}" >&2
+		FAILED=1
+	fi
+	if [ "$XSTHEME" = '"kde-stale"' ]; then
+		pass "抢回来时把对方的主题设置抄了过来（Net/ThemeName = kde-stale）"
+	else
+		echo "  FAIL  抢回来时丢了对方的设置（Net/ThemeName = ${XSTHEME:-空}）" >&2
+		FAILED=1
+	fi
+	grep -aq "xsettings: _XSETTINGS_S0 被别的程序抢走" "$RUNDIR/vidow.log" &&
+		pass "日志里说了选区被抢、按 2 倍重新发布" ||
+		{ echo "  FAIL  日志里没有「被抢走」那条" >&2; FAILED=1; }
+else
+	echo "  SKIP  没装 xsettingsd，只验了自建属主那条"
+fi
+
 mark "1) 端到端：点窗口里的一个点，X 客户端收到的坐标 = 布局坐标 × 2"
 setsid nohup xev -name xevhidi > "$RUNDIR/xev.log" 2>&1 &
 XEV_PID=$!

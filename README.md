@@ -5591,8 +5591,27 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
      - 未做：niri 的 `fixed 1920`（固定像素档）、`preset-window-heights`、`default-column-width {}`（让客户端自己定宽）、
        `always-center-single-column`；窗口规则级的 per-rule 预设覆盖。
 
+293. **合成器自己发布 XSETTINGS：GTK3 的窗口倍率不再被 KDE 的 xsettingsd 缩成一半**（用户：「X11 窗口内容变成 1/2，2 倍屏上只剩 1/4 面积」；2026-11-02）
+      - **根因**：GTK3 的 X11 后端**不看** `Xft.dpi` 推窗口倍率（只把它当字体 DPI），窗口倍率听 XSETTINGS 的 `Gdk/WindowScalingFactor`。
+        vidow 以前只往 root 写 `Xft.dpi = S×96`，没有 XSETTINGS 属主 → GTK 按 1 倍画，vidow 又按 `native:logical` 把 X 缓冲除 2
+        —— 内容在屏上只剩一半（2 倍屏上面积剩 1/4）。更糟的是 KDE 的 `kded6` 会在第一次启动 KDE 程序时被 DBus 激活，拉起
+        `xsettingsd`，按 `~/.config/xsettingsd/xsettingsd.conf`（KDE 从 `kwinrc [Xwayland] Scale=1` 生成）把 `Gdk/WindowScalingFactor`
+        显式写成 1，正好把这半缩落实。现场（20:54 打开 Dolphin → kded6）：Chromium 的 `devicePixelRatio` 从 2 掉到 **1**；停掉
+        `xsettingsd` 立刻回到 2（A/B 实测，Steam CEF 同引擎）。
+      - **修法**：vidow 自己当 XSETTINGS 属主，而不是只改 KDE 配置。启动（以及 `xwayland_scale` 变化）时建一个 override-redirect
+        窗口，把现有属主那份设置**原样抄过来**（主题 / 字体 / 光标 / 提示音），只覆盖 `Gdk/WindowScalingFactor = xwayland_scale`，
+        挂上 `_XSETTINGS_S0` 选区并向 root 发 `MANAGER`。被别的属主抢走（`SelectionClear`）时按记住的倍率**重新发布**并再抄一次
+        对方的设置；`xsettingsd` 丢了选区会自己退出，不会来回拉锯。`Xft.dpi` 保留（Chromium/CEF 和字体密度仍走它）。
+      - 判据：`test-xwayland-hidpi.sh` 1c —— 启动后 `Gdk/WindowScalingFactor = 2`；临时起一个写 1 的 `xsettingsd` 抢走选区后
+        vidow 抢回 2，且 `Net/ThemeName` 等对方设置在；日志有「被别的程序抢走 → 按 2 倍重新发布」。GTK3 实测监视器 640x360、
+        scale 2。`tools/xsettingsget.c`（`build/xsettingsget [名字] / --owner`）能直接读当前值。
+      - 落点：`src/xwm_x11.c`（XSETTINGS 线格式编解码 / 发布 / `SelectionClear`）、`src/xwayland.c`（`x11_apply_scale_props`
+        里调 `vidow_x11_xsettings_update`）、`src/x11surface.h`、`tools/xsettingsget.c`、`test-xwayland-hidpi.sh`。
+      - 备注：KDE 下次会话仍会拉起 `xsettingsd`（读 `kwinrc` 的 `Scale=1`），现在 vidow 会抢回；要彻底不打架可以把 `kwinrc` 的
+        `Scale` 改成 2 或关掉 kded 的 gtkconfig，但无论改不改，vidow 的倍率都以 `xwayland_scale` 为准。
+
 292. **Steam 窗口偏低 + 顶部一条黑带：map 前那条 echo configure 的位置归零**（用户：「Steam 窗口内容偏低，顶部一条黑带」；2026-11-01）
-     - **根因**：Steam（CEF）把 init 期收到的**第一条 configure 的 x/y** 当成自己 frame 子窗口（标题栏那层，`0x22xxxxx`）的**父内相对
+      - **根因**：Steam（CEF）把 init 期收到的**第一条 configure 的 x/y** 当成自己 frame 子窗口（标题栏那层，`0x22xxxxx`）的**父内相对
        偏移**写死，之后挪窗 / 换屏 / 改尺寸都不更新。`5509e3d` 加的 map 前 echo 回的是创建坐标（Steam 的 `USPosition`，当天是 `16,92`）
        —— 相对偏移恰好等于窗口的绝对坐标，叠出来就是「标题栏低 46 逻辑像素 + 顶部露一条黑带」，黑带高度永远等于首摆位置 y。
      - **修法**：这条 echo 只为破「客户端等 configure 才 XMapWindow → 不 map 就没 surface → 没 surface 就进不了布局」的死锁，尺寸照
