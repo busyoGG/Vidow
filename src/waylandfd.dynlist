@@ -1,0 +1,7 @@
+{
+  /* 只把 sendmsg 放进 vidow 的动态符号表：libwayland-server.so 里的
+   * sendmsg@plt 会先找到可执行文件里的这个定义（见 src/waylandfd.c）。
+   * 千万别改成 -Wl,--export-dynamic —— 那会把 vidow 自己的所有全局符号
+   * 都泄出去，和 libc / 库里的同名符号抢解析。 */
+  sendmsg;
+};

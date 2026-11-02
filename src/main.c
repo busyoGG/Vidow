@@ -790,6 +790,36 @@ int main(int argc, char *argv[]) {
 		return 1;
 	}
 
+	/* 每个客户端那条发送缓冲区（socket 写不出去时先攒在这儿）的上限。
+	 *
+	 * libwayland 的默认是 **4096 字节**（wayland-private.h 的
+	 * WL_BUFFER_DEFAULT_MAX_SIZE）。缓冲区满了以后，下一条事件进不去，
+	 * wl_connection_queue() 直接返回 -1(E2BIG)，libwayland 只打一行
+	 * "Data too big for buffer (4088 + 20 > 4096)." 就把这个客户端
+	 * **整条连接踢掉** —— 客户端那边看到的是 ECONNRESET（Linux 报
+	 * "连接被对方重置"），Chrome/Electron 系会当成致命 Wayland 错误，
+	 * 干净退出（Element 就是这样：exit code 0、没有 core、还写了
+	 * window-state.json）。
+	 *
+	 * 什么时候会满：客户端一时没读 socket（主线程忙、GC、加载页面），
+	 * 而合成器这边还在发东西 —— 指针 motion（144Hz 下每秒几 KB）、
+	 * frame_done、text-input、剪贴板…… 几毫秒就够撑满 4KB。
+	 * 这不是协议里该断连的情形，是缓冲区太小。
+	 *
+	 * Hyprland 和 niri 都显式把默认值抬到 1MB
+	 * （Hyprland: wl_display_set_default_max_buffer_size(display, 1_MB)；
+	 * niri: 同样 1024*1024）。vidow 以前没设，于是就是 4096 ——
+	 * 会话日志里 2026-11-02 00:04:40 那条 "Data too big for buffer
+	 * (4088 + 20 > 4096)" 和 00:07:16 的 "error in client
+	 * communication"，根子都在这儿。 */
+#if defined(WAYLAND_VERSION_MAJOR) && \
+	(WAYLAND_VERSION_MAJOR > 1 || \
+	 (WAYLAND_VERSION_MAJOR == 1 && WAYLAND_VERSION_MINOR >= 23))
+	wl_display_set_default_max_buffer_size(server.display, 1024 * 1024);
+#else
+#warning "libwayland < 1.23：客户端发送缓冲区仍是 4096，慢客户端会被误杀"
+#endif
+
 	/* 要会话指针（真机 tty 上 wlroots 会建一个，嵌套 / headless 是 NULL）：
 	 * 切 VT 的键位要用它调 wlr_session_change_vt，不活动 / 回来也要有事件可听。 */
 	server.backend = wlr_backend_autocreate(

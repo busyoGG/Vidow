@@ -165,6 +165,7 @@ xkg_server_code = custom_target('xwayland-keyboard-grab-unstable-v1-protocol.c',
 
 sources = files(
   'src/main.c',
+  'src/waylandfd.c',
   'src/output.c',
   'src/color.c',
   'src/outputconf.c',
@@ -407,6 +408,14 @@ executable('geowin',
   include_directories: include_directories('.'),
   install: false)
 
+# 测试工具：主线程长时间不读 socket，验证合成器不会因为「客户端发送缓冲区」
+# 满了就把连接踢掉（libwayland 默认只有 4096 字节，见 src/main.c 的说明）
+executable('stalltest',
+  ['tools/stalltest.c', xs_header, xs_code],
+  dependencies: [wayland_client_dep],
+  include_directories: include_directories('.'),
+  install: false)
+
 executable('bgblur',
   ['tools/bgblur.c', xs_header, xs_code, bge_client_header, bgeffect_code],
   dependencies: [wayland_client_dep],
@@ -623,6 +632,25 @@ executable('keyinhibit',
   include_directories: include_directories('.'),
   install: false)
 
+# 测试工具：带自定义 keymap 的虚拟键盘 —— 用来复现「Ctrl+Alt+F2 解成
+# XF86Switch_VT_2 而不是 F2」这条真实按键路径（wtype 的 keymap 里没有
+# srvr_ctrl(fkey2vt)，解出来是 F2，量不到这个 bug）。
+vk_xml = 'protocols/virtual-keyboard-unstable-v1.xml'
+vk_header = custom_target('virtual-keyboard-unstable-v1-client-protocol.h',
+  input: vk_xml,
+  output: 'virtual-keyboard-unstable-v1-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'])
+vk_code = custom_target('virtual-keyboard-unstable-v1-protocol.c',
+  input: vk_xml,
+  output: 'virtual-keyboard-unstable-v1-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
+
+executable('vtkeysym',
+  ['tools/vtkeysym.c', vk_header, vk_code],
+  dependencies: [wayland_client_dep, xkbcommon_dep],
+  include_directories: include_directories('.'),
+  install: false)
+
 # 测试工具：X11 的键盘抓取（Xwayland 会把它变成 zwp_xwayland_keyboard_grab_v1）
 executable('xkeygrab',
   ['tools/xkeygrab.c'],
@@ -644,6 +672,10 @@ executable('vidow',
                  drm_dep, pipewire_dep,
                  libinput_dep],
   include_directories: include_directories('.'),
+  # src/waylandfd.c 拦截 sendmsg：只有这个符号要进动态符号表，好让
+  # libwayland-server.so 里的 sendmsg@plt 绑到我们这份（见该文件头注释）。
+  link_args: ['-Wl,--dynamic-list=' + meson.current_source_dir() +
+              '/src/waylandfd.dynlist'],
   install: false)
 
 # 示例 shader 装到 ~/.config/vidow/shaders/

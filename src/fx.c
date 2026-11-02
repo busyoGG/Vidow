@@ -2182,13 +2182,31 @@ static bool view_region_build(struct vidow_server *server,
 		ph = py2 - py;
 	}
 
+	/* 夹取用**这块屏自己**的视野，不是 server->output_w/h。
+	 *
+	 * server->output_w/h 是「最后渲染的那块屏」留下的全局量（见 output.c 里
+	 * 那两行的说明）。两块屏布局框不一样大、或者倍率不同的时候，按它夹会在
+	 * 区域边上多出一截屏外的像素：抓不到东西、链条在那一条上混进透明，屏幕上
+	 * 就是「底衬边上一条空的」。
+	 *
+	 * 单屏也要按这块屏算：这块屏的帧还没渲染之前，server->output_w/h 还是
+	 * 上一次的值（开机第一帧是 0），那一次的区域会被判成「整块在屏外」。 */
+	int my_w = output->wlr_output->width;
+	int my_h = output->wlr_output->height;
+	if (my_w <= 0 || my_h <= 0) {
+		struct wlr_box ob = {0};
+		wlr_output_layout_get_box(server->output_layout,
+			output->wlr_output, &ob);
+		my_w = ob.width;
+		my_h = ob.height;
+	}
 	int x1 = rx < 0 ? 0 : rx, y1 = ry < 0 ? 0 : ry;
 	int x2 = rx + rw, y2 = ry + rh;
-	if (x2 > server->output_w) {
-		x2 = server->output_w;
+	if (x2 > my_w) {
+		x2 = my_w;
 	}
-	if (y2 > server->output_h) {
-		y2 = server->output_h;
+	if (y2 > my_h) {
+		y2 = my_h;
 	}
 	if (x2 <= x1 || y2 <= y1) {
 		return false; /* 整块在屏外，没东西可抓 */

@@ -712,7 +712,25 @@ bool vidow_keybind_key(struct vidow_server *server, xkb_keysym_t sym,
 	 * 这类绑定会把 F1..F12 一起吃掉（用户配置里那条 fit-expand 就是）。
 	 * 放在最前面先判掉，配置里怎么写都不影响逃生口。
 	 *
-	 * 锁定期间也认（锁屏界面切不走 tty 同样说不过去），所以排在 locked 之前。 */
+	 * 锁定期间也认（锁屏界面切不走 tty 同样说不过去），所以排在 locked 之前。
+	 *
+	 * **两个 keysym 都要认**：默认 keymap 里 Ctrl+Alt+Fn 被
+	 * srvr_ctrl(fkey2vt) 换成 XF86Switch_VT_n，普通 Fn 根本不会出现 ——
+	 * 2026-11-03 实测日志：
+	 *     KEYPROBE evdev=60 down sym0=0x1008FE02(XF86Switch_VT_2) mods=0xC
+	 * 以前这里只认 XKB_KEY_F1..F12，于是这条逃生口一直是死的（用户报
+	 * 「怎么还是不能切换 tty」，整个会话没有任何 VT 日志）。sway / Hyprland
+	 * 也是直接挂 XF86Switch_VT_n 这几个 symbol 的。
+	 *
+	 * XF86Switch_VT_n 不带修饰位判断：这个 keysym 只会由那条规则产生，
+	 * 能收到它就是用户按了 Ctrl+Alt+Fn。 */
+	if (sym >= XKB_KEY_XF86Switch_VT_1 && sym <= XKB_KEY_XF86Switch_VT_12) {
+		if (pressed) {
+			vidow_vt_switch(server,
+				(unsigned)(sym - XKB_KEY_XF86Switch_VT_1 + 1));
+		}
+		return true;
+	}
 	if ((mods & INTERESTING_MODS) ==
 			(WLR_MODIFIER_CTRL | WLR_MODIFIER_ALT) &&
 			sym >= XKB_KEY_F1 && sym <= XKB_KEY_F12) {
@@ -1009,9 +1027,14 @@ static void log_action(const char *action, const char *what) {
  * 在会话不活动时 wlr_output_destroy 每一块屏）、输入设备挂起。所以只能在没有别人
  * 的事件处理栈上做 —— 见下面的 vt_switch_idle。 */
 static bool vt_switch_now(struct vidow_server *server, unsigned vt) {
+	if (server->session == NULL) {
+		wlr_log(WLR_ERROR, "VT: 没有会话（嵌套 / headless），切不了 tty");
+		return false;
+	}
 	wlr_log(WLR_INFO, "VT: 切到 %u 号 tty", vt);
 	if (!wlr_session_change_vt(server->session, vt)) {
-		wlr_log(WLR_ERROR, "VT: 切到 %u 号 tty 失败", vt);
+		wlr_log(WLR_ERROR, "VT: 切到 %u 号 tty 失败（libseat_switch_session 返回非 0）",
+			vt);
 		return false;
 	}
 	return true;
@@ -1043,7 +1066,9 @@ static void vt_switch_idle(void *data) {
  * （libseat 没有「现在在哪块 tty」的接口，所以不做「已经在目标 tty 上」的去重。） */
 bool vidow_vt_switch(struct vidow_server *server, unsigned vt) {
 	if (server->session == NULL) {
-		wlr_log(WLR_DEBUG, "VT: 没有会话（嵌套 / headless），切 VT 交给宿主");
+		/* INFO 而不是 DEBUG：嵌套 / headless 下按 Ctrl+Alt+F2，用户看到
+		 * 「没反应」，至少日志里得说清楚是「没有会话」，不是逃生口坏了。 */
+		wlr_log(WLR_INFO, "VT: 没有会话（嵌套 / headless），切 VT 交给宿主");
 		return false;
 	}
 	if (vt < 1 || vt > 12) {

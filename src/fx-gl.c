@@ -275,7 +275,17 @@ static const char *decor_fragment_src =
 	"	if (a <= 0.0) {\n"
 	"		return vec3(0.0);\n"
 	"	}\n"
-	"	return vidow_tf_decode(rgb / a, tf) * a;\n"
+	/* 预乘缓冲的合法写法是 rgb ≤ a（rgb = a * encode(c)）。rgb / a > 1 说明那个
+	 * 像素的 alpha 和色值**不自洽** —— 底衬是上一版留下的、边缘抗锯齿把 alpha
+	 * 乘掉了、局部重跑没覆盖到……这一格的值本身就没有意义。不夹的话，1/255 的
+	 * alpha 配一个 1.0 的色值就是 rgb/a = 255，解码再编码回来仍然是一个刺眼的
+	 * 亮斑（实测拖拽中整块变纯白）。非线性传输函数的值域就是 0..1，越界即错，
+	 * 夹住只是把错误限制在「最多到这个像素的 alpha 允许的亮度」。 */
+	"	vec3 c = rgb / a;\n"
+	"	if (tf > 0.5) {\n"
+	"		c = clamp(c, 0.0, 1.0);\n"
+	"	}\n"
+	"	return vidow_tf_decode(c, tf) * a;\n"
 	"}\n"
 	"\n"
 	"float sd_round_box(vec2 p, vec2 half_size, float r, float n) {\n"
@@ -410,7 +420,16 @@ static const char *decor_fragment_src =
 	"	out_px = border + out_px * (1.0 - border.a);\n"
 	"	if (u_linear > 0.5) {\n"
 	"		float a = clamp(out_px.a, 0.0, 1.0);\n"
-	"		out_px = a > 0.0 ? vec4(vidow_tf_encode(out_px.rgb / a, u_dst_tf) * a, a)\n"
+	/* 和 vidow_decode_premul 同一条道理，反过来：合成完的 rgb / a 也可能越界
+	 * （内容、底衬、投影各自解码后相加，任何一路不自洽都会顶出去）。 */
+	"		vec3 c = vec3(0.0);\n"
+	"		if (a > 0.0) {\n"
+	"			c = out_px.rgb / a;\n"
+	"			if (u_dst_tf > 0.5) {\n"
+	"				c = clamp(c, 0.0, 1.0);\n"
+	"			}\n"
+	"		}\n"
+	"		out_px = a > 0.0 ? vec4(vidow_tf_encode(c, u_dst_tf) * a, a)\n"
 	"			: vec4(0.0);\n"
 	"	}\n"
 	"	gl_FragColor = out_px * u_alpha;\n"
@@ -473,8 +492,8 @@ static const char *kawase_prefix =
 	/* 预乘编码值 → 预乘线性值（除 alpha 再解码，不能直接解码预乘值）。 */
 	"vec4 k_tap_decode(vec4 c, float weight) {\n"
 	"	if (u_linear > 0.5) {\n"
-	"		vec3 lin = c.a > 0.0 ? k_tf_decode(c.rgb / c.a, u_tf) * c.a\n"
-	"			: vec3(0.0);\n"
+	"		vec3 ratio = c.a > 0.0 ? clamp(c.rgb / c.a, 0.0, 1.0) : vec3(0.0);\n"
+	"		vec3 lin = k_tf_decode(ratio, u_tf) * c.a;\n"
 	"		return vec4(lin, c.a) * weight;\n"
 	"	}\n"
 	"	return c * weight;\n"
@@ -506,7 +525,8 @@ static const char *kawase_down_src =
 	"	vec4 res = sum / 8.0;\n"
 	"	if (u_linear > 0.5) {\n"
 	"		float a = clamp(res.a, 0.0, 1.0);\n"
-	"		res = a > 0.0 ? vec4(k_tf_encode(res.rgb / a, u_tf) * a, a)\n"
+	"		res = a > 0.0 ? vec4(k_tf_encode(clamp(res.rgb / a, 0.0, 1.0),\n"
+	"			u_tf) * a, a)\n"
 	"			: vec4(0.0);\n"
 	"	}\n"
 	"	gl_FragColor = res;\n"
@@ -534,7 +554,8 @@ static const char *kawase_up_src =
 	"	vec4 res = sum / 12.0;\n"
 	"	if (u_linear > 0.5) {\n"
 	"		float a = clamp(res.a, 0.0, 1.0);\n"
-	"		res = a > 0.0 ? vec4(k_tf_encode(res.rgb / a, u_tf) * a, a)\n"
+	"		res = a > 0.0 ? vec4(k_tf_encode(clamp(res.rgb / a, 0.0, 1.0),\n"
+	"			u_tf) * a, a)\n"
 	"			: vec4(0.0);\n"
 	"	}\n"
 	"	gl_FragColor = res;\n"
@@ -637,7 +658,10 @@ static const char *mesh_blur_fragment_src =
 	"	if (a <= 0.0) {\n"
 	"		return vec3(0.0);\n"
 	"	}\n"
-	"	return mesh_tf_decode(rgb / a) * a;\n"
+	/* 同 decor 的 vidow_decode_premul：gamma2.2 的值域就是 0..1，rgb / a 越界
+	 * 说明这一格的 alpha 和色值不自洽 —— 不夹就会把一格 1/255 alpha 的垃圾
+	 * 放大成整片纯白（拖拽 / 果冻变形时最明显）。 */
+	"	return mesh_tf_decode(clamp(rgb / a, 0.0, 1.0)) * a;\n"
 	"}\n"
 	"float sd_round_box(vec2 p, vec2 half_size, float r, float n) {\n"
 	"	vec2 q = abs(p) - half_size + r;\n"
@@ -695,7 +719,8 @@ static const char *mesh_blur_fragment_src =
 	"	if (u_linear > 0.5) {\n"
 	"		float a = clamp(out_px.a, 0.0, 1.0);\n"
 	"		out_px = a > 0.0 ?\n"
-	"			vec4(mesh_tf_encode(out_px.rgb / a) * a, a) : vec4(0.0);\n"
+	"			vec4(mesh_tf_encode(clamp(out_px.rgb / a, 0.0, 1.0)) * a, a)\n"
+	"			: vec4(0.0);\n"
 	"	}\n"
 	"	gl_FragColor = out_px;\n"
 	"}\n";
