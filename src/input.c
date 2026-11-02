@@ -2829,11 +2829,16 @@ static void server_request_cursor(struct wl_listener *listener, void *data) {
 
 	struct wlr_seat_client *focused = server->seat->pointer_state.focused_client;
 	if (vidow_cursor_trace_on()) {
-		wlr_log(WLR_INFO, "cursor-trace: set_cursor surface=%p %dx%d "
-			"hotspot=%d,%d focused=%p event_client=%p %s",
+		wlr_log(WLR_INFO, "cursor-trace: set_cursor surface=%p %dx%d scale=%d "
+			"buffer=%dx%d hotspot=%d,%d focused=%p event_client=%p %s",
 			(void *)event->surface,
 			event->surface != NULL ? event->surface->current.width : 0,
 			event->surface != NULL ? event->surface->current.height : 0,
+			event->surface != NULL ? event->surface->current.scale : 0,
+			event->surface != NULL && event->surface->buffer != NULL ?
+				event->surface->buffer->base.width : 0,
+			event->surface != NULL && event->surface->buffer != NULL ?
+				event->surface->buffer->base.height : 0,
 			event->hotspot_x, event->hotspot_y,
 			(void *)focused, (void *)event->seat_client,
 			focused == event->seat_client ? "匹配" : "**不匹配，丢弃**");

@@ -1,5 +1,6 @@
 #!/bin/bash
-# 普通 X11 窗口里的光标：set_cursor(NULL) 不能一律当成「游戏自己画光标」。
+# 普通 X11 窗口里的光标：set_cursor(NULL) 不能一律当成「游戏自己画光标」；
+# 而且 X 光标图不能被 xwayland_scale 再除一次（2 倍屏上会只有一半大）。
 #
 # 背景（5ee22c0）：root 光标换成 1x1 透明，好让全屏游戏 SetCursor(NULL) 之后
 # 那支系统箭头不再被继承上去。代价是**普通 X11 窗口没设光标**时，X 沿继承链
@@ -7,13 +8,20 @@
 # 旧代码一律按「不画」处理，普通 X11 窗口里光标就整块消失（用户 2026-11-02
 # 报「xwayland 应用光标不再发生变化」）。
 #
-# 判据（headless 1280x720、一块 1x 屏）：
+# 第二个坑：Xwayland 给的 cursor surface 自带 buffer scale，热点也在 surface
+# 坐标里。旧代码又按 xwayland_scale 除了一次缓冲和热点，2 倍屏上光标只剩一半
+# 大、热点也偏了（看着像「不跟着控件变」）。用户 2026-11-02 补报「光标大小也
+# 小了一半」。
+#
+# 判据：
 #   1) 普通窗口、客户端没设光标 → 显示主题箭头（不是「不画」），日志有
 #      「X11 窗口没设光标…→ 主题箭头」
 #   2) 客户端换 hand2 → 光标图跟着换（普通窗口的光标变化照常生效）
 #   3) 客户端再设 None（仍非全屏）→ 回到同一张主题箭头
 #   4) 全屏窗口设 hand2 → 有光标；再设 None → image == 0x0（隐藏），而且
 #      不再打「→ 主题箭头」那条日志（两条路真的分开了）
+#   5) 同一套流程在 2 倍屏上重跑：hand2 的逻辑尺寸和 1 倍屏一样（16x16），
+#      不能被 xwayland_scale 再除成 8x8
 #
 # 用法：./test-x11cursor-none.sh   （VIDOW_TEST_KEEP=1 保留运行目录）
 set -u
@@ -48,11 +56,6 @@ trap cleanup EXIT
 rm -rf "$RUNDIR"
 mkdir -p "$CFGDIR/.config/vidow" "$RUNDIR/run"
 chmod 700 "$RUNDIR/run"
-cat > "$CFGDIR/.config/vidow/config.lua" <<'CFG'
-scale = "1"
-xwayland = true
-window_open_ms = 60
-CFG
 
 export XDG_RUNTIME_DIR="$RUNDIR/run" HOME="$CFGDIR" VIDOW_LOG=debug
 export WLR_BACKENDS=headless WLR_HEADLESS_OUTPUTS=1 WLR_LIBINPUT_NO_DEVICES=1
@@ -87,37 +90,63 @@ else:
 
 arrow_lines() { grep -ac "X11 窗口没设光标" "$LOG" 2>/dev/null || true; }
 
-setsid ./build/vidow > "$LOG" 2>&1 &
-VIDOW_PGID=$!
-for _ in $(seq 1 80); do grep -aq "vidow ready" "$LOG" && break; sleep 0.25; done
-grep -aq "vidow ready" "$LOG" || { echo "vidow 没起来"; tail -5 "$LOG"; exit 1; }
-export WAYLAND_DISPLAY=$(grep -ao "WAYLAND_DISPLAY=[a-z0-9-]*" "$LOG" | tail -1 | cut -d= -f2)
-sleep 0.6
+start_probe() { # 起窗口 + 等它上屏；结果留在 X Y W H
+	coproc PROBE { ./build/x11cursorwin 2>"$RUNDIR/probe.err"; }
+	read -r -t 5 -u "${PROBE[0]}" line || true
+	[ "$line" = "mapped" ] || { echo "x11cursorwin 没起来"; exit 1; }
+	for _ in $(seq 1 80); do
+		[ "$(geo)" != "-1 -1 0 0" ] && break
+		sleep 0.25
+	done
+	sleep 0.6
+	read -r X Y W H <<<"$(geo)"
+	[ "$W" -gt 0 ] || { echo "x11cursorwin 窗口没上屏"; tail -5 "$LOG"; exit 1; }
+	echo "  窗口在 $X,$Y ${W}x${H}"
+}
 
-export DISPLAY=$(grep -ao "xwayland: DISPLAY=:[0-9]*" "$LOG" | tail -1 | cut -d= -f2)
-[ -n "$DISPLAY" ] || { echo "拿不到 Xwayland 的 DISPLAY"; exit 1; }
+stop_probe() {
+	[ -n "$PROBE_PID" ] && kill "$PROBE_PID" 2>/dev/null
+	PROBE_PID=""
+	sleep 0.2
+}
 
-# 光标链路探针（日志里才有 set_cursor 的账）
-touch /tmp/vidow-cursor-trace
+start_vidow() { # <缩放>
+	cat > "$VIDOW_CONFIG_LUA" <<CFG
+scale = "$1"
+xwayland = true
+window_open_ms = 60
+CFG
+	rm -f "$LOG"
+	setsid ./build/vidow > "$LOG" 2>&1 &
+	VIDOW_PGID=$!
+	for _ in $(seq 1 80); do grep -aq "vidow ready" "$LOG" && break; sleep 0.25; done
+	grep -aq "vidow ready" "$LOG" || { echo "vidow 没起来"; tail -5 "$LOG"; exit 1; }
+	export WAYLAND_DISPLAY=$(grep -ao "WAYLAND_DISPLAY=[a-z0-9-]*" "$LOG" | tail -1 | cut -d= -f2)
+	sleep 0.6
+	export DISPLAY=$(grep -ao "xwayland: DISPLAY=:[0-9]*" "$LOG" | tail -1 | cut -d= -f2)
+	[ -n "$DISPLAY" ] || { echo "拿不到 Xwayland 的 DISPLAY"; exit 1; }
+	# 光标链路探针（日志里才有 set_cursor 的账）
+	touch /tmp/vidow-cursor-trace
+}
 
-coproc PROBE { ./build/x11cursorwin 2>"$RUNDIR/probe.err"; }
-read -r -t 5 -u "${PROBE[0]}" line || true
-[ "$line" = "mapped" ] || { echo "x11cursorwin 没起来"; exit 1; }
-
-for _ in $(seq 1 80); do
-	[ "$(geo)" != "-1 -1 0 0" ] && break
-	sleep 0.25
-done
-sleep 0.6
-read -r X Y W H <<<"$(geo)"
-[ "$W" -gt 0 ] || { echo "x11cursorwin 窗口没上屏"; tail -5 "$LOG"; exit 1; }
-echo "  窗口在 $X,$Y ${W}x${H}"
+stop_vidow() {
+	stop_probe
+	if [ -n "$VIDOW_PGID" ]; then
+		kill -TERM -- "-$VIDOW_PGID" 2>/dev/null
+		sleep 0.4
+		kill -KILL -- "-$VIDOW_PGID" 2>/dev/null
+		VIDOW_PGID=""
+	fi
+}
 
 probe_cmd() { # <hand|none>，等它把这一条处理完
 	echo "$1" >&"${PROBE[1]}"
 	read -r -t 5 -u "${PROBE[0]}" line || line=""
 	[ "$line" = "$1" ] || fail "x11cursorwin 没回执：$1（拿到 '$line'）"
 }
+
+start_vidow 1
+start_probe
 
 mark "1) 普通窗口、客户端没设光标 → 主题箭头"
 msg move-cursor $((X + W / 2)) $((Y + H / 2)) >/dev/null
@@ -175,6 +204,27 @@ mark "5) 日志干净"
 grep -aqE "assert|abort" "$LOG" &&
 	fail "日志里有 assert / abort" ||
 	pass "日志里没有 assert / abort"
+
+# 2 倍屏：Xwayland 的 cursor surface 自带 buffer scale，热点也在 surface
+# 坐标里。再按 xwayland_scale 除一次 → 光标一半大、热点偏一半（看着像
+# 「不跟着控件变」）。同一支 hand2 在 2 倍屏上的逻辑尺寸应该和 1 倍屏一样。
+mark "6) 2 倍屏：光标图不能被 xwayland_scale 再除一次"
+stop_vidow
+start_vidow 2
+start_probe
+msg move-cursor $((X + W / 2)) $((Y + H / 2)) >/dev/null
+sleep 0.6
+probe_cmd hand
+sleep 0.5
+HAND2=$(image)
+# image 报的是物理像素：同一支 16x16 的 hand2 在 2 倍屏上应该是 32x32。
+EXPECT=$(python3 -c "w,h='$HAND'.split('x'); print('%dx%d' % (int(w)*2, int(h)*2))")
+[ "$HAND2" = "$EXPECT" ] &&
+	pass "2 倍屏上 hand2 是 $HAND2（1 倍屏 $HAND 的 2 倍，没被再除一次）" ||
+	fail "2 倍屏上 hand2 是 $HAND2（期望 $EXPECT；1 倍屏是 $HAND，被除了一半？）"
+[ "$(arrow_lines)" -ge 1 ] &&
+	pass "2 倍屏上「→ 主题箭头」那条照常走" ||
+	fail "2 倍屏上没走「→ 主题箭头」"
 
 if [ "$FAILED" -eq 0 ]; then
 	echo

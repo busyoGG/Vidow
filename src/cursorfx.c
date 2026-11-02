@@ -640,26 +640,28 @@ void vidow_cursor_fx_motion(struct vidow_server *server) {
 
 /* --------------------------------------------------------------- 光标图跟踪 */
 
-/* X cursor images are already in the global X density's native pixels.
- * Do not let a scale=1 Xwayland cursor surface multiply them a second time
- * on HiDPI outputs. Keep surface commits/lifetime tracking, but present the
- * borrowed buffer with its actual density and convert the hotspot once. */
+/* X cursor images come from Xwayland as a normal wl_surface: the hotspot is in
+ * surface coordinates and wlroots applies the surface's own buffer scale. Do
+ * not multiply by xwayland_scale a second time — on a 2x output that halves
+ * both the image and the hotspot (user 2026-11-02: 「光标大小也小了一半」), and
+ * the shifted hotspot makes the visible tip sit on a different widget, so the
+ * cursor appears not to change shape. Keep lifetime/commit tracking, but hand
+ * the surface to wlroots like any other client cursor. */
 bool vidow_cursor_set_client_surface(struct vidow_server *server,
 		struct wlr_surface *surface, int32_t hx, int32_t hy) {
 	bool x11 = surface != NULL && server->xwayland_server != NULL &&
 		wl_resource_get_client(surface->resource) == server->xwayland_server->client;
-	if (!x11) {
-		wlr_cursor_set_surface(server->cursor, surface, hx, hy);
-		return false;
+	if (vidow_cursor_trace_on() && x11) {
+		wlr_log(WLR_INFO, "cursor-trace: X11 光标图 surface %dx%d scale=%d "
+			"buffer=%dx%d hotspot=%d,%d（按表面自己的 scale 上屏）",
+			surface->current.width, surface->current.height,
+			surface->current.scale,
+			surface->buffer != NULL ? surface->buffer->base.width : 0,
+			surface->buffer != NULL ? surface->buffer->base.height : 0,
+			hx, hy);
 	}
-	double density = server->xwayland_scale;
-	if (!(density > 0.0)) density = 1.0;
-	struct wlr_buffer *buffer = surface->buffer != NULL ?
-		&surface->buffer->base : NULL;
-	wlr_cursor_set_buffer(server->cursor, buffer,
-		(int32_t)lround(hx / density), (int32_t)lround(hy / density),
-		(float)density);
-	return true;
+	wlr_cursor_set_surface(server->cursor, surface, hx, hy);
+	return x11;
 }
 
 static void client_cursor_commit(struct wl_listener *listener, void *data) {
