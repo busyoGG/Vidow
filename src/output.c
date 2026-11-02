@@ -2080,6 +2080,135 @@ static void output_destroy(struct wl_listener *listener, void *data) {
 	vidow_xwayland_scale_apply(server);
 }
 
+/* --------------------------------------------------------- 色彩能力诊断 */
+/* 计划第 1 步：只印能力，不改任何行为。VIDOW_COLORDIAG=1 时，每块屏建好之后
+ * （配置里的位深 / VRR 都落过了）印一份：
+ *
+ *   - 主 plane 的格式表：没有 XRGB2101010 就没有 10bit 扫描输出，第 2 步到此为止
+ *   - 渲染器的目标格式表：没有 16161616F 就没有 FP16 内部缓冲，第 3 步得退 8bit
+ *   - 当前位深 / gamma 表项数 / renderer 的两个色彩开关
+ *
+ * 这几行是后面所有色彩步骤的判据，所以打印的是「后端实际报的」，不做任何推断。 */
+
+/* wlroots 0.20 导出了这个符号但 Arch 的包里没装原型（fx.c / fx-gl.c 同样处理）。 */
+extern const struct wlr_drm_format_set *wlr_renderer_get_render_formats(
+	struct wlr_renderer *r, uint32_t buffer_caps);
+
+static const char *drm_fourcc_name(uint32_t fmt) {
+	switch (fmt) {
+	case DRM_FORMAT_XRGB8888: return "XRGB8888";
+	case DRM_FORMAT_XBGR8888: return "XBGR8888";
+	case DRM_FORMAT_ARGB8888: return "ARGB8888";
+	case DRM_FORMAT_ABGR8888: return "ABGR8888";
+	case DRM_FORMAT_RGBA8888: return "RGBA8888";
+	case DRM_FORMAT_BGRA8888: return "BGRA8888";
+	case DRM_FORMAT_RGBX8888: return "RGBX8888";
+	case DRM_FORMAT_BGRX8888: return "BGRX8888";
+	case DRM_FORMAT_XRGB2101010: return "XRGB2101010";
+	case DRM_FORMAT_XBGR2101010: return "XBGR2101010";
+	case DRM_FORMAT_ARGB2101010: return "ARGB2101010";
+	case DRM_FORMAT_ABGR2101010: return "ABGR2101010";
+	case DRM_FORMAT_XRGB16161616: return "XRGB16161616";
+	case DRM_FORMAT_XBGR16161616: return "XBGR16161616";
+	case DRM_FORMAT_ARGB16161616: return "ARGB16161616";
+	case DRM_FORMAT_ABGR16161616: return "ABGR16161616";
+	case DRM_FORMAT_XRGB16161616F: return "XRGB16161616F";
+	case DRM_FORMAT_XBGR16161616F: return "XBGR16161616F";
+	case DRM_FORMAT_ARGB16161616F: return "ARGB16161616F";
+	case DRM_FORMAT_ABGR16161616F: return "ABGR16161616F";
+	case DRM_FORMAT_NV12: return "NV12";
+	case DRM_FORMAT_P010: return "P010";
+	default: return NULL;
+	}
+}
+
+static bool format_set_has(const struct wlr_drm_format_set *set, uint32_t fmt) {
+	return set != NULL && wlr_drm_format_set_get(set, fmt) != NULL;
+}
+
+/* 一张格式表打成一行。同一格式只印一次（modifier 的个数另标），不然 AMD 的
+ * 主 plane 会刷出几十条同名的行 —— 判断「有没有 2101010」用不着看 modifier。 */
+static void log_format_set(const char *what, const struct wlr_drm_format_set *set) {
+	if (set == NULL) {
+		wlr_log(WLR_INFO, "color: %s：后端没报", what);
+		return;
+	}
+	char buf[768];
+	size_t o = 0;
+	size_t printed = 0;
+	buf[0] = '\0';
+	for (size_t i = 0; i < set->len && o + 40 < sizeof(buf); i++) {
+		const char *name = drm_fourcc_name(set->formats[i].format);
+		int n;
+		if (name != NULL) {
+			n = snprintf(buf + o, sizeof(buf) - o, "%s%s",
+				printed > 0 ? " " : "", name);
+		} else {
+			n = snprintf(buf + o, sizeof(buf) - o, "%s0x%08x",
+				printed > 0 ? " " : "", set->formats[i].format);
+		}
+		if (n < 0) {
+			break;
+		}
+		o += (size_t)n;
+		if (set->formats[i].len > 1) {
+			n = snprintf(buf + o, sizeof(buf) - o, "(%zu mod)",
+				set->formats[i].len);
+			if (n > 0) {
+				o += (size_t)n;
+			}
+		}
+		printed++;
+	}
+	wlr_log(WLR_INFO, "color: %s（%zu 种）: %s%s", what, set->len, buf,
+		printed < set->len ? " …" : "");
+}
+
+static void output_log_color_caps(struct vidow_server *server,
+		struct wlr_output *wlr_output) {
+	static int on = -1;
+	if (on < 0) {
+		on = getenv("VIDOW_COLORDIAG") != NULL ? 1 : 0;
+	}
+	if (!on) {
+		return;
+	}
+
+	/* 后端能扫的（主 plane 格式表） */
+	const struct wlr_drm_format_set *primary = wlr_output_get_primary_formats(
+		wlr_output, server->allocator != NULL ?
+		server->allocator->buffer_caps : WLR_BUFFER_CAP_DATA_PTR);
+	/* 渲染器能当渲染目标的（离屏缓冲从这里面挑） */
+	const struct wlr_drm_format_set *render =
+		server->renderer != NULL ?
+		wlr_renderer_get_render_formats(server->renderer,
+			server->allocator != NULL ?
+			server->allocator->buffer_caps : WLR_BUFFER_CAP_DATA_PTR) :
+		NULL;
+
+	const char *now = drm_fourcc_name(wlr_output->render_format);
+	wlr_log(WLR_INFO, "color: %s 当前 %s（%dx%d @ %.3fHz），gamma 表 %zu 项，"
+		"renderer 输入变换 %s / 输出变换 %s",
+		wlr_output->name, now != NULL ? now : "未知格式",
+		wlr_output->width, wlr_output->height,
+		(float)wlr_output->refresh / 1000.0f,
+		wlr_output_get_gamma_size(wlr_output),
+		(server->renderer != NULL &&
+		 server->renderer->features.input_color_transform) ? "有" : "无",
+		(server->renderer != NULL &&
+		 server->renderer->features.output_color_transform) ? "有" : "无");
+
+	log_format_set("扫描输出格式", primary);
+	log_format_set("渲染目标格式", render);
+
+	/* 一句话结论：后面几步能不能做，全看这三行。 */
+	wlr_log(WLR_INFO, "color: %s 判定：10bit 扫描 %s，FP16 内部缓冲 %s，"
+		"KMS 3x1D LUT %s", wlr_output->name,
+		format_set_has(primary, DRM_FORMAT_XRGB2101010) ? "可以" : "不行",
+		format_set_has(render, DRM_FORMAT_ABGR16161616F) ? "可以" : "不行",
+		wlr_output_get_gamma_size(wlr_output) > 0 ? "可以" : "没有");
+}
+
 static void server_new_output(struct wl_listener *listener, void *data) {
 	struct vidow_server *server = wl_container_of(listener, server, new_output);
 	struct wlr_output *wlr_output = data;
@@ -2280,6 +2409,10 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 	/* 配置里那块屏还写了 VRR / 位深的话，现在补上（不能在关着的屏上设，也不该
 	 * 和上模式挤同一次 commit）。 */
 	output_apply_conf_extra(server, output);
+
+	/* 色彩能力诊断（VIDOW_COLORDIAG=1）：摆在最末尾，印的是「最终生效」的那一份
+	 * （布局、模式、位深都落过了），不是初始 state。只读，不改任何行为。 */
+	output_log_color_caps(server, wlr_output);
 
 	/* 新屏可能比现有的都密：X 的全局缩放要跟着涨（涨了已存在的 X11 窗口会
 	 * 重新声明缓冲区比例）。 */

@@ -473,6 +473,13 @@ executable('cursorprobe',
   dependencies: [pipewire_dep],
   install: false)
 
+# 只读探针：合成器跑着的时候看这块屏「硬件那一侧」支持什么
+# （主 plane 格式表 / max bpc / Colorspace / HDR_OUTPUT_METADATA）。不拿 DRM master。
+executable('drmprobe',
+  ['tools/drmprobe.c'],
+  dependencies: [drm_dep],
+  install: false)
+
 # 离线自检：JSON 写出 / 读入（纯函数，不开合成器）
 executable('jsontest',
   ['tools/jsontest.c', 'src/json.c'],
