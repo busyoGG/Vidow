@@ -1432,6 +1432,20 @@ static int l_output(lua_State *L) {
 	}
 	lua_pop(L, 1);
 
+	/* 输出端 HDR（第 9 步）：场景走 FP16 离屏 + 全屏后处理，以 BT.2020 / PQ
+	 * 上屏。默认关；显示器不支持时打开只会让画面发灰，别当自动档用。 */
+	lua_getfield(L, 1, "hdr");
+	if (!lua_isnil(L, -1)) {
+		if (!lua_isboolean(L, -1)) {
+			lua_pop(L, 1);
+			return luaL_error(L, "vidow.output{ name = \"%s\" }: hdr 只能是 "
+				"true / false", who);
+		}
+		spec.has_hdr = true;
+		spec.hdr = lua_toboolean(L, -1);
+	}
+	lua_pop(L, 1);
+
 	/* 方向 / 翻转 */
 	lua_getfield(L, 1, "transform");
 	if (!lua_isnil(L, -1)) {
@@ -1450,7 +1464,7 @@ static int l_output(lua_State *L) {
 	/* 项名写错（scalee / pos）不该悄悄不生效：列一遍能写什么。 */
 	static const char *const fields[] = {
 		"name", "scale", "x", "y", "mode", "enabled", "vrr", "depth",
-		"transform", "vrr_on_demand", "layout",
+		"hdr", "transform", "vrr_on_demand", "layout",
 	};
 	lua_pushnil(L);
 	while (lua_next(L, 1) != 0) {
@@ -1467,7 +1481,7 @@ static int l_output(lua_State *L) {
 		if (!known) {
 			lua_pop(L, 2);
 			return luaL_error(L, "vidow.output{…}: 没有 '%s' 这一项"
-				"（能写：name / scale / x / y / mode / enabled / vrr / depth / "
+				"（能写：name / scale / x / y / mode / enabled / vrr / depth / hdr / "
 				"transform / vrr_on_demand / layout）", field != NULL ? field : "?");
 		}
 		lua_pop(L, 1);

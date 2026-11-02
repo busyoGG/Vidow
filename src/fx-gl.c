@@ -660,6 +660,112 @@ static const char *mesh_blur_fragment_src =
 
 /* --------------------------------------------------------- program build */
 
+/* ---------------------------------------------------- output post pass */
+
+/* 输出端全屏后处理（vidow.output{ hdr }，计划第 9 步 C 档）。
+ *
+ * 场景先渲进一张 FP16 离屏（见 output.c 的 output_post_swapchain），这一趟
+ * 把它搬进真正的扫描输出缓冲，中间做：
+ *   解码（源 TF）→ 3x3 色域矩阵 → luminance 缩放 → 编码（目标 TF）→ dither。
+ *
+ * 传输函数用 0..4 的小整数，和装饰着色器同一套（0 线性 / 1 PQ / 2 gamma22 /
+ * 3 BT.1886 / 4 sRGB）。PQ 的 1.0 = 10000 cd/m²（和装饰那边一致），所以
+ * SDR → PQ 的 u_scale = SDR 白点亮度 / 10000。 */
+static const char *post_vertex_src =
+	"attribute vec2 a_pos;\n"
+	"varying vec2 v_uv;\n"
+	"void main() {\n"
+	"	v_uv = a_pos;\n"
+	"	gl_Position = vec4(a_pos * 2.0 - 1.0, 0.0, 1.0);\n"
+	"}\n";
+
+static const char *post_fragment_src =
+	"#ifdef GL_FRAGMENT_PRECISION_HIGH\n"
+	"precision highp float;\n"
+	"#else\n"
+	"precision mediump float;\n"
+	"#endif\n"
+	"uniform sampler2D u_tex;\n"
+	"uniform float u_src_tf;\n"
+	"uniform float u_dst_tf;\n"
+	"uniform mat3 u_matrix;\n"
+	"uniform float u_scale;\n"
+	"uniform float u_dither;\n"
+	"uniform float u_seed;\n"
+	"varying vec2 v_uv;\n"
+	"\n"
+	"vec3 vidow_pq_eotf(vec3 c) {\n"
+	"	const float m1 = 0.1593017578125;\n"
+	"	const float m2 = 78.84375;\n"
+	"	const float c1 = 0.8359375;\n"
+	"	const float c2 = 18.8515625;\n"
+	"	const float c3 = 18.6875;\n"
+	"	vec3 p = pow(max(c, 0.0), vec3(1.0 / m2));\n"
+	"	vec3 num = max(p - c1, 0.0);\n"
+	"	vec3 den = max(c2 - c3 * p, 1e-6);\n"
+	"	return pow(num / den, vec3(1.0 / m1));\n"
+	"}\n"
+	"vec3 vidow_pq_inv_eotf(vec3 c) {\n"
+	"	const float m1 = 0.1593017578125;\n"
+	"	const float m2 = 78.84375;\n"
+	"	const float c1 = 0.8359375;\n"
+	"	const float c2 = 18.8515625;\n"
+	"	const float c3 = 18.6875;\n"
+	"	vec3 p = pow(max(c, 0.0), vec3(m1));\n"
+	"	return pow((c1 + c2 * p) / (1.0 + c3 * p), vec3(m2));\n"
+	"}\n"
+	"vec3 vidow_tf_decode(vec3 c, float tf) {\n"
+	"	c = max(c, 0.0);\n"
+	"	if (tf > 3.5) {\n"
+	"		vec3 lo = c / 12.92;\n"
+	"		vec3 hi = pow((c + 0.055) / 1.055, vec3(2.4));\n"
+	"		return mix(lo, hi, step(vec3(0.04045), c));\n"
+	"	} else if (tf > 2.5) {\n"
+	"		return pow(c, vec3(2.4));\n"
+	"	} else if (tf > 1.5) {\n"
+	"		return pow(c, vec3(2.2));\n"
+	"	} else if (tf > 0.5) {\n"
+	"		return vidow_pq_eotf(c);\n"
+	"	}\n"
+	"	return c;\n"
+	"}\n"
+	"vec3 vidow_tf_encode(vec3 c, float tf) {\n"
+	"	c = max(c, 0.0);\n"
+	"	if (tf > 3.5) {\n"
+	"		vec3 lo = c * 12.92;\n"
+	"		vec3 hi = 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055;\n"
+	"		return mix(lo, hi, step(vec3(0.0031308), c));\n"
+	"	} else if (tf > 2.5) {\n"
+	"		return pow(c, vec3(1.0 / 2.4));\n"
+	"	} else if (tf > 1.5) {\n"
+	"		return pow(c, vec3(1.0 / 2.2));\n"
+	"	} else if (tf > 0.5) {\n"
+	"		return vidow_pq_inv_eotf(c);\n"
+	"	}\n"
+	"	return c;\n"
+	"}\n"
+	"/* 三角分布噪声：两个均匀分布相减，均值 0、范围 ±u_dither，比单个\n"
+	" * 均匀分布更不容易在平坦渐变上留下固定花纹。坐标先取模压回 mediump\n"
+	" * 的安全范围（大屏幕上 sin 的参数会溢出成 Inf，见装饰着色器的注）。 */\n"
+	"float vidow_hash(vec2 p) {\n"
+	"	p = mod(p, 1024.0);\n"
+	"	return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);\n"
+	"}\n"
+	"void main() {\n"
+	"	vec3 c = texture2D(u_tex, v_uv).rgb;\n"
+	"	vec3 lin = vidow_tf_decode(c, u_src_tf);\n"
+	"	lin = u_matrix * lin * u_scale;\n"
+	"	vec3 o = vidow_tf_encode(lin, u_dst_tf);\n"
+	"	if (u_dither > 0.0) {\n"
+	"		float n1 = vidow_hash(gl_FragCoord.xy + u_seed);\n"
+	"		float n2 = vidow_hash(gl_FragCoord.xy + u_seed + 17.0);\n"
+	"		o += (n1 - n2) * u_dither;\n"
+	"	}\n"
+	"	gl_FragColor = vec4(clamp(o, 0.0, 1.0), 1.0);\n"
+	"}\n";
+
+/* --------------------------------------------------------- program build */
+
 static bool link_program_full(unsigned int *out, const char *vert_src,
 		const char *frag_src, const char *name) {
 	GLuint vs = compile(GL_VERTEX_SHADER, vert_src, name);
@@ -732,6 +838,24 @@ static void load_mesh_program(struct vidow_server *server) {
 		b->u_mask_map = glGetUniformLocation(prog, "u_mask_map");
 		b->u_mask_min = glGetUniformLocation(prog, "u_mask_min");
 	}
+}
+
+/* 输出端全屏后处理程序（见上面的 post_fragment_src）。着色器编译失败时
+ * program 留 0，output.c 那边会退回「场景直接进扫描输出缓冲」的老路。 */
+static void load_post_program(struct vidow_server *server) {
+	struct vidow_post_prog *p = &server->post;
+	unsigned int prog = 0;
+	if (!link_program_full(&prog, post_vertex_src, post_fragment_src, "post")) {
+		return;
+	}
+	p->program = prog;
+	p->u_tex = glGetUniformLocation(prog, "u_tex");
+	p->u_src_tf = glGetUniformLocation(prog, "u_src_tf");
+	p->u_dst_tf = glGetUniformLocation(prog, "u_dst_tf");
+	p->u_matrix = glGetUniformLocation(prog, "u_matrix");
+	p->u_scale = glGetUniformLocation(prog, "u_scale");
+	p->u_dither = glGetUniformLocation(prog, "u_dither");
+	p->u_seed = glGetUniformLocation(prog, "u_seed");
 }
 
 static void load_decor_program(struct vidow_server *server) {
@@ -979,6 +1103,7 @@ bool vidow_shader_init(struct vidow_server *server) {
 	load_decor_program(server);
 	load_kawase_programs(server);
 	load_mesh_program(server);
+	load_post_program(server);
 
 	/* A 1x1 transparent texture for samplers that are switched off. */
 	static const uint32_t pixel = 0x00000000;
@@ -1763,4 +1888,39 @@ void dump_target(struct vidow_server *server,
 		free(data);
 	}
 	wlr_texture_destroy(tex);
+}
+
+/* 输出端全屏后处理：把 src（场景刚渲进去的 FP16 离屏）搬进 dst（真正的扫描
+ * 输出缓冲），中间按参数做解码 → 矩阵 → 缩放 → 编码 → dither。
+ *
+ * src_tf / dst_tf 用和装饰着色器同一套小整数（0 线性 / 1 PQ / 2 gamma22 /
+ * 3 BT.1886 / 4 sRGB）；matrix 是 3x3 **行主序**，这里按 GL 的列主序要求
+ * 转置上传。返回 false 时 dst 的内容不可用，调用方应该丢掉这一帧。 */
+bool vidow_fx_post_pass(struct vidow_server *server, struct wlr_buffer *dst,
+		struct wlr_texture *src, int w, int h, float src_tf, float dst_tf,
+		const float *matrix, float scale, float dither, float seed) {
+	struct vidow_post_prog *p = &server->post;
+	if (p->program == 0 || src == NULL || dst == NULL) {
+		return false;
+	}
+	struct wlr_gles2_texture_attribs sa;
+	wlr_gles2_texture_get_attribs(src, &sa);
+
+	struct wlr_egl *egl = NULL;
+	if (begin_pass(server, dst, w, h, &egl) == 0) {
+		return false;
+	}
+	glUseProgram(p->program);
+	bind_tex(0, sa.target, sa.tex);
+	glUniform1i(p->u_tex, 0);
+	glUniform1f(p->u_src_tf, src_tf);
+	glUniform1f(p->u_dst_tf, dst_tf);
+	glUniformMatrix3fv(p->u_matrix, 1, GL_TRUE, matrix);
+	glUniform1f(p->u_scale, scale);
+	glUniform1f(p->u_dither, dither);
+	glUniform1f(p->u_seed, seed);
+	draw_quad(p->program);
+	glUseProgram(0);
+	end_pass(egl);
+	return true;
 }

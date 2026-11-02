@@ -849,6 +849,17 @@ struct vidow_mesh_blur_prog {
 	int u_shadow_radius, u_shadow_color, u_shadow_on;
 };
 
+/* 输出端全屏后处理（第 9 步 C 档）：场景先渲进 FP16 离屏，再一趟 shader
+ * 做「解码 → 色域矩阵 → luminance 缩放 → 编码（HDR = PQ）→ dither」，最后
+ * 上屏。不开（hdr = false）时场景直接渲进扫描输出缓冲，没有这一趟。
+ *
+ * gles2 的 output_color_transform 是空操作，所以这趟必须自己写；代价是
+ * 失去 direct scanout（见计划第 9 节）。 */
+struct vidow_post_prog {
+	unsigned int program;
+	int u_tex, u_src_tf, u_dst_tf, u_matrix, u_scale, u_dither, u_seed;
+};
+
 /* The built-in decoration program: rounded corners, border, drop shadow,
  * blurred backdrop and grain. */
 struct vidow_decor_prog {
@@ -1403,6 +1414,17 @@ struct vidow_output {
 	bool gamma_lut_dirty;
 	/* 当前持有 LUT 的那个 control 对象（失败时要回 failed 并销毁它）。 */
 	struct wlr_gamma_control_v1 *gamma_ctl;
+	/* 输出端全屏后处理（vidow.output{ hdr }，第 9 步）：
+	 *   true  = 场景先渲进 post_swapchain（FP16），再跑 vidow_fx_post_pass
+	 *           上屏（矩阵 / tone map / PQ / dither），代价是失去直通；
+	 *   false = 老路径，场景直接渲进扫描输出缓冲。
+	 * post_swapchain 按输出尺寸懒建，尺寸变了就重建。 */
+	bool hdr;
+	struct wlr_swapchain *post_swapchain;
+	int post_w, post_h;
+	/* 上一帧后处理的源贴图（还锁着那张离屏缓冲）。留一帧再放：GL 命令可能
+	 * 还没执行完，立刻 unlock 会让交换链把它回收去画下一帧。 */
+	struct wlr_texture *post_tex;
 	struct wlr_scene_output *scene_output;
 	struct wlr_output_layout_output *layout_output;
 	/* 这块屏的抓帧器（capture.c 的 vidow_capture）：独立的假输出 + 自己的
@@ -2956,6 +2978,7 @@ struct vidow_server {
 
 	struct vidow_config config;
 	struct vidow_decor_prog decor;
+	struct vidow_post_prog post;
 	struct vidow_gl_prog kawase_down, kawase_up;
 	struct vidow_mesh_prog mesh;
 	struct vidow_mesh_blur_prog mesh_blur;
@@ -3852,6 +3875,11 @@ void vidow_fx_release(struct vidow_fx_target *fx);
 bool vidow_view_blur_wanted(struct vidow_view *view);
 bool vidow_view_scanout_ok(struct vidow_view *view);
 void vidow_fx_flush(struct vidow_server *server);
+/* 输出端全屏后处理（第 9 步，vidow.output{ hdr }）：把场景的 FP16 离屏搬进
+ * 扫描输出缓冲，中间做 TF 解码 / 色域矩阵 / PQ 编码 / dither。见 fx-gl.c。 */
+bool vidow_fx_post_pass(struct vidow_server *server, struct wlr_buffer *dst,
+		struct wlr_texture *src, int w, int h, float src_tf, float dst_tf,
+		const float *matrix, float scale, float dither, float seed);
 bool vidow_fx_set_shader(struct vidow_server *server,
 		struct vidow_fx_target *fx, const char *name,
 		enum vidow_shader_phase phase);

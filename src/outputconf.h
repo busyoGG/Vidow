@@ -54,6 +54,12 @@ struct vidow_output_conf {
 	bool has_depth;
 	int depth;
 
+	/* 输出端 HDR（第 9 步）：true = 场景先渲进 FP16 离屏，再一趟全屏 shader
+	 * 做色域 / tone map / PQ 编码 / dither 上屏。默认 false（SDR，老路径）。
+	 * 需要显示器支持 BT.2020 + PQ（见 EDID），否则只是把画面搞坏。 */
+	bool has_hdr;
+	bool hdr;
+
 	/* 方向 / 翻转（normal / 90 / 180 / 270 / flipped / flipped-90 …） */
 	bool has_transform;
 	enum wl_output_transform transform;
@@ -79,6 +85,8 @@ struct vidow_output_spec {
 	bool vrr_on_demand;
 	bool has_depth;
 	int depth;
+	bool has_hdr;
+	bool hdr;
 	bool has_transform;
 	enum wl_output_transform transform;
 	bool has_enabled;

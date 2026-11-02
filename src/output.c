@@ -16,6 +16,7 @@
 
 #include <wlr/backend/headless.h>
 #include <wlr/render/color.h>
+#include <wlr/render/swapchain.h>
 #include <wlr/types/wlr_color_management_v1.h>
 #include <wlr/util/log.h>
 
@@ -31,6 +32,14 @@
  * 每 500ms 才 stat 一次：这个函数一帧要问好几遍，而 stat 也是 syscall。 */
 static void output_color_apply(struct vidow_output *output,
 		struct wlr_output_state *state);
+/* 输出端后处理（第 9 步）用的离屏交换链 / 上屏 blit 在下面定义，render_for
+ * 在前面调用，所以先声明。 */
+static void output_post_finish(struct vidow_output *output);
+static struct wlr_swapchain *output_post_swapchain(struct vidow_output *output,
+		int w, int h);
+static bool output_post_blit(struct vidow_output *output,
+		struct wlr_output_state *state, struct wlr_texture *src, int w, int h);
+static void output_set_hdr(struct vidow_output *output, bool on);
 static bool render_stats_file_on(void) {
 	static int64_t last_ns = 0;
 	static bool on = false;
@@ -379,13 +388,58 @@ void vidow_output_render(struct vidow_output *output) {
 	if (wlr_scene_output_needs_frame(output->scene_output)) {
 		struct wlr_output_state state;
 		wlr_output_state_init(&state);
-		if (wlr_scene_output_build_state(output->scene_output, &state, NULL)) {
+		struct wlr_scene_output_state_options options = { 0 };
+		const struct wlr_scene_output_state_options *options_ptr = NULL;
+		/* HDR（第 9 步）：场景先渲进 FP16 离屏，再一趟全屏 pass 上屏。
+		 * 主交换链在这里先用**空 state** 配好 —— 等 build_state 把 FP16
+		 * 缓冲塞进 state 之后再配，wlr_output_test_state 会拿那张缓冲去
+		 * 试主交换链，必然失败。 */
+		int post_w = output->wlr_output->width;
+		int post_h = output->wlr_output->height;
+		bool post_ok = output->hdr && post_w > 0 && post_h > 0 &&
+			output_post_swapchain(output, post_w, post_h) != NULL &&
+			wlr_output_configure_primary_swapchain(output->wlr_output,
+				&state, &output->wlr_output->swapchain);
+		if (post_ok) {
+			options.swapchain = output->post_swapchain;
+			options_ptr = &options;
+		} else if (output->hdr) {
+			/* 建不出来（没有 FP16 / 交换链失败）：这一帧退回直接渲染，
+			 * 别把「HDR 开着」变成黑屏。 */
+			wlr_log(WLR_ERROR, "color: %s HDR 后处理不可用，这一帧走 SDR",
+				output->wlr_output->name);
+		}
+		if (wlr_scene_output_build_state(output->scene_output, &state,
+				options_ptr)) {
+			bool post_failed = false;
+			if (post_ok) {
+				struct wlr_texture *src = wlr_texture_from_buffer(
+					output->server->renderer, state.buffer);
+				if (src == NULL ||
+						!output_post_blit(output, &state, src,
+							post_w, post_h)) {
+					post_failed = true;
+				} else {
+					/* 这一帧的源留着，下一帧再放（见 post_tex）。 */
+					if (output->post_tex != NULL) {
+						wlr_texture_destroy(output->post_tex);
+					}
+					output->post_tex = src;
+					src = NULL;
+				}
+				if (src != NULL) {
+					wlr_texture_destroy(src);
+				}
+			}
 			/* LUT 只在「改过」的那一帧提交一次：KMS 的 CTM 属性不会因为
 			 * 后续不带它的提交而丢，每帧重塞只是白算一个 blob。 */
 			if (output->gamma_lut_dirty) {
 				output_color_apply(output, &state);
 			}
-			if (!wlr_output_commit_state(output->wlr_output, &state)) {
+			if (post_failed) {
+				wlr_log(WLR_ERROR, "color: %s 后处理失败，丢掉这一帧",
+					output->wlr_output->name);
+			} else if (!wlr_output_commit_state(output->wlr_output, &state)) {
 				wlr_log(WLR_DEBUG, "output %s: 提交失败（含校色 LUT）",
 					output->wlr_output->name);
 			} else {
@@ -2018,6 +2072,9 @@ static void output_apply_conf_extra(struct vidow_server *server,
 	if (conf->has_depth) {
 		vidow_output_set_depth(server, wlr_output, conf->depth);
 	}
+	if (conf->has_hdr) {
+		output_set_hdr(output, conf->hdr);
+	}
 }
 
 /* 配置里那块屏的开关 / 模式 / 方向改过（SIGHUP、配置刚跑完）：按新配置对一遍账。
@@ -2195,6 +2252,12 @@ static void output_destroy(struct wl_listener *listener, void *data) {
 
 	/* 事件要带名字，而 wlr_output 在这个信号之后就被释放了 —— 所以在这里发。 */
 	vidow_ipc_emit_output(server, "output-removed", output->wlr_output);
+	/* 后处理：放掉 attach_render 锁（成对）并销毁离屏交换链 / 源贴图。 */
+	if (output->hdr) {
+		output->hdr = false;
+		wlr_output_lock_attach_render(output->wlr_output, false);
+	}
+	output_post_finish(output);
 	wlr_color_transform_unref(output->gamma_lut);
 	output->gamma_lut = NULL;
 	output->gamma_ctl = NULL;
@@ -2203,16 +2266,6 @@ static void output_destroy(struct wl_listener *listener, void *data) {
 	/* 最密的那块屏拔了：X 的全局缩放可以降下来。 */
 	vidow_xwayland_scale_apply(server);
 }
-
-/* --------------------------------------------------------- 色彩能力诊断 */
-/* 计划第 1 步：只印能力，不改任何行为。VIDOW_COLORDIAG=1 时，每块屏建好之后
- * （配置里的位深 / VRR 都落过了）印一份：
- *
- *   - 主 plane 的格式表：没有 XRGB2101010 就没有 10bit 扫描输出，第 2 步到此为止
- *   - 渲染器的目标格式表：没有 16161616F 就没有 FP16 内部缓冲，第 3 步得退 8bit
- *   - 当前位深 / gamma 表项数 / renderer 的两个色彩开关
- *
- * 这几行是后面所有色彩步骤的判据，所以打印的是「后端实际报的」，不做任何推断。 */
 
 /* wlroots 0.20 导出了这个符号但 Arch 的包里没装原型（fx.c / fx-gl.c 同样处理）。 */
 extern const struct wlr_drm_format_set *wlr_renderer_get_render_formats(
@@ -2245,6 +2298,131 @@ static const char *drm_fourcc_name(uint32_t fmt) {
 	default: return NULL;
 	}
 }
+
+/* ------------------------------------------------------ 输出端后处理（第 9 步） */
+
+/* vidow.output{ hdr = true } 的落点：场景先渲进 FP16 离屏，再一趟全屏 shader
+ * 做色域 / PQ / dither 上屏。代价是失去 direct scanout（wlr_output_lock_attach_render
+ * 顺便把直通也挡掉 —— 后处理必须每帧自己画）。
+ *
+ * slice 1（当前）：shader 参数是全通（线性进线性出、矩阵单位、不 dither），
+ * 只验证「多这一趟不改变像素、方向不反」。真正的 BT.2020 + PQ 在 slice 2。 */
+
+static void output_post_finish(struct vidow_output *output) {
+	wlr_swapchain_destroy(output->post_swapchain);
+	output->post_swapchain = NULL;
+	output->post_w = output->post_h = 0;
+	if (output->post_tex != NULL) {
+		wlr_texture_destroy(output->post_tex);
+		output->post_tex = NULL;
+	}
+}
+
+/* FP16 离屏交换链，按输出尺寸懒建。渲染器必须能把 16F 当渲染目标（gles2 在
+ * 真机上可以），否则返回 NULL，调用方退回 SDR 老路。 */
+static struct wlr_swapchain *output_post_swapchain(struct vidow_output *output,
+		int w, int h) {
+	struct vidow_server *server = output->server;
+	if (output->post_swapchain != NULL &&
+			output->post_w == w && output->post_h == h) {
+		return output->post_swapchain;
+	}
+	output_post_finish(output);
+	if (server->allocator == NULL || server->renderer == NULL) {
+		return NULL;
+	}
+	const struct wlr_drm_format_set *set =
+		wlr_renderer_get_render_formats(server->renderer,
+			server->allocator->buffer_caps);
+	if (set == NULL) {
+		return NULL;
+	}
+	/* ABGR 优先（带 alpha，和 fx 的中间缓冲一致）；没有就退 ARGB / XBGR。 */
+	static const uint32_t want[] = {
+		DRM_FORMAT_ABGR16161616F,
+		DRM_FORMAT_ARGB16161616F,
+		DRM_FORMAT_XBGR16161616F,
+	};
+	const struct wlr_drm_format *fmt = NULL;
+	for (size_t i = 0; i < sizeof(want) / sizeof(want[0]) && fmt == NULL; i++) {
+		fmt = wlr_drm_format_set_get(set, want[i]);
+	}
+	if (fmt == NULL) {
+		wlr_log(WLR_ERROR, "color: %s 没有 FP16 渲染目标（16161616F），"
+			"HDR 后处理用不了，保持 SDR", output->wlr_output->name);
+		return NULL;
+	}
+	output->post_swapchain = wlr_swapchain_create(server->allocator, w, h, fmt);
+	if (output->post_swapchain == NULL) {
+		wlr_log(WLR_ERROR, "color: %s 建 FP16 离屏交换链失败（%dx%d）",
+			output->wlr_output->name, w, h);
+		return NULL;
+	}
+	output->post_w = w;
+	output->post_h = h;
+	wlr_log(WLR_INFO, "color: %s 后处理离屏 %dx%d（%s）",
+		output->wlr_output->name, w, h,
+		drm_fourcc_name(output->post_swapchain->format.format));
+	return output->post_swapchain;
+}
+
+/* 把场景刚渲好的 FP16 缓冲搬进真正的扫描输出缓冲。
+ *
+ * 主交换链必须先配好（HDR 时 scene 不碰它），调用方在 build_state **之前**
+ * 就用空 state 配好了 —— 这里只 acquire。state.buffer 还是 FP16 那张，
+ * 换成新的之后 wlr_output_state 会自己放掉旧的那把锁。 */
+static bool output_post_blit(struct vidow_output *output,
+		struct wlr_output_state *state, struct wlr_texture *src, int w, int h) {
+	struct wlr_output *wlr_output = output->wlr_output;
+	struct wlr_buffer *dst = wlr_swapchain_acquire(wlr_output->swapchain);
+	if (dst == NULL) {
+		wlr_log(WLR_DEBUG, "color: %s 主交换链没缓冲可拿", wlr_output->name);
+		return false;
+	}
+	/* slice 1：全通（src/dst 都当「已经是显示编码」，矩阵单位，不 dither），
+	 * 用来单独验证多出来的这一趟不改变画面。slice 2 换真参数。 */
+	static const float identity[9] = { 1, 0, 0, 0, 1, 0, 0, 0, 1 };
+	bool ok = vidow_fx_post_pass(output->server, dst, src, w, h,
+		0.0f /* linear */, 0.0f /* linear */, identity, 1.0f, 0.0f, 0.0f);
+	if (ok) {
+		wlr_output_state_set_buffer(state, dst);
+	} else {
+		wlr_log(WLR_ERROR, "color: %s 后处理 pass 失败，丢掉这一帧",
+			wlr_output->name);
+	}
+	wlr_buffer_unlock(dst);
+	return ok;
+}
+
+/* 打开 / 关掉这块屏的输出端 HDR。重复调用幂等；开的时候加一把 attach_render
+ * 锁（禁 direct scanout），关的时候放掉，成对平衡。 */
+static void output_set_hdr(struct vidow_output *output, bool on) {
+	if (output->hdr == on) {
+		return;
+	}
+	output->hdr = on;
+	if (on) {
+		wlr_output_lock_attach_render(output->wlr_output, true);
+		wlr_log(WLR_INFO, "color: %s 输出端 HDR 开（FP16 离屏 + 全屏后处理，"
+			"直通关闭）", output->wlr_output->name);
+	} else {
+		output_post_finish(output);
+		wlr_output_lock_attach_render(output->wlr_output, false);
+		wlr_log(WLR_INFO, "color: %s 输出端 HDR 关（回到直通路径）",
+			output->wlr_output->name);
+	}
+	wlr_output_schedule_frame(output->wlr_output);
+}
+
+/* --------------------------------------------------------- 色彩能力诊断 */
+/* 计划第 1 步：只印能力，不改任何行为。VIDOW_COLORDIAG=1 时，每块屏建好之后
+ * （配置里的位深 / VRR 都落过了）印一份：
+ *
+ *   - 主 plane 的格式表：没有 XRGB2101010 就没有 10bit 扫描输出，第 2 步到此为止
+ *   - 渲染器的目标格式表：没有 16161616F 就没有 FP16 内部缓冲，第 3 步得退 8bit
+ *   - 当前位深 / gamma 表项数 / renderer 的两个色彩开关
+ *
+ * 这几行是后面所有色彩步骤的判据，所以打印的是「后端实际报的」，不做任何推断。 */
 
 static bool format_set_has(const struct wlr_drm_format_set *set, uint32_t fmt) {
 	return set != NULL && wlr_drm_format_set_get(set, fmt) != NULL;

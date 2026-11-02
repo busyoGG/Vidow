@@ -63,10 +63,14 @@ static void describe(const struct vidow_output_conf *conf, char *buf,
 		n += (size_t)snprintf(buf + (n < len ? n : len - 1),
 			len - (n < len ? n : len - 1), " %s", conf->enabled ? "开" : "关");
 	}
+	if (conf->has_hdr) {
+		n += (size_t)snprintf(buf + (n < len ? n : len - 1),
+			len - (n < len ? n : len - 1), " HDR=%s", conf->hdr ? "开" : "关");
+	}
 	if (!conf->has_scale && !conf->has_pos && !conf->has_mode &&
 			!conf->has_vrr && !conf->has_vrr_on_demand &&
 			!conf->has_depth && !conf->has_transform &&
-			!conf->has_enabled) {
+			!conf->has_hdr && !conf->has_enabled) {
 		snprintf(buf + (n < len ? n : len - 1),
 			len - (n < len ? n : len - 1), "（什么也没写：缩放和位置都自动）");
 	}
@@ -106,6 +110,8 @@ struct vidow_output_conf *vidow_output_conf_add(struct vidow_server *server,
 	conf->vrr_on_demand = spec->vrr_on_demand;
 	conf->has_depth = spec->has_depth;
 	conf->depth = spec->depth;
+	conf->has_hdr = spec->has_hdr;
+	conf->hdr = spec->hdr;
 	conf->has_transform = spec->has_transform;
 	conf->transform = spec->transform;
 	conf->has_enabled = spec->has_enabled;
