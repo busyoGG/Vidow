@@ -1748,18 +1748,20 @@ void vidow_output_vrr_on_demand_update(struct vidow_server *server,
 
 /* 渲染位深：10 位 = DRM_FORMAT_XRGB2101010 的输出缓冲。
  *
- * 「支不支持」不猜：先看后端报的格式表（能问就问），再直接提交试一次（后端
- * 没报格式表的时候只能这样）。失败就保持 8 位，日志里说清楚 —— 10 位要显卡、
- * 显示器、渲染器三样都到位，缺一样就只剩「本来就不生效」。 */
-bool vidow_output_set_depth(struct vidow_server *server,
+ * 「支不支持」不猜：先看后端报的格式表（能问就问），表是空的（后端不给）时才
+ * 直接提交试一次。失败就保持 8 位，日志里说清楚 —— 10 位要显卡、显示器、渲染器
+ * 三样都到位，缺一样就只剩「本来就不生效」。
+ *
+ * **位深不是只有 framebuffer。** 链路发几 bpc 由 connector 的 max bpc 决定，而
+ * wlroots 只在 modeset 提交里写这一项（`backend/drm/atomic.c:510`，
+ * `pick_max_bpc()` 按主 fb 的格式算）。所以建屏时位深必须进第一次 commit（那次
+ * 是 modeset）；运行中改必须顺带把当前模式一起提交，让它构成 modeset。只设
+ * `render_format` 的话 framebuffer 是 10 位、链路还是 8 位，屏幕上不会有任何变化
+ * （2026-11-02 实测：max bpc 范围 8..16，默认 8）。 */
+static uint32_t output_depth_format(struct vidow_server *server,
 		struct wlr_output *wlr_output, int depth) {
-	struct vidow_output *output = output_of(server, wlr_output);
-	if (output == NULL) {
-		return false;
-	}
-	uint32_t want = depth >= 10 ? DRM_FORMAT_XRGB2101010 : DRM_FORMAT_XRGB8888;
-	if (wlr_output->render_format == want) {
-		return true;
+	if (depth < 10) {
+		return DRM_FORMAT_XRGB8888;
 	}
 	const struct wlr_drm_format_set *formats = wlr_output_get_primary_formats(
 		wlr_output, server->allocator != NULL ?
@@ -1767,26 +1769,104 @@ bool vidow_output_set_depth(struct vidow_server *server,
 	/* 格式表里有这个格式就行，modifier 不挑（wlr_drm_format_set_has 是「一模一样的
 	 * modifier」，拿 MOD_INVALID 去问会永远说不支持）。 */
 	if (formats != NULL && formats->len > 0 &&
-			wlr_drm_format_set_get(formats, want) == NULL) {
-		wlr_log(WLR_INFO, "output %s: 这块屏不支持 %d 位色（输出缓冲没有 %s），"
-			"保持 %d 位", wlr_output->name, depth,
-			depth >= 10 ? "XRGB2101010" : "XRGB8888",
+			wlr_drm_format_set_get(formats, DRM_FORMAT_XRGB2101010) == NULL) {
+		wlr_log(WLR_INFO, "output %s: 这块屏不支持 10 位色（主 plane 没有 "
+			"XRGB2101010），保持 %d 位", wlr_output->name,
 			wlr_output->render_format == DRM_FORMAT_XRGB2101010 ? 10 : 8);
+		return DRM_FORMAT_XRGB8888;
+	}
+	return DRM_FORMAT_XRGB2101010;
+}
+
+/* 位深提交必须带一个模式 —— 只有 modeset 提交里后端才会写 max bpc（见上面的
+ * 注释）。优先带配置里这块屏的目标模式：配置重载时模式通常也在变，两者合进一次
+ * 提交，只重训一次链路（分开做会多闪一下）。没有配置模式就带当前模式。 */
+static void output_state_add_mode(struct vidow_server *server,
+		struct wlr_output *wlr_output, struct wlr_output_state *state) {
+	const struct vidow_output_conf *conf =
+		vidow_output_conf_for(server, wlr_output->name);
+	if (conf != NULL && conf->has_mode && conf->mode_w > 0 &&
+			conf->mode_h > 0) {
+		struct wlr_output_mode *m = output_find_mode(wlr_output,
+			conf->mode_w, conf->mode_h, conf->mode_hz);
+		if (m != NULL) {
+			wlr_output_state_set_mode(state, m);
+			return;
+		}
+		wlr_output_state_set_custom_mode(state, conf->mode_w, conf->mode_h,
+			conf->mode_hz > 0.0 ? (int32_t)(conf->mode_hz * 1000.0) : 0);
+		return;
+	}
+	if (wlr_output->current_mode != NULL) {
+		wlr_output_state_set_mode(state, wlr_output->current_mode);
+	} else {
+		wlr_output_state_set_custom_mode(state, wlr_output->width,
+			wlr_output->height, wlr_output->refresh);
+	}
+}
+
+bool vidow_output_set_depth(struct vidow_server *server,
+		struct wlr_output *wlr_output, int depth) {
+	struct vidow_output *output = output_of(server, wlr_output);
+	if (output == NULL) {
 		return false;
 	}
+	uint32_t want = output_depth_format(server, wlr_output, depth);
+	if (wlr_output->render_format == want) {
+		return true;
+	}
+
 	struct wlr_output_state state;
 	wlr_output_state_init(&state);
 	wlr_output_state_set_render_format(&state, want);
+	/* 带上模式：max bpc 只在 modeset 提交里生效（见上面的注释）。代价是链路
+	 * 可能重训，画面可能闪一下 —— 所以只在用户真的改了位深时才走这里。 */
+	int32_t before_refresh = wlr_output->refresh;
+	const struct vidow_output_conf *conf =
+		vidow_output_conf_for(server, wlr_output->name);
+	bool mode_changing = conf != NULL && conf->has_mode &&
+		((int)wlr_output->width != conf->mode_w ||
+		 (int)wlr_output->height != conf->mode_h ||
+		 (conf->mode_hz > 0.0 &&
+		  fabs(wlr_output->refresh / 1000.0 - conf->mode_hz) > 0.6));
+	output_state_add_mode(server, wlr_output, &state);
+	wlr_log(WLR_INFO, "output %s: %d 位色要重设链路（画面可能闪一下）",
+		wlr_output->name, want == DRM_FORMAT_XRGB2101010 ? 10 : 8);
 	bool ok = wlr_output_commit_state(wlr_output, &state);
 	wlr_output_state_finish(&state);
+
 	if (!ok) {
 		wlr_log(WLR_INFO, "output %s: 设成 %d 位色失败（后端 / 渲染器不支持），"
 			"保持 %d 位", wlr_output->name, depth,
 			wlr_output->render_format == DRM_FORMAT_XRGB2101010 ? 10 : 8);
 		return false;
 	}
-	wlr_log(WLR_INFO, "output %s: 输出缓冲 -> %s（%d 位色）", wlr_output->name,
-		depth >= 10 ? "XRGB2101010" : "XRGB8888", depth);
+
+	/* 10 位把带宽吃掉了：刷新率掉下来就不接受（宁可 8 位也不掉帧）。只在
+	 * 「模式没变、单纯换位深」时判 —— 模式本来就在变的话，刷新率是配置要
+	 * 求的，不该算到位深头上。 */
+	if (want == DRM_FORMAT_XRGB2101010 && !mode_changing &&
+			before_refresh > 0 && wlr_output->refresh > 0 &&
+			wlr_output->refresh < (int32_t)(before_refresh * 0.99)) {
+		wlr_log(WLR_INFO, "output %s: 10 位色让刷新率从 %.3fHz 掉到 %.3fHz，"
+			"回退 8 位", wlr_output->name, before_refresh / 1000.0,
+			wlr_output->refresh / 1000.0);
+		wlr_output_state_init(&state);
+		wlr_output_state_set_render_format(&state, DRM_FORMAT_XRGB8888);
+		output_state_add_mode(server, wlr_output, &state);
+		if (!wlr_output_commit_state(wlr_output, &state)) {
+			wlr_log(WLR_ERROR, "output %s: 回退 8 位失败（现在可能还是 10 位）",
+				wlr_output->name);
+		}
+		wlr_output_state_finish(&state);
+		output_state_applied(server, output);
+		return false;
+	}
+
+	wlr_log(WLR_INFO, "output %s: 输出缓冲 -> %s（%d 位色），刷新率 %.3fHz",
+		wlr_output->name, want == DRM_FORMAT_XRGB2101010 ? "XRGB2101010" :
+		"XRGB8888", want == DRM_FORMAT_XRGB2101010 ? 10 : 8,
+		(float)wlr_output->refresh / 1000.0f);
 	output_state_applied(server, output);
 	return true;
 }
@@ -1919,6 +1999,11 @@ void vidow_output_apply_state_all(struct vidow_server *server) {
 				wlr_output->name, conf->enabled ? "打开" : "关掉");
 			vidow_output_set_enabled(server, wlr_output, conf->enabled);
 		}
+		/* 位深要在模式**之前**：max bpc 只在 modeset 提交里被改写，而模式
+		 * 切换本身就是 modeset —— 位深那次提交顺手把配置里的新模也上了，
+		 * 整条链路只重训一次（分开做会多闪一下）。模式已经在位深提交里落
+		 * 过的话，下面的模式判断自然就跳过了。 */
+		output_apply_conf_extra(server, output);
 		if (conf->has_mode && wlr_output->enabled &&
 				((int)wlr_output->width != conf->mode_w ||
 				 (int)wlr_output->height != conf->mode_h ||
@@ -1932,7 +2017,6 @@ void vidow_output_apply_state_all(struct vidow_server *server) {
 		if (conf->has_transform && wlr_output->transform != conf->transform) {
 			vidow_output_set_transform(server, wlr_output, conf->transform);
 		}
-		output_apply_conf_extra(server, output);
 		/* 按需 VRR：配置改了（全局开关 / 这块屏的 vrr_on_demand / 静态 vrr）
 		 * 也对一遍账 —— 该提的提、该降的降。 */
 		vidow_output_vrr_on_demand_update(server, wlr_output);
@@ -2218,10 +2302,12 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 		return;
 	}
 
-	/* 配置里这块屏那一组（vidow.output{…}）：开关 / 模式 / 方向都进第一次
-	 * commit —— 一起上屏，客户端看到的第一个尺寸就是对的。VRR 和位深不行
-	 * （不能在关着的屏上设，也不该和上模式挤同一次 commit），commit 之后由
-	 * output_apply_conf_extra() 单独补。 */
+	/* 配置里这块屏那一组（vidow.output{…}）：开关 / 模式 / 方向 / 位深都进第一次
+	 * commit —— 一起上屏，客户端看到的第一个尺寸就是对的。**位深必须在第一次
+	 * commit 里**：链路位深（connector 的 max bpc）只在 modeset 提交里才会被
+	 * 后端改写，而这一次就是 modeset；放到后面单独设只能换 framebuffer 格式，
+	 * 链路仍是 8bpc（详见 output_depth_format() 的注释）。VRR 仍然要等 commit
+	 * 之后单独补（不能在关着的屏上设）。 */
 	const struct vidow_output_conf *conf =
 		vidow_output_conf_for(server, wlr_output->name);
 	bool want_enabled = conf != NULL && conf->has_enabled ? conf->enabled : true;
@@ -2252,6 +2338,17 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 			mode_w = mode->width;
 			mode_h = mode->height;
 			wlr_output_state_set_mode(&state, mode);
+		}
+	}
+	/* 位深进第一次 commit（见上面那段注释）。输出关着的时候不设：后端会拒。 */
+	if (conf != NULL && conf->has_depth && want_enabled) {
+		uint32_t want = output_depth_format(server, wlr_output, conf->depth);
+		if (want != wlr_output->render_format) {
+			wlr_output_state_set_render_format(&state, want);
+			wlr_log(WLR_INFO, "output %s: 第一次上屏就用 %s（%d 位色）",
+				wlr_output->name,
+				want == DRM_FORMAT_XRGB2101010 ? "XRGB2101010" : "XRGB8888",
+				want == DRM_FORMAT_XRGB2101010 ? 10 : 8);
 		}
 	}
 	if (conf != NULL && conf->has_transform) {
