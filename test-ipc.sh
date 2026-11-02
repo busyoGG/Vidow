@@ -552,7 +552,7 @@ check "im 状态" '{"cmd":"im"}' 'resp["result"]["connected"]' 'False'
 check "anims 结构" '{"cmd":"anims"}' '"running" in resp["result"]' 'True'
 check "state 里带上了一切" '{"cmd":"state"}' \
 	'sorted(resp["result"].keys())' \
-	"['activation_tokens', 'anims', 'clipboard', 'config', 'config_lua', 'counts', 'focused', 'gestures', 'im', 'input', 'keybinds', 'layers', 'log_level', 'mru', 'output_memories', 'outputs', 'overview', 'pid', 'primary_selection', 'rules', 'screencast', 'seats', 'shaders', 'socket', 'time_ms', 'version', 'wayland_display', 'windows', 'workspaces', 'xwayland']"
+	"['activation_tokens', 'anims', 'clipboard', 'config', 'config_lua', 'counts', 'focused', 'gestures', 'im', 'input', 'keybinds', 'layers', 'log_level', 'mru', 'output_memories', 'outputs', 'overview', 'pid', 'primary_selection', 'render_stats', 'rules', 'screencast', 'seats', 'shaders', 'socket', 'time_ms', 'version', 'wayland_display', 'windows', 'workspaces', 'xwayland']"
 
 # ------------------------------------------------------------ 10) 事件订阅
 mark "事件订阅：打开 / 移动 / 浮动 / 关闭 / 工作区 / 输出 / 过滤器"
@@ -788,6 +788,44 @@ check "output-power 再打开" \
 	'resp["result"]["output"]["enabled"]' 'True'
 check "两块屏各报各的窗口" '{"cmd":"outputs"}' \
 	"[len(o['windows']) for o in resp['result'] if o['name']=='$OTHER'][0] >= 1" 'True'
+
+# ------------------------------------------------------- 12b) 应答延迟
+mark "应答延迟：一问一答不许被定时器节拍拖慢"
+
+# 判据：中位延迟 < 20ms。
+#
+# 曾经把 IPC 交给 fdwatch 的 250ms timerfd 节拍统一 poll（commit d88bad1
+# 「60Hz 降到 4Hz」）—— 那个节拍是给诊断 fd 用的，IPC 搭上去之后每条请求 /
+# 应答都要多等最多 250ms。vshell 每次事件要连发 windows / workspaces /
+# focused 几轮快照，串行排队 → 界面整体晚半秒；启动器问「光标在哪块屏」
+# 也是被这条拖到 70~750ms，于是先画在 remembered 的屏上、过一会儿才跳回
+# 正确的屏。这条断言把那种「又接回定时器」的改动挡在门外。
+lat=$(python3 - "$SOCK" <<'PY'
+import socket, sys, time
+p = sys.argv[1]
+lat = []
+for _ in range(30):
+    s = socket.socket(socket.AF_UNIX)
+    s.connect(p)
+    t = time.perf_counter()
+    s.sendall(b'{"cmd":"cursor"}\n')
+    buf = b""
+    while not buf.endswith(b"\n"):
+        d = s.recv(4096)
+        if not d:
+            break
+        buf += d
+    lat.append((time.perf_counter() - t) * 1000)
+    s.close()
+lat.sort()
+print("%.1f" % lat[len(lat) // 2])
+PY
+)
+if awk -v v="$lat" 'BEGIN { exit !(v < 20) }'; then
+	pass "cursor 请求的中位延迟 ${lat}ms（< 20ms）"
+else
+	fail "cursor 请求的中位延迟 ${lat}ms（应该 < 20ms —— 又被什么节拍拖住了？）"
+fi
 
 # ------------------------------------------------------------ 13) 收尾
 mark "收尾：quit 让合成器退出、socket 清掉"

@@ -1,11 +1,15 @@
 /* 自唤醒 fd 统管（实现在 fdwatch.c，和 fd 泄漏看门狗放在同一个文件里）。
  *
  * 合成器自己的自唤醒 fd —— Xwayland 的 ready 管道、配置监听的 inotify、exec
- * 子进程的退出管道、IPC 的连接 / 监听 socket、剪贴板拉取管道、录制给客户端的
- * pipe —— **不挂** wl_event_loop_add_fd：libwayland 会先 dup 一份藏进
+ * 子进程的退出管道、剪贴板拉取管道、录制给客户端的 pipe —— **不挂**
+ * wl_event_loop_add_fd：libwayland 会先 dup 一份藏进
  * /proc/self/fd 里那个不让非特权用户读的目录（`lsof -p` 连 fd 都看不到），
- * 而且这些 fd 只要不读干净就是常驻自唤醒。改由一个 16ms 的 timerfd 节拍统一
+ * 而且这些 fd 只要不读干净就是常驻自唤醒。改由一个 250ms 的 timerfd 节拍统一
  * poll：没人有事 = 这一拍什么也不做。
+ *
+ * **IPC 不在这个名单里**：250ms 的节拍对诊断够用，对「一问一答」的请求/应答
+ * 就是灾难（vshell 的状态刷新每条都晚最多 250ms，界面整体慢半拍）。IPC 的监听
+ * socket 和每条连接都直接挂 wl_event_loop_add_fd（见 ipc.c）。
  *
  * 用法（详细语义见 server.h 里那段注释）：
  *

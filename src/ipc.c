@@ -3193,21 +3193,6 @@ static bool ipc_client_read(struct ipc_client *c) {
 	return true;
 }
 
-static int ipc_client_handle(struct ipc_client *c, uint32_t mask);
-
-/* fdwatch 版：走到这儿一定是「可读」或者「该去写完」。返回 1 = 这一拍的事办
- * 完了（下一拍没可读的自然不会再叫）；0 不用 —— ipc 的缓冲有上限，写不完下次
- * poll 会报 EPOLLOUT。 */
-static int ipc_client_fdw(int fd, void *data) {
-	(void)fd;
-	struct ipc_client *c = data;
-	uint32_t mask = WL_EVENT_READABLE;
-	if (c->out_sent < c->out_len) {
-		mask |= WL_EVENT_WRITABLE;
-	}
-	return ipc_client_handle(c, mask) == 0;
-}
-
 static int ipc_client_handle(struct ipc_client *c, uint32_t mask) {
 	if (mask & (WL_EVENT_HANGUP | WL_EVENT_ERROR)) {
 		ipc_client_destroy(c);
@@ -3249,18 +3234,22 @@ static void ipc_new_client(struct vidow_server *server, int fd) {
 	}
 	c->server = server;
 	c->fd = fd;
-	/* 自唤醒 fd 不挂 add_fd（见 fdwatch.c）：监听 socket 常驻可读，挂在事件
-	 * 循环上等于每轮都自己叫醒自己。 */
-	if (!vidow_fdwatch_register(fd, VIDOW_FDWATCH_IPC, ipc_client_fdw, c)) {
-		c->source = wl_event_loop_add_fd(
-			wl_display_get_event_loop(server->display), fd,
-			WL_EVENT_READABLE, ipc_client_event, c);
-		if (c->source == NULL) {
-			vidow_fdwatch_deregister(fd, VIDOW_FDWATCH_IPC, c);
-			close(fd);
-			free(c);
-			return;
-		}
+	/* **IPC 走事件循环，不进 fdwatch。**
+	 *
+	 * fdwatch 的节拍是 250ms（见 fdwatch.c）—— 诊断用的 fd 慢一点无所谓，
+	 * IPC 不行：vshell 每次事件都发一轮快照请求（windows / workspaces /
+	 * focused），串行排队，每条多等最多 250ms，界面状态就整体晚半秒；
+	 * openLauncher 的 outputAtCursor 也是被这条拖到 70~750ms 的。
+	 *
+	 * 挂 add_fd 不会空转：ipc_client_read 一次读到 EAGAIN，请求读干净之后
+	 * fd 就不可读了。 */
+	c->source = wl_event_loop_add_fd(
+		wl_display_get_event_loop(server->display), fd,
+		WL_EVENT_READABLE, ipc_client_event, c);
+	if (c->source == NULL) {
+		close(fd);
+		free(c);
+		return;
 	}
 	wl_list_insert(server->ipc_clients.prev, &c->link);
 }
@@ -3281,14 +3270,7 @@ static void ipc_serve(struct vidow_server *server, int fd) {
 	}
 }
 
-/* fdwatch 版（监听 socket）：可读了就把排队的连接全领走。 */
-static int ipc_listen_fdw(int fd, void *data) {
-	struct vidow_server *server = data;
-	ipc_serve(server, fd);
-	return 1;
-}
-
-/* 事件循环版（fdwatch 起不来时兜底）。 */
+/* 事件循环版。 */
 static int ipc_accept(int fd, uint32_t mask, void *data) {
 	struct vidow_server *server = data;
 	if (!(mask & WL_EVENT_READABLE)) {
@@ -3428,19 +3410,19 @@ bool vidow_ipc_apply_config(struct vidow_server *server) {
 		unlink(path);
 		return false;
 	}
-	/* 监听 socket 常驻可读：挂 add_fd 的话每轮循环都在「有东西读」，等于
-	 * 常驻自唤醒。交给 fdwatch（见 fdwatch.c），起不来才退回事件循环。 */
-	if (!vidow_fdwatch_register(server->ipc_fd = fd, VIDOW_FDWATCH_IPC,
-			ipc_listen_fdw, server)) {
-		server->ipc_listen = wl_event_loop_add_fd(
-			wl_display_get_event_loop(server->display), fd, WL_EVENT_READABLE,
-			ipc_accept, server);
-		if (server->ipc_listen == NULL) {
-			close(fd);
-			server->ipc_fd = -1;
-			unlink(path);
-			return false;
-		}
+	/* **监听 socket 走事件循环**（和连接一样，见 ipc_new_client 的说明）。
+	 * 它只在真有连接排队时才是可读的（ipc_serve 一次 accept 到 EAGAIN），
+	 * 挂 add_fd 不产生空转；而 250ms 的 fdwatch 节拍会让每次新连接多等
+	 * 最多四分之一秒 —— vshell 一断线重连就是几百毫秒的空窗。 */
+	server->ipc_fd = fd;
+	server->ipc_listen = wl_event_loop_add_fd(
+		wl_display_get_event_loop(server->display), fd, WL_EVENT_READABLE,
+		ipc_accept, server);
+	if (server->ipc_listen == NULL) {
+		close(fd);
+		server->ipc_fd = -1;
+		unlink(path);
+		return false;
 	}
 	snprintf(server->ipc_path, sizeof(server->ipc_path), "%s", path);
 	wlr_log(WLR_INFO, "ipc: 听 %s（一行一个 JSON 请求，客户端是 vidowmsg）",

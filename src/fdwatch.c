@@ -311,7 +311,7 @@ bool vidow_fdwatch_register(int fd, enum vidow_fdwatch_kind kind,
 	e->handler = handler;
 	e->data = data;
 	wl_list_insert(&server->fdwatch->entries, &e->link);
-	/* **别刷屏**。IPC 这类 fd 一秒来去几十个（vshot 的回放待机每 250ms 问
+	/* **别刷屏**。这类 fd 一秒来去几十个（vshot 的回放待机每 250ms 问
 	 * 一次窗口列表、portal 连一次 dbus 就是一对 fd），每次接管都打一行
 	 * INFO，一天就是几十万行 —— 日志本身变成最大的 IO。降到 DEBUG。 */
 	wlr_log(WLR_DEBUG, "fdwatch: 接管 fd %d（kind %d），改由定时器轮询",
@@ -548,7 +548,8 @@ static int fd_watch_tick(void *data) {
  * VIDOW_FD_WATCH=1）时白占 ~60 次/秒的空闲唤醒（实测空闲总唤醒 371/s，
  * 它一家占 1/6）。这个 tick 的工作只是「看看有没有新东西可读」，250ms
  * 的粒度对诊断足够（16-env.lua 注释里说的也是「每 3 秒数一次」的量级），
- * 抓 IPC / 钩子的突发照样抓得住。 */
+ * 抓钩子的突发照样抓得住。**IPC 不在这里**：一问一答等 250ms 就是「界面
+ * 慢半拍」，它直接挂事件循环（见 ipc.c）。 */
 #define FDWATCH_INTERVAL_NS 250000000LL
 
 void vidow_fdwatch_init(struct vidow_server *server) {
