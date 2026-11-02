@@ -1367,6 +1367,21 @@ enum vidow_redraw_state {
 	VIDOW_REDRAW_RENDERING,
 };
 
+/* 输出端 3x1D LUT 的主人（第 8 步并进第 9 步的「仲裁」，见 output.c 的
+ * output_color_apply）。KMS 只有一张 GAMMA_LUT，同一时刻只能有一个赢家：
+ *
+ *   CLIENT  客户端 zwlr_gamma_control_v1（redshift / 夜间模式 / wlr-randr）
+ *   VIDOW   Vidow 自己的输出曲线（第 9 步的 HDR / 校准）
+ *
+ * 优先级 **客户端 > Vidow**：用户装校色工具的意图比合成器的默认曲线更明确。
+ * 真要叠加（例如 HDR 的 PQ 曲线 + 客户端亮度）不能靠两张 LUT，得在第 9 步的
+ * 全屏 pass 里合成 —— KMS 这边只留一个赢家。 */
+enum vidow_lut_owner {
+	VIDOW_LUT_OWNER_NONE = 0,
+	VIDOW_LUT_OWNER_CLIENT,
+	VIDOW_LUT_OWNER_VIDOW,
+};
+
 struct vidow_output {
 	struct wl_list link; /* vidow_server.outputs */
 	struct vidow_server *server;
@@ -1381,6 +1396,9 @@ struct vidow_output {
 	/* 上次给这块屏下发的校色 LUT（zwlr_gamma_control_v1，见 vidow_gamma_init）。
 	 * 走 KMS 的 3x1D color_transform，不经 renderer —— 所以 gles2 也能用。 */
 	struct wlr_color_transform *gamma_lut;
+	/* 这张 LUT 现在是谁的（见 enum vidow_lut_owner）。改的时候要记日志：
+	 * 「为什么我的夜间模式不生效 / 为什么合成器曲线没了」全靠这一条。 */
+	enum vidow_lut_owner gamma_owner;
 	/* LUT 改过、还没跟着某一帧提交（KMS 属性不会自己丢，不用每帧重塞）。 */
 	bool gamma_lut_dirty;
 	/* 当前持有 LUT 的那个 control 对象（失败时要回 failed 并销毁它）。 */

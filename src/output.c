@@ -29,6 +29,8 @@
  * --debug 跑的时候才看得见）。这样不用改登录环境就能在真实会话里量基线。
  *
  * 每 500ms 才 stat 一次：这个函数一帧要问好几遍，而 stat 也是 syscall。 */
+static void output_color_apply(struct vidow_output *output,
+		struct wlr_output_state *state);
 static bool render_stats_file_on(void) {
 	static int64_t last_ns = 0;
 	static bool on = false;
@@ -381,8 +383,7 @@ void vidow_output_render(struct vidow_output *output) {
 			/* LUT 只在「改过」的那一帧提交一次：KMS 的 CTM 属性不会因为
 			 * 后续不带它的提交而丢，每帧重塞只是白算一个 blob。 */
 			if (output->gamma_lut_dirty) {
-				wlr_output_state_set_color_transform(&state,
-					output->gamma_lut);
+				output_color_apply(output, &state);
 			}
 			if (!wlr_output_commit_state(output->wlr_output, &state)) {
 				wlr_log(WLR_DEBUG, "output %s: 提交失败（含校色 LUT）",
@@ -2346,6 +2347,23 @@ static void output_log_color_caps(struct vidow_server *server,
  *   - 没有损伤的帧也要提交一次（颜色变了但画面没变，scene 那条路会被
  *     「不需要出帧」挡掉）；
  *   - 屏重新打开时重下发（KMS 的 gamma 表在关屏 / 换模式时会丢）。 */
+/* 输出端色彩状态的唯一决策入口（第 8 步并进第 9 步的那一小块「仲裁」）。
+ *
+ * KMS 侧能表达的只有一张 3x1D LUT（DRM 的 GAMMA_LUT 属性）；矩阵 / 3D LUT /
+ * 逐内容 tone map 在 gles2 上只能靠第 9 步的全屏 pass，不在这里。
+ *
+ * 优先级（见 enum vidow_lut_owner）：客户端 zwlr_gamma_control_v1 > Vidow 自己
+ * 的曲线。将来加 HDR / 校准时，**只改这一个函数**决定谁上屏，不要再在别处
+ * 直接 wlr_output_state_set_color_transform() —— 两张 LUT 不可能同时生效，
+ * 分散设置的结果就是「谁后提交谁赢」，日志里还看不出来。 */
+static void output_color_apply(struct vidow_output *output,
+		struct wlr_output_state *state) {
+	if (output->gamma_lut == NULL) {
+		return;
+	}
+	wlr_output_state_set_color_transform(state, output->gamma_lut);
+}
+
 /* 把当前 LUT 立刻提交下去（只带 color_transform，不带 buffer）。
  * 不这么做就得等下一帧 —— 而改颜色时画面可能一点没脏，那一帧可能永远不来
  * （headless 上实测：set_gamma 之后一帧都没有）。 */
@@ -2358,7 +2376,7 @@ static void gamma_apply(struct vidow_output *output) {
 	}
 	struct wlr_output_state state;
 	wlr_output_state_init(&state);
-	wlr_output_state_set_color_transform(&state, output->gamma_lut);
+	output_color_apply(output, &state);
 	bool ok = wlr_output_test_state(wlr_output, &state) &&
 		wlr_output_commit_state(wlr_output, &state);
 	wlr_output_state_finish(&state);
@@ -2370,6 +2388,11 @@ static void gamma_apply(struct vidow_output *output) {
 	wlr_log(WLR_ERROR, "gamma: %s 不接受这份校色表（%zu 项），"
 		"告诉客户端失败", wlr_output->name,
 		wlr_output_get_gamma_size(wlr_output));
+	if (output->gamma_owner == VIDOW_LUT_OWNER_CLIENT) {
+		wlr_log(WLR_INFO, "color: %s 输出 LUT -> Vidow 默认（这份表没被接受）",
+			wlr_output->name);
+		output->gamma_owner = VIDOW_LUT_OWNER_NONE;
+	}
 	/* 先把本地状态清干净，再回 failed：send_failed 会触发一次
 	 * set_gamma(control = NULL)，那时不该再拿着同一个 control 重入。 */
 	struct wlr_gamma_control_v1 *ctl = output->gamma_ctl;
@@ -2396,6 +2419,17 @@ static void gamma_handle_set(struct wl_listener *listener, void *data) {
 	wlr_color_transform_unref(output->gamma_lut);
 	output->gamma_lut = lut;
 	output->gamma_ctl = event->control;
+	enum vidow_lut_owner owner = lut != NULL ? VIDOW_LUT_OWNER_CLIENT
+		: VIDOW_LUT_OWNER_NONE;
+	if (owner != output->gamma_owner) {
+		/* 这条用 INFO：出了「夜间模式不生效 / 颜色被谁改了」时，日志里
+		 * 必须能看出输出端 LUT 在谁手里。 */
+		wlr_log(WLR_INFO, "color: %s 输出 LUT -> %s", event->output->name,
+			owner == VIDOW_LUT_OWNER_CLIENT
+				? "客户端（zwlr_gamma_control_v1）"
+				: "Vidow 默认（客户端已清掉）");
+		output->gamma_owner = owner;
+	}
 	wlr_log(WLR_DEBUG, "gamma: %s 校色表 -> %s", event->output->name,
 		lut != NULL ? "已设" : "清掉");
 	gamma_apply(output);
@@ -2414,6 +2448,7 @@ static void gamma_handle_destroy(struct wl_listener *listener, void *data) {
 	wl_list_for_each(output, &server->outputs, link) {
 		wlr_color_transform_unref(output->gamma_lut);
 		output->gamma_lut = NULL;
+		output->gamma_owner = VIDOW_LUT_OWNER_NONE;
 	}
 }
 
