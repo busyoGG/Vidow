@@ -400,9 +400,28 @@ double vidow_jelly_pad(const struct vidow_view *view) {
 	return pad;
 }
 
+/* 窗口现在是不是骑在两块（或更多）屏上。
+ *
+ * 果冻是**整窗一张**缓冲、一份源（jelly_source_node 只能挑一格的装饰缓冲），
+ * 而跨屏时两块屏各有一份、倍率还不一样（1x / 2x）。一份源喂两块屏，另一半
+ * 拿到的就是**错倍率**那张图 —— 用户 2026-11-03 报的「还没过边界时另一块屏幕
+ * 那半截有横纹，越过去就开始闪烁」。
+ *
+ * 跨屏期间退回「每屏各画自己那份装饰」（fx 的 per-output blur_slot），形变
+ * 让位给正确性：窗口在边界上那一小段没有果冻，落到某块屏里之后照旧。 */
+static bool jelly_view_straddles(struct vidow_view *view) {
+	struct vidow_place place;
+	vidow_place_of_view(view->server, view, &place);
+	return place.resident && place.n > 1;
+}
+
 bool vidow_jelly_begin(struct vidow_view *view) {
 	struct vidow_server *server = view->server;
 	if (!server->config.jelly) {
+		return false;
+	}
+	/* 起手时就在边界上：不做（见 jelly_view_straddles）。 */
+	if (jelly_view_straddles(view)) {
 		return false;
 	}
 	/* 上一个还没收完（松手之后紧接着又按下去拖）：直接收掉重来，不然新的拖拽
@@ -1132,6 +1151,22 @@ void vidow_jelly_tick(struct vidow_server *server, int64_t now_ns) {
 	wl_list_for_each_safe(view, tmp, &server->views, link) {
 		struct vidow_jelly *jelly = view->jelly;
 		if (jelly == NULL) {
+			continue;
+		}
+		/* **骑到两块屏上就收掉形变**（见 jelly_view_straddles）。
+		 *
+		 * 果冻只有一份整窗缓冲、一份源：两块屏倍率不同时，另一块屏那一半
+		 * 只能拿错倍率的图（横纹），或者两块屏轮流用各自那一份（闪烁）。
+		 * 收掉之后 fx->jelly 归 false，装饰节点当场恢复可见（jelly_free 里
+		 * 那次 apply_anim），每块屏按自己那份装饰缓冲画自己那一半。
+		 *
+		 * 收一次就够：松手之前不会再起手（起手只在拖拽开始时调），所以这行
+		 * 日志一次拖拽最多一条。 */
+		if ((view->dragging || server->grab_view == view) &&
+				jelly_view_straddles(view)) {
+			wlr_log(WLR_INFO, "果冻: 窗口骑在两块屏上，暂停形变"
+				"（每屏各画各的装饰，避免另一半拿错倍率）");
+			vidow_jelly_end(view);
 			continue;
 		}
 		double source_scale = 1.0;

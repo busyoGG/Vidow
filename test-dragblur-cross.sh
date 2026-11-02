@@ -62,7 +62,7 @@ blur_offset = 1.5
 window_open_ms = 0
 window_close_ms = 0
 window_move_ms = 0
-jelly = false
+jelly = true
 scale = "1"
 vidow.bind("Mod+mouse-left", "interactive-move")
 CFG
@@ -259,6 +259,11 @@ log = open(os.path.join(rundir, "log"), "rb").read()[before:after]
 log = log.decode("utf-8", "replace")
 own = log.count("blur: own region wA")
 check(own >= 2, "前提：拖动期间 wA 的私有底衬重抓过（%d 次）" % own)
+
+# 0) 果冻必须在跨屏那一刻收手：整窗一份果冻缓冲喂不了两块倍率不同的屏
+#    （1x / 2x），另一块屏那一半会拿错倍率 —— 横纹 / 闪烁的来源。
+check(log.count("果冻: 窗口骑在两块屏上") >= 1,
+      "跨屏时果冻收手（退回每屏各画各的装饰）")
 
 # 2) 左屏：wA ∩ wB ∩ 左屏 的那一条，左右各留 20 避开圆角 / 阴影
 gbox = (max(w - 200, bx + 20), by + 60,
