@@ -181,9 +181,9 @@ from PIL import Image
 a = np.asarray(Image.open(sys.argv[1]).convert('RGB'), dtype=np.int16)
 b = np.asarray(Image.open(sys.argv[2]).convert('RGB'), dtype=np.int16)
 d = np.abs(a - b).max(axis=2)
-# 容差 3 而不是 2：color.linear_blend / linear_blur 打开时，每趟模糊 /
-# 合成多了几次解码-编码往返，8 位缓冲上的量化差偶尔会到 3（实测 8 个像素，
-# 都在模糊的渐变里，肉眼无差）。差 3 以上仍然算失败。
+# 容差 3 而不是 2：color.linear_blend 默认开（linear_blur 打开时又多一层），
+# 每趟模糊 / 合成多了几次解码-编码往返，8 位缓冲上的量化差偶尔会到 3（实测
+# 8 个像素，都在模糊的渐变里，肉眼无差）。差 3 以上仍然算失败。
 n = int((d > 3).sum())
 print("    最大差 %d，差 > 3 的像素 %d 个（整幅 %d 像素；差 > 2 的 %d 个）"
       % (int(d.max()), n, d.size, int((d > 2).sum())))

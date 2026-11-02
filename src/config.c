@@ -323,13 +323,14 @@ static const struct entry entries[] = {
 		"是 vidow.output{ depth } 的事" },
 	{ "color_linear_blend", K_BOOL, OFF(color_linear_blend),
 		SZ(color_linear_blend), 5,
-		"装饰合成在线性光里做（先解码内容 / 底衬，混完再编码）。默认关："
-		"开着阴影和半透明边缘会更透、更接近物理叠加，是有意的视觉变化。"
-		"组写法 color.linear_blend" },
+		"装饰合成在线性光里做（先解码内容 / 底衬，混完再编码）。默认开："
+		"阴影和半透明边缘更透、更接近物理叠加（2026-11-02 真机 A/B 后拍板）。"
+		"想要老观感就设 false。组写法 color.linear_blend" },
 	{ "color_linear_blur", K_BOOL, OFF(color_linear_blur),
 		SZ(color_linear_blur), 5,
 		"背景模糊在线性光里算（每级解码 → 加权平均 → 编码回屏幕空间）。"
-		"默认关：开着亮部糊得更亮、更柔。组写法 color.linear_blur" },
+		"默认关：真机上肉眼几乎无差（窗口均值 +0.7），却要给每一级多算一对"
+		"解码 / 编码；想要理论正确再打开。组写法 color.linear_blur" },
 
 	{ "debug_show_refresh", K_BOOL, OFF(debug_show_refresh), SZ(debug_show_refresh), 5,
 		"在每块屏右上角显示实测帧率（debug 用；静止桌面应接近 0，顶到刷新率说明有空转）" },
@@ -2202,8 +2203,10 @@ static void defaults(struct vidow_config *cfg) {
 	/* 默认 auto：能上 FP16 就上（用户在 2026-11-02 拍板接受这份显存代价）。
 	 * 驱动不支持半浮点线性过滤时会自动退回 8 位，见 fx-gl.c。 */
 	snprintf(cfg->color_precision, sizeof(cfg->color_precision), "auto");
-	/* 线性合成默认关：这是有意的视觉变化（阴影更透），要用户看过 A/B 再定。 */
-	cfg->color_linear_blend = false;
+	/* 线性合成默认开（2026-11-02 真机 A/B 后拍板）：半透明窗内部均值
+	 * +17.5、阴影更透，只影响本该线性化的部分。模糊的线性化肉眼几乎无差
+	 * （+0.7）却要给每级多算一对解码/编码，保持默认关。 */
+	cfg->color_linear_blend = true;
 	cfg->color_linear_blur = false;
 	/* 激活令牌不过期：wlroots 默认 30 秒，而「弹通知」和「点通知」之间常常隔着
 	 * 几分钟 —— 令牌过期了 wlroots 直接把激活请求丢掉，我们连信号都收不到
