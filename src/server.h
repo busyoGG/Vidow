@@ -22,6 +22,7 @@
 #include <wlr/types/wlr_cursor.h>
 #include <wlr/types/wlr_cursor_shape_v1.h>
 #include <wlr/types/wlr_data_device.h>
+#include <wlr/types/wlr_gamma_control_v1.h>
 #include <wlr/types/wlr_input_device.h>
 #include <wlr/types/wlr_input_method_v2.h>
 #include <wlr/types/wlr_keyboard.h>
@@ -2729,6 +2730,9 @@ struct vidow_server {
 	struct wlr_allocator *allocator;
 
 	struct wlr_scene *scene;
+	/* zwlr_gamma_control_manager_v1（校色 / 亮度 / 色温工具用的 1D LUT）。
+	 * 交给 scene 接管：LUT 走 KMS 的 3x1D，不经 renderer —— gles2 也能用。 */
+	struct wlr_gamma_control_manager_v1 *gamma_control;
 	/* 桌面底色（background_color）：垫在**所有东西**下面。壁纸由 layer-shell
 	 * 的 background 层客户端画（swaybg / swww / shell），这个只是「谁都没画」
 	 * 时的兜底，所以它在 layer_background 下面一层。 */

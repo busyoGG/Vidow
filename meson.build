@@ -291,6 +291,22 @@ executable('colorprobe',
   dependencies: [wayland_client_dep],
   include_directories: include_directories('.'),
   install: false)
+
+# 测试工具：校色 LUT 探针（zwlr_gamma_control_v1 下发了到底接不接）
+gc_xml = 'protocols/wlr-gamma-control-unstable-v1.xml'
+gc_client_header = custom_target('wlr-gamma-control-unstable-v1-client-protocol.h',
+  input: gc_xml,
+  output: 'wlr-gamma-control-unstable-v1-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'])
+gc_code = custom_target('wlr-gamma-control-unstable-v1-protocol.c',
+  input: gc_xml,
+  output: 'wlr-gamma-control-unstable-v1-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
+executable('gammaprobe',
+  ['tools/gammaprobe.c', gc_client_header, gc_code],
+  dependencies: [wayland_client_dep, math_dep],
+  include_directories: include_directories('.'),
+  install: false)
 bge_client_header = custom_target('ext-background-effect-v1-client-protocol.h',
   input: bge_xml,
   output: 'ext-background-effect-v1-client-protocol.h',

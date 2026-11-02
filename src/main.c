@@ -982,6 +982,19 @@ int main(int argc, char *argv[]) {
 	server.scene = wlr_scene_create();
 	server.scene_layout =
 		wlr_scene_attach_output_layout(server.scene, server.output_layout);
+	/* 校色 / 亮度 / 色温工具（wlr-randr --gamma、icc-brightness、redshift 类）
+	 * 靠 zwlr_gamma_control_manager_v1 下发每通道 1D LUT。之前没导出这个
+	 * global，那些工具全部静默无效。
+	 *
+	 * 交给 scene 接管而不是自己接：scene 会把 LUT 变成 3x1D color_transform
+	 * 塞进 output state，DRM 后端直接下发 KMS gamma 表（本机 4096 项），
+	 * 完全不经 renderer —— 所以强制 gles2 的 Vidow 也能用（计划第 8 节）。
+	 * 输出没有 KMS gamma 表时才退回渲染器做（gles2 不支持，那时会发 failed）。
+	 *
+	 * **和 wp_color_manager_v1 互斥**（wlr_scene_set_color_manager_v1 的
+	 * 头文件写明两者只能设一个）：第 5 步接色彩管理时，这里的取舍要一起定。 */
+	server.gamma_control = wlr_gamma_control_manager_v1_create(server.display);
+	wlr_scene_set_gamma_control_manager_v1(server.scene, server.gamma_control);
 	/* Scene trees are stacked in creation order: bottom-most first. */
 	/* 桌面底色（background_color）：比壁纸还底下 —— 壁纸是 background 层的客户端
 	 * 画的，这个只是「谁都没画」时的兜底（见 layer.c 的 vidow_background_apply）。
