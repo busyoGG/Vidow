@@ -2054,23 +2054,25 @@ static bool view_region_rect(struct vidow_server *server,
 		scale = 1.0;
 	}
 	int pad = vidow_fx_pad(server);
-	/* **模糊的那一块 = 这块屏上看得见的那一块**（place 的 hit），不是整个几何框：
-	 * 窗口骑在两块屏中间时，各自的区域只算自己那一半（以前按整框算，区域跨过
-	 * 屏边界、被下面的夹取截成半条 —— 跨屏那一半就只有一条横道）；滚出屏 /
-	 * 藏起来的工作区更是连一块都没有，压根不该走到这儿。 */
+	/* **这块屏上的区域要包住整个窗口，不只是这一半。**
+	 *
+	 * 原来这里取的是 place 的 hit —— 这块屏上看得见的那一块。窗口压在屏边界上
+	 * 时，每块屏的各烘各的一半：左屏那份不含右半、右屏那份不含左半。链条每一
+	 * 趟都会把边界外那圈**透明**像素一起平均进去，于是那条屏上窗口靠边的一圈
+	 * 变成「窗口自己 + 透明」的混合 —— 屏幕上就是窗口靠近屏边界那一条发黑、
+	 * 发虚，跨过去的部分看起来根本没采到底衬。
+	 *
+	 * 现在两边都按**整框**算（再多留一格，「这两块屏差一格」的判定才不会在
+	 * 平移时反复翻转，见下面 fx-cross 那行）：每块屏自己采自己那一半的像素，
+	 * 但每一半的模糊里都有完整窗口的内容，屏边界上两边算出来的值一致。
+	 *
+	 * 滚出屏 / 藏起来的工作区仍然一块都不建（place.resident）。 */
 	struct vidow_place place;
 	vidow_place_of_view(server, view, &place);
-	const struct vidow_place_hit *hit = NULL;
-	for (int i = 0; i < place.n; i++) {
-		if (place.hits[i].out == output->wlr_output) {
-			hit = &place.hits[i];
-			break;
-		}
-	}
-	if (!place.resident || hit == NULL) {
+	if (!place.resident) {
 		return false;
 	}
-	struct wlr_box box = hit->box;
+	struct wlr_box box = place.world;
 	int lv = blur_levels_for(server,
 		output->wlr_output->width, output->wlr_output->height);
 	int margin = blur_reach_px(server, lv);
@@ -2101,6 +2103,25 @@ static bool view_region_rect(struct vidow_server *server,
 	/* 原点对齐到网格（见上面那个宏）：窗口在格子里挪动时区域一个字都不变。 */
 	int gx1 = (int)floor((double)left / grid) * grid;
 	int gy1 = (int)floor((double)top / grid) * grid;
+	/* **这个窗口压着两块屏时，这条屏多留一格（网格）的边，一直伸到隔壁屏里。**
+	 *
+	 * 只给「自己这一半 + 一圈」不够：窗口骑在边界上时，那一圈里一半是同屏的
+	 * 底衬、一半是隔壁屏的内容，而隔壁屏的内容还没被烘到自己的底衬里（对面
+	 * 那块屏的这次重烘可能还没发生 / 已经过去了）。屏幕上跨过去那一条就成了
+	 * 「窗口 + 隔壁屏的真实像素」拼在一起 —— 用户看到的「完全跨过去也没有
+	 * 采集另一个窗口的背景」。
+	 *
+	 * 伸出屏外的那一条抓的时候是黑色的（这块屏的 scene 只覆盖自己），但它是
+	 * 上一次内更新的 leftovers 里最快被盖住的部分：屏幕上看不到它（在屏外），
+	 * 看得见的那一圈采的是屏内像素。真越过边界的那部分由隔壁屏自己负责 ——
+	 * 两边各留一格，交界处的采样窗口里两边的像素都在。 */
+	bool cross = false;
+	for (int i = 0; i < place.n; i++) {
+		if (place.hits[i].out != output->wlr_output) {
+			cross = true;
+			break;
+		}
+	}
 	/* 尺寸**只跟窗口自己的大小有关，跟位置无关**（多留一格给「窗口在格子里挪
 	 * 动」）：拖窗口时区域整体平移，缓冲尺寸不变 —— 金字塔那几块缓冲才能一直
 	 * 复用（尺寸一变就得整批重建 + 重新导入贴图，那正是上一版修掉的卡顿）。 */
@@ -2112,8 +2133,13 @@ static bool view_region_rect(struct vidow_server *server,
 	}
 	/* 原点再夹一下，让整块区域留在屏内：屏外没有像素可抓（那就是透明的），
 	 * 贴边窗口的边缘会被链条混进黑。夹的是原点、不是尺寸 —— 尺寸照样只跟窗口
-	 * 大小有关，缓冲不会因为窗口移动而重建。窗口比屏幕还大的极端情况下夹不住，
-	 * 那圈就还是透明的（layer 那一路一直是这个行为）。
+	 * 大小有关，缓冲不会因为窗口移动而重建。
+	 *
+	 * **跨两块屏的窗口例外（cross）**：这时候允许区域伸到屏外，上面那两个
+	 * 理由在这儿反过来成立 —— 伸出去的那条看不见（在屏外），而这块屏自己
+	 * 贴边的那一圈必须采到「隔壁屏那一侧的像素」，不然边界上就是两种画面
+	 * 拼在一起（见 cross 那段的说明）。伸出去的部分抓的时候是黑的，但它落在
+	 * 这块屏看清的范围之外，屏幕上看不到。
 	 *
 	 * 夹的边界是**这块屏自己的**尺寸（my_out_w/h），不是 server->output_w/h：
 	 * 后者是最后渲染的那块屏的，窗口跨在边界上时两趟互相覆盖，先渲染的那趟
@@ -2121,6 +2147,17 @@ static bool view_region_rect(struct vidow_server *server,
 	 * 「跨屏那一半是横条」）。 */
 	int max_x = my_out_w - size_w;
 	int max_y = my_out_h - size_h;
+	if (cross) {
+		/* 留一格在屏内：屏内那条总算得出来（不至于整块都在屏外抓了个空）。 */
+		max_x += grid;
+		max_y += grid;
+	}
+	if (max_x < -grid) {
+		max_x = -grid;
+	}
+	if (max_y < -grid) {
+		max_y = -grid;
+	}
 	if (max_x < 0) {
 		max_x = 0;
 	}
@@ -2200,8 +2237,18 @@ static bool view_region_build(struct vidow_server *server,
 		my_w = ob.width;
 		my_h = ob.height;
 	}
-	int x1 = rx < 0 ? 0 : rx, y1 = ry < 0 ? 0 : ry;
+	/* 区域夹进屏内。**不夹原点**（region 可以按 cross 的约定伸到隔壁屏里，
+	 * 伸出去的就是黑的），只保证「区域 ∩ 屏」还在。以前这里把 x1/y1 也夹到 0，
+	 * 原点在屏外的区域于是被当成「整块在屏外」直接放弃 —— 跨屏那一半就再也没
+	 * 重烘过。 */
+	int x1 = rx, y1 = ry;
 	int x2 = rx + rw, y2 = ry + rh;
+	if (x1 < 0) {
+		x1 = 0;
+	}
+	if (y1 < 0) {
+		y1 = 0;
+	}
 	if (x2 > my_w) {
 		x2 = my_w;
 	}
