@@ -16,6 +16,19 @@
 #include <wlr/types/wlr_scene.h>
 #include <wlr/util/log.h>
 
+/* 这张快照这一帧画在屏幕上的那一块：位置带着滑出偏移，范围含装饰外圈和缩放
+ * 溢出（过冲时四周会探出去，量正比于窗口尺寸 —— 固定余量盖不住大窗口）。 */
+static struct wlr_box closing_drawn_box(const struct vidow_closing *closing) {
+	struct wlr_box box = {
+		.x = closing->x,
+		.y = closing->y + (int)lround(closing->off_y),
+		.width = closing->w,
+		.height = closing->h,
+	};
+	vidow_drawn_box_expand(closing->server, &box, closing->fx.anim_scale);
+	return box;
+}
+
 static void closing_update(void *data, double t, double linear) {
 	struct vidow_closing *closing = data;
 	struct vidow_config *cfg = &closing->server->config;
@@ -38,27 +51,23 @@ static void closing_update(void *data, double t, double linear) {
 		closing->alpha *= vidow_rule_opacity(&closing->rule_eff);
 	}
 	/* 回弹的曲线让 t 稍微越过 1：位移和缩放跟着过冲（那才是回弹）。 */
+	/* 改之前先取「上一帧画在哪」，改完再取「这一帧画在哪」，两块并起来记一笔 ——
+	 * 只记当前位置的话，快照滑下去时底缘让出的那条永远是上一版（局部重抓只补
+	 * 账本里有的盒子）。盒子走和窗口同一条算法：装饰外圈 + anim_scale 的缩放
+	 * 溢出，不写固定余量常数。
+	 *
+	 * 用 vidow_backdrop_damage_region 而不是 _box：_box 只记账、**不推进
+	 * gen_scene**，没有代次前进下游一个都不会重抓（这条路上没有窗口能替它推，
+	 * 快照不是 vidow_view）。region 推的是 gen_scene（layers=false），不碰
+	 * gen_layer / backdrop_revision，共享底衬不会因此整屏重抓。 */
+	struct wlr_box drawn = closing_drawn_box(closing);
 	closing->off_y = (double)closing->slide_px * t;
 	closing->fx.anim_scale = 1.0 + (closing->anim_scale_to - 1.0) * t;
 	closing->fx.progress = t;
-	/* 变的就是这张快照（滑下去 + 缩放），别整屏都算损伤 —— 关窗动画每帧都在动，
-	 * 整屏都算的话别人的底衬会跟着每帧重抓。
-	 *
-	 * 盒子要盖住**整段动画范围**：快照往下滑，底缘每帧新露出来的那条在原始盒
-	 * 外面；回弹把缩放顶过 1 时四周也会探出几像素。局部重抓（
-	 * region_update_rect 只补账本里有的盒子，账本每次重抓后就清空）补不到
-	 * 没记的那块 —— 别人底衬里这条带就停在「快照还没盖到」的上一版。 */
 	{
-		struct wlr_box box = {
-			.x = closing->x, .y = closing->y,
-			.width = closing->w, .height = closing->h,
-		};
-		int slack = closing->slide_px + 24;
-		box.x -= slack;
-		box.y -= slack;
-		box.width += 2 * slack;
-		box.height += 2 * slack;
-		vidow_backdrop_damage_region(closing->server, &box);
+		struct wlr_box now = closing_drawn_box(closing);
+		blur_box_add(&now, &drawn);
+		vidow_backdrop_damage_region(closing->server, &now);
 	}
 
 	int y = closing->y + (int)lround(closing->off_y);

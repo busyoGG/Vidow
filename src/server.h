@@ -3804,6 +3804,17 @@ void vidow_backdrop_damage_box(struct vidow_server *server,
 		const struct wlr_box *box);
 /* 窗口「现在画在哪」：布局几何 + 动画偏移（拖拽 / 开合 / overview 都算在这上面）。 */
 struct wlr_box vidow_view_screen_box(const struct vidow_view *view);
+/* 「这一帧真正占屏幕多大」：上面那个几何盒 + 装饰外圈（底衬里画着它的投影，
+ * 只报窗口框会留一圈残影）+ anim_scale 的缩放溢出（过冲量正比于窗口尺寸，
+ * 固定余量盖不住）。也是**布局逻辑坐标**，和 view_region_rect 同一口径。 */
+struct wlr_box vidow_view_drawn_box(const struct vidow_view *view);
+void vidow_drawn_box_pad_view(const struct vidow_view *view,
+		struct wlr_box *box);
+void vidow_drawn_box_expand(struct vidow_server *server, struct wlr_box *box,
+		double anim_scale);
+/* 动画每帧的损伤记账：改 anim_off / anim_scale 之前、之后各调一次（两笔并起来
+ * 才是这一帧真正变化的范围）。盒子按 vidow_view_drawn_box 算，调用点别自己算。 */
+void vidow_backdrop_damage_drawn(struct vidow_view *view);
 
 /* ---------------------------------------------------------------- place
 

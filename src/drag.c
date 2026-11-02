@@ -1197,11 +1197,7 @@ void vidow_tile_grab_end(struct vidow_server *server) {
 	 * 更新会有滞留像素」）。 */
 	if (view != NULL) {
 		struct wlr_box box = server->grab_last_box;
-		int pad = (int)ceil(vidow_jelly_pad(view)) + 8;
-		box.x -= pad;
-		box.y -= pad;
-		box.width += 2 * pad;
-		box.height += 2 * pad;
+		vidow_drawn_box_pad_view(view, &box);
 		vidow_backdrop_damage_box(server, &box);
 	}
 	/* 预览块收掉（落点算不算得出来都得收）。小窗（S4）落点区同理 —— 松手那一刻

@@ -684,6 +684,10 @@ static const struct vidow_ease MINI_POS_EASE = {
 
 static void mini_anim_apply(struct vidow_view *view, double t, double ts) {
 	/* t = 位置进度（单调曲线），ts = 缩放进度（可能过冲）。 */
+	/* 位移 + 缩放一起变：改之前先记「上一帧画在哪」，改完再记「这一帧画在哪」
+	 * —— 见 vidow_backdrop_damage_drawn。以前这里一笔都不记，整段转换期间别人
+	 * 底衬里画的是转换开始那一刻的它（局部重抓只补账本里有的盒子）。 */
+	vidow_backdrop_damage_drawn(view);
 	view->anim_off_x = view->mini_from_dx * (1.0 - t);
 	view->anim_off_y = view->mini_from_dy * (1.0 - t);
 	double s = 1.0 + (view->mini_scale_from - 1.0) * (1.0 - ts);
@@ -691,6 +695,7 @@ static void mini_anim_apply(struct vidow_view *view, double t, double ts) {
 		s = 0.01;
 	}
 	view->anim_scale = s;
+	vidow_backdrop_damage_drawn(view);
 	vidow_view_apply_anim(view);
 	wlr_log(WLR_DEBUG, "mini anim: %s t=%.3f 画在 %d,%d（偏移 %.1f,%.1f）缩放 %.3f",
 		vidow_view_title(view) != NULL ? vidow_view_title(view) : "?",

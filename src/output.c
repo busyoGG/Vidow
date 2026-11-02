@@ -174,11 +174,7 @@ void vidow_output_render(struct vidow_output *output) {
 		 * 实际占过的范围记（grab_last_box 存的是窗口框，扩在用的地方）。
 		 * 漏了这圈，松开、收尾之后留白 / 投影那一圈没人擦。 */
 		struct wlr_box old = server->grab_last_box;
-		int jpad = (int)ceil(vidow_jelly_pad(gv)) + 8;
-		old.x -= jpad;
-		old.y -= jpad;
-		old.width += 2 * jpad;
-		old.height += 2 * jpad;
+		vidow_drawn_box_pad_view(gv, &old);
 		vidow_backdrop_damage_box(server, &old);
 		/* 只有这个窗口自己动了：记在它头上，它自己的私有底衬（抓的时候它藏着）
 		 * 不该因为这一笔就过期。 */

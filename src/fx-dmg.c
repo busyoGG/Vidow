@@ -254,6 +254,63 @@ struct wlr_box vidow_view_screen_box(const struct vidow_view *view) {
 	return box;
 }
 
+/* 这块内容**真正占屏幕多大**：几何盒 ± 装饰外圈，再按 anim_scale 围绕中心缩放。
+ *
+ * 两个都要算，少一个就是一条残影：
+ *   - 装饰外圈（vidow_fx_pad）：底衬抓的时候这个窗口是**整块**藏起来的，所以别人
+ *     的底衬里画着它的投影。只报窗口框的话，投影让出来的那一圈永远不重抓 ——
+ *     jelly.c 的 vidow_jelly_pad 注释里记着同一件事（「窗口释放的时候背景模糊
+ *     更新会有滞留像素」）。
+ *   - anim_scale：开合 / 小窗的缩放作用在**内容**上（fx-frame 里 dst 尺寸乘它、
+ *     位置按中心回挪），内容占的屏幕面积跟着变。固定加一圈余量盖不住：过冲量
+ *     正比于窗口尺寸（out_elastic 冲到 1.085，默认 open_scale_from 0.82 →
+ *     1.5% × 边长），大窗口能差出几十像素。
+ *
+ * 坐标是**布局逻辑坐标**，和 view_region_rect 算出来的区域同一口径 —— 中间不做
+ * 任何输出映射（overview 里也一样：区域那边读的也是 place 的布局盒）。 */
+void vidow_drawn_box_expand(struct vidow_server *server, struct wlr_box *box,
+		double anim_scale) {
+	if (box == NULL) {
+		return;
+	}
+	int pad = vidow_fx_pad(server);
+	double as = anim_scale > 0.0 ? anim_scale : 1.0;
+	double cx = (double)box->x + (double)box->width * 0.5;
+	double cy = (double)box->y + (double)box->height * 0.5;
+	double bw = ((double)box->width + 2.0 * (double)pad) * as;
+	double bh = ((double)box->height + 2.0 * (double)pad) * as;
+	box->x = (int)floor(cx - bw * 0.5);
+	box->y = (int)floor(cy - bh * 0.5);
+	box->width = (int)ceil(cx + bw * 0.5) - box->x;
+	box->height = (int)ceil(cy + bh * 0.5) - box->y;
+}
+
+/* 把「窗口框」补成「这一帧真正占屏幕的那块」：果冻在画的时候是整窗装饰 + 四周
+ * 形变余量（vidow_jelly_pad 里已经含了 vidow_fx_pad，别叠第二遍）；否则是装饰
+ * 外圈 + anim_scale 的缩放溢出（见 vidow_drawn_box_expand）。 */
+void vidow_drawn_box_pad_view(const struct vidow_view *view,
+		struct wlr_box *box) {
+	if (view == NULL || box == NULL) {
+		return;
+	}
+	if (view->jelly != NULL) {
+		int pad = (int)ceil(vidow_jelly_pad(view)) + 8;
+		box->x -= pad;
+		box->y -= pad;
+		box->width += 2 * pad;
+		box->height += 2 * pad;
+		return;
+	}
+	vidow_drawn_box_expand(view->server, box, view->anim_scale);
+}
+
+/* 窗口这一帧画在屏幕上的那一块。 */
+struct wlr_box vidow_view_drawn_box(const struct vidow_view *view) {
+	struct wlr_box box = vidow_view_screen_box(view);
+	vidow_drawn_box_pad_view(view, &box);
+	return box;
+}
+
 /* 世界代次前进（损伤区域由调用方决定记哪一块）。 */
 void damage_bump(struct vidow_server *server, bool layers) {
 	vidow_stats.dmg_bumps++;
@@ -336,6 +393,9 @@ void vidow_backdrop_damage_region(struct vidow_server *server,
 	blur_note_damage(server, box, NULL);
 }
 
+static void vidow_backdrop_note_self(struct vidow_view *view,
+		const struct wlr_box *box);
+
 /* 只有某个窗口自己变了的那些改动（它被拖、内容重画、开合动画、果冻形变）：
  * 世界代次照常前进，另外在这个窗口头上单独记一笔。私有底衬抓的是「世界减掉这
  * 个窗口」（抓的时候它自己藏着），所以那张图只跟 gen_scene - self_gen 有关 ——
@@ -358,15 +418,38 @@ void vidow_backdrop_damage_view_rect(struct vidow_view *view,
 		b.width += 2 * pad;
 		b.height += 2 * pad;
 	}
+	vidow_backdrop_note_self(view, &b);
+}
+
+/* 「这个窗口自己变了这一块」的收口：世界代次前进、它自己的私有底衬不算过期、
+ * 别人（底衬里画着它）记一笔。 */
+static void vidow_backdrop_note_self(struct vidow_view *view,
+		const struct wlr_box *box) {
 	view->self_gen++;
 	damage_bump(view->server, false);
 	/* 变的是它自己这一块：别人（底衬里画着它）得重抓，它自己不用。 */
-	blur_note_damage(view->server, &b, view);
+	blur_note_damage(view->server, box, view);
 	/* 一次 arrange 里只要有一个「不是正被拖的那个」窗口报了自己变了，这一趟就
 	 * 不能整笔算在被拖的那个头上（见 vidow_arrange）。 */
 	if (view->server->arrange_self_only && view->server->grab_view != view) {
 		view->server->arrange_self_only = false;
 	}
+}
+
+/* 动画每帧的记账：窗口这一帧**画在这儿**。
+ *
+ * 必须在改 anim_off / anim_scale 之前和之后**各调一次** —— 两次的盒子并起来才是
+ * 这一帧真正变化的范围（让出来的那一条 + 新盖上去的那一条）。只记当前位置的话，
+ * 每帧让出的那一条在别人的底衬里永远停在「窗口还在那儿」的上一版：局部重抓
+ * （region_update_rect）只补账本里有的盒子、补完就清空（view_region_build 的
+ * dmg_clear），整块重抓的年代每次全量重画，这个洞不存在。
+ *
+ * 盒子按 vidow_view_drawn_box 算（几何 + 装饰外圈 + 缩放溢出 + 果冻那圈），别在
+ * 调用点各写一套 —— 位移 / 开窗 / 关窗 / 小窗 / 拖拽原来各算各的，余量常数已经
+ * 漂过一轮。 */
+void vidow_backdrop_damage_drawn(struct vidow_view *view) {
+	struct wlr_box box = vidow_view_drawn_box(view);
+	vidow_backdrop_note_self(view, &box);
 }
 
 void vidow_backdrop_damage_view(struct vidow_view *view) {
