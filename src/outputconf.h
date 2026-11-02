@@ -59,6 +59,8 @@ struct vidow_output_conf {
 	 * 需要显示器支持 BT.2020 + PQ（见 EDID），否则只是把画面搞坏。 */
 	bool has_hdr;
 	bool hdr;
+	bool has_sdr_white_nits;
+	double sdr_white_nits;
 
 	/* 方向 / 翻转（normal / 90 / 180 / 270 / flipped / flipped-90 …） */
 	bool has_transform;
@@ -87,6 +89,8 @@ struct vidow_output_spec {
 	int depth;
 	bool has_hdr;
 	bool hdr;
+	bool has_sdr_white_nits;
+	double sdr_white_nits;
 	bool has_transform;
 	enum wl_output_transform transform;
 	bool has_enabled;

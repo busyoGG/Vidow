@@ -1420,6 +1420,8 @@ struct vidow_output {
 	 *   false = 老路径，场景直接渲进扫描输出缓冲。
 	 * post_swapchain 按输出尺寸懒建，尺寸变了就重建。 */
 	bool hdr;
+	bool hdr_metadata_dirty; /* HDR 开关或元数据变更，需要向 KMS 下发 image description */
+	double sdr_white_nits; /* 默认 203.0 */
 	struct wlr_swapchain *post_swapchain;
 	int post_w, post_h;
 	/* 上一帧后处理的源贴图（还锁着那张离屏缓冲）。留一帧再放：GL 命令可能

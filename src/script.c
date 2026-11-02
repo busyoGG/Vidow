@@ -1446,6 +1446,19 @@ static int l_output(lua_State *L) {
 	}
 	lua_pop(L, 1);
 
+	/* SDR 白点亮度（cd/m²，默认 203 nits = BT.2408 推荐） */
+	lua_getfield(L, 1, "sdr_white_nits");
+	if (!lua_isnil(L, -1)) {
+		if (!lua_isnumber(L, -1) || lua_tonumber(L, -1) <= 0.0) {
+			lua_pop(L, 1);
+			return luaL_error(L, "vidow.output{ name = \"%s\" }: sdr_white_nits "
+				"得是个正数（比如 203 或 250，单位 cd/m²）", who);
+		}
+		spec.has_sdr_white_nits = true;
+		spec.sdr_white_nits = lua_tonumber(L, -1);
+	}
+	lua_pop(L, 1);
+
 	/* 方向 / 翻转 */
 	lua_getfield(L, 1, "transform");
 	if (!lua_isnil(L, -1)) {
@@ -1464,7 +1477,7 @@ static int l_output(lua_State *L) {
 	/* 项名写错（scalee / pos）不该悄悄不生效：列一遍能写什么。 */
 	static const char *const fields[] = {
 		"name", "scale", "x", "y", "mode", "enabled", "vrr", "depth",
-		"hdr", "transform", "vrr_on_demand", "layout",
+		"hdr", "sdr_white_nits", "transform", "vrr_on_demand", "layout",
 	};
 	lua_pushnil(L);
 	while (lua_next(L, 1) != 0) {
@@ -1481,7 +1494,7 @@ static int l_output(lua_State *L) {
 		if (!known) {
 			lua_pop(L, 2);
 			return luaL_error(L, "vidow.output{…}: 没有 '%s' 这一项"
-				"（能写：name / scale / x / y / mode / enabled / vrr / depth / hdr / "
+				"（能写：name / scale / x / y / mode / enabled / vrr / depth / hdr / sdr_white_nits / "
 				"transform / vrr_on_demand / layout）", field != NULL ? field : "?");
 		}
 		lua_pop(L, 1);

@@ -14,6 +14,7 @@
 #include "workspace.h"
 #include "sessionlock.h"
 
+#include <wlr/backend/drm.h>
 #include <wlr/backend/headless.h>
 #include <wlr/render/color.h>
 #include <wlr/render/swapchain.h>
@@ -379,9 +380,9 @@ void vidow_output_render(struct vidow_output *output) {
 	 * 不能用 wlr_scene_output_commit() —— 它内部建完 state 就直接提交了，没有
 	 * 插队的地方。另外它「没有损伤」时直接返回，而改 LUT 时画面可以一点没脏，
 	 * 所以上面先 schedule 一帧。 */
-	/* 改 LUT 时画面可以一点没脏，「没有损伤就不出帧」会把颜色变更吞掉 ——
-	 * 所以改过之后主动要一帧（只一次，不是每帧：否则设了 LUT 就永远满帧空转）。 */
-	if (output->gamma_lut_dirty &&
+	/* 改 LUT 或切换 HDR 状态时画面可以一点没脏，「没有损伤就不出帧」会把变更吞掉 ——
+	 * 所以改过之后主动要一帧（只一次，不是每帧：否则设了就永远满帧空转）。 */
+	if ((output->gamma_lut_dirty || output->hdr_metadata_dirty) &&
 			!wlr_scene_output_needs_frame(output->scene_output)) {
 		wlr_output_schedule_frame(output->wlr_output);
 	}
@@ -436,14 +437,41 @@ void vidow_output_render(struct vidow_output *output) {
 			if (output->gamma_lut_dirty) {
 				output_color_apply(output, &state);
 			}
+			/* HDR 模式与元数据向 KMS 下发（只对 DRM 后端下发，切换时下发一次） */
+			if (output->hdr_metadata_dirty) {
+				if (wlr_output_is_drm(output->wlr_output)) {
+					if (output->hdr) {
+						static const struct wlr_output_image_description desc = {
+							.primaries = WLR_COLOR_NAMED_PRIMARIES_BT2020,
+							.transfer_function = WLR_COLOR_TRANSFER_FUNCTION_ST2084_PQ,
+							.mastering_display_primaries = {
+								.red = { 0.708, 0.292 },
+								.green = { 0.170, 0.797 },
+								.blue = { 0.131, 0.046 },
+								.white = { 0.3127, 0.3290 },
+							},
+							.mastering_luminance = {
+								.min = 0.0001,
+								.max = 1000.0,
+							},
+							.max_cll = 1000.0,
+							.max_fall = 400.0,
+						};
+						wlr_output_state_set_image_description(&state, &desc);
+					} else {
+						wlr_output_state_set_image_description(&state, NULL);
+					}
+				}
+			}
 			if (post_failed) {
 				wlr_log(WLR_ERROR, "color: %s 后处理失败，丢掉这一帧",
 					output->wlr_output->name);
 			} else if (!wlr_output_commit_state(output->wlr_output, &state)) {
-				wlr_log(WLR_DEBUG, "output %s: 提交失败（含校色 LUT）",
+				wlr_log(WLR_DEBUG, "output %s: 提交失败（含校色 LUT / HDR）",
 					output->wlr_output->name);
 			} else {
 				output->gamma_lut_dirty = false;
+				output->hdr_metadata_dirty = false;
 			}
 		}
 		wlr_output_state_finish(&state);
@@ -2073,6 +2101,9 @@ static void output_apply_conf_extra(struct vidow_server *server,
 		vidow_output_set_depth(server, wlr_output, conf->depth);
 	}
 	if (conf->has_hdr) {
+		if (conf->has_sdr_white_nits) {
+			output->sdr_white_nits = conf->sdr_white_nits;
+		}
 		output_set_hdr(output, conf->hdr);
 	}
 }
@@ -2379,11 +2410,27 @@ static bool output_post_blit(struct vidow_output *output,
 		wlr_log(WLR_DEBUG, "color: %s 主交换链没缓冲可拿", wlr_output->name);
 		return false;
 	}
-	/* slice 1：全通（src/dst 都当「已经是显示编码」，矩阵单位，不 dither），
-	 * 用来单独验证多出来的这一趟不改变画面。slice 2 换真参数。 */
-	static const float identity[9] = { 1, 0, 0, 0, 1, 0, 0, 0, 1 };
+	/* sRGB -> BT.2020 转换矩阵（行主序） */
+	static const float srgb_to_bt2020[9] = {
+		0.6274039f,  0.3292830f,  0.0433131f,
+		0.0690973f,  0.9195404f,  0.0113623f,
+		0.0163914f,  0.0880133f,  0.8955953f,
+	};
+	/* 源 TF：gamma2.2 (2)；目标 TF：ST2084 PQ (1)。
+	 * scale：BT.2408 基准 SDR 白点 (cd/m²) 对应 PQ 的 1.0 (10000 cd/m²)。
+	 * dither：输出位深 10 位对应 ~1/1023，8 位对应 ~1/255。 */
+	float scale = (float)(output->sdr_white_nits > 0.0 ? output->sdr_white_nits : 203.0) / 10000.0f;
+	float dither = (output->wlr_output->render_format == DRM_FORMAT_XRGB2101010 ||
+		output->wlr_output->render_format == DRM_FORMAT_XBGR2101010 ||
+		output->wlr_output->render_format == DRM_FORMAT_ARGB2101010 ||
+		output->wlr_output->render_format == DRM_FORMAT_ABGR2101010) ? (1.0f / 1023.0f) : (1.0f / 255.0f);
+	static float seed = 0.0f;
+	seed += 1.0f;
+	if (seed > 1000.0f) {
+		seed = 0.0f;
+	}
 	bool ok = vidow_fx_post_pass(output->server, dst, src, w, h,
-		0.0f /* linear */, 0.0f /* linear */, identity, 1.0f, 0.0f, 0.0f);
+		2.0f /* gamma22 */, 1.0f /* PQ */, srgb_to_bt2020, scale, dither, seed);
 	if (ok) {
 		wlr_output_state_set_buffer(state, dst);
 	} else {
@@ -2401,6 +2448,7 @@ static void output_set_hdr(struct vidow_output *output, bool on) {
 		return;
 	}
 	output->hdr = on;
+	output->hdr_metadata_dirty = true;
 	if (on) {
 		wlr_output_lock_attach_render(output->wlr_output, true);
 		wlr_log(WLR_INFO, "color: %s 输出端 HDR 开（FP16 离屏 + 全屏后处理，"
@@ -2734,6 +2782,7 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 	}
 	output->server = server;
 	output->wlr_output = wlr_output;
+	output->sdr_white_nits = 203.0; /* 默认 203 nits = BT.2408 推荐基准 */
 	/* 帧追踪的基准：第一次出帧之前 last_frame_ns 是 0，而 vidow_now_ns() 是开机
 	 * 以来的纳秒数 —— 不初始化的话第一帧会被算成「停了 3.8 小时」（实测）。 */
 	output->last_frame_ns = vidow_now_ns();

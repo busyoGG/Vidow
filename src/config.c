@@ -3005,6 +3005,7 @@ static void print_output_hint(FILE *f) {
 "--     hdr        true = 输出端 HDR（第 9 步）：场景走 FP16 离屏 + 全屏后处理，\n"
 "--                按 BT.2020 / PQ 上屏；默认 false。显示器 EDID 里没有 HDR 块\n"
 "--                就别开（画面只会发灰）。开了会失去 direct scanout。\n"
+"--     sdr_white_nits SDR 白点亮度（cd/m²），默认 203（BT.2408 推荐）\n"
 "--     transform  方向：normal / 90 / 180 / 270 / flipped / flipped-90 / flipped-180 /\n"
 "--                flipped-270（也认 \"0\" 当 normal）\n"
 "--\n"
