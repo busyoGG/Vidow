@@ -547,13 +547,6 @@ executable('xgrab',
   dependencies: [xcb_dep],
   install: false)
 
-# 测试工具：读 XSETTINGS（Gdk/WindowScalingFactor）。X11 的窗口倍率只认它，
-# Xft.dpi 只够字体 / Chromium；没有属主时 GTK3 按 1 倍画（内容半缩）。
-executable('xsettingsget',
-  ['tools/xsettingsget.c'],
-  dependencies: [xcb_dep],
-  install: false)
-
 # 测试工具：普通 X11 窗口 + 从 stdin 换窗口光标（验 set_cursor(NULL) 的两条路）。
 x11_dep = dependency('x11')
 executable('x11cursorwin',

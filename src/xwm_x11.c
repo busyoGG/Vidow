@@ -41,8 +41,6 @@
 
 static struct vidow_x11_server *g_x11;
 
-static void x11_handle_selection_clear(xcb_selection_clear_event_t *e);
-
 /* ------------------------------------------------------------------ 原子 */
 
 struct atom_spec {
@@ -94,10 +92,6 @@ static const struct atom_spec atom_specs[] = {
 	 * 所有 X 客户端卡死在 connect()。 */
 	ATOM(wm_s0, "WM_S0"),
 	ATOM(net_wm_cm_s0, "_NET_WM_CM_S0"),
-	/* XSETTINGS：选区名带屏号（我们只有 screen 0）。 */
-	ATOM(xsettings_s0, "_XSETTINGS_S0"),
-	ATOM(xsettings_settings, "_XSETTINGS_SETTINGS"),
-	ATOM(manager, "MANAGER"),
 };
 #undef ATOM
 
@@ -524,8 +518,7 @@ static void find_render_format(struct vidow_x11_server *x11);
 /* ------------------------------------------------------------ 事件处理 */
 
 static void x11_handle_create(xcb_create_notify_event_t *e) {
-	if (g_x11 == NULL || e->window == g_x11->wm_window ||
-			e->window == g_x11->xsettings_xid) {
+	if (g_x11 == NULL || e->window == g_x11->wm_window) {
 		return;
 	}
 	if (surface_for_window(e->window) != NULL) {
@@ -1008,10 +1001,6 @@ static int x11_dispatch(int fd, uint32_t mask, void *data) {
 			x11_handle_client_message(
 				(xcb_client_message_event_t *)event);
 			break;
-		case XCB_SELECTION_CLEAR:
-			x11_handle_selection_clear(
-				(xcb_selection_clear_event_t *)event);
-			break;
 		case 0:
 			x11_handle_error(event);
 			break;
@@ -1072,304 +1061,6 @@ static void wm_window_create(struct vidow_x11_server *x11) {
 	 * WM_S0 和 _NET_WM_CM_S0 一起挂到 wm_window 上。 */
 	xcb_set_selection_owner(x11->conn, x11->wm_window,
 		x11->atoms.net_wm_cm_s0, XCB_CURRENT_TIME);
-}
-
-/* ------------------------------------------------------------ XSETTINGS */
-
-/* XSETTINGS 的线格式（对照 XSETTINGS 规范与 xsettingsd 1.0.2 实际字节）：
- *
- *   头 12 字节：order(1) pad(3) serial(4) n(4)
- *   每条设置：  type(1) pad(1) name_len(2) name  pad→4
- *               u32 1                      ← 值区先导，xsettingsd 恒写 1
- *               INTEGER：u32 value
- *               STRING ：u32 len + bytes + pad→4
- *
- * 我们只改 `Gdk/WindowScalingFactor`，其余设置（主题、字体、光标、提示音）
- * 原样抄过去 —— 接管 KDE 的属主时不能把桌面设置一起吃掉。
- *
- * 为什么必须由合成器来当属主：GTK3 的 X11 后端**不**用 Xft.dpi 推窗口倍率
- * （Xft.dpi 只影响字体 DPI），窗口倍率听 XSETTINGS 的
- * Gdk/WindowScalingFactor。没有属主时 GTK 按 1 倍画，而 vidow 按输出的
- * native:logical 把 X 缓冲除 2 —— 窗口内容在屏上只剩一半（2x 屏上面积
- * 只剩四分之一）。KDE 的 kded6 又会在第一次启动 KDE 程序时通过 DBus
- * 拉一个 xsettingsd，拿 kwinrc 里那份跟本会话无关的 Scale=1 把倍率写成 1，
- * 正好把内容再缩一半（2026-11-02 现场：20:54 kded6 起来之前正常，之后
- * Steam / Chromium 的 devicePixelRatio 从 2 掉到 1）。
- *
- * 所以这里发布的值只认 xwayland_scale；被别的 XSETTINGS 属主抢走时
- * （SelectionClear）按同一个值再抢回来。xsettingsd 收到 SelectionClear
- * 会自己退出，不会来回拉锯。 */
-
-#define XSET_TYPE_INT 0
-#define XSET_TYPE_STRING 1
-
-struct xset_buf {
-	unsigned char *data;
-	size_t len;
-	size_t cap;
-};
-
-static size_t xset_align4(size_t n) {
-	return (n + 3u) & ~(size_t)3;
-}
-
-static bool xset_reserve(struct xset_buf *b, size_t extra) {
-	if (b->len + extra <= b->cap) {
-		return true;
-	}
-	size_t cap = b->cap != 0 ? b->cap : 512;
-	while (cap < b->len + extra) {
-		cap *= 2;
-	}
-	unsigned char *p = realloc(b->data, cap);
-	if (p == NULL) {
-		return false;
-	}
-	b->data = p;
-	b->cap = cap;
-	return true;
-}
-
-static bool xset_bytes(struct xset_buf *b, const void *p, size_t n) {
-	if (!xset_reserve(b, n)) {
-		return false;
-	}
-	memcpy(b->data + b->len, p, n);
-	b->len += n;
-	return true;
-}
-
-static bool xset_u8(struct xset_buf *b, unsigned char v) {
-	return xset_bytes(b, &v, 1);
-}
-
-/* 只支持 LSBFirst（order = 0）。X 服务器和客户端都是 x86_64，写死没问题；
- * 真上大端再按 b->data[0] 分支。 */
-static bool xset_u16(struct xset_buf *b, uint16_t v) {
-	unsigned char t[2] = { (unsigned char)(v & 0xff), (unsigned char)(v >> 8) };
-	return xset_bytes(b, t, sizeof(t));
-}
-
-static bool xset_u32(struct xset_buf *b, uint32_t v) {
-	unsigned char t[4] = {
-		(unsigned char)(v & 0xff), (unsigned char)((v >> 8) & 0xff),
-		(unsigned char)((v >> 16) & 0xff), (unsigned char)(v >> 24),
-	};
-	return xset_bytes(b, t, sizeof(t));
-}
-
-static bool xset_pad4(struct xset_buf *b) {
-	while (b->len % 4 != 0) {
-		if (!xset_u8(b, 0)) {
-			return false;
-		}
-	}
-	return true;
-}
-
-/* 设置头 + 值区先导（那个恒为 1 的 u32）。 */
-static bool xset_head(struct xset_buf *b, uint8_t type, const char *name) {
-	size_t nlen = strlen(name);
-	if (nlen > 0xffff) {
-		return false;
-	}
-	if (!xset_u8(b, type) || !xset_u8(b, 0) ||
-			!xset_u16(b, (uint16_t)nlen) ||
-			!xset_bytes(b, name, nlen) || !xset_pad4(b)) {
-		return false;
-	}
-	return xset_u32(b, 1);
-}
-
-static bool xset_int(struct xset_buf *b, const char *name, uint32_t value) {
-	return xset_head(b, XSET_TYPE_INT, name) && xset_u32(b, value);
-}
-
-static bool xset_str(struct xset_buf *b, const char *name, const char *value) {
-	size_t vlen = strlen(value);
-	return xset_head(b, XSET_TYPE_STRING, name) &&
-		xset_u32(b, (uint32_t)vlen) &&
-		xset_bytes(b, value, vlen) && xset_pad4(b);
-}
-
-/* 一条设置在旧属性里占多少字节；认不出来返回 0（调用方停止抄写）。 */
-static size_t xset_old_setting_len(const unsigned char *data, size_t len,
-		size_t off, const char **name, size_t *name_len) {
-	if (off + 4 > len) {
-		return 0;
-	}
-	uint8_t type = data[off];
-	uint16_t nlen = (uint16_t)(data[off + 2] | (data[off + 3] << 8));
-	size_t name_at = off + 4;
-	if (name_at + nlen > len) {
-		return 0;
-	}
-	size_t val_at = xset_align4(name_at + nlen);
-	if (val_at + 8 > len) {
-		return 0;
-	}
-	size_t end = 0;
-	if (type == XSET_TYPE_INT) {
-		end = val_at + 8;
-	} else if (type == XSET_TYPE_STRING) {
-		uint32_t slen = (uint32_t)data[val_at + 4] |
-			((uint32_t)data[val_at + 5] << 8) |
-			((uint32_t)data[val_at + 6] << 16) |
-			((uint32_t)data[val_at + 7] << 24);
-		if (slen > len) {
-			return 0;
-		}
-		end = xset_align4(val_at + 8 + slen);
-	} else {
-		return 0; /* COLOR 没用到；认不出就整套不抄，别抄坏 */
-	}
-	if (end > len) {
-		return 0;
-	}
-	if (name != NULL) {
-		*name = (const char *)(data + name_at);
-	}
-	if (name_len != NULL) {
-		*name_len = nlen;
-	}
-	return end - off;
-}
-
-void vidow_x11_xsettings_update(struct vidow_x11_server *x11, int scale) {
-	if (x11 == NULL || x11->conn == NULL || x11->screen == NULL ||
-			x11->atoms.xsettings_settings == XCB_NONE) {
-		return;
-	}
-	if (scale < 1) {
-		scale = 1;
-	}
-	xcb_connection_t *conn = x11->conn;
-	xcb_window_t root = x11->screen->root;
-
-	if (x11->xsettings_xid == XCB_NONE) {
-		x11->xsettings_xid = xcb_generate_id(conn);
-		uint32_t mask = XCB_CW_OVERRIDE_REDIRECT;
-		uint32_t value = 1;
-		xcb_create_window(conn, XCB_COPY_FROM_PARENT, x11->xsettings_xid,
-			root, 0, 0, 1, 1, 0, XCB_WINDOW_CLASS_INPUT_ONLY,
-			XCB_COPY_FROM_PARENT, mask, &value);
-	}
-
-	/* 现在的属主可能是 KDE 的 xsettingsd：它那份设置要抄过来。 */
-	xcb_window_t old_owner = XCB_NONE;
-	xcb_get_selection_owner_reply_t *owner_reply =
-		xcb_get_selection_owner_reply(conn,
-			xcb_get_selection_owner(conn, x11->atoms.xsettings_s0), NULL);
-	if (owner_reply != NULL) {
-		old_owner = owner_reply->owner;
-		free(owner_reply);
-	}
-
-	unsigned char *old = NULL;
-	size_t old_len = 0;
-	uint32_t old_serial = 0;
-	xcb_get_property_reply_t *prop = NULL;
-	if (old_owner != XCB_NONE) {
-		prop = xcb_get_property_reply(conn,
-			xcb_get_property(conn, 0, old_owner,
-				x11->atoms.xsettings_settings,
-				XCB_GET_PROPERTY_TYPE_ANY, 0, 1 << 16), NULL);
-		if (prop != NULL && prop->format == 8 && prop->value_len > 0 &&
-				prop->type == x11->atoms.xsettings_settings) {
-			old = xcb_get_property_value(prop);
-			old_len = (size_t)xcb_get_property_value_length(prop);
-			if (old_len >= 12) {
-				old_serial = (uint32_t)old[4] |
-					((uint32_t)old[5] << 8) |
-					((uint32_t)old[6] << 16) |
-					((uint32_t)old[7] << 24);
-			}
-		}
-	}
-
-	struct xset_buf out = {0};
-	unsigned char header[12] = {0};
-	bool ok = xset_bytes(&out, header, sizeof(header));
-	unsigned copied = 0;
-	size_t off = 12;
-	while (ok && old != NULL && off + 4 <= old_len) {
-		const char *name = NULL;
-		size_t nlen = 0;
-		size_t used = xset_old_setting_len(old, old_len, off, &name, &nlen);
-		if (used == 0) {
-			break;
-		}
-		bool drop = nlen == strlen("Gdk/WindowScalingFactor") &&
-			memcmp(name, "Gdk/WindowScalingFactor", nlen) == 0;
-		if (!drop) {
-			ok = xset_bytes(&out, old + off, used);
-			copied++;
-		}
-		off += used;
-	}
-	if (ok) {
-		ok = xset_int(&out, "Gdk/WindowScalingFactor", (uint32_t)scale);
-		copied++;
-	}
-	if (ok) {
-		uint32_t serial = old_serial + 1;
-		memcpy(out.data + 4, &serial, 4);
-		memcpy(out.data + 8, &copied, 4);
-		xcb_change_property(conn, XCB_PROP_MODE_REPLACE,
-			x11->xsettings_xid, x11->atoms.xsettings_settings,
-			x11->atoms.xsettings_settings, 8, (uint32_t)out.len,
-			out.data);
-		xcb_set_selection_owner(conn, x11->xsettings_xid,
-			x11->atoms.xsettings_s0, XCB_CURRENT_TIME);
-
-		/* MANAGER：告诉所有客户端「属主换成这个窗口了」。 */
-		xcb_client_message_event_t ev = {0};
-		ev.response_type = XCB_CLIENT_MESSAGE;
-		ev.format = 32;
-		ev.window = root;
-		ev.type = x11->atoms.manager;
-		ev.data.data32[0] = XCB_CURRENT_TIME;
-		ev.data.data32[1] = x11->atoms.xsettings_s0;
-		ev.data.data32[2] = x11->xsettings_xid;
-		ev.data.data32[3] = 0;
-		xcb_send_event(conn, 0, root, XCB_EVENT_MASK_STRUCTURE_NOTIFY,
-			(const char *)&ev);
-		xcb_flush(conn);
-
-		if (x11->xsettings_scale != scale ||
-				(old_owner != XCB_NONE &&
-					old_owner != x11->xsettings_xid)) {
-			wlr_log(WLR_INFO, "xsettings: Gdk/WindowScalingFactor = %d"
-				"（%s；Xft.dpi 按同一倍率）", scale,
-				old_owner != XCB_NONE &&
-					old_owner != x11->xsettings_xid ?
-					"接管了别的 XSETTINGS 属主，主题/字体设置已抄过来" :
-					"自建属主");
-		}
-		x11->xsettings_scale = scale;
-	} else {
-		wlr_log(WLR_ERROR, "xsettings: 发布失败（内存不足？），X11 的"
-			"窗口倍率会退回客户端默认值");
-	}
-	free(out.data);
-	if (prop != NULL) {
-		free(prop);
-	}
-}
-
-/* 别的程序（KDE 的 kded6 → xsettingsd）抢走了 _XSETTINGS_S0：
- * 它那份配置是 KWin 的，不是这个会话的。按我们的倍率抢回来。 */
-static void x11_handle_selection_clear(xcb_selection_clear_event_t *e) {
-	struct vidow_x11_server *x11 = g_x11;
-	if (x11 == NULL || x11->xsettings_xid == XCB_NONE ||
-			e->selection != x11->atoms.xsettings_s0 ||
-			e->owner != x11->xsettings_xid) {
-		return;
-	}
-	wlr_log(WLR_INFO, "xsettings: _XSETTINGS_S0 被别的程序抢走"
-		"（多半是 KDE 的 xsettingsd，它按 kwinrc 的 Scale=1 写）→ 按 %d 倍"
-		"重新发布", x11->xsettings_scale);
-	vidow_x11_xsettings_update(x11, x11->xsettings_scale);
 }
 
 static void supported_atoms_publish(struct vidow_x11_server *x11) {
