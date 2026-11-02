@@ -707,6 +707,43 @@ static bool seat_over_x11(const struct vidow_server *server) {
 		server->xwayland_server->client;
 }
 
+/* set_cursor(NULL) 有两种来源，必须分开：
+ *
+ *   1. 全屏游戏自己画准星（5ee22c0 修的现场）—— 指针底下那块 X11 view
+ *      是全屏的。这是真正的「不画」。
+ *   2. 普通 X11 窗口没设光标 —— X 沿继承链找到 root 上那支 1x1 透明占位
+ *      （5ee22c0 把 root 光标换成了它），Xwayland 于是也报 NULL。
+ *
+ * 以前不区分，第 2 种被当成「不画」，普通 X11 窗口里光标就整块消失
+ * （用户 2026-11-02 报「xwayland 应用光标不再发生变化」）。这里用「指针底下
+ * 那个 X11 view 是不是全屏」把两种分开：全屏才藏，其余回主题箭头。 */
+bool vidow_cursor_x11_none_means_hide(struct vidow_server *server) {
+	if (server == NULL || server->seat == NULL) {
+		return false;
+	}
+	struct wlr_surface *focused = server->seat->pointer_state.focused_surface;
+	if (focused == NULL) {
+		return false;
+	}
+	struct vidow_view *view = vidow_view_from_surface(server, focused);
+	return view != NULL && view->kind == VIDOW_VIEW_X11 && view->fullscreen;
+}
+
+/* 普通 X11 窗口继承了 root 的透明占位：把「X11 要求不画」的账清掉。
+ * 不清的话，下次 enter 任何 X11 表面都会按 x11_none 把光标重新藏起来。 */
+void vidow_cursor_fx_x11_cursor_cleared(struct vidow_server *server) {
+	struct vidow_cursor_fx *fx = server != NULL ? server->cursor_fx : NULL;
+	if (fx == NULL) {
+		return;
+	}
+	if (fx->x11_last_surface != NULL) {
+		wl_list_remove(&fx->x11_surface_destroy.link);
+		wl_list_init(&fx->x11_surface_destroy.link);
+	}
+	fx->x11_last_surface = NULL;
+	fx->x11_none = false;
+}
+
 /* 「现在该显示的那张图」：客户端 surface > （X11 要求不画）> 主题形状。
  * 三处还原（摇晃收摊 / 隐藏后显示回来 / 主题重建）共用这一份，别各写一套 ——
  * 少一处就会在某个时机把箭头漏回游戏里。 */

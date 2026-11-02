@@ -4460,6 +4460,12 @@ void vidow_cursor_fx_set_surface(struct vidow_server *server,
 /* 客户端 set_cursor 的内容变了（none = 它给的是 NULL，即「别画光标」）。 */
 void vidow_cursor_fx_note_x11_cursor(struct vidow_server *server,
 	struct wlr_surface *surface, int32_t hx, int32_t hy);
+/* set_cursor(NULL) 是「全屏游戏自己画光标」还是「普通窗口继承了 root 的透明
+ * 占位」？只有前者该藏。判据 = 指针底下那个 X11 view 是不是全屏。 */
+bool vidow_cursor_x11_none_means_hide(struct vidow_server *server);
+/* 普通 X11 窗口没设光标（继承到 root 的透明占位）：把「不画」的账清掉，
+ * 让主题箭头回来。 */
+void vidow_cursor_fx_x11_cursor_cleared(struct vidow_server *server);
 /* 指针进到一个表面上（input.c 的 notify_enter 之前调）：X11 客户端要求不画
  * 光标时，把那张「不画」补设回去（见 cursorfx.c 的说明）。 */
 void vidow_cursor_fx_entered(struct vidow_server *server,

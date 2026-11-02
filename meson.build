@@ -554,6 +554,13 @@ executable('xsettingsget',
   dependencies: [xcb_dep],
   install: false)
 
+# 测试工具：普通 X11 窗口 + 从 stdin 换窗口光标（验 set_cursor(NULL) 的两条路）。
+x11_dep = dependency('x11')
+executable('x11cursorwin',
+  ['tools/x11cursorwin.c'],
+  dependencies: [x11_dep],
+  install: false)
+
 # 测试工具：指针约束客户端（锁鼠标 / 夹光标 + 相对位移）
 pc_xml = 'protocols/pointer-constraints-unstable-v1.xml'
 pc_header = custom_target('pointer-constraints-unstable-v1-client-protocol.h',

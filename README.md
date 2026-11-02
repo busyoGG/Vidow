@@ -5591,6 +5591,19 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
      - 未做：niri 的 `fixed 1920`（固定像素档）、`preset-window-heights`、`default-column-width {}`（让客户端自己定宽）、
        `always-center-single-column`；窗口规则级的 per-rule 预设覆盖。
 
+294. **普通 X11 窗口的光标不再消失：set_cursor(NULL) 按「指针底下是不是全屏」分开**（用户：「XWayland 应用光标不再正常显示 / 变化」；2026-11-02）
+      - **根因**：`5ee22c0` 为让全屏游戏藏得住系统箭头，把 root 光标换成了 1x1 透明（游戏 SetCursor(NULL) 继承到透明 = 不画）。
+        但**从来没设过光标的普通 X11 窗口**继承的是同一支透明 root 光标 —— Xwayland 报上来的也是 `set_cursor(NULL)`，和
+        「游戏自己画光标」长得一模一样。旧代码一律按「不画」处理，普通 X11 窗口里光标就整块消失、也不再随窗口变化。
+      - **修法**：`server_request_cursor()` 里把两种 NULL 分开：指针底下那块 X11 view 是**全屏** → 照旧隐藏（游戏自己画）；
+        否则清掉「X11 要求不画」的账（`vidow_cursor_fx_x11_cursor_cleared`）并恢复主题箭头
+        （`vidow_cursor_fx_default_cursor`）。判据只看全屏与否，不再按「是 Xwayland 发的」一刀切。
+      - 判据：`test-x11cursor-none.sh`（headless 1280x720）—— 普通窗口没设光标 → 主题箭头 72x72 且日志有「X11 窗口没设光标
+        …→ 主题箭头」；客户端换 hand2 → 16x16；再设 None（仍非全屏）→ 回到 72x72；全屏下 hand2 → 16x16，None → `0x0`
+        且不再打「→ 主题箭头」。`tools/x11cursorwin.c` 是这个测试的 X11 客户端（stdin 换窗口光标）。
+      - 落点：`src/input.c`（`server_request_cursor`）、`src/cursorfx.c`（`vidow_cursor_x11_none_means_hide` /
+        `vidow_cursor_fx_x11_cursor_cleared`）、`src/server.h`、`tools/x11cursorwin.c`、`test-x11cursor-none.sh`。
+
 293. **合成器自己发布 XSETTINGS：GTK3 的窗口倍率不再被 KDE 的 xsettingsd 缩成一半**（用户：「X11 窗口内容变成 1/2，2 倍屏上只剩 1/4 面积」；2026-11-02）
       - **根因**：GTK3 的 X11 后端**不看** `Xft.dpi` 推窗口倍率（只把它当字体 DPI），窗口倍率听 XSETTINGS 的 `Gdk/WindowScalingFactor`。
         vidow 以前只往 root 写 `Xft.dpi = S×96`，没有 XSETTINGS 属主 → GTK 按 1 倍画，vidow 又按 `native:logical` 把 X 缓冲除 2

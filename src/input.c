@@ -2841,13 +2841,31 @@ static void server_request_cursor(struct wl_listener *listener, void *data) {
 	if (focused != event->seat_client) {
 		return;
 	}
+	/* **set_cursor(NULL) 要分两种。**
+	 *
+	 * 根光标是 1x1 透明（5ee22c0，为了全屏游戏藏得住系统箭头）。普通 X11
+	 * 窗口没设光标时，X 沿继承链落到 root，Xwayland 报上来的也是 NULL ——
+	 * 和「游戏自己画光标」长得一模一样。以前一律按「不画」处理，于是普通
+	 * X11 窗口里光标直接消失（用户 2026-11-02 报「xwayland 应用光标不再
+	 * 发生变化」）。全屏才藏，其余回主题箭头。 */
+	bool from_xwayland = server->xwayland_server != NULL &&
+		event->seat_client->client == server->xwayland_server->client;
+	if (from_xwayland && event->surface == NULL &&
+			!vidow_cursor_x11_none_means_hide(server)) {
+		if (vidow_cursor_trace_on()) {
+			wlr_log(WLR_INFO, "cursor-trace: X11 窗口没设光标（继承 root "
+				"的透明占位；不是全屏）→ 主题箭头");
+		}
+		vidow_cursor_fx_x11_cursor_cleared(server);
+		vidow_cursor_fx_default_cursor(server);
+		return;
+	}
 	/* 先告诉摇晃放大「光标图要换了」，再设上去，最后让它把新图重新放大一遍
 	 * —— 放大期间客户端换光标（焦点切到别的窗口就会）不再把放大缩回去。 */
 	/* 只把**来自 Xwayland** 的请求记进 X11 光标账：别家（Wayland 窗口）的
 	 * set_cursor 不许冲掉它 —— 冲掉了，回到游戏时就补不回「游戏要的那张 /
 	 * 不画」（用户 2026-10-30：「移出去再回来会是 Wayland 光标」）。 */
-	if (server->xwayland_server != NULL && event->seat_client->client ==
-			server->xwayland_server->client) {
+	if (from_xwayland) {
 		vidow_cursor_fx_note_x11_cursor(server, event->surface,
 			event->hotspot_x, event->hotspot_y);
 	}
