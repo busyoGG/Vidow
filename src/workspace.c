@@ -40,11 +40,37 @@ static struct vidow_workspace *find_by_name(struct vidow_server *server,
 	return NULL;
 }
 
-/* 把还没挂进链表的工作区插到 output 那块屏的第 idx0 位（0 起；越界 = 那组的最后）。
- * 同屏工作区之间的先后就是序号，所以只要保证组内相对顺序对就行。 */
+/* 这个节点现在挂在一串链表上吗？
+ *
+ * 不能用 wl_list_empty() 代：wl_list_remove() 会把 next / prev 一起清成 NULL
+ * （见 wayland-util.h 的说明），那时候 wl_list_empty(&ws->link) 是 **false**
+ * （NULL != &ws->link），再摘一次就是往地址 0x8 写。 */
+static bool ws_linked(const struct vidow_workspace *ws) {
+	return ws->link.next != NULL && ws->link.prev != NULL &&
+		ws->link.next != &ws->link && ws->link.prev != &ws->link;
+}
+
+/* 摘下来并复位成「不在任何链上」：摘两次、没摘过就插，都不会再出事。 */
+static void ws_unlink(struct vidow_workspace *ws) {
+	if (ws_linked(ws)) {
+		wl_list_remove(&ws->link);
+	}
+	wl_list_init(&ws->link);
+}
+
+/* 把工作区插到 output 那块屏的第 idx0 位（0 起；越界 = 那组的最后）。
+ * 同屏工作区之间的先后就是序号，所以只要保证组内相对顺序对就行。
+ *
+ * 进来时**不管它还挂在哪**，先摘再插 —— wl_list_insert() 不会替你把节点从老
+ * 位置摘掉：一个已经挂在链上的节点再插一次，它在链上就有两份，顺着 next 走
+ * 永远走不到头（100% CPU）。用户 2026-11-03 报的「从 tty 切回来整机卡死、
+ * 连别的 tty 都切不过去」就是 adopt_homeless() 直接 splice 已经在链上的工作区
+ * 造成的：VT 切走时 wlroots 销毁输出、这些工作区 output 变 NULL 但仍挂在链上，
+ * 切回来时被再插一遍。 */
 static void ws_splice(struct vidow_workspace *ws, struct wlr_output *output,
 		int idx0) {
 	struct vidow_server *server = ws->server;
+	ws_unlink(ws);
 	struct vidow_workspace *it;
 	struct wl_list *before = NULL; /* 插在它前面；NULL = 追加到那组后面 */
 	int seen = 0;
@@ -329,11 +355,10 @@ static void ws_set_output_full(struct vidow_server *server,
 		ws->output = output; /* 特殊工作区不绑屏：home 一直是 NULL */
 	} else if (ws->output != output) {
 		/* 换屏 = 在新屏的栈里重新排位：插到底部那块空工作区**之前**
-		 * （niri 的 append_workspaces 就是这个位置）。 */
+		 * （niri 的 append_workspaces 就是这个位置）。摘这一步不能省：
+		 * 下面 ws_splice 会先摘，但这里要先摘掉再数格子。 */
 		struct wlr_output *old = ws->output;
-		if (!wl_list_empty(&ws->link)) {
-			wl_list_remove(&ws->link);
-		}
+		ws_unlink(ws);
 		int n = vidow_workspace_count(server, output);
 		ws_splice(ws, output, n > 0 ? n - 1 : 0);
 		if (old != NULL) {
@@ -495,14 +520,47 @@ static void ws_destroy(struct vidow_server *server,
 			out->slide_anim = NULL;
 		}
 	}
-	wl_list_remove(&ws->link);
+	ws_unlink(ws);
 	free(ws);
+}
+
+/* 这串链表还自洽吗（正着走能回到表头、每步的 prev 都对得上）？
+ *
+ * 收尸（cleanup）是**摘节点**的地方：链一旦坏在这儿，顺着 next 走就是死循环
+ * —— 主线程 100% CPU、日志一行不出、键盘被独占于是连别的 tty 都切不过去，
+ * 用户只能硬断电源。宁可这一轮不收，也别把整机拖死：坏的时候留一条 ERROR，
+ * 下一次复现至少能直接从日志里看出是哪一步开始坏的。 */
+static bool ws_list_sane(struct vidow_server *server) {
+	struct wl_list *head = &server->workspaces;
+	struct wl_list *n = head->next;
+	int guard = 0;
+	while (n != head) {
+		if (n == NULL || n->next == NULL || n->prev == NULL) {
+			wlr_log(WLR_ERROR, "workspace: 链表断了（节点 %p 的 next/prev 是空的）",
+				(void *)n);
+			return false;
+		}
+		if (n->next->prev != n) {
+			wlr_log(WLR_ERROR, "workspace: 链表坏了（%p 和它的下一个对不上）",
+				(void *)n);
+			return false;
+		}
+		if (++guard > 10000) {
+			wlr_log(WLR_ERROR, "workspace: 链表成环或者长得离谱（>10000），先不动它");
+			return false;
+		}
+		n = n->next;
+	}
+	return true;
 }
 
 void vidow_workspace_cleanup(struct vidow_server *server) {
 	/* niri 的 clean_up_workspaces()：中间那些**空的、没名字的**工作区（不是当前
 	 * 亮着的那块、也不是栈底那块）→ 收掉。「切走就消失」说的就是这里。 */
 	if (server == NULL) {
+		return;
+	}
+	if (!ws_list_sane(server)) {
 		return;
 	}
 	struct vidow_workspace *ws, *tmp;
@@ -662,8 +720,6 @@ bool vidow_workspace_move_step(struct vidow_server *server,
 	if (idx == 0 || want < 1 || want > n) {
 		return false;
 	}
-	wl_list_remove(&ws->link);
-	wl_list_init(&ws->link);
 	ws_splice(ws, ws->output, want - 1);
 	wlr_log(WLR_INFO, "workspace: %s 上的工作区 %d ⇄ %d",
 		ws->output->name, idx, want);
@@ -1614,8 +1670,6 @@ bool vidow_workspace_move_to_output(struct vidow_server *server,
 		vidow_workspace_active_for(server, output);
 	if (target_active != NULL && target_active != ws) {
 		int at = vidow_workspace_index(target_active); /* 插在它后面 */
-		wl_list_remove(&ws->link);
-		wl_list_init(&ws->link);
 		ws_splice(ws, output, at);
 	}
 	{
