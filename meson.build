@@ -275,6 +275,22 @@ xs_code = custom_target('xdg-shell-protocol.c',
   input: xs_xml,
   output: 'xdg-shell-protocol.c',
   command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
+
+# 测试工具：色彩管理探针（客户端视角看 wp_color_manager_v1 到底报了什么）
+cm_xml = 'protocols/color-management-v1.xml'
+cm_header = custom_target('color-management-v1-client-protocol.h',
+  input: cm_xml,
+  output: 'color-management-v1-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'])
+cm_code = custom_target('color-management-v1-protocol.c',
+  input: cm_xml,
+  output: 'color-management-v1-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
+executable('colorprobe',
+  ['tools/colorprobe.c', xs_header, xs_code, cm_header, cm_code],
+  dependencies: [wayland_client_dep],
+  include_directories: include_directories('.'),
+  install: false)
 bge_client_header = custom_target('ext-background-effect-v1-client-protocol.h',
   input: bge_xml,
   output: 'ext-background-effect-v1-client-protocol.h',
