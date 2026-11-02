@@ -358,6 +358,23 @@ executable('frames',
   include_directories: include_directories('.'),
   install: false)
 
+# 测试工具：layer surface 的帧回调计数器（内容全透明 + input region 为空，
+# 用来验证「节点被关掉之后 layer 补帧泵还在喂帧」）
+ls_client_header = custom_target('wlr-layer-shell-client-protocol.h',
+  input: 'protocols/wlr-layer-shell-unstable-v1.xml',
+  output: 'wlr-layer-shell-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'])
+ls_client_code = custom_target('wlr-layer-shell-client-protocol.c',
+  input: 'protocols/wlr-layer-shell-unstable-v1.xml',
+  output: 'wlr-layer-shell-client-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
+executable('layerframes',
+  ['tools/layerframes.c', ls_client_header, ls_client_code,
+   xs_header, xs_code],
+  dependencies: [wayland_client_dep],
+  include_directories: include_directories('.'),
+  install: false)
+
 # 测试工具：激活请求客户端（xdg-activation-v1：窗口自己请求被顶上来）
 xa_header = custom_target('xdg-activation-v1-client-protocol.h',
   input: xa_xml,

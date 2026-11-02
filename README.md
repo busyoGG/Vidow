@@ -1009,6 +1009,7 @@ VIDOW_TEST_RENDERER=gles2 ./test-screencast.sh
 ./test-layerwin.sh                   # top 层模糊里含窗口（纯蓝窗口 + 压在它上面的面板，4 项断言）
 ./test-layermask.sh                  # 按元素自己的 alpha 剔除（透明内边距里的亮点不糊，3 项断言）
 ./test-layerdestroy.sh               # layer 没了要收干净它的模糊节点（反复重建不崩不漏，9 项断言）
+./test-layerpump.sh                  # 内容全透明的 layer 关掉节点之后补帧泵还在喂帧（4 项断言）
 ./test-layerstorm.sh                 # 一批 layer 面一起上屏：动画每帧不许重跑布局灌 configure（两块屏，6 项断言）
 ./test-openanim.sh                   # 开窗动画画的是装饰后的窗口本身（不是一块更大的矩形，4 项断言）
 ./test-bounce.sh                     # 入场过冲 / 关闭回弹（q 弹曲线真的落到屏幕上了，5 项断言）

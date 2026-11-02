@@ -2100,7 +2100,7 @@ void vidow_view_render_pump(struct vidow_server *server,
 	{
 		struct vidow_layer_surface *ls, *waiting = NULL;
 		wl_list_for_each(ls, &server->layers, link) {
-			if (!ls->hide_content || ls->output != output->wlr_output ||
+			if (!ls->hide_content || ls->output != output ||
 					ls->layer_surface == NULL ||
 					ls->layer_surface->surface == NULL ||
 					!ls->layer_surface->surface->mapped ||
@@ -2121,7 +2121,7 @@ void vidow_view_render_pump(struct vidow_server *server,
 			output->layer_pump_next_ms = (int64_t)msec + 16;
 			wl_list_for_each(ls, &server->layers, link) {
 				if (!ls->hide_content ||
-						ls->output != output->wlr_output ||
+						ls->output != output ||
 						ls->layer_surface == NULL ||
 						ls->layer_surface->surface == NULL ||
 						!ls->layer_surface->surface->mapped ||

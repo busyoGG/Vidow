@@ -731,7 +731,7 @@ static int output_watchdog_tick(void *data) {
 	}
 	struct vidow_layer_surface *ls;
 	wl_list_for_each(ls, &server->layers, link) {
-		if (ls->output != output->wlr_output || ls->layer_surface == NULL) {
+		if (ls->output != output || ls->layer_surface == NULL) {
 			continue;
 		}
 		struct wlr_surface *surface = ls->layer_surface->surface;
