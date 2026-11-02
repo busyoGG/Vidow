@@ -264,6 +264,12 @@ struct vidow_config {
 	 * 影响的是装饰、模糊金字塔、底衬这些「自己渲的」缓冲；扫描输出位深是
 	 * vidow.output{ depth } 的事，两者独立。 */
 	char color_precision[8];
+	/* 装饰合成走线性光（color.linear_blend）。默认关：视觉会变（阴影更透），
+	 * 见 fx-gl.c 的 decor_fragment_src 和第 7 步的说明。 */
+	bool color_linear_blend;
+	/* 背景模糊在线性光里算（color.linear_blur）。默认关：亮部会更亮更柔，
+	 * 也是有意的视觉变化。 */
+	bool color_linear_blur;
 	/* 光标压到全屏窗口（游戏）上、而指针焦点不是它时，**立刻把指针焦点
 	 * （enter）补给它一次**，并同步激活它的指针约束（锁鼠标 / 夹光标）。
 	 *
@@ -820,6 +826,8 @@ struct vidow_gl_prog {
 	int u_tex, u_texel, u_offset;
 	/* kawase 专用：只画目标里的一块（u_rect，目标像素）时的目标尺寸/矩形。 */
 	int u_rect, u_dst;
+	/* 线性模糊（color.linear_blur）：u_linear 开关 + 源/目标传输函数。 */
+	int u_linear, u_tf;
 };
 
 /* 任意四边形网格（jelly.c 的果冻形变用）：顶点直接给「渲染目标物理像素坐标 +
@@ -859,6 +867,9 @@ struct vidow_decor_prog {
 	int u_mask, u_mask_on, u_mask_min;
 	/* mask 的采样映射（见 struct vidow_fx_target 的 mask_*）。 */
 	int u_mask_map;
+	/* 线性工作空间（color.linear_blend）：源 / 目标传输函数 + 色域矩阵。
+	 * 见 fx-gl.c 的 decor_fragment_src。 */
+	int u_linear, u_src_tf, u_dst_tf, u_src_to_dst;
 };
 
 /* One kawase pyramid. The compositor keeps a shared one for the wallpaper
@@ -1192,6 +1203,11 @@ struct vidow_fx_target {
 	/* mask 的透明度阈值；0 = 用全局 blur_alpha_min。弹出物会设成 1/255，
 	 * 只剔掉 alpha 恰好为 0 的透明留白（见 fx.c 的 popup_blur_frame）。 */
 	float mask_min;
+	/* 内容贴图（u_texture）的编码：源 surface 声明的 TF / primaries。
+	 * 0 = 没设（layer 底衬那种没有内容贴图的路），按 gamma22 + srgb 算。
+	 * color.linear_blend 打开时装饰着色器用它解码 + 做色域转换。 */
+	enum wlr_color_transfer_function src_tf;
+	enum wlr_color_named_primaries src_primaries;
 
 	/* 只画「背后的模糊」：layer surface 的底衬用它。内容和阴影/边框/圆角/噪点
 	 * 全部关掉，输出就是一层模糊，垫在 layer surface 自己的节点下面。 */
@@ -2751,6 +2767,7 @@ struct vidow_server {
 	struct wlr_color_representation_manager_v1 *color_representation;
 	/* 每个新 surface 的编码声明追踪（见 color.c） */
 	struct wl_listener color_new_surface;
+	struct wl_listener color_compositor_destroy;
 	/* 桌面底色（background_color）：垫在**所有东西**下面。壁纸由 layer-shell
 	 * 的 background 层客户端画（swaybg / swww / shell），这个只是「谁都没画」
 	 * 时的兜底，所以它在 layer_background 下面一层。 */

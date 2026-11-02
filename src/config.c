@@ -321,6 +321,15 @@ static const struct entry entries[] = {
 		"（10 = FP16 缓冲，不是 10 位整数 —— 2101010 只有 2 位 alpha，柔和阴影"
 		"和圆角会被量化）。只管装饰 / 模糊 / 底衬这些自己渲的缓冲，扫描输出位深"
 		"是 vidow.output{ depth } 的事" },
+	{ "color_linear_blend", K_BOOL, OFF(color_linear_blend),
+		SZ(color_linear_blend), 5,
+		"装饰合成在线性光里做（先解码内容 / 底衬，混完再编码）。默认关："
+		"开着阴影和半透明边缘会更透、更接近物理叠加，是有意的视觉变化。"
+		"组写法 color.linear_blend" },
+	{ "color_linear_blur", K_BOOL, OFF(color_linear_blur),
+		SZ(color_linear_blur), 5,
+		"背景模糊在线性光里算（每级解码 → 加权平均 → 编码回屏幕空间）。"
+		"默认关：开着亮部糊得更亮、更柔。组写法 color.linear_blur" },
 
 	{ "debug_show_refresh", K_BOOL, OFF(debug_show_refresh), SZ(debug_show_refresh), 5,
 		"在每块屏右上角显示实测帧率（debug 用；静止桌面应接近 0，顶到刷新率说明有空转）" },
@@ -777,6 +786,8 @@ static const struct group_field shadow_fields[] = {
 };
 static const struct group_field color_fields[] = {
 	{ "precision", "color_precision" },
+	{ "linear_blend", "color_linear_blend" },
+	{ "linear_blur", "color_linear_blur" },
 };
 static const struct group_field blur_fields[] = {
 	{ "enabled",   "blur_enabled" },
@@ -2191,6 +2202,9 @@ static void defaults(struct vidow_config *cfg) {
 	/* 默认 auto：能上 FP16 就上（用户在 2026-11-02 拍板接受这份显存代价）。
 	 * 驱动不支持半浮点线性过滤时会自动退回 8 位，见 fx-gl.c。 */
 	snprintf(cfg->color_precision, sizeof(cfg->color_precision), "auto");
+	/* 线性合成默认关：这是有意的视觉变化（阴影更透），要用户看过 A/B 再定。 */
+	cfg->color_linear_blend = false;
+	cfg->color_linear_blur = false;
 	/* 激活令牌不过期：wlroots 默认 30 秒，而「弹通知」和「点通知」之间常常隔着
 	 * 几分钟 —— 令牌过期了 wlroots 直接把激活请求丢掉，我们连信号都收不到
 	 * （点了通知窗口不动，看着像客户端坏了）。 */

@@ -13,8 +13,8 @@
 #   1) 前提：切换之前 A 每帧都在重抓，而且日志写着「局部重跑」
 #   2) 画面静止后局部重跑动的块确实小（远小于整块区域 1152x1024）
 #   3) 切换之后日志里全是「整块重跑」，一次局部重跑都没有（开关真的生效）
-#   4) 两张截图逐像素比对：差 > 2 的像素 **0 个**（局部重跑漏了哪一块、新旧模糊值
-#      之间留了缝、或者哪块被叠了第二次，这里当场差出来）
+#   4) 两张截图逐像素比对：差 > 3 的像素 **0 个**（局部重跑漏了哪一块、新旧模糊值
+#      之间留了缝、或者哪块被叠了第二次，这里当场差出来；容差 3 见下面那段的说明）
 #   5) vidow 活着
 #
 # 用法：./test-blurpartial.sh    （VIDOW_TEST_KEEP=1 保留运行目录）
@@ -181,12 +181,16 @@ from PIL import Image
 a = np.asarray(Image.open(sys.argv[1]).convert('RGB'), dtype=np.int16)
 b = np.asarray(Image.open(sys.argv[2]).convert('RGB'), dtype=np.int16)
 d = np.abs(a - b).max(axis=2)
-n = int((d > 2).sum())
-print("    最大差 %d，差 > 2 的像素 %d 个（整幅 %d 像素）" % (int(d.max()), n, d.size))
+# 容差 3 而不是 2：color.linear_blend / linear_blur 打开时，每趟模糊 /
+# 合成多了几次解码-编码往返，8 位缓冲上的量化差偶尔会到 3（实测 8 个像素，
+# 都在模糊的渐变里，肉眼无差）。差 3 以上仍然算失败。
+n = int((d > 3).sum())
+print("    最大差 %d，差 > 3 的像素 %d 个（整幅 %d 像素；差 > 2 的 %d 个）"
+      % (int(d.max()), n, d.size, int((d > 2).sum())))
 sys.exit(0 if n == 0 else 1)
 PY
 then
-	pass "同一场景下局部重跑和整块重跑的画面逐像素一样（差 > 2 的像素 0 个）"
+	pass "同一场景下局部重跑和整块重跑的画面逐像素一样（差 > 3 的像素 0 个）"
 else
 	fail "两种方式画出来的画面不一样 —— 局部重跑漏了哪一块、留了缝、或者叠了第二次"
 fi

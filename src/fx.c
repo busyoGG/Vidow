@@ -282,6 +282,12 @@ static void kawase_pass_rect(struct vidow_server *server,
 	glUniform1i(prog->u_tex, 0);
 	glUniform2f(prog->u_texel, 1.0f / (float)src_w, 1.0f / (float)src_h);
 	glUniform1f(prog->u_offset, (float)server->config.blur_offset);
+	/* 模糊金字塔在线性光里算（color.linear_blur）。底衬是屏幕编码（gamma22），
+	 * 所以每趟的源和目标都用同一条传输函数 —— 中间每一级写回时编码，链条
+	 * 本身仍然是「屏幕编码」，下游（装饰 / 底衬拼贴 / 果冻）不用改。 */
+	glUniform1f(prog->u_linear,
+		server->config.color_linear_blur ? 1.0f : 0.0f);
+	glUniform1f(prog->u_tf, 2.0f); /* gamma2.2 */
 	glUniform2f(prog->u_dst, (float)dst_w, (float)dst_h);
 	if (rect != NULL) {
 		glUniform4f(prog->u_rect, (float)rect->x, (float)rect->y,
@@ -1332,6 +1338,13 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 	if (!fx->active || fx->node == NULL || src == NULL || src->buffer == NULL) {
 		return false;
 	}
+	/* 内容贴图这次是按什么编码采的：源 scene buffer 的声明（wlroots 在
+	 * surface commit 时已经写在它上面）。0 = 没标 = 默认 gamma22 + srgb。
+	 * color.linear_blend 打开时装饰着色器按这个解码、做色域转换。 */
+	fx->src_tf = src->transfer_function != 0 ? src->transfer_function :
+		WLR_COLOR_TRANSFER_FUNCTION_GAMMA22;
+	fx->src_primaries = src->primaries != 0 ? src->primaries :
+		WLR_COLOR_NAMED_PRIMARIES_SRGB;
 	/* 这个窗口 / layer 现在该长什么样：全局配置压上窗口规则（见 rule.c 的
 	 * vidow_view_look / vidow_rule_look）。eff = NULL 就是纯全局。 */
 	struct vidow_blur_slot *instance = NULL;
@@ -3104,6 +3117,40 @@ struct decor_geo {
 };
 
 
+/* 传输函数 → 着色器里的 0..4 小整数（见 fx-gl.c 的 decor_fragment_src）。
+ * wlroots 的枚举是位标志（1/2/4/8/16），直接传进 GLSL 不好读，也容易和
+ * 协议那边的枚举混。0 = 线性；2 = gamma2.2（wlroots 的默认）。 */
+static float color_tf_code(enum wlr_color_transfer_function tf) {
+	switch (tf) {
+	case WLR_COLOR_TRANSFER_FUNCTION_ST2084_PQ:
+		return 1.0f;
+	case WLR_COLOR_TRANSFER_FUNCTION_BT1886:
+		return 3.0f;
+	case WLR_COLOR_TRANSFER_FUNCTION_SRGB:
+		return 4.0f;
+	case WLR_COLOR_TRANSFER_FUNCTION_EXT_LINEAR:
+		return 0.0f;
+	case WLR_COLOR_TRANSFER_FUNCTION_GAMMA22:
+	default:
+		return 2.0f;
+	}
+}
+
+/* 源色域 → 输出色域（sRGB）的 3x3 线性 RGB 矩阵（行主序；上传时 GL_TRUE
+ * 转置给 GLSL）。只处理 wlroots 已有的两个 named primaries —— 协议里还有
+ * DCI-P3 / Display-P3 / Adobe RGB，但我们没把它们报出去（第 5 步的表）。 */
+static void color_src_matrix(enum wlr_color_named_primaries prim, float m[9]) {
+	for (int i = 0; i < 9; i++) {
+		m[i] = i % 4 == 0 ? 1.0f : 0.0f;
+	}
+	if (prim == WLR_COLOR_NAMED_PRIMARIES_BT2020) {
+		struct wlr_color_primaries src, dst;
+		wlr_color_primaries_from_named(&src, WLR_COLOR_NAMED_PRIMARIES_BT2020);
+		wlr_color_primaries_from_named(&dst, WLR_COLOR_NAMED_PRIMARIES_SRGB);
+		wlr_color_primaries_transform_absolute_colorimetric(&src, &dst, m);
+	}
+}
+
 static bool decor_pass(struct vidow_server *server,
 		struct vidow_fx_target *fx, struct wlr_buffer *dst,
 		const struct decor_geo *g,
@@ -3222,6 +3269,16 @@ static bool decor_pass(struct vidow_server *server,
 	glUniform2f(d->u_blur_scale, bsx, bsy);
 	glUniform2f(d->u_blur_bias, fx->blur_bias_x, fx->blur_bias_y);
 	glUniform1f(d->u_flip_y, cfg->shader_flip_y ? 1.0f : 0.0f);
+	/* 线性合成（color.linear_blend）：目标固定 gamma2.2（当前输出编码），
+	 * 源按 fx 记的 TF / primaries。关着的时候着色器完全走老路径，这几个
+	 * uniform 不影响任何像素。 */
+	glUniform1f(d->u_linear, cfg->color_linear_blend ? 1.0f : 0.0f);
+	glUniform1f(d->u_src_tf, color_tf_code(fx->src_tf));
+	glUniform1f(d->u_dst_tf,
+		color_tf_code(WLR_COLOR_TRANSFER_FUNCTION_GAMMA22));
+	float src_m[9];
+	color_src_matrix(fx->src_primaries, src_m);
+	glUniformMatrix3fv(d->u_src_to_dst, 1, GL_TRUE, src_m);
 	/* 模糊那层要不要叠：除了「有贴图」（fx->blur_tex）和全局开关（fx->blur），
 	 * 还得看**这一次渲染自己的 look** —— 预览（缩略图）那一趟在
 	 * vidow_fx_frame 里把 look.blur 关掉，于是预览里不叠模糊（见那里的注释）。 */

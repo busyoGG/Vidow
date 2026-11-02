@@ -132,6 +132,20 @@ static void color_handle_new_surface(struct wl_listener *listener, void *data) {
 	wl_signal_add(&surface->events.destroy, &t->destroy);
 }
 
+/* wlr_compositor 销毁时 wlroots 会断言它的 new_surface 监听链表已经空了
+ * （types/wlr_compositor.c 的 compositor_handle_display_destroy）——
+ * 摘掉我们那个，不然每次正常退出都 abort（核心转储）。 */
+static void color_handle_compositor_destroy(struct wl_listener *listener,
+		void *data) {
+	(void)data;
+	struct vidow_server *server =
+		wl_container_of(listener, server, color_compositor_destroy);
+	wl_list_remove(&server->color_new_surface.link);
+	wl_list_init(&server->color_new_surface.link);
+	wl_list_remove(&server->color_compositor_destroy.link);
+	wl_list_init(&server->color_compositor_destroy.link);
+}
+
 /* 内容拷贝的标签继承：Vidow 自己烘出来的缓冲是源缓冲的逐像素拷贝
  * （gles2 不做任何色彩转换），编码必然和源一致。不继承的话场景把它当
  * 「没标色彩」—— 直通判据会误放行（PQ 内容当 sRGB 直接上屏就是发灰 /
@@ -236,4 +250,8 @@ void vidow_color_init(struct vidow_server *server) {
 	server->color_new_surface.notify = color_handle_new_surface;
 	wl_signal_add(&server->compositor->events.new_surface,
 		&server->color_new_surface);
+	wl_list_init(&server->color_compositor_destroy.link);
+	server->color_compositor_destroy.notify = color_handle_compositor_destroy;
+	wl_signal_add(&server->compositor->events.destroy,
+		&server->color_compositor_destroy);
 }

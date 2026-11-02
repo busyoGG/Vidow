@@ -198,7 +198,85 @@ static const char *decor_fragment_src =
 	"uniform float u_mask_on;\n"
 	"uniform float u_mask_min;\n"
 	"uniform vec4 u_mask_map;\n"
+	/* ------------------------------------------------ 线性工作空间
+	 * u_linear = 0：完全走老路径（编码空间直接合成，逐像素和以前一样）。
+	 * u_linear = 1：源内容 / 底衬模糊 / 边框 / 阴影先解码到线性，按预乘 alpha
+	 * 混完再编码回输出空间。
+	 *
+	 * 传输函数用 0..4 的**小整数**而不是 wlroots 的位标志：GLES2 的 float
+	 * uniform 传位标志不好读，也省得两边枚举以后又错位。
+	 *   0 = 线性（ext_linear） 1 = PQ / ST.2084  2 = gamma2.2
+	 *   3 = BT.1886（2.4）     4 = sRGB 分段曲线
+	 * 输出端暂时固定 gamma2.2（和「没声明 = gamma22」那条默认一致）；
+	 * 第 9 步接 HDR 输出时换成 PQ。 */
+	"uniform float u_linear;\n"
+	"uniform float u_src_tf;\n"
+	"uniform float u_dst_tf;\n"
+	"uniform mat3 u_src_to_dst;\n"
 	"varying vec2 v_uv;\n"
+	"\n"
+	/* ST.2084 的常数。解码结果归一化到 1.0 = 10000 cd/m²（还没 tone map，
+	 * 那是第 9 步；现在只保证数值上是线性的）。 */
+	"vec3 vidow_pq_eotf(vec3 c) {\n"
+	"	const float m1 = 0.1593017578125;\n"
+	"	const float m2 = 78.84375;\n"
+	"	const float c1 = 0.8359375;\n"
+	"	const float c2 = 18.8515625;\n"
+	"	const float c3 = 18.6875;\n"
+	"	vec3 p = pow(max(c, 0.0), vec3(1.0 / m2));\n"
+	"	vec3 num = max(p - c1, 0.0);\n"
+	"	vec3 den = max(c2 - c3 * p, 1e-6);\n"
+	"	return pow(num / den, vec3(1.0 / m1));\n"
+	"}\n"
+	"vec3 vidow_pq_inv_eotf(vec3 c) {\n"
+	"	const float m1 = 0.1593017578125;\n"
+	"	const float m2 = 78.84375;\n"
+	"	const float c1 = 0.8359375;\n"
+	"	const float c2 = 18.8515625;\n"
+	"	const float c3 = 18.6875;\n"
+	"	vec3 p = pow(max(c, 0.0), vec3(m1));\n"
+	"	return pow((c1 + c2 * p) / (1.0 + c3 * p), vec3(m2));\n"
+	"}\n"
+	"\n"
+	"vec3 vidow_tf_decode(vec3 c, float tf) {\n"
+	"	c = max(c, 0.0);\n"
+	"	if (tf > 3.5) {\n" /* sRGB 分段 */
+	"		vec3 lo = c / 12.92;\n"
+	"		vec3 hi = pow((c + 0.055) / 1.055, vec3(2.4));\n"
+	"		return mix(lo, hi, step(vec3(0.04045), c));\n"
+	"	} else if (tf > 2.5) {\n"
+	"		return pow(c, vec3(2.4));\n"
+	"	} else if (tf > 1.5) {\n"
+	"		return pow(c, vec3(2.2));\n"
+	"	} else if (tf > 0.5) {\n"
+	"		return vidow_pq_eotf(c);\n"
+	"	}\n"
+	"	return c;\n"
+	"}\n"
+	"vec3 vidow_tf_encode(vec3 c, float tf) {\n"
+	"	c = max(c, 0.0);\n"
+	"	if (tf > 3.5) {\n"
+	"		vec3 lo = c * 12.92;\n"
+	"		vec3 hi = 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055;\n"
+	"		return mix(lo, hi, step(vec3(0.0031308), c));\n"
+	"	} else if (tf > 2.5) {\n"
+	"		return pow(c, vec3(1.0 / 2.4));\n"
+	"	} else if (tf > 1.5) {\n"
+	"		return pow(c, vec3(1.0 / 2.2));\n"
+	"	} else if (tf > 0.5) {\n"
+	"		return vidow_pq_inv_eotf(c);\n"
+	"	}\n"
+	"	return c;\n"
+	"}\n"
+	/* 预乘编码值 → 预乘线性值。预乘是在编码空间做的（rgb = a * encode(c)），
+	 * 所以必须先除 alpha 再解码，不能直接解码预乘值 —— 直接解会得到一条
+	 * 偏暗的曲线，亮的半透明边缘尤其明显。 */
+	"vec3 vidow_decode_premul(vec3 rgb, float a, float tf) {\n"
+	"	if (a <= 0.0) {\n"
+	"		return vec3(0.0);\n"
+	"	}\n"
+	"	return vidow_tf_decode(rgb / a, tf) * a;\n"
+	"}\n"
 	"\n"
 	"float sd_round_box(vec2 p, vec2 half_size, float r, float n) {\n"
 	"	vec2 q = abs(p) - half_size + r;\n"
@@ -236,24 +314,56 @@ static const char *decor_fragment_src =
 	"\n"
 	"	vec2 cuv = clamp(wp / u_size, 0.0, 1.0);\n"
 	"	vec2 uv = clamp(u_tex_map.xy + cuv * u_tex_map.zw, 0.0, 1.0);\n"
-	"	vec4 content = texture2D(u_texture, uv) * u_opacity * u_content_alpha * inside;\n"
+	"	vec4 tcontent = texture2D(u_texture, uv);\n"
+	"	vec4 content;\n"
+	"	if (u_linear > 0.5) {\n"
+	/* 内容先解码到线性、再转色域（BT.2020 → sRGB），最后按线性预乘合成。
+	 * 不先解码就乘 alpha 是错的：预乘是在编码空间做的。 */
+	"		float ck = u_opacity * u_content_alpha * inside;\n"
+	"		vec3 clin = vidow_decode_premul(tcontent.rgb, tcontent.a, u_src_tf);\n"
+	"		clin = u_src_to_dst * clin;\n"
+	"		content = vec4(clin * ck, tcontent.a * ck);\n"
+	"	} else {\n"
+	"		content = tcontent * u_opacity * u_content_alpha * inside;\n"
+	"	}\n"
 	"\n"
 	"	float bw = min(u_border_width, min(half_size.x, half_size.y));\n"
 	"	float ring = inside - (1.0 - smoothstep(-1.0, 1.0, d + bw));\n"
-	"	vec4 border = u_border_color * u_opacity * ring;\n"
-	"\n"
+	"	vec4 border;\n"
 	"	float sa = 1.0 - smoothstep(-1.0, u_shadow_radius,\n"
 	"		sd_round_box(wp - u_shadow_offset - half_size, half_size, r, u_corner_n));\n"
 	/* Only outside the window: otherwise the shadow shows through a
 	 * translucent window instead of staying behind it. */
-	"	vec4 shadow = u_shadow_color * sa * (1.0 - inside);\n"
+	"	float shk = sa * (1.0 - inside);\n"
+	"	vec4 shadow;\n"
+	"	if (u_linear > 0.5) {\n"
+	/* 配置里的颜色是 sRGB 直线值（上传时乘过 alpha 变成预乘）。先除回直线值
+	 * 再解码，和内容走同一套线性合成。 */
+	"		float ba = u_border_color.a;\n"
+	"		vec3 bs = ba > 0.0 ? u_border_color.rgb / ba : vec3(0.0);\n"
+	"		float bk = u_opacity * ring;\n"
+	"		border = vec4(vidow_tf_decode(bs, u_dst_tf) * ba * bk, ba * bk);\n"
+	"		float sha = u_shadow_color.a;\n"
+	"		vec3 shs = sha > 0.0 ? u_shadow_color.rgb / sha : vec3(0.0);\n"
+	"		shadow = vec4(vidow_tf_decode(shs, u_dst_tf) * sha * shk,\n"
+	"			sha * shk);\n"
+	"	} else {\n"
+	"		border = u_border_color * u_opacity * ring;\n"
+	"		shadow = u_shadow_color * shk;\n"
+	"	}\n"
 	"	if (u_shadow_only > 0.5) {\n"
-	"		gl_FragColor = shadow * u_alpha;\n"
+	"		vec4 o = shadow;\n"
+	"		if (u_linear > 0.5) {\n"
+	"			float a = clamp(o.a, 0.0, 1.0);\n"
+	"			o = a > 0.0 ? vec4(vidow_tf_encode(o.rgb / a, u_dst_tf) * a, a)\n"
+	"				: vec4(0.0);\n"
+	"		}\n"
+	"		gl_FragColor = o * u_alpha;\n"
 	"		return;\n"
 	"	}\n"
 	"\n"
 	"	vec2 o = (u_origin - u_content_off + p * u_blur_scale + u_blur_bias) / u_output_size;\n"
-	"	vec4 blurred = texture2D(u_blur, clamp(o, 0.0, 1.0));\n"
+	"	vec4 tblur = texture2D(u_blur, clamp(o, 0.0, 1.0));\n"
 	/* 元素自己的 alpha（「透明度剔除」）：模糊只画在元素真的有内容的地方 —— 透明
 	 * 内边距、圆角外面、弹窗自带的半透明阴影边都不再透出一圈模糊。窗口 / 弹窗那条
 	 * 路内容贴图就是元素自己（u_texture）；layer surface 的模糊底衬不画内容，元素
@@ -263,7 +373,7 @@ static const char *decor_fragment_src =
 	/* mask 是元素**自己**那张缓冲，采样坐标用元素局部（恒等映射）：窗口那层
 	 * CSD 留白偏移只属于内容贴图，不能带到 mask 上，否则剔除会看错地方。 */
 	"		texture2D(u_mask, clamp(u_mask_map.xy + cuv * u_mask_map.zw,\n"
-	"			0.0, 1.0)).a : texture2D(u_texture, uv).a;\n"
+	"			0.0, 1.0)).a : tcontent.a;\n"
 	"	float cover = 1.0;\n"
 	"	if (u_blur_region_on > 0.5) {\n"
 	"		vec2 lo = u_blur_region.xy;\n"
@@ -272,8 +382,17 @@ static const char *decor_fragment_src =
 	"		vec2 b = 1.0 - smoothstep(hi - 1.0, hi + 1.0, wp);\n"
 	"		cover = a.x * a.y * b.x * b.y;\n"
 	"	}\n"
-	"	vec4 out_px = blurred * u_blur_strength * inside * cover *\n"
+	"	float blur_k = u_blur_strength * inside * cover *\n"
 	"		step(u_mask_min, elem_a);\n"
+	"	vec4 out_px;\n"
+	"	if (u_linear > 0.5) {\n"
+	/* 底衬模糊是屏幕编码（sRGB / gamma22）的预乘值 —— 用**输出**那条传输
+	 * 函数解码，不能用内容的 u_src_tf（两者可以不同：PQ 窗口压在 sRGB 底衬上）。 */
+	"		vec3 blin = vidow_decode_premul(tblur.rgb, tblur.a, u_dst_tf);\n"
+	"		out_px = vec4(blin * blur_k, tblur.a * blur_k);\n"
+	"	} else {\n"
+	"		out_px = tblur * blur_k;\n"
+	"	}\n"
 	"\n"
 	/* mediump 只有约 16 位有效范围：大窗口上 dot(p, vec2(12.99, 78.23)) 会
 	 * 直接溢出成 Inf，sin(Inf) = NaN，而 NaN * u_noise（哪怕 u_noise = 0）
@@ -289,6 +408,11 @@ static const char *decor_fragment_src =
 	"	out_px = shadow + out_px * (1.0 - shadow.a);\n"
 	"	out_px = content + out_px * (1.0 - content.a);\n"
 	"	out_px = border + out_px * (1.0 - border.a);\n"
+	"	if (u_linear > 0.5) {\n"
+	"		float a = clamp(out_px.a, 0.0, 1.0);\n"
+	"		out_px = a > 0.0 ? vec4(vidow_tf_encode(out_px.rgb / a, u_dst_tf) * a, a)\n"
+	"			: vec4(0.0);\n"
+	"	}\n"
 	"	gl_FragColor = out_px * u_alpha;\n"
 	"}\n";
 
@@ -299,7 +423,62 @@ static const char *kawase_prefix =
 	"uniform sampler2D u_tex;\n"
 	"uniform vec2 u_texel;\n" /* 1 / source size */
 	"uniform float u_offset;\n" /* 半径，单位：源 texel */
+	"uniform float u_linear;\n" /* color.linear_blur：在线性光里加权平均 */
+	"uniform float u_tf;\n"     /* 源/目标传输函数（0..4，见装饰着色器） */
 	"varying vec2 v_uv;\n"
+	"\n"
+	"vec3 k_tf_decode(vec3 c, float tf) {\n"
+	"	c = max(c, 0.0);\n"
+	"	if (tf > 3.5) {\n"
+	"		vec3 lo = c / 12.92;\n"
+	"		vec3 hi = pow((c + 0.055) / 1.055, vec3(2.4));\n"
+	"		return mix(lo, hi, step(vec3(0.04045), c));\n"
+	"	} else if (tf > 2.5) {\n"
+	"		return pow(c, vec3(2.4));\n"
+	"	} else if (tf > 1.5) {\n"
+	"		return pow(c, vec3(2.2));\n"
+	"	} else if (tf > 0.5) {\n"
+	"		const float m1 = 0.1593017578125;\n"
+	"		const float m2 = 78.84375;\n"
+	"		const float c1 = 0.8359375;\n"
+	"		const float c2 = 18.8515625;\n"
+	"		const float c3 = 18.6875;\n"
+	"		vec3 p = pow(c, vec3(1.0 / m2));\n"
+	"		return pow(max(p - c1, 0.0) / max(c2 - c3 * p, 1e-6),\n"
+	"			vec3(1.0 / m1));\n"
+	"	}\n"
+	"	return c;\n"
+	"}\n"
+	"vec3 k_tf_encode(vec3 c, float tf) {\n"
+	"	c = max(c, 0.0);\n"
+	"	if (tf > 3.5) {\n"
+	"		vec3 lo = c * 12.92;\n"
+	"		vec3 hi = 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055;\n"
+	"		return mix(lo, hi, step(vec3(0.0031308), c));\n"
+	"	} else if (tf > 2.5) {\n"
+	"		return pow(c, vec3(1.0 / 2.4));\n"
+	"	} else if (tf > 1.5) {\n"
+	"		return pow(c, vec3(1.0 / 2.2));\n"
+	"	} else if (tf > 0.5) {\n"
+	"		const float m1 = 0.1593017578125;\n"
+	"		const float m2 = 78.84375;\n"
+	"		const float c1 = 0.8359375;\n"
+	"		const float c2 = 18.8515625;\n"
+	"		const float c3 = 18.6875;\n"
+	"		vec3 p = pow(c, vec3(m1));\n"
+	"		return pow((c1 + c2 * p) / (1.0 + c3 * p), vec3(m2));\n"
+	"	}\n"
+	"	return c;\n"
+	"}\n"
+	/* 预乘编码值 → 预乘线性值（除 alpha 再解码，不能直接解码预乘值）。 */
+	"vec4 k_tap_decode(vec4 c, float weight) {\n"
+	"	if (u_linear > 0.5) {\n"
+	"		vec3 lin = c.a > 0.0 ? k_tf_decode(c.rgb / c.a, u_tf) * c.a\n"
+	"			: vec3(0.0);\n"
+	"		return vec4(lin, c.a) * weight;\n"
+	"	}\n"
+	"	return c * weight;\n"
+	"}\n"
 	"\n"
 	/* 抽样就是抽样：链上不做任何透明度剔除。底衬本身就是预乘的，直接糊就行 ——
 	 * 它透明的地方 alpha 跟着一起淡出，合成的时候自然透出真实背景。
@@ -309,7 +488,7 @@ static const char *kawase_prefix =
 	 * 改糊出来的像素；底衬该不该糊已经由「谁在它上面、它自己透不透」决定了。现在
 	 * 剔除只有一处 —— 装饰着色器里按**元素自己**的 alpha 剔（decor_fragment_src）。 */
 	"vec4 tap(vec2 uv, float weight) {\n"
-	"	return texture2D(u_tex, uv) * weight;\n"
+	"	return k_tap_decode(texture2D(u_tex, uv), weight);\n"
 	"}\n"
 	"\n";
 
@@ -324,7 +503,13 @@ static const char *kawase_down_src =
 	"	sum += tap(v_uv + vec2( o.x, -o.y), 1.0);\n"
 	"	sum += tap(v_uv + vec2(-o.x,  o.y), 1.0);\n"
 	"	sum += tap(v_uv + vec2( o.x,  o.y), 1.0);\n"
-	"	gl_FragColor = sum / 8.0;\n"
+	"	vec4 res = sum / 8.0;\n"
+	"	if (u_linear > 0.5) {\n"
+	"		float a = clamp(res.a, 0.0, 1.0);\n"
+	"		res = a > 0.0 ? vec4(k_tf_encode(res.rgb / a, u_tf) * a, a)\n"
+	"			: vec4(0.0);\n"
+	"	}\n"
+	"	gl_FragColor = res;\n"
 	"}\n";
 
 /* 上升：采样单位是**源 texel 的一半**（niri 的 blur_up）。目标比源大一倍，半步
@@ -346,7 +531,13 @@ static const char *kawase_down_src =
 
 static const char *kawase_up_src =
 	"void main() {\n" KAWASE_UP_TAPS
-	"	gl_FragColor = sum / 12.0;\n"
+	"	vec4 res = sum / 12.0;\n"
+	"	if (u_linear > 0.5) {\n"
+	"		float a = clamp(res.a, 0.0, 1.0);\n"
+	"		res = a > 0.0 ? vec4(k_tf_encode(res.rgb / a, u_tf) * a, a)\n"
+	"			: vec4(0.0);\n"
+	"	}\n"
+	"	gl_FragColor = res;\n"
 	"}\n";
 
 /* ------------------------------------------------------------ mesh shader */
@@ -581,6 +772,10 @@ static void load_decor_program(struct vidow_server *server) {
 	LOC(u_mask_on, "u_mask_on");
 	LOC(u_mask_min, "u_mask_min");
 	LOC(u_mask_map, "u_mask_map");
+	LOC(u_linear, "u_linear");
+	LOC(u_src_tf, "u_src_tf");
+	LOC(u_dst_tf, "u_dst_tf");
+	LOC(u_src_to_dst, "u_src_to_dst");
 #undef LOC
 }
 
@@ -607,6 +802,8 @@ static void load_kawase_programs(struct vidow_server *server) {
 		pass[i].prog->u_offset = glGetUniformLocation(prog, "u_offset");
 		pass[i].prog->u_rect = glGetUniformLocation(prog, "u_rect");
 		pass[i].prog->u_dst = glGetUniformLocation(prog, "u_dst");
+		pass[i].prog->u_linear = glGetUniformLocation(prog, "u_linear");
+		pass[i].prog->u_tf = glGetUniformLocation(prog, "u_tf");
 	}
 }
 
