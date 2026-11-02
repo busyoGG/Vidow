@@ -253,6 +253,14 @@ struct vidow_config {
 	/* 视口外强制渲染（窗口规则 / 录屏预览）每秒补多少帧，0 = 不限。
 	 * 补帧会主动排下一帧，不节流的话在没 vsync 的后端上会空转到几千 fps。 */
 	int force_render_hz;
+	/* 内部离屏缓冲的精度："auto" / "8" / "10"。
+	 *
+	 * 10 不是 10 位整数格式，而是 ABGR16161616F（FP16）—— 2101010 只有 2 位
+	 * alpha，柔和阴影和抗锯齿圆角会被量化没（见 fx-gl.c 的 format_score）。
+	 * auto = 渲染器 / 驱动支持半浮点线性过滤就用 FP16，否则退回 8 位。
+	 * 影响的是装饰、模糊金字塔、底衬这些「自己渲的」缓冲；扫描输出位深是
+	 * vidow.output{ depth } 的事，两者独立。 */
+	char color_precision[8];
 	/* 光标压到全屏窗口（游戏）上、而指针焦点不是它时，**立刻把指针焦点
 	 * （enter）补给它一次**，并同步激活它的指针约束（锁鼠标 / 夹光标）。
 	 *
@@ -2939,6 +2947,11 @@ struct vidow_server {
 	struct wl_list closing; /* vidow_closing.link */
 	struct wl_list shaders; /* vidow_shader.link */
 	bool shader_ok;         /* GLES2 custom shader path usable */
+	/* 内部离屏缓冲用不用 FP16（color.precision = auto/8/10，见 fx-gl.c）。
+	 * ok = 这台机器/驱动支持；fp16 = ok 且配置要。两者分开存：配置热改成
+	 * 8 再改回 10 时不用重新探一遍 GL。 */
+	bool fx_fp16_ok;
+	bool fx_fp16;
 	/* 这一帧开过离屏趟吗（见 fx.c 的 begin_pass / vidow_fx_flush）。
 	 *
 	 * 一帧一次的 glFlush 只对「真的开过趟」有意义：静止画面上一个趟都不开，
@@ -3653,6 +3666,8 @@ struct wlr_buffer *vidow_alloc_target(struct vidow_server *server, int w, int h)
 
 void vidow_fx_set_alpha(struct wlr_scene_node *node, double alpha);
 bool vidow_shader_init(struct vidow_server *server);
+/* 配置热更（color.precision）：只重算 fx_fp16，不重建已分配的缓冲。 */
+void vidow_fx_apply_config(struct vidow_server *server);
 struct vidow_shader *vidow_shader_get(struct vidow_server *server,
 		const char *name);
 

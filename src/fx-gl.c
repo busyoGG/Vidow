@@ -13,6 +13,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
 #include <EGL/egl.h>
@@ -685,6 +686,61 @@ struct vidow_shader *vidow_shader_get(struct vidow_server *server,
 	return sh;
 }
 
+/* --------------------------------------------------- 内部缓冲精度（FP16） */
+
+/* 半浮点纹理的线性过滤：kawase 金字塔和装饰烘图全是线性采样，不能过滤就等于
+ * 画面发硬。GLES 3 核心就要求 16F 可过滤；GLES 2 要看扩展。 */
+static bool gl_half_float_linear_ok(void) {
+	const char *version = (const char *)glGetString(GL_VERSION);
+	if (version == NULL) {
+		return false;
+	}
+	int major = 0;
+	if (sscanf(version, "OpenGL ES %d", &major) == 1 && major >= 3) {
+		return true;
+	}
+	const char *exts = (const char *)glGetString(GL_EXTENSIONS);
+	if (exts == NULL) {
+		return false;
+	}
+	static const char want[] = "GL_OES_texture_half_float_linear";
+	size_t want_len = sizeof(want) - 1;
+	for (const char *p = exts; *p != '\0'; ) {
+		while (*p == ' ') {
+			p++;
+		}
+		const char *end = strchr(p, ' ');
+		size_t n = end != NULL ? (size_t)(end - p) : strlen(p);
+		if (n == want_len && strncmp(p, want, n) == 0) {
+			return true;
+		}
+		if (end == NULL) {
+			break;
+		}
+		p = end + 1;
+	}
+	return false;
+}
+
+/* color_precision 要 FP16 吗（还要再过一次 fx_fp16_ok）。
+ * 10 = FP16 缓冲，不是 10 位整数：2101010 只有 2 位 alpha。 */
+static bool fx_config_wants_fp16(struct vidow_server *server) {
+	const char *want = server->config.color_precision;
+	return want == NULL || strcmp(want, "8") != 0;
+}
+
+void vidow_fx_apply_config(struct vidow_server *server) {
+	bool want = fx_config_wants_fp16(server);
+	bool now = want && server->fx_fp16_ok;
+	if (now != server->fx_fp16) {
+		wlr_log(WLR_INFO, "fx: 内部缓冲精度 -> %s（color_precision = %s）",
+			now ? "FP16" : "8bit",
+			server->config.color_precision[0] != '\0' ?
+			server->config.color_precision : "auto");
+	}
+	server->fx_fp16 = now;
+}
+
 bool vidow_shader_init(struct vidow_server *server) {
 	wl_list_init(&server->shaders);
 	server->shader_ok = server->config.shader_enabled &&
@@ -701,6 +757,28 @@ bool vidow_shader_init(struct vidow_server *server) {
 		server->shader_ok = false;
 		return false;
 	}
+
+	/* 内部缓冲能不能上 FP16（color.precision）：两样都要有 ——
+	 *   1) 渲染器能当渲染目标，且是带 alpha 的 16F（XRGB16F 会让圆角发黑）
+	 *   2) 半浮点纹理能线性过滤（kawase 金字塔和装饰烘图全是线性采样；
+	 *      不能过滤 = 画面发硬，比 8bit 的色阶更难看）
+	 * GLES3 核心就要求 16F 可过滤；GLES2 看 OES_texture_half_float_linear。 */
+	const struct wlr_drm_format_set *render_formats =
+		wlr_renderer_get_render_formats(server->renderer,
+			WLR_BUFFER_CAP_DMABUF);
+	bool has_fp16 = render_formats != NULL &&
+		wlr_drm_format_set_get(render_formats,
+			DRM_FORMAT_ABGR16161616F) != NULL;
+	bool linear_ok = gl_half_float_linear_ok();
+	server->fx_fp16_ok = has_fp16 && linear_ok;
+	/* 配置还没跑（Lua 比渲染器晚）：先按 auto 来，vidow_config_sync 再对账。 */
+	server->fx_fp16 = server->fx_fp16_ok;
+	if (!server->fx_fp16_ok) {
+		wlr_log(WLR_INFO, "fx: 内部缓冲用不了 FP16（%s），走 8bit",
+			!has_fp16 ? "渲染器没有 ABGR16161616F" :
+			"半浮点不能线性过滤");
+	}
+
 	load_decor_program(server);
 	load_kawase_programs(server);
 	load_mesh_program(server);
@@ -725,8 +803,22 @@ bool vidow_shader_init(struct vidow_server *server) {
 /* ---------------------------------------------------------------- targets */
 
 /* Higher is better. 2101010 has only two bits of alpha, which quantises soft
- * shadows and antialiased corners into nothing, so it is a last resort. */
-static int format_score(uint32_t format) {
+ * shadows and antialiased corners into nothing, so it is a last resort.
+ *
+ * FP16 (ABGR16161616F) is the best: full float alpha, no banding in gradients,
+ * and it is what the blur pyramid / decoration buffers want when
+ * color.precision says so. Only the alpha-capable variants count — XRGB 16F
+ * would give black rounded corners, same reason XRGB8888 scores lowest. */
+static int format_score(struct vidow_server *server, uint32_t format) {
+	if (server->fx_fp16) {
+		switch (format) {
+		case DRM_FORMAT_ABGR16161616F:
+		case DRM_FORMAT_ARGB16161616F:
+			return 4;
+		default:
+			break;
+		}
+	}
 	switch (format) {
 	case DRM_FORMAT_ARGB8888:
 	case DRM_FORMAT_ABGR8888:
@@ -749,7 +841,7 @@ static int format_score(uint32_t format) {
 struct wlr_buffer *vidow_alloc_target(struct vidow_server *server, int w,
 		int h) {
 	const uint32_t caps[] = { WLR_BUFFER_CAP_DMABUF, WLR_BUFFER_CAP_SHM };
-	for (int want = 3; want >= 0; want--) {
+	for (int want = server->fx_fp16 ? 4 : 3; want >= 0; want--) {
 		for (size_t c = 0; c < sizeof(caps) / sizeof(caps[0]); c++) {
 			const struct wlr_drm_format_set *set =
 				wlr_renderer_get_render_formats(server->renderer, caps[c]);
@@ -757,7 +849,7 @@ struct wlr_buffer *vidow_alloc_target(struct vidow_server *server, int w,
 				continue;
 			}
 			for (size_t i = 0; i < set->len; i++) {
-				if (format_score(set->formats[i].format) != want) {
+				if (format_score(server, set->formats[i].format) != want) {
 					continue;
 				}
 				struct wlr_buffer *buf = wlr_allocator_create_buffer(

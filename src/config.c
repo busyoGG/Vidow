@@ -316,6 +316,12 @@ static const struct entry entries[] = {
 	{ "force_render_hz", K_INT,    OFF(force_render_hz), SZ(force_render_hz), 5,
 		"滚出视口 / 被藏起来 / 最小化的窗口每秒补多少帧（0 = 不限），配合规则的 force_render" },
 
+	{ "color_precision", K_STRING, OFF(color_precision), SZ(color_precision), 5,
+		"内部离屏缓冲的精度：\"auto\"（默认，能用 FP16 就用）/ \"8\" / \"10\""
+		"（10 = FP16 缓冲，不是 10 位整数 —— 2101010 只有 2 位 alpha，柔和阴影"
+		"和圆角会被量化）。只管装饰 / 模糊 / 底衬这些自己渲的缓冲，扫描输出位深"
+		"是 vidow.output{ depth } 的事" },
+
 	{ "debug_show_refresh", K_BOOL, OFF(debug_show_refresh), SZ(debug_show_refresh), 5,
 		"在每块屏右上角显示实测帧率（debug 用；静止桌面应接近 0，顶到刷新率说明有空转）" },
 
@@ -769,6 +775,9 @@ static const struct group_field shadow_fields[] = {
 	{ "offset_x", "shadow_offset_x" },
 	{ "offset_y", "shadow_offset_y" },
 };
+static const struct group_field color_fields[] = {
+	{ "precision", "color_precision" },
+};
 static const struct group_field blur_fields[] = {
 	{ "enabled",   "blur_enabled" },
 	{ "all",       "blur_all" },
@@ -915,6 +924,7 @@ static const struct group groups[] = {
 	GROUP("border",    NULL,             border_fields),
 	GROUP("shadow",    NULL,             shadow_fields),
 	GROUP("blur",      "blur_enabled",   blur_fields),
+	GROUP("color",     NULL,             color_fields),
 	GROUP("anim",      NULL,             anim_fields),
 	GROUP("window",    NULL,             window_fields),
 	GROUP("layer",     NULL,             layer_fields),
@@ -1973,6 +1983,17 @@ static bool apply_one(struct vidow_config *cfg, const char *key,
 					"min==max 提示就锁，否则 free）；给的是 '%s'", value);
 				return false;
 			}
+			/* 内部缓冲精度：auto / 8 / 10。10 走 FP16（不是 10 位整数），
+			 * 写错当场报错，别静默变成 auto。 */
+			if (strcmp(e->key, "color_precision") == 0 &&
+					strcmp(value, "auto") != 0 &&
+					strcmp(value, "8") != 0 &&
+					strcmp(value, "10") != 0) {
+				wlr_log(WLR_ERROR, "config: color_precision 只能是 "
+					"auto / 8 / 10（10 = FP16 内部缓冲）；给的是 '%s'",
+					value);
+				return false;
+			}
 			/* 这两个键的取值是 niri 定的，写错了当场报错、该行不生效
 			 * （值保持不变，不静默退回默认 —— 和缓动那条路一个规矩）。 */
 			if (strcmp(e->key,
@@ -2167,6 +2188,9 @@ static void defaults(struct vidow_config *cfg) {
 
 	cfg->force_render_hz = 60; /* 视口外补帧：跟屏幕刷新率差不多就够 */
 	cfg->debug_show_refresh = false; /* 右上角帧率叠层，默认不显示 */
+	/* 默认 auto：能上 FP16 就上（用户在 2026-11-02 拍板接受这份显存代价）。
+	 * 驱动不支持半浮点线性过滤时会自动退回 8 位，见 fx-gl.c。 */
+	snprintf(cfg->color_precision, sizeof(cfg->color_precision), "auto");
 	/* 激活令牌不过期：wlroots 默认 30 秒，而「弹通知」和「点通知」之间常常隔着
 	 * 几分钟 —— 令牌过期了 wlroots 直接把激活请求丢掉，我们连信号都收不到
 	 * （点了通知窗口不动，看着像客户端坏了）。 */

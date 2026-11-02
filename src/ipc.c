@@ -1688,6 +1688,10 @@ static bool cmd_set_config(struct vidow_server *server, struct jval *req,
 			strcmp(key, "honor_xdg_activation_with_invalid_serial") == 0) {
 		vidow_activation_apply_config(server);
 	}
+	/* 内部缓冲精度：新分配的离屏缓冲立刻按新值挑格式（已分配的不动） */
+	if (strcmp(key, "color_precision") == 0) {
+		vidow_fx_apply_config(server);
+	}
 	vidow_arrange(server);
 	const char *now = vidow_config_get(&server->config, key);
 	jb_obj(out);

@@ -1945,6 +1945,9 @@ void vidow_config_sync(struct vidow_server *server) {
 	 * `vidowmsg cursor-size` 调它，改配置再 reload 光标根本不动（用户报的
 	 * 「光标大小不能热更新」）。 */
 	vidow_cursor_apply(server);
+	/* 内部缓冲精度（color.precision）可能被改过：只重算「用不用 FP16」，
+	 * 已经分配好的缓冲不重建（它们格式各自独立，混用不影响正确性）。 */
+	vidow_fx_apply_config(server);
 	/* portal 那两个键改了也要跟上：XDG_CURRENT_DESKTOP 重设一遍，生效的
 	 * portals.conf 重新算一遍（内容没变的话什么都不做，不会白重启 portal）。 */
 	vidow_portal_desktop_env(&server->config);
