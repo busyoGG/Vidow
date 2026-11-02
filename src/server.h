@@ -1360,6 +1360,13 @@ struct vidow_output {
 	 * （用户 2026-10-25：「overview 触发的时候应该所有显示器都进 overview，
 	 * 现在虽然都进了但非激活显示器不显示内容」）。 */
 	struct vidow_ov_screen ov;
+	/* 上次给这块屏下发的校色 LUT（zwlr_gamma_control_v1，见 vidow_gamma_init）。
+	 * 走 KMS 的 3x1D color_transform，不经 renderer —— 所以 gles2 也能用。 */
+	struct wlr_color_transform *gamma_lut;
+	/* LUT 改过、还没跟着某一帧提交（KMS 属性不会自己丢，不用每帧重塞）。 */
+	bool gamma_lut_dirty;
+	/* 当前持有 LUT 的那个 control 对象（失败时要回 failed 并销毁它）。 */
+	struct wlr_gamma_control_v1 *gamma_ctl;
 	struct wlr_scene_output *scene_output;
 	struct wlr_output_layout_output *layout_output;
 	/* 这块屏的抓帧器（capture.c 的 vidow_capture）：独立的假输出 + 自己的
@@ -2733,6 +2740,9 @@ struct vidow_server {
 	/* zwlr_gamma_control_manager_v1（校色 / 亮度 / 色温工具用的 1D LUT）。
 	 * 交给 scene 接管：LUT 走 KMS 的 3x1D，不经 renderer —— gles2 也能用。 */
 	struct wlr_gamma_control_manager_v1 *gamma_control;
+	/* 自己接 set_gamma（不交给 scene）：见 output.c 的 vidow_gamma_init */
+	struct wl_listener gamma_set;
+	struct wl_listener gamma_destroy;
 	/* 桌面底色（background_color）：垫在**所有东西**下面。壁纸由 layer-shell
 	 * 的 background 层客户端画（swaybg / swww / shell），这个只是「谁都没画」
 	 * 时的兜底，所以它在 layer_background 下面一层。 */
@@ -3672,6 +3682,10 @@ void vidow_fx_set_alpha(struct wlr_scene_node *node, double alpha);
 bool vidow_shader_init(struct vidow_server *server);
 /* 配置热更（color.precision）：只重算 fx_fp16，不重建已分配的缓冲。 */
 void vidow_fx_apply_config(struct vidow_server *server);
+/* 自己接 zwlr_gamma_control_v1：LUT 变成 3x1D 塞进我们自己的 output state
+ * （不交给 scene —— scene 的 gamma control 和 color manager 互斥，第 5 步要
+ * 自己接色彩管理，所以两条都自己来）。 */
+void vidow_gamma_init(struct vidow_server *server);
 struct vidow_shader *vidow_shader_get(struct vidow_server *server,
 		const char *name);
 

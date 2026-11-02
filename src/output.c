@@ -15,6 +15,7 @@
 #include "sessionlock.h"
 
 #include <wlr/backend/headless.h>
+#include <wlr/render/color.h>
 #include <wlr/util/log.h>
 
 /* 环境变量只问一次。
@@ -362,7 +363,35 @@ void vidow_output_render(struct vidow_output *output) {
 			vidow_stats.damage_lifted++;
 		}
 	}
-	wlr_scene_output_commit(output->scene_output, NULL);
+	/* 校色 LUT 要跟着这一帧一起提交：先建 state，再塞 color_transform，最后提交。
+	 * 不能用 wlr_scene_output_commit() —— 它内部建完 state 就直接提交了，没有
+	 * 插队的地方。另外它「没有损伤」时直接返回，而改 LUT 时画面可以一点没脏，
+	 * 所以上面先 schedule 一帧。 */
+	/* 改 LUT 时画面可以一点没脏，「没有损伤就不出帧」会把颜色变更吞掉 ——
+	 * 所以改过之后主动要一帧（只一次，不是每帧：否则设了 LUT 就永远满帧空转）。 */
+	if (output->gamma_lut_dirty &&
+			!wlr_scene_output_needs_frame(output->scene_output)) {
+		wlr_output_schedule_frame(output->wlr_output);
+	}
+	if (wlr_scene_output_needs_frame(output->scene_output)) {
+		struct wlr_output_state state;
+		wlr_output_state_init(&state);
+		if (wlr_scene_output_build_state(output->scene_output, &state, NULL)) {
+			/* LUT 只在「改过」的那一帧提交一次：KMS 的 CTM 属性不会因为
+			 * 后续不带它的提交而丢，每帧重塞只是白算一个 blob。 */
+			if (output->gamma_lut_dirty) {
+				wlr_output_state_set_color_transform(&state,
+					output->gamma_lut);
+			}
+			if (!wlr_output_commit_state(output->wlr_output, &state)) {
+				wlr_log(WLR_DEBUG, "output %s: 提交失败（含校色 LUT）",
+					output->wlr_output->name);
+			} else {
+				output->gamma_lut_dirty = false;
+			}
+		}
+		wlr_output_state_finish(&state);
+	}
 	int64_t st_t4 = vidow_now_ns();
 	if (render_stats_on()) {
 		vidow_stats.jelly_ns += st_t1 - st_t0;
@@ -1107,8 +1136,14 @@ void vidow_output_kick_all(struct vidow_server *server) {
 }
 
 static void output_commit(struct wl_listener *listener, void *data) {
-	(void)data;
+	struct wlr_output_event_commit *event = data;
 	struct vidow_output *output = wl_container_of(listener, output, commit);
+	/* 屏开回来 / 换模式之后，KMS 那边的 CTM 不一定还挂着：标脏，让下一帧
+	 * 重新把 LUT 塞进去（开屏本身会产生损伤，一定会有下一帧）。 */
+	if ((event->state->committed & WLR_OUTPUT_STATE_ENABLED) &&
+			event->state->enabled && output->gamma_lut != NULL) {
+		output->gamma_lut_dirty = true;
+	}
 	/* 会话锁（见 sessionlock.c）：锁定期间这块屏刚提交了新状态（换模式 / 改缩放 /
 	 * 热插拔重排），逻辑尺寸可能变了 —— 立刻对齐黑 rect + 重新 configure 它的
 	 * lock surface。不能等下一帧：锁定期间没人动的话可能一直不出帧。
@@ -2158,6 +2193,9 @@ static void output_destroy(struct wl_listener *listener, void *data) {
 
 	/* 事件要带名字，而 wlr_output 在这个信号之后就被释放了 —— 所以在这里发。 */
 	vidow_ipc_emit_output(server, "output-removed", output->wlr_output);
+	wlr_color_transform_unref(output->gamma_lut);
+	output->gamma_lut = NULL;
+	output->gamma_ctl = NULL;
 	free(output);
 	vidow_arrange(server);
 	/* 最密的那块屏拔了：X 的全局缩放可以降下来。 */
@@ -2291,6 +2329,116 @@ static void output_log_color_caps(struct vidow_server *server,
 		format_set_has(primary, DRM_FORMAT_XRGB2101010) ? "可以" : "不行",
 		format_set_has(render, DRM_FORMAT_ABGR16161616F) ? "可以" : "不行",
 		wlr_output_get_gamma_size(wlr_output) > 0 ? "可以" : "没有");
+}
+
+/* ----------------------------------------------------------- 校色 LUT */
+/* zwlr_gamma_control_v1：客户端（wlr-randr --gamma / icc-brightness / redshift
+ * 类）下发每通道 1D LUT，我们把它变成 3x1D color_transform 塞进这一帧的
+ * output state。DRM 后端直接把它转成 KMS gamma 表下发（本机 4096 项），完全
+ * 不经 renderer —— 所以强制 gles2 的 Vidow 也能用。
+ *
+ * **为什么不交给 scene**（`wlr_scene_set_gamma_control_manager_v1`）：scene 的
+ * gamma control 和 color manager 在同一个 scene 上互斥（头文件写明），而第 5 步
+ * 要自己接 wp_color_manager_v1，所以两条都自己接，谁也不占 scene 那个位置。
+ *
+ * 和 scene 比多做的两件事：
+ *   - 没有损伤的帧也要提交一次（颜色变了但画面没变，scene 那条路会被
+ *     「不需要出帧」挡掉）；
+ *   - 屏重新打开时重下发（KMS 的 gamma 表在关屏 / 换模式时会丢）。 */
+/* 把当前 LUT 立刻提交下去（只带 color_transform，不带 buffer）。
+ * 不这么做就得等下一帧 —— 而改颜色时画面可能一点没脏，那一帧可能永远不来
+ * （headless 上实测：set_gamma 之后一帧都没有）。 */
+static void gamma_apply(struct vidow_output *output) {
+	struct wlr_output *wlr_output = output->wlr_output;
+	if (!wlr_output->enabled) {
+		/* 关着的屏提交会失败，等它开回来再补（见 output_commit）。 */
+		output->gamma_lut_dirty = true;
+		return;
+	}
+	struct wlr_output_state state;
+	wlr_output_state_init(&state);
+	wlr_output_state_set_color_transform(&state, output->gamma_lut);
+	bool ok = wlr_output_test_state(wlr_output, &state) &&
+		wlr_output_commit_state(wlr_output, &state);
+	wlr_output_state_finish(&state);
+	output->gamma_lut_dirty = !ok;
+	if (ok) {
+		return;
+	}
+
+	wlr_log(WLR_ERROR, "gamma: %s 不接受这份校色表（%zu 项），"
+		"告诉客户端失败", wlr_output->name,
+		wlr_output_get_gamma_size(wlr_output));
+	/* 先把本地状态清干净，再回 failed：send_failed 会触发一次
+	 * set_gamma(control = NULL)，那时不该再拿着同一个 control 重入。 */
+	struct wlr_gamma_control_v1 *ctl = output->gamma_ctl;
+	output->gamma_ctl = NULL;
+	wlr_color_transform_unref(output->gamma_lut);
+	output->gamma_lut = NULL;
+	output->gamma_lut_dirty = false;
+	if (ctl != NULL) {
+		wlr_gamma_control_v1_send_failed_and_destroy(ctl);
+	}
+}
+
+static void gamma_handle_set(struct wl_listener *listener, void *data) {
+	struct vidow_server *server = wl_container_of(listener, server, gamma_set);
+	const struct wlr_gamma_control_manager_v1_set_gamma_event *event = data;
+	struct vidow_output *output = output_of(server, event->output);
+	if (output == NULL) {
+		return;
+	}
+	struct wlr_color_transform *lut =
+		wlr_gamma_control_v1_get_color_transform(event->control);
+	/* 客户端 destroy 掉 control 也是走这条信号（control 为 NULL），那时 LUT
+	 * 回到「没有」，等于恢复正常颜色。 */
+	wlr_color_transform_unref(output->gamma_lut);
+	output->gamma_lut = lut;
+	output->gamma_ctl = event->control;
+	wlr_log(WLR_DEBUG, "gamma: %s 校色表 -> %s", event->output->name,
+		lut != NULL ? "已设" : "清掉");
+	gamma_apply(output);
+}
+
+static void gamma_handle_destroy(struct wl_listener *listener, void *data) {
+	(void)data;
+	struct vidow_server *server =
+		wl_container_of(listener, server, gamma_destroy);
+	wl_list_remove(&server->gamma_destroy.link);
+	wl_list_remove(&server->gamma_set.link);
+	wl_list_init(&server->gamma_destroy.link);
+	wl_list_init(&server->gamma_set.link);
+	server->gamma_control = NULL;
+	struct vidow_output *output;
+	wl_list_for_each(output, &server->outputs, link) {
+		wlr_color_transform_unref(output->gamma_lut);
+		output->gamma_lut = NULL;
+	}
+}
+
+void vidow_gamma_init(struct vidow_server *server) {
+	wl_list_init(&server->gamma_set.link);
+	wl_list_init(&server->gamma_destroy.link);
+	server->gamma_control = wlr_gamma_control_manager_v1_create(server->display);
+	if (server->gamma_control == NULL) {
+		wlr_log(WLR_ERROR, "gamma: 导出 zwlr_gamma_control_manager_v1 失败");
+		return;
+	}
+	/* 测试钩子：headless 的输出没有 KMS gamma 表（gamma_size = 0），客户端会
+	 * 直接拿到 failed，set_gamma 那条路就永远测不到。给个假的 fallback 大小，
+	 * 让「客户端下发 → 我们塞 color_transform → 提交」这条链路在 headless 上
+	 * 也能跑（headless 后端不做色彩变换，只是照单全收）。 */
+	const char *fallback = getenv("VIDOW_TEST_GAMMA_FALLBACK");
+	if (fallback != NULL) {
+		server->gamma_control->fallback_gamma_size =
+			(size_t)strtoul(fallback, NULL, 10);
+	}
+	server->gamma_set.notify = gamma_handle_set;
+	wl_signal_add(&server->gamma_control->events.set_gamma,
+		&server->gamma_set);
+	server->gamma_destroy.notify = gamma_handle_destroy;
+	wl_signal_add(&server->gamma_control->events.destroy,
+		&server->gamma_destroy);
 }
 
 static void server_new_output(struct wl_listener *listener, void *data) {

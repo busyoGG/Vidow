@@ -186,8 +186,11 @@ static int send_lut(struct out *o, float kr, float kg, float kb) {
 int main(int argc, char **argv) {
 	const char *set_name = NULL;
 	float kr = 1.0f, kg = 0.8f, kb = 0.8f;
+	int hold_s = 3;
 	for (int i = 1; i < argc; i++) {
-		if (strcmp(argv[i], "--set") == 0 && i + 1 < argc) {
+		if (strcmp(argv[i], "--hold") == 0 && i + 1 < argc) {
+			hold_s = atoi(argv[++i]);
+		} else if (strcmp(argv[i], "--set") == 0 && i + 1 < argc) {
 			set_name = argv[++i];
 		} else if (strcmp(argv[i], "--reset") == 0 && i + 1 < argc) {
 			set_name = argv[++i];
@@ -200,7 +203,7 @@ int main(int argc, char **argv) {
 			kb = strtof(argv[i + 2], NULL);
 			i += 2;
 		} else {
-			fprintf(stderr, "用法：%s [--set 屏名 [R G B]] [--reset 屏名]\n",
+			fprintf(stderr, "用法：%s [--set 屏名 [R G B]] [--reset 屏名] [--hold 秒]\n",
 				argv[0]);
 			return 1;
 		}
@@ -253,9 +256,13 @@ int main(int argc, char **argv) {
 			fprintf(stderr, "下发失败\n");
 			return 1;
 		}
-		/* set_gamma 之后合成器会在下一帧应用；这里只把请求冲出去。 */
+		/* **必须保持连接**：LUT 属于这个 control 对象，客户端一退出、control
+		 * 被 destroy，合成器就会把颜色恢复（协议就是这么定的）。所以
+		 * wlr-randr --gamma 这种「设完就跑」的工具效果只有一帧。 */
+		printf("保持 %d 秒（看屏幕：偏暖/偏冷说明生效）……\n", hold_s);
 		wl_display_flush(st.display);
-		printf("已下发（看屏幕：偏暖/偏冷说明生效；没变化就是没生效）\n");
+		sleep((unsigned)hold_s);
+		wl_display_roundtrip(st.display);
 	}
 
 	return 0;
