@@ -168,13 +168,10 @@ static void mask_apply(struct vidow_server *server, bool off) {
 		opacity_mask(view->scene_surface != NULL ?
 			view->scene_surface->buffer : NULL, &view->mask_saved_surf,
 			off);
-		/* 拖着果冻的时候，画在屏幕上的既不是表面也不是装饰节点，而是果冻那个
-		 * 节点（内容一样，只是弯了）：它也得压，不然「截图里不出现」的窗口
-		 * 一拖就露出来了。 */
-		struct wlr_scene_buffer *jn = vidow_jelly_node(view);
-		if (jn != NULL) {
-			wlr_scene_buffer_set_opacity(jn, off ? 0.0f : 1.0f);
-		}
+		/* 拖着果冻的时候，画在屏幕上的既不是表面也不是装饰节点，而是果冻那几
+		 * 个节点（每块屏一个；内容一样，只是弯了）：它们也得压，不然「截图里
+		 * 不出现」的窗口一拖就露出来了。 */
+		vidow_jelly_set_opacity(view, off ? 0.0f : 1.0f);
 		view->mask_opacity = off;
 	}
 	struct vidow_layer_surface *ls;

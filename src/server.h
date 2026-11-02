@@ -3774,6 +3774,8 @@ struct vidow_shader *vidow_shader_get(struct vidow_server *server,
 bool vidow_jelly_begin(struct vidow_view *view);
 /* 抓底衬期间把果冻节点也藏起来（它是窗口内容的另一份拷贝）。 */
 void vidow_jelly_capture_visible(struct vidow_view *view, bool on);
+/* 抓帧遮挡：果冻那几块屏的显示节点一起压（每屏一个）。 */
+void vidow_jelly_set_opacity(struct vidow_view *view, float opacity);
 /* 松手：解掉抓点，整张网自己晃回去，晃静了自动交接（装饰节点重新露出来）。 */
 void vidow_jelly_release(struct vidow_view *view);
 /* 立刻收掉（源对不上了 / 松手收尾结束）。 */
@@ -3789,9 +3791,7 @@ bool vidow_jelly_pending(struct vidow_server *server);
  * 形变 + 缓冲里那圈留白都在这个数以内：擦旧位置 / 报损伤的地方按窗口框
  * 外扩这么多才不会留下半截残影。 */
 double vidow_jelly_pad(const struct vidow_view *view);
-/* 正在显示形变结果的那个场景节点（没有就是 NULL）。抓帧遮挡要用：藏着不露的
- * 窗口拖起来的时候，画在屏幕上的其实是这个节点。 */
-struct wlr_scene_buffer *vidow_jelly_node(struct vidow_view *view);
+
 
 bool vidow_fx_begin(struct vidow_server *server, struct vidow_fx_target *fx,
 		struct wlr_scene_tree *parent, const char *shader_name);

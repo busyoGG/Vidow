@@ -15,9 +15,9 @@
 #
 # 判据：
 #   1) 前提：拖动期间 wA 在两块屏上都重抓过私有底衬
-#   2) 果冻全程在画，源固定为**倍率最高**那块屏的装饰缓冲（见 jelly.c 的
-#      jelly_source_node：按 bake_output 挑源会每帧翻，1x 铺到 2x 屏上是横纹，
-#      两套源轮流用是闪烁）
+#   2) 果冻**每块屏各画一格**：左屏那格用左屏的倍率、右屏那格用右屏的倍率
+#      （边框每格各采自己那块屏的装饰缓冲和底衬，见 jelly.c 的 struct
+#      jelly_slot）。整窗只画一份的话另一半必然是错倍率 —— 横纹 / 闪烁。
 #   3) 左屏：wA 压着 wB 的那一条看得到蓝
 #   4) 右屏：wA 越过边界那一截不发黑
 #   5) vidow 全程活着
@@ -212,16 +212,17 @@ grep -a "blur: own region wA" "$LOG" | tail -4 | sed 's/^/    /'
 mark "断言"
 python3 - "$RUNDIR" "$W" "$RX" "$LSCALE" "$RRX" "$RSCALE" \
 	"$FBX" "$FBY" "$FBW" "$FBH" "$ACT_BEFORE" "$ACT_AFTER" \
-	"${GTRACE_BEFORE:-0}" <<'PY'
+	"${GTRACE_BEFORE:-0}" "$LNAME" "$RNAME" <<'PY'
 import os, re, sys
 from PIL import Image
 
 (rundir, w, lx, lscale, rx, rscale, bx, by, bw, bh,
- before, after, gt_before) = (sys.argv[1], int(sys.argv[2]), int(sys.argv[3]),
+ before, after, gt_before, lname, rname) = (
+                   sys.argv[1], int(sys.argv[2]), int(sys.argv[3]),
                    float(sys.argv[4]), int(sys.argv[5]), float(sys.argv[6]),
                    int(sys.argv[7]), int(sys.argv[8]), int(sys.argv[9]),
                    int(sys.argv[10]), int(sys.argv[11]), int(sys.argv[12]),
-                   int(sys.argv[13]))
+                   int(sys.argv[13]), sys.argv[14], sys.argv[15])
 failed = []
 
 def check(cond, msg):
@@ -275,15 +276,17 @@ except OSError:
 own = log.count("blur: own region wA")
 check(own >= 2, "前提：拖动期间 wA 的私有底衬重抓过（%d 次）" % own)
 
-# 0) 果冻源固定取**倍率最高**的那一格（这里是右屏 2 倍）。以前按
-#    fx->bake_output 挑源，跨屏时每帧在两块屏之间翻：1x 那份铺到 2x 屏上
-#    是横纹，两套源轮流用是闪烁。源要是翻了，这里两个倍率都会出现。
-m = re.findall(r"jelly v=\d+ .*scale=([\d.]+)", log)
-scales = sorted(set(m))
-max_scale = max(lscale, rscale)
-check(len(m) > 60 and scales == ["%.2f" % max_scale],
-      "跨屏拖拽期间果冻一直在画，源固定 = 最高倍率 %.2f（实测 %s，%d 条）"
-      % (max_scale, ",".join(scales) or "无", len(m)))
+# 0) 果冻**每块屏各一格**：每格必须用自己那块屏的倍率（源和底衬都是那块屏
+#    自己的）。以前整窗只画一份，挑到哪块屏的源另一半就错了 —— 1x 铺到 2x
+#    屏上是横纹，两套源轮流用是闪烁。
+per_out = {}
+for mm in re.finditer(r"jelly v=\d+ out=(\S+) .*?scale=([\d.]+)", log):
+    per_out.setdefault(mm.group(1), set()).add("%.2f" % float(mm.group(2)))
+check(per_out.get(lname) == {"%.2f" % lscale} and
+      per_out.get(rname) == {"%.2f" % rscale},
+      "跨屏拖拽期间两块屏各画一格、各用自己的倍率（%s=%s，%s=%s）"
+      % (lname, ",".join(sorted(per_out.get(lname) or ["无"])),
+         rname, ",".join(sorted(per_out.get(rname) or ["无"]))))
 
 # 2) 左屏：wA ∩ wB ∩ 左屏 的那一条，左右各留 20 避开圆角 / 阴影
 gbox = (max(w - 200, bx + 20), by + 60,
