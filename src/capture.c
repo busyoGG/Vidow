@@ -126,10 +126,14 @@ void vidow_grab_sync(struct wlr_renderer *renderer, struct wlr_buffer *buffer) {
 	if (texture == NULL) {
 		return;
 	}
+	/* 读回格式必须能走 glReadPixels：10 位 / 半浮点缓冲的 preferred_read_format
+	 * 是 2101010，Mesa 对那个 packed 类型直接 GL_INVALID_OPERATION（每次抓帧
+	 * 往日志刷一条 ERROR，而且这 1×1 的像素根本没读到）。XRGB8888 永远可用。 */
+	uint32_t format = DRM_FORMAT_XRGB8888;
 	uint32_t px = 0;
 	wlr_texture_read_pixels(texture, &(struct wlr_texture_read_pixels_options){
 		.data = &px,
-		.format = DRM_FORMAT_XRGB8888,
+		.format = format,
 		.stride = 4,
 		.src_box = (struct wlr_box){ .width = 1, .height = 1 },
 	});
@@ -652,6 +656,35 @@ struct wlr_buffer *vidow_capture_grab(struct vidow_server *server,
 	return vidow_capture_grab_into(server, output, NULL, 0, NULL);
 }
 
+/* ext-image-copy-capture 的 wl_shm 格式兜底（capture.c 的 10bit 输出问题）。
+ *
+ * wlroots 从输出 swapchain 的 preferred_read_format 推 shm 格式，10 位输出给的是
+ * 2101010；客户端照它建 wl_shm 缓冲，wlroots 的 copy_shm 又用
+ * GL_RGBA + GL_UNSIGNED_INT_2_10_10_10_REV 去 glReadPixels —— Mesa 直接
+ * GL_INVALID_OPERATION（packed 类型不能 CPU 读回），grim 要么报
+ * 「failed to copy output」、要么拿到一张全黑。
+ *
+ * 只把 **shm** 这条改成 8 位 XRGB8888（glReadPixels 用 BGRA + UNSIGNED_BYTE，
+ * GPU 负责 10→8 归一化）。dmabuf 那条不动：GPU 间 blit，什么格式都行。
+ * 真要 10bit 截图是第 10 步另开的格式，不走这条兜底。 */
+void vidow_capture_fix_shm_formats(struct wlr_ext_image_capture_source_v1 *source) {
+	if (source->shm_formats_len == 1) {
+		uint32_t f = source->shm_formats[0];
+		if (f == DRM_FORMAT_XRGB8888 || f == DRM_FORMAT_ARGB8888 ||
+				f == DRM_FORMAT_XBGR8888 || f == DRM_FORMAT_ABGR8888) {
+			return; /* 本来就是 8 位，原样用 */
+		}
+	}
+	uint32_t *formats = calloc(1, sizeof(formats[0]));
+	if (formats == NULL) {
+		return;
+	}
+	formats[0] = DRM_FORMAT_XRGB8888;
+	free(source->shm_formats);
+	source->shm_formats = formats;
+	source->shm_formats_len = 1;
+}
+
 /* 光标抓帧源（pointer cursor session）：结构要先定义，输出源那边会用到它。 */
 struct vidow_cursor_source {
 	struct wlr_ext_image_capture_source_v1_cursor base;
@@ -688,6 +721,7 @@ static void source_update_constraints(struct vidow_capture_source *src) {
 	}
 	wlr_ext_image_capture_source_v1_set_constraints_from_swapchain(&src->base,
 		output->swapchain, output->renderer);
+	vidow_capture_fix_shm_formats(&src->base);
 }
 
 static void source_start(struct wlr_ext_image_capture_source_v1 *base,

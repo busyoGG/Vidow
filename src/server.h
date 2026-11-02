@@ -4175,6 +4175,9 @@ bool vidow_screencopy_has_pending_for_output(struct vidow_screencopy *manager,
  * 负责 wlr_buffer_unlock()。渲染不出来返回 NULL。 */
 struct wlr_buffer *vidow_capture_grab(struct vidow_server *server,
 		struct wlr_output *output);
+/* ext-image-copy-capture 的 wl_shm 格式兜底：10 位输出上把 shm 报成 8 位
+ * XRGB8888（见 capture.c 的定义）。dmabuf 那条不动。 */
+void vidow_capture_fix_shm_formats(struct wlr_ext_image_capture_source_v1 *source);
 /* 抓这块屏上的任意一个矩形（box 是**布局坐标**，scale 是「逻辑 → 像素」，出图
  * 尺寸 = round(w*scale) × round(h*scale)）。按区域录屏 / 按区域截图用它。 */
 /* 抓帧的通用入口（上面两条都是它的特例）：box 为 NULL = 整块输出。

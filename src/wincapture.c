@@ -828,6 +828,7 @@ static void source_send_constraints(struct vidow_win_source *src) {
 	}
 	wlr_ext_image_capture_source_v1_set_constraints_from_swapchain(&src->base,
 		swapchain, src->grab->output.renderer);
+	vidow_capture_fix_shm_formats(&src->base);
 	src->have_constraints = true;
 	src->last_w = w;
 	src->last_h = h;

@@ -230,6 +230,30 @@ static uint32_t shm_format_stride(uint32_t width) {
 	return width * 4;
 }
 
+/* 这个读回格式能不能直接塞进 wl_shm 并让 glReadPixels 读出来。
+ *
+ * 只认 8 位 4 通道那四个。**10 位输出（vidow.output{ depth = 10 }）这里是
+ * 关键**：2101010 的输出缓冲，GLES2 的 preferred_read_format 会返回 2101010，
+ * 客户端照这个格式建 wl_shm 缓冲，wlr_texture_read_pixels 就用
+ * GL_RGBA + GL_UNSIGNED_INT_2_10_10_10_REV 去 glReadPixels —— Mesa 直接
+ * GL_INVALID_OPERATION（packed 类型不支持 CPU 读回），截图要么报
+ * 「failed to copy output」，要么拿到一张全黑。
+ *
+ * 所以 10 位 / 半浮点这类读回格式一律改发 XRGB8888：glReadPixels 用
+ * BGRA + UNSIGNED_BYTE，由 GPU 负责 10→8 位归一化。截图本来就是给 SDR 8 位
+ * 用的（真要 HDR 截图是第 10 步的事，不是靠 screencopy 的原始格式）。 */
+static bool shm_read_format_ok(uint32_t format) {
+	switch (format) {
+	case DRM_FORMAT_ARGB8888:
+	case DRM_FORMAT_XRGB8888:
+	case DRM_FORMAT_ABGR8888:
+	case DRM_FORMAT_XBGR8888:
+		return true;
+	default:
+		return false;
+	}
+}
+
 /* ------------------------------------------------------------ 拷进目标缓冲 */
 
 static bool copy_to_shm(struct vidow_screencopy_frame *frame,
@@ -256,6 +280,9 @@ static bool copy_to_shm(struct vidow_screencopy_frame *frame,
 			.stride = stride,
 			.src_box = frame->box,
 		});
+	wlr_log(WLR_DEBUG, "screencopy: shm 读回 %s fmt=0x%08X %dx%d -> %s",
+		frame->output->name, format, frame->box.width, frame->box.height,
+		ok ? "ok" : "失败");
 	wlr_texture_destroy(texture);
 	wlr_buffer_end_data_ptr_access(frame->buffer);
 	return ok;
@@ -682,11 +709,20 @@ static void capture_output(struct wl_client *client,
 	}
 	uint32_t read_format = wlr_texture_preferred_read_format(texture);
 	wlr_texture_destroy(texture);
+	wlr_log(WLR_DEBUG, "screencopy: %s 首选读回格式 0x%08X（输出缓冲 0x%08X）",
+		output->name, read_format, output->render_format);
 
 	if (read_format == DRM_FORMAT_INVALID) {
 		/* 注意别拿 shm_format == 0 当「没有」判：ARGB8888 在 wl_shm 里就是 0。 */
 		wlr_log(WLR_ERROR, "screencopy: 渲染器给不出读回格式");
 		goto error;
+	}
+	if (!shm_read_format_ok(read_format)) {
+		/* 10 位 / 半浮点输出：见 shm_read_format_ok 的说明。 */
+		wlr_log(WLR_INFO, "screencopy: %s 的读回格式 0x%08X 不能走 wl_shm，"
+			"改发 XRGB8888（GPU 归一化到 8 位）",
+			output->name, read_format);
+		read_format = DRM_FORMAT_XRGB8888;
 	}
 	frame->shm_format = drm_format_to_shm(read_format);
 	if (output->allocator != NULL &&
