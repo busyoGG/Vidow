@@ -680,15 +680,47 @@ static void jelly_render(struct vidow_jelly *jelly) {
 	/* 只在「这个窗口确实该有模糊」时才走屏幕空间那一层：规则关掉模糊 /
 	 * 客户端只要一块区域（ext-background-effect）时退回烘进内容图的那一版，
 	 * 别把整窗都糊上。 */
-	bool blur_ok = fx->blur && fx->blur_tex != NULL &&
+	/* **底衬有没有，要看格子，不能只看老的单值字段。**
+	 *
+	 * 按屏分格之后（server.h 的 vidow_blur_slot），vidow_blur_update 走的是
+	 * blur_assign(fx, out, ...)，只写那一格；fx->blur_tex 一直是 NULL。
+	 * 以前这里只查 fx->blur_tex，于是果冻永远以为「没有底衬」：不画模糊层，
+	 * 而内容图那边（fx.c 的 look.blur）也跟着以为没有底衬、把模糊照旧烘进
+	 * 装饰缓冲 —— 那块缓冲标的是**归属屏**的底衬，果冻再把它整块铺到两块屏
+	 * 上，另一半就是「用着对面那块屏的底衬」（2026-11-02 复现：跨屏拖拽时
+	 * 右半底衬是左屏壁纸的颜色）。 */
+	struct vidow_blur_slot *bslot = blur_slot_for(fx, fx->bake_output, false);
+	bool has_slot_tex = false;
+	for (struct vidow_blur_slot *sl = fx->blur_slot; sl; sl = sl->next) {
+		if (sl->tex != NULL) {
+			has_slot_tex = true;
+			break;
+		}
+	}
+	struct wlr_texture *blur1 = bslot != NULL && bslot->tex != NULL ?
+		bslot->tex : fx->blur_tex;
+	bool blur_ok = fx->blur && (has_slot_tex || fx->blur_tex != NULL) &&
 		jelly->blur_verts != NULL && !fx->blur_region_on &&
 		vidow_view_blur_wanted(jelly->view);
+	/* 单份模式（只有一块屏 / 另一格还没烘出底衬）用的那套原点与区域：
+	 * 优先 bake_output 那一格，没有格子才退回老的单值字段。 */
 	int out_x = fx->blur_out_w > 0 ? fx->blur_out_x : server->output_x;
 	int out_y = fx->blur_out_h > 0 ? fx->blur_out_y : server->output_y;
 	int out_w = fx->blur_out_w > 0 ? fx->blur_out_w : server->output_w;
 	int out_h = fx->blur_out_h > 0 ? fx->blur_out_h : server->output_h;
-	int bw = fx->blur_tex_w > 0 ? fx->blur_tex_w : out_w;
-	int bh = fx->blur_tex_h > 0 ? fx->blur_tex_h : out_h;
+	int rg1_x = fx->blur_tex_x, rg1_y = fx->blur_tex_y;
+	if (bslot != NULL && bslot->tex != NULL) {
+		out_x = bslot->ox;
+		out_y = bslot->oy;
+		out_w = bslot->ow;
+		out_h = bslot->oh;
+		rg1_x = bslot->rx;
+		rg1_y = bslot->ry;
+	}
+	int bw = bslot != NULL && bslot->tex != NULL && bslot->rw > 0 ?
+		bslot->rw : (fx->blur_tex_w > 0 ? fx->blur_tex_w : out_w);
+	int bh = bslot != NULL && bslot->tex != NULL && bslot->rh > 0 ?
+		bslot->rh : (fx->blur_tex_h > 0 ? fx->blur_tex_h : out_h);
 	if (bw < 1) bw = 1;
 	if (bh < 1) bh = 1;
 	/* 节点位置是**逻辑**像素（场景图就是逻辑像素），乘 s 换到输出的设备像素，
@@ -729,10 +761,18 @@ static void jelly_render(struct vidow_jelly *jelly) {
 			}
 			rpass[npass++] = blur_slot_for(fx, out->wlr_output, false);
 		}
+		/* 格子里的底衬有两种：整屏共享那份（rw == 0，贴图就是整块屏的糊壁纸）
+		 * 和私有区域那份（rw > 0，贴图只是窗口背后那一块）。两种都能两趟画 ——
+		 * 整屏那份当成「区域 = 0,0 ow×oh」。 */
 		if (npass != 2 || rpass[0] == NULL || rpass[1] == NULL ||
-				rpass[0]->tex == NULL || rpass[1]->tex == NULL ||
-				rpass[0]->rw < 1 || rpass[1]->rw < 1) {
+				rpass[0]->tex == NULL || rpass[1]->tex == NULL) {
 			npass = 0; /* 哪一块还没烘出底衬：这一帧退回单份（旧行为） */
+		}
+		for (int p = 0; npass == 2 && p < 2; p++) {
+			if (rpass[p]->rw < 1 &&
+					(rpass[p]->ow < 1 || rpass[p]->oh < 1)) {
+				npass = 0; /* 连屏有多大都不知道：没法算 UV */
+			}
 		}
 	}
 
@@ -766,14 +806,28 @@ static void jelly_render(struct vidow_jelly *jelly) {
 			 * (i+1,j+1) (i+1,j) —— 两个三角形：0-2 和 3-5。 */
 			static const int dx6[6] = {0, 1, 0, 1, 1, 0};
 			static const int dy6[6] = {0, 0, 1, 0, 1, 1};
-			/* 每个顶点的静止屏幕位置（设备像素）：模糊 UV 和跨屏归堆
-			 * 都用它。**不能用形变后的 xs[]**：xs 里含弹簧位移，拿它算
-			 * UV 等于让底衬跟着网格一起弯 —— 用户报的「背景跟着窗口
-			 * 扭曲」。底衬是屏幕上烘好的背景，不参与形变：顶点滑到哪，
-			 * 就采它此刻压住的那块背景像素。 */
+			/* 每个顶点的静止屏幕位置。模糊 UV 和跨屏归堆都用它。
+			 * **不能用形变后的 xs[]**：xs 里含弹簧位移，拿它算 UV 等于让
+			 * 底衬跟着网格一起弯 —— 用户报的「背景跟着窗口扭曲」。底衬
+			 * 是屏幕上烘好的背景，不参与形变：顶点滑到哪，就采它此刻压住
+			 * 的那块背景像素。
+			 *
+			 * **归堆必须用布局逻辑坐标，不能先按一个倍率换成设备像素。**
+			 * 两块屏倍率不同（1x / 2x）时，「逻辑 × 单倍率」得到的是哪个
+			 * 坐标系都不是：它既对不上 1x 屏的设备原点，也对不上 2x 屏的
+			 * 设备原点，所有三角形都会掉进「缝隙」分支被塞给第 1 趟 ——
+			 * 右半就采了左屏的底衬（2026-11-02 复现：跨屏拖拽时右半
+			 * 底衬是左屏壁纸的颜色）。逻辑坐标只有一份，先归堆，再在每一
+			 * 趟里按**那块屏自己的倍率**换成设备像素。 */
+			float lx6[6], ly6[6];
+			/* 单份模式退回去用的设备像素坐标（口径 = 当前源缓冲倍率）。 */
 			float sx6[6], sy6[6];
 			if (blur_ok) {
 				for (int k = 0; k < 6; k++) {
+					lx6[k] = (float)node_x +
+						(float)(jelly_rest_xf(jelly, j + dx6[k]) / s);
+					ly6[k] = (float)node_y +
+						(float)(jelly_rest_yf(jelly, i + dy6[k]) / s);
 					sx6[k] = (float)((double)node_x * s) +
 						(float)jelly_rest_xf(jelly, j + dx6[k]);
 					sy6[k] = (float)((double)node_y * s) +
@@ -782,21 +836,27 @@ static void jelly_render(struct vidow_jelly *jelly) {
 			}
 			for (int t = 0; t < 2; t++) {
 				/* 这个三角形归哪块屏：3 个顶点静止位置的均值落进哪块屏
-				 * 的视野框（设备像素布局坐标），就用那块屏的底衬。 */
+				 * 的**布局框**（逻辑坐标），就用那块屏的底衬。 */
 				struct vidow_blur_slot *sl = NULL;
 				if (npass == 2) {
 					float cx = 0.0f, cy = 0.0f;
 					for (int k = 0; k < 3; k++) {
-						cx += sx6[t * 3 + k];
-						cy += sy6[t * 3 + k];
+						cx += lx6[t * 3 + k];
+						cy += ly6[t * 3 + k];
 					}
 					cx /= 3.0f;
 					cy /= 3.0f;
 					for (int p = 0; p < 2 && sl == NULL; p++) {
-						if (cx >= (float)rpass[p]->ox &&
-								cx < (float)(rpass[p]->ox + rpass[p]->ow) &&
-								cy >= (float)rpass[p]->oy &&
-								cy < (float)(rpass[p]->oy + rpass[p]->oh)) {
+						struct wlr_box lb = rpass[p]->layout_box;
+						if (lb.width <= 0 || lb.height <= 0) {
+							wlr_output_layout_get_box(
+								server->output_layout,
+								rpass[p]->out, &lb);
+						}
+						if (cx >= (float)lb.x &&
+								cx < (float)(lb.x + lb.width) &&
+								cy >= (float)lb.y &&
+								cy < (float)(lb.y + lb.height)) {
 							sl = rpass[p];
 						}
 					}
@@ -808,12 +868,38 @@ static void jelly_render(struct vidow_jelly *jelly) {
 				float *dv = second ? jelly->verts2 : jelly->verts;
 				float *db = second ? jelly->blur_verts2 : jelly->blur_verts;
 				int *cnt = second ? &n2 : &n1;
+				/* 两份模式：这一趟要按**它自己那块屏**的倍率把逻辑坐标换成
+				 * 设备像素，再用那一格的区域做 UV（槽位的 ox / rx 都是这套
+				 * 口径，见 server.h 的 vidow_blur_slot）。 */
+				struct wlr_box lbsl = {0};
+				double sp = 1.0;
+				int prx = 0, pry = 0, prw = 1, prh = 1;
+				if (npass == 2) {
+					lbsl = sl->layout_box;
+					if (lbsl.width <= 0 || lbsl.height <= 0) {
+						wlr_output_layout_get_box(server->output_layout,
+							sl->out, &lbsl);
+					}
+					if (sl->out != NULL && sl->out->scale > 0.0) {
+						sp = sl->out->scale;
+					}
+					/* rw == 0 = 整屏共享那份：区域就是整块屏。 */
+					if (sl->rw > 0) {
+						prx = sl->rx;
+						pry = sl->ry;
+						prw = sl->rw;
+						prh = sl->rh;
+					} else {
+						prw = sl->ow > 0 ? sl->ow : 1;
+						prh = sl->oh > 0 ? sl->oh : 1;
+					}
+				}
 				/* 这一趟的底衬原点 / 区域（设备像素）：两份模式按各自
 				 * 的屏，单份模式照旧用 fx 里 bake_output 那一份。 */
 				int uo_x = npass == 2 ? sl->ox : out_x;
 				int uo_y = npass == 2 ? sl->oy : out_y;
-				int ut_x = npass == 2 ? sl->rx : fx->blur_tex_x;
-				int ut_y = npass == 2 ? sl->ry : fx->blur_tex_y;
+				int ut_x = npass == 2 ? sl->rx : rg1_x;
+				int ut_y = npass == 2 ? sl->ry : rg1_y;
 				int ut_w = npass == 2 ? sl->rw : bw;
 				int ut_h = npass == 2 ? sl->rh : bh;
 				for (int k = 0; k < 3; k++) {
@@ -829,10 +915,19 @@ static void jelly_render(struct vidow_jelly *jelly) {
 						b[1] = ys[kk];
 						b[2] = us[kk];
 						b[3] = vs[kk];
-						b[4] = (sx6[kk] - (float)uo_x -
-							(float)ut_x) / (float)ut_w;
-						b[5] = (sy6[kk] - (float)uo_y -
-							(float)ut_y) / (float)ut_h;
+						if (npass == 2) {
+							b[4] = (float)(((double)lx6[kk] -
+								(double)lbsl.x) * sp -
+								(double)prx) / (float)prw;
+							b[5] = (float)(((double)ly6[kk] -
+								(double)lbsl.y) * sp -
+								(double)pry) / (float)prh;
+						} else {
+							b[4] = (sx6[kk] - (float)uo_x -
+								(float)ut_x) / (float)ut_w;
+							b[5] = (sy6[kk] - (float)uo_y -
+								(float)ut_y) / (float)ut_h;
+						}
 					}
 					(*cnt)++;
 				}
@@ -933,7 +1028,7 @@ static void jelly_render(struct vidow_jelly *jelly) {
 			}
 		} else {
 		ok = vidow_fx_draw_mesh_blur(server, target, jelly->buf_w,
-			jelly->buf_h, tex, fx->blur_tex,
+			jelly->buf_h, tex, blur1,
 			(float)server->config.blur_strength, jelly->blur_verts, n1,
 			fx->px_pad, fx->px_pad, fx->content_w, fx->content_h,
 			fx->w, fx->h, (float)(look.corner_radius * s),

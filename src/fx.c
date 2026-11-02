@@ -1412,7 +1412,7 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 	/* 果冻期间内容图里**不烘模糊**：模糊由 jelly.c 的网格单独一层按屏幕坐标
 	 * 采样，跟着形状弯但不被拉长。贴图还没建好时保留烘进去的那一版，别让窗口
 	 * 在起手第一帧突然没模糊。 */
-	if (fx->jelly && fx->blur && fx->blur_tex != NULL &&
+	if (fx->jelly && fx->blur && fx_blur_tex_now(fx) != NULL &&
 			!fx->blur_region_on && look.blur) {
 		look.blur = false;
 	}
