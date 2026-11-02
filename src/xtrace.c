@@ -61,7 +61,10 @@ bool vidow_cursor_trace_on(void) {
 
 /* 拖拽跟手探针（见头文件里的说明）：单独一个文件，写完就落盘。 */
 void vidow_gtrace(const char *fmt, ...) {
-	FILE *f = fopen("/tmp/vidow-grab-trace.log", "a");
+	/* VIDOW_GTRACE 指名写到哪儿（测试用临时目录，别和真实会话那份混）。 */
+	const char *path = getenv("VIDOW_GTRACE");
+	FILE *f = fopen(path != NULL && path[0] != '\0' ?
+		path : "/tmp/vidow-grab-trace.log", "a");
 	if (f == NULL) {
 		return;
 	}

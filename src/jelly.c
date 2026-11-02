@@ -169,47 +169,53 @@ static struct wlr_buffer *jelly_src_buffer(struct wlr_buffer *buffer) {
 	return buffer;
 }
 
-/* Per-output decorations replace the legacy FX node. Sample the instance
- * actually carrying this view's pixels, never the disabled startup snapshot.
- * Opacity is intentionally ignored: the source is hidden while jelly draws. */
+/* 果冻的**源**：整窗的一份装饰缓冲，外加它属于哪块屏（= 按哪块屏的倍率烘的）。
+ *
+ * 果冻是整窗一张缓冲、一份源，两块屏同时显示它，所以「取哪一份」只看倍率：
+ * **取最高的那一份**。2x 屏按 1:1 采样（原生清晰），1x 屏降采样（略软，但不
+ * 会有隔行重复的横纹）。
+ *
+ * 以前按 fx->bake_output 挑源，而跨屏时 bake_output 每帧在两块屏之间翻
+ * （view_bake_for_output 给对面那块屏再烘一份），于是同一张果冻缓冲一帧里
+ * 被两套倍率轮流覆盖：1x 那份铺到 2x 屏上是横纹，两套源来回换就是闪烁
+ * （用户 2026-11-03 报的那两条）。取「最高倍率」这个规则跟帧序无关，
+ * 跨屏来回拖也永远是同一份。
+ *
+ * 倍率相同（两块 1x 屏）时按 bake_output → view->output 排，纯粹为了挑得
+ * 稳定。 */
 static struct wlr_scene_buffer *jelly_source_node(struct vidow_view *view,
-		double *scale) {
+		double *scale, struct vidow_blur_slot **slot) {
 	struct vidow_fx_target *fx = &view->fx;
+	if (slot != NULL) {
+		*slot = NULL;
+	}
 	if (!fx->active) {
 		return NULL;
 	}
-	struct vidow_blur_slot *fallback = NULL;
-	/* **先看 fx->bake_output 那一份。** 跨屏时两块屏各烘一份（按各自倍率），
-	 * 果冻的源必须和「这个窗口此刻按哪块屏的倍率画」一致 —— 那就是
-	 * bake_output（见 fx.c 里它的说明）。按 view->output 找的话，窗口刚跨到
-	 * 对面、归属还没变的那几帧取到的是旧屏那份（倍率不同），源一换果冻就
-	 * 被判成「失效」。 */
+	struct vidow_blur_slot *best = NULL;
+	double best_scale = -1.0;
+	int best_rank = -1;
 	for (struct vidow_blur_slot *sl = fx->blur_slot; sl; sl = sl->next) {
 		if (sl->node == NULL || !sl->node->node.enabled ||
 				sl->node->buffer == NULL || !sl->dec_valid) {
 			continue;
 		}
-		if (sl->out == fx->bake_output) {
-			*scale = sl->dec_scale;
-			return sl->node;
+		double sc = sl->dec_scale > 0.0 ? sl->dec_scale : 1.0;
+		int rank = sl->out == fx->bake_output ? 2 :
+			sl->out == view->output ? 1 : 0;
+		if (best == NULL || sc > best_scale + 1e-6 ||
+				(fabs(sc - best_scale) <= 1e-6 && rank > best_rank)) {
+			best = sl;
+			best_scale = sc;
+			best_rank = rank;
 		}
 	}
-	for (struct vidow_blur_slot *sl = fx->blur_slot; sl; sl = sl->next) {
-		if (sl->node == NULL || !sl->node->node.enabled ||
-				sl->node->buffer == NULL || !sl->dec_valid) {
-			continue;
+	if (best != NULL) {
+		*scale = best->dec_scale;
+		if (slot != NULL) {
+			*slot = best;
 		}
-		if (sl->out == view->output) {
-			*scale = sl->dec_scale;
-			return sl->node;
-		}
-		if (fallback == NULL) {
-			fallback = sl;
-		}
-	}
-	if (fallback != NULL) {
-		*scale = fallback->dec_scale;
-		return fallback->node;
+		return best->node;
 	}
 	if (fx->node != NULL && fx->node->node.enabled &&
 			fx->node->buffer != NULL) {
@@ -217,12 +223,6 @@ static struct wlr_scene_buffer *jelly_source_node(struct vidow_view *view,
 		return fx->node;
 	}
 	return NULL;
-}
-
-static struct wlr_buffer *jelly_source(struct vidow_jelly *jelly) {
-	double scale = 1.0;
-	struct wlr_scene_buffer *node = jelly_source_node(jelly->view, &scale);
-	return node != NULL ? node->buffer : NULL;
 }
 
 static int clampi(int v, int lo, int hi) {
@@ -400,28 +400,9 @@ double vidow_jelly_pad(const struct vidow_view *view) {
 	return pad;
 }
 
-/* 窗口现在是不是骑在两块（或更多）屏上。
- *
- * 果冻是**整窗一张**缓冲、一份源（jelly_source_node 只能挑一格的装饰缓冲），
- * 而跨屏时两块屏各有一份、倍率还不一样（1x / 2x）。一份源喂两块屏，另一半
- * 拿到的就是**错倍率**那张图 —— 用户 2026-11-03 报的「还没过边界时另一块屏幕
- * 那半截有横纹，越过去就开始闪烁」。
- *
- * 跨屏期间退回「每屏各画自己那份装饰」（fx 的 per-output blur_slot），形变
- * 让位给正确性：窗口在边界上那一小段没有果冻，落到某块屏里之后照旧。 */
-static bool jelly_view_straddles(struct vidow_view *view) {
-	struct vidow_place place;
-	vidow_place_of_view(view->server, view, &place);
-	return place.resident && place.n > 1;
-}
-
 bool vidow_jelly_begin(struct vidow_view *view) {
 	struct vidow_server *server = view->server;
 	if (!server->config.jelly) {
-		return false;
-	}
-	/* 起手时就在边界上：不做（见 jelly_view_straddles）。 */
-	if (jelly_view_straddles(view)) {
 		return false;
 	}
 	/* 上一个还没收完（松手之后紧接着又按下去拖）：直接收掉重来，不然新的拖拽
@@ -433,7 +414,8 @@ bool vidow_jelly_begin(struct vidow_view *view) {
 	/* 果冻的源是 fx 那份带装饰的离屏图：没有它就没东西可弯（比如装饰和
 	 * shader 都关着）。 */
 	double source_scale = 1.0;
-	struct wlr_scene_buffer *source = jelly_source_node(view, &source_scale);
+	struct wlr_scene_buffer *source =
+		jelly_source_node(view, &source_scale, NULL);
 	if (source == NULL) {
 		return false;
 	}
@@ -472,7 +454,12 @@ bool vidow_jelly_begin(struct vidow_view *view) {
 	jelly->dst_w = (int)lround((double)jelly->buf_w / jelly->scale);
 	jelly->dst_h = (int)lround((double)jelly->buf_h / jelly->scale);
 
-	/* 网格：按目标格子大小定，两边都夹住。 */
+	/* 网格：按目标格子大小定，两边都夹住。
+	 *
+	 * 格子按**源的倍率**换算，所以 cols/rows 只跟窗口的**逻辑**尺寸有关：
+	 * 源从 1x 换成 2x（跨屏，见 jelly_source_node）时 src_w 翻倍、cell 也
+	 * 翻倍，网格尺寸不变 —— jelly_rebase 才有得搬（它只搬同尺寸的弹簧
+	 * 状态，尺寸一变就当场收手，那就是「跨屏果冻丢了」）。 */
 	double cell = JELLY_CELL * jelly->scale;
 	jelly->cols = clampi((int)lround((double)jelly->src_w / cell),
 		JELLY_CELL_MIN, JELLY_CELL_MAX);
@@ -662,9 +649,20 @@ static void jelly_step(struct vidow_jelly *jelly, double base_x, double base_y,
 
 /* ---------------------------------------------------------------- 渲染 */
 
-static void jelly_render(struct vidow_jelly *jelly) {
+/* source 是**这一帧 tick 校验过的那一块**（不是重新挑一遍）：挑源和画源必须
+ * 是同一次决定。以前这里自己再调一次 jelly_source_node()，跨屏时那两次调用
+ * 可能给出两块不同倍率的缓冲 —— 网格按一块尺寸算、贴图却是另一块，画出来
+ * 一格一格错位、两帧一换就是闪烁。 */
+static void jelly_render(struct vidow_jelly *jelly,
+		struct wlr_scene_buffer *source) {
 	struct vidow_server *server = jelly->server;
-	struct wlr_buffer *src = jelly_source(jelly);
+	struct wlr_buffer *src = source != NULL ? source->buffer : NULL;
+	if (jelly->view != NULL && vidow_xtrace_on()) {
+		vidow_gtrace("jellydraw v=%d buf=%dx%d srcbuf=%dx%d scale=%.2f",
+			jelly->view->id, jelly->buf_w, jelly->buf_h,
+			src != NULL ? src->width : 0, src != NULL ? src->height : 0,
+			jelly->scale);
+	}
 	if (src == NULL) {
 		return; /* 源这一帧没准备好：保持上一帧的画面 */
 	}
@@ -1153,24 +1151,9 @@ void vidow_jelly_tick(struct vidow_server *server, int64_t now_ns) {
 		if (jelly == NULL) {
 			continue;
 		}
-		/* **骑到两块屏上就收掉形变**（见 jelly_view_straddles）。
-		 *
-		 * 果冻只有一份整窗缓冲、一份源：两块屏倍率不同时，另一块屏那一半
-		 * 只能拿错倍率的图（横纹），或者两块屏轮流用各自那一份（闪烁）。
-		 * 收掉之后 fx->jelly 归 false，装饰节点当场恢复可见（jelly_free 里
-		 * 那次 apply_anim），每块屏按自己那份装饰缓冲画自己那一半。
-		 *
-		 * 收一次就够：松手之前不会再起手（起手只在拖拽开始时调），所以这行
-		 * 日志一次拖拽最多一条。 */
-		if ((view->dragging || server->grab_view == view) &&
-				jelly_view_straddles(view)) {
-			wlr_log(WLR_INFO, "果冻: 窗口骑在两块屏上，暂停形变"
-				"（每屏各画各的装饰，避免另一半拿错倍率）");
-			vidow_jelly_end(view);
-			continue;
-		}
 		double source_scale = 1.0;
-		struct wlr_scene_buffer *source = jelly_source_node(view, &source_scale);
+		struct wlr_scene_buffer *source =
+			jelly_source_node(view, &source_scale, NULL);
 		/* Validate the same instance we sample, not the last output baked. */
 		if (!view->mapped || view->scene_tree == NULL || source == NULL) {
 			vidow_jelly_end(view);
@@ -1243,11 +1226,14 @@ void vidow_jelly_tick(struct vidow_server *server, int64_t now_ns) {
 			wlr_scene_node_coords(&jelly->node->node, &jn_x, &jn_y);
 			wlr_scene_node_coords(&view->scene_tree->node, &tr_x, &tr_y);
 			vidow_gtrace("jelly v=%d tree=%d,%d src=%d,%d rel=%d,%d "
-				"node=%d,%d rel_now=%d,%d off=%.0f,%.0f scale=%.2f",
+				"node=%d,%d rel_now=%d,%d off=%.0f,%.0f scale=%.2f "
+				"srcbuf=%dx%d",
 				view->id, tx, ty, fx_x, fx_y,
 				jelly->last_rel_x, jelly->last_rel_y, jn_x, jn_y,
 				jelly->node->node.x, jelly->node->node.y,
-				view->anim_off_x, view->anim_off_y, jelly->scale);
+				view->anim_off_x, view->anim_off_y, jelly->scale,
+				source->buffer != NULL ? source->buffer->width : 0,
+				source->buffer != NULL ? source->buffer->height : 0);
 		}
 
 		/* 客户端提交了新内容：让装饰那趟重画一次，果冻采到的才是新图。 */
@@ -1335,7 +1321,7 @@ void vidow_jelly_tick(struct vidow_server *server, int64_t now_ns) {
 			vidow_backdrop_damage_box(server, &box);
 			vidow_backdrop_damage_view(view);
 			/* 节点在树里的相对位置固定，只有内容在变：重画一次。 */
-			jelly_render(jelly);
+			jelly_render(jelly, source);
 		}
 	}
 }

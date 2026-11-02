@@ -15,9 +15,12 @@
 #
 # 判据：
 #   1) 前提：拖动期间 wA 在两块屏上都重抓过私有底衬
-#   2) 左屏：wA 压着 wB 的那一条看得到蓝
-#   3) 右屏：wA 越过边界那一截不发黑
-#   4) vidow 全程活着
+#   2) 果冻全程在画，源固定为**倍率最高**那块屏的装饰缓冲（见 jelly.c 的
+#      jelly_source_node：按 bake_output 挑源会每帧翻，1x 铺到 2x 屏上是横纹，
+#      两套源轮流用是闪烁）
+#   3) 左屏：wA 压着 wB 的那一条看得到蓝
+#   4) 右屏：wA 越过边界那一截不发黑
+#   5) vidow 全程活着
 #
 # 用法：./test-dragblur-cross.sh    （VIDOW_TEST_KEEP=1 保留运行目录）
 # 注意：别和别的测试并行跑 —— 收尾按 cmdline 杀 sheet.py / wall.py。
@@ -72,6 +75,9 @@ export WLR_BACKENDS=headless WLR_HEADLESS_OUTPUTS=2 WLR_LIBINPUT_NO_DEVICES=1
 export HOME="$CFGDIR" VIDOW_LOG=debug VIDOW_BLUR_TRACE=1
 export DISPLAY= WAYLAND_DISPLAY=
 export VIDOW_TEST_ACTION="file:$RUNDIR/actions"
+# 果冻的每帧探针（jelly v=... scale=）只在 x11 trace 开关打开时打
+export VIDOW_X11_TRACE="$RUNDIR/xtrace"
+export VIDOW_GTRACE="$RUNDIR/gtrace.log"
 mkfifo "$RUNDIR/actions"
 
 BIN=${VIDOW_BIN:-./build/vidow}
@@ -165,6 +171,7 @@ echo "    wA（白）：$(geom_of wA)"
 AX=$(geom_of wA | awk '{print $1}')
 AY=$(geom_of wA | awk '{print $2}')
 ACT_BEFORE=$(wc -c < "$LOG")
+GTRACE_BEFORE=$(wc -c < "$RUNDIR/gtrace.log" 2>/dev/null || echo 0)
 
 # 按住 wA 中心往右拖，停在「盒子左 = 边界 - 285」附近：wB 占
 # [边界-220, 边界+192)，wA 占 [边界-285, 边界+127) —— 左半截压着 wB，右半截
@@ -204,15 +211,17 @@ grep -a "blur: own region wA" "$LOG" | tail -4 | sed 's/^/    /'
 
 mark "断言"
 python3 - "$RUNDIR" "$W" "$RX" "$LSCALE" "$RRX" "$RSCALE" \
-	"$FBX" "$FBY" "$FBW" "$FBH" "$ACT_BEFORE" "$ACT_AFTER" <<'PY'
-import os, sys
+	"$FBX" "$FBY" "$FBW" "$FBH" "$ACT_BEFORE" "$ACT_AFTER" \
+	"${GTRACE_BEFORE:-0}" <<'PY'
+import os, re, sys
 from PIL import Image
 
 (rundir, w, lx, lscale, rx, rscale, bx, by, bw, bh,
- before, after) = (sys.argv[1], int(sys.argv[2]), int(sys.argv[3]),
+ before, after, gt_before) = (sys.argv[1], int(sys.argv[2]), int(sys.argv[3]),
                    float(sys.argv[4]), int(sys.argv[5]), float(sys.argv[6]),
                    int(sys.argv[7]), int(sys.argv[8]), int(sys.argv[9]),
-                   int(sys.argv[10]), int(sys.argv[11]), int(sys.argv[12]))
+                   int(sys.argv[10]), int(sys.argv[11]), int(sys.argv[12]),
+                   int(sys.argv[13]))
 failed = []
 
 def check(cond, msg):
@@ -257,13 +266,24 @@ def stats(path, gbox, ox, scale):
 # 1) 前提：拖动期间两块屏都重抓过
 log = open(os.path.join(rundir, "log"), "rb").read()[before:after]
 log = log.decode("utf-8", "replace")
+# 果冻每帧探针走的是另一份文件（vidow_gtrace）。
+try:
+    log += open(os.path.join(rundir, "gtrace.log"), "rb").read()[gt_before:].decode(
+        "utf-8", "replace")
+except OSError:
+    pass
 own = log.count("blur: own region wA")
 check(own >= 2, "前提：拖动期间 wA 的私有底衬重抓过（%d 次）" % own)
 
-# 0) 果冻必须在跨屏那一刻收手：整窗一份果冻缓冲喂不了两块倍率不同的屏
-#    （1x / 2x），另一块屏那一半会拿错倍率 —— 横纹 / 闪烁的来源。
-check(log.count("果冻: 窗口骑在两块屏上") >= 1,
-      "跨屏时果冻收手（退回每屏各画各的装饰）")
+# 0) 果冻源固定取**倍率最高**的那一格（这里是右屏 2 倍）。以前按
+#    fx->bake_output 挑源，跨屏时每帧在两块屏之间翻：1x 那份铺到 2x 屏上
+#    是横纹，两套源轮流用是闪烁。源要是翻了，这里两个倍率都会出现。
+m = re.findall(r"jelly v=\d+ .*scale=([\d.]+)", log)
+scales = sorted(set(m))
+max_scale = max(lscale, rscale)
+check(len(m) > 60 and scales == ["%.2f" % max_scale],
+      "跨屏拖拽期间果冻一直在画，源固定 = 最高倍率 %.2f（实测 %s，%d 条）"
+      % (max_scale, ",".join(scales) or "无", len(m)))
 
 # 2) 左屏：wA ∩ wB ∩ 左屏 的那一条，左右各留 20 避开圆角 / 阴影
 gbox = (max(w - 200, bx + 20), by + 60,
