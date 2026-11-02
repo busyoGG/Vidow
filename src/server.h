@@ -23,6 +23,8 @@
 #include <wlr/types/wlr_cursor_shape_v1.h>
 #include <wlr/types/wlr_data_device.h>
 #include <wlr/types/wlr_gamma_control_v1.h>
+#include <wlr/types/wlr_color_management_v1.h>
+#include <wlr/types/wlr_color_representation_v1.h>
 #include <wlr/types/wlr_input_device.h>
 #include <wlr/types/wlr_input_method_v2.h>
 #include <wlr/types/wlr_keyboard.h>
@@ -2738,11 +2740,15 @@ struct vidow_server {
 
 	struct wlr_scene *scene;
 	/* zwlr_gamma_control_manager_v1（校色 / 亮度 / 色温工具用的 1D LUT）。
-	 * 交给 scene 接管：LUT 走 KMS 的 3x1D，不经 renderer —— gles2 也能用。 */
+	 * 自己接，不交给 scene：LUT 走 KMS 的 3x1D，不经 renderer —— gles2 也能用。 */
 	struct wlr_gamma_control_manager_v1 *gamma_control;
 	/* 自己接 set_gamma（不交给 scene）：见 output.c 的 vidow_gamma_init */
 	struct wl_listener gamma_set;
 	struct wl_listener gamma_destroy;
+	/* wp_color_manager_v1 / wp_color_representation_v1（见 color.c）。
+	 * 同样不交给 scene —— scene 的 gamma 和 color 两个位置互斥。 */
+	struct wlr_color_manager_v1 *color_manager;
+	struct wlr_color_representation_manager_v1 *color_representation;
 	/* 桌面底色（background_color）：垫在**所有东西**下面。壁纸由 layer-shell
 	 * 的 background 层客户端画（swaybg / swww / shell），这个只是「谁都没画」
 	 * 时的兜底，所以它在 layer_background 下面一层。 */
@@ -3686,6 +3692,9 @@ void vidow_fx_apply_config(struct vidow_server *server);
  * （不交给 scene —— scene 的 gamma control 和 color manager 互斥，第 5 步要
  * 自己接色彩管理，所以两条都自己来）。 */
 void vidow_gamma_init(struct vidow_server *server);
+/* 导出 wp_color_manager_v1 + wp_color_representation_v1（见 color.c）。
+ * 调用点：renderer 和 scene 都建好之后（main.c）。 */
+void vidow_color_init(struct vidow_server *server);
 struct vidow_shader *vidow_shader_get(struct vidow_server *server,
 		const char *name);
 

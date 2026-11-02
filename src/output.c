@@ -16,6 +16,7 @@
 
 #include <wlr/backend/headless.h>
 #include <wlr/render/color.h>
+#include <wlr/types/wlr_color_management_v1.h>
 #include <wlr/util/log.h>
 
 /* 环境变量只问一次。

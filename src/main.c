@@ -991,6 +991,9 @@ int main(int argc, char *argv[]) {
 	 * 接 wp_color_manager_v1 —— 所以两条都自己接。实现见 output.c 的
 	 * vidow_gamma_init()。 */
 	vidow_gamma_init(&server);
+	/* 色彩管理（第 5 步）：客户端判断 HDR 的唯一依据。见 color.c 的注释 ——
+	 * 只开 parametric，只报 gamma22 + srgb，等第 6 步有转换能力再放开。 */
+	vidow_color_init(&server);
 	/* Scene trees are stacked in creation order: bottom-most first. */
 	/* 桌面底色（background_color）：比壁纸还底下 —— 壁纸是 background 层的客户端
 	 * 画的，这个只是「谁都没画」时的兜底（见 layer.c 的 vidow_background_apply）。

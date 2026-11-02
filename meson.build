@@ -166,6 +166,7 @@ xkg_server_code = custom_target('xwayland-keyboard-grab-unstable-v1-protocol.c',
 sources = files(
   'src/main.c',
   'src/output.c',
+  'src/color.c',
   'src/outputconf.c',
   'src/view.c',
   'src/place.c',
