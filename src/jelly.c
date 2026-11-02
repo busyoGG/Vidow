@@ -962,6 +962,12 @@ static void jelly_render(struct vidow_jelly *jelly) {
 	pixman_region32_init_rect(&damage, 0, 0, jelly->buf_w, jelly->buf_h);
 	wlr_scene_buffer_set_buffer_with_damage(jelly->node, target, &damage);
 	pixman_region32_fini(&damage);
+	/* 果冻网格是同一张内容贴图的形变拷贝，编码跟着窗口表面走。 */
+	struct vidow_view *jv = jelly->view;
+	if (jv != NULL && jv->scene_surface != NULL &&
+			jv->scene_surface->buffer != NULL) {
+		vidow_color_inherit_tags(jelly->node, jv->scene_surface->buffer);
+	}
 	jelly->drawn_once = true;
 }
 

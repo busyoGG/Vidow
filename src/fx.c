@@ -1843,6 +1843,13 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 	}
 	wlr_scene_buffer_set_buffer_with_damage(node, displayed, &damage);
 	pixman_region32_fini(&damage);
+	/* 刚烘的这张是**源内容 + 装饰**的拷贝：gles2 不做转换，像素编码还是源的
+	 * 那套（PQ 内容烘出来仍是 PQ）。不把标签抄过来，wlroots 会把它当「没标
+	 * 色彩」—— 直通判据误放行，第 6 步以后还会按 sRGB 再转一次。 */
+	vidow_color_inherit_tags(node, src);
+	if (node != fx->node) {
+		vidow_color_inherit_tags(fx->node, src);
+	}
 	/* 源框要**最后**设：换缓冲（这一路每帧在两张目标之间来回换）会把它抹掉。 */
 	wlr_scene_buffer_set_source_box(node, cropped ? &crop_src : NULL);
 

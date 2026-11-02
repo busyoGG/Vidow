@@ -159,6 +159,8 @@ void vidow_closing_start(struct vidow_server *server,
 	wlr_scene_node_set_position(&closing->node->node,
 		x - closing->geo.off_x, y - closing->geo.off_y);
 	wlr_scene_buffer_set_dest_size(closing->node, w, h);
+	/* 快照是 Vidow 自己烘的屏幕画面（已带装饰），就按当前输出编码标。 */
+	vidow_color_mark_srgb(closing->node);
 
 	/* Decorate the outgoing window too, but never blur behind it: the scene it
 	 * would sample is already changing underneath.

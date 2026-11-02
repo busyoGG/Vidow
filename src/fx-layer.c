@@ -1093,6 +1093,8 @@ void vidow_overview_blur_frame(struct vidow_server *server,
 	pixman_region32_init_rect(&damage, 0, 0, logical_w, logical_h);
 	wlr_scene_buffer_set_buffer_with_damage(fx->node, target, &damage);
 	pixman_region32_fini(&damage);
+	/* overview 壁纸：整块屏的模糊拷贝，已经是屏幕编码（sRGB）。 */
+	vidow_color_mark_srgb(fx->node);
 	wlr_scene_node_set_enabled(&fx->node->node, true);
 	fx->blur_drawn = fx->blur_ver;
 	ov->fx_on = true;
@@ -1444,6 +1446,10 @@ bool layer_blur_frame(struct vidow_server *server,
 	pixman_region32_init_rect(&damage, 0, 0, logical_w, logical_h);
 	wlr_scene_buffer_set_buffer_with_damage(fx->node, target, &damage);
 	pixman_region32_fini(&damage);
+	/* 这一张是「底衬 + layer 自己的内容」烘出来的：layer 的内容原样拷进来，
+	 * 编码跟着它走（标成 sRGB 会让以后声明广色域的面板被二次转换）。 */
+	struct wlr_scene_surface *ss = layer_scene_surface(ls);
+	vidow_color_inherit_tags(fx->node, ss != NULL ? ss->buffer : NULL);
 	wlr_scene_node_set_enabled(&fx->node->node, true);
 
 	fx->blur_drawn = fx->blur_ver;

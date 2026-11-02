@@ -2749,6 +2749,8 @@ struct vidow_server {
 	 * 同样不交给 scene —— scene 的 gamma 和 color 两个位置互斥。 */
 	struct wlr_color_manager_v1 *color_manager;
 	struct wlr_color_representation_manager_v1 *color_representation;
+	/* 每个新 surface 的编码声明追踪（见 color.c） */
+	struct wl_listener color_new_surface;
 	/* 桌面底色（background_color）：垫在**所有东西**下面。壁纸由 layer-shell
 	 * 的 background 层客户端画（swaybg / swww / shell），这个只是「谁都没画」
 	 * 时的兜底，所以它在 layer_background 下面一层。 */
@@ -3695,6 +3697,12 @@ void vidow_gamma_init(struct vidow_server *server);
 /* 导出 wp_color_manager_v1 + wp_color_representation_v1（见 color.c）。
  * 调用点：renderer 和 scene 都建好之后（main.c）。 */
 void vidow_color_init(struct vidow_server *server);
+/* 内容拷贝的编码继承：源 scene buffer 的 TF / primaries 抄给拷贝节点。
+ * 见 color.c 的说明（不继承 = 直通判据误放行 + 以后二次转换）。 */
+void vidow_color_inherit_tags(struct wlr_scene_buffer *dst,
+		const struct wlr_scene_buffer *src);
+/* Vidow 自绘的屏幕空间内容（底衬 / 快照）标成当前输出编码（sRGB）。 */
+void vidow_color_mark_srgb(struct wlr_scene_buffer *buffer);
 struct vidow_shader *vidow_shader_get(struct vidow_server *server,
 		const char *name);
 

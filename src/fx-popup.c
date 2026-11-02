@@ -27,6 +27,27 @@
 static void popup_blur_node_destroy(struct wl_listener *listener, void *data);
 static void popup_blur_owner_destroy(struct wl_listener *listener, void *data);
 
+/* 这棵弹出物树里挂着的那个 wlr_scene_surface（弹出物的内容节点）。用它拿
+ * 内容的 TF / primaries —— 烘出来的模糊图里也拷了这份内容，编码得跟着走。 */
+static struct wlr_scene_surface *popup_scene_surface(
+		struct wlr_scene_tree *tree) {
+	if (tree == NULL) {
+		return NULL;
+	}
+	struct wlr_scene_node *n;
+	wl_list_for_each(n, &tree->children, link) {
+		if (n->type != WLR_SCENE_NODE_BUFFER) {
+			continue;
+		}
+		struct wlr_scene_surface *ss = wlr_scene_surface_try_from_buffer(
+			wlr_scene_buffer_from_node(n));
+		if (ss != NULL) {
+			return ss;
+		}
+	}
+	return NULL;
+}
+
 
 /* 窗口的 xdg_popup / X11 菜单提示 / 输入法候选框背后的模糊。
  *
@@ -656,6 +677,9 @@ void popup_blur_frame(struct vidow_server *server,
 	pixman_region32_init_rect(&damage, 0, 0, w, h);
 	wlr_scene_buffer_set_buffer_with_damage(fx->node, target, &damage);
 	pixman_region32_fini(&damage);
+	/* 弹出物自己的内容原样烘了进来，编码跟着它走。 */
+	struct wlr_scene_surface *ss = popup_scene_surface(pb->tree);
+	vidow_color_inherit_tags(fx->node, ss != NULL ? ss->buffer : NULL);
 	wlr_scene_node_set_enabled(&fx->node->node, true);
 	fx->blur_drawn = fx->blur_ver;
 }

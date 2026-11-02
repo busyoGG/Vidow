@@ -5238,6 +5238,8 @@ static void mini_snapshot_place(struct vidow_view *view) {
 		if (view->mini_snapshot == NULL) {
 			return;
 		}
+		/* 最后一帧是 Vidow 自己烘的装饰结果（屏幕编码）。 */
+		vidow_color_mark_srgb(view->mini_snapshot);
 		wlr_log(WLR_INFO, "mini: %s 图标态走快照（force_render 关）→ 真实节点"
 			"停到停车位、客户端停帧，图标和预览都是最后一帧",
 			vidow_view_title(view) != NULL ? vidow_view_title(view) : "(无题)");
@@ -5597,6 +5599,7 @@ static void preview_show(struct vidow_server *server, struct vidow_view *view) {
 			if (server->mini_preview_snap == NULL) {
 				return;
 			}
+			vidow_color_mark_srgb(server->mini_preview_snap);
 		} else if (server->mini_preview_snap->buffer != view->last_buffer) {
 			wlr_scene_buffer_set_buffer(server->mini_preview_snap,
 				view->last_buffer);
