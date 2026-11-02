@@ -847,6 +847,8 @@ struct vidow_mesh_blur_prog {
 	int u_mask, u_mask_on, u_mask_map, u_mask_min;
 	int u_shadow, u_shadow_off, u_shadow_size, u_shadow_offset;
 	int u_shadow_radius, u_shadow_color, u_shadow_on;
+	/* 线性工作空间（color.linear_blend），见 fx-gl.c 的 mesh_blur_fragment_src。 */
+	int u_linear;
 };
 
 /* 输出端全屏后处理（第 9 步 C 档）：场景先渲进 FP16 离屏，再一趟 shader

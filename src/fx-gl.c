@@ -612,9 +612,33 @@ static const char *mesh_blur_fragment_src =
 	"uniform float u_mask_on;\n"
 	"uniform vec4 u_mask_map;\n"
 	"uniform float u_mask_min;\n"
+	/* 线性工作空间（color.linear_blend），和装饰着色器同一套口径。
+	 *
+	 * 这里必须和装饰那条路一致：果冻的源缓冲就是装饰缓冲（渲染时已经按
+	 * u_linear 在线性光里混好了），多出来的模糊层也得在线性光里叠进去。
+	 * 只在 gamma 空间按 content + blur * (1 - a) 算的话，半透明窗口按住
+	 * 的那一下整个窗口会变样 —— 实测 50% 窗口红色分量 186 → 160、背景对比
+	 * 也变强（2026-11-02：test-jelly 第 10 段「按住前后窗口那一块几乎一样」
+	 * 差 65.2）。 */
+	"uniform float u_linear;\n"
 	"varying vec2 v_uv;\n"
 	"varying vec2 v_buv;\n"
 	"varying vec2 v_local;\n"
+	/* 装饰着色器的 u_dst_tf 恒为 gamma2.2（见 fx.c 的 decor_pass），这里
+	 * 就按同一条曲线来；两者要改就得一起改。 */
+	"vec3 mesh_tf_decode(vec3 c) {\n"
+	"	return pow(max(c, 0.0), vec3(2.2));\n"
+	"}\n"
+	"vec3 mesh_tf_encode(vec3 c) {\n"
+	"	return pow(max(c, 0.0), vec3(1.0 / 2.2));\n"
+	"}\n"
+	/* 预乘编码值 → 预乘线性值：先除 alpha 再解码（预乘是在编码空间做的）。 */
+	"vec3 mesh_decode_premul(vec3 rgb, float a) {\n"
+	"	if (a <= 0.0) {\n"
+	"		return vec3(0.0);\n"
+	"	}\n"
+	"	return mesh_tf_decode(rgb / a) * a;\n"
+	"}\n"
 	"float sd_round_box(vec2 p, vec2 half_size, float r, float n) {\n"
 	"	vec2 q = abs(p) - half_size + r;\n"
 	"	vec2 c = max(q, 0.0);\n"
@@ -632,8 +656,8 @@ static const char *mesh_blur_fragment_src =
 	"	return (d - r) * k + min(max(q.x, q.y), 0.0);\n"
 	"}\n"
 	"void main() {\n"
-	"	vec4 content = texture2D(u_texture, v_uv);\n"
-	"	vec4 blurred = texture2D(u_blur, v_buv) * u_blur_strength;\n"
+	"	vec4 tcontent = texture2D(u_texture, v_uv);\n"
+	"	vec4 tblur = texture2D(u_blur, v_buv);\n"
 	"	vec2 p = v_uv * u_src_size;\n"
 	"	vec2 cuv = (p - u_content_off) / u_content_size;\n"
 	/* 窗口矩形之外（投影 / 圆角留白）直接不画模糊；矩形里面再按客户端
@@ -653,8 +677,26 @@ static const char *mesh_blur_fragment_src =
 	"	float window = 1.0 - smoothstep(-1.0, 1.0,\n"
 	"		sd_round_box(sh, u_shadow_size * 0.5, sr, u_corner_n));\n"
 	"	vec4 shadow = u_shadow_color * sa * (1.0 - window) * u_shadow_on;\n"
+	/* 线性工作空间：内容 / 底衬 / 投影都先解码，按预乘 alpha 混完再编码回去。
+	 * 顺序和装饰着色器一样：模糊在底，内容压上，投影在窗口外面。 */
+	"	vec4 content = tcontent;\n"
+	"	vec4 blurred = tblur * u_blur_strength;\n"
+	"	if (u_linear > 0.5) {\n"
+	"		content = vec4(mesh_decode_premul(tcontent.rgb, tcontent.a),\n"
+	"			tcontent.a);\n"
+	"		blurred = vec4(mesh_decode_premul(tblur.rgb, tblur.a),\n"
+	"			tblur.a) * u_blur_strength;\n"
+	"		float sha = shadow.a;\n"
+	"		vec3 shs = sha > 0.0 ? shadow.rgb / sha : vec3(0.0);\n"
+	"		shadow = vec4(mesh_tf_decode(shs) * sha, sha);\n"
+	"	}\n"
 	"	vec4 out_px = content + blurred * (1.0 - content.a) * inside;\n"
 	"	out_px = shadow + out_px * (1.0 - shadow.a);\n"
+	"	if (u_linear > 0.5) {\n"
+	"		float a = clamp(out_px.a, 0.0, 1.0);\n"
+	"		out_px = a > 0.0 ?\n"
+	"			vec4(mesh_tf_encode(out_px.rgb / a) * a, a) : vec4(0.0);\n"
+	"	}\n"
 	"	gl_FragColor = out_px;\n"
 	"}\n";
 
@@ -837,6 +879,7 @@ static void load_mesh_program(struct vidow_server *server) {
 		b->u_mask_on = glGetUniformLocation(prog, "u_mask_on");
 		b->u_mask_map = glGetUniformLocation(prog, "u_mask_map");
 		b->u_mask_min = glGetUniformLocation(prog, "u_mask_min");
+		b->u_linear = glGetUniformLocation(prog, "u_linear");
 	}
 }
 
@@ -1573,6 +1616,8 @@ bool vidow_fx_draw_mesh_blur(struct vidow_server *server,
 	}
 	glActiveTexture(GL_TEXTURE0);
 	glUniform1f(m->u_blur_strength, blur_strength);
+	/* 和装饰着色器同一条合成口径（见 mesh_blur_fragment_src 的说明）。 */
+	glUniform1f(m->u_linear, server->config.color_linear_blend ? 1.0f : 0.0f);
 	glUniform2f(m->u_size, (float)w, (float)h);
 	glUniform2f(m->u_src_size, (float)src_w, (float)src_h);
 	glUniform2f(m->u_content_off, (float)content_off_x,
