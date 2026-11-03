@@ -125,6 +125,11 @@ struct vidow_jelly {
 	int cols, rows;      /* 格子数（按窗口的**逻辑**尺寸定，两块屏共用） */
 	int nx, ny;          /* 节点数 = cols + 1 / rows + 1 */
 	float *verts;        /* 内容顶点：[x, y, u, v] × rows*cols*6 */
+	/* 模糊顶点：[x, y, u_content, v_content, u_blur, v_blur] × rows*cols*6。
+	 * 位置和内容层共用、内容 UV 共用；只有 blur UV 是按**静止的屏幕坐标**
+	 * 另算的 —— 底衬不跟着网格弯（用户 2026-11-03：「果冻晃动的时候底衬
+	 * 看起来和背景原来的位置一一对应」）。 */
+	float *blur_verts;
 	float *ox, *oy;      /* 每个节点的偏移（逻辑像素） */
 	float *vx, *vy;      /* 每个节点的速度 */
 	float *lx, *ly;      /* 每个节点的「滞后位置」（跟底座跟得慢的那个版本） */
@@ -140,6 +145,11 @@ struct vidow_jelly {
 	/* 客户端上一帧提交的表面缓冲：换了就说明内容变了，得让 fx 那条管线重画
 	 * 一次（松手之后没有指针事件，没人去催它，果冻会一直采样旧图）。 */
 	struct wlr_buffer *src_surface_buffer;
+	/* 客户端表面贴图：模糊遮罩用它的 alpha（窗口本身哪里真的存在），
+	 * 投影不在客户端表面里，所以阴影不会被圈进模糊。 */
+	struct wlr_buffer *mask_buf;
+	struct wlr_texture *mask_tex;
+	bool mask_owned;
 	double base_x, base_y;   /* 上一帧底座（场景树）位置 */
 	int64_t last_ns;
 	/* 上一帧果冻在屏幕上占的那一整块（布局逻辑坐标，已按 vidow_jelly_pad
@@ -277,7 +287,16 @@ static void jelly_free(struct vidow_jelly *jelly) {
 			vidow_backdrop_damage_view(view);
 		}
 	}
+	if (jelly->mask_owned && jelly->mask_tex != NULL) {
+		wlr_texture_destroy(jelly->mask_tex);
+	}
+	jelly->mask_tex = NULL;
+	if (jelly->mask_buf != NULL) {
+		wlr_buffer_unlock(jelly->mask_buf);
+		jelly->mask_buf = NULL;
+	}
 	free(jelly->verts);
+	free(jelly->blur_verts);
 	free(jelly->ox);
 	free(jelly->oy);
 	free(jelly->vx);
@@ -484,6 +503,8 @@ bool vidow_jelly_begin(struct vidow_view *view) {
 	size_t n = (size_t)jelly->nx * (size_t)jelly->ny;
 	jelly->verts = calloc((size_t)jelly->rows * (size_t)jelly->cols * 24,
 		sizeof(float));
+	jelly->blur_verts = calloc((size_t)jelly->rows * (size_t)jelly->cols * 36,
+		sizeof(float));
 	jelly->ox = calloc(n, sizeof(float));
 	jelly->oy = calloc(n, sizeof(float));
 	jelly->vx = calloc(n, sizeof(float));
@@ -493,7 +514,7 @@ bool vidow_jelly_begin(struct vidow_view *view) {
 	jelly->gtau = calloc(n, sizeof(float));
 	jelly->lx = calloc(n, sizeof(float));
 	jelly->ly = calloc(n, sizeof(float));
-	if (jelly->verts == NULL || jelly->ox == NULL || jelly->oy == NULL || jelly->vx == NULL ||
+	if (jelly->verts == NULL || jelly->blur_verts == NULL || jelly->ox == NULL || jelly->oy == NULL || jelly->vx == NULL ||
 			jelly->vy == NULL || jelly->gw2 == NULL || jelly->gcc == NULL ||
 			jelly->gtau == NULL || jelly->lx == NULL || jelly->ly == NULL) {
 		wlr_log(WLR_ERROR, "jelly: 分配 %dx%d 网格失败",
@@ -636,39 +657,30 @@ static void jelly_step(struct vidow_jelly *jelly, double base_x, double base_y,
 
 /* ---------------------------------------------------------------- 渲染 */
 
-/* 按网格算出这一格要画的三角形（顶点是**这一格自己缓冲**的设备像素坐标，
- * 内容 UV 是源缓冲里的归一化坐标）。 */
-static int jelly_build_verts(struct vidow_jelly *jelly,
+/* 这一格该不该自己叠一层底衬。
+ *
+ * **底衬要自己采**（和没有果冻时同一个着色器、同一条公式），原因是果冻把
+ * 内容网格掰弯了：如果模糊烘在内容图里，底衬会跟着网格一起被拉 —— 用户
+ * 2026-11-03：「果冻晃动的时候底衬看起来和背景原来的位置一一对应」。
+ *
+ * 所以模糊顶点另算一套 UV：位置取**静止**的屏幕坐标（不含弹簧位移），
+ * 底衬就是那块屏上原来那张背景图，顶点滑到哪儿就采哪儿的像素。
+ *
+ * 每格用自己的那张底衬贴图 —— 跨屏时两块屏各有一张，一层贴图一套坐标，
+ * 各画各的才不会拿错屏。 */
+static bool jelly_slot_blur_ok(struct vidow_jelly *jelly,
 		struct jelly_slot *slot) {
-	int n = 0;
-	for (int i = 0; i < jelly->rows; i++) {
-		for (int j = 0; j < jelly->cols; j++) {
-			for (int k = 0; k < 6; k++) {
-				static const int dx6[6] = {0, 1, 0, 1, 1, 0};
-				static const int dy6[6] = {0, 0, 1, 0, 1, 1};
-				float *v = jelly->verts + (size_t)n * 4;
-				v[0] = (float)jelly_slot_xf(jelly, slot, i + dy6[k],
-					j + dx6[k]);
-				v[1] = (float)jelly_slot_yf(jelly, slot, i + dy6[k],
-					j + dx6[k]);
-				v[2] = (float)(j + dx6[k]) / (float)jelly->cols;
-				v[3] = (float)(i + dy6[k]) / (float)jelly->rows;
-				n++;
-			}
-		}
+	struct vidow_fx_target *fx = &jelly->view->fx;
+	if (!fx->blur || fx->blur_region_on || jelly->blur_verts == NULL ||
+			!vidow_view_blur_wanted(jelly->view)) {
+		return false;
 	}
-	return n;
+	return slot->bs != NULL && slot->bs->tex != NULL;
 }
 
-/* 把**这块屏已经画好的装饰图**按网格掰弯。就这么一件事。
- *
- * 以前这里还要自己叠一层模糊底衬（按屏幕坐标采样）。那一层得知道「贴图属于
- * 哪块屏、区域原点是多少、倍率多少」—— 跨屏时这些是两块屏两套值，而一层
- * 贴图只有一套坐标，另一半必然错：1x 那份铺到 2x 屏上是横纹，两套源轮流用
- * 是闪烁（用户 2026-11-03：「果冻的时候直接用没果冻时候的底衬不行吗」）。
- *
- * 现在模糊和没有果冻时一样**烘在内容图里**（见 fx.c 里 look.blur 那段），
- * 果冻只负责形变：每块屏各掰自己那张，底衬逐像素就是没有果冻时的那张。 */
+/* 把**这一格**画出来：内容是那块屏的装饰图，按网格掰弯；底衬是那块屏的
+ * 底衬，按**静止的屏幕坐标**贴（不弯）。和没有果冻时是同一个着色器
+ * （vidow_fx_draw_mesh_blur），所以静止时逐像素一样。 */
 static void jelly_render(struct vidow_jelly *jelly, struct jelly_slot *slot) {
 	struct vidow_server *server = jelly->server;
 	struct wlr_buffer *src = slot->src;
@@ -694,9 +706,164 @@ static void jelly_render(struct vidow_jelly *jelly, struct jelly_slot *slot) {
 		return;
 	}
 
-	int n1 = jelly_build_verts(jelly, slot);
-	bool ok = vidow_fx_draw_mesh(server, target, slot->buf_w, slot->buf_h,
-		tex, jelly->verts, n1);
+	struct vidow_fx_target *fx = &jelly->view->fx;
+	struct vidow_blur_slot *bs = slot->bs;
+	bool blur_ok = jelly_slot_blur_ok(jelly, slot);
+	/* 底衬的原点 / 区域（设备像素）。有格子就用**这一格**自己的；老的单份
+	 * 路（没有分格）退回 fx 里那一组单值。 */
+	int out_x, out_y, rg_x, rg_y, bw, bh;
+	if (bs != NULL) {
+		out_x = bs->ox;
+		out_y = bs->oy;
+		rg_x = bs->rx;
+		rg_y = bs->ry;
+		bw = bs->rw > 0 ? bs->rw : bs->ow;
+		bh = bs->rh > 0 ? bs->rh : bs->oh;
+	} else {
+		out_x = fx->blur_out_w > 0 ? fx->blur_out_x : server->output_x;
+		out_y = fx->blur_out_h > 0 ? fx->blur_out_y : server->output_y;
+		rg_x = fx->blur_tex_x;
+		rg_y = fx->blur_tex_y;
+		bw = fx->blur_tex_w > 0 ? fx->blur_tex_w : server->output_w;
+		bh = fx->blur_tex_h > 0 ? fx->blur_tex_h : server->output_h;
+	}
+	if (bw < 1) {
+		bw = 1;
+	}
+	if (bh < 1) {
+		bh = 1;
+	}
+	/* 这一格烘装饰时用的内边距 / 内容尺寸（设备像素，**这块屏自己的**）。
+	 * 不能用 fx->content_w 那一组单值：跨屏时它是「上一次烘的那一块」。 */
+	int cpad = bs != NULL ? bs->dec_px_pad : fx->px_pad;
+	int cw = bs != NULL && bs->dec_content_w > 0 ?
+		bs->dec_content_w : fx->content_w;
+	int ch = bs != NULL && bs->dec_content_h > 0 ?
+		bs->dec_content_h : fx->content_h;
+
+	/* 节点**左上角**是逻辑像素（场景图就是逻辑像素），乘这一格的倍率换到
+	 * 设备像素，才和底衬贴图（按设备像素抓）同一个口径。
+	 *
+	 * 不能拿显示节点自己的坐标：窗口贴近屏幕边缘时那个节点被裁过（位置挪到
+	 * 交集、源框切一块，见 tick 里那段），坐标就不再是缓冲的原点了，UV 会
+	 * 整块偏出去（实测：窗口左半透出的全是右边那块背景）。源节点的坐标
+	 * 没被裁过，减掉那圈留白就是缓冲原点。 */
+	int node_x = 0, node_y = 0;
+	if (blur_ok) {
+		if (bs != NULL && bs->node != NULL) {
+			wlr_scene_node_coords(&bs->node->node, &node_x, &node_y);
+			node_x -= (int)lround(JELLY_MARGIN);
+			node_y -= (int)lround(JELLY_MARGIN);
+		} else {
+			wlr_scene_node_coords(&slot->node->node, &node_x,
+				&node_y);
+		}
+	}
+	double s = slot->scale > 0.0 ? slot->scale : 1.0;
+
+	int n1 = 0;
+	for (int i = 0; i < jelly->rows; i++) {
+		for (int j = 0; j < jelly->cols; j++) {
+			for (int k = 0; k < 6; k++) {
+				static const int dx6[6] = {0, 1, 0, 1, 1, 0};
+				static const int dy6[6] = {0, 0, 1, 0, 1, 1};
+				int col = j + dx6[k];
+				int row = i + dy6[k];
+				float x = (float)jelly_slot_xf(jelly, slot, row, col);
+				float y = (float)jelly_slot_yf(jelly, slot, row, col);
+				float u = (float)col / (float)jelly->cols;
+				float v = (float)row / (float)jelly->rows;
+				float *w = jelly->verts + (size_t)n1 * 4;
+				w[0] = x;
+				w[1] = y;
+				w[2] = u;
+				w[3] = v;
+				if (blur_ok) {
+					/* 底衬 UV 用**静止位置**（不含 ox/oy 位移）：
+					 * 顶点滑到哪，就采它此刻压住的那块背景像素。
+					 * 拿形变后的坐标算等于让底衬跟着网格弯。 */
+					float *b = jelly->blur_verts + (size_t)n1 * 6;
+					double sx = (double)node_x * s +
+						jelly_slot_rest_xf(slot, col);
+					double sy = (double)node_y * s +
+						jelly_slot_rest_yf(slot, row);
+					b[0] = x;
+					b[1] = y;
+					b[2] = u;
+					b[3] = v;
+					b[4] = (float)((sx - (double)out_x -
+						(double)rg_x) / (double)bw);
+					b[5] = (float)((sy - (double)out_y -
+						(double)rg_y) / (double)bh);
+				}
+				n1++;
+			}
+		}
+	}
+
+	bool ok = false;
+	if (blur_ok) {
+		/* 模糊只画在窗口可见矩形（含圆角）里面：投影 / 圆角外那圈留白
+		 * 不采模糊，否则阴影会被底下的底衬染糊。 */
+		struct vidow_look look;
+		vidow_view_look(&server->config, &jelly->view->rule_eff,
+			jelly->view->fullscreen, &look);
+		struct wlr_buffer *mb = jelly->view->scene_surface != NULL &&
+			jelly->view->scene_surface->buffer != NULL ?
+			jelly->view->scene_surface->buffer->buffer : NULL;
+		/* mask 可能借的是 wlr_client_buffer 的缓存贴图：客户端每 commit 一次
+		 * dmabuf，贴图会换一张（buffer 指针却可能不变）。只比较 mask_buf 会
+		 * 把旧贴图留成悬空指针，下一帧传给 GLES2 就是
+		 * `wlr_texture_is_gles2()` 断言 / SIGABRT。 */
+		struct wlr_client_buffer *mask_client =
+			mb != NULL ? wlr_client_buffer_get(mb) : NULL;
+		bool mask_changed = mb != jelly->mask_buf;
+		if (!mask_changed && mask_client != NULL) {
+			if (mask_client->texture != NULL) {
+				mask_changed = mask_client->texture != jelly->mask_tex;
+			} else if (!jelly->mask_owned && jelly->mask_tex != NULL) {
+				/* 借来的贴图没了：下一帧换成自己建的那张（或者 NULL）。 */
+				mask_changed = true;
+			}
+		}
+		if (mask_changed) {
+			if (jelly->mask_owned && jelly->mask_tex != NULL) {
+				wlr_texture_destroy(jelly->mask_tex);
+			}
+			/* 锁住这份 mask：旧 buffer 一旦被释放，地址可能被新 buffer 复用，
+			 * 光比较 mask_buf 指针会把「新 buffer 的旧地址」当成同一份。 */
+			if (mb != jelly->mask_buf) {
+				if (jelly->mask_buf != NULL) {
+					wlr_buffer_unlock(jelly->mask_buf);
+				}
+				jelly->mask_buf = mb != NULL ? wlr_buffer_lock(mb) : NULL;
+			}
+			jelly->mask_tex = vidow_fx_client_texture(server, mb,
+				jelly->view->scene_surface != NULL ?
+					jelly->view->scene_surface->buffer : NULL,
+				&jelly->mask_owned);
+		}
+		/* 目标缓冲比内容四周多一圈 JELLY_MARGIN，窗口矩形在目标坐标里要
+		 * 加上这圈留白；漏了它模糊就会偏进阴影 / 圆角外面。 */
+		float shadow_pm[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+		ok = vidow_fx_draw_mesh_blur(server, target, slot->buf_w,
+			slot->buf_h, tex, bs->tex,
+			(float)server->config.blur_strength, jelly->blur_verts, n1,
+			cpad, cpad, cw, ch,
+			slot->src_w, slot->src_h,
+			(float)(look.corner_radius * s),
+			(float)vidow_corner_n_clamp(look.corner_n),
+			jelly->mask_tex, fx->tex_off_x, fx->tex_off_y,
+			fx->tex_scale_x, fx->tex_scale_y, 1.0f / 255.0f,
+			NULL,
+			(int)slot->margin_px + cpad, (int)slot->margin_px + cpad,
+			cw, ch,
+			0.0f, 0.0f, 0.0f, shadow_pm, false, true);
+	}
+	if (!ok) {
+		ok = vidow_fx_draw_mesh(server, target, slot->buf_w, slot->buf_h,
+			tex, jelly->verts, n1);
+	}
 	wlr_texture_destroy(tex);
 	if (!ok) {
 		return;
