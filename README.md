@@ -984,6 +984,7 @@ VIDOW_TEST_RENDERER=gles2 ./test-screencast.sh
 ./test-keyboard-grab.sh              # 键盘那两个协议：快捷键抑制（含逃生口）+ X11 的 XGrabKeyboard（全 headless，30 项断言）
 ./test-maximize.sh                   # 列最大化（niri 的 maximize-column）：客户端 set_maximized 也映射到它（全 headless，60 项断言）
 ./test-cursor-shake.sh              # 摇晃找光标：线性加 + 补间、晃到屏幕那么大，截图里没有它（全 headless，55 项断言）
+./test-x11cursor-none.sh            # X11 窗口光标：set_cursor(NULL) 的两条路 + 按设备像素上屏（2 倍屏不乘 2、大光标不被平面裁，全 headless，14 项断言）
 ./test-geometry.sh                   # 窗口几何和表面尺寸对不上时内容铺满框（chromium 改大小那 1-2 秒）（全 headless，6 项断言）
 ./test-viewport-crop.sh              # 客户端用 wp_viewport 只声明缓冲的一部分时，装饰按那块采（chromium，5 项断言）
 ./test-blurcache.sh                  # 拖重叠窗口时只重建「它底下那个」的底衬、且一次贴图都不重新导入（7 项断言）
@@ -5672,14 +5673,21 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
       - **修法**：`server_request_cursor()` 里把两种 NULL 分开：指针底下那块 X11 view 是**全屏** → 照旧隐藏（游戏自己画）；
         否则清掉「X11 要求不画」的账（`vidow_cursor_fx_x11_cursor_cleared`）并恢复主题箭头
         （`vidow_cursor_fx_default_cursor`）。判据只看全屏与否，不再按「是 Xwayland 发的」一刀切。
-      - **修法 ②（用户当天补报「光标大小也小了一半」）**：Xwayland 给的 cursor surface 自带 buffer scale，热点也在 surface 坐标里。
-        旧代码绕过 `wlr_cursor_set_surface()`、自己把缓冲按 `xwayland_scale` 声明成密度并**再把热点除一次**：2 倍屏上图像和热点都只剩
-        一半，热点一偏，看着就像「光标不跟着控件变」（指针实际压在背景上）。现在两种客户端（Wayland / X11）都直接交给
-        `wlr_cursor_set_surface()`，由表面自己的 scale 和热点上屏。
+      - **修法 ②（当天补报「光标大小也小了一半」）**：一度改成两种客户端都把 cursor surface 交给
+        `wlr_cursor_set_surface()`，由表面自己的 scale 上屏。**这一步是错的**（2026-11-03 用户报「光标大小出问题了，光标被裁切」）：
+        Xwayland 不开 `-hidpi` 时 X11 光标 surface 的 `buffer_scale` 恒为 1，而 X 像素就是**设备像素**（X11 窗口缓冲也是这个约定）。
+        当逻辑尺寸上屏等于把光标乘了 `xwayland_scale`：2 倍屏上 64px 的 X 光标变成 128 设备像素（Wayland 主题光标只有 64），
+        而且硬件光标平面通常只到 64x64 —— wlroots 的 `render_cursor_buffer()` 挑一个装得下**纹理**的 64x64 缓冲，再把
+        `dst_box` 按 128 画进去，只画得出左上 64x64，光标被裁掉一大块。
+      - **修法 ③（2026-11-03）**：X11 光标改回按**设备像素**上屏 —— `wlr_cursor_set_buffer()`，密度 = `xwayland_scale`、热点同除；
+        Wayland 客户端仍走 `wlr_cursor_set_surface()`。`set_buffer` 这条路 wlroots 不给 cursor surface 发 `wl_surface.frame`
+        回调，Xwayland 的 `xwl_cursor->frame_cb` 会一直挂着、第二次换光标被它自己挡在 `needs_update` 里（实测只有第一张上屏）——
+        所以 `output.c` 每画完一帧调 `vidow_cursor_fx_frame_done()`，给记下的那张 X11 光标表面补一个 frame 回调。
       - 判据：`test-x11cursor-none.sh`（headless 1280x720）—— 普通窗口没设光标 → 主题箭头 72x72 且日志有「X11 窗口没设光标
         …→ 主题箭头」；客户端换 hand2 → 16x16；再设 None（仍非全屏）→ 回到 72x72；全屏下 hand2 → 16x16，None → `0x0`
-        且不再打「→ 主题箭头」；同一套在 **2 倍屏**上重跑，hand2 是 32x32（1 倍屏 16x16 的 2 倍，没被再除一次）。
-        `tools/x11cursorwin.c` 是这个测试的 X11 客户端（stdin 换窗口光标）。
+        且不再打「→ 主题箭头」；**2 倍屏**上 hand2 还是 16x16（X 像素=设备像素，不乘 2）；`box 64 8 8` → 64x64、热点 8,8；
+        再 `box 32` / `box 160` 必须一张接一张生效（image 和 texture 都是 160x160，验证 frame 回调没断、也没被平面裁）。
+        `tools/x11cursorwin.c` 是这个测试的 X11 客户端（stdin 换窗口光标；`hand` 是字体光标，`box N [hx hy]` 是任意尺寸方块）。
       - 落点：`src/input.c`（`server_request_cursor`）、`src/cursorfx.c`（`vidow_cursor_x11_none_means_hide` /
         `vidow_cursor_fx_x11_cursor_cleared`）、`src/server.h`、`tools/x11cursorwin.c`、`test-x11cursor-none.sh`。
 

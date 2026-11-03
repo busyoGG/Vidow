@@ -1,6 +1,7 @@
 #!/bin/bash
 # 普通 X11 窗口里的光标：set_cursor(NULL) 不能一律当成「游戏自己画光标」；
-# 而且 X 光标图不能被 xwayland_scale 再除一次（2 倍屏上会只有一半大）。
+# 而且 X 光标图是按设备像素上屏的（2 倍屏上不能再乘一次，也不能被硬件光标
+# 平面裁掉）。
 #
 # 背景（5ee22c0）：root 光标换成 1x1 透明，好让全屏游戏 SetCursor(NULL) 之后
 # 那支系统箭头不再被继承上去。代价是**普通 X11 窗口没设光标**时，X 沿继承链
@@ -8,10 +9,15 @@
 # 旧代码一律按「不画」处理，普通 X11 窗口里光标就整块消失（用户 2026-11-02
 # 报「xwayland 应用光标不再发生变化」）。
 #
-# 第二个坑：Xwayland 给的 cursor surface 自带 buffer scale，热点也在 surface
-# 坐标里。旧代码又按 xwayland_scale 除了一次缓冲和热点，2 倍屏上光标只剩一半
-# 大、热点也偏了（看着像「不跟着控件变」）。用户 2026-11-02 补报「光标大小也
-# 小了一半」。
+# 第二个坑：X 光标图**没有**自带倍率。Xwayland 不开 -hidpi 时 cursor surface
+# 的 buffer_scale 恒为 1，而 X 像素就是这边的**设备像素**（X11 窗口的缓冲也是
+# 这么声明的：500x400 的 X 缓冲 → 500x400 设备像素）。所以 X11 光标得按设备
+# 像素上屏（wlr_cursor_set_buffer，密度 = xwayland_scale）。
+#
+# b623d68 曾把它改成交给 wlr_cursor_set_surface（按表面自己的 scale 当逻辑
+# 尺寸），2 倍屏上整张图被乘 2：64px 的 X 光标变成 128 设备像素，比 Wayland
+# 主题光标大一倍；更糟的是硬件光标平面只收得下 64x64，wlroots 把 128 的
+# dst_box 画进 64 的缓冲 —— 用户 2026-11-03 报的「光标被裁切」就是这个。
 #
 # 判据：
 #   1) 普通窗口、客户端没设光标 → 显示主题箭头（不是「不画」），日志有
@@ -20,8 +26,11 @@
 #   3) 客户端再设 None（仍非全屏）→ 回到同一张主题箭头
 #   4) 全屏窗口设 hand2 → 有光标；再设 None → image == 0x0（隐藏），而且
 #      不再打「→ 主题箭头」那条日志（两条路真的分开了）
-#   5) 同一套流程在 2 倍屏上重跑：hand2 的逻辑尺寸和 1 倍屏一样（16x16），
-#      不能被 xwayland_scale 再除成 8x8
+#   5) 2 倍屏上 X11 光标按设备像素上屏：同一支 16x16 的 hand2 还是 16x16
+#      （不乘 2、也不再除成 8x8），热点按设备像素报
+#   6) 大光标 / 连续换图：64 / 32 / 160 px 的方块光标都得原样上屏（image 和
+#      texture 一样大、不被 ×2），而且**每一张**都要生效（Xwayland 等 frame
+#      回调，漏发就只有第一张能上屏）
 #
 # 用法：./test-x11cursor-none.sh   （VIDOW_TEST_KEEP=1 保留运行目录）
 set -u
@@ -205,10 +214,10 @@ grep -aqE "assert|abort" "$LOG" &&
 	fail "日志里有 assert / abort" ||
 	pass "日志里没有 assert / abort"
 
-# 2 倍屏：Xwayland 的 cursor surface 自带 buffer scale，热点也在 surface
-# 坐标里。再按 xwayland_scale 除一次 → 光标一半大、热点偏一半（看着像
-# 「不跟着控件变」）。同一支 hand2 在 2 倍屏上的逻辑尺寸应该和 1 倍屏一样。
-mark "6) 2 倍屏：光标图不能被 xwayland_scale 再除一次"
+# 2 倍屏：X 光标 pixmap 的像素就是设备像素（和 X11 窗口缓冲同一个约定）。
+# 同一支 16x16 的 hand2，1 倍屏和 2 倍屏报出来的都该是 16x16 —— 不是 32x32
+# （那是当逻辑尺寸又乘了一次），也不是 8x8（旧代码按密度除两次）。
+mark "6) 2 倍屏：X11 光标按设备像素上屏（不乘 2）"
 stop_vidow
 start_vidow 2
 start_probe
@@ -217,14 +226,50 @@ sleep 0.6
 probe_cmd hand
 sleep 0.5
 HAND2=$(image)
-# image 报的是物理像素：同一支 16x16 的 hand2 在 2 倍屏上应该是 32x32。
-EXPECT=$(python3 -c "w,h='$HAND'.split('x'); print('%dx%d' % (int(w)*2, int(h)*2))")
-[ "$HAND2" = "$EXPECT" ] &&
-	pass "2 倍屏上 hand2 是 $HAND2（1 倍屏 $HAND 的 2 倍，没被再除一次）" ||
-	fail "2 倍屏上 hand2 是 $HAND2（期望 $EXPECT；1 倍屏是 $HAND，被除了一半？）"
+[ "$HAND2" = "$HAND" ] &&
+	pass "2 倍屏上 hand2 还是 $HAND2（1 倍屏也是 $HAND；X 像素=设备像素）" ||
+	fail "2 倍屏上 hand2 是 $HAND2（期望和 1 倍屏一样 $HAND；乘 2 或除 2 都不对）"
 [ "$(arrow_lines)" -ge 1 ] &&
 	pass "2 倍屏上「→ 主题箭头」那条照常走" ||
 	fail "2 倍屏上没走「→ 主题箭头」"
+
+# 大光标 + 连续换图：桌面光标的尺寸本来就是主题给的 32（这里用 64 的 X
+# pixmap 模拟 Xft.dpi 已放大过的主题光标），上屏必须一张不多不少。热点
+# 8,8 也要按设备像素落回 8,8（按密度除一次、上屏再乘回输出倍率）。
+mark "7) 大光标 / 连续换图：原样上屏、每张都生效"
+probe_cmd "box 64 8 8"
+sleep 0.5
+BOX64=$(image)
+HOT=$(msg cursor | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+if "result" in d: d=d["result"]
+print("%s,%s" % (d.get("hotspot_x"), d.get("hotspot_y")))
+')
+[ "$BOX64" = "64x64" ] &&
+	pass "64px 的 X 光标是 64x64（没被 ×2 成 128）" ||
+	fail "64px 的 X 光标是 $BOX64（期望 64x64）"
+[ "$HOT" = "8,8" ] &&
+	pass "热点按设备像素落回 8,8" ||
+	fail "热点是 $HOT（期望 8,8）"
+probe_cmd "box 32 0 0"
+sleep 0.5
+BOX32=$(image)
+[ "$BOX32" = "32x32" ] &&
+	pass "换成 32px 立刻生效（frame 回调没断）" ||
+	fail "换成 32px 没生效（拿到 $BOX32；只有第一张上屏？）"
+probe_cmd "box 160 0 0"
+sleep 0.5
+BOX160=$(image)
+TEX=$(msg cursor | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+if "result" in d: d=d["result"]
+print("%sx%s" % (d.get("texture_width"), d.get("texture_height")))
+')
+[ "$BOX160" = "160x160" ] && [ "$TEX" = "160x160" ] &&
+	pass "160px 的方块整张上屏（image 和 texture 都是 160x160，不会被光标平面裁）" ||
+	fail "160px 方块 image=$BOX160 texture=$TEX（期望都 160x160）"
 
 if [ "$FAILED" -eq 0 ]; then
 	echo

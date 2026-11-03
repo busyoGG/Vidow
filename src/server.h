@@ -4577,6 +4577,10 @@ void vidow_cursor_apply(struct vidow_server *server);
 
 bool vidow_cursor_set_client_surface(struct vidow_server *server,
 		struct wlr_surface *surface, int32_t hx, int32_t hy);
+/* 画完一帧：给 X11 光标表面补 wl_surface.frame 回调（它走 set_buffer 那条路，
+ * wlroots 不替我们发；见 cursorfx.c 的 vidow_cursor_set_client_surface）。 */
+void vidow_cursor_fx_frame_done(struct vidow_server *server,
+		struct wlr_output *output, const struct timespec *when);
 /* 客户端换了光标图（request_set_cursor）：记下来，好在放大结束时还原。 */
 /* cursor manager 重建后（主题 / 尺寸热更新）重设当前光标图。 */
 void vidow_cursor_fx_reapply(struct vidow_server *server);

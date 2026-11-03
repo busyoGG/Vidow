@@ -145,6 +145,13 @@ struct vidow_cursor_fx {
 	struct wlr_surface *x11_last_surface;
 	int32_t x11_last_hx, x11_last_hy;
 	struct wl_listener x11_surface_destroy;
+
+	/* 现在正用「X11 帧缓冲」这条路显示的表面（见
+	 * vidow_cursor_set_client_surface）：每画完一帧要给它补一个
+	 * wl_surface.frame 回调，否则 Xwayland 的 xwl_cursor->frame_cb 永远挂着，
+	 * 第二次换光标就被它自己挡在 needs_update 里（实测：只有第一张上屏）。
+	 * 主题箭头 / 不画 / 藏着时是 NULL。 */
+	struct wlr_surface *ack_surface;
 };
 
 static void shake_count_flip(struct vidow_cursor_fx *fx, int64_t now);
@@ -415,6 +422,9 @@ static bool shake_draw_at(struct vidow_server *server, double f, const char **wh
 	int32_t hx = (int32_t)lround(fx->src_hx * f);
 	int32_t hy = (int32_t)lround(fx->src_hy * f);
 	wlr_cursor_set_buffer(server->cursor, big, hx, hy, (float)fx->scale);
+	/* 放大图是自己画的，屏幕上已经不是那张客户端 X11 光标了：别再替它 ack
+	 * frame（等放大收摊、restore_shown_cursor 重新设上去时会再记上）。 */
+	fx->ack_surface = NULL;
 
 	struct wlr_output *output = NULL;
 	struct wlr_output_cursor *oc = cursor_under_pointer(server, &output);
@@ -640,28 +650,86 @@ void vidow_cursor_fx_motion(struct vidow_server *server) {
 
 /* --------------------------------------------------------------- 光标图跟踪 */
 
-/* X cursor images come from Xwayland as a normal wl_surface: the hotspot is in
- * surface coordinates and wlroots applies the surface's own buffer scale. Do
- * not multiply by xwayland_scale a second time — on a 2x output that halves
- * both the image and the hotspot (user 2026-11-02: 「光标大小也小了一半」), and
- * the shifted hotspot makes the visible tip sit on a different widget, so the
- * cursor appears not to change shape. Keep lifetime/commit tracking, but hand
- * the surface to wlroots like any other client cursor. */
+/* X11 的光标图和 Wayland 客户端的不一样：它**没有**自带倍率。
+ *
+ * Xwayland 把光标画成一块 X 像素的 pixmap，在 wl_surface 上只声明
+ * buffer_scale=1（Xwayland 不开 -hidpi 时 global_surface_scale 恒为 1），
+ * 而 Xwayland 的 X 像素就是我们这边的**设备像素** —— 和 X11 窗口完全同一个
+ * 约定：vidow 把 500x400 的 X11 缓冲按 xwayland_scale 声明密度、落到 500x400
+ * 设备像素（见 view-access.c）。光标也得照这个约定上屏，否则：
+ *
+ *   * 按表面自己的 scale（1）当逻辑尺寸上屏 → 图被放大 xwayland_scale 倍。
+ *     2 倍屏 / 64px 的 X 光标会变成 128 设备像素，比 Wayland 主题光标
+ *     （64 设备像素）大一倍；
+ *   * 更糟的是硬件光标平面：wlroots 的 render_cursor_buffer() 会挑一个
+ *     「装得下**纹理**」的固定尺寸游标缓冲（常见 64x64），然后把 dst_box 按
+ *     cursor->width（128）画进去 —— 只画得出左上 64x64，光标被裁掉一大块。
+ *     用户 2026-11-03 报的「光标被裁切」就是这个。
+ *
+ * 所以 X11 光标走 wlr_cursor_set_buffer()，把 pixmap 的像素当**设备像素**，
+ * 按 xwayland_scale 换成逻辑尺寸（和 b623d68 之前一样）。Wayland 客户端的
+ * cursor surface 继续走 wlr_cursor_set_surface()，它们的 buffer_scale 是真的。
+ *
+ * 代价：set_buffer 这条路 wlroots 不会给 cursor surface 发 wl_surface.frame
+ * 回调（它只跟 state->surface 发）。Xwayland 的 xwl_cursor->frame_cb 拿不到
+ * done 就一直挂着，第二次换光标会被它自己挡在 needs_update 里（实测只有第
+ * 一张上屏）。所以这里记下 ack_surface，由 vidow_cursor_fx_frame_done()
+ * 在画完一帧后补一个。 */
 bool vidow_cursor_set_client_surface(struct vidow_server *server,
 		struct wlr_surface *surface, int32_t hx, int32_t hy) {
 	bool x11 = surface != NULL && server->xwayland_server != NULL &&
 		wl_resource_get_client(surface->resource) == server->xwayland_server->client;
 	if (vidow_cursor_trace_on() && x11) {
 		wlr_log(WLR_INFO, "cursor-trace: X11 光标图 surface %dx%d scale=%d "
-			"buffer=%dx%d hotspot=%d,%d（按表面自己的 scale 上屏）",
+			"buffer=%dx%d hotspot=%d,%d（按设备像素上屏，密度 %.2f）",
 			surface->current.width, surface->current.height,
 			surface->current.scale,
 			surface->buffer != NULL ? surface->buffer->base.width : 0,
 			surface->buffer != NULL ? surface->buffer->base.height : 0,
-			hx, hy);
+			hx, hy, server->xwayland_scale > 0.0 ? server->xwayland_scale : 1.0);
+	}
+	struct vidow_cursor_fx *fx = server->cursor_fx;
+	if (x11) {
+		double density = server->xwayland_scale;
+		if (!(density > 0.0)) {
+			density = 1.0;
+		}
+		struct wlr_buffer *buffer = surface->buffer != NULL ?
+			&surface->buffer->base : NULL;
+		wlr_cursor_set_buffer(server->cursor, buffer,
+			(int32_t)lround(hx / density), (int32_t)lround(hy / density),
+			(float)density);
+		if (fx != NULL) {
+			fx->ack_surface = buffer != NULL ? surface : NULL;
+		}
+		return true;
 	}
 	wlr_cursor_set_surface(server->cursor, surface, hx, hy);
-	return x11;
+	if (fx != NULL) {
+		fx->ack_surface = NULL;
+	}
+	return false;
+}
+
+/* 画完一帧：给 X11 的光标表面补一个 frame 回调（它走的是 set_buffer 那条路，
+ * wlroots 不会替我们发）。只在该表面真的显示在这块屏上时发 —— 和 wlroots
+ * 按输出发 done 的语义一致。 */
+void vidow_cursor_fx_frame_done(struct vidow_server *server,
+		struct wlr_output *output, const struct timespec *when) {
+	struct vidow_cursor_fx *fx = server->cursor_fx;
+	if (fx == NULL || fx->hidden || fx->ack_surface == NULL ||
+			server->cursor == NULL || server->output_layout == NULL ||
+			output == NULL) {
+		return;
+	}
+	struct wlr_box box;
+	wlr_output_layout_get_box(server->output_layout, output, &box);
+	if (server->cursor->x < box.x || server->cursor->y < box.y ||
+			server->cursor->x >= box.x + box.width ||
+			server->cursor->y >= box.y + box.height) {
+		return;
+	}
+	wlr_surface_send_frame_done(fx->ack_surface, when);
 }
 
 static void client_cursor_commit(struct wl_listener *listener, void *data) {
@@ -676,11 +744,13 @@ static void client_cursor_commit(struct wl_listener *listener, void *data) {
 static void surface_gone(struct wl_listener *listener, void *data) {
 	struct vidow_cursor_fx *fx =
 		wl_container_of(listener, fx, surface_destroy);
-	(void)data;
 	wl_list_remove(&fx->surface_destroy.link);
 	wl_list_init(&fx->surface_destroy.link);
 	wl_list_remove(&fx->surface_commit.link);
 	wl_list_init(&fx->surface_commit.link);
+	if (fx->ack_surface == data) {
+		fx->ack_surface = NULL; /* 表面都要没了，别再给它发 frame */
+	}
 	fx->surface = NULL;
 }
 
@@ -690,6 +760,7 @@ static void forget_surface(struct vidow_cursor_fx *fx) {
 	wl_list_remove(&fx->surface_commit.link);
 	wl_list_init(&fx->surface_commit.link);
 	fx->surface = NULL;
+	fx->ack_surface = NULL;
 }
 
 /* 指针焦点那个表面是不是 Xwayland 的（X11 窗口）。判据和
@@ -759,6 +830,7 @@ static void restore_shown_cursor(struct vidow_server *server) {
 		return;
 	}
 	if (fx->x11_none && seat_over_x11(server)) {
+		fx->ack_surface = NULL;
 		wlr_cursor_set_surface(server->cursor, NULL, 0, 0);
 		return;
 	}
@@ -782,6 +854,9 @@ static void x11_cursor_gone(struct wl_listener *listener, void *data) {
 		wl_container_of(listener, fx, x11_surface_destroy);
 	wl_list_remove(&fx->x11_surface_destroy.link);
 	wl_list_init(&fx->x11_surface_destroy.link);
+	if (fx->ack_surface == fx->x11_last_surface) {
+		fx->ack_surface = NULL;
+	}
 	fx->x11_last_surface = NULL;
 	fx->x11_none = false;
 }
@@ -907,6 +982,7 @@ void vidow_cursor_fx_set_hidden(struct vidow_server *server, bool hidden) {
 	fx->hidden = hidden;
 	wlr_log(WLR_DEBUG, "光标: %s", hidden ? "藏起来（没在动）" : "显示回来");
 	if (hidden) {
+		fx->ack_surface = NULL;
 		wlr_cursor_set_surface(server->cursor, NULL, 0, 0);
 		return;
 	}

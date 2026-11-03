@@ -630,6 +630,10 @@ void vidow_output_render(struct vidow_output *output) {
 	 *
 	 * 幂等：只给有 pending callback 的表面发，场景已发过的这里 no-op。 */
 	vidow_views_send_wayland_frame_done(server, output);
+	/* X11 光标走的是 wlr_cursor_set_buffer（设备像素，见 cursorfx.c），wlroots
+	 * 不会给它发 frame 回调 —— 这里补上，不然 Xwayland 第二次换光标就卡在
+	 * 自己的 frame_cb 上（只有第一张能上屏）。 */
+	vidow_cursor_fx_frame_done(server, output->wlr_output, &now);
 	/* 这块屏画完一帧了：会话锁的锁定握手在这里记账（每块屏都画过一帧才发
 	 * locked，见 sessionlock.c）。 */
 	vidow_sessionlock_frame(output);
