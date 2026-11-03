@@ -1,0 +1,3 @@
+输出: HEADLESS-1, HEADLESS-2
+着色器 (0): 
+render_stats: frames=2 empty_frames=0 lifted_frames=0 full_frames=2 damage_px=1843200 damage_area=1843200 from_event=2 from_watchdog=0 from_kick=0 from_capture=0

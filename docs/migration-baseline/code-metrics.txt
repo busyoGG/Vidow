@@ -1,0 +1,79 @@
+# 迁移前的渲染层规模（2026-11-03T15:51:50+08:00）
+
+## 文件行数
+  2063 src/fx-gl.c
+  3672 src/fx.c
+  3411 src/output.c
+  1300 src/capture.c
+ 10446 总计
+
+## 用到的 GL 符号（去重）
+count: 39
+     56 glGetUniformLocation
+     48 glUniform1f
+     22 glUniform2f
+     12 glUseProgram
+     12 glUniform1i
+      9 glUniform4f
+      8 glReadPixels
+      6 glVertexAttribPointer
+      6 glGetAttribLocation
+      6 glEnableVertexAttribArray
+      6 glDisableVertexAttribArray
+      6 glDisable
+      5 glBindTexture
+      4 glTexParameteri
+      4 glFlush
+      4 glDeleteShader
+      4 glActiveTexture
+      3 glDrawArrays
+      3 glClear
+      3 glBindFramebuffer
+      2 glViewport
+      2 glUniformMatrix3fv
+      2 glUniform4fv
+      2 glGetString
+      2 glClearColor
+      2 glAttachShader
+      1 glUniform3fv
+      1 glShaderSource
+      1 glLinkProgram
+      1 glGetShaderiv
+      1 glGetShaderInfoLog
+      1 glGetProgramiv
+      1 glGetProgramInfoLog
+      1 glEnable
+      1 glDeleteProgram
+      1 glCreateShader
+      1 glCreateProgram
+      1 glCompileShader
+      1 glBlendFunc
+
+## 内建着色器程序（fx-gl.c）
+  871:static bool link_program_full(unsigned int *out, const char *vert_src,
+  904:	return link_program_full(out, vertex_src, frag_src, name);
+  910:	if (!link_program_full(&prog, mesh_vertex_src, mesh_fragment_src, "mesh")) {
+  919:	if (link_program_full(&prog, mesh_blur_vertex_src, mesh_blur_fragment_src,
+  951:	if (!link_program_full(&prog, post_vertex_src, post_fragment_src, "post")) {
+  974:	if (!link_program(&prog, decor_fragment_src, "decor")) {
+  1030:		if (!link_program_full(&prog, kawase_vertex_src, buf, pass[i].name)) {
+  1047:	if (!link_program(&sh->program, fragment_src, sh->name)) {
+
+## 内联 GLSL 源（fx-gl.c）
+  101:static const char *vertex_src =
+  114:static const char *kawase_vertex_src =
+  146:static const char *decor_fragment_src =
+  517:static const char *kawase_down_src =
+  552:static const char *kawase_up_src =
+  573:static const char *mesh_vertex_src =
+  583:static const char *mesh_fragment_src =
+  595:static const char *mesh_blur_vertex_src =
+  610:static const char *mesh_blur_fragment_src =
+  741:static const char *post_vertex_src =
+  749:static const char *post_fragment_src =
+
+## 直接摸 GLES2 内部的文件
+  src/fx.c
+  src/fx-gl.c
+  src/fx-popup.c
+  src/view.c

@@ -12,10 +12,7 @@ color_precision = "auto"
 color_linear_blend = true
 -- 背景模糊在线性光里算（每级解码 → 加权平均 → 编码回屏幕空间）。默认关：真机上肉眼几乎无差（窗口均值 +0.7），却要给每一级多算一对解码 / 编码；想要理论正确再打开。组写法 color.linear_blur
 color_linear_blur = false
--- 输出端调色（整块屏）：饱和度 / 对比度 / 色温 / 色相 / 亮度 / 伽马。
--- 只有色温 / 亮度 / 对比度 / 伽马时走 KMS 的 3×1D 曲线，全屏直通照旧；
--- 饱和度 / 色相非中性时改用 FP16 离屏 + 全屏着色器（那块屏失去直通）。
--- 整组也可以写成 grade = { saturation, contrast, temperature, hue, brightness, gamma }
+-- 输出端调色的饱和度（1 = 不变，0 = 灰度，>1 更艳）。整组写成 grade = { saturation, contrast, temperature, hue, brightness, gamma }
 grade_saturation = 1
 -- 输出端调色的对比度（1 = 不变，>1 更强，绕线性光 0.18 中灰）
 grade_contrast = 1
