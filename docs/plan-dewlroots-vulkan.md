@@ -37,7 +37,7 @@ Vidow
 
 ## Steps
 
-- [ ] 0. 摸底与基线：抓 `wayland-info` 全局清单、跑全套测试、记录每块屏的直通 / 帧率基线；把测试脚本归类进「必须过」清单。
+- [x] 0. 摸底与基线：抓 `wayland-info` 全局清单、跑全套测试、记录每块屏的直通 / 帧率基线；把测试脚本归类进「必须过」清单。
 - [ ] 1. 抽出渲染抽象层：新增 `src/gpu.h` + `gpu-gl.c`（把 fx-gl.c / fx.c / output.c / capture.c 的 GL 调用收进去），行为零变化，全套测试仍过。
 - [ ] 2. 着色器资产化：把内联 GLSL 字符串提到 `shaders/*.vert/.frag`，构建期生成 SPIR-V + GL 回退源码；建立「同一份源，两个后端像素一致」的比对测试。
 - [ ] 3. 写 `gpu-vk.c`（设备选择、分配器、命令缓冲、管线缓存落盘、dmabuf 导入导出、多趟 render pass）。
@@ -47,6 +47,12 @@ Vidow
 - [ ] 7. 逐协议自实现：wl_compositor/subcompositor、xdg-shell、layer-shell、XWayland、session-lock、input-method、idle、screencopy、ext-copy、dmabuf、ptr-constraints、decoration、gamma-control、color-management、foreign-toplevel…（先列清单，按依赖排序）。
 - [ ] 8. 删除 wlroots 依赖，保留 `backend/` 兼容层一个版本周期做对照回归。
 - [ ] 9. 收尾：文档 / changelog / README 对账，性能与直通对比报告。
+
+## 基线（第 0 步已完成）
+
+`docs/migration-baseline/`：117 个测试（PASS 80 / FAIL 34 / MANUAL 3）、49 个 Wayland
+全局、渲染层规模（39 个 GL 符号 / fx-gl.c 2063 行）、已知红分类。34 条红里抽样 12 条
+在旧提交 `5016b89` 上同样红，不是迁移引入的。
 
 ## 关键风险与对策
 
