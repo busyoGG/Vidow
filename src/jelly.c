@@ -100,8 +100,13 @@ struct jelly_slot {
 	struct vidow_blur_slot *bs;     /* fx 里对应那一格（源 + 底衬） */
 	struct wlr_scene_buffer *node;  /* 显示形变结果（挂在窗口的场景树下面） */
 	struct wl_listener node_destroy;
-	struct wlr_buffer *src;         /* 这一格的源：那块屏的装饰缓冲 */
+	struct wlr_buffer *src;         /* 这一格的源：那块屏的装饰缓冲（每帧刷新） */
 	int src_w, src_h;               /* 源缓冲尺寸，设备像素 */
+	/* 源**内容**的版本号。装饰缓冲每帧在两张之间来回换（wlr_scene_buffer
+	 * 上的指针一变），拿指针判「源换了」就会每帧重建这个节点 —— 屏幕上
+	 * 一拖就闪（用户 2026-11-03 报的）。只有尺寸 / 倍率变了才真的重建，
+	 * 内容变了只标一个「这一帧要重画」。 */
+	uint64_t src_rev, src_blur_rev;
 	double scale;                   /* 这块屏烘装饰用的倍率 */
 	double margin_px;               /* JELLY_MARGIN 换算成设备像素 */
 	int buf_w, buf_h;               /* 形变缓冲（设备像素）= src + 2*margin */
@@ -425,6 +430,8 @@ static bool jelly_slot_init(struct vidow_jelly *jelly, struct jelly_slot *slot,
 	wlr_scene_node_raise_to_top(&slot->node->node);
 	slot->node_destroy.notify = jelly_node_destroy;
 	wl_signal_add(&slot->node->node.events.destroy, &slot->node_destroy);
+	slot->src_rev = bs != NULL ? bs->dec_revision : 0;
+	slot->src_blur_rev = bs != NULL ? bs->dec_blur_ver : 0;
 	slot->need_draw = true;
 	return true;
 }
@@ -683,6 +690,11 @@ static bool jelly_slot_blur_ok(struct vidow_jelly *jelly,
  * （vidow_fx_draw_mesh_blur），所以静止时逐像素一样。 */
 static void jelly_render(struct vidow_jelly *jelly, struct jelly_slot *slot) {
 	struct vidow_server *server = jelly->server;
+	/* 源每帧都在换（双缓冲）：用**这一帧**挂着的那张，别用上次记下的。 */
+	if (slot->bs != NULL && slot->bs->node != NULL &&
+			slot->bs->node->buffer != NULL) {
+		slot->src = slot->bs->node->buffer;
+	}
 	struct wlr_buffer *src = slot->src;
 	if (src == NULL || slot->node == NULL) {
 		return;
@@ -931,17 +943,31 @@ static bool jelly_sync_slots(struct vidow_jelly *jelly) {
 			jelly_slot_free(slot);
 			continue;
 		}
-		if (cur == slot->src && fabs(bs->dec_scale - slot->scale) <= 1e-3) {
-			int fx_x = 0, fx_y = 0;
-			wlr_scene_node_coords(&bs->node->node, &fx_x, &fx_y);
-			slot->rel_x = fx_x - tx;
-			slot->rel_y = fx_y - ty;
+		/* 缓冲每帧在两张之间轮换（装饰是双缓冲的），**不能**按指针判断
+		 * 「源换了」：那样每帧都拆掉重建，一拖就闪。只有尺寸 / 倍率变了
+		 * 才真的重建这一格。 */
+		if (fabs(bs->dec_scale - slot->scale) > 1e-3 ||
+				cur->width != slot->src_w ||
+				cur->height != slot->src_h) {
+			/* 这一格的源换了尺寸 / 倍率：只重建这一格（网格不动）。 */
+			jelly_slot_free(slot);
+			jelly_slot_init(jelly, slot, bs, bs->node, cur,
+				bs->dec_scale, tx, ty);
 			continue;
 		}
-		/* 这一格的源换了：只重建这一格。 */
-		jelly_slot_free(slot);
-		jelly_slot_init(jelly, slot, bs, bs->node, cur, bs->dec_scale,
-			tx, ty);
+		slot->src = cur;
+		/* 源**内容**换了（客户端新帧 / 底衬重抓）：这一格要重画一次。 */
+		if (bs->dec_revision != slot->src_rev ||
+				bs->dec_blur_ver != slot->src_blur_rev) {
+			slot->src_rev = bs->dec_revision;
+			slot->src_blur_rev = bs->dec_blur_ver;
+			slot->need_draw = true;
+		}
+		int fx_x = 0, fx_y = 0;
+		wlr_scene_node_coords(&bs->node->node, &fx_x, &fx_y);
+		slot->rel_x = fx_x - tx;
+		slot->rel_y = fx_y - ty;
+		continue;
 	}
 
 	/* 新压上的屏：补一格。 */

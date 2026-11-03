@@ -1418,9 +1418,13 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 	 *
 	 * 以前这里烘一层、jelly 又叠一层，同一块底衬被算了两次 —— 半透明窗口
 	 * 一拖整块亮一截（实测 197.6 → 225.0）。 */
+	/* 判据里**不能**带「这一格现在有没有底衬贴图」：装饰每帧重烘一次，
+	 * 底衬贴图在拖动时也在重抓，那个条件会在两帧之间翻 —— 烘出来的内容
+	 * 一会儿带模糊一会儿不带，屏幕上就是「一拖就闪」。条件只看配置和
+	 * 规则（跟果冻那一层用的判据一致），结果就稳定。 */
 	if (fx->jelly && fx->blur && !fx->blur_region_on &&
 			fx->view != NULL && vidow_view_blur_wanted(fx->view) &&
-			instance != NULL && instance->tex != NULL && look.blur) {
+			look.blur) {
 		look.blur = false;
 	}
 	/* 果冻期间投影单独画（jelly.c 的 shadow 节点），内容图里不烘投影：
