@@ -41,6 +41,7 @@ static struct wlr_swapchain *output_post_swapchain(struct vidow_output *output,
 static bool output_post_blit(struct vidow_output *output,
 		struct wlr_output_state *state, struct wlr_texture *src, int w, int h);
 static void output_set_hdr(struct vidow_output *output, bool on);
+static void output_update_post_lock(struct vidow_output *output);
 static bool render_stats_file_on(void) {
 	static int64_t last_ns = 0;
 	static bool on = false;
@@ -391,24 +392,39 @@ void vidow_output_render(struct vidow_output *output) {
 		wlr_output_state_init(&state);
 		struct wlr_scene_output_state_options options = { 0 };
 		const struct wlr_scene_output_state_options *options_ptr = NULL;
-		/* HDR（第 9 步）：场景先渲进 FP16 离屏，再一趟全屏 pass 上屏。
-		 * 主交换链在这里先用**空 state** 配好 —— 等 build_state 把 FP16
-		 * 缓冲塞进 state 之后再配，wlr_output_test_state 会拿那张缓冲去
-		 * 试主交换链，必然失败。 */
+		/* HDR（第 9 步）/ 输出端调色（grade.*）：场景先渲进 FP16 离屏，再一趟
+		 * 全屏 pass 上屏。主交换链在这里先用**空 state** 配好 —— 等 build_state
+		 * 把 FP16 缓冲塞进 state 之后再配，wlr_output_test_state 会拿那张缓冲去
+		 * 试主交换链，必然失败。
+		 *
+		 * 调色每帧从全局配置读一遍（配置重载会主动排一帧）：非中性才启用，
+		 * 全中性时连 FP16 离屏都不建，direct scanout 照旧。 */
+		const struct vidow_config *cfg = &output->server->config;
+		struct vidow_grade grade;
+		bool grade_on = vidow_grade_from_config(cfg, &grade);
+		if (output->grade != grade_on) {
+			output->grade = grade_on;
+			output_update_post_lock(output);
+			wlr_log(WLR_INFO, "color: %s 输出端调色 %s（%s）",
+				output->wlr_output->name, grade_on ? "开" : "关",
+				grade_on ? "饱和度 / 对比度 / 色温 / 色相 / 亮度 / 伽马，直通关闭"
+					: "全中性，回到直通");
+		}
+		bool post_wanted = output->hdr || output->grade;
 		int post_w = output->wlr_output->width;
 		int post_h = output->wlr_output->height;
-		bool post_ok = output->hdr && post_w > 0 && post_h > 0 &&
+		bool post_ok = post_wanted && post_w > 0 && post_h > 0 &&
 			output_post_swapchain(output, post_w, post_h) != NULL &&
 			wlr_output_configure_primary_swapchain(output->wlr_output,
 				&state, &output->wlr_output->swapchain);
 		if (post_ok) {
 			options.swapchain = output->post_swapchain;
 			options_ptr = &options;
-		} else if (output->hdr) {
+		} else if (post_wanted) {
 			/* 建不出来（没有 FP16 / 交换链失败）：这一帧退回直接渲染，
-			 * 别把「HDR 开着」变成黑屏。 */
-			wlr_log(WLR_ERROR, "color: %s HDR 后处理不可用，这一帧走 SDR",
-				output->wlr_output->name);
+			 * 别把「HDR / 调色开着」变成黑屏。 */
+			wlr_log(WLR_ERROR, "color: %s 后处理不可用（没有 FP16 或交换链"
+				"失败），这一帧走直接渲染", output->wlr_output->name);
 		}
 		if (wlr_scene_output_build_state(output->scene_output, &state,
 				options_ptr)) {
@@ -2256,9 +2272,10 @@ static void output_destroy(struct wl_listener *listener, void *data) {
 
 	/* 事件要带名字，而 wlr_output 在这个信号之后就被释放了 —— 所以在这里发。 */
 	vidow_ipc_emit_output(server, "output-removed", output->wlr_output);
-	/* 后处理：放掉 attach_render 锁（成对）并销毁离屏交换链 / 源贴图。 */
-	if (output->hdr) {
-		output->hdr = false;
+	/* 后处理：放掉 attach_render 锁（HDR / 调色共用一把，成对）并销毁离屏
+	 * 交换链 / 源贴图。 */
+	if (output->post_locked) {
+		output->post_locked = false;
 		wlr_output_lock_attach_render(output->wlr_output, false);
 	}
 	output_post_finish(output);
@@ -2389,21 +2406,48 @@ static bool output_post_blit(struct vidow_output *output,
 		0.0690973f,  0.9195404f,  0.0113623f,
 		0.0163914f,  0.0880133f,  0.8955953f,
 	};
-	/* 源 TF：gamma2.2 (2)；目标 TF：ST2084 PQ (1)。
-	 * scale：BT.2408 基准 SDR 白点 (cd/m²) 对应 PQ 的 1.0 (10000 cd/m²)。
-	 * dither：输出位深 10 位对应 ~1/1023，8 位对应 ~1/255。 */
-	float scale = (float)(output->sdr_white_nits > 0.0 ? output->sdr_white_nits : 203.0) / 10000.0f;
-	float dither = (output->wlr_output->render_format == DRM_FORMAT_XRGB2101010 ||
-		output->wlr_output->render_format == DRM_FORMAT_XBGR2101010 ||
-		output->wlr_output->render_format == DRM_FORMAT_ARGB2101010 ||
-		output->wlr_output->render_format == DRM_FORMAT_ABGR2101010) ? (1.0f / 1023.0f) : (1.0f / 255.0f);
+	/* 源 TF：gamma2.2 (2)；目标 TF：HDR = ST2084 PQ (1)，调色 / SDR = 仍
+	 * gamma22 (2)。scale：HDR 时是 BT.2408 基准 SDR 白点 (cd/m²) 对应 PQ 的
+	 * 1.0 (10000 cd/m²)；调色时恒为 1（线性光进、线性光出）。
+	 * dither：只有 HDR 走 PQ 时才需要（输出位深 10 位对应 ~1/1023，8 位对应
+	 * ~1/255）；纯调色沿用 0。 */
+	bool hdr = output->hdr;
+	float scale = hdr ? (float)(output->sdr_white_nits > 0.0 ?
+		output->sdr_white_nits : 203.0) / 10000.0f : 1.0f;
+	float dither = 0.0f;
+	if (hdr) {
+		dither = (output->wlr_output->render_format == DRM_FORMAT_XRGB2101010 ||
+			output->wlr_output->render_format == DRM_FORMAT_XBGR2101010 ||
+			output->wlr_output->render_format == DRM_FORMAT_ARGB2101010 ||
+			output->wlr_output->render_format == DRM_FORMAT_ABGR2101010) ?
+			(1.0f / 1023.0f) : (1.0f / 255.0f);
+	}
+	static const float identity[9] = {
+		1.0f, 0.0f, 0.0f,
+		0.0f, 1.0f, 0.0f,
+		0.0f, 0.0f, 1.0f,
+	};
+	const float *matrix = hdr ? srgb_to_bt2020 : identity;
+	struct vidow_grade grade;
+	const struct vidow_grade *grade_ptr = NULL;
+	if (output->grade) {
+		const struct vidow_config *cfg = &output->server->config;
+		grade.saturation = (float)cfg->grade_saturation;
+		grade.contrast = (float)cfg->grade_contrast;
+		grade.temperature = (float)cfg->grade_temperature;
+		grade.hue = (float)cfg->grade_hue;
+		grade.brightness = (float)cfg->grade_brightness;
+		grade.gamma = (float)cfg->grade_gamma;
+		grade_ptr = &grade;
+	}
 	static float seed = 0.0f;
 	seed += 1.0f;
 	if (seed > 1000.0f) {
 		seed = 0.0f;
 	}
 	bool ok = vidow_fx_post_pass(output->server, dst, src, w, h,
-		2.0f /* gamma22 */, 1.0f /* PQ */, srgb_to_bt2020, scale, dither, seed);
+		2.0f /* gamma22 */, hdr ? 1.0f /* PQ */ : 2.0f /* gamma22 */,
+		matrix, scale, dither, seed, grade_ptr);
 	if (ok) {
 		wlr_output_state_set_buffer(state, dst);
 	} else {
@@ -2470,18 +2514,32 @@ static void output_set_hdr(struct vidow_output *output, bool on) {
 	}
 	output->hdr = on;
 	output->hdr_metadata_dirty = true;
+	output_update_post_lock(output);
 	if (on) {
-		wlr_output_lock_attach_render(output->wlr_output, true);
 		wlr_log(WLR_INFO, "color: %s 输出端 HDR 开（FP16 离屏 + 全屏后处理，"
 			"直通关闭）", output->wlr_output->name);
 	} else {
-		output_post_finish(output);
-		wlr_output_lock_attach_render(output->wlr_output, false);
-		wlr_log(WLR_INFO, "color: %s 输出端 HDR 关（回到直通路径）",
-			output->wlr_output->name);
+		wlr_log(WLR_INFO, "color: %s 输出端 HDR 关（%s）",
+			output->wlr_output->name,
+			output->grade ? "调色还开着，继续走后处理" : "回到直通路径");
 	}
 	output_hdr_metadata_apply(output);
 	wlr_output_schedule_frame(output->wlr_output);
+}
+
+/* HDR 与调色共用同一把 attach_render 锁：只要有一个要后处理就拿着，两个都关
+ * 才放掉（并销毁 FP16 离屏交换链）。成对加 / 解锁，不能各加各的 ——
+ * wlr_output_lock_attach_render 是计数锁，加两次就得解两次。 */
+static void output_update_post_lock(struct vidow_output *output) {
+	bool want = output->hdr || output->grade;
+	if (want == output->post_locked) {
+		return;
+	}
+	output->post_locked = want;
+	wlr_output_lock_attach_render(output->wlr_output, want);
+	if (!want) {
+		output_post_finish(output);
+	}
 }
 
 /* --------------------------------------------------------- 色彩能力诊断 */

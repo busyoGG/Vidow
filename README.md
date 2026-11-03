@@ -1000,6 +1000,7 @@ VIDOW_TEST_RENDERER=gles2 ./test-screencast.sh
 ./test-widthanim.sh                  # 列宽过渡：cycle / 最大化 / IPC 改宽按 column_width_ms 补间，隔壁列不给位移补间（全 headless，30 项断言）
 ./test-config-include.sh             # 配置拆成好几份：vidow.include() 的路径/顺序/报错 + 改哪份都自动重载（全 headless，24 项断言）
 ./test-defaultconfig.sh              # 默认配置按类别拆成 configs/（--default-config / --write-config）+ 配置族的表写法 + 说明的完整性（全 headless，44 项断言）
+./test-grade.sh                      # 输出端调色：饱和度 / 对比度 / 色温 / 色相 / 亮度 / 伽马（headless + grim 量像素，13 项断言）
 ./test-gap.sh                        # 间距：一个数管全部 + 单边/内间距覆盖 + 「两条 50% 正好装进一屏」（全 headless，34 项断言）
 ./test-layerblur.sh                  # 半透明状态栏背后的模糊（全 headless，4 项断言）
 ./test-blurscale.sh                  # 模糊在高 DPI 倍率下的底衬覆盖 + 对位（1/1.7/2 倍，7 项断言）
@@ -1352,6 +1353,53 @@ wlroots 0.20.2 的 DRM 后端这条链其实是齐的：
 
 完整调研（每条结论的 wlroots 源码出处、两条路线的步骤与工作量、真机验证清单、复现调研的
 命令）见 [`docs/hdr-feasibility.md`](docs/hdr-feasibility.md)。
+
+### 输出端调色（`grade`）
+
+整块屏的显示效果：饱和度、对比度、色温、色相、亮度、伽马。**只在非中性时**才启用，
+代价和 HDR 一样 —— 场景先渲进 FP16 离屏，再一趟全屏着色器调色后上屏，那块屏失去
+direct scanout；全部写回中性值时这一趟自动关掉，直通照旧。
+
+```lua
+-- 平铺键（也可以整组写）
+grade_saturation  = 1.0     -- 1 = 不变，0 = 灰度，>1 更艳
+grade_contrast    = 1.0     -- 1 = 不变，>1 更强（绕线性光 0.18 中灰）
+grade_temperature = 6500    -- 开尔文：6500 = 不变，>6500 偏冷，<6500 偏暖
+grade_hue         = 0       -- 度：绕灰轴旋转，-180 .. 180
+grade_brightness  = 1.0     -- 倍率：1 = 不变，0 = 全黑
+grade_gamma       = 1.0     -- 1 = 不变，>1 中间调更亮
+
+-- 等价写法：
+grade = { saturation = 0.8, temperature = 5000, contrast = 1.1 }
+```
+
+**算在哪一步**（`src/fx-gl.c` 的 `vidow_grade()`）：先把场景的颜色按 gamma22 解码回
+**线性光**，然后按顺序
+
+1. 色温：白平衡增益（Tanner Helland 近似 → 线性 RGB，按 6500K 归一化，再按 Rec.709
+   亮度归一回 1）—— 偏色但不变亮变暗；
+2. 亮度：线性乘 `grade_brightness`；
+3. 对比度：`(c - 0.18) * contrast + 0.18`，支点就是 18% 中灰；
+4. 饱和度：`mix(vec3(亮度), c, saturation)`；
+5. 色相：RGB → YIQ，在 I/Q 平面里旋转 `grade_hue` 度，再转回来；
+6. 伽马：`pow(c, 1 / gamma)`，仍在线性光里，所以 SDR（再编码 gamma22）和 HDR
+   （再走 BT.2020 + PQ）都一致。
+
+负值和超范围一律夹到 0..1 再编码。每个键都有范围，越界**夹住**而不是报错：
+饱和度 / 对比度 / 亮度 0 .. 4，色温 1000 .. 40000 K，色相 -180 .. 180°，
+伽马 0.1 .. 4。
+
+**生效方式：** 和别的配置键一样，改 `config.lua` 自动重载；也可以
+`vidowmsg set-config grade_saturation 0` 运行时改（IPC 会主动给每块屏排一帧，
+静止桌面上也会立刻变色）。`vidowmsg get-config grade_*` 读回当前值。
+
+**截图 / 录屏也带调色**：`capture.c` 的抓帧路径（screencopy / ext-copy / 录屏）在
+非中性时同样先渲 FP16 再走后处理 —— 抓到的是屏幕上那个颜色，不是调色前的画面。
+
+判据：`./test-grade.sh`（13 项，headless + grim 量像素）—— 纯色背景
+`#c04020` 在饱和度 0 下变成灰度 `(107,107,107)`、对比度 0 压到线性 0.18 中灰
+`(117,117,117)`、色温 3000K 红升蓝降、色相 +90° 换成蓝紫、亮度 / 伽马变亮，
+全部写回中性后像素原样且日志说「输出端调色 关」，越界值被夹住。
 
 ### 一条链：从输出缩放到清晰的像素
 
@@ -10343,6 +10391,33 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
      窗口）：连拖带晃同一次 2961 行探针，2 倍那格 1578 帧全开、1 倍那格 0 帧被夹、越界 0 帧；
      headless 回归 12 条全过（jelly / dragblur-cross / drag / blur 全家 / workspace /
      hotplug / outputstate / blurcache）。
+
+127. **输出端调色：饱和度 / 对比度 / 色温 / 色相 / 亮度 / 伽马**。
+     用户要「色彩管理需要能够调整饱和度对比度色温色相等项目」。做法是复用第 9 步已有的
+     输出端后处理（`vidow.output{ hdr }` 那条 FP16 离屏 + 全屏 shader），不另开一条管线：
+
+     * `struct vidow_config` 加 6 个键（`grade_saturation` / `grade_contrast` /
+       `grade_temperature` / `grade_hue` / `grade_brightness` / `grade_gamma`），
+       默认全中性（1 / 1 / 6500 / 0 / 1 / 1）。也认组写法
+       `grade = { saturation = 0.8, temperature = 5000 }`。
+     * `output.c` 的 `post_ok` 判据从「`hdr`」改成「`hdr` 或调色非中性」；两者共用
+       同一把 `wlr_output_lock_attach_render` 锁（`output_update_post_lock()`，计数锁
+       必须成对），全中性时自动解锁并销毁 FP16 交换链，回到 direct scanout。
+     * `fx-gl.c` 的 `post_fragment_src` 在线性光里按「色温 → 亮度 → 对比度 → 饱和度 →
+       色相（YIQ 旋转）→ 伽马」调色，再走原来的矩阵 / PQ / dither。色温增益在 CPU 侧
+       算（每帧一次，不是每像素），按 6500K 归一化并按 Rec.709 亮度保持。
+     * `capture.c` 的抓帧路径（screencopy / ext-copy / 录屏）同样走这一趟：截图 / 录屏
+       抓到的是屏幕上那个颜色，不是调色前的画面。中性时仍是老路径。
+     * IPC `set-config grade_*` 改完主动给每块屏排一帧（否则静止桌面上那块屏还停在
+       旧颜色上）。
+
+     实测（headless + grim 量像素，`./test-grade.sh` 13 项全过）：背景 `#c04020`
+     `(192,64,32)`；饱和度 0 → `(107,107,107)`（线性亮度一致）；对比度 0 →
+     `(117,117,117)`（线性 0.18 中灰）；色温 3000K → `(254,58,19)`；色相 +90° →
+     `(145,41,231)`；亮度 1.5 → `(231,77,38)`；伽马 2 → `(221,128,90)`；全部写回中性
+     → `(192,64,32)` 且日志「输出端调色 关」。越界值夹住（伽马 0 → 0.1、色温 0 →
+     1000K）。顺手把 `config.example/configs/06-render.lua` / `09-output.lua` 与
+     `--write-config` 对账（`test-defaultconfig.sh` 之前是红的）。
 
 ## 尚未实现（原型边界）
 

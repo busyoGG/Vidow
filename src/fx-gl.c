@@ -759,6 +759,13 @@ static const char *post_fragment_src =
 	"uniform float u_scale;\n"
 	"uniform float u_dither;\n"
 	"uniform float u_seed;\n"
+	"uniform float u_grade_on;\n"
+	"uniform float u_sat;\n"
+	"uniform float u_contrast;\n"
+	"uniform float u_bright;\n"
+	"uniform float u_gamma;\n"
+	"uniform float u_hue;\n"
+	"uniform vec3 u_temp;\n"
 	"varying vec2 v_uv;\n"
 	"\n"
 	"vec3 vidow_pq_eotf(vec3 c) {\n"
@@ -818,9 +825,37 @@ static const char *post_fragment_src =
 	"	p = mod(p, 1024.0);\n"
 	"	return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);\n"
 	"}\n"
+	"/* 输出端调色：线性光里做白平衡 → 亮度 → 对比度 → 饱和度 → 色相 → 伽马。\n"
+	" * 色温增益在 CPU 侧算好（u_temp，6500K 归一成 1,1,1），这里只乘。\n"
+	" * 色相在 YIQ 里绕灰轴旋转；旋转 / 提高饱和度都可能出负值，夹回 0。 */\n"
+	"vec3 vidow_grade(vec3 c) {\n"
+	"	c = max(c * u_temp, 0.0);\n"
+	"	c *= u_bright;\n"
+	"	c = (c - 0.18) * u_contrast + 0.18;\n"
+	"	c = max(c, 0.0);\n"
+	"	float y = dot(c, vec3(0.2126, 0.7152, 0.0722));\n"
+	"	c = mix(vec3(y), c, u_sat);\n"
+	"	if (u_hue != 0.0) {\n"
+	"		float gy = dot(c, vec3(0.299, 0.587, 0.114));\n"
+	"		float gi = dot(c, vec3(0.5959, -0.2746, -0.3213));\n"
+	"		float gq = dot(c, vec3(0.2115, -0.5227, 0.3112));\n"
+	"		float cs = cos(u_hue);\n"
+	"		float sn = sin(u_hue);\n"
+	"		float i2 = gi * cs - gq * sn;\n"
+	"		float q2 = gi * sn + gq * cs;\n"
+	"		c = vec3(gy + 0.956 * i2 + 0.621 * q2,\n"
+	"			gy - 0.272 * i2 - 0.647 * q2,\n"
+	"			gy - 1.106 * i2 + 1.703 * q2);\n"
+	"		c = max(c, 0.0);\n"
+	"	}\n"
+	"	return pow(max(c, 0.0), vec3(1.0 / max(u_gamma, 0.05)));\n"
+	"}\n"
 	"void main() {\n"
 	"	vec3 c = texture2D(u_tex, v_uv).rgb;\n"
 	"	vec3 lin = vidow_tf_decode(c, u_src_tf);\n"
+	"	if (u_grade_on > 0.5) {\n"
+	"		lin = vidow_grade(lin);\n"
+	"	}\n"
 	"	lin = u_matrix * lin * u_scale;\n"
 	"	vec3 o = vidow_tf_encode(lin, u_dst_tf);\n"
 	"	if (u_dither > 0.0) {\n"
@@ -924,6 +959,13 @@ static void load_post_program(struct vidow_server *server) {
 	p->u_scale = glGetUniformLocation(prog, "u_scale");
 	p->u_dither = glGetUniformLocation(prog, "u_dither");
 	p->u_seed = glGetUniformLocation(prog, "u_seed");
+	p->u_grade_on = glGetUniformLocation(prog, "u_grade_on");
+	p->u_sat = glGetUniformLocation(prog, "u_sat");
+	p->u_contrast = glGetUniformLocation(prog, "u_contrast");
+	p->u_bright = glGetUniformLocation(prog, "u_bright");
+	p->u_gamma = glGetUniformLocation(prog, "u_gamma");
+	p->u_hue = glGetUniformLocation(prog, "u_hue");
+	p->u_temp = glGetUniformLocation(prog, "u_temp");
 }
 
 static void load_decor_program(struct vidow_server *server) {
@@ -1961,14 +2003,66 @@ void dump_target(struct vidow_server *server,
 }
 
 /* 输出端全屏后处理：把 src（场景刚渲进去的 FP16 离屏）搬进 dst（真正的扫描
- * 输出缓冲），中间按参数做解码 → 矩阵 → 缩放 → 编码 → dither。
+ * 输出缓冲），中间按参数做解码 → 矩阵 → 缩放 → 编码 → dither，调色参数非空时
+ * 先在线性光里做白平衡 / 亮度 / 对比度 / 饱和度 / 色相 / 伽马。
  *
  * src_tf / dst_tf 用和装饰着色器同一套小整数（0 线性 / 1 PQ / 2 gamma22 /
  * 3 BT.1886 / 4 sRGB）；matrix 是 3x3 **行主序**，这里按 GL 的列主序要求
  * 转置上传。返回 false 时 dst 的内容不可用，调用方应该丢掉这一帧。 */
+
+static float post_srgb_to_linear(float c) {
+	c = fminf(fmaxf(c, 0.0f), 1.0f);
+	return c <= 0.04045f ? c / 12.92f :
+		powf((c + 0.055f) / 1.055f, 2.4f);
+}
+
+/* Tanner Helland 的色温近似：开尔文 → sRGB 0..255 → 线性 RGB。
+ * 只在参数变化时算一次（每帧一次，不是每像素）。 */
+static void post_kelvin_linear(float kelvin, float out[3]) {
+	float t = kelvin / 100.0f;
+	if (!(t > 0.0f)) {
+		t = 65.0f;
+	}
+	float r, g, b;
+	if (t <= 66.0f) {
+		r = 255.0f;
+		g = 99.4708025861f * logf(t) - 161.1195681661f;
+		b = t <= 19.0f ? 0.0f :
+			138.5177312231f * logf(t - 10.0f) - 305.0447927307f;
+	} else {
+		r = 329.698727446f * powf(t - 60.0f, -0.1332047592f);
+		g = 288.1221695283f * powf(t - 60.0f, -0.0755148492f);
+		b = 255.0f;
+	}
+	out[0] = post_srgb_to_linear(r / 255.0f);
+	out[1] = post_srgb_to_linear(g / 255.0f);
+	out[2] = post_srgb_to_linear(b / 255.0f);
+}
+
+/* 色温 → 线性 RGB 增益。按 6500K 归一化（所以中性色温正好是 1,1,1），再按
+ * Rec.709 亮度归一回 1 —— 调色温只偏色，不变亮变暗。 */
+static void post_temp_gain(float kelvin, float out[3]) {
+	float k[3], ref[3];
+	post_kelvin_linear(kelvin, k);
+	post_kelvin_linear(VIDOW_GRADE_NEUTRAL_TEMP, ref);
+	float r = k[0] / fmaxf(ref[0], 1e-4f);
+	float g = k[1] / fmaxf(ref[1], 1e-4f);
+	float b = k[2] / fmaxf(ref[2], 1e-4f);
+	float y = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+	if (y > 1e-4f) {
+		r /= y;
+		g /= y;
+		b /= y;
+	}
+	out[0] = r;
+	out[1] = g;
+	out[2] = b;
+}
+
 bool vidow_fx_post_pass(struct vidow_server *server, struct wlr_buffer *dst,
 		struct wlr_texture *src, int w, int h, float src_tf, float dst_tf,
-		const float *matrix, float scale, float dither, float seed) {
+		const float *matrix, float scale, float dither, float seed,
+		const struct vidow_grade *grade) {
 	struct vidow_post_prog *p = &server->post;
 	if (p->program == 0 || src == NULL || dst == NULL) {
 		return false;
@@ -1989,6 +2083,24 @@ bool vidow_fx_post_pass(struct vidow_server *server, struct wlr_buffer *dst,
 	glUniform1f(p->u_scale, scale);
 	glUniform1f(p->u_dither, dither);
 	glUniform1f(p->u_seed, seed);
+	glUniform1f(p->u_grade_on, grade != NULL ? 1.0f : 0.0f);
+	float sat = 1.0f, contrast = 1.0f, bright = 1.0f, gamma = 1.0f;
+	float hue_rad = 0.0f;
+	float temp[3] = { 1.0f, 1.0f, 1.0f };
+	if (grade != NULL) {
+		sat = fmaxf(grade->saturation, 0.0f);
+		contrast = fmaxf(grade->contrast, 0.0f);
+		bright = fmaxf(grade->brightness, 0.0f);
+		gamma = fmaxf(grade->gamma, 0.05f);
+		hue_rad = grade->hue * 3.14159265358979f / 180.0f;
+		post_temp_gain(grade->temperature, temp);
+	}
+	glUniform1f(p->u_sat, sat);
+	glUniform1f(p->u_contrast, contrast);
+	glUniform1f(p->u_bright, bright);
+	glUniform1f(p->u_gamma, gamma);
+	glUniform1f(p->u_hue, hue_rad);
+	glUniform3fv(p->u_temp, 1, temp);
 	draw_quad(p->program);
 	glUseProgram(0);
 	end_pass(egl);

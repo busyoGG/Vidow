@@ -1692,6 +1692,16 @@ static bool cmd_set_config(struct vidow_server *server, struct jval *req,
 	if (strcmp(key, "color_precision") == 0) {
 		vidow_fx_apply_config(server);
 	}
+	/* 调色是输出端的事：参数改了要真排一帧，否则静止桌面上那块屏还停在
+	 * 旧颜色上（抓帧会重新渲染，看不出这个差别）。开关的加 / 解锁也在
+	 * 渲染那一帧里做，见 output.c 的 output_update_post_lock。 */
+	if (strncmp(key, "grade_", 6) == 0) {
+		struct vidow_output *output;
+		wl_list_for_each(output, &server->outputs, link) {
+			vidow_output_schedule_frame(server, output->wlr_output,
+				"调色参数改了");
+		}
+	}
 	vidow_arrange(server);
 	const char *now = vidow_config_get(&server->config, key);
 	jb_obj(out);

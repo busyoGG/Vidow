@@ -320,7 +320,8 @@ static const struct entry entries[] = {
 		"内部离屏缓冲的精度：\"auto\"（默认，能用 FP16 就用）/ \"8\" / \"10\""
 		"（10 = FP16 缓冲，不是 10 位整数 —— 2101010 只有 2 位 alpha，柔和阴影"
 		"和圆角会被量化）。只管装饰 / 模糊 / 底衬这些自己渲的缓冲，扫描输出位深"
-		"是 vidow.output{ depth } 的事" },
+		"是 vidow.output{ depth } 的事。组写法 color = { precision, linear_blend,"
+		" linear_blur }" },
 	{ "color_linear_blend", K_BOOL, OFF(color_linear_blend),
 		SZ(color_linear_blend), 5,
 		"装饰合成在线性光里做（先解码内容 / 底衬，混完再编码）。默认开："
@@ -331,6 +332,24 @@ static const struct entry entries[] = {
 		"背景模糊在线性光里算（每级解码 → 加权平均 → 编码回屏幕空间）。"
 		"默认关：真机上肉眼几乎无差（窗口均值 +0.7），却要给每一级多算一对"
 		"解码 / 编码；想要理论正确再打开。组写法 color.linear_blur" },
+
+	/* 输出端调色（grade.*）：只在非中性时启用输出端后处理（那块屏失去
+	 * direct scanout）。整组写成 grade = { … }，项名就是下面这些键去掉
+	 * grade_ 前缀。 */
+	{ "grade_saturation", K_DOUBLE, OFF(grade_saturation), SZ(grade_saturation), 5,
+		"输出端调色的饱和度（1 = 不变，0 = 灰度，>1 更艳）。整组写成 "
+		"grade = { saturation, contrast, temperature, hue, brightness, gamma }" },
+	{ "grade_contrast", K_DOUBLE, OFF(grade_contrast), SZ(grade_contrast), 5,
+		"输出端调色的对比度（1 = 不变，>1 更强，绕线性光 0.18 中灰）" },
+	{ "grade_temperature", K_DOUBLE, OFF(grade_temperature), SZ(grade_temperature), 5,
+		"输出端调色的色温（开尔文，6500 = 不变；>6500 偏冷，<6500 偏暖；"
+		"亮度保持不变）" },
+	{ "grade_hue", K_DOUBLE, OFF(grade_hue), SZ(grade_hue), 5,
+		"输出端调色的色相旋转（度，0 = 不变，范围 -180 .. 180）" },
+	{ "grade_brightness", K_DOUBLE, OFF(grade_brightness), SZ(grade_brightness), 5,
+		"输出端调色的亮度倍率（1 = 不变，0 = 全黑）" },
+	{ "grade_gamma", K_DOUBLE, OFF(grade_gamma), SZ(grade_gamma), 5,
+		"输出端调色的伽马（1 = 不变，>1 中间调更亮、<1 更暗）" },
 
 	{ "debug_show_refresh", K_BOOL, OFF(debug_show_refresh), SZ(debug_show_refresh), 5,
 		"在每块屏右上角显示实测帧率（debug 用；静止桌面应接近 0，顶到刷新率说明有空转）" },
@@ -790,6 +809,14 @@ static const struct group_field color_fields[] = {
 	{ "linear_blend", "color_linear_blend" },
 	{ "linear_blur", "color_linear_blur" },
 };
+static const struct group_field grade_fields[] = {
+	{ "saturation",  "grade_saturation" },
+	{ "contrast",    "grade_contrast" },
+	{ "temperature", "grade_temperature" },
+	{ "hue",         "grade_hue" },
+	{ "brightness",  "grade_brightness" },
+	{ "gamma",       "grade_gamma" },
+};
 static const struct group_field blur_fields[] = {
 	{ "enabled",   "blur_enabled" },
 	{ "all",       "blur_all" },
@@ -937,6 +964,7 @@ static const struct group groups[] = {
 	GROUP("shadow",    NULL,             shadow_fields),
 	GROUP("blur",      "blur_enabled",   blur_fields),
 	GROUP("color",     NULL,             color_fields),
+	GROUP("grade",     NULL,             grade_fields),
 	GROUP("anim",      NULL,             anim_fields),
 	GROUP("window",    NULL,             window_fields),
 	GROUP("layer",     NULL,             layer_fields),
@@ -1905,7 +1933,30 @@ static bool apply_one(struct vidow_config *cfg, const char *key,
 			 * 得跟着重算一遍。 */
 			if (strcmp(e->key, "back_overshoot") == 0) {
 				sync_easings(cfg);
-			}			return true;
+			}
+			/* 调色的每个键都有物理上说得通的范围：超出就夹住，不报错
+			 * （写成 0 的伽马会让 pow() 分母为 0，色温写 0 会算出
+			 * log(0)）。NaN 也走「夹到下限」这一支。 */
+			if (strncmp(e->key, "grade_", 6) == 0) {
+				double v = *(double *)field;
+				double lo = 0.0, hi = 4.0;
+				if (strcmp(e->key, "grade_temperature") == 0) {
+					lo = 1000.0;
+					hi = 40000.0;
+				} else if (strcmp(e->key, "grade_hue") == 0) {
+					lo = -180.0;
+					hi = 180.0;
+				} else if (strcmp(e->key, "grade_gamma") == 0) {
+					lo = 0.1;
+				}
+				if (!(v >= lo)) {
+					v = lo;
+				} else if (v > hi) {
+					v = hi;
+				}
+				*(double *)field = v;
+			}
+			return true;
 		case K_BOOL:
 			*(bool *)field = strcmp(value, "0") != 0 &&
 				strcasecmp(value, "false") != 0 &&
@@ -2208,6 +2259,14 @@ static void defaults(struct vidow_config *cfg) {
 	 * （+0.7）却要给每级多算一对解码/编码，保持默认关。 */
 	cfg->color_linear_blend = true;
 	cfg->color_linear_blur = false;
+	/* 输出端调色默认全中性：不启用后处理（= 不牺牲 direct scanout）。
+	 * 用户改了其中任意一项，output.c 才把场景改走 FP16 离屏 + 全屏 shader。 */
+	cfg->grade_saturation = 1.0;
+	cfg->grade_contrast = 1.0;
+	cfg->grade_temperature = VIDOW_GRADE_NEUTRAL_TEMP;
+	cfg->grade_hue = 0.0;
+	cfg->grade_brightness = 1.0;
+	cfg->grade_gamma = 1.0;
 	/* 激活令牌不过期：wlroots 默认 30 秒，而「弹通知」和「点通知」之间常常隔着
 	 * 几分钟 —— 令牌过期了 wlroots 直接把激活请求丢掉，我们连信号都收不到
 	 * （点了通知窗口不动，看着像客户端坏了）。 */
@@ -2705,6 +2764,10 @@ void vidow_config_log(const struct vidow_config *cfg) {
 		cfg->blur_levels, cfg->blur_strength, cfg->blur_alpha_min);
 	wlr_log(WLR_INFO, "config: force_render_hz=%d（视口外补帧的节流，0 = 不限）",
 		cfg->force_render_hz);
+	wlr_log(WLR_INFO, "config: grade 饱和度 %.2f 对比度 %.2f 色温 %.0fK "
+		"色相 %.1f° 亮度 %.2f 伽马 %.2f（全中性 = 不开输出端后处理）",
+		cfg->grade_saturation, cfg->grade_contrast, cfg->grade_temperature,
+		cfg->grade_hue, cfg->grade_brightness, cfg->grade_gamma);
 	wlr_log(WLR_INFO, "config: gap 统一 %d → 屏幕边到窗口 上%d 下%d 左%d 右%d、"
 		"窗口之间 %d（单边 -1 = 跟随统一值）",
 		cfg->gaps,

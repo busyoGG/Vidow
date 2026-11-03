@@ -2,6 +2,7 @@
 #define VIDOW_SERVER_H
 
 #include <limits.h>
+#include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -270,6 +271,17 @@ struct vidow_config {
 	/* 背景模糊在线性光里算（color.linear_blur）。默认关：真机肉眼几乎
 	 * 无差，却要给每级多算一对解码 / 编码。 */
 	bool color_linear_blur;
+	/* ---- 输出端调色（grade.*）----
+	 * 只在**非中性**时启用输出端后处理（场景先渲进 FP16 离屏，再一趟全屏
+	 * shader 做调色），代价是那块屏失去 direct scanout。中性值：
+	 * 饱和度 1 / 对比度 1 / 色温 6500K / 色相 0° / 亮度 1 / 伽马 1。
+	 * 色温按开尔文给（> 6500 偏冷，< 6500 偏暖），色相是绕灰轴的角度。 */
+	double grade_saturation;
+	double grade_contrast;
+	double grade_temperature;
+	double grade_hue;
+	double grade_brightness;
+	double grade_gamma;
 	/* 光标压到全屏窗口（游戏）上、而指针焦点不是它时，**立刻把指针焦点
 	 * （enter）补给它一次**，并同步激活它的指针约束（锁鼠标 / 夹光标）。
 	 *
@@ -860,7 +872,45 @@ struct vidow_mesh_blur_prog {
 struct vidow_post_prog {
 	unsigned int program;
 	int u_tex, u_src_tf, u_dst_tf, u_matrix, u_scale, u_dither, u_seed;
+	/* 调色（grade.*）：饱和度 / 对比度 / 亮度 / 伽马 / 色相（弧度）/ 色温增益
+	 * （已在 CPU 侧按 6500K 归一化成线性 RGB 倍率）。 */
+	int u_grade_on, u_sat, u_contrast, u_bright, u_gamma, u_hue, u_temp;
 };
+
+/* 输出端调色的参数（全局配置 grade.*，每帧从 vidow_config 拷一份）。
+ * 阈值比较用「和中性值差多少」，因为配置是 double、这里是 float。 */
+struct vidow_grade {
+	float saturation;
+	float contrast;
+	float temperature; /* 开尔文 */
+	float hue;         /* 度 */
+	float brightness;
+	float gamma;
+};
+
+#define VIDOW_GRADE_NEUTRAL_TEMP 6500.0f
+
+static inline bool vidow_grade_neutral(const struct vidow_grade *g) {
+	return g != NULL &&
+		fabsf(g->saturation - 1.0f) < 1e-4f &&
+		fabsf(g->contrast - 1.0f) < 1e-4f &&
+		fabsf(g->temperature - VIDOW_GRADE_NEUTRAL_TEMP) < 1e-2f &&
+		fabsf(g->hue) < 1e-4f &&
+		fabsf(g->brightness - 1.0f) < 1e-4f &&
+		fabsf(g->gamma - 1.0f) < 1e-4f;
+}
+
+/* 从全局配置拷一份调色参数；返回「非中性」（= 要后处理）。 */
+static inline bool vidow_grade_from_config(const struct vidow_config *cfg,
+		struct vidow_grade *g) {
+	g->saturation = (float)cfg->grade_saturation;
+	g->contrast = (float)cfg->grade_contrast;
+	g->temperature = (float)cfg->grade_temperature;
+	g->hue = (float)cfg->grade_hue;
+	g->brightness = (float)cfg->grade_brightness;
+	g->gamma = (float)cfg->grade_gamma;
+	return !vidow_grade_neutral(g);
+}
 
 /* The built-in decoration program: rounded corners, border, drop shadow,
  * blurred backdrop and grain. */
@@ -1422,6 +1472,12 @@ struct vidow_output {
 	 *   false = 老路径，场景直接渲进扫描输出缓冲。
 	 * post_swapchain 按输出尺寸懒建，尺寸变了就重建。 */
 	bool hdr;
+	/* 输出端调色（全局 grade.*）这块屏当前生不生效。非中性时也要走后处理
+	 * （见 hdr 上面的说明），hdr 与 grade 共用同一把 attach_render 锁。 */
+	bool grade;
+	/* 那把 attach_render 锁现在是不是我们拿着（hdr || grade 时拿住）。
+	 * 两个开关各自变化时靠它保持加 / 解锁成对。 */
+	bool post_locked;
 	bool hdr_metadata_dirty; /* HDR 开关或元数据变更，需要向 KMS 下发 image description */
 	double sdr_white_nits; /* 默认 203.0 */
 	struct wlr_swapchain *post_swapchain;
@@ -3883,7 +3939,8 @@ void vidow_fx_flush(struct vidow_server *server);
  * 扫描输出缓冲，中间做 TF 解码 / 色域矩阵 / PQ 编码 / dither。见 fx-gl.c。 */
 bool vidow_fx_post_pass(struct vidow_server *server, struct wlr_buffer *dst,
 		struct wlr_texture *src, int w, int h, float src_tf, float dst_tf,
-		const float *matrix, float scale, float dither, float seed);
+		const float *matrix, float scale, float dither, float seed,
+		const struct vidow_grade *grade);
 bool vidow_fx_set_shader(struct vidow_server *server,
 		struct vidow_fx_target *fx, const char *name,
 		enum vidow_shader_phase phase);

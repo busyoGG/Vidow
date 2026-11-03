@@ -41,6 +41,10 @@ key_press_enables_dpms = false
 --                default_column_width，**没写的继承全局**；比如
 --                layout = { gaps = 20, center_focused_column = "always" }
 --     depth      位深，只能 8 或 10
+--     hdr        true = 输出端 HDR（第 9 步）：场景走 FP16 离屏 + 全屏后处理，
+--                按 BT.2020 / PQ 上屏；默认 false。显示器 EDID 里没有 HDR 块
+--                就别开（画面只会发灰）。开了会失去 direct scanout。
+--     sdr_white_nits SDR 白点亮度（cd/m²），默认 203（BT.2408 推荐）
 --     transform  方向：normal / 90 / 180 / 270 / flipped / flipped-90 / flipped-180 /
 --                flipped-270（也认 "0" 当 normal）
 --

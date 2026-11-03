@@ -73,6 +73,12 @@ struct vidow_capture {
 	struct wlr_buffer *mosaic;
 	int mosaic_w, mosaic_h;
 
+	/* 输出端调色（grade.*）生效时的抓帧路径：场景先渲进 FP16 离屏，再一趟
+	 * 后处理搬进 8 位出图（截图 / 录屏也该是屏幕上那个颜色）。按尺寸懒建。 */
+	struct wlr_swapchain *grade_scene; /* FP16 场景树目标 */
+	struct wlr_swapchain *grade_out;   /* 调色后的 8 位出图（target 为空时用） */
+	int grade_w, grade_h;
+
 	/* 光标源（pointer cursor session 用） */
 	struct vidow_cursor_source *cursor;
 
@@ -175,6 +181,77 @@ struct wlr_swapchain *vidow_grab_target_new(struct vidow_server *server,
  *
  * target 非空 = 渲染进**调用方那张** linear 交换链（录屏 dmabuf 直通），空 = 渲染
  * 进抓帧自己的交换链（老行为，给截图 / 按窗口抓帧用）。 */
+/* wlroots 0.20 导出了这个符号但 Arch 的包里没装原型（output.c / fx.c 同样处理）。 */
+extern const struct wlr_drm_format_set *wlr_renderer_get_render_formats(
+	struct wlr_renderer *r, uint32_t buffer_caps);
+
+/* 调色生效时抓帧用的两张交换链：FP16 场景目标 + 8 位出图。建不出来（没有
+ * FP16）就返回 false，抓帧退回「不调色」的老路 —— 截图失败比颜色不准难受。 */
+static bool capture_grade_swapchains(struct vidow_capture *cap, int w, int h) {
+	if (cap->grade_scene != NULL && cap->grade_out != NULL &&
+			cap->grade_w == w && cap->grade_h == h) {
+		return true;
+	}
+	wlr_swapchain_destroy(cap->grade_scene);
+	wlr_swapchain_destroy(cap->grade_out);
+	cap->grade_scene = NULL;
+	cap->grade_out = NULL;
+	cap->grade_w = cap->grade_h = 0;
+	const struct wlr_drm_format_set *set =
+		wlr_renderer_get_render_formats(cap->server->renderer,
+			cap->server->allocator->buffer_caps);
+	const struct wlr_drm_format *fmt = set != NULL ?
+		wlr_drm_format_set_get(set, DRM_FORMAT_ABGR16161616F) : NULL;
+	if (fmt == NULL) {
+		return false;
+	}
+	cap->grade_scene = wlr_swapchain_create(cap->server->allocator, w, h, fmt);
+	cap->grade_out = vidow_grab_target_new(cap->server, w, h);
+	if (cap->grade_scene == NULL || cap->grade_out == NULL) {
+		wlr_swapchain_destroy(cap->grade_scene);
+		wlr_swapchain_destroy(cap->grade_out);
+		cap->grade_scene = NULL;
+		cap->grade_out = NULL;
+		return false;
+	}
+	cap->grade_w = w;
+	cap->grade_h = h;
+	return true;
+}
+
+/* 把场景刚渲好的 FP16 图按调色参数搬进出图缓冲（target 为空时用 grade_out）。
+ * 返回**加锁的**缓冲，调用方负责 unlock；失败返回 NULL。 */
+static struct wlr_buffer *capture_grade_apply(struct vidow_capture *cap,
+		struct wlr_buffer *scene, int w, int h, struct wlr_swapchain *target,
+		const struct vidow_grade *grade) {
+	struct wlr_texture *src = wlr_texture_from_buffer(cap->server->renderer,
+		scene);
+	if (src == NULL) {
+		return NULL;
+	}
+	struct wlr_swapchain *out_sc = target != NULL ? target : cap->grade_out;
+	struct wlr_buffer *dst = out_sc != NULL ?
+		wlr_swapchain_acquire(out_sc) : NULL;
+	if (dst == NULL) {
+		wlr_texture_destroy(src);
+		return NULL;
+	}
+	static const float identity[9] = {
+		1.0f, 0.0f, 0.0f,
+		0.0f, 1.0f, 0.0f,
+		0.0f, 0.0f, 1.0f,
+	};
+	bool ok = vidow_fx_post_pass(cap->server, dst, src, w, h,
+		2.0f /* gamma22 */, 2.0f /* gamma22 */, identity,
+		1.0f, 0.0f, 1.0f, grade);
+	wlr_texture_destroy(src);
+	if (!ok) {
+		wlr_buffer_unlock(dst);
+		return NULL;
+	}
+	return dst;
+}
+
 /* 同上，但出图尺寸**给死**（<=0 表示按 box × scale 算）。整屏抓帧用给死的那条：
  * 缩放不是整数时「逻辑框 × 缩放」round 回来可能差一两个像素，而客户端缓冲是照
  * 输出尺寸建的（见 capture_render）。 */
@@ -229,15 +306,44 @@ static struct wlr_buffer *capture_render_box_size(struct vidow_capture *cap,
 	}
 	struct wlr_scene_output_state_options opts = { .swapchain = sc };
 
+	/* 调色（grade.*）开着时抓帧也要那个颜色：场景先渲进 FP16 离屏，再一趟
+	 * 后处理搬进出图（直通的 target 或 grade_out）。中性 / 建不出来时保持
+	 * 老路（场景直接渲进出图）。 */
+	struct vidow_grade grade;
+	bool grade_on = vidow_grade_from_config(&cap->server->config, &grade);
+	struct wlr_swapchain *scene_sc = sc;
+	if (grade_on) {
+		if (capture_grade_swapchains(cap, width, height)) {
+			scene_sc = cap->grade_scene;
+			opts.swapchain = scene_sc;
+		} else {
+			grade_on = false;
+		}
+	}
+
 	struct wlr_buffer *buffer = NULL;
 	if (wlr_scene_output_build_state(cap->scene_output, &state,
-			sc != NULL ? &opts : NULL)) {
+			scene_sc != NULL ? &opts : NULL)) {
 		buffer = state.buffer;
 		if (buffer != NULL) {
 			wlr_buffer_lock(buffer);
 		}
 	}
 	wlr_output_state_finish(&state);
+
+	if (grade_on && buffer != NULL) {
+		struct wlr_buffer *graded = capture_grade_apply(cap, buffer, width,
+			height, sc, &grade);
+		if (graded != NULL) {
+			wlr_buffer_unlock(buffer);
+			buffer = graded;
+		} else {
+			/* 调色这一趟失败（着色器 / 出图交换链）：宁可抓一张没调色的，
+			 * 也不要整帧抓不到。 */
+			wlr_log(WLR_ERROR, "抓帧: %s 调色失败，退回未调色",
+				cap->output->name);
+		}
+	}
 
 	if (buffer == NULL) {
 		if (sc != NULL) {
@@ -1000,6 +1106,8 @@ static void capture_destroy(struct vidow_capture *cap) {
 		cursor_source_destroy(cap->cursor);
 	}
 	wlr_buffer_unlock(cap->mosaic);
+	wlr_swapchain_destroy(cap->grade_scene);
+	wlr_swapchain_destroy(cap->grade_out);
 	wlr_scene_output_destroy(cap->scene_output);
 	wlr_output_finish(&cap->grab_output);
 	wlr_backend_finish(&cap->backend);
