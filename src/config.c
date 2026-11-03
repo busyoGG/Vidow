@@ -59,7 +59,7 @@ struct entry {
 	size_t offset;
 	size_t size;
 	int section;      /* 打印默认配置时的分节，见 sections[] */
-	const char *doc;  /* 打印在那行配置上面的注释（不能有换行） */
+	const char *doc;  /* 打印在那行配置上面的注释（多行用 \n 分隔） */
 };
 
 /* 配置的「类」。entries[] 按这个顺序排（section 就是这里的下标），一份默认配置
@@ -324,9 +324,10 @@ static const struct entry entries[] = {
 		" linear_blur }" },
 	{ "color_linear_blend", K_BOOL, OFF(color_linear_blend),
 		SZ(color_linear_blend), 5,
-		"装饰合成在线性光里做（先解码内容 / 底衬，混完再编码）。默认开："
-		"阴影和半透明边缘更透、更接近物理叠加（2026-11-02 真机 A/B 后拍板）。"
-		"想要老观感就设 false。组写法 color.linear_blend" },
+		"装饰合成在线性光里做（先解码内容 / 底衬，混完再编码）。默认关："
+		"线性光下 20% 的亮底衬看起来约有 48% 亮度，半透明深色内容会明显更透、"
+		"发白（2026-11-03 实测 80% 黑压在 180 灰上：36 → 87/255）。要物理"
+		"正确的叠加再打开。组写法 color.linear_blend" },
 	{ "color_linear_blur", K_BOOL, OFF(color_linear_blur),
 		SZ(color_linear_blur), 5,
 		"背景模糊在线性光里算（每级解码 → 加权平均 → 编码回屏幕空间）。"
@@ -337,8 +338,11 @@ static const struct entry entries[] = {
 	 * direct scanout）。整组写成 grade = { … }，项名就是下面这些键去掉
 	 * grade_ 前缀。 */
 	{ "grade_saturation", K_DOUBLE, OFF(grade_saturation), SZ(grade_saturation), 5,
-		"输出端调色的饱和度（1 = 不变，0 = 灰度，>1 更艳）。整组写成 "
-		"grade = { saturation, contrast, temperature, hue, brightness, gamma }" },
+		"输出端调色（整块屏）：饱和度 / 对比度 / 色温 / 色相 / 亮度 / 伽马。\n"
+		"只有色温 / 亮度 / 对比度 / 伽马时走 KMS 的 3×1D 曲线，全屏直通照旧；\n"
+		"饱和度 / 色相非中性时改用 FP16 离屏 + 全屏着色器（那块屏失去直通）。\n"
+		"整组也可以写成 grade = { saturation, contrast, temperature, hue, "
+		"brightness, gamma }" },
 	{ "grade_contrast", K_DOUBLE, OFF(grade_contrast), SZ(grade_contrast), 5,
 		"输出端调色的对比度（1 = 不变，>1 更强，绕线性光 0.18 中灰）" },
 	{ "grade_temperature", K_DOUBLE, OFF(grade_temperature), SZ(grade_temperature), 5,
@@ -2254,10 +2258,12 @@ static void defaults(struct vidow_config *cfg) {
 	/* 默认 auto：能上 FP16 就上（用户在 2026-11-02 拍板接受这份显存代价）。
 	 * 驱动不支持半浮点线性过滤时会自动退回 8 位，见 fx-gl.c。 */
 	snprintf(cfg->color_precision, sizeof(cfg->color_precision), "auto");
-	/* 线性合成默认开（2026-11-02 真机 A/B 后拍板）：半透明窗内部均值
-	 * +17.5、阴影更透，只影响本该线性化的部分。模糊的线性化肉眼几乎无差
-	 * （+0.7）却要给每级多算一对解码/编码，保持默认关。 */
-	cfg->color_linear_blend = true;
+	/* 线性合成默认关（2026-11-03 用户实测后改回来）：半透明深色内容会
+	 * 明显更透、发白 —— 80% 黑压在 180 灰上，编码空间 36/255，线性光
+	 * 87/255（20% 的亮底衬在线性光里看起来约有 48% 亮度）。要物理正确的
+	 * 叠加可以手动打开；模糊的线性化肉眼几乎无差（+0.7）却要给每级多算
+	 * 一对解码/编码，保持默认关。 */
+	cfg->color_linear_blend = false;
 	cfg->color_linear_blur = false;
 	/* 输出端调色默认全中性：不启用后处理（= 不牺牲 direct scanout）。
 	 * 用户改了其中任意一项，output.c 才把场景改走 FP16 离屏 + 全屏 shader。 */
@@ -3021,6 +3027,23 @@ static void print_section_header(FILE *f, int section) {
 	fputc('\n', f);
 }
 
+/* 一条说明可能有多行（\n 分隔）：逐行加 "-- " 前缀，打出来还是合法注释。 */
+static void print_doc(FILE *f, const char *doc) {
+	if (doc == NULL) {
+		return;
+	}
+	const char *line = doc;
+	for (;;) {
+		const char *nl = strchr(line, '\n');
+		if (nl == NULL) {
+			fprintf(f, "-- %s\n", line);
+			return;
+		}
+		fprintf(f, "-- %.*s\n", (int)(nl - line), line);
+		line = nl + 1;
+	}
+}
+
 /* 一节的配置键：注释 + 键 = 默认值，末尾附上这一节的「族」写法提示。 */
 static void print_section_keys(FILE *f, const struct vidow_config *cfg,
 		int section) {
@@ -3032,12 +3055,13 @@ static void print_section_keys(FILE *f, const struct vidow_config *cfg,
 		}
 		const char *derived = derived_note(e->key);
 		if (derived != NULL) {
-			fprintf(f, "-- %s\n-- %s\n-- %s = \"<配置目录>/shaders\""
-				"   ← 要写死就自己换成绝对路径\n",
-				e->doc != NULL ? e->doc : "", derived, e->key);
+			print_doc(f, e->doc);
+			fprintf(f, "-- %s\n-- %s = \"<配置目录>/shaders\""
+				"   ← 要写死就自己换成绝对路径\n", derived, e->key);
 			continue;
 		}
-		fprintf(f, "-- %s\n%s = ", e->doc != NULL ? e->doc : "", e->key);
+		print_doc(f, e->doc);
+		fprintf(f, "%s = ", e->key);
 		print_lua_value(f, cfg, e->key, e->kind);
 		fputc('\n', f);
 	}

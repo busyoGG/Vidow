@@ -8,8 +8,8 @@
 force_render_hz = 60
 -- 内部离屏缓冲的精度："auto"（默认，能用 FP16 就用）/ "8" / "10"（10 = FP16 缓冲，不是 10 位整数 —— 2101010 只有 2 位 alpha，柔和阴影和圆角会被量化）。只管装饰 / 模糊 / 底衬这些自己渲的缓冲，扫描输出位深是 vidow.output{ depth } 的事。组写法 color = { precision, linear_blend, linear_blur }
 color_precision = "auto"
--- 装饰合成在线性光里做（先解码内容 / 底衬，混完再编码）。默认开：阴影和半透明边缘更透、更接近物理叠加（2026-11-02 真机 A/B 后拍板）。想要老观感就设 false。组写法 color.linear_blend
-color_linear_blend = true
+-- 装饰合成在线性光里做（先解码内容 / 底衬，混完再编码）。默认关：线性光下 20% 的亮底衬看起来约有 48% 亮度，半透明深色内容会明显更透、发白（2026-11-03 实测 80% 黑压在 180 灰上：36 → 87/255）。要物理正确的叠加再打开。组写法 color.linear_blend
+color_linear_blend = false
 -- 背景模糊在线性光里算（每级解码 → 加权平均 → 编码回屏幕空间）。默认关：真机上肉眼几乎无差（窗口均值 +0.7），却要给每一级多算一对解码 / 编码；想要理论正确再打开。组写法 color.linear_blur
 color_linear_blur = false
 -- 输出端调色（整块屏）：饱和度 / 对比度 / 色温 / 色相 / 亮度 / 伽马。

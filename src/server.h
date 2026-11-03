@@ -265,8 +265,9 @@ struct vidow_config {
 	 * 影响的是装饰、模糊金字塔、底衬这些「自己渲的」缓冲；扫描输出位深是
 	 * vidow.output{ depth } 的事，两者独立。 */
 	char color_precision[8];
-	/* 装饰合成走线性光（color.linear_blend）。默认开（2026-11-02 真机 A/B
-	 * 拍板）：阴影和半透明边缘更透。见 fx-gl.c 的 decor_fragment_src。 */
+	/* 装饰合成走线性光（color.linear_blend）。默认关（2026-11-03 实测）：
+	 * 线性光会半透明深色内容明显更透、发白（80% 黑压 180 灰：36 → 87/255）。
+	 * 打开时阴影和边缘更接近物理叠加。见 fx-gl.c 的 decor_fragment_src。 */
 	bool color_linear_blend;
 	/* 背景模糊在线性光里算（color.linear_blur）。默认关：真机肉眼几乎
 	 * 无差，却要给每级多算一对解码 / 编码。 */
