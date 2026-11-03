@@ -741,6 +741,10 @@ static void layer_surface_commit(struct wl_listener *listener, void *data) {
 	 * 标 -1 只是让 layer_content_invisible 别再拿旧结论做判定。 */
 	ls->content_invisible = -1;
 	ls->content_dirty = true;
+	/* 读回要等节流窗口（200ms），但模糊不能等：面板开合时每帧都在长，
+	 * 读回永远慢半拍，剪出来的模糊区域就缺刚长出来的那一条。这一帧真正
+	 * 画到哪儿，从损伤盒子里当场就能知道。 */
+	vidow_layer_content_box_expand(ls);
 	/* 复检的调度在这里（原来只挂在 blur 路径的 layer_content_invisible 里）：
 	 * 节点被关掉（hide_content）之后 blur 那条路在「场景树被关」就提前退出，
 	 * 不会再调它 —— 不在这里排，滑出去的 dock 就永远等不到复检、永远回不来。

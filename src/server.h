@@ -5078,6 +5078,9 @@ void vidow_layer_node_update_visible(struct vidow_layer_surface *ls);
  * 关掉之后 blur 那条路提前退出，不在这里排就没有人复检了。 */
 void vidow_layer_content_check_schedule(struct vidow_server *server,
 	struct vidow_layer_surface *ls);
+/* 把这一帧的损伤盒子并进内容包围盒（commit 里调）。内容盒是 200ms 节流
+ * 读回的，模糊区域拿它求交会把「刚长出来的那一条」裁掉 —— 见 fx-layer.c。 */
+void vidow_layer_content_box_expand(struct vidow_layer_surface *ls);
 /* 桌面底色（background_color）落到场景里：颜色 + 整个布局的包围盒。配置重载、
  * 输出变化、启动时各调一次（幂等）。 */
 void vidow_background_apply(struct vidow_server *server);

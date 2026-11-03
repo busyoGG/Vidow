@@ -281,6 +281,85 @@ static int layer_content_scan(struct vidow_server *server,
 	return 0;
 }
 
+/* 这一帧**画到了哪儿**，立刻并进内容包围盒（commit 里调，见 layer.c）。
+ *
+ * 为什么必须并：内容盒是 200ms 节流的读回结果，只配当「上界」用。可面板的
+ * 开合动画只有 340ms，读回最多赶上两次 —— 客户端申报的模糊区域跟这个旧盒子
+ * 求交之后，刚长出来的那一条就落在区域外：屏幕上底板已经画出来了、模糊还停在
+ * 旧的底边，最下面那一条「有底色没糊」，过一两帧才补上（用户报的「面板打开
+ * 的时候会先缺一块，然后才全模糊」）。
+ *
+ * 损伤盒子不慢也不贵：它就是这一帧真正改动的像素，commit 里现成的，不用读回、
+ * 不用等 idle。合并只让盒子变大（绝不会裁掉刚画的地方），缩回去交给下一次
+ * 节流读回 —— 多报的那点面积顶多让这一小会儿多抓一块底衬，比糊缺一条划算。
+ *
+ * 盒子还没测出来（content_w == 0，全透明 / 没扫过）时不动它：那种情况模糊
+ * 路径是拿客户端申报的区域直接用，本来就不会裁，硬塞一个小盒子反而会裁。 */
+void vidow_layer_content_box_expand(struct vidow_layer_surface *ls) {
+	if (ls == NULL || ls->layer_surface == NULL ||
+			ls->layer_surface->surface == NULL) {
+		return;
+	}
+	if (ls->content_w <= 0 || ls->content_h <= 0) {
+		return;
+	}
+	struct wlr_surface *s = ls->layer_surface->surface;
+	const struct wlr_surface_state *st = &s->current;
+	if (st->width <= 0 || st->height <= 0 ||
+			st->buffer_width <= 0 || st->buffer_height <= 0) {
+		return;
+	}
+	/* 有 transform / viewport 缩放时缓冲像素和逻辑像素不是简单比例，
+	 * 算不准就别算 —— 宁可让盒子小一帧，等读回纠正（和内容扫描的假设一致）。 */
+	if (st->transform != WL_OUTPUT_TRANSFORM_NORMAL ||
+			st->viewport.has_src || st->viewport.has_dst) {
+		return;
+	}
+	if (!pixman_region32_not_empty(&s->buffer_damage)) {
+		return;
+	}
+	pixman_box32_t *d = pixman_region32_extents(&s->buffer_damage);
+	double sc = (double)st->buffer_width / (double)st->width;
+	int x1 = (int)floor((double)d->x1 / sc);
+	int y1 = (int)floor((double)d->y1 / sc);
+	int x2 = (int)ceil((double)d->x2 / sc);
+	int y2 = (int)ceil((double)d->y2 / sc);
+	if (x1 < 0) {
+		x1 = 0;
+	}
+	if (y1 < 0) {
+		y1 = 0;
+	}
+	if (x2 > st->width) {
+		x2 = st->width;
+	}
+	if (y2 > st->height) {
+		y2 = st->height;
+	}
+	if (x2 <= x1 || y2 <= y1) {
+		return;
+	}
+	/* content_* 是 surface 局部逻辑坐标（同 layer_content_scan）。 */
+	int cx = ls->content_x, cy = ls->content_y;
+	int cx2 = cx + ls->content_w, cy2 = cy + ls->content_h;
+	if (x1 < cx) {
+		cx = x1;
+	}
+	if (y1 < cy) {
+		cy = y1;
+	}
+	if (x2 > cx2) {
+		cx2 = x2;
+	}
+	if (y2 > cy2) {
+		cy2 = y2;
+	}
+	ls->content_x = cx;
+	ls->content_y = cy;
+	ls->content_w = cx2 - cx;
+	ls->content_h = cy2 - cy;
+}
+
 /* 读回排到事件循环空闲时跑（见下面 layer_content_invisible 的说明）。 */
 static void layer_content_idle(void *data) {
 	struct vidow_layer_surface *ls = data;
