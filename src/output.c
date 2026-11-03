@@ -38,6 +38,8 @@ static void output_color_apply(struct vidow_output *output,
 static void output_post_finish(struct vidow_output *output);
 static struct wlr_swapchain *output_post_swapchain(struct vidow_output *output,
 		int w, int h);
+static void output_grade_lut_set(struct vidow_output *output,
+		struct wlr_color_transform *lut);
 static bool output_post_blit(struct vidow_output *output,
 		struct wlr_output_state *state, struct wlr_texture *src, int w, int h);
 static void output_set_hdr(struct vidow_output *output, bool on);
@@ -402,15 +404,61 @@ void vidow_output_render(struct vidow_output *output) {
 		const struct vidow_config *cfg = &output->server->config;
 		struct vidow_grade grade;
 		bool grade_on = vidow_grade_from_config(cfg, &grade);
-		if (output->grade != grade_on) {
-			output->grade = grade_on;
-			output_update_post_lock(output);
-			wlr_log(WLR_INFO, "color: %s 输出端调色 %s（%s）",
-				output->wlr_output->name, grade_on ? "开" : "关",
-				grade_on ? "饱和度 / 对比度 / 色温 / 色相 / 亮度 / 伽马，直通关闭"
-					: "全中性，回到直通");
+		/* 能交给 KMS 的（纯通道曲线）就别走后处理 —— 保住直通。HDR 开着时
+		 * 反正已经在后处理里了，曲线顺路在 shader 里做，不再叠一张 LUT
+		 * （两张都会生效，叠起来就是把曲线算两遍）。 */
+		const char *kms_why = NULL;
+		bool can_kms = vidow_grade_kms_possible(&grade, &kms_why);
+		size_t gamma_size = wlr_output_get_gamma_size(output->wlr_output);
+		if (gamma_size == 0) {
+			/* 测试钩子：headless 没有 KMS gamma 表，但「曲线塞进 LUT →
+			 * 提交」这条路要能测（和 vidow_gamma_init 的
+			 * VIDOW_TEST_GAMMA_FALLBACK 一个道理）。只在真后端报 0 时
+			 * 生效，接在真屏上没用。 */
+			const char *test_size = getenv("VIDOW_TEST_GRADE_LUT_SIZE");
+			if (test_size != NULL) {
+				gamma_size = strtoul(test_size, NULL, 10);
+			}
 		}
-		bool post_wanted = output->hdr || output->grade;
+		if (can_kms && gamma_size < 2) {
+			kms_why = "后端没有 gamma 表";
+		}
+		/* HDR 开着就走 shader：上屏的是 PQ 编码，KMS 曲线是按 gamma22
+		 * 算的，叠在一起颜色会错。 */
+		bool kms = grade_on && can_kms && !output->hdr && gamma_size >= 2;
+		if (kms) {
+			struct wlr_color_transform *lut = vidow_grade_lut_get(
+				output->server, &grade, gamma_size);
+			if (lut == NULL) {
+				/* 建不出来（内存 / 后端不收 3x1D）：退到 shader。 */
+				kms = false;
+				kms_why = "LUT 建不出来";
+			}
+			output_grade_lut_set(output, lut);
+		} else {
+			output_grade_lut_set(output, NULL);
+		}
+		bool grade_post_new = grade_on && !kms;
+		if (output->grade != grade_on || output->grade_post != grade_post_new) {
+			if (output->grade != grade_on) {
+				wlr_log(WLR_INFO, "color: %s 输出端调色 %s",
+					output->wlr_output->name, grade_on ? "开" : "关");
+			}
+			if (grade_on) {
+				wlr_log(WLR_INFO, "color: %s 调色走 %s（%s）",
+					output->wlr_output->name,
+					grade_post_new ? "shader 后处理，直通关闭" : "KMS LUT，直通保留",
+					output->hdr ? "HDR 已开后处理"
+						: kms_why != NULL ? kms_why : "没有硬件 LUT");
+			} else {
+				wlr_log(WLR_INFO, "color: %s 全中性，回到直通",
+					output->wlr_output->name);
+			}
+			output->grade = grade_on;
+			output->grade_post = grade_post_new;
+			output_update_post_lock(output);
+		}
+		bool post_wanted = output->hdr || output->grade_post;
 		int post_w = output->wlr_output->width;
 		int post_h = output->wlr_output->height;
 		bool post_ok = post_wanted && post_w > 0 && post_h > 0 &&
@@ -422,7 +470,8 @@ void vidow_output_render(struct vidow_output *output) {
 			options_ptr = &options;
 		} else if (post_wanted) {
 			/* 建不出来（没有 FP16 / 交换链失败）：这一帧退回直接渲染，
-			 * 别把「HDR / 调色开着」变成黑屏。 */
+			 * 别把「HDR / 调色开着」变成黑屏。纯调色时还能再把曲线塞进
+			 * KMS LUT —— 颜色保住了，只是丢了 HDR。 */
 			wlr_log(WLR_ERROR, "color: %s 后处理不可用（没有 FP16 或交换链"
 				"失败），这一帧走直接渲染", output->wlr_output->name);
 		}
@@ -450,7 +499,7 @@ void vidow_output_render(struct vidow_output *output) {
 			}
 			/* LUT 只在「改过」的那一帧提交一次：KMS 的 CTM 属性不会因为
 			 * 后续不带它的提交而丢，每帧重塞只是白算一个 blob。 */
-			if (output->gamma_lut_dirty) {
+			if (output->gamma_lut_dirty || output->grade_lut_dirty) {
 				output_color_apply(output, &state);
 			}
 			if (post_failed) {
@@ -461,6 +510,7 @@ void vidow_output_render(struct vidow_output *output) {
 					output->wlr_output->name);
 			} else {
 				output->gamma_lut_dirty = false;
+				output->grade_lut_dirty = false;
 			}
 		}
 		wlr_output_state_finish(&state);
@@ -2281,6 +2331,8 @@ static void output_destroy(struct wl_listener *listener, void *data) {
 	output_post_finish(output);
 	wlr_color_transform_unref(output->gamma_lut);
 	output->gamma_lut = NULL;
+	wlr_color_transform_unref(output->grade_lut);
+	output->grade_lut = NULL;
 	output->gamma_ctl = NULL;
 	free(output);
 	vidow_arrange(server);
@@ -2430,7 +2482,7 @@ static bool output_post_blit(struct vidow_output *output,
 	const float *matrix = hdr ? srgb_to_bt2020 : identity;
 	struct vidow_grade grade;
 	const struct vidow_grade *grade_ptr = NULL;
-	if (output->grade) {
+	if (output->grade_post) {
 		const struct vidow_config *cfg = &output->server->config;
 		grade.saturation = (float)cfg->grade_saturation;
 		grade.contrast = (float)cfg->grade_contrast;
@@ -2521,7 +2573,8 @@ static void output_set_hdr(struct vidow_output *output, bool on) {
 	} else {
 		wlr_log(WLR_INFO, "color: %s 输出端 HDR 关（%s）",
 			output->wlr_output->name,
-			output->grade ? "调色还开着，继续走后处理" : "回到直通路径");
+			output->grade ? "调色还开着，下一帧重算走法"
+				: "回到直通路径");
 	}
 	output_hdr_metadata_apply(output);
 	wlr_output_schedule_frame(output->wlr_output);
@@ -2530,8 +2583,23 @@ static void output_set_hdr(struct vidow_output *output, bool on) {
 /* HDR 与调色共用同一把 attach_render 锁：只要有一个要后处理就拿着，两个都关
  * 才放掉（并销毁 FP16 离屏交换链）。成对加 / 解锁，不能各加各的 ——
  * wlr_output_lock_attach_render 是计数锁，加两次就得解两次。 */
+/* 这块屏持有的调色曲线引用（曲线本体在 server->grade_lut 里全局共享，
+ * 换参数时会被 replace —— 所以每块屏自己拿一份引用，别指着别人的生命周期）。 */
+static void output_grade_lut_set(struct vidow_output *output,
+		struct wlr_color_transform *lut) {
+	if (lut == output->grade_lut) {
+		return;
+	}
+	if (lut != NULL) {
+		wlr_color_transform_ref(lut);
+	}
+	wlr_color_transform_unref(output->grade_lut);
+	output->grade_lut = lut;
+	output->grade_lut_dirty = true;
+}
+
 static void output_update_post_lock(struct vidow_output *output) {
-	bool want = output->hdr || output->grade;
+	bool want = output->hdr || output->grade_post;
 	if (want == output->post_locked) {
 		return;
 	}
@@ -2664,10 +2732,31 @@ static void output_log_color_caps(struct vidow_server *server,
  * 分散设置的结果就是「谁后提交谁赢」，日志里还看不出来。 */
 static void output_color_apply(struct vidow_output *output,
 		struct wlr_output_state *state) {
-	if (output->gamma_lut == NULL) {
-		return;
+	enum vidow_lut_owner owner = output->gamma_lut != NULL
+		? VIDOW_LUT_OWNER_CLIENT
+		: output->grade_lut != NULL ? VIDOW_LUT_OWNER_VIDOW
+		: VIDOW_LUT_OWNER_NONE;
+	if (owner != output->gamma_owner) {
+		/* 这条用 INFO：出了「为什么我的夜间模式不生效 / 为什么调色没效果」
+		 * 时，日志里必须能看出输出端 LUT 在谁手里。 */
+		wlr_log(WLR_INFO, "color: %s 输出 LUT -> %s",
+			output->wlr_output->name,
+			owner == VIDOW_LUT_OWNER_CLIENT
+				? "客户端（zwlr_gamma_control_v1）"
+				: owner == VIDOW_LUT_OWNER_VIDOW
+					? "Vidow 调色（grade.*）"
+					: "无");
+		output->gamma_owner = owner;
 	}
-	wlr_output_state_set_color_transform(state, output->gamma_lut);
+	/* 客户端表更特定（校色 / 夜间模式是用户专门下发的），有它就只用它；
+	 * 调色曲线不撤，客户端表一清就回到它（KMS 只有一个 LUT 位置）。 */
+	if (owner == VIDOW_LUT_OWNER_CLIENT) {
+		wlr_output_state_set_color_transform(state, output->gamma_lut);
+	} else if (owner == VIDOW_LUT_OWNER_VIDOW) {
+		wlr_output_state_set_color_transform(state, output->grade_lut);
+	} else {
+		wlr_output_state_set_color_transform(state, NULL);
+	}
 }
 
 /* 把当前 LUT 立刻提交下去（只带 color_transform，不带 buffer）。
@@ -2688,6 +2777,7 @@ static void gamma_apply(struct vidow_output *output) {
 	wlr_output_state_finish(&state);
 	output->gamma_lut_dirty = !ok;
 	if (ok) {
+		output->grade_lut_dirty = false;
 		return;
 	}
 
@@ -2706,6 +2796,8 @@ static void gamma_apply(struct vidow_output *output) {
 	wlr_color_transform_unref(output->gamma_lut);
 	output->gamma_lut = NULL;
 	output->gamma_lut_dirty = false;
+	/* 表没了，下一帧要把调色曲线（如果有）重新塞进去。 */
+	output->grade_lut_dirty = true;
 	if (ctl != NULL) {
 		wlr_gamma_control_v1_send_failed_and_destroy(ctl);
 	}
@@ -2725,20 +2817,14 @@ static void gamma_handle_set(struct wl_listener *listener, void *data) {
 	wlr_color_transform_unref(output->gamma_lut);
 	output->gamma_lut = lut;
 	output->gamma_ctl = event->control;
-	enum vidow_lut_owner owner = lut != NULL ? VIDOW_LUT_OWNER_CLIENT
-		: VIDOW_LUT_OWNER_NONE;
-	if (owner != output->gamma_owner) {
-		/* 这条用 INFO：出了「夜间模式不生效 / 颜色被谁改了」时，日志里
-		 * 必须能看出输出端 LUT 在谁手里。 */
-		wlr_log(WLR_INFO, "color: %s 输出 LUT -> %s", event->output->name,
-			owner == VIDOW_LUT_OWNER_CLIENT
-				? "客户端（zwlr_gamma_control_v1）"
-				: "Vidow 默认（客户端已清掉）");
-		output->gamma_owner = owner;
-	}
+	/* LUT 归谁由 output_color_apply 记日志：客户端表一设 / 一清，这块屏是
+	 * 继续走 KMS 曲线还是退到 shader 也跟着变（见 output_commit）。 */
 	wlr_log(WLR_DEBUG, "gamma: %s 校色表 -> %s", event->output->name,
 		lut != NULL ? "已设" : "清掉");
 	gamma_apply(output);
+	/* 客户端表占了 / 让出了 KMS 那唯一一张 LUT，调色的走法也跟着变（KMS
+	 * 曲线 ↔ shader），排一帧让它立刻切过去，别等下一次有人重绘。 */
+	wlr_output_schedule_frame(output->wlr_output);
 }
 
 static void gamma_handle_destroy(struct wl_listener *listener, void *data) {

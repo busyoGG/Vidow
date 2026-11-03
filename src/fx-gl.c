@@ -2010,54 +2010,9 @@ void dump_target(struct vidow_server *server,
  * 3 BT.1886 / 4 sRGB）；matrix 是 3x3 **行主序**，这里按 GL 的列主序要求
  * 转置上传。返回 false 时 dst 的内容不可用，调用方应该丢掉这一帧。 */
 
-static float post_srgb_to_linear(float c) {
-	c = fminf(fmaxf(c, 0.0f), 1.0f);
-	return c <= 0.04045f ? c / 12.92f :
-		powf((c + 0.055f) / 1.055f, 2.4f);
-}
-
-/* Tanner Helland 的色温近似：开尔文 → sRGB 0..255 → 线性 RGB。
- * 只在参数变化时算一次（每帧一次，不是每像素）。 */
-static void post_kelvin_linear(float kelvin, float out[3]) {
-	float t = kelvin / 100.0f;
-	if (!(t > 0.0f)) {
-		t = 65.0f;
-	}
-	float r, g, b;
-	if (t <= 66.0f) {
-		r = 255.0f;
-		g = 99.4708025861f * logf(t) - 161.1195681661f;
-		b = t <= 19.0f ? 0.0f :
-			138.5177312231f * logf(t - 10.0f) - 305.0447927307f;
-	} else {
-		r = 329.698727446f * powf(t - 60.0f, -0.1332047592f);
-		g = 288.1221695283f * powf(t - 60.0f, -0.0755148492f);
-		b = 255.0f;
-	}
-	out[0] = post_srgb_to_linear(r / 255.0f);
-	out[1] = post_srgb_to_linear(g / 255.0f);
-	out[2] = post_srgb_to_linear(b / 255.0f);
-}
-
-/* 色温 → 线性 RGB 增益。按 6500K 归一化（所以中性色温正好是 1,1,1），再按
- * Rec.709 亮度归一回 1 —— 调色温只偏色，不变亮变暗。 */
-static void post_temp_gain(float kelvin, float out[3]) {
-	float k[3], ref[3];
-	post_kelvin_linear(kelvin, k);
-	post_kelvin_linear(VIDOW_GRADE_NEUTRAL_TEMP, ref);
-	float r = k[0] / fmaxf(ref[0], 1e-4f);
-	float g = k[1] / fmaxf(ref[1], 1e-4f);
-	float b = k[2] / fmaxf(ref[2], 1e-4f);
-	float y = 0.2126f * r + 0.7152f * g + 0.0722f * b;
-	if (y > 1e-4f) {
-		r /= y;
-		g /= y;
-		b /= y;
-	}
-	out[0] = r;
-	out[1] = g;
-	out[2] = b;
-}
+/* 色温增益用 src/color.c 里那一份（vidow_grade_temp_gain）：KMS 3×1D
+ * 曲线（graded 走 LUT 时）和这里的 shader 必须算得一模一样，否则「色温 +
+ * 饱和度」同时开时会看到 LUT 和 shader 之间差一档颜色。 */
 
 bool vidow_fx_post_pass(struct vidow_server *server, struct wlr_buffer *dst,
 		struct wlr_texture *src, int w, int h, float src_tf, float dst_tf,
@@ -2093,7 +2048,7 @@ bool vidow_fx_post_pass(struct vidow_server *server, struct wlr_buffer *dst,
 		bright = fmaxf(grade->brightness, 0.0f);
 		gamma = fmaxf(grade->gamma, 0.05f);
 		hue_rad = grade->hue * 3.14159265358979f / 180.0f;
-		post_temp_gain(grade->temperature, temp);
+		vidow_grade_temp_gain(grade->temperature, temp);
 	}
 	glUniform1f(p->u_sat, sat);
 	glUniform1f(p->u_contrast, contrast);

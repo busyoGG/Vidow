@@ -2764,10 +2764,18 @@ void vidow_config_log(const struct vidow_config *cfg) {
 		cfg->blur_levels, cfg->blur_strength, cfg->blur_alpha_min);
 	wlr_log(WLR_INFO, "config: force_render_hz=%d（视口外补帧的节流，0 = 不限）",
 		cfg->force_render_hz);
-	wlr_log(WLR_INFO, "config: grade 饱和度 %.2f 对比度 %.2f 色温 %.0fK "
-		"色相 %.1f° 亮度 %.2f 伽马 %.2f（全中性 = 不开输出端后处理）",
-		cfg->grade_saturation, cfg->grade_contrast, cfg->grade_temperature,
-		cfg->grade_hue, cfg->grade_brightness, cfg->grade_gamma);
+	{
+		struct vidow_grade g;
+		bool on = vidow_grade_from_config(cfg, &g);
+		wlr_log(WLR_INFO, "config: grade 饱和度 %.2f 对比度 %.2f 色温 %.0fK "
+			"色相 %.1f° 亮度 %.2f 伽马 %.2f（%s）",
+			cfg->grade_saturation, cfg->grade_contrast,
+			cfg->grade_temperature, cfg->grade_hue, cfg->grade_brightness,
+			cfg->grade_gamma,
+			!on ? "全中性，不开输出端调色"
+				: vidow_grade_can_kms(&g) ? "纯通道曲线，走 KMS LUT 保住直通"
+				: "饱和度 / 色相非中性，走后处理");
+	}
 	wlr_log(WLR_INFO, "config: gap 统一 %d → 屏幕边到窗口 上%d 下%d 左%d 右%d、"
 		"窗口之间 %d（单边 -1 = 跟随统一值）",
 		cfg->gaps,

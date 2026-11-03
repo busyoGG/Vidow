@@ -890,6 +890,29 @@ struct vidow_grade {
 
 #define VIDOW_GRADE_NEUTRAL_TEMP 6500.0f
 
+/* 色温 → 线性 RGB 增益（6500K 归一化并按 Rec.709 亮度归一回 1）。fx-gl.c 的
+ * shader 和 color.c 的 KMS 曲线用同一份，见 src/color.c。 */
+void vidow_grade_temp_gain(float kelvin, float out[3]);
+
+/* 调色参数里「每通道各自一条曲线」的那部分（色温 / 亮度 / 对比度 / 伽马）
+ * → 3×1D LUT（屏幕编码空间 gamma22 16 位，两端钉死 0 / 65535）。饱和度和
+ * 色相必须混合通道，1D 曲线表达不了，不在这里。 */
+void vidow_grade_curve(const struct vidow_grade *grade, size_t size,
+		uint16_t *r, uint16_t *g, uint16_t *b);
+
+/* 全局共享的那张调色曲线（server->grade_lut 的懒建 / 复用）。size 是这块屏
+ * wlr_output_get_gamma_size() 报的项数；曲线不变就返回同一张（调用方只借用，
+ * 不持有引用）。返回 NULL = 建不出来。 */
+struct wlr_color_transform *vidow_grade_lut_get(struct vidow_server *server,
+		const struct vidow_grade *grade, size_t size);
+
+/* 这次调色能不能整段交给 KMS 的 3×1D LUT（= 保住 direct scanout）：只有
+ * 饱和度 / 色相是中性时才行。 */
+static inline bool vidow_grade_can_kms(const struct vidow_grade *g) {
+	return g != NULL && fabsf(g->saturation - 1.0f) < 1e-4f &&
+		fabsf(g->hue) < 1e-4f;
+}
+
 static inline bool vidow_grade_neutral(const struct vidow_grade *g) {
 	return g != NULL &&
 		fabsf(g->saturation - 1.0f) < 1e-4f &&
@@ -898,6 +921,34 @@ static inline bool vidow_grade_neutral(const struct vidow_grade *g) {
 		fabsf(g->hue) < 1e-4f &&
 		fabsf(g->brightness - 1.0f) < 1e-4f &&
 		fabsf(g->gamma - 1.0f) < 1e-4f;
+}
+
+/* vidow_grade_can_kms 的日志版：不能走 KMS 时往 why 里写一句原因（日志里
+ * 必须看得出「为什么直通没了」—— 要么是饱和度 / 色相，要么是 HDR）。 */
+static inline bool vidow_grade_kms_possible(const struct vidow_grade *g,
+		const char **why) {
+	if (g == NULL || vidow_grade_neutral(g)) {
+		if (why != NULL) {
+			*why = "全中性";
+		}
+		return false;
+	}
+	if (fabsf(g->saturation - 1.0f) >= 1e-4f) {
+		if (why != NULL) {
+			*why = "饱和度不是 1";
+		}
+		return false;
+	}
+	if (fabsf(g->hue) >= 1e-4f) {
+		if (why != NULL) {
+			*why = "色相不是 0";
+		}
+		return false;
+	}
+	if (why != NULL) {
+		*why = "色温 / 亮度 / 对比度 / 伽马都是每通道曲线";
+	}
+	return true;
 }
 
 /* 从全局配置拷一份调色参数；返回「非中性」（= 要后处理）。 */
@@ -1472,9 +1523,18 @@ struct vidow_output {
 	 *   false = 老路径，场景直接渲进扫描输出缓冲。
 	 * post_swapchain 按输出尺寸懒建，尺寸变了就重建。 */
 	bool hdr;
-	/* 输出端调色（全局 grade.*）这块屏当前生不生效。非中性时也要走后处理
-	 * （见 hdr 上面的说明），hdr 与 grade 共用同一把 attach_render 锁。 */
+	/* 输出端调色（全局 grade.*）这块屏当前生不生效。见 vidow.output{grade}。 */
 	bool grade;
+	/* 调色走哪条路（每帧按当前参数判）：
+	 *   grade_post = true  → 走上面的 FP16 + shader（饱和度 / 色相非中性，
+	 *                        或者 HDR 本来就在后处理）；
+	 *   grade_lut          → 纯通道曲线（色温 / 亮度 / 对比度 / 伽马）交给 KMS
+	 *                        的 3×1D LUT，direct scanout 照旧。
+	 * 两个都是中性时为 NULL / false。 */
+	bool grade_post;
+	struct wlr_color_transform *grade_lut;
+	/* grade_lut 有没有被改过、还没跟着某一帧提交（和 gamma_lut_dirty 一个道理）。 */
+	bool grade_lut_dirty;
 	/* 那把 attach_render 锁现在是不是我们拿着（hdr || grade 时拿住）。
 	 * 两个开关各自变化时靠它保持加 / 解锁成对。 */
 	bool post_locked;
@@ -2861,6 +2921,14 @@ struct vidow_server {
 	/* 自己接 set_gamma（不交给 scene）：见 output.c 的 vidow_gamma_init */
 	struct wl_listener gamma_set;
 	struct wl_listener gamma_destroy;
+	/* 调色曲线（grade.*，见 src/color.c 的 vidow_grade_curve）。全局一份：亮度 /
+	 * 对比度 / 色温 / 伽马是全局配置，所有屏一样，每帧现算 4096×3 个 pow 纯属
+	 * 浪费。曲线没变就复用；换参数时旧表会被替换，所以各块屏自己持一份引用
+	 * （output->grade_lut，见 output_grade_lut_set）。 */
+	struct wlr_color_transform *grade_lut;
+	size_t grade_lut_size;
+	struct vidow_grade grade_lut_args;
+	bool grade_lut_have_args;
 	/* wp_color_manager_v1 / wp_color_representation_v1（见 color.c）。
 	 * 同样不交给 scene —— scene 的 gamma 和 color 两个位置互斥。 */
 	struct wlr_color_manager_v1 *color_manager;

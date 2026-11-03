@@ -1001,6 +1001,7 @@ VIDOW_TEST_RENDERER=gles2 ./test-screencast.sh
 ./test-config-include.sh             # 配置拆成好几份：vidow.include() 的路径/顺序/报错 + 改哪份都自动重载（全 headless，24 项断言）
 ./test-defaultconfig.sh              # 默认配置按类别拆成 configs/（--default-config / --write-config）+ 配置族的表写法 + 说明的完整性（全 headless，44 项断言）
 ./test-grade.sh                      # 输出端调色：饱和度 / 对比度 / 色温 / 色相 / 亮度 / 伽马（headless + grim 量像素，13 项断言）
+./test-gradelut.sh                   # 调色混合路线：纯通道曲线走 KMS LUT 保住直通，和 shader 那条路像素一致（9 项断言）
 ./test-gap.sh                        # 间距：一个数管全部 + 单边/内间距覆盖 + 「两条 50% 正好装进一屏」（全 headless，34 项断言）
 ./test-layerblur.sh                  # 半透明状态栏背后的模糊（全 headless，4 项断言）
 ./test-blurscale.sh                  # 模糊在高 DPI 倍率下的底衬覆盖 + 对位（1/1.7/2 倍，7 项断言）
@@ -1357,8 +1358,25 @@ wlroots 0.20.2 的 DRM 后端这条链其实是齐的：
 ### 输出端调色（`grade`）
 
 整块屏的显示效果：饱和度、对比度、色温、色相、亮度、伽马。**只在非中性时**才启用，
-代价和 HDR 一样 —— 场景先渲进 FP16 离屏，再一趟全屏着色器调色后上屏，那块屏失去
-direct scanout；全部写回中性值时这一趟自动关掉，直通照旧。
+全部写回中性值时自动关掉，直通照旧。
+
+调色分两条路走，按当前参数自动选：
+
+| 参数 | 走哪 | direct scanout |
+| --- | --- | --- |
+| 只有 色温 / 亮度 / 对比度 / 伽马 | **KMS 的 3×1D GAMMA_LUT**（硬件曲线） | **保留** |
+| 饱和度 或 色相 非中性 | FP16 离屏 + 全屏着色器 | 关闭 |
+| 上面任一条 + HDR 开着 | 全屏着色器（HDR 本来就在后处理里） | 关闭 |
+
+前四项都只是「每个通道各自一条曲线」（色温就是 R/G/B 各乘一个常数），算术上塞得进
+CRTC 的 3×1D LUT，renderer 完全不参与 —— 全屏视频 / 游戏那种 single-plane 直通照旧。
+饱和度 / 色相要把 R/G/B 混在一起，wlroots 0.20.2 的 DRM 后端只接受 3×1D
+（`Only 3x1D LUT color transforms are supported`），所以只能退到着色器。
+
+两条路的数学是同一份：`src/color.c` 的 `vidow_grade_curve()` 把曲线按 gamma22 编码
+逐项算好（和 `fx-gl.c` 的 `vidow_grade()` 在线性光里算的等价），色温增益
+（`vidow_grade_temp_gain()`）两条路共用同一个函数 —— 所以「色温开着，再开饱和度」
+跨到 shader 那一瞬间颜色不跳。
 
 ```lua
 -- 平铺键（也可以整组写）
@@ -1396,10 +1414,18 @@ grade = { saturation = 0.8, temperature = 5000, contrast = 1.1 }
 **截图 / 录屏也带调色**：`capture.c` 的抓帧路径（screencopy / ext-copy / 录屏）在
 非中性时同样先渲 FP16 再走后处理 —— 抓到的是屏幕上那个颜色，不是调色前的画面。
 
+**客户端下发的校色表优先**：`zwlr_gamma_control_v1`（wlr-randr --gamma、
+icc-brightness、redshift 类）来了就用它，KMS 那张 LUT 只有一个位置，日志里
+`color: <屏> 输出 LUT -> …` 说清现在是谁的。
+
 判据：`./test-grade.sh`（13 项，headless + grim 量像素）—— 纯色背景
 `#c04020` 在饱和度 0 下变成灰度 `(107,107,107)`、对比度 0 压到线性 0.18 中灰
 `(117,117,117)`、色温 3000K 红升蓝降、色相 +90° 换成蓝紫、亮度 / 伽马变亮，
 全部写回中性后像素原样且日志说「输出端调色 关」，越界值被夹住。
+`./test-gradelut.sh`（9 项）专测混合路线：纯通道参数时日志说走 KMS LUT、上屏像素
+和 shader 那条路**逐字节一致**、开饱和度 / 色相自动降级到 shader、关掉回到 LUT。
+（headless 没有 KMS gamma 表，测试用 `VIDOW_TEST_GRADE_LUT_SIZE` 假装一张
+4096 项的表，让「曲线 → LUT → 提交」这条链路跑起来。）
 
 ### 一条链：从输出缩放到清晰的像素
 
@@ -10400,9 +10426,10 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
        `grade_temperature` / `grade_hue` / `grade_brightness` / `grade_gamma`），
        默认全中性（1 / 1 / 6500 / 0 / 1 / 1）。也认组写法
        `grade = { saturation = 0.8, temperature = 5000 }`。
-     * `output.c` 的 `post_ok` 判据从「`hdr`」改成「`hdr` 或调色非中性」；两者共用
-       同一把 `wlr_output_lock_attach_render` 锁（`output_update_post_lock()`，计数锁
-       必须成对），全中性时自动解锁并销毁 FP16 交换链，回到 direct scanout。
+     * `output.c` 的 `post_ok` 判据从「`hdr`」改成「`hdr` 或调色**必须走 shader**」；
+       两者共用同一把 `wlr_output_lock_attach_render` 锁（`output_update_post_lock()`，
+       计数锁必须成对），全中性 / 只走 KMS LUT 时自动解锁并销毁 FP16 交换链，回到
+       direct scanout。
      * `fx-gl.c` 的 `post_fragment_src` 在线性光里按「色温 → 亮度 → 对比度 → 饱和度 →
        色相（YIQ 旋转）→ 伽马」调色，再走原来的矩阵 / PQ / dither。色温增益在 CPU 侧
        算（每帧一次，不是每像素），按 6500K 归一化并按 Rec.709 亮度保持。
@@ -10418,6 +10445,19 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
      → `(192,64,32)` 且日志「输出端调色 关」。越界值夹住（伽马 0 → 0.1、色温 0 →
      1000K）。顺手把 `config.example/configs/06-render.lua` / `09-output.lua` 与
      `--write-config` 对账（`test-defaultconfig.sh` 之前是红的）。
+
+     之后补了**混合路线**（用户选的「先做 1」）：凡是 1D 曲线能表达的四项（色温 /
+     亮度 / 对比度 / 伽马）都不再走后处理，改算成 KMS 的 3×1D GAMMA_LUT ——
+     渲染器不参与，`wlr_output_lock_attach_render` 也不用拿，全屏视频 / 游戏的
+     direct scanout 保住了。只有饱和度 / 色相需要跨通道混合（wlroots 0.20.2 的 DRM
+     后端只收 3×1D，矩阵会被拒）时才退回 FP16 + shader。曲线在 `src/color.c` 的
+     `vidow_grade_curve()`（屏幕 gamma22 编码空间 16 位，和 shader 在线性光里算的
+     等价，逐项误差 < 1/65535），色温增益两条路共用 `vidow_grade_temp_gain()`，所以
+     开饱和度切到 shader 那一帧颜色不跳。客户端 `zwlr_gamma_control_v1` 的校色表
+     仍然优先（`output_color_apply()` 一处仲裁，日志 `输出 LUT -> 客户端 / Vidow 调色 /
+     无`）。实测（`./test-gradelut.sh` 9 项）：同一组参数下 LUT 路和 shader 路抓出来的
+     像素完全相同（`(238,77,0)`），开饱和度 / 色相自动降级、关掉自动回到 LUT，
+     来回切换像素回到原样。
 
 ## 尚未实现（原型边界）
 
