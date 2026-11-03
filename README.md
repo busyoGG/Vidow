@@ -10321,192 +10321,100 @@ test-blurcache.sh 拖一个和别的窗口**重叠**的浮动窗口时，模糊�
      新增 `./test-defaultconfig.sh`（20 条：默认配置回灌后逐键等于内置默认值 / 表写法只盖写了的项 /
      报错信息 / 老键名提示 / 示例文件不漂移）。
 
+126. **跨屏拖拽果冻闪：裁到哪块屏用全局坐标求交**（`8cb11f6`）。
+     用户报「拖窗口过两块屏还闪」。跟手探针（`touch /tmp/vidow-x11-trace`，
+     `grep 'jelly v='`）把每一格的摆设记下来，一眼就看到错在哪：`jelly_slot` 的显示节点
+     是 `view->scene_tree` 的孩子，`nb` 是**局部**坐标；`wlr_output_layout_get_box()`
+     给的是**全局**坐标。两套口径直接 `wlr_box_intersection`，只有布局原点在 (0,0) 的那块
+     屏能算出东西，而且是错的 ——
+
+       * 起点不在 (0,0) 的屏（用户机器的 2 倍那块在 x=1920）永远求不出交集 → 那一格被
+         **整个关掉**，2 倍屏上根本没画果冻；
+       * 起点在 (0,0) 的屏求出来的是假交集 → 节点位置被夹到 0、目标尺寸被压短
+         （580x517 → 496x433），画出来横跨到隔壁屏、还是错的倍率，偶尔还把负的源框喂给
+         `wlr_scene_buffer_set_source_box`，直接断言挂掉。
+
+     两张图叠在一起且交界每帧都在变 = 一拖就闪。修法：先把 `nb` 加上场景树原点换成全局
+     再求交，摆节点 / 切源框时再换回局部。`test-dragblur-cross.sh` 加了一条断言「每格的
+     显示节点都得落在自己那块屏的方框里、并且是开着的」（旧代码 478 帧里全是关着 / 越界），
+     场景也改成和用户真机同一个摆法（1 倍在 x=0、2 倍在 x=1920）。
+
+     实机验收（助手用 IPC 的 `action interactive-move` + `move-cursor` 自己拖，没碰用户的
+     窗口）：连拖带晃同一次 2961 行探针，2 倍那格 1578 帧全开、1 倍那格 0 帧被夹、越界 0 帧；
+     headless 回归 12 条全过（jelly / dragblur-cross / drag / blur 全家 / workspace /
+     hotplug / outputstate / blurcache）。
+
 ## 尚未实现（原型边界）
 
-1. 强制渲染的边界：
-   - 规则的作用现在有五个（`force_render` / `hz` / `focus_on_open` / `focus_on_activate` /
-     `honor_invalid_serial`），但没有 opacity / 位置 / 尺寸这类规则
-   - 节流是固定频率（`force_render_hz` / 规则 `hz`），不会自动跟输出的刷新率
-     （144Hz 屏上默认也只补 60Hz；想要更多就自己调高或者写 0 不限速）
-   - 录屏 / 预览的「保活」靠窗口截图源的存在（portal 的窗口录制路径）；如果哪天有
-     别的协议直接抓窗口而不建截图源，那条路不会自动保活
-   - 窗口在视口外时客户端照常出帧 = 照常耗电（这正是它想要的效果，但要有意识地开）
-2. 工作区的边界：
-   - 工作区是**全局**的一叠（不是「每块屏自己做一套编号」）：切过去的那块屏就是它现在
-     住的地方，跨屏切换会把整块工作区搬过去
-   - 切工作区没有动效（也没有窗口「飞向新位置」的连续布局动画），切回来是瞬时的
-   - 工作区本身不持久化（重启后只剩 `config.lua` 里声明的那几块，窗口不会自动回去 ——
-     和热插拔记忆一样是进程内的）
-   - 把窗口拖到别的工作区只支持动作/键位（`move`），没有鼠标拖拽手势
-   - 特殊工作区同一时间只显示一块；每屏各一块它也不做（跟随聚焦的屏）
-3. 焦点 / 激活的边界：
-   - 令牌里 serial 不对（客户端写了 `set_serial(0, seat)`，或者拿的是别的客户端的
-     serial）现在能治了：窗口规则 `honor_invalid_serial = true`（按应用）或者全局
-     `honor_xdg_activation_with_invalid_serial = 1`（所有应用）。默认都不开，跟
-     niri / wlroots 一样。**代价**是这个校验本来是防随便抢焦点的 —— 开了之后拿到令牌串
-     的客户端就能把你正在打字的窗口顶下去，所以默认关、按应用开
-   - 令牌本身还是「谁拿到串谁就能用」：我们只校验 serial，不校验「请求方是不是建令牌的
-     那个人」（协议就是这么设计的：令牌本来就要跨进程传）
-   - `focus_on_open = false` 的窗口，如果这块屏上**一个焦点窗口都没有**，还是会拿到焦点
-     （不然没人收键盘）；「绝对不聚焦」这个语义没做
-   - 没有「新窗口一律不抢焦点」的全局开关（只有规则里的 `focus_on_open` / `focus_on_activate`；
-     「焦点跟随鼠标」`focus-follows-mouse` 与「键盘换焦点把光标带过去」`warp-mouse-to-focus`
-     已经实现，见上面的编号 256）
-     （要的话写一条不带匹配字段的规则：`vidow.rule{ focus_on_open = false }`，它会匹配所有
-     窗口 —— 但连你自己的终端也会不抢，谨慎）
-   - 激活请求只在「窗口已经存在」时能兑现：应用还没启动 / 窗口还没建出来时点通知，
-     我们不负责把它拉起来（那需要 xdg-activation 的启动令牌 + 会话恢复）
-2. XWayland 的边界（真实 X11 程序能跑，但下面这些没做）：
-   - 没有 `_NET_WM_STRUT` 面板预留：X11 面板不会把可用区挤出来（最大化 / 最小化已经在做，
-     见 changelog 177 与「列最大化」「最小化」两节：X11 客户端请求最大化 -> 它那条列最大化 +
-     写 `_NET_WM_STATE_MAXIMIZED_VERT`/`HORZ`）
-   - X11 弹出物（菜单 / 提示 / 通知）不装饰、不做动画、不进布局、不抢焦点，按客户端
-     给的绝对位置显示，层级在所有托管窗口之上（和 Wayland 的 xdg_popup 一致）；
-     `_MOTIF_WM_HINTS` 故意不听，见上文
-   - 客户端按「屏幕边界」夹弹出菜单时可能偏：X 屏幕（客户端看到的尺寸）是**逻辑**尺寸，
-     而我们告诉窗口的坐标是 `逻辑 × S`。窗口内部的相对定位是对的（用命中坐标验过），
-     但按屏幕边缘做裁剪的客户端会算错
-   - 分数缩放下 GTK3 不认 fractional-scale，会按 `ceil` 渲染再被我们缩小（仍然清晰，
-     只是多花像素）；GTK4 / Qt6 认 fractional-scale，按 1.70 精确渲染
-   - Xft 系（GTK2、老 Motif）不认 `GDK_SCALE`：保持 1:1（清晰但相对偏小）。`Xft.dpi`
-     vidow 已经写了（恒 96，不乘 S），GTK2 这类按它走；要自己接管就在 config.lua 里
-     跑 `xrdb -merge` —— 但别和 `GDK_SCALE` 一起用，会叠成 4 倍字号
+> 2026-11-03 对账：上一版这一段有 11 条已经不成立了 —— 规则字段（`opacity` / `width` /
+> `height` / `center` / `output` / `workspace` / `column_width` / 边框圆角那一族）、工作区
+> 每屏一份 + 切换滑动动画、浮窗 Mod+拖动 / 改大小的自动化测试、动画缩放、模糊改成**本帧**
+> 抓（不再慢半拍）、装饰留边按配置重算（不用重启）、两个浮窗叠着时底衬按损伤局部重抓、
+> 键位全在 `config.lua` 且改文件就自动重载（`configwatch.c` 的 inotify）、`exec_status`
+> 并进 `vidow.exec(cmd, {status=true})`、portal 的前端已经会用区域流、ext-background-effect
+> 支持 layer、`zwp_keyboard_shortcuts_inhibit` / `zwp_xwayland_keyboard_grab` 两条、SIGPIPE、
+> Steam 二次开窗黑屏。下面只剩**确实还没做**的。
+
+1. 会话 / 持久化：
+   - 工作区与热插拔记忆都在进程里（`src/hotplug.c` 只有链表，`src/workspace.c` 的 `home`
+     指着同一份内存），**重启就丢**；没有会话恢复（记住 app_id + 列序 + 工作区 + 输出，
+     重启后摆回去）
+   - IPC 改的输出设置（缩放 / 方向 / 模式 / 位置）只在运行时生效，不写回 `config.lua`
+2. 窗口操作：
+   - 浮动窗口改大小固定从**右下角**起，没有八向的边缘判定；也没有「双击标题栏最大化」
+     （列最大化已经有，见「列最大化」一节）
+   - 拖窗口只落在**当前显示**的那块工作区：拖到隐藏工作区、或者拖到屏幕边缘顺带切工作区
+     都还没有（跨工作区只有 `move` 动作 / 键位）
+   - 特殊工作区同一时间只显示一块，并且跟随聚焦的屏；不做「每块屏各一块」
+3. layer / popup：
+   - layer surface 的**装饰**没做（圆角 / 边框）；模糊已经有（`fx-layer.c`），
+     两者不是一回事
+   - layer 的键盘独占：ON_DEMAND 现在点一下也能拿到键盘，但拿住以后只在 unmap / destroy
+     归还 —— 点别的窗口不会把键盘从 layer 收回来
+   - popup 的约束盒只在创建 / 首次 commit 时下发一次，父窗口移动后不重发
+4. 渲染 / 动画：
+   - `shader_idle` 不单独排帧：没有新帧时 `u_time` 不推进，所以常驻 shader 不会一直动
+   - 模糊底衬只含 background / bottom / toplevels 三层；top / overlay 不参与窗口背景
+     （它们自己有另一份独立模糊）
+   - 客户端申报了模糊区域就**盖过** `blur_all`，两者不取并集（区域外不模糊）
+   - ext-background-effect 只取申报区域的包围盒：挖洞的 region 会被当成外接矩形
+   - 视口外补帧是固定频率（`force_render_hz` 默认 60），不跟输出刷新率
+5. X11：
+   - 没有 `_NET_WM_STRUT`：X11 面板不会把可用区挤出来
+   - 按「屏幕边界」夹菜单的客户端会偏：X 屏幕是**逻辑**尺寸，我们给的窗口坐标是
+     `逻辑 × S`
    - 没接 `wlr_xwayland_surface_offer_focus`（ICCCM 的 GLOBAL 输入模型），只发 activate
-3. 热插拔的边界：
-   - 记忆在进程里（`vidow_output_memories`），**重启不保留**；要「重启之后还把应用放回
-     原来的屏」得自己做会话保存/恢复（记住 app_id + 列序，重启后按它拉起/摆放）
-   - 只按连接器名认身份，不看 EDID serial：同一个口换一块显示器也当同一块屏（要按屏认
-     人得把 `wlr_output.serial` 也纳入身份）
-   - 插回来落在哪个位置由 wlroots 的 `add_auto` 决定（不保证回到原来的位置）；窗口是相对
-     自己那块屏还原的，所以位置变了也会跟着走
-   - 焦点只还原到「离开时那个窗口还活着」这一层；它被关了就不会挑替代
-   - 浮动窗口被手动拖到别的屏上不会改变归属，所以拔插会把它带回归属的那块屏
-4. overview 的边界（对着 niri 的还差这些）：
-   - 看到的是**现在显示着那块工作区**的列：藏起来的工作区不出现在全景里，也没有 niri 那种
-     「把所有工作区排成一行缩略图、在上面拖动窗口跨工作区」的整体视图（重排请用
-     `Mod+Shift+H/L`，跨工作区用 `move` 动作）
-   - 只缩当前那块屏：别的屏上的窗口是淡出而不是也缩成一个「小显示器」摆进来
-   - 缩放的上下限：t = 1 时最多 1:1（只有一两列时不放大），也不做「缩到一定程度就换
-     布局」那种分级
-   - 没有键盘选择框（overview 里没有「选中项」的独立高亮，焦点即选中）
-   - 动画只有缩放 + 压暗，没有 niri 那种「窗口飞向新位置」的连续布局动画
-5. 浮动窗口的 `Mod+拖动` 与缩放分支未经自动化测试（只覆盖了客户端发起的移动路径，
-   两者共用同一套 grab 代码）；缩放固定从右下角开始，没有边缘判定
-5. layer surface 的键盘独占只在 map 时授予，未处理 on-demand 的失焦回收
-6. popup 只在创建时下发一次约束盒，父窗口移动后不会重新约束
-7. 动画只位移/改透明度，不做缩放：缩放要逐缓冲改 dest size，会被客户端 commit 覆盖，
-   这类几何变形交给自定义 shader
-8. `shader_idle` 只在布局变化时重绘，所以常驻 shader 里 `u_time` 不会连续推进
-9. 装饰只做窗口，不做 layer surface；layer 只有滑入/淡出动画
-10. 模糊只包含 background/bottom/toplevels 三层；top/overlay 层不参与背景
-11. 模糊用的是**上一帧**的场景快照（本帧开头采样），窗口快速移动时模糊内容有一帧延迟
-12. 装饰缓冲固定按 `shadow_radius + |shadow_offset|` 留边，改大阴影半径要重启
-13. 按键仍是硬编码（动画/装饰/模糊/shader/列宽走配置文件 —— 列宽那三档见编号 261）
-14. 配置里的 shell 命令只在启动和 SIGHUP 时跑，没有定时轮询 / inotify 触发
-15. `vidow.exec` 成功时返回 stdout、失败时返回 `nil, 原因`（stderr 优先）；
-    要退出码用 `vidow.exec_status`。stderr 单独抓，不混进返回值
-16. 两个浮动窗口叠在一起时，两份私有 backdrop 都要重建；动画期间每帧各一次
-    （正确但偏贵，可以按「只有自己动了」再细分一代）
-17. 输入法：同一时间只服务一个（第二个连上来会被 `unavailable` 劝退）；
-    候选框只在焦点窗口是 xdg toplevel 时摆位（layer surface 上的输入框不摆，
-    子表面的偏移也没算）
-18. 输入法的中文转换没在测试环境里跑通（fcitx5 切不到 rime），只验到 commit 中继本身
-19. 没有 `zwp_input_method_v1` / GTK 的老 IME 路径
-20. ext-background-effect 只支持 xdg toplevel（layer surface 上的输入框/面板请求了不生效）；
-    区域取包围盒，任意形状（比如挖洞的 region）会被当成它的外接矩形
-21. 客户端指定区域后，窗口其余部分就不模糊了（哪怕 `blur_all` 开着）。想要「区域只做
-    补充、其余照旧模糊」的话得把两者取并集，目前是客户端说了算
-22. portal 的 `ScreenCast` / `Screenshot` 现在是 **vidow 自己的后端**（`vidow-portal`，见
-    「录屏 portal」那节）：屏幕 / 窗口 / 虚拟屏幕 / 区域四种来源、`hidden` / `embedded` /
-    `metadata` 三种光标模式、`Screenshot` / `PickColor` 都通了。剩下的口子：
-    `stream_region` 合成器侧实现了，但前端不通过 ScreenCast 要区域（只有交互式截图走它）。
-    `zkde_screencast_unstable_v1` 对所有客户端开放是**故意的**（和 KDE 一致，见上面那节的
-    「注意」）。
-23. portal 的 activation：`set_serial(0)` 的 token 被 wlroots 拒绝，而 GTK / Qt 的
-    portal 对话框就是这么发的（能聚焦是因为我们 map 新窗口时无条件给焦点）。
-    另外没有给 vidow 自己启动的子进程发 `XDG_ACTIVATION_TOKEN`
-24. foreign-toplevel（任务栏 / waybar）的 `set_maximized` 请求没接：vidow 现在有「列最大化」
-    了（changelog 177），但那条协议上的请求还没接，任务栏上的最大化按钮点了没反应
-    （`set_minimized` / `request_activate` / `request_fullscreen` 都接了，就差它）
-25. `ext_foreign_toplevel_image_capture_source_v1` 的截图源建得出来，但没跑过真实的
-    逐窗口录屏客户端（同样缺 xdg-desktop-portal-wlr）
-26. `portal_conf_sync` 那一步是**会话级**的：`import-environment` +
-    `restart xdg-desktop-portal` 影响的是整个 systemd user session。vidow 当会话
-    合成器时这是对的；但**嵌套在别的桌面里跑会把宿主的 portal 也指到 vidow**，
-    那种场合应该 `portal_desktop=` 关掉，或者接受「宿主的对话框也画进 vidow」
-27. 只支持 `[preferred]` 一个段（portals.conf 目前也就只有这个段）；用户覆盖里
-    段名行会被跳过，其他段的键会被合并进 `[preferred]`
-28. 重启 portal 走 `systemctl --user`；没有 systemd user session 的环境下这一步
-    静默失败（文件还是会写，重启要自己来）
-
-29. IPC 的边界：
-   - 只有**事件推送**，没有「断线重连后补发」：订阅那一刻之前发生的事收不到（要快照就
-     `state`，之后靠事件跟）
-   - 没有 i3/sway 那种**命令行解析**（`vidowmsg` 只是把参数拼成 JSON）；也没有 niri 的
-     `--json` 之外的输出格式
-   - 命令覆盖到的是「合成器自己的功能」，没有 shell 执行（能跑 shell 的只有 config.lua）、
-     没有窗口规则的运行时增删（要改规则就改 config.lua + `reload-config`）
-   - 输出设置（缩放 / 方向 / 模式 / 位置）是**运行时**的，不写回配置文件：SIGHUP 之后按
-     配置重算（想让它持久就写进 config.lua 的 `scale` / `outputs`）
-   - 没有权限分级：socket 是 0600（只有本人能连），但连上之后所有命令都能用
-   - 事件没有背压策略之外的流控：订阅者卡住（不读 socket）攒到 8 MiB 会被踢掉
-
-30. UI 元素树（给 UI 识别用）：合成器只能给**表面树**（窗口 / 弹层 / 子表面的矩形 + pid），
-    控件级的树（角色 / 名字 / 文本 / 动作）**只有 AT-SPI 一条路**，而且只覆盖**实现了无障碍**
-    的应用（Chromium / Electron 系还要 `ACCESSIBILITY_ENABLED=1` 才上总线，纯自绘应用永远没有）。
-    另外 AT-SPI 报的坐标是**窗口相对的**，全局坐标要合成器补窗口位置 —— 这是 vidow 在这件事里
-    唯一不可替代的部分。调研、实测数据（含覆盖率与「操作路径未验证」）与补齐路线见
-    [`docs/ui-tree-feasibility.md`](docs/ui-tree-feasibility.md)
-
-31. ~~指针约束只做了鼠标那对，键盘那两个还没接~~ **已做（changelog 176）**：
-    `zwp_keyboard_shortcuts_inhibit_manager_v1` 接进了键位那条路（焦点那个表面抑制着时让路，
-    `{ inhibited = true }` 的绑定是逃生口），`zwp_xwayland_keyboard_grab_manager_v1` 像
-    `src/bgeffect.c` 那样自己写了服务端（X11 的 `XGrabKeyboard`，谁抓谁收）。判据
-    `./test-keyboard-grab.sh`。本机 `/usr/bin/Xwayland` 两个都会 bind。
+   - Steam 二次开窗黑屏已经修了（`view.c` 按 `scene_serial` 重建场景树，`15f4a73`），
+     但只有 `test-steam-fix.sh` / `test-steam-reopen-blackscreen.sh` 这类真机脚本，
+     没有 headless 判据
+6. 输入法 / 文本输入：
+   - 同时只服务一个输入法，第二个连上来直接静默拒绝（不发 `unavailable`）
+   - 候选框只在焦点窗口是 xdg toplevel 时摆位：layer surface 上的输入框不摆，子表面的
+     偏移也没算
+   - 中文转换没验通（rime 能切过去、但不产生 commit）
+   - 没有 `zwp_input_method_v1` / GTK 的老 IME 路径
+7. portal / 桌面集成：
+   - 不给 vidow 自己启动的子进程发 `XDG_ACTIVATION_TOKEN`
+   - foreign-toplevel（任务栏 / waybar）的 `set_maximized` 没接：任务栏上的最大化按钮
+     点了没反应（`request_activate` / `close` / `fullscreen` / `minimize` 都接了）
+   - portal_conf_sync 是**会话级**的：`import-environment` + 重启 `xdg-desktop-portal`
+     打的是整个 user session；嵌套跑会把宿主的 portal 也指过来
+   - `portals.conf` 只支持 `[preferred]` 一个段
+   - 没有 systemd user session 时，重启 portal 那一步静默失败（文件照写）
+8. IPC / 自动化：
+   - 只有事件推送，没有「断线重连后补发」；规则不能运行时增删（只能改 `config.lua` +
+     重载）；没有权限分级（socket 0600，连上就全能用）；订阅者不读 socket 攒到 8 MiB
+     会被踢
+9. UI 元素树：合成器只能给**表面树**（窗口 / 弹层 / 子表面的矩形 + pid），控件级的树
+   只有 AT-SPI 一条路（且只覆盖实现了无障碍的应用），调研见
+   [`docs/ui-tree-feasibility.md`](docs/ui-tree-feasibility.md)
 
 ## 下一步建议顺序
 
-1. 浮动窗口的八向缩放边缘 + 双击标题栏最大化（列最大化已经有了，见「列最大化」一节）
-2. layer surface 的装饰与模糊（状态栏/启动器也想要圆角）
-3. workspace / 多显示器列组
-4. `_NET_WM_STRUT`（面板预留），以及按屏幕边界夹菜单的客户端（把 X 屏幕也改成 `逻辑 × S`）
-
-32. 信号：合成器必须**显式忽略 SIGPIPE**，这不是可选加固。
-
-    现场：在 vidow 里开的 kitty 里跑 vshell，按 Ctrl+C，vidow 整个进程消失 —— 没有 core、
-    没有断言、连退出日志都写不出来。gdb 挂上去看到的收尾是
-
-        [Thread 1 ... (id 1) exited]
-        ...
-        Program terminated with signal SIGPIPE, Broken pipe.
-
-    也就是说所有线程都已经正常退完，最后收走进程的是 SIGPIPE 的默认动作。原因很日常：
-    合成器天天往**随时会消失的对端**写 —— 剪贴板把数据塞进 pipe
-    （`clipboard.c` 的 `wlr_data_source_send` 用 `fds[1]`，读端是客户端）、IPC 往订阅者
-    那条 socket 上写（`ipc.c` 的 `write(c->fd, …)`）。客户端一走，这些写就撞上 EPIPE。
-
-    `main.c` 里现在 SIGINT / SIGQUIT / SIGPIPE 三个一起设成 `SIG_IGN`（前两个的道理见那里的
-    注释：终端把 Ctrl+C 发给整个前台进程组），要求子进程在 `exec` 前把这三个都还原成
-    `SIG_DFL`（`exec.c` 的 `vidow_exec_detached`），否则 kitty / vshell 自己会失去 Ctrl+C。
-
-    判据：`grep SigIgn /proc/$(pgrep -xo vidow)/status` 里第 13 位（SIGPIPE）必须是 1；
-    `SigIgn: 0000000000001006` 就是对的（bit 2 = SIGINT、bit 3 = SIGQUIT、bit 13 = SIGPIPE）。
-
-33. **未解**：Steam 第二次打开主窗口黑屏（Hyprland 下同一个操作正常）。
-
-    已用数据排除的假设（都别再走一遍）：`configured` 是 xdg-only 标志、渲染逻辑不读它；
-    configure **确实发出去过**（`16,94 3808x2050`，见 `x11-cfg` 日志）；窗口在列里
-    （`column_width: 1`）；`不裁（屏框 0,0 0x0）` 是不裁剪分支的正常值；`WM_STATE` 是
-    `Normal`；colormap `not installed` 是 X11 常态；`atom_cache.cc` 那些 ERROR 在**健康**的
-    第一次打开时同样出现（共 1500+ 条噪声）。
-
-    数据指到的现象：第一次打开有 **13 次换帧**，之后每一次重开**只有 1 次**，然后客户端
-    就不再交帧了；窗口 xid 不变（复用同一个 X 窗口）。也就是**我们收到的每一帧都画了，
-    是 Steam 自己停下来了**。差距在 XWayland 与合成器之间某个我们没发的信号上。
-
-    复现步骤（照抄）：`spawn kitty` 之类先开一个正常会话 → `steam` 开出主窗口（正常）→
-    `vidowmsg close-window --id <N>` → 再 `steam` → 全黑。手动拖一下窗口就恢复
-    （拖动走 grab → arrange，顺带把 CEF 的合成唤醒）。
-
-    下一轮要带的工具：`x11-buf`（本仓库已加的换帧日志，`grep x11-buf`）对比健康/黑屏两次
-    的差别；再看 XWayland 侧给 Steam 发的 `Expose` / `ConfigureNotify` 序列。
+1. 会话恢复：把工作区栈、`home`、浮动几何、输出设置落盘，重启后摆回去 —— 现在唯一
+   「用久了会疼」的缺口
+2. 浮动窗口八向缩放边缘 + 双击标题栏最大化
+3. layer surface 的装饰（圆角 / 边框）：模糊已经在了，只差装饰
+4. foreign-toplevel 的 `set_maximized` + `_NET_WM_STRUT`（任务栏按钮、X11 面板预留）
+5. 小件打包：popup 约束盒随父窗口移动重发、`shader_idle` 补帧、客户端模糊区域与
+   `blur_all` 取并集
