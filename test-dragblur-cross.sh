@@ -56,8 +56,11 @@ chmod 700 "$RUNDIR/run"
 cat > "$CFGDIR/.config/vidow/config.lua" <<'CFG'
 xwayland = false
 -- 用户真机：一块 1 倍、一块 2 倍（2 倍那块物理 3840x2160，逻辑还是 1920x1080）
-vidow.output{ name = "HEADLESS-1", scale = 1, mode = "1920x1080" }
-vidow.output{ name = "HEADLESS-2", scale = 2, mode = "3840x2160" }
+-- 和用户真机同一个摆法：左屏 1 倍在 x=0，右屏 2 倍在 x=1920（HEADLESS-1 排在
+-- 后面，布局里落在 1920）。倍率挂在**非原点**那块屏上，坐标空间写错时最先炸的
+-- 就是它。
+vidow.output{ name = "HEADLESS-1", scale = 2, mode = "3840x2160" }
+vidow.output{ name = "HEADLESS-2", scale = 1, mode = "1920x1080" }
 blur_enabled = true
 blur_all = true
 blur_levels = 4
@@ -212,17 +215,18 @@ grep -a "blur: own region wA" "$LOG" | tail -4 | sed 's/^/    /'
 mark "断言"
 python3 - "$RUNDIR" "$W" "$RX" "$LSCALE" "$RRX" "$RSCALE" \
 	"$FBX" "$FBY" "$FBW" "$FBH" "$ACT_BEFORE" "$ACT_AFTER" \
-	"${GTRACE_BEFORE:-0}" "$LNAME" "$RNAME" <<'PY'
+	"${GTRACE_BEFORE:-0}" "$LNAME" "$RNAME" "$RRW" <<'PY'
 import os, re, sys
 from PIL import Image
 
 (rundir, w, lx, lscale, rx, rscale, bx, by, bw, bh,
- before, after, gt_before, lname, rname) = (
+ before, after, gt_before, lname, rname, rw) = (
                    sys.argv[1], int(sys.argv[2]), int(sys.argv[3]),
                    float(sys.argv[4]), int(sys.argv[5]), float(sys.argv[6]),
                    int(sys.argv[7]), int(sys.argv[8]), int(sys.argv[9]),
                    int(sys.argv[10]), int(sys.argv[11]), int(sys.argv[12]),
-                   int(sys.argv[13]), sys.argv[14], sys.argv[15])
+                   int(sys.argv[13]), sys.argv[14], sys.argv[15],
+                   int(sys.argv[16]))
 failed = []
 
 def check(cond, msg):
@@ -287,6 +291,29 @@ check(per_out.get(lname) == {"%.2f" % lscale} and
       "跨屏拖拽期间两块屏各画一格、各用自己的倍率（%s=%s，%s=%s）"
       % (lname, ",".join(sorted(per_out.get(lname) or ["无"])),
          rname, ",".join(sorted(per_out.get(rname) or ["无"]))))
+
+# 0b) 每格的显示节点必须落在**它自己那块屏**里、而且是开着的。坐标空间搞错
+#     （节点的局部框直接跟屏的全局框求交）时：起点不在 (0,0) 的那块屏永远求
+#     不出交集 —— 那一格被整个关掉；起点在 (0,0) 的那块屏求出的是假交集（位置
+#     被夹到 0、目标尺寸压短），画出来横跨到隔壁屏、还是错的倍率。拖起来就是
+#     横纹 / 闪烁。
+boxes = {lname: (lx, w - lx), rname: (rx, rw)}
+total = stray = off = 0
+for mm in re.finditer(
+        r"jelly v=\d+ out=(\S+) .*?node=(-?\d+),(-?\d+).*?en=(\d+)", log):
+    name, nx, en = mm.group(1), int(mm.group(2)), int(mm.group(4))
+    if name not in boxes:
+        continue
+    total += 1
+    if en != 1:
+        off += 1
+        continue
+    ox, ow = boxes[name]
+    if not (ox - 2 <= nx <= ox + ow):
+        stray += 1
+check(total > 0 and stray == 0 and off == 0,
+      "每格的显示节点都在自己那块屏里、且是开着的"
+      "（%d 帧，越界 %d，关着 %d）" % (total, stray, off))
 
 # 2) 左屏：wA ∩ wB ∩ 左屏 的那一条，左右各留 20 避开圆角 / 阴影
 gbox = (max(w - 200, bx + 20), by + 60,

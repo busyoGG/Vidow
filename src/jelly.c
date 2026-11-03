@@ -1072,6 +1072,15 @@ void vidow_jelly_tick(struct vidow_server *server, int64_t now_ns) {
 				wlr_output_layout_get_box(server->output_layout,
 					slot->out, &ob);
 			}
+			/* nb 是**场景树局部**坐标（节点是 scene_tree 的孩子），ob 是布局
+			 * 全局坐标 —— 两个口径不能直接求交：起点不在 (0,0) 的那块屏永远
+			 * 求不出交集，那一格就被整个关掉（那块屏上的果冻直接没了）；起点
+			 * 在 (0,0) 的那块屏求出来的也是假的交集（位置被夹到 0、目标尺寸
+			 * 被压短），画出来横跨到隔壁屏上、还是错的倍率。拖拽时这两件事
+			 * 一起发作，就是「一拖就闪」。先换到全局求交，再换回局部摆节点。 */
+			struct wlr_box gb = nb;
+			gb.x += tx;
+			gb.y += ty;
 			/* 没有屏的（老路那格）/ 查不到屏框的：不裁，整块照画。 */
 			if (ob.width < 1 || ob.height < 1) {
 				wlr_scene_node_set_enabled(&slot->node->node, true);
@@ -1082,16 +1091,17 @@ void vidow_jelly_tick(struct vidow_server *server, int64_t now_ns) {
 				wlr_scene_buffer_set_source_box(slot->node, NULL);
 				continue;
 			}
-			if (!wlr_box_intersection(&inter, &nb, &ob)) {
+			if (!wlr_box_intersection(&inter, &gb, &ob)) {
 				/* 这块屏上没有它：整个关掉（不然它会画到别的屏上）。 */
 				wlr_scene_node_set_enabled(&slot->node->node, false);
 				continue;
 			}
 			wlr_scene_node_set_enabled(&slot->node->node, true);
-			bool full = inter.width == nb.width &&
-				inter.height == nb.height;
+			bool full = inter.width == gb.width &&
+				inter.height == gb.height;
 			wlr_scene_node_set_position(&slot->node->node,
-				full ? nb.x : inter.x, full ? nb.y : inter.y);
+				full ? nb.x : inter.x - tx,
+				full ? nb.y : inter.y - ty);
 			wlr_scene_buffer_set_dest_size(slot->node,
 				full ? nb.width : inter.width,
 				full ? nb.height : inter.height);
@@ -1103,8 +1113,8 @@ void vidow_jelly_tick(struct vidow_server *server, int64_t now_ns) {
 				double ky = (double)slot->buf_h /
 					(double)nb.height;
 				struct wlr_fbox sb = {
-					.x = (double)(inter.x - nb.x) * kx,
-					.y = (double)(inter.y - nb.y) * ky,
+					.x = (double)(inter.x - gb.x) * kx,
+					.y = (double)(inter.y - gb.y) * ky,
 					.width = (double)inter.width * kx,
 					.height = (double)inter.height * ky,
 				};
@@ -1128,12 +1138,14 @@ void vidow_jelly_tick(struct vidow_server *server, int64_t now_ns) {
 				}
 				vidow_gtrace("jelly v=%d out=%s tree=%d,%d src=%d,%d "
 					"rel=%d,%d node=%d,%d off=%.0f,%.0f scale=%.2f "
-					"srcbuf=%dx%d",
+					"srcbuf=%dx%d en=%d dst=%dx%d",
 					view->id,
 					slot->out != NULL ? slot->out->name : "-",
 					tx, ty, fx_x, fx_y, slot->rel_x, slot->rel_y,
 					jn_x, jn_y, view->anim_off_x, view->anim_off_y,
-					slot->scale, slot->src_w, slot->src_h);
+					slot->scale, slot->src_w, slot->src_h,
+					slot->node->node.enabled, slot->dst_w,
+					slot->dst_h);
 			}
 		}
 
