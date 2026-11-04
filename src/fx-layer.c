@@ -1144,8 +1144,13 @@ void vidow_overview_blur_frame(struct vidow_server *server,
 		fx->blur_drawn = 0; /* 尺寸变了，必须重画 */
 	}
 	/* region = NULL：这张贴图盖的就是整块屏，着色器按「元素在输出上的位置」
-	 * 采样（u_origin = ox*scale - 输出原点），跟 bottom 层那条路一样。 */
-	blur_assign(fx, output->wlr_output, output->blur_tex, false, output->blur_id, NULL);
+	 * 采样（u_origin = ox*scale - 输出原点），跟 bottom 层那条路一样。
+	 *
+	 * out 传 NULL：这条路的 fx 目标没有 bake_output，走的是单份字段
+	 * （fx->blur_tex）。给了 out 就会写进「每屏一格」的槽里，而着色器
+	 * 按 bake_output 取贴图 —— 取不到，u_blur_strength 归零、整块全透明
+	 * （开关开了和没开一个像素都不差）。 */
+	blur_assign(fx, NULL, output->blur_tex, false, output->blur_id, NULL);
 	if (fx->blur_drawn == fx->blur_ver) {
 		ov->fx_on = true; /* 已经画的就是这一版 */
 		wlr_scene_node_set_enabled(&fx->node->node, true);
@@ -1459,7 +1464,9 @@ bool layer_blur_frame(struct vidow_server *server,
 		if (ls->bd != NULL || ls->bd_tex != NULL) {
 			layer_bd_drop(ls);
 		}
-		blur_assign(fx, output->wlr_output, output->blur_tex, false, output->blur_id, NULL);
+		/* out 传 NULL，理由同 overview 那条路：layer 的 fx 目标没有
+		 * bake_output，走单份字段才能被 fx_blur_tex_now() 取到。 */
+		blur_assign(fx, NULL, output->blur_tex, false, output->blur_id, NULL);
 	}
 	/* 采样原点必须记**这块屏自己**的（设备像素）：装饰着色器拿 out_* 和
 	 * blur_tex_* 算 UV，而 server->output_* 是「最后渲染的那块屏」留下的全局
