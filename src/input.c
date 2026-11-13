@@ -102,6 +102,43 @@ static bool lock_pointer_route(struct vidow_server *server, uint32_t time_msec,
 
 /* ======================================================= 会话锁（S3）结束 */
 
+/* 客户端看到的修饰位：**只要机器上有可信物理键盘，depressed 就只取它们的并集**。
+ *
+ * 以前是「seat 上那把键盘说什么就是什么」：修饰位跟着 seat 的键盘走，而 seat 经常
+ * 是输入法的虚拟键盘（fcitx5 回注时切过去就不再切回来）。虚拟键盘的 xkb_state 由
+ * fcitx5 记账，它漏回注一次 release，状态就永远带着那个修饰键 —— 客户端看到的就是
+ * 「什么都没按，Super / Ctrl 却按着不放」（卡住的根）。
+ *
+ * 物理键盘的 xkb 状态由 libinput 的按键事件驱动，和「这一下按键有没有被合成器吃掉」
+ * 无关，所以它是唯一可信的那一份。latch / lock / group 仍按 kb 自己记（NumLock /
+ * CapsLock / 输入法布局是键盘自己的状态，抹掉会打不出数字、布局乱跳）。
+ *
+ * 一台物理键盘都没有时（headless / 只有注入）保持原样：并集恒为 0，全抹掉的话
+ * wtype 这类虚拟键盘连修饰键都发不出去。 */
+static void push_client_modifiers(struct vidow_server *server,
+		struct wlr_keyboard *kb) {
+	if (server == NULL || kb == NULL || server->shutting_down) {
+		return;
+	}
+	if (wlr_seat_get_keyboard(server->seat) != kb) {
+		return; /* 不是 seat 正拿着的那把：发出去只会把别人的状态带歪 */
+	}
+	struct wlr_keyboard_modifiers mods = kb->modifiers;
+	uint32_t phys = 0;
+	bool has_phys = false;
+	struct vidow_keyboard *it;
+	wl_list_for_each(it, &server->keyboards, link) {
+		if (it->virtual == NULL && !it->inject && !it->uinput) {
+			has_phys = true;
+			phys |= wlr_keyboard_get_modifiers(it->wlr_keyboard);
+		}
+	}
+	if (has_phys) {
+		mods.depressed = phys;
+	}
+	wlr_seat_keyboard_notify_modifiers(server->seat, &mods);
+}
+
 static void keyboard_modifiers(struct wl_listener *listener, void *data) {
 	(void)data;
 	struct vidow_keyboard *kb = wl_container_of(listener, kb, modifiers);
@@ -118,8 +155,7 @@ static void keyboard_modifiers(struct wl_listener *listener, void *data) {
 			wlr_seat_set_keyboard(kb->server->seat, kb->wlr_keyboard);
 		}
 		lock_focus_keyboard(kb->server);
-		wlr_seat_keyboard_notify_modifiers(kb->server->seat,
-			&kb->wlr_keyboard->modifiers);
+		push_client_modifiers(kb->server, kb->wlr_keyboard);
 		return;
 	}
 
@@ -131,8 +167,7 @@ static void keyboard_modifiers(struct wl_listener *listener, void *data) {
 	 * 仍然只发给输入法。 */
 	if (vidow_im_owns_keyboard(kb->server, kb)) {
 		vidow_im_modifiers(kb->server, kb->wlr_keyboard);
-		wlr_seat_keyboard_notify_modifiers(kb->server->seat,
-			&kb->wlr_keyboard->modifiers);
+		push_client_modifiers(kb->server, kb->wlr_keyboard);
 		return;
 	}
 
@@ -157,8 +192,7 @@ static void keyboard_modifiers(struct wl_listener *listener, void *data) {
 	if (wlr_seat_get_keyboard(kb->server->seat) != kb->wlr_keyboard) {
 		wlr_seat_set_keyboard(kb->server->seat, kb->wlr_keyboard);
 	}
-	wlr_seat_keyboard_notify_modifiers(kb->server->seat,
-		&kb->wlr_keyboard->modifiers);
+	push_client_modifiers(kb->server, kb->wlr_keyboard);
 
 	/* Alt+Tab 切换器只在「还按着修饰键」的时候开着（niri 同此）：所有修饰键都
 	 * 松开了就是「选好了」—— 把焦点给选中的那个，关掉。按住 Alt 连点 Tab 的
@@ -409,7 +443,7 @@ static bool input_key_share(struct vidow_keyboard *kb, uint32_t key,
 	return true;
 }
 
-static void keyboard_key(struct wl_listener *listener, void *data) {
+static void keyboard_key_impl(struct wl_listener *listener, void *data) {
 	struct vidow_keyboard *kb = wl_container_of(listener, kb, key);
 	struct vidow_server *server = kb->server;
 	struct wlr_keyboard_key_event *event = data;
@@ -701,7 +735,35 @@ static void keyboard_destroy(struct wl_listener *listener, void *data) {
 		}
 		wlr_seat_set_keyboard(server->seat, next != NULL ? next->wlr_keyboard : NULL);
 	}
+	/* **拔键盘 / 无线断连时修饰位要归位。**
+	 *
+	 * 这块键盘的 xkb 状态跟着设备一起没了，但 seat 那边记的还是它最后报上来的
+	 * 那一份 —— 断连时正按着的 Ctrl / Super 没有任何事件能纠正，客户端就永远
+	 * 以为按着。换完 seat 键盘之后按剩下的物理键盘再报一次真值。 */
+	{
+		struct wlr_keyboard *seat_kb = wlr_seat_get_keyboard(server->seat);
+		if (seat_kb != NULL) {
+			push_client_modifiers(server, seat_kb);
+		} else {
+			wlr_seat_keyboard_notify_modifiers(server->seat, NULL);
+		}
+	}
 	free(kb);
+}
+
+/* 一个键事件：先按原路分发，然后**每一个键之后都把修饰位补报一次**。
+ *
+ * 用户反复报「super 键容易卡住」。合成器的分发里有十来处早退（锁定、输入法、
+ * MRU、全景、跨键盘去重），每一处都可能漏发修饰位；而客户端那边只要收到过
+ * 「Super 按着」，之后没收到「Super 松开」，它就一直以为按着 —— 而且修饰位
+ * 之后不再变化时，wlroots「有变化才发」也永远不会纠正它。
+ *
+ * 收口放在这里：路由完不管走哪条路，都按当前真值补报一次（push_client_modifiers
+ * 里再按物理键盘取真值）。重报无害，客户端只是把状态改成当前值。 */
+static void keyboard_key(struct wl_listener *listener, void *data) {
+	struct vidow_keyboard *kb = wl_container_of(listener, kb, key);
+	keyboard_key_impl(listener, data);
+	push_client_modifiers(kb->server, kb->wlr_keyboard);
 }
 
 /* 键盘自己的参数（configs/21-keyboard.lua）：
