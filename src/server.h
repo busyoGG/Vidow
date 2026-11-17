@@ -668,48 +668,6 @@ struct vidow_config {
 	 * 颜色，有壁纸客户端时被它盖住。RRGGBB 或 RRGGBBAA。 */
 	float background_color[4];
 
-	/* ---- 小窗（mini window，configs/24-mini.lua）----
-	 * 小窗是浮动窗口上的一个形态（见 enum vidow_mini_state）：迷你 / 图标 /
-	 * 自由小窗。S1 只铺数据模型 + 配置 + IPC，形态还不会自动切换、渲染与
-	 * 输入路由未动。 */
-	bool mini_enabled;         /* 总开关，false = 这套东西完全不生效 */
-	bool mini_drop_zone;       /* 拖拽时亮落点区 */
-	char mini_drop_zone_w[16]; /* 落点区宽（工作区百分比，如 "15%"） */
-	char mini_drop_zone_h[16];
-	char mini_w[16];           /* 迷你态尺寸（工作区百分比，如 "28%"） */
-	char mini_h[16];
-	char mini_free_w[16];      /* 自由小窗的初始尺寸（工作区百分比） */
-	char mini_free_h[16];
-	int mini_icon_size;        /* 图标边长（逻辑像素） */
-	double mini_icon_overflow; /* 图标沿贴边那一侧出屏的比例，0..0.6 */
-	int mini_icon_hover_ms;    /* 图标悬停多久出预览 */
-	int mini_icon_hover_leave_ms;
-	int mini_icon_hover_grace_ms;
-	bool mini_icon_preview;    /* 悬停预览开关 */
-	bool mini_toolbar;         /* 悬停工具条开关 */
-	int mini_edge_snap_px;     /* 拖到屏边多少像素内算「贴边」 */
-	/* 甩出（S5）：松手时指针速度 ≥ 这个值（逻辑像素 / 秒）= 甩出。0 = 关掉。
-	 * 速度按最近 100ms 的采样算（不是单帧增量，见 input.c 的采样环）。 */
-	int mini_fling_speed;
-	int mini_transition_ms;    /* 形态转换时长（0 = 不做动画） */
-	int mini_hover_fade_in_ms;
-	int mini_hover_fade_out_ms;
-	bool mini_remember_size;   /* 记住 FREE 的尺寸（false = 每次用初始比例） */
-	int mini_edge_margin;      /* 图标 / 迷你态离屏边的最小留白 */
-	/* 保留客户端原生分辨率：小窗态只是**呈现**变了，由合成器缩放显示。
-	 * false = 小窗态按小窗尺寸重配客户端（省显存，但有的游戏一 resize 就
-	 * 重置成窗口模式）。**不要**再加一个取反的 mini_resize_client，两个键会打架。 */
-	bool mini_preserve_buffer;
-	/* 自由小窗的宽高比策略："auto" / "lock" / "free"（默认 "auto"）。
-	 * 三个取值都是强制语义，优先级：键位 > 窗口规则 > 这个全局键。
-	 * "auto" = 让自动信号决定（X11 有 PAspect / min==max 提示就锁，否则
-	 * free）；lock / free 显式压过自动信号。写错的值当场报错且**值不变**。
-	 * 只对自由小窗有效 —— 迷你 / 图标态永远按内容比例。 */
-	char mini_aspect[16];
-	/* 迷你态「单击 = 放大」vs「拖拽 = 移动」的位移阈值（逻辑像素）。迷你态
-	 * 要同时是「点一下放大」和「拖着挪位置」，只能按位移分：指针按下后走了
-	 * 这么多像素才算拖拽，没走到就松手当单击。 */
-	int mini_drag_threshold_px;
 };
 
 /* gap 的唯一算法：单独设了就用它，没设（-1）跟随统一值 gaps；其余负值当 0
@@ -1759,53 +1717,6 @@ enum vidow_float_mode {
 	VIDOW_FLOAT_FOLLOW,   /* floats at a fixed offset from a parent view */
 };
 
-/* ------------------------------------------------- 小窗（mini window，S1）
- *
- * 小窗**不是**新的浮动模式：`float_mode` 仍是 VIDOW_FLOAT_FIXED（复用
- * float_geom / home_dx,home_dy / float_place_recursive() / vidow_float_set_size()
- * 那一整套），它只是浮动窗口上的一个「形态」字段。三态 + NONE：
- *
- *   NONE  不在小窗态（可能平铺、也可能普通浮动窗口）
- *   FREE  自由小窗：位置与尺寸都记比例锚点，客户端可以改尺寸
- *   MINI  迷你态：尺寸跟配置钉死，只记位置锚点
- *   ICON  图标态：正方形（配置的边长），贴边、按比例超出屏幕一点
- *
- * 位置**不记绝对坐标**，记的是「相对自己那块输出工作区的比例锚点」
- * （mini_ax/mini_ay ∈ 0..1，图标允许 -0.5..1.5 好让它出屏）。理由和
- * home_dx/home_dy 一样但更强：改工作区尺寸 / 改缩放 / 拔插屏之后比例锚点
- * 天然跟着走，不需要在每个热插拔路径里补换算。
- *
- * 尺寸：FREE 记比例（mini_wf/mini_hf，mini_size_known = 记过没有）；
- * MINI / ICON 不记 —— 永远跟配置，改配置当场生效。 */
-enum vidow_mini_state {
-	VIDOW_MINI_NONE = 0,
-	VIDOW_MINI_FREE,
-	VIDOW_MINI_MINI,
-	VIDOW_MINI_ICON,
-};
-
-/* 图标态贴着哪条边（沿这条边按比例超出屏幕一点，另一轴按锚点）。 */
-enum vidow_mini_edge {
-	VIDOW_MINI_EDGE_NONE = 0,
-	VIDOW_MINI_EDGE_LEFT,
-	VIDOW_MINI_EDGE_RIGHT,
-	VIDOW_MINI_EDGE_TOP,
-	VIDOW_MINI_EDGE_BOTTOM,
-};
-
-/* 自由小窗的宽高比策略。三个取值都是「强制」语义，优先级：
- * 键位（运行时）> 窗口规则 > 全局键（config.c 的 mini_aspect）。
- *   auto  让自动信号决定：X11 有 PAspect / min==max 提示就锁，否则 free
- *   lock  显式锁内容比例（压过自动信号）
- *   free  显式自由拖（压过自动信号）
- * 迷你 / 图标态永远按内容比例显示，不受它影响。 */
-enum vidow_mini_aspect {
-	VIDOW_MINI_ASPECT_UNSET = 0, /* 规则没写（不是 "auto" —— 那是一个值） */
-	VIDOW_MINI_ASPECT_AUTO,
-	VIDOW_MINI_ASPECT_LOCK,
-	VIDOW_MINI_ASPECT_FREE,
-};
-
 enum vidow_grab_mode {
 	VIDOW_GRAB_NONE = 0,
 	VIDOW_GRAB_MOVE,
@@ -2049,17 +1960,6 @@ struct vidow_view {
 	/* 内容在场景里的 1:1 尺寸（不带 overview 缩放）。overview 里尺寸要乘上缩放，
 	 * 而 multiply 是会累加的 —— 所以基线只在 commit 时（没进 overview 时）记一次。 */
 	int base_dst_w, base_dst_h;
-	/* 小窗（S3）：场景节点现在被缩过（保留原生分辨率那条路，见 view.c 的
-	 * view_mini_scale / view_anim_place）。退出小窗 / 关掉保留之后要还原成原生
-	 * 尺寸，这个标志就是「该不该还原」。 */
-	bool mini_scaled;
-	/* 小窗（S3b）：内容居中用的原始偏移 —— 进缩放态那一刻记下内容节点在它父节点
-	 * 里的位置（xdg 的窗口几何留白有可能是 wlroots 设在这一层的），居中偏移加在
-	 * 它上面、退出缩放态时还原成它。见 view.c 的 view_anim_place。 */
-	int mini_base_dx, mini_base_dy;
-	/* 小窗（S3b）：运行时键位覆盖（toggle-mini-aspect）。UNSET = 没按过。
-	 * 有效值 = 键位 > 窗口规则 > 全局键，见 vidow_mini_aspect_effective()。 */
-	enum vidow_mini_aspect mini_aspect_runtime;
 	/* 上次记「缓冲区多大 / 几倍」日志时的值：每个 commit 都刷一行没意义。
 	 * 两处日志各用一个变量：x11 那条（view.c 的 vidow_view_x11_scale）用的是
 	 * 「按 N 倍声明」的放大倍率，xdg 那条（客户端缓冲区 / 逻辑尺寸反推）用的是
@@ -2164,51 +2064,6 @@ struct vidow_view {
 	struct wlr_box float_geom; /* FIXED: absolute box
 	                              FOLLOW: x/y = offset from the parent tile */
 	struct vidow_view *parent; /* FOLLOW: the view we track */
-
-	/* ---- 小窗（mini window，S1；见 enum vidow_mini_state 顶上那段）----
-	 * 只有 float_mode == VIDOW_FLOAT_FIXED 时才有意义：进小窗态时
-	 * float_mode 会被设成 FIXED，位置尺寸由下面的锚点算出来。 */
-	enum vidow_mini_state mini;
-	/* 位置锚点：相对**自己那块输出的工作区**的比例。算位置时：
-	 *   x = work.x + round(mini_ax × (work.w − 窗口宽))
-	 * 所以 0 = 贴工作区左 / 上边，1 = 贴右 / 下边。图标态允许超出 0..1
-	 * （夹在 -0.5..1.5），好让它按 mini_icon_overflow 出屏一点。 */
-	double mini_ax, mini_ay;
-	/* FREE 的尺寸比例（相对工作区）；mini_size_known = 记过没有。
-	 * MINI / ICON 不看这两个 —— 它们的尺寸永远跟配置。 */
-	double mini_wf, mini_hf;
-	bool mini_size_known;
-	/* ICON 贴哪条边（沿这条边按比例出屏）。NONE = 不贴边（居中）。 */
-	enum vidow_mini_edge mini_edge;
-	/* 小窗是**屏级对象**（像安卓的画中画），不属于任何工作区：进小窗态时
-	 * view->ws 会被清成 NULL 并把这笔账从那块工作区的 floats 里减掉（不然
-	 * 一块只剩小窗的工作区永远收不掉）。mini_home 按输出名记着它属于哪块屏，
-	 * 拔屏再插回来时按它认领回去。 */
-	struct vidow_output_memory *mini_home;
-	/* 窗口规则写的宽高比策略（VRA_MINI_ASPECT）。UNSET = 规则没写。 */
-	enum vidow_mini_aspect mini_aspect_rule;
-	/* 窗口规则写的「保留客户端原生分辨率」（VRA_MINI_PRESERVE_BUFFER）。 */
-	bool mini_preserve_buffer_set;
-	bool mini_preserve_buffer;
-
-	/* ---- 小窗（mini window，S5）：形态转换的过渡动画 ----
-	 *
-	 * 起点**严格取「上一帧画在哪」**（geom + anim_off，和 view.c 的
-	 * drawn_x/drawn_y 同源），在改几何之前取一次、存成下面那两个常量差值；
-	 * update() 里绝不重读 view->geom（`daeba31` 的教训：推断起点会让滚动 /
-	 * 转换时窗口从屏幕外飞入）。位置曲线一律单调，只有缩放用 out_back。 */
-	struct vidow_anim *mini_anim;
-	double mini_from_dx, mini_from_dy; /* 起点 − 目标（转换期间是常量） */
-	double mini_scale_from;            /* 缩放补间起点（相对目标盒） */
-	struct vidow_ease mini_scale_ease; /* 只用在缩放上（可过冲） */
-
-	/* ---- 小窗（mini window，S5）：图标态的「快照」节点 ----
-	 *
-	 * 按该窗口**有效**的 force_render 分叉：开 → 图标就是窗口自己那块活节点
-	 * （render_pump 保活，图标和预览都是动的）；关 → 真实节点停到停车位（客户端
-	 * 停帧）、屏上由这个快照节点画 `view->last_buffer` 的最后一帧。见 view.c 的
-	 * vidow_mini_uses_snapshot() / mini_snapshot_place()。 */
-	struct wlr_scene_buffer *mini_snapshot;
 
 	struct wl_listener map;
 	struct wl_listener unmap;
@@ -3296,25 +3151,6 @@ struct vidow_server {
 	 * 这份计数只由 vidow 在真正的按下 / 松开入口加减（vidow_pointer_button），
 	 * 不受 wlroots 换焦点的影响。判「是不是还在抓」用 pointer_held()。 */
 	int pointer_button_count;
-	/* 小窗（S2）形态拖拽：迷你 / 图标态客户端收不到任何指针事件，所以同一个
-	 * 左键按下要同时承载「单击 = 放大」和「拖拽 = 移动」两个语义 —— 按累计位移
-	 * 和 mini_drag_threshold_px 区分（见 input.c 的 mini_pointer_*）。
-	 * 单向不回退：一旦判成拖拽就锁到松手（慢速拖出去再拖回来不该变成单击）。
-	 * 和上面的 grab_mode 是两套东西：那个是给平铺 / 浮窗的（会转事件给客户端），
-	 * 这个全程吞事件。 */
-	struct vidow_view *mini_grab_view;
-	double mini_grab_press_x, mini_grab_press_y; /* 按下点（布局坐标） */
-	double mini_grab_dx, mini_grab_dy;           /* 按下点 - 窗口左上角 */
-	bool mini_grab_dragging;                     /* 已经越过阈值（单向） */
-	uint32_t mini_grab_button;
-	/* 甩出（S5）：最近几次指针采样（vidow_pointer_motion 每次都推一格），
-	 * 松手时按「最近 ~100ms 的那一段」算速度 —— **不用单帧增量**：一帧的
-	 * dx/dy 在高刷新率下小得量不出意图，在低刷新率下又抖得离谱。 */
-	struct vidow_fling_pt { double x, y; int64_t ns; } mini_fling_pts[8];
-	int mini_fling_n;
-	/* 这一趟形态转换的时长覆盖（毫秒，0 = 用 mini_transition_ms）：甩出的
-	 * 时长由速度推出来（越快越短），见 float.c 的 mini_transition_start。 */
-	int mini_transition_override_ms;
 	/* 拖动时指针比刷新快：一帧里会来好几个移动事件，中间那些位置屏幕上从来没
 	 * 出现过。重画装饰（整块窗口那么大的离屏渲染）+ 记损伤推迟到出帧之前做一次
 	 * （见 vidow_tile_grab_update / output.c 的帧回调）—— 实测每个事件 66µs
@@ -3327,66 +3163,6 @@ struct vidow_server {
 	 * 一条横条。平时 node.enabled = false。建在 layer_toplevels 里、压在别的窗口
 	 * 之上、被拖的那个之下（见 vidow_insert_hint_update）。 */
 	struct wlr_scene_rect *insert_hint;
-	/* ---- 小窗（mini window，S4）：拖拽落点区 + 悬停工具条 ----
-	 *
-	 * 落点区**只在拖拽中出现**（拖平铺 / 浮窗 / 自由小窗的时候，光标落在某块屏
-	 * 右上角那块区域里才亮）—— 常亮的话「盲拖到角落」会跟现有的平铺落点撞车。
-	 * 两块半透明矩形：底板 = 落点区本身，preview = 松手会得到的那个迷你小窗的
-	 * 大小和位置（用户要的「带目标预览」）。
-	 *
-	 * 工具条：迷你 / 图标态悬停时露出的四个按钮（放大 / 收成图标 / 还原成列 /
-	 * 关闭）。不是表面，命中靠矩形判定（见 vidow_mini_toolbar_hit）—— 所以位置
-	 * 得记在 server 上，按钮点击和绘制用的是同一份。 */
-	struct wlr_scene_rect *mini_drop_zone;    /* 落点区底板 */
-	struct wlr_scene_rect *mini_drop_preview; /* 落点区里的目标预览块 */
-	bool mini_drop_active;                    /* 这一刻落点区亮着没有 */
-	struct wlr_output *mini_drop_output;      /* 亮在哪块屏上 */
-	struct wlr_scene_rect *mini_toolbar_bg;   /* 工具条底板 */
-	struct wlr_scene_rect *mini_toolbar_btn[4];
-	struct vidow_view *mini_toolbar_view;     /* 工具条现在属于哪个小窗 */
-	/* 工具条按钮的那一对按下 / 松手要成对吃掉（客户端两边都没见过）——
-	 * 按在按钮上的那次按下记在这儿，松手时靠它判断。 */
-	bool mini_toolbar_pressed;
-
-	/* ---- 小窗（mini window，S5）：图标悬停预览 ----
-	 *
-	 * 悬停图标 mini_icon_hover_ms 之后，在**朝屏内**那一侧展开一块迷你尺寸
-	 * ×0.8 的**实时预览**（同一张表面的第二份镜面，先例 wincapture.c 的
-	 * wlr_scene_subsurface_tree_create）。只读：不抢焦点、不进 MRU、不参与
-	 * vidow_view_at 命中 —— 但它**吞点击**（看到指针底下有块「像窗口的东西」，
-	 * 点下去却激活了背后的窗口是明显的错）。
-	 *
-	 * 时间轴用 vidow_anim_start 当定时器（不新开 timer）：延迟 250ms → 出；
-	 * 离开 300ms → 收；指针从图标移向预览要跨那 8px 空隙，所以「既不在图标
-	 * 也不在预览」时给 200ms 宽限，进到预览矩形里就把计时清掉（宽限期只是
-	 * 视觉稳定性，不引入新的输入语义 —— 预览不吃点击语义、只吞掉）。 */
-	struct wlr_scene_tree *mini_preview;      /* 预览的镜面节点（layer_top 里） */
-	struct wlr_scene_surface *mini_preview_surface; /* 里面那层内容节点（缩放 / 透明度） */
-	/* 预览的快照节点（同一个窗口走快照那条路时用它，**和图标同一份策略** ——
-	 * 不能出现「图标静止、预览还在动」）。 */
-	struct wlr_scene_buffer *mini_preview_snap;
-	struct vidow_view *mini_preview_view;     /* 预览现在属于哪个图标 */
-	bool mini_preview_shown;                  /* 已经露出来了（含淡入中） */
-	struct wlr_box mini_preview_box;          /* 预览那块（布局坐标，命中用） */
-	struct vidow_anim *mini_preview_fade;     /* 淡入 / 淡出 */
-	double mini_preview_alpha;                /* 现在的不透明度 */
-	double mini_preview_alpha_from, mini_preview_alpha_to;
-	struct vidow_anim *mini_hover_timer;      /* 延迟 / 离开的定时器 */
-	struct vidow_view *mini_hover_view;       /* 定时器属于哪个图标 */
-	bool mini_hover_leaving;                  /* 上面那条定时器是「离开」还是「延迟」 */
-	bool mini_preview_pressed;                /* 预览上那对按下 / 松手要成对吞 */
-	/* 最近一个小窗的 id（键位动作用）：迷你 / 图标态**不拿键盘焦点**，所以
-	 * server->focused 指不到它们 —— cycle-mini-state 这类动作得有别的指认办法。
-	 * 存 id 不存指针：窗口随时可能被关掉，指针会悬空。 */
-	uint64_t mini_last_id;
-	struct wlr_box mini_toolbar_box;          /* 工具条整块（布局坐标） */
-	struct wlr_box mini_toolbar_btn_box[4];   /* 四个按钮（布局坐标） */
-	/* 按钮上的字形（**不是**表面，也不是字库：每个亮点一个 3x3 的小方块，
-	 * 字模在 drag.c）：以前四个按钮就是四个空方块 —— 用户报的「没有内容只有
-	 * 四个格子」。顺序 = 字模行优先，节点在 vidow_mini_ui_init 里一次建好。
-	 * 第一个下标 = enum vidow_mini_toolbar_btn（4 个）。 */
-	struct wlr_scene_rect
-		*mini_toolbar_glyph[4][VIDOW_MINI_TOOLBAR_GLYPH_MAX];
 	/* 浮动窗口拖拽同理：每帧最多重排一次（见 vidow_float_grab_update）。 */
 	bool arrange_dirty;
 	/* 正在跑的列宽过渡有几条。过渡期间**位置跟着变的那几列不做位移补间**：
@@ -4212,100 +3988,6 @@ void vidow_insert_hint_update(struct vidow_server *server);
 /* 收起来（松手、拖到没屏的地方、暂停拖动）。 */
 void vidow_insert_hint_hide(struct vidow_server *server);
 
-/* --------------------------------- 小窗（mini window，S4）：落点区 / 工具条
- *
- * 落点区 = 每块屏右上角那一块（尺寸是 mini_drop_zone_w × mini_drop_zone_h 的
- * 工作区百分比）。**只在拖拽中出现**：光标不在里面时两块矩形都是关着的，所以
- * 「盲拖到角落松手」不会命中（那样会跟现有的平铺落点撞车）。
- * 松手时命中 → 那个窗口变成迷你小窗（vidow_mini_set_state(view, MINI)）。 */
-
-/* 算某块屏的落点区（zone）和松手会得到的迷你小窗预览盒（preview）。
- * 返回 false = 这套东西关着（mini_enabled / mini_drop_zone）或者屏没尺寸。 */
-bool vidow_mini_drop_zone_box(struct vidow_server *server,
-		struct wlr_output *output, struct wlr_box *zone,
-		struct wlr_box *preview);
-/* 拖动中每个指针事件调一次：光标在落点区里就亮（并收掉平铺落点预览块 ——
- * 两个预览同时画，用户不知道松手会得到哪个）。 */
-void vidow_mini_drop_zone_update(struct vidow_server *server);
-/* 收起来（松手 / 拖拽结束）。 */
-void vidow_mini_drop_zone_hide(struct vidow_server *server);
-/* 松手那一刻光标是不是落在某块屏的落点区里。 */
-bool vidow_mini_drop_zone_hit(struct vidow_server *server, double lx, double ly);
-
-/* 悬停工具条（mini_toolbar）：迷你 / 图标态悬停时露出，四个按钮。
- * 按钮 id 见 enum vidow_mini_toolbar_btn。 */
-enum vidow_mini_toolbar_btn {
-	VIDOW_MINI_BTN_EXPAND = 0,  /* 放大：图标 → 迷你 → 自由 */
-	VIDOW_MINI_BTN_ICON,        /* 收成图标 */
-	VIDOW_MINI_BTN_RESTORE,     /* 还原成列 */
-	VIDOW_MINI_BTN_CLOSE,       /* 关掉 */
-	VIDOW_MINI_BTN_COUNT,
-};
-/* 给某个小窗摆出工具条（重复调幂等）。view == NULL = 收起来。 */
-void vidow_mini_toolbar_hide(struct vidow_server *server);
-/* 命中测试：这个点落在工具条的哪个按钮上（没有 = -1）。工具条不是表面，靠矩形。 */
-bool vidow_mini_toolbar_near(struct vidow_server *server, double lx, double ly);
-
-int vidow_mini_toolbar_hit(struct vidow_server *server,
-		struct vidow_view *view, double lx, double ly);
-/* 点一下某个按钮（工具条自己的动作，见 float.c）。 */
-void vidow_mini_toolbar_press(struct vidow_server *server,
-		struct vidow_view *view, int button);
-
-/* ---- 小窗（mini window，S5）：图标悬停预览 ----
- * 指针一动就调一次（input.c 的指针分流里）：hit = 光标底下的窗口（可能 NULL）。
- * 它自己管延迟 / 离开 / 宽限三条时间轴，调用方不用知道状态。 */
-void vidow_mini_preview_motion(struct vidow_server *server,
-		struct vidow_view *hit);
-/* 收掉预览（形态变了 / 窗口没了 / 进锁屏）。 */
-void vidow_mini_preview_hide(struct vidow_server *server);
-/* 这个点是不是落在预览那块上（预览吞点击用 —— 它是只读的，但点下去不能
- * 落到背后的窗口上）。 */
-bool vidow_mini_preview_hit(struct vidow_server *server, double lx, double ly);
-/* ---- 小窗（S5）图标 / 预览的出帧策略 ----
- * 该窗口这一刻是不是走「快照」那条路（图标态 + force_render 关 + 手里有最后一帧）。 */
-bool vidow_mini_uses_snapshot(const struct vidow_view *view);
-/* `view->last_buffer` 换了之后同步快照节点（图标 + 预览共用一份；图标态下也会把
- * 快照节点重新摆一次 —— 进快照态时 last_buffer 还是空的那种情况靠它兜住）。 */
-void vidow_mini_frames_sync(struct vidow_view *view);
-/* 出帧策略（快照 / 活）跟着有效 force_render 翻面时，把摆位接上（幂等）。 */
-void vidow_mini_frames_recheck(struct vidow_view *view);
-/* 建场景节点（main.c 建完场景层之后调一次，和 vidow_drag_init 一起）。 */
-bool vidow_mini_ui_init(struct vidow_server *server);
-
-/* 小窗（S4）边缘判定：这条边**外侧有没有相邻输出** —— 有（跨屏边）→ 拖到那儿
- * 松手是「移到那块屏、保持形态」；没有（内边缘）→ 收成图标。
- * 探针沿边的法线取 1px，并要求与目标屏有**非零区间重叠**（只看「角上相接」
- * 不算相邻边）。返回 NULL = 这条边外侧没有屏。 */
-struct wlr_output *vidow_mini_output_across(struct vidow_server *server,
-		struct wlr_output *self, enum vidow_mini_edge edge);
-/* 光标贴着自己那块屏的哪条边（mini_edge_snap_px 以内）。NONE = 没贴边。 */
-/* 离 (bx,by,w,h) 这个盒子最近的那条工作区边（图标态拖拽吸附用）。 */
-enum vidow_mini_edge vidow_mini_nearest_edge(struct vidow_server *server,
-		struct vidow_view *view, int w, int h, double bx, double by);
-
-enum vidow_mini_edge vidow_mini_edge_under_cursor(struct vidow_server *server,
-		struct vidow_view *view);
-/* 跨屏边松手：换屏、保持形态（锚点是相对那块屏的工作区记的，天然对得上）。 */
-void vidow_mini_move_to_output(struct vidow_server *server,
-		struct vidow_view *view, struct wlr_output *to);
-/* 形态拖拽松手的落点判定（内边缘 → 图标；跨屏 → 换屏保持形态）。返回 true =
- * 形态 / 归属变了。浮窗拖拽（float.c）和形态拖拽（input.c）共用这一份。 */
-bool vidow_mini_drag_finish(struct vidow_server *server,
-		struct vidow_view *view);
-
-/* ---- 甩出（mini fling，S5）----
- * 采样环：vidow_pointer_motion 每次都推一格（8 格 ≈ 最近几帧）。 */
-void vidow_mini_fling_sample(struct vidow_server *server, double x, double y);
-/* 松手速度（布局坐标 px/s）。最近一段采样不够（< 3 点）或最后一点已经过去
- * 超过 80ms（指针停住之后才松手）→ 返回 false = 不算甩。 */
-bool vidow_mini_fling_velocity(struct vidow_server *server, double *vx,
-		double *vy);
-/* 甩出：速度够快就朝最近的那条边飞过去。返回 true = 形态 / 归属已经变了
- * （调用方别再走自己的落点判定）。 */
-bool vidow_mini_fling(struct vidow_server *server, struct vidow_view *view,
-		double vx, double vy);
-
 /* 平铺窗口的 Mod+右键拖拽：改这一列的宽度（niri 的 interactive resize 那条）。
  * 只有横向 —— 平铺窗口的高度是布局给的（整块可用高），没有「单个窗口的高度」。 */
 void vidow_tile_resize_begin(struct vidow_server *server,
@@ -5031,53 +4713,6 @@ void vidow_float_place_all(struct vidow_server *server,
 		struct vidow_output *output);
 void vidow_float_on_commit(struct vidow_view *view);
 
-/* ------------------------------------------------------------- 小窗（S1） */
-
-/* 换形态。NONE = 还原成列（等价于 vidow_view_join_layout + 重新记账）。
- * 只动数据模型与几何（比例锚点 -> float_geom），不碰可见性 / 焦点 / 输入 /
- * 渲染 / 动画 —— 那些是 S2–S5。 */
-void vidow_mini_set_state(struct vidow_view *view, enum vidow_mini_state state);
-/* S2：这个窗口要进 MINI / ICON 了 —— 把键盘 / 指针焦点交出去（迷你 / 图标不接
- * 键盘）。必须在摘列 / 摘工作区**之前**调（要还在列里才找得到焦点邻居）。 */
-void vidow_view_yield_focus_for_mini(struct vidow_view *view);
-/* 按比例锚点算出 float_geom（幂等，不 configure 客户端）。摆放前调。 */
-void vidow_mini_resolve_geom(struct vidow_view *view);
-
-/* 拖拽中把迷你 / 图标 / 自由小窗的归属换到 to 那块屏上，并按新屏的工作区重算
- * 比例锚点（抓取偏移保持不变）。 */
-void vidow_mini_drag_to_output(struct vidow_server *server,
-		struct vidow_view *view, struct wlr_output *to, double lx, double ly);
-
-/* 把一个绝对位置（盒子左上角）换算成小窗的比例锚点，并按 allow_over 夹取：
- * MINI 传 false（夹在工作区里），FREE / ICON 传 true（允许出屏一点）。 */
-void vidow_mini_anchor_from(struct vidow_view *view, struct wlr_box work,
-		int w, int h, double bx, double by, bool allow_over);
-/* S5（修「退出小窗那一瞬间显示原始大小」）：这一帧内容画出来的缩放 / 内容原点
- * 相对盒子原点的居中偏移。补间的起点必须取这两个量（「上一帧画在哪」），
- * 不能从盒子面积推（见 float.c 的 mini_transition_start）。 */
-double vidow_view_mini_scale_export(const struct vidow_view *view);
-void vidow_view_mini_content_offset(const struct vidow_view *view, int *dx,
-		int *dy);
-/* S3：这个窗口现在要不要**保留客户端原生分辨率**（小窗态不 configure 客户端、
- * 由合成器把场景节点缩到小窗盒显示）。规则写了就按规则的，没写按全局键。 */
-bool vidow_mini_preserve_buffer(const struct vidow_view *view);
-/* "none" / "free" / "mini" / "icon" <- 文本（IPC / 日志）。返回 NULL = 不认识。 */
-bool vidow_mini_parse_state(const char *text, enum vidow_mini_state *out);
-const char *vidow_mini_state_name(enum vidow_mini_state state);
-/* "auto" / "lock" / "free" <- 文本。返回 NULL = 不认识。 */
-const char *vidow_mini_aspect_name(enum vidow_mini_aspect aspect);
-bool vidow_mini_parse_aspect(const char *text, enum vidow_mini_aspect *out);
-/* S3b：宽高比的**有效值** —— 键位（运行时）> 窗口规则 > 全局键，三级都是显式
- * 选择（auto 也是「我选择按自动信号走」）。判策略只有这一个出口，别散在各处。 */
-enum vidow_mini_aspect vidow_mini_aspect_effective(const struct vidow_view *view);
-/* S3b：这个窗口现在锁不锁宽高比；锁的话把比值（w/h）写到 *ratio。只有自由小窗
- * （FREE）看它 —— 迷你 / 图标态永远按内容比例显示（contain），不给逃生口。 */
-bool vidow_mini_aspect_lock(const struct vidow_view *view, double *ratio);
-/* S3b：客户端的比例信号变了（X11 后来才设 PAspect）时的重判点。 */
-void vidow_mini_aspect_changed(struct vidow_view *view);
-/* S3b：X11 客户端声明的宽高比（WM_NORMAL_HINTS 的 PAspect，num/den = w/h）。
- * 只设了一边（区间）不算。Wayland 协议没有对应物 —— 那边恒返回 false。 */
-bool vidow_view_aspect_hint(const struct vidow_view *view, int *num, int *den);
 void vidow_float_detach_children(struct vidow_server *server,
 		struct vidow_view *dying);
 /* from_client = 客户端自己发起的（CSD 标题栏拖拽 / _NET_WM_MOVERESIZE）：它的
@@ -5119,11 +4754,6 @@ void vidow_focus_view(struct vidow_view *view);
  * 调用方不用知道内部是怎么取 view 的，也免得再造一套平行的入口。 */
 void view_map(struct wl_listener *listener, void *data);
 void view_unmap(struct wl_listener *listener, void *data);
-/* 「跳到这个窗口」的入口（MRU 切换器提交 / IPC 的 focus-window）：目标是迷你 /
- * 图标态的话，先把它摊成自由小窗（FREE）**再**给焦点 —— 顺序不能反，
- * vidow_focus_view 对 MINI / ICON 有守卫（不变量：server->focused 永不指向
- * MINI / ICON）。FREE 态与普通窗口照旧。 */
-void vidow_focus_view_expand_mini(struct vidow_view *view);
 /* 「聚焦这个窗口会让条带滚多少像素」—— 和 arrange 的 Pass 2（把焦点列滚回可见
  * 区）算的是同一件事。focus-follows-mouse 的 max-scroll-amount 拿它跟阈值比
  * （见 input.c 的 focus_follows_mouse）。 */

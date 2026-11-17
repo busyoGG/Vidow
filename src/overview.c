@@ -973,7 +973,7 @@ bool vidow_overview_click(struct vidow_server *server, double sx, double sy) {
 			return true;
 		}
 		/* 先把**它的工作区端出来**，再给焦点。全景里点的是哪块工作区的窗口都
-		 * 可能 —— 只调 vidow_focus_view_expand_mini() 的话，焦点落在一个看不见
+		 * 可能 —— 只调 vidow_focus_view() 的话，焦点落在一个看不见
 		 * 的窗口上（那块工作区没亮着），屏幕上什么都不变，看起来就是「点了没
 		 * 反应」（用户报的「点击窗口无法切换焦点」）。vidow_view_activate() 就是
 		 * 「把这个窗口端到人面前」那条路（点通知 / 任务栏 / xdg-activation 同一个

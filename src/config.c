@@ -1934,33 +1934,6 @@ static bool apply_one(struct vidow_config *cfg, const char *key,
 			}
 			return true;
 		case K_STRING:
-			/* 小窗的尺寸键都写成「工作区的百分比」（mini_w = "28%"）。写错一位
-			 * 会让小窗比屏幕还大，所以当场报错、该行不生效（值保持不变 ——
-			 * 508239e 定下的规矩：不静默退回默认）。 */
-			if (strncmp(e->key, "mini_", 5) == 0 &&
-					(strcmp(e->key, "mini_w") == 0 ||
-					 strcmp(e->key, "mini_h") == 0 ||
-					 strcmp(e->key, "mini_free_w") == 0 ||
-					 strcmp(e->key, "mini_free_h") == 0 ||
-					 strcmp(e->key, "mini_drop_zone_w") == 0 ||
-					 strcmp(e->key, "mini_drop_zone_h") == 0) &&
-					!vidow_config_parse_percent(value, NULL)) {
-				wlr_log(WLR_ERROR, "config: %s 要写成百分比（相对工作区，"
-					"比如 \"28%%\" / \"40%%\"）；给的是 '%s'",
-					e->key, value);
-				return false;
-			}
-			/* 宽高比策略：auto / lock / free 三个取值都是强制语义
-			 * （优先级：键位 > 窗口规则 > 这个全局键）。 */
-			if (strcmp(e->key, "mini_aspect") == 0 &&
-					strcmp(value, "auto") != 0 &&
-					strcmp(value, "lock") != 0 &&
-					strcmp(value, "free") != 0) {
-				wlr_log(WLR_ERROR, "config: mini_aspect 只能是 auto / "
-					"lock / free（auto = 让自动信号决定：X11 有 PAspect / "
-					"min==max 提示就锁，否则 free）；给的是 '%s'", value);
-				return false;
-			}
 			/* 内部缓冲精度：auto / 8 / 10。10 走 FP16（不是 10 位整数），
 			 * 写错当场报错，别静默变成 auto。 */
 			if (strcmp(e->key, "color_precision") == 0 &&
@@ -3242,12 +3215,6 @@ static void print_keys_lua(FILE *f) {
 "--     maximize = true            开出来就整列最大化\n"
 "--     minimize = true            开出来就收起来（不显示、不抢焦点）\n"
 "--     column_width = 0.3         这个窗口新开的列有多宽（占可用宽度的比例，默认 0.5）\n"
-"--     mini_window = true         开出来就是迷你小窗（false = 显式不是小窗）\n"
-"--     mini_state = \"mini\"        开出来的初始形态：\"free\" / \"mini\" / \"icon\"（比\n"
-"--                                mini_window 更细）\n"
-"--     mini_aspect = \"lock\"       这个窗口自由小窗态的宽高比策略：\"auto\" / \"lock\" /\n"
-"--                                \"free\"（默认跟全局 mini_aspect；三个取值都是强制语义）\n"
-"--     mini_preserve_buffer = false  这个小窗化时不保留客户端原生分辨率（默认跟全局）\n"
 "--\n"
 "--   vidow.rule{ app_id = \"^mpv$\", force_render = true }\n"
 "--   vidow.rule{ title = \"^预览\", force_render = true, hz = 15 }\n"

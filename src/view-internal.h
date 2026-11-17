@@ -35,7 +35,6 @@ void fx_geo_tex_map(struct vidow_fx_geo *geo,
 /* 窗口在布局坐标里被裁到的那块（哪块屏上都没画着时返回 false）。 */
 bool view_clip_box(struct vidow_view *view, struct wlr_box *out);
 /* 小窗（S3）：窗口的原生尺寸（场景坐标）。 */
-void view_mini_native(const struct vidow_view *view, int *w, int *h);
 /* X11：按窗口的绝对坐标把它归到某块输出上。 */
 void x11_track_output(struct vidow_view *view);
 
