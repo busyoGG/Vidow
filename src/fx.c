@@ -728,7 +728,7 @@ static struct vidow_view *view_from_scene_node(struct wlr_scene_node *node) {
 static bool view_fully_occluded(struct vidow_view *view) {
 	struct vidow_server *server = view->server;
 	if (!view->mapped || !view->placed || view->popup ||
-			view->scene_tree == NULL || view->mini != VIDOW_MINI_NONE) {
+			view->scene_tree == NULL) {
 		return false;
 	}
 	if (server->layer_toplevels == NULL) {
@@ -748,7 +748,7 @@ static bool view_fully_occluded(struct vidow_view *view) {
 		}
 		struct vidow_view *o = view_from_scene_node(n);
 		if (o == NULL || !o->mapped || !o->placed ||
-				o->mini != VIDOW_MINI_NONE || o->anim_alpha < 1.0 ||
+				o->anim_alpha < 1.0 ||
 				o->mask_opacity || o->jelly != NULL) {
 			continue;
 		}
@@ -818,16 +818,6 @@ bool vidow_view_scanout_ok(struct vidow_view *view) {
 	/* 关掉直通的开关（和 VIDOW_RENDER_STATS 一样的探针）：怀疑「全屏画面和
 	 * 以前不一样」时先拿它排除直通这条路 —— 两个方向应该一个像素都不差。 */
 	if (scanout_off()) {
-		return false;
-	}
-	/* 小窗（mini window，S3）：一律走合成。直通的定义是「屏幕上该显示的像素就是
-	 * 缓冲自己」，而小窗要的正是「把原生 buffer 缩进一个小盒子」—— 两者互斥。
-	 *
-	 * **必须放在 fullscreen 判断之前**：小窗态刻意保留 fullscreen 标志（不重配
-	 * 客户端、不发 set_fullscreen(false)，见 float.c 的 on_commit），全屏游戏进
-	 * 小窗之后这条判据照样成立 —— 不挡住的话场景会把 2560x1440 的原生 buffer
-	 * 整块扫上屏，小窗化完全失效。 */
-	if (view->mini != VIDOW_MINI_NONE) {
 		return false;
 	}
 	/* 只做全屏：只有它铺满整块输出（wlroots 要求节点的框正好等于输出框）。 */
@@ -946,13 +936,13 @@ bool vidow_view_scanout_ok(struct vidow_view *view) {
 		int64_t now = vidow_now_ns();
 		if (now - last_ns > 1000 * 1000000LL) {
 			last_ns = now;
-			wlr_log(WLR_INFO, "直通: %s -> %s | 全屏=%d mini=%d 停放=%d "
+			wlr_log(WLR_INFO, "直通: %s -> %s | 全屏=%d 停放=%d "
 				"overview=%d 动画=%d 果冻=%d 遮罩=%d shader=%d 裁剪=%d "
 				"look(r=%.1f bw=%.1f sr=%.1f noise=%.1f op=%.2f) "
 				"留白=%d,%d 几何=%dx%d 缓冲=%dx%d 输出=%s %dx%d 不透明=%d",
 				vidow_view_title(view) != NULL ? vidow_view_title(view) : "(无题)",
 				ok ? "直通" : "合成",
-				view->fullscreen, (int)view->mini, view->scene_parked,
+				view->fullscreen, view->scene_parked,
 				vidow_overview_active(view->server),
 				view->anim_open != NULL || view->anim_move != NULL,
 				view->jelly != NULL, view->mask_opacity,
@@ -1505,7 +1495,7 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 	 * 那个像素去采屏幕上它现在真正盖住的位置。bias 用同一条式子：中心缩放
 	 * 的平移量。
 	 *
-	 * 注意 ov 是**调用方传进来的那个**（view.c 的 fx_ov = ov * mini_scale），
+	 * 注意 ov 是**调用方传进来的那个**（view.c 的 fx_ov），
 	 * 和 out_scale 用的 ov 是同一个值 —— out_scale = scale / ov 里两者同乘，
 	 * 输出倍率一点没变，所以这里只影响采样坐标，不影响烘图分辨率。 */
 	double blur_as = fx->anim_scale > 0.0 ? fx->anim_scale : 1.0;
@@ -1678,7 +1668,7 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 	bool ov_clip = false;
 	struct wlr_box ov_clip_box = {0};
 	if (fx->view != NULL && vidow_overview_active(fx->view->server) &&
-			fx->view->mini == VIDOW_MINI_NONE && fx->view->mapped) {
+			fx->view->mapped) {
 		/* 裁到**显示器**，不是行矩形。
 		 *
 		 * 用户要的语义（2026-10-25）：「工作区内窗口可以溢出工作区，但不会

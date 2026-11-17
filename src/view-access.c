@@ -387,22 +387,6 @@ void vidow_view_client_size(const struct vidow_view *view, int *w, int *h) {
 }
 
 void vidow_view_set_size(struct vidow_view *view, int w, int h) {
-	/* 小窗 + 保留客户端原生分辨率（S3，默认开）：**一个尺寸 configure 都不发**
-	 * —— 客户端 buffer 保持原生，由合成器把场景节点缩到小窗盒显示（见
-	 * view_mini_scale）。挡在唯一的出口上：进小窗、arrange 摆位、拖拽改盒子、
-	 * 迟到的 commit 全都走这儿，挡一处就够。退出小窗（mini == NONE）之后照常
-	 * configure —— 还原成列 / 浮动窗口那边要按布局重新定尺寸。
-	 *
-	 * **只管迷你 / 图标两个形态**：那两态是「缩略图」语义（只缩不重排，保留原生
-	 * buffer 才便宜）。自由小窗（FREE）是**正常窗户**语义 —— 盒子多大就命令客户端
-	 * 多大多，它跟着重新排版（用户报的「自由小窗改大小被限制了比例」：以前 FREE
-	 * 也吃这条，改盒子只改留白、客户端一次 configure 都不发，内容比例一动不动，
-	 * 看起来就像被锁了比例）。 */
-	if (view->mini == VIDOW_MINI_MINI || view->mini == VIDOW_MINI_ICON) {
-		if (vidow_mini_preserve_buffer(view)) {
-			return;
-		}
-	}
 	if (!vidow_view_configure_ready(view)) {
 		/* 客户端第一帧还没来：几何先记着，初始 configure 由 commit 那边发。 */
 		return;
@@ -976,14 +960,6 @@ void vidow_view_x11_scale(struct vidow_view *view) {
  * 只在没进 overview 的时候记 —— overview 里是我们自己把场景尺寸改小的，
  * 再记一次就等于把缩放叠进去（越缩越小）。 */
 void view_dst_capture(struct vidow_view *view) {
-	/* 小窗态（S3）也照 overview 那条办：现在节点上是**缩过的**尺寸，记进基线
-	 * 就等于把缩放叠进去 —— 退出小窗之后 base_dst_* 永久是错的（overview 里
-	 * 那个窗口会越缩越小）。退出小窗态时 view_anim_place 会把节点还原成原生尺寸
-	 * 并在这里重记一次。 */
-	if (view->server->overview.t > 0.0 || view->mini != VIDOW_MINI_NONE ||
-			view->scene_surface == NULL) {
-		return;
-	}
 	struct wlr_scene_buffer *src = view->scene_surface->buffer;
 	if (src == NULL) {
 		return;
@@ -1014,130 +990,11 @@ void view_dst_capture(struct vidow_view *view) {
 	}
 }
 
-/* 小窗（S5）：**图标态**那块矩形上的命中，单独判一次，不走场景图。两个理由：
- *   - 走快照那条路时场景图里根本命不中它（真实节点停在停车位上，屏上画的是快照
- *     节点，而快照节点**故意不带 view tag** —— 带了会被 vidow_restack 当成窗口
- *     节点参与层级排序，一个窗口两个节点）；
- *   - 图标是**贴边 + 缩放 + 裁到自己那块屏**的一小块，场景图那条路（表面节点 +
- *     裁剪）本来就容易差几像素。小窗的输入是合成器自己吃的（mini_swallows_input），
- *     坐标只用来定形态，不需要像素级精确。
- * 盒子取 geom + anim_off（和摆位同源）—— 贴边时有一半在屏外，照收。 */
-static struct vidow_view *mini_icon_view_at(struct vidow_server *server,
-		double lx, double ly, double *sx, double *sy) {
-	struct vidow_view *view;
-	wl_list_for_each(view, &server->views, link) {
-		if (view->mini != VIDOW_MINI_ICON ||
-				!view->mapped || view->output == NULL ||
-				!vidow_workspace_view_visible(server, view)) {
-			continue;
-		}
-		int x = view->geom.x + (int)lround(view->anim_off_x);
-		int y = view->geom.y + (int)lround(view->anim_off_y);
-		if (lx < x || lx >= x + view->geom.width ||
-				ly < y || ly >= y + view->geom.height) {
-			continue;
-		}
-		/* 本地坐标：图标是缩放的，按缩放比折回去（小窗吞输入，这两个数只用来
-		 * 定形态，不精确也不影响判断 —— 但别给错得离谱的）。 */
-		int nw = 0, nh = 0;
-		view_mini_native(view, &nw, &nh);
-		double k = (nw > 0 && view->geom.width > 0) ?
-			(double)nw / (double)view->geom.width : 1.0;
-		if (sx != NULL) {
-			*sx = (lx - x) * k;
-		}
-		if (sy != NULL) {
-			*sy = (ly - y) * k;
-		}
-		return view;
-	}
-	return NULL;
-}
-
-/* 小窗（S3）：**迷你态**的命中按整个**盒子**算，不走场景图。理由：内容是按比例
- * contain 摆在盒子中间的（665x740 的内容装进 534x299 的盒子 → 左右各留 130 像素
- * 的留白），而命中测试只认内容节点 —— 那两块留白按下去不算窗口，拖不起来。用户
- * 报的「小窗左右有死区、拖不动、窗口卡在范围内」就是这条。
- * 盒子取 float_geom + anim_off（和摆位、和拖拽夹取同源）。 */
-static struct vidow_view *mini_box_view_at(struct vidow_server *server,
-		double lx, double ly, double *sx, double *sy) {
-	/* 全景里不算这一笔：那时小窗画在**全景网格**里，float_geom 还是全景之前的
-	 * 盒子 —— 照它判会让屏上别处的格子被这个窗口吞掉（test-overview 的「格子
-	 * 右上内缩 4px 命中它自己」就是这么挂的）。全景自己的命中走场景图。 */
-	if (vidow_overview_active(server)) {
-		return NULL;
-	}
-	struct vidow_view *view;
-	wl_list_for_each(view, &server->views, link) {
-		/* 迷你**和自由**小窗都整盒命中：内容被 contain 缩放过，盒里左右（或
-		 * 上下）留着壁纸色的留白 —— 只靠场景图命中的话，点在留白上什么也不
-		 * 发生（用户报的「还是左右有死区」）。图标态不在这儿：它有自己的命中
-		 * 盒（mini_icon_view_at，贴边那一块）。 */
-		if ((view->mini != VIDOW_MINI_MINI &&
-				view->mini != VIDOW_MINI_FREE) ||
-				!view->mapped || view->output == NULL ||
-				!vidow_workspace_view_visible(server, view) ||
-				view->float_geom.width <= 0 || view->float_geom.height <= 0) {
-			continue;
-		}
-		double x = view->float_geom.x + view->anim_off_x;
-		double y = view->float_geom.y + view->anim_off_y;
-		if (lx < x || lx >= x + view->float_geom.width ||
-				ly < y || ly >= y + view->float_geom.height) {
-			continue;
-		}
-		/* 局部坐标：从**内容节点**在场景里的原点量，再乘回表面坐标（内容被缩
-		 * 过：dst ≠ surface 尺寸，见 vidow_view_hit_scale）。落在留白里会得到
-		 * 负数 / 超出表面的值，夹进表面里 —— 客户端收到越界坐标没意义。 */
-		if (sx != NULL && sy != NULL && view->scene_surface != NULL) {
-			int nx = 0, ny = 0;
-			if (wlr_scene_node_coords(&view->scene_surface->buffer->node,
-					&nx, &ny)) {
-				double k = vidow_view_hit_scale(view);
-				struct wlr_surface *surf = vidow_view_surface(view);
-				*sx = (lx - nx) * k;
-				*sy = (ly - ny) * k;
-				if (surf != NULL) {
-					if (*sx < 0) {
-						*sx = 0;
-					}
-					if (*sy < 0) {
-						*sy = 0;
-					}
-					if (*sx > surf->current.width) {
-						*sx = surf->current.width;
-					}
-					if (*sy > surf->current.height) {
-						*sy = surf->current.height;
-					}
-				}
-			}
-		}
-		return view;
-	}
-	return NULL;
-}
-
 /* 定义在下面（裁剪那段）；命中测试要用它挡掉「裁掉了但还能点到」的窗口。 */
 
 struct vidow_view *vidow_view_at(struct vidow_server *server,
 		double lx, double ly, struct wlr_surface **surface,
 		double *sx, double *sy) {
-	struct vidow_view *snap = mini_icon_view_at(server, lx, ly, sx, sy);
-	if (snap != NULL) {
-		if (surface != NULL) {
-			*surface = vidow_view_surface(snap);
-		}
-		return snap;
-	}
-	/* 迷你小窗同理（整盒命中，见上）：它画在平铺窗口之上，所以先于场景图判。 */
-	struct vidow_view *mini = mini_box_view_at(server, lx, ly, sx, sy);
-	if (mini != NULL) {
-		if (surface != NULL) {
-			*surface = vidow_view_surface(mini);
-		}
-		return mini;
-	}
 	/* **内容全透明被关节点的 layer：命中兜底**（dec9bba 的另一半）。
 	 *
 	 * wlr_scene_node_at 不看关掉的节点 —— quickshell 的 dock 缩下去之后，

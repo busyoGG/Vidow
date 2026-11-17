@@ -825,18 +825,6 @@ bool vidow_workspace_view_visible(struct vidow_server *server,
 	if (view->minimized) {
 		return false;
 	}
-	/* 小窗（mini window，S2）**跟屏不跟工作区**（像安卓 PiP）：切工作区它不消失。
-	 * 和 overview 那条旁路（view.c 的 vidow_view_should_park）同一个位置、同一个
-	 * 思想：可见性只有这一个判据口，所以旁路也只开在这儿。进小窗态时 view->ws
-	 * 已经摘成 NULL（float.c 的 vidow_mini_set_state），下面那句
-	 * `view->ws == active` 必然为假 —— 必须在这儿提前放行。
-	 *
-	 * 这一处改完，三处自动跟着对：vidow_view_should_park()（它调这个函数）、
-	 * view_on_screen()（view.c）、vidow_workspace_apply_visibility()（走 should_park）。
-	 * 判据只看「它有没有屏」—— 小窗是屏级对象。 */
-	if (view->mini != VIDOW_MINI_NONE) {
-		return view->output != NULL;
-	}
 	/* 「这块窗口住哪块屏」：工作区说在哪就在哪。view->output 是住址，热插拔 /
 	 * 规则搬屏的中间态里会短暂分叉；可见性按它判的话，窗口在新屏上不显示、
 	 * 在旧屏上又因为工作区不对而不显示，两边都没有。 */
@@ -892,8 +880,7 @@ static bool node_enabled(struct wlr_scene_tree *tree) {
  * 那条路就会把窗口算到隔壁屏的工作区里。每次 arrange 收口时对齐一遍，任何路径
  * 都不需要自己记得同步。
  *
- * 例外：小窗（mini）是**屏级对象**，view->ws 是 NULL，它自己就是最终住址；
- * 弹窗不进布局，位置由客户端给死，也不动。 */
+ * 例外：弹窗不进布局，位置由客户端给死，也不动。 */
 void vidow_workspace_sync_outputs(struct vidow_server *server) {
 	if (server == NULL) {
 		return;
@@ -915,7 +902,7 @@ void vidow_workspace_sync_outputs(struct vidow_server *server) {
 	}
 	struct vidow_view *view;
 	wl_list_for_each(view, &server->views, link) {
-		if (view->popup || view->ws == NULL || view->mini != VIDOW_MINI_NONE) {
+		if (view->popup || view->ws == NULL) {
 			continue;
 		}
 		if (view->ws->output != NULL && view->output != view->ws->output) {
@@ -1010,10 +997,7 @@ static void focus_workspace(struct vidow_server *server,
 	 *
 	 * 「找浮窗」这一档是补的：一块工作区上的窗口**全是浮窗 / 自由小窗**时
 	 * （用户桌上那堆小窗就是），只翻列的话一个都找不到 —— 焦点被清空，键盘
-	 * 打进虚空。现象就是「切过去之后焦点没跟过来」。小窗（MINI / ICON）跳过：
-	 * 不变量是 focused 永远不指小窗（要给焦点得先摊开，见
-	 * vidow_focus_view_expand_mini，那条路是 Alt+Tab / 全景点选 / IPC 走
-	 * 的，不该在切工作区时替用户把窗口改形态）。 */
+	 * 打进虚空。现象就是「切过去之后焦点没跟过来」。 */
 	if (ws->focused != NULL && view_alive(server, ws->focused) &&
 			ws->focused->mapped && ws->focused->ws == ws) {
 		vidow_focus_view(ws->focused);
@@ -1031,8 +1015,7 @@ static void focus_workspace(struct vidow_server *server,
 	}
 	struct vidow_view *fv;
 	wl_list_for_each(fv, &server->views, link) {
-		if (fv->ws != ws || !fv->mapped || fv->minimized || fv->popup ||
-				fv->mini != VIDOW_MINI_NONE) {
+		if (fv->ws != ws || !fv->mapped || fv->minimized || fv->popup) {
 			continue;
 		}
 		vidow_focus_view(fv);

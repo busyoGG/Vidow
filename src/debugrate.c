@@ -191,8 +191,7 @@ static void dbg_view_update(struct vidow_server *server,
 	 * 也不 disable 节点，而是把 scene_tree park 到所有输出框外面（见 view.c
 	 * 的 vidow_view_set_parked）。只看 node.enabled 的话，窗口已经滚走了、
 	 * 那一行窗口还留在原处把数字钉在屏上（用户报的「窗口裁切掉了 fps 还在」）。 */
-	bool shown = view->mapped && !view->popup && view->mini == VIDOW_MINI_NONE &&
-		!view->scene_parked &&
+	bool shown = view->mapped && !view->popup && !view->scene_parked &&
 		view->scene_tree != NULL && view->scene_tree->node.enabled &&
 		view->geom.width > 0 && view->geom.height > 0;
 	if (!shown) {

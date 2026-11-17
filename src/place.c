@@ -90,12 +90,6 @@ static void place_view_policy(struct vidow_server *server,
 		p->reason = VIDOW_PLACE_UNMAPPED;
 		return;
 	}
-	if (vidow_mini_uses_snapshot(view)) {
-		/* 图标态：真实节点停到停车位，屏上由快照节点画（mini_snapshot_place）。 */
-		p->resident = false;
-		p->reason = VIDOW_PLACE_MINI;
-		return;
-	}
 	bool visible = vidow_workspace_view_visible(server, view);
 	if (!visible && !vidow_view_sliding_out(server, view) &&
 			!(vidow_overview_active(server) && !view->minimized)) {
@@ -198,9 +192,6 @@ static const char *place_why(struct vidow_server *server,
 		struct vidow_view *view) {
 	if (!view->mapped) {
 		return "未 map";
-	}
-	if (vidow_mini_uses_snapshot(view)) {
-		return "mini 快照";
 	}
 	if (view->minimized) {
 		return "最小化";

@@ -819,8 +819,7 @@ static int output_watchdog_tick(void *data) {
 	wl_list_for_each(view, &server->views, link) {
 		if (view->output == output->wlr_output && view->mapped &&
 				view->scene_parked && !view->popup &&
-				view->kind != VIDOW_VIEW_X11 &&
-				!vidow_mini_uses_snapshot(view)) {
+				view->kind != VIDOW_VIEW_X11) {
 			parked_want++;
 		}
 	}
