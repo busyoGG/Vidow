@@ -1181,7 +1181,7 @@ struct vidow_fx_target {
 	 * 里的那部分。clip = 那块屏的框（布局逻辑坐标），clip_on 为 false 时整块
 	 * 都画。裁剪只作用在**显示**上：几何、客户端、录屏抓帧都不动。 */
 	bool clip_on;
-	/* 这一份 fx 属于哪个窗口（小窗 / 图标 / MRU 卡片那些不是窗口，是 NULL）。
+	/* 这一份 fx 属于哪个窗口（MRU 卡片那些不是窗口，是 NULL）。
 	 * 裁剪在 vidow_fx_frame() 里做，那个函数只拿得到 target、拿不到 view ——
 	 * 而「overview 开着时裁到 overview 那块屏」这条判据需要 view。 */
 	struct vidow_view *view;
@@ -2761,10 +2761,6 @@ struct vidow_popup_scene {
 	struct wl_listener destroy;  /* 表面没了就摘掉这条 */
 };
 
-/* 每个按钮上的字形最多几个亮点（5x5 字模，最满的那个「三根竖条」是 15 ——
- * 留点余量给以后换字模）。建节点时超了会当场报错，不悄悄少画。 */
-#define VIDOW_MINI_TOOLBAR_GLYPH_MAX 20
-
 struct wlr_cursor_shape_manager_v1;
 
 struct vidow_server {
@@ -3647,7 +3643,7 @@ struct vidow_anim *vidow_anim_start(struct vidow_server *server,
 /* 回弹幅度 → out_back 里那个常数（峰值 = 4c1³/(27(c1+1)²) 的反解）。见 anim.c。 */
 double vidow_ease_out_back_c1(double overshoot);
 /* 取一条缓动曲线在 t（0..1 的**线性**进度）处的值。一条 anim 里要用两条曲线
- * （小窗转换：位置单调、缩放可过冲）时用这个 —— 别为第二条曲线再起一条 anim。 */
+ * （位置单调、缩放可过冲两种曲线叠着用）时用这个 —— 别为第二条曲线再起一条 anim。 */
 double vidow_ease_value(const struct vidow_ease *ease, double t);
 /* 曲线的「自然时长」（毫秒）：固定时长的曲线返回 0（用调用方给的 ms），
  * 弹簧返回 −ln(epsilon)/β。见 anim.c 的 spring_value()。 */
@@ -3881,7 +3877,6 @@ struct vidow_place_hit {
 enum vidow_place_reason {
 	VIDOW_PLACE_OK = 0,      /* 在屏上，画 */
 	VIDOW_PLACE_UNMAPPED,    /* 还没 map：不画 */
-	VIDOW_PLACE_MINI,        /* 小窗图标态，屏上由快照节点画：真实节点不画 */
 	VIDOW_PLACE_WS_HIDDEN,   /* 工作区没显示（含切工作区过渡之外的情况） */
 	VIDOW_PLACE_MINIMIZED,   /* 最小化 */
 	VIDOW_PLACE_OFFSCREEN,   /* 几何上跟该算的屏没有交集：滚出去了 */
@@ -3897,7 +3892,7 @@ struct vidow_place {
 	int n;
 	struct vidow_place_hit hits[VIDOW_PLACE_MAX_HITS];
 	/* **最终结论**：这块 surface 现在要不要参与渲染流程（I1）。策略
-	 * （未 map / 小窗快照 / 工作区藏着 / 最小化 / overview）和几何（hits）
+	 * （未 map / 工作区藏着 / 最小化 / overview）和几何（hits）
 	 * 都在 place 里合成完了，消费者只读这一个 bool。 */
 	bool resident;
 	enum vidow_place_reason reason;

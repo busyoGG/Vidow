@@ -2,7 +2,7 @@
  *
  * 这一层只读改 view 自己的字段，不碰布局（列、条带、视口都不在这里）。调用方是
  * 别处所有模块：IPC 查询、输入命中、X11、渲染。所以它是 view 里最靠外的一层，
- * 没有反向依赖 —— 只借了三个更靠里的小工具（裁剪框 / 小窗原生尺寸 / X11 归屏），
+ * 没有反向依赖 —— 只借了三个更靠里的小工具（裁剪框 / 原生尺寸 / X11 归屏），
  * 走 view-internal.h。
  */
 #include "server.h"
@@ -690,9 +690,9 @@ void vidow_view_close(struct vidow_view *view) {
  * 两个来源：
  *   X11     缓冲区被我们按 xwayland_scale 倍声明过，场景里占的位置比客户端
  *           自己的坐标空间小；
- *   小窗     保留原生分辨率时（S3），场景节点被缩到小窗盒，表面还是原生的。
- * 两者是同一个式子：表面宽 / 节点宽。尺寸一致时返回 1.0（这条保证非小窗 /
- * 非缩放路径逐字节不变）。 */
+ *   overview / 动画  场景节点被缩到缩略尺寸，表面还是原生的。
+ * 两者是同一个式子：表面宽 / 节点宽。尺寸一致时返回 1.0（这条保证非缩放
+ * 路径逐字节不变）。 */
 /* Locate the actual surface node, not the toplevel tree: decorations,
  * subsurfaces and popups can all have different origins. Do not clip a grab. */
 static struct wlr_scene_buffer *view_find_surface_buffer(
@@ -967,12 +967,11 @@ void view_dst_capture(struct vidow_view *view) {
 	int w = src->dst_width;
 	int h = src->dst_height;
 	if (w <= 0 || h <= 0) {
-		/* 节点的 dst 是 0（退出小窗那一刻会把它清成 0，wlroots 要等这个表面
-		 * 下一次 commit 才按表面尺寸重设）：这个字段量的是**场景单位**里的
-		 * 1:1 尺寸，所以退回「表面自己的逻辑尺寸」—— 不是缓冲像素数：输出缩放
-		 * 2 的客户端（buffer scale 2）缓冲宽高是逻辑的两倍，照缓冲像素记下来
-		 * 基线就大了一倍，之后每次进小窗算出的缩放系数都小一半（实测：盒里
-		 * 的内容只画成该有的 1/2 —— 172x190 的物理脚印变成 86x95）。 */
+		/* 节点的 dst 是 0（刚建出来 / wlroots 还没按表面尺寸设过）：这个字段
+		 * 量的是**场景单位**里的 1:1 尺寸，所以退回「表面自己的逻辑尺寸」——
+		 * 不是缓冲像素数：输出缩放 2 的客户端（buffer scale 2）缓冲宽高是逻辑
+		 * 的两倍，照缓冲像素记下来基线就大了一倍，之后算出的缩放系数都小一半
+		 * （实测：内容只画成该有的 1/2 —— 172x190 的物理脚印变成 86x95）。 */
 		struct wlr_surface *surface = vidow_view_surface(view);
 		if (surface != NULL && surface->current.width > 0 &&
 				surface->current.height > 0) {

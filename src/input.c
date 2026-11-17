@@ -1511,7 +1511,7 @@ static void focus_follows_mouse(struct vidow_server *server,
 	 * 「窗口焦点移动后…否则会和焦点切换有冲突」）。离开再回来 = 变了，才跟。 */
 	struct vidow_view *prev_hover = server->hovered_view;
 	server->hovered_view = hit;
-	/* **弹出物也不跟。** 和上面小窗同一个理由、同一个位置。
+	/* **弹出物也不跟。** 和上面同一个理由、同一个位置。
 	 *
 	 * X11 的菜单 / 提示是 override-redirect 窗口，它靠 X 自己的 grab 收指针
 	 * 和键盘，从来不是"焦点窗口"。光标扫过菜单时这里一跟，焦点就从父窗口
@@ -2106,7 +2106,7 @@ static uint32_t pointer_modifiers(struct vidow_server *server) {
 void vidow_pointer_button(struct vidow_server *server, uint32_t button,
 		bool pressed, uint32_t time_msec, bool force_mod) {
 	/* 自己记一份按键数（见 server.h 里 pointer_button_count 的注释）：放在
-	 * **所有 return 之前** —— 不管这一下被谁吃掉（lock surface / 小窗预览 /
+	 * **所有 return 之前** —— 不管这一下被谁吃掉（lock surface /
 	 * 绑定表 / 转给客户端），物理按键状态都变了。 */
 	if (pressed) {
 		server->pointer_button_count++;
@@ -2425,9 +2425,8 @@ void vidow_pointer_axis(struct vidow_server *server,
 	 * —— 竖直轴 = 选中项往后 / 往前一格（**到边停住，不循环**，见 mru.c），横向轴
 	 * 吃掉不动作。面板开着时输入是模态的，一格都不透给别处。
 	 *
-	 * 必须排在**小窗档位**（下面那段）之前：用户撞的就是这个 —— 按住 Alt 滚滚轮，
-	 * 光标压在某个迷你 / 图标小窗上时先被「档位状态机」抢走；再往下走还会命中绑定
-	 * 表（默认配置里 `Alt+wheel-up/down` = 换工作区，见 configs/14-keys.lua），
+	 * 再往下走会命中绑定表（默认配置里 `Alt+wheel-up/down` = 换工作区，见
+	 * configs/14-keys.lua），
 	 * 结果「按着 Alt 想切窗口，工作区真的跳了」。 */
 	if (vidow_mru_active(server)) {
 		vidow_mru_wheel(server, orientation, amount);

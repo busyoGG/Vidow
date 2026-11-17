@@ -1484,7 +1484,7 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 	 * 着色器算的是 o = (borg - content_off + p * blur_scale + blur_bias) / bsize
 	 * —— p 是**缓冲像素**，borg 是窗口在屏幕上的原点。缓冲里这个像素最终落在
 	 * 屏幕的哪个点，取决于节点把它缩放到多大：anim_scale（开合动画）和 ov
-	 * （overview / 小窗 / 预览的缩略倍率）都会缩。
+	 * （overview 的缩略倍率）都会缩。
 	 *
 	 * 以前只乘了 anim_scale。于是 overview 里窗口缩到 0.46、位置也换了，采样
 	 * 坐标却还按原尺寸算 —— 采到的模糊跟窗口现在盖住的那块屏幕完全不是一回

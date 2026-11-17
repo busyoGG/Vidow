@@ -421,7 +421,7 @@ static struct wlr_scene_surface *find_scene_surface(struct wlr_scene_node *node,
  * 跟着错（越界的那一块本来就被裁掉了、压根不画，隔壁那块屏跟这个窗口没关系）。 */
 struct wlr_output *vidow_view_owner_output(const struct vidow_view *view) {
 	/* 唯一真值：窗口属于工作区，工作区属于屏。浮窗也一样（它只是不占列宽，
-	 * 不是「不属于工作区」）。弹窗 / 小窗没有工作区，各自按自己的位置算。 */
+	 * 不是「不属于工作区」）。弹窗没有工作区，按自己的位置算。 */
 	if (view->popup) {
 		return NULL;
 	}
@@ -444,7 +444,7 @@ struct wlr_output *vidow_view_owner_output(const struct vidow_view *view) {
  * 另一个屏幕的缩放变化了」）。 */
 static void view_visible_box(const struct vidow_view *view, struct wlr_box *out) {
 	*out = (struct wlr_box){0};
-	/* **判据走 place**（src/place.c）：resident 为假（未 map / 小窗快照 /
+	/* **判据走 place**（src/place.c）：resident 为假（未 map /
 	 * 工作区藏着 / 最小化 / 滚出自己那块屏）= 哪块屏上都没有它，框是空的。
 	 *
 	 *   overview          → 世界框（所有窗口都缩进画面，不裁）
@@ -601,7 +601,7 @@ static struct wlr_output *view_home_output(const struct vidow_view *view) {
 	return vidow_view_display_output(view);
 }
 
-/* 拖拽中窗口**此刻画在哪块屏上**（平铺 / 浮窗 / 小窗都算）。不在拖拽里返回
+/* 拖拽中窗口**此刻画在哪块屏上**（平铺 / 浮窗都算）。不在拖拽里返回
  * NULL —— 那时候倍率该按归属屏算（view_home_output），不能按「画在哪」翻。
  *
  * 为什么拖拽要单独一份：窗口跟着光标越过屏边界之后，它**真的已经画在对面那块
@@ -1212,7 +1212,7 @@ bool view_clip_box(struct vidow_view *view, struct wlr_box *out) {
 	struct vidow_server *server = view->server;
 
 	/* 有工作区的窗口平时一律裁到自己那块屏： 「窗口只在自己的工作区显示」
-	 * 是硬约束。小窗和弹窗在上面 / 后面各自走自己的路。
+	 * 是硬约束。弹窗在上面 / 后面各自走自己的路。
 	 *
 	 * **但拖拽中的窗口是例外**（下面那段，用户 2026-10-23 报的「跨一半之后
 	 * 突然被另一个屏幕裁剪了」）。 */
@@ -1398,74 +1398,6 @@ static void view_snapshot_content_box(struct vidow_view *view) {
 	 * 客户端声明的 viewport / 缓冲，跟场景节点裁没裁无关 —— 要的就是这份
 	 * 「没裁过」的有效区。 */
 	wlr_surface_get_buffer_source_box(surface, &view->fx.content_box);
-}
-
-/* 缩放节点的越界裁剪（S3 修）：把表面那份内容节点裁成「这一帧落在屏里那一块」。
- *
- * 为什么不能借 wlroots 的 wlr_scene_subsurface_tree_set_clip()：那套是给
- * **1:1 逻辑坐标**的窗口准备的（内部把 clip 当节点位置用、src_box 按表面尺寸
- * 比例缩、dst 不动，见 types/scene/subsurface_tree.c 的
- * subsurface_tree_reconfigure_clip + types/scene/surface.c 的 src_box 换算）。
- * 缩放态（小窗保留原生 buffer：图标 / 迷你 / 自由小窗，以及过渡动画那几帧）
- * 下它三件事一起错：内容挪到错的地方、剩下那一小条拉伸铺满整块 dst、而且
- * dst 不缩 → 越界那半块照画到隔壁屏上（实测 16×64 条带 832 像素）。
- *
- * 这里自己裁：**源框取可见那一块、目标框也取可见那一块**，缩放比一个像素都不变，
- * 框外那部分根本不画。缓冲像素 ↔ 场景像素按「整块有效源区对应整块 dst」换算
- * （整块源区从 wlr_surface_get_buffer_source_box() 拿，客户端声明的 viewport 也
- * 算在里面）。
- *
- * 返回 true = 这一档接管了（调用方别再走 wlroots 那套）；false = 没接管（不是
- * 能安全处理的缩放表面：没有缓冲 / 旋转过 / 拿不到源区），退回原路。 */
-static bool view_scaled_crop(struct vidow_view *view, const struct wlr_box *clip) {
-	struct wlr_scene_buffer *sb = view->scene_surface != NULL ?
-		view->scene_surface->buffer : NULL;
-	struct wlr_surface *surface = vidow_view_surface(view);
-	if (sb == NULL || sb->buffer == NULL || surface == NULL ||
-			sb->dst_width <= 0 || sb->dst_height <= 0 ||
-			surface->current.transform != WL_OUTPUT_TRANSFORM_NORMAL) {
-		return false;
-	}
-	int cx = 0, cy = 0;
-	wlr_scene_node_coords(&sb->node, &cx, &cy);
-	struct wlr_box cbox = {.x = cx, .y = cy,
-		.width = sb->dst_width, .height = sb->dst_height};
-	struct wlr_box vis;
-	if (!wlr_box_intersection(&vis, &cbox, clip)) {
-		/* 这一帧整个身子都在自己那块屏外：一个像素都不该画（场景图是全局
-		 * 坐标，画了就是画到隔壁屏上）。甩到所有输出框外面去 —— 和 fx 那边
-		 * 同一招（src_box 空着 wlroots 会当成「整块」，那是另一个意思）。 */
-		wlr_scene_buffer_set_source_box(sb, NULL);
-		wlr_scene_node_set_position(&sb->node,
-			sb->node.x - cx - 1000000, sb->node.y - cy - 1000000);
-		return true;
-	}
-	if (vis.width == cbox.width && vis.height == cbox.height) {
-		wlr_scene_buffer_set_source_box(sb, NULL); /* 可见那块 = 整块：不用裁 */
-		return true;
-	}
-	struct wlr_fbox full = {0};
-	wlr_surface_get_buffer_source_box(surface, &full);
-	if (full.width <= 0.0 || full.height <= 0.0) {
-		return false;
-	}
-	double kx = (double)full.width / (double)cbox.width;
-	double ky = (double)full.height / (double)cbox.height;
-	struct wlr_fbox src = {
-		.x = full.x + (double)(vis.x - cx) * kx,
-		.y = full.y + (double)(vis.y - cy) * ky,
-		.width = (double)vis.width * kx,
-		.height = (double)vis.height * ky,
-	};
-	/* 裁之前先抄一份没裁过的有效区：装饰管线（fx）采源缓冲的哪一块照的是
-	 * view->fx.content_box 那一份，别让它认成裁剩下的一小条（187 那个坑）。 */
-	wlr_scene_buffer_set_source_box(sb, NULL);
-	view_snapshot_content_box(view);
-	wlr_scene_buffer_set_source_box(sb, &src);
-	wlr_scene_node_set_position(&sb->node,
-		sb->node.x + (vis.x - cx), sb->node.y + (vis.y - cy));
-	wlr_scene_buffer_set_dest_size(sb, vis.width, vis.height);
-	return true;
 }
 
 static void view_apply_clip_impl(struct vidow_view *view) {
@@ -2227,7 +2159,7 @@ bool vidow_view_should_park(struct vidow_server *server,
 		return false; /* 弹出物：各有各的路（见 workspace.c） */
 	}
 	/* **判据只有 place 一份**（src/place.c 的 place_view_policy）：未 map /
-	 * 小窗快照 / 工作区藏着（overview 例外）/ 最小化 / 几何上不在自己那块屏 ——
+	 * 工作区藏着（overview 例外）/ 最小化 / 几何上不在自己那块屏 ——
 	 * 全都合成在那里，这里只读结论。
 	 *
 	 * 以前这个函数自己写了一长串：mapped → 工作区可见 → sliding_out →
@@ -2275,8 +2207,6 @@ void vidow_view_set_parked(struct vidow_view *view, bool park) {
 	 *   从 wlr_surface 另建的镜像；
 	 * - MRU 卡片缩略图（mru.c 的 mru_card_thumb）：直接把客户端的 buffer
 	 *   挂到自己的 wlr_scene_buffer 上；
-	 * - 小窗悬停预览（view.c 的 preview_show）：同样是另建的镜面 / 快照，
-	 *   挂在 layer_top；
 	 * - overview 不一样：它渲染的就是真实场景树，所以 overview 期间
 	 *   should_park 一律返回 false（见 vidow_view_should_park）—— 进
 	 *   overview 时 set_parked(false) 会把树重新点亮，退出时再关。
@@ -2377,10 +2307,6 @@ static double view_overview_alpha(struct vidow_server *server,
 	return alpha;
 }
 
-/* 窗口的**原生**尺寸（场景里的 1:1 尺寸）：overview 缩放拿它当基线。X11 那条在
- * commit 时记过 base_dst（已经除过 xwayland_scale），没有就取表面自己的逻辑尺寸
- * —— 两者都是「没被小窗缩过」的量，所以每帧算出来稳定（拿节点现在的 dst 算就会
- * 越缩越小）。 */
 /* 窗口的**原生**尺寸（场景坐标里的 1:1 大小）：overview 缩放拿它当基线。
  * X11 读 base_dst_*（已除过 xwayland_scale），其余读表面当前逻辑尺寸 —— 后者
  * 随时读都是当前值，输出缩放变了、客户端被重新 configure 成另一个大小之后也
@@ -2506,12 +2432,13 @@ static void view_anim_place(struct vidow_view *view) {
 	 * 拿 dst_width/dst_height 当节点盒子，wlr_scene_surface 再按表面尺寸卡一遍
 	 * 边界 —— 所以这个盒子必须跟着缩放走，不然全景里点谁都不是谁（实测 3 列时
 	 * 最后一个窗口的盒子从 646 一路伸到 1291，把整排吞掉）。src_box 不是原因：
-	 * 它一直是整块缓冲（实测 0,0 665x740）。
+	 * 它一直是整块缓冲（实测 0,0 665x740）。两者都是「没被缩过」的量，每帧算
+	 * 出来稳定（拿节点现在的 dst 算就会越缩越小）。
 	 *
 	 * 1:1 尺寸走 view_native_size()，不走 base_dst_*：那个字段 xdg 从来不记
-	 * （只在 X11 的 commit 和「退出小窗」两处写），恒为 0，下面这个守卫根本进不来
+	 * （只在 X11 的 commit 里写），恒为 0，下面这个守卫根本进不来
 	 * —— 这正是「xdg 窗口在全景里内容尺寸一次都没缩过」的原因。view_native_size()
-	 * 是唯一一处按 kind 分派的 1:1 尺寸来源（小窗那套缩放用的也是它）：非 X11 读
+	 * 是唯一一处按 kind 分派的 1:1 尺寸来源：非 X11 读
 	 * 表面当前逻辑尺寸（随时读都是当前值），X11 读 base_dst_*（已除过
 	 * xwayland_scale）—— X11 这边行为因此一个字没变。
 	 *
@@ -2519,12 +2446,7 @@ static void view_anim_place(struct vidow_view *view) {
 	 * 偏移，盒子会整体往左上偏 ~20px、右边还盖不满格子（实测右侧差 2px、左侧多出
 	 * 20px 伸进两列之间的缝里）。X11 的窗口几何 x/y 是 0，这条对它天然是空操作。
 	 *
-	 * 小窗（MINI / ICON）不进这一支：那两态的**内容节点几何是小窗那套机制管的**
-	 * （命中盒与内容节点的尺寸必须同源），
-	 * 而且小窗不参与行布局、全景里不重映射（vidow_overview_map 对它原样返回）——
-	 * 照这里乘 ov 会把盒子撑到 306x340，比小窗那块卡片还高，白盖掉旁边一列的
-	 * 一条（实测 14px 宽、160px 高）。X11 那一支保持原样：它读的就是 base_dst_*，
-	 * 和小窗态的既有行为一致。 */
+	 * X11 那一支保持原样：它读的就是 base_dst_*，缩放比按表面 / 节点算。 */
 	int nw = 0, nh = 0;
 	view_native_size(view, &nw, &nh);
 	if (ov != 1.0 && nw > 0 && nh > 0) {
@@ -2535,7 +2457,7 @@ static void view_anim_place(struct vidow_view *view) {
 			/* 目标是「内容节点在场景里的绝对位置 = 窗口矩形原点 - 留白 ×
 			 * 缩放」—— 留白（xdg 的窗口几何偏移）不一定挂在缓冲节点自己身上：
 			 * 它是 wlroots 设在这一层还是父树那一层，得减掉父节点的偏移才算
-			 * 得对（和上面小窗居中那段同一个算法）。只按「节点自己的 x」设就
+			 * 得对（偏移可能记在父树那一层）。只按「节点自己的 x」设就
 			 * 会在父树再叠一份 -20px。 */
 			struct wlr_box geo = vidow_view_geometry(view);
 			int vx = 0, vy = 0, px = 0, py = 0;
@@ -6175,7 +6097,7 @@ enum vidow_surface_damage vidow_view_surface_damage(struct vidow_view *view,
  * 判据只读 place（第 2 步起策略也收在里面，不许另写一套）：
  *   resident   → 要帧；
  *   UNMAPPED   → 要帧（第一帧可能触发 map / 兑现 configure，别把客户端饿死）；
- *   其余       → 不要：工作区没显示 / 最小化 / 小窗图标态 / 滚出屏外。
+ *   其余       → 不要：工作区没显示 / 最小化 / 滚出屏外。
  *
  * 变回可见时不用在这里补：arrange（切工作区、滚动、还原）会给那块屏推帧，
  * 场景的损伤也由 place 那条路重新记。 */
@@ -6505,12 +6427,10 @@ static void view_commit(struct wl_listener *listener, void *data) {
 
 	/* The visible pixels come from our offscreen decoration buffer now, so a
 	 * client repaint has to be pushed through it again. */
-	/* 小窗（S3）也走这一趟，哪怕 fx 不 active：wlroots 在每次 commit 时会把场景
-	 * 节点的显示尺寸重置成表面自己的尺寸（types/scene/surface.c 的
-	 * surface_reconfigure），而我们的 commit 监听器排在它后面 —— 不在这一趟里
-	 * 重设一次小窗那条缩放，客户端每交一帧节点就弹回原生尺寸（画面忽大忽小、
-	 * 点击范围也跟着错）。装饰开着时本来就会走到这儿，这条只多覆盖「装饰全关 +
-	 * 小窗」那一种。 */
+	/* fx active 时本来就走这一趟（重设开合动画那条缩放）：wlroots 在每次 commit
+	 * 时会把场景节点的显示尺寸重置成表面自己的尺寸（types/scene/surface.c 的
+	 * surface_reconfigure），而我们的 commit 监听器排在它后面 —— 不重设一次，
+	 * 客户端每交一帧节点就弹回原生尺寸（画面忽大忽小、点击范围也跟着错）。 */
 	if (view->mapped && view->fx.active) {
 		vidow_view_apply_anim(view);
 	}
@@ -6525,7 +6445,7 @@ static void view_commit(struct wl_listener *listener, void *data) {
 	 * 也是「Electron 卡」的直接原因（每帧都在重排重画）。
 	 *
 	 * 修：每次 commit 后把客户端节点的显示尺寸钉回逻辑尺寸（surface->width /
-	 * height 已经是逻辑值）。fx / 小窗那条路自己会设，不打架。 */
+	 * height 已经是逻辑值）。fx 那条路自己会设，不打架。 */
 	if (view->scene_surface != NULL && surface != NULL &&
 			surface->current.width > 0 && surface->current.height > 0) {
 		wlr_scene_buffer_set_dest_size(view->scene_surface->buffer,

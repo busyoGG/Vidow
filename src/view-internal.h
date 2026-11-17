@@ -23,7 +23,7 @@ void x11_apply_rule_scale(const struct vidow_view *view, double *w, double *h);
 /* 进 / 退全屏（含 X11 同步与布局重排）。 */
 void view_apply_fullscreen(struct vidow_view *view, bool want, const char *why);
 void view_sync_x11_fullscreen(struct vidow_view *view);
-/* 把当前节点尺寸记成基线（小窗 / overview 退出后回到这个尺寸）。 */
+/* 把当前节点尺寸记成基线（overview 退出后回到这个尺寸）。 */
 void view_dst_capture(struct vidow_view *view);
 /* 窗口几何 → 装饰着色器的纹理映射（tex_u0/v0/du/dv）。 */
 void fx_geo_tex_map(struct vidow_fx_geo *geo,
@@ -34,7 +34,6 @@ void fx_geo_tex_map(struct vidow_fx_geo *geo,
 
 /* 窗口在布局坐标里被裁到的那块（哪块屏上都没画着时返回 false）。 */
 bool view_clip_box(struct vidow_view *view, struct wlr_box *out);
-/* 小窗（S3）：窗口的原生尺寸（场景坐标）。 */
 /* X11：按窗口的绝对坐标把它归到某块输出上。 */
 void x11_track_output(struct vidow_view *view);
 

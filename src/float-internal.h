@@ -1,7 +1,7 @@
 /* float 模块的内部常量（只在 src/float*.c 之间用）。
  *
  * 对外 API 在 server.h（vidow_float_*）；这里只是三块实现
- * （模式判定 / 几何与拖拽 / 迷你小窗）都必须认同的几个数。 */
+ * （模式判定 / 几何与拖拽）都必须认同的几个数。 */
 #ifndef VIDOW_FLOAT_INTERNAL_H
 #define VIDOW_FLOAT_INTERNAL_H
 

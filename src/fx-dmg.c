@@ -261,7 +261,7 @@ struct wlr_box vidow_view_screen_box(const struct vidow_view *view) {
  *     的底衬里画着它的投影。只报窗口框的话，投影让出来的那一圈永远不重抓 ——
  *     jelly.c 的 vidow_jelly_pad 注释里记着同一件事（「窗口释放的时候背景模糊
  *     更新会有滞留像素」）。
- *   - anim_scale：开合 / 小窗的缩放作用在**内容**上（fx-frame 里 dst 尺寸乘它、
+ *   - anim_scale：开合动画的缩放作用在**内容**上（fx-frame 里 dst 尺寸乘它、
  *     位置按中心回挪），内容占的屏幕面积跟着变。固定加一圈余量盖不住：过冲量
  *     正比于窗口尺寸（out_elastic 冲到 1.085，默认 open_scale_from 0.82 →
  *     1.5% × 边长），大窗口能差出几十像素。
@@ -445,7 +445,7 @@ static void vidow_backdrop_note_self(struct vidow_view *view,
  * dmg_clear），整块重抓的年代每次全量重画，这个洞不存在。
  *
  * 盒子按 vidow_view_drawn_box 算（几何 + 装饰外圈 + 缩放溢出 + 果冻那圈），别在
- * 调用点各写一套 —— 位移 / 开窗 / 关窗 / 小窗 / 拖拽原来各算各的，余量常数已经
+ * 调用点各写一套 —— 位移 / 开窗 / 关窗 / 拖拽原来各算各的，余量常数已经
  * 漂过一轮。 */
 void vidow_backdrop_damage_drawn(struct vidow_view *view) {
 	struct wlr_box box = vidow_view_drawn_box(view);

@@ -79,8 +79,8 @@ static bool place_rides_outputs(const struct vidow_server *server,
 
 /* **策略层**：所有「该不该画」的原因在这儿合成成 resident + reason。
  *
- * 顺序照依赖：越早成立的理由越硬（未 map 的谈不上工作区；小窗快照根本不是这棵
- * 树在画；overview 能豁免工作区隐藏，但豁免不了最小化）。以前这些原因散在
+ * 顺序照依赖：越早成立的理由越硬（未 map 的谈不上工作区；overview 能豁免
+ * 工作区隐藏，但豁免不了最小化）。以前这些原因散在
  * vidow_view_should_park / workspace_view_visible / view_on_screen 三处，各自的
  * 顺序还不一样 —— 那正是碎片来源。 */
 static void place_view_policy(struct vidow_server *server,
@@ -186,23 +186,6 @@ static bool place_check_on(void) {
 	last = now;
 	on = access("/tmp/vidow-place-check", F_OK) == 0;
 	return on;
-}
-
-static const char *place_why(struct vidow_server *server,
-		struct vidow_view *view) {
-	if (!view->mapped) {
-		return "未 map";
-	}
-	if (view->minimized) {
-		return "最小化";
-	}
-	if (!vidow_workspace_view_visible(server, view)) {
-		return vidow_overview_active(server) ? "overview 里" : "工作区被藏";
-	}
-	if (vidow_overview_active(server)) {
-		return "overview";
-	}
-	return "未知";
 }
 
 void vidow_place_check(struct vidow_server *server, const char *tag) {

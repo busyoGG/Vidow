@@ -982,10 +982,7 @@ bool vidow_overview_click(struct vidow_server *server, double sx, double sy) {
 		 * 它带窗口规则的 focus_on_activate 闸（后台 Electron 反复顶自己那类），
 		 * 但这里是**用户点了一下**，闸不该拦；所以后面照样再给一次焦点。
 		 *
-		 * 迷你 / 图标态：摊成普通窗口再给焦点（和 Alt+Tab 提交、IPC focus-window
-		 * 同一个入口、同一个语义，见 server.h）。以前用的是那个「什么都不做」的
-		 * vidow_focus_view()：它开头就把 MINI / ICON 挡回去了（不变量：focused
-		 * 永远不指小窗），于是全景里小窗那块格子点上去只有日志、焦点一点没动。 */
+		 * 和 Alt+Tab 提交、IPC focus-window 同一个入口、同一个语义，见 server.h。 */
 		vidow_view_activate(hit);
 		vidow_focus_view(hit);
 		/* 点下去就退出，但客户端从没收到这次按下；对应的松手也吃掉，
