@@ -23,6 +23,8 @@
 #      品红的底衬里可以同时有品红和绿色 —— 绿色现在会带一层屏幕空间模糊，
 #      那层模糊里就有品红（dump 的 owner 写在 /tmp/vidow-bd-<n>.owner 里）
 #  12) 模糊采样屏幕坐标（四象限 + 半透明薄纱）
+#  14) 跨屏拖拽：窗口压着两块屏时两格都在（日志「现在 2 格」）、果冻照样形变
+#      （连续拖不断，最大偏移 >= 8px）
 #  13) 日志里没有 assert / abort
 #
 # 用法：./test-jelly.sh   （VIDOW_TEST_KEEP=1 保留运行目录）
@@ -222,6 +224,34 @@ px = im.load()
 bg = px[0, 0]
 xs = [x for y in range(0, H, 4) for x in range(W) if px[x, y] != bg]
 print(0 if not xs else max(xs) - min(xs) + 1)
+PY
+}
+
+# 区域平均亮度（R+G+B 均值，0..765）：跨屏那段用它比「拖起来 vs 静置」
+region_mean() { # <png> <x> <y> <w> <h>
+	python3 - "$@" <<'PY'
+import sys
+from PIL import Image
+
+im = Image.open(sys.argv[1]).convert("RGB")
+# 窗口可能比屏还高（pattern 窗口 631x708），把取样框裁进图里
+iw, ih = im.size
+x = max(0, int(sys.argv[2]))
+y = max(0, int(sys.argv[3]))
+w = min(int(sys.argv[4]), iw - x)
+h = min(int(sys.argv[5]), ih - y)
+if w <= 0 or h <= 0:
+    print("0.0")
+    raise SystemExit
+px = im.load()
+t = 0
+n = 0
+for yy in range(y, y + h, 2):
+    for xx in range(x, x + w, 2):
+        p = px[xx, yy]
+        t += p[0] + p[1] + p[2]
+        n += 1
+print("%.1f" % (t / max(n, 1)))
 PY
 }
 
@@ -842,6 +872,78 @@ PY
 		fail "左边没透出红 / 右边没透出绿（R-G：280=$LEFT，380=$RIGHT）—— 模糊跟着窗口内容走了"
 	fi
 fi
+stop_vidow
+
+# ------------------------------------------------------- 14) 跨屏拖拽
+mark "跨屏拖拽：两块屏各一格，果冻照样形变"
+stop_vidow
+export WLR_HEADLESS_OUTPUTS=2
+export VIDOW_JELLY_DEBUG=1
+start_vidow 'vidow.output{ name = "HEADLESS-1", scale = 1 }
+vidow.output{ name = "HEADLESS-2", scale = 1 }
+window_opacity = 0.5' 'blur_enabled = true'
+python3 ./tools/pattern.py w1 >/dev/null 2>&1 &
+CLIENT_PIDS="$CLIENT_PIDS $!"
+sleep 1.5
+./build/vidowmsg toggle-floating --title w1 >/dev/null
+./build/vidowmsg set-window-position --title w1 100 150 >/dev/null
+sleep 0.6
+read -r WX WY WW WH FLOAT <<<"$(win_geom w1)"
+grim -o HEADLESS-1 "$RUNDIR/cross-rest.png" 2>/dev/null
+REST=$(region_mean "$RUNDIR/cross-rest.png" \
+	$((WX + 24)) $((WY + 24)) $((WW - 48)) $((WH - 48)))
+# 连续快速拖：170 步 x 6px（750px/s），从 x=100 拖到 x=1120 —— 窗口
+# 625 宽，最后左边 220px 留在左屏、右边 405px 进右屏，跨得清清楚楚
+# （只擦过去十几像素的话第二块屏那一格可能不建，看着像「没跨屏」）。**不能**几步一大跳 —— 一帧挪 100px 以上
+# 会被 vidow_jelly_tick 判成「布局把窗口搬走了」，偏移直接清零，那就测不到果冻
+# （老脚本那种 12 步拖法就是这样，看着像「果冻没了」）。
+CX=$((WX + WW / 2))
+CY=$((WY + 20))
+act "pointer-motion $CX $CY"
+act "pointer-button left press mod"
+MID=""
+for i in $(seq 1 170); do
+	act "pointer-motion $((CX + i * 6)) $CY" 0.01
+	if [ "$i" = 60 ]; then
+		# 还在左屏里（没跨边界）：窗口内亮度该和静置一样。装饰节点（同一张
+		# 缓冲）没让位的话，半透明内容会画两遍 —— 50% 窗口静置约 0.5，
+		# 画两遍约 0.75，亮度差一大截。
+		read -r WX2 WY2 WW2 WH2 _ <<<"$(win_geom w1)"
+		sleep 0.05
+		grim -o HEADLESS-1 "$RUNDIR/cross-drag.png" 2>/dev/null
+		MID=$(region_mean "$RUNDIR/cross-drag.png" \
+			$((WX2 + 24)) $((WY2 + 24)) \
+			$((WW2 - 48)) $((WH2 - 48)))
+	fi
+done
+act "pointer-button left release mod" 0.3
+sleep 1.2
+read -r EX EY EW EH _ <<<"$(win_geom w1)"
+echo "  跨屏拖动后几何：$EX,$EY ${EW}x${EH}（拖动前 $WX,$WY）"
+
+MAXOFF=$(grep -ao 'maxoff=[0-9.]*' "$LOG" | cut -d= -f2 | sort -rn | head -1)
+if python3 -c "import sys; sys.exit(0 if float('${MAXOFF:-0}') >= 8 else 1)"; then
+	pass "拖着跨屏时果冻还在形变（最大偏移 $MAXOFF px）"
+else
+	fail "跨屏拖拽没看出形变（最大偏移 ${MAXOFF:-0} px，判据 >= 8）"
+fi
+if grep -aq "jelly: w1 现在 2 格" "$LOG"; then
+	pass "跨屏时两块屏各一格（日志：现在 2 格）"
+else
+	fail "跨屏时没有两格（$(grep -ao 'jelly: w1 现在 [0-9]* 格' "$LOG" | sort -u | tr '\n' ' ')）"
+fi
+if grep -aq "jelly: w1 起手" "$LOG"; then
+	pass "跨屏拖拽也起了果冻"
+else
+	fail "跨屏拖拽没起果冻"
+fi
+# 拖起来窗口内的亮度：只打出来参考，**不当判据**。内容亮度和底衬亮度差不多
+# 时，「半透明内容叠两遍」在像素上根本看不出来；真正能钉住它的是自带 alpha 的
+# 客户端（kitty 的 background_opacity）+ 亮底衬，见提交 8573d0c 里的实测数字。
+echo "  窗口内亮度：静置 $REST / 拖拽中 $MID（仅供参考）"
+
+unset VIDOW_JELLY_DEBUG
+export WLR_HEADLESS_OUTPUTS=1
 stop_vidow
 
 # ---------------------------------------------------------------- 13) 日志

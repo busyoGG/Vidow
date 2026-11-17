@@ -166,6 +166,7 @@ struct vidow_jelly {
 	int64_t release_ns;      /* 松手时刻，0 = 还在拖 */
 	double last_max_off;     /* 上一帧的最大偏移：没动就不重画 */
 	double last_sum_off;     /* 上一帧的偏移总量（形状变了也得重画） */
+	int last_slots;          /* 上一帧有几格（变了才打日志，见 sync_slots） */
 	int base_drawn_x, base_drawn_y; /* 上一帧画的时候底座在哪（挪了就得重画） */
 	double kill;             /* 收尾系数：1 = 正常，超时后按指数收到 0 */
 	bool drawn_once;
@@ -997,6 +998,21 @@ static bool jelly_sync_slots(struct vidow_jelly *jelly) {
 		}
 	}
 
+	/* 跨屏时窗口同时压着两块屏，每块一格（网格 / 弹簧一点不重建）。只在
+	 * 格数变了的时候打一条：test-jelly.sh 靠它确认「跨屏时两格都在」。 */
+	int nslot = 0;
+	for (int i = 0; i < JELLY_SLOTS; i++) {
+		if (jelly->slot[i].node != NULL) {
+			nslot++;
+		}
+	}
+	if (nslot != jelly->last_slots) {
+		jelly->last_slots = nslot;
+		struct vidow_view *jv = jelly->view;
+		wlr_log(WLR_DEBUG, "jelly: %s 现在 %d 格",
+			jv != NULL && vidow_view_title(jv) != NULL ?
+				vidow_view_title(jv) : "?", nslot);
+	}
 	for (int i = 0; i < JELLY_SLOTS; i++) {
 		if (jelly->slot[i].node != NULL) {
 			return true;
