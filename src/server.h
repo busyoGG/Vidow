@@ -938,6 +938,7 @@ struct vidow_decor_prog {
 	int u_tex_map;
 	/* 元素自己的 alpha（「透明度剔除」，见 fx.c 的 decor_fragment_src）。 */
 	int u_mask, u_mask_on, u_mask_min;
+	int u_skip_interior;   /* 内圈不透明像素直接输出内容（见 decor 着色器） */
 	/* mask 的采样映射（见 struct vidow_fx_target 的 mask_*）。 */
 	int u_mask_map;
 	/* 线性工作空间（color.linear_blend）：源 / 目标传输函数 + 色域矩阵。

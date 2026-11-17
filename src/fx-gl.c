@@ -196,6 +196,11 @@ static const char *decor_fragment_src =
 	 * 跟 niri 的 blur_finish 一样；0 = 不剔）。 */
 	"uniform sampler2D u_mask;\n"
 	"uniform float u_mask_on;\n"
+	/* 内容**逐像素**不透明、且落在画框里面两像素以上的像素：那几项全是 0，
+	 * 输出等于内容本身，着色器里可以直接返回（见 main() 里的早退）。只在
+	 * u_linear < 0.5 时走 —— 线性光那条路最后还要编码一次，这儿不重算它，
+	 * 免得差一个色阶。4K 上一个整窗几百万个片元，九成以上是这种。 */
+	"uniform float u_skip_interior;\n"
 	"uniform float u_mask_min;\n"
 	"uniform vec4 u_mask_map;\n"
 	/* ------------------------------------------------ 线性工作空间
@@ -335,6 +340,17 @@ static const char *decor_fragment_src =
 	"		content = vec4(clin * ck, tcontent.a * ck);\n"
 	"	} else {\n"
 	"		content = tcontent * u_opacity * u_content_alpha * inside;\n"
+	"	}\n"
+	"\n"
+	/* 内圈逐像素不透明：阴影（shk 乘了 1 - inside）、画框（ring 只在边上）、
+	 * 底衬模糊（合成时乘 1 - content.a）在这块全是 0，输出就是内容本身。
+	 * 直接交出去，不再采模糊 / mask，也不算 smoothstep 和噪声。 */
+	"	if (u_skip_interior > 0.5 && u_linear < 0.5 && u_mask_on < 0.5 &&\n"
+	"			u_shadow_only < 0.5 && u_opacity > 0.999 &&\n"
+	"			u_content_alpha > 0.999 && tcontent.a > 0.999 &&\n"
+	"			d < -(u_border_width + 2.0)) {\n"
+	"		gl_FragColor = tcontent * u_alpha;\n"
+	"		return;\n"
 	"	}\n"
 	"\n"
 	"	float bw = min(u_border_width, min(half_size.x, half_size.y));\n"
@@ -1004,6 +1020,7 @@ static void load_decor_program(struct vidow_server *server) {
 	LOC(u_tex_map, "u_tex_map");
 	LOC(u_mask, "u_mask");
 	LOC(u_mask_on, "u_mask_on");
+	LOC(u_skip_interior, "u_skip_interior");
 	LOC(u_mask_min, "u_mask_min");
 	LOC(u_mask_map, "u_mask_map");
 	LOC(u_linear, "u_linear");

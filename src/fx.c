@@ -3292,6 +3292,18 @@ static bool decor_pass(struct vidow_server *server,
 	bind_tex(2, ma.target, ma.tex);
 	glUniform1i(d->u_mask, 2);
 	glUniform1f(d->u_mask_on, mask != NULL ? 1.0f : 0.0f);
+	/* 内圈逐像素不透明的像素：着色器里直接输出内容就返回（见 fx-gl.c 的
+	 * decor 着色器），省掉模糊采样、mask 采样和一堆 smoothstep。4K 上一个
+	 * 整窗几百万个片元，九成以上是这种。VIDOW_DECOR_NOSKIP=1 关掉做对照。 */
+	{
+		static int skip_interior = -1;
+
+		if (skip_interior < 0) {
+			skip_interior = getenv("VIDOW_DECOR_NOSKIP") != NULL ? 0 : 1;
+		}
+		glUniform1f(d->u_skip_interior, skip_interior ? 1.0f : 0.0f);
+	}
+
 	/* 阈值：客户端用 ext-background-effect 自己要了区域就不按元素 alpha 剔 ——
 	 * 那块区域就是它画出来的边界（niri 的 need_ignore_alpha 同一个判断）。layer
 	 * 底衬拿不到元素内容时也不能剔，不然整块模糊都没了。0 = step(0, a) 恒为 1，
