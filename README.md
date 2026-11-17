@@ -1026,7 +1026,6 @@ VIDOW_TEST_RENDERER=gles2 ./test-screencast.sh
 ./test-preinit.sh                    # 状态请求抢在第一次 commit 之前（set_maximized /
                                      #   set_minimized / set_fullscreen）不许把合成器打死（22 项断言）
 ./test-drag.sh                       # 拖窗口：拖得动 / 跨屏改归属 / 平铺按落点插入（10 项）
-./test-mini.sh                       # 小窗模式（mini window，S1–S8）：三态与交互 / 跟屏 / 焦点守卫 / 输入路由与 4px 阈值 / 图标裁剪 / 原生 buffer 与坐标换算 / mini_aspect / 落点区 / 工具条 / 出帧分叉 / 过渡动画与惯性甩出；S7 HiDPI（scale 2：逻辑工作区 / 跨缩放边界裁剪 / 指针坐标换算）；S8 自由小窗（拖动跟手 / 拖动中跨屏换归属贴边 / 全屏可达 / 能拖出屏边一半在外 / resize 真重配客户端）（全 headless 双屏，见 277、289）
 ./test-corner.sh                     # 圆角形状：corner_n = 4 超椭圆（角区面积 957 / 对角线第一颗第 5）vs 2 圆弧（815 / 第 9）/ 边框环跟同一形状（沿对角线 11 vs 解析 10.75）/ AA 过渡 1~2px（20 项，见 280）
 ./test-drag-insert.sh                # 拖平铺窗口的落点：插进已有列 / 新开一条列（左右两边的缝都算）/ 落点预览块 / 条带比屏宽时拖到屏边自动滚条带（30 项，见 288）
 ./test-expel.sh                      # 把窗口从列里拎出来单独成列（niri 的 expel-window-from-column：动作 / IPC / 左右 / 拖到右边与空白处 / 取不出来的两种情形，32 项）
@@ -1557,7 +1556,7 @@ X11 没有 per-window 的缓冲区缩放，所以：
      - 被拖的平铺窗口降到 **75% 不透明度**（niri 的 `INTERACTIVE_MOVE_ALPHA`），松手恢复；
        拖动期间视口锁在当前值（`output->drag_scroll/drag_viewport`），摘列后条带变短也不会
        让焦点列把视口拽回去。
-     - 松手插回 / 取消 / 变迷你：`drag_restore_view()` 清标记和透明度；插入函数看得到原来的
+     - 松手插回 / 取消：`drag_restore_view()` 清标记和透明度；插入函数看得到原来的
        列链表，`insert_pos_at()` 看的是并拢后的布局。落点动画从**拖到的位置**补间，不先跳回
        旧 geom 一帧。
      - `test-drag-insert.sh` 的期望跟着改成「摘走后的布局」：w1 插 w2 列、w2 从 w1 列取出来、
@@ -2033,7 +2032,7 @@ vidow.rule{ namespace = "^awww-daemonov", overview = "only" }
 
 实现在三处：`input.c` 的指针移动 / 按下 / 滚轮三个入口各自第一行问一句
 （切换器活着就归它）、`keybind.c` 的 `keybind_mru_key`（键位白名单）、`gesture.c` 的每个手势
-入口。滚轮那条闸**排在小窗档位之前**：不然光标压在迷你 / 图标小窗上时先被「档位状态机」抢走。
+入口。（原来滚轮那条闸还要排在小窗档位之前 —— 小窗功能下线后，闸后面没有别的档位状态机了。）
 
 ### 台账（谁「最近用过」）
 

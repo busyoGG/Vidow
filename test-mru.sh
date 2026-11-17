@@ -702,7 +702,7 @@ mark "15) B1 面板按着时字母键进不了客户端（wtype，真键盘那�
 cat > "$RUNDIR/keyprobe.py" <<'PY'
 #!/usr/bin/env python3
 # 客户端探针：把自己收到的按键 / 鼠标按下打出来（一行一条）。「面板开着时输入是
-# 模态的」就拿它当判据 —— 客户端收到了 = 漏了。照 test-mini.sh 那个探针的形状。
+# 模态的」就拿它当判据 —— 客户端收到了 = 漏了。
 import sys
 import time
 import gi

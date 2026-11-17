@@ -21,7 +21,7 @@
 
 `view_commit_needs_frame()`：客户端交帧要不要叫醒渲染，只读 place——
 `resident` / `UNMAPPED` / 还没建场景节点这三种排帧，其余（隐藏工作区 / 最小化 /
-小窗图标态 / 滚出屏外）一律不排。变回可见时由 arrange 补帧。
+滚出屏外）一律不排。变回可见时由 arrange 补帧。
 
 开关：`/tmp/vidow-no-commit-skip` 退回「任何交帧都排帧」。
 

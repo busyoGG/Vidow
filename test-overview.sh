@@ -162,16 +162,8 @@ kill -TERM -- "-$VIDOW_PGID" 2>/dev/null
 sleep 0.6
 
 
-# ---------------------------------------------------- 迷你 / 图标态 + 命中盒（A + B）
-# A：全景里 mini / 图标态的窗口**点得中**。以前这里是 vidow_focus_view()：它开头就把
-#    MINI / ICON 挡回去了（不变量：focused 永远不指小窗），于是点小窗只有一行「选中」
-#    日志、焦点一点没动。现在和 Alt+Tab 提交 / IPC focus-window 走同一个入口
-#    （vidow_focus_view_expand_mini：先摊成普通窗口再给焦点）。
-# B：**命中盒必须和画出来的格子一致**。命中走 wlroots 的场景图：盒子 = 内容节点的
-#    dst_width/dst_height（scene_node_get_size），再被表面尺寸卡一遍边界。全景里内容
-#    节点的尺寸/偏移没跟着行缩放走的时候，一格能吞掉整排（实测 3 列时最后一个窗口的
-#    盒子是 646..1291，而它的格子只到 934），用户看到的就是「点谁都不是谁」。
-mark "全景里点小窗（A）+ 命中盒和画出来的格子一致（B）"
+# ---------------------------------------------------- 命中盒和画出来的格子一致
+mark "全景里命中盒和画出来的格子一致"
 start_vidow 1
 python3 tools/wall.py >/dev/null 2>&1 &
 sleep 0.9
@@ -195,14 +187,6 @@ for w in json.load(sys.stdin):
     if w["title"] == sys.argv[1]:
         print(w.get(sys.argv[2])); break' "$1" "$2"
 }
-wbox() { # 小窗那块盒子：迷你态在 float_geometry，图标态在 geometry
-	./build/vidowmsg windows 2>/dev/null | python3 -c '
-import json,sys
-for w in json.load(sys.stdin):
-    if w["title"] == sys.argv[1]:
-        g = w.get("float_geometry") or w.get("geometry") or {}
-        print(g.get("x",0), g.get("y",0), g.get("width",0), g.get("height",0)); break' "$1"
-}
 what() { # <x> <y> → 命中的窗口名（没命中就是空）
 	./build/vidowmsg pick-window "$1" "$2" 2>/dev/null | python3 -c '
 import json,sys
@@ -222,8 +206,8 @@ check_cell() { # <title> <x> <y> <说明>
 	[ "$got" = "$1" ] && pass "$4（$1 @ $2,$3）" ||
 		fail "$4：$2,$3 命中「$got」（应该是 $1）"
 }
-check_picked() { # <title> <说明> [expand]：选中日志 + 缩回去 + 焦点换成它
-	local f mini
+check_picked() { # <title> <说明>：选中日志 + 缩回去 + 焦点换成它
+	local f
 	grep -aq "overview: 选中 $1" "$LOG" && pass "$2：日志记了「选中 $1」" ||
 		fail "$2：日志里没有「overview: 选中 $1」"
 	awk -v t="$1" '$0 ~ ("overview: 选中 " t) {seen=1}
@@ -232,23 +216,8 @@ check_picked() { # <title> <说明> [expand]：选中日志 + 缩回去 + 焦点
 	f=$(wfield "$1" focused)
 	[ "$f" = "True" ] && pass "$2：焦点真的换成 $1 了" ||
 		fail "$2：焦点没换（$1 focused=$f）"
-	[ "${3:-}" = "expand" ] || return 0
-	mini=$(wfield "$1" mini)
-	case "$mini" in
-	none | free) pass "$2：小窗摊成普通窗口了（mini=$mini）" ;;
-	*) fail "$2：还是小窗态（mini=$mini），没展开" ;;
-	esac
 }
 
-# wm 变迷你态、焦点留给 wa（这样「点 wm 换焦点」才有对照）
-./build/vidowmsg focus-window --id "$(wid wm)" >/dev/null 2>&1
-sleep 0.4
-./build/vidowmsg set-mini-state --id "$(wid wm)" --state mini >/dev/null 2>&1
-sleep 0.8
-./build/vidowmsg focus-window --id "$(wid wa)" >/dev/null 2>&1
-sleep 0.5
-[ "$(wfield wm mini)" = "mini" ] && pass "wm 进了迷你态、焦点在 wa" ||
-	fail "wm 没进迷你态（mini=$(wfield wm mini)）"
 
 wtype -M logo -k o >/dev/null 2>&1
 sleep 1.0
@@ -278,10 +247,6 @@ win = json.loads(subprocess.run(["./build/vidowmsg", "windows"],
                                 capture_output=True, text=True).stdout)
 pad = 0
 for w in win:
-    # 只按普通窗口算：小窗 / 图标态的 geometry 是那块小盒子（353x196），和表面
-    # 尺寸（665x740）差得远，混进来会把留白圈撑成一百多像素、判据就形同虚设。
-    if str(w.get("mini", "none")) not in ("none", "free"):
-        continue
     s, g = w.get("surface") or {}, w.get("geometry") or {}
     if s and g:
         pad = max(pad, (s["width"] - g["width"]) / 2.0,
@@ -342,37 +307,16 @@ sys.exit(1 if failed else 0)
 PY2
 [ $? -ne 0 ] && FAILED=1
 
-# 1：点迷你窗那块 → 焦点换成它
-read -r WX WY WW WH <<<"$(wbox wm)"
-MCX=$((WX + WW / 2)); MCY=$((WY + WH / 2))
-GOT=$(what "$MCX" "$MCY")
-[ "$GOT" = "wm" ] && pass "迷你窗那块也画出来了、中心命中它自己（$MCX,$MCY）" ||
-	fail "迷你窗中心 $MCX,$MCY 命中「$GOT」（应该是 wm）"
-click_at "$MCX" "$MCY"
-sleep 1.3
-check_picked wm "点迷你窗" expand
-
-# 1（图标态）：同一条路再走一遍
-./build/vidowmsg set-mini-state --id "$(wid wm)" --state icon >/dev/null 2>&1
-sleep 0.9
-./build/vidowmsg focus-window --id "$(wid wa)" >/dev/null 2>&1
-sleep 0.5
-wtype -M logo -k o >/dev/null 2>&1
-sleep 1.0
-read -r WX WY WW WH <<<"$(wbox wm)"
-MCX=$((WX + WW / 2)); MCY=$((WY + WH / 2))
-GOT=$(what "$MCX" "$MCY")
-[ "$GOT" = "wm" ] && pass "图标那块中心命中它自己（$MCX,$MCY）" ||
-	fail "图标中心 $MCX,$MCY 命中「$GOT」（应该是 wm）"
-read -r AX AY AW AH <<<"$(ov_rect wa)"
-check_cell wa "$((AX + AW / 2))" "$((AY + AH / 2))" "格子中心命中它自己（屏上有图标）"
-click_at "$MCX" "$MCY"
-sleep 1.3
-check_picked wm "点图标态" expand
-
-# 2：普通窗照旧（屏上刚有小窗折腾过：先让焦点停在 wb，再点 wa 的格子）
+# 2：普通窗照旧：先让焦点停在 wb，再点 wa 的格子
 ./build/vidowmsg focus-window --id "$(wid wb)" >/dev/null 2>&1
 sleep 0.5
+# 上面那一段可能还留着全景开着（它只在点选成功时才自己退出）—— 开着就先按 Esc 关掉，
+# 不然下面这句 Mod+O 会变成「关」，接着的格子中心点击就落在桌面上。
+if ./build/vidowmsg overview 2>/dev/null |
+	python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin)["t"] > 0.01 else 1)'; then
+	wtype -k Escape >/dev/null 2>&1
+	sleep 1.0
+fi
 wtype -M logo -k o >/dev/null 2>&1
 sleep 1.0
 read -r AX AY AW AH <<<"$(ov_rect wa)"
@@ -382,7 +326,7 @@ click_at "$((AX + AW / 2))" "$((AY + AH / 2))"
 sleep 1.3
 check_picked wa "点普通窗（wa）"
 
-cp "$LOG" "$RUNDIR/log-miniov.txt"
+cp "$LOG" "$RUNDIR/log-overview-hit.txt"
 stop_clients
 kill -TERM -- "-$VIDOW_PGID" 2>/dev/null
 sleep 0.6
