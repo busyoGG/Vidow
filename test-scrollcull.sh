@@ -417,7 +417,11 @@ echo "      $(tail -1 "$RUNDIR/cap-c.txt" 2>/dev/null)"
 ./build/vidowmsg focus-workspace 1 >/dev/null 2>&1
 sleep 1.0
 ./build/vidowmsg set-config window_move_ms 900 >/dev/null 2>&1
+# 「抓的这几张落在动画里」的判据要把**视口滚动**算进去：换焦点列时整条带子
+# 是刚性平移的（视口负责位移，窗口不各起一条位移补间 —— 见 view.c 的
+# viewport_spring_tick）。只数 move tween 的话，这条在「视口滚」的实现下永远红。
 n_tween=$(count "move tween")
+n_vp=$(( $(count "viewport spring") + $(count "viewport tween") ))
 ./build/vidowmsg focus-column 1 >/dev/null 2>&1
 sleep 0.25
 ./build/vidowmsg focus-column 1 >/dev/null 2>&1
@@ -426,9 +430,13 @@ for i in 1 2 3 4; do
 	grim -o HEADLESS-1 "$RUNDIR/mid-$i.png" 2>/dev/null
 done
 sleep 1.2
-[ "$(count "move tween")" -gt "$n_tween" ] &&
-	pass "抓的这几张确实落在滚动动画里（日志里有新的 move tween）" ||
-	fail "没抓到动画（日志里没有新的 move tween）"
+n_move=$(( $(count "move tween") - n_tween ))
+n_scroll=$(( $(count "viewport spring") + $(count "viewport tween") - n_vp ))
+if [ "$n_move" -gt 0 ] || [ "$n_scroll" -gt 0 ]; then
+	pass "抓的这几张确实落在滚动动画里（新的位移补间 $n_move 条 / 视口滚动 $n_scroll 条）"
+else
+	fail "没抓到动画（日志里既没有新的 move tween，也没有视口滚动）"
+fi
 mid_bad=0
 mid_px=""
 for i in 1 2 3 4; do

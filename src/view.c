@@ -3765,7 +3765,14 @@ struct vp_anim {
 	 * 终点（用户 2026-10-30：「没有完成过渡动画的时候再切换聚焦会直接
 	 * 瞬移」）。 */
 	struct vidow_anim *anim;
+	/* 弹簧那条路（viewport_spring_tick）：ticker 的时长（秒）和上一帧的
+	 * 归一化进度 —— 两者相减就是这一帧的 dt。 */
+	double spring_dur_s;
+	double spring_t_prev;
+	bool spring;
 };
+
+static void viewport_apply(struct vp_anim *a);
 
 static void viewport_anim_update(void *data, double t, double linear) {
 	(void)linear;
@@ -3776,6 +3783,15 @@ static void viewport_anim_update(void *data, double t, double linear) {
 	double v = a->output->viewport_anim_from +
 		(a->output->viewport_anim_to - a->output->viewport_anim_from) * t;
 	a->output->viewport_x = v;
+	viewport_apply(a);
+}
+
+/* 条带挪了一格之后每帧都要做的两件事：记损伤（只记给窗口，别记给 layer）、
+ * 重摆一遍。注释见下面那段（原样搬过来的，别把那些坑丢了）。 */
+static void viewport_apply(struct vp_anim *a) {
+	if (a == NULL || a->output == NULL) {
+		return;
+	}
 	/* **整块屏记一笔损伤就够，不要每个窗口各记一笔。**
 	 *
 	 * 整条带子在横向平移，受影响的本来就是一整块屏 —— 一帧记一笔，而不是
@@ -3812,9 +3828,76 @@ static void viewport_anim_update(void *data, double t, double linear) {
 	a->server->arrange_skip_world_damage = false;
 }
 
+/* **视口弹簧：把「速度」当状态，改道只换目标。**
+ *
+ * 用户 2026-11-17：「窗口焦点快速切换的时候有时候像是被夹住一样过渡时长太长
+ * （像是一个一个窗口过渡一样）」。
+ *
+ * 以前每次改道都重起一条完整时长的弹簧曲线（见 viewport_slide 里那段长注释：
+ * 「接着跑」试过两版都失败，于是回到「每次改道 = 一条完整时长的动画」）。
+ * 那条曲线的**初速度恒为 0**：连按换焦点时，每一段都从「静止 → 缓慢加速」
+ * 起步，带子每按一下先顿一下、再走；最后一下要走满一整条曲线（配置里
+ * spring 0.6 370 ≈ 798ms）才到位。观感就是「被夹住 / 一个一个地过」。
+ *
+ * 真正的弹簧有**位置和速度**两个状态：改道时只换目标，速度接着用 —— 于是
+ * 连按时带子是连续加速的，不会顿，也不会把时长一段段地叠起来（速度被下一段
+ * 直接利用，而不是清零重来）。niri 的视口弹簧也是这么做的。
+ *
+ * 积分：半隐式欧拉，每帧拆 4 个子步（dt 上限 32ms → 子步 ≤ 8ms；劲度几千
+ * 也稳）。dt 来自 ticker 的归一化进度差 × 时长 —— 掉帧 / 切 tty 回来时
+ * 时间跳变会被上限挡住，不会一步飞出屏幕。 */
+static void viewport_spring_tick(void *data, double t, double linear) {
+	(void)linear;
+	struct vp_anim *a = data;
+	if (a->output == NULL || a->server == NULL) {
+		return;
+	}
+	struct vidow_output *out = a->output;
+	double dt = (t - a->spring_t_prev) * a->spring_dur_s;
+	a->spring_t_prev = t;
+	if (dt <= 0.0) {
+		return;
+	}
+	if (dt > 0.032) {
+		dt = 0.032;
+	}
+	const struct vidow_ease *curve = &a->server->config.viewport_easing;
+	double k = curve->stiffness > 1.0 ? curve->stiffness : 1.0;
+	double zeta = curve->damping_ratio > 0.0 ? curve->damping_ratio : 1.0;
+	/* m = 1：c = 2·ζ·√k —— 和 anim.c 的 spring_value 用的是同一套参数化。 */
+	double damp = 2.0 * zeta * sqrt(k);
+	double x = out->viewport_x;
+	double v = out->viewport_vel;
+	double target = out->viewport_spring_to;
+	const int sub = 4;
+	double h = dt / (double)sub;
+	for (int i = 0; i < sub; i++) {
+		v += (k * (target - x) - damp * v) * h;
+		x += v * h;
+	}
+	out->viewport_vel = v;
+	out->viewport_x = x;
+	/* 到位判据：位置和速度都收住。0.5px / 20px·s⁻¹ 是「再走一帧也看不出来」
+	 * 的量级；收住就当场落定并收掉 ticker（下一帧不再重摆，省掉整屏重排）。 */
+	if (fabs(target - x) <= 0.5 && fabs(v) <= 20.0) {
+		out->viewport_x = target;
+		out->viewport_vel = 0.0;
+		viewport_apply(a);
+		vidow_anim_cancel(a->anim);
+		return;
+	}
+	viewport_apply(a);
+}
+
 static void viewport_anim_done(void *data, bool cancelled) {
 	struct vp_anim *a = data;
 	if (a->output != NULL) {
+		/* 弹簧收尾：清状态。**速度必须清**，否则下一次改道会带着一条已经不
+		 * 存在的运动尾巴去追新目标（表停下来了，账上还在跑）。 */
+		if (a->spring) {
+			a->output->viewport_spring = false;
+			a->output->viewport_vel = 0.0;
+		}
 		if (!cancelled && a->output->viewport_anim != NULL) {
 			a->output->viewport_x = a->output->viewport_anim_to;
 		}
@@ -3867,6 +3950,60 @@ static void viewport_slide(struct vidow_server *server,
 	 * 代价：快速连按时每小段都从 t=0 起步（停在曲线加速段），过冲幅度按
 	 * 该段距离算，比单次慢速切要小。这是「幅度」与「可预测」之间的取舍，
 	 * 这里选后者 —— 极慢和飞出屏幕是故障，幅度偏小只是观感。 */
+	/* **弹簧那条路：改道只换目标，速度接着用。**
+	 *
+	 * 上面那段注释里说的「每次改道 = 一条完整时长的动画」是给**固定时长**
+	 * 曲线的（out_back 之类：时长本来就该由配置说了算）。弹簧不该这么走 ——
+	 * 它自带速度和阻尼，重起一条等于把速度清零，连按时每按一下就顿一下，
+	 * 最后那一下还要走满一整条曲线（spring 0.6 370 ≈ 798ms），用户报的
+	 * 「像是被夹住一样过渡时长太长（像是一个一个窗口过渡）」就是这个。
+	 * 细节见 viewport_spring_tick。 */
+	struct vidow_ease sp = server->config.viewport_easing;
+	if (sp.kind == VIDOW_EASE_SPRING && vidow_ease_duration_ms(&sp) > 0) {
+		output->viewport_spring = true;
+		output->viewport_spring_to = to;
+		output->viewport_anim_to = to;
+		if (output->viewport_anim != NULL) {
+			/* 已经在跑：**什么都不重起**，只换目标。速度是连续的，
+			 * 所以连按看起来是「一路加速过去」而不是「一顿一顿」。 */
+			wlr_log(WLR_INFO,
+				"viewport spring 改道: %.0f -> %.0f（当前速度 "
+				"%.0fpx/s，want_slide=%d）", output->viewport_x, to,
+				output->viewport_vel,
+				(int)output->viewport_want_slide);
+			return;
+		}
+		struct vp_anim *sa = calloc(1, sizeof(*sa));
+		if (sa == NULL) {
+			output->viewport_x = to;
+			output->viewport_spring = false;
+			return;
+		}
+		struct vidow_ease lin = {0};
+		lin.kind = VIDOW_EASE_LINEAR;
+		sa->server = server;
+		sa->output = output;
+		sa->spring = true;
+		/* ticker 的时长只是「帧从哪儿来」：弹簧自己按 dt 积分，到位就收
+		 * （见 viewport_spring_tick 末尾）。4000ms 是宁可多挂一会的上限。 */
+		sa->spring_dur_s = 4.0;
+		sa->spring_t_prev = 0.0;
+		output->viewport_x = from;
+		output->viewport_anim = vidow_anim_start(server, "视口弹簧", 4000,
+			lin, viewport_spring_tick, viewport_anim_done, sa);
+		sa->anim = output->viewport_anim;
+		if (output->viewport_anim == NULL) {
+			output->viewport_x = to;
+			output->viewport_spring = false;
+			free(sa);
+			return;
+		}
+		wlr_log(WLR_INFO,
+			"viewport spring 起跑: %.0f -> %.0f（速度 %.0fpx/s，"
+			"want_slide=%d）", from, to, output->viewport_vel,
+			(int)output->viewport_want_slide);
+		return;
+	}
 	if (output->viewport_anim != NULL) {
 		vidow_anim_cancel(output->viewport_anim);
 		output->viewport_anim = NULL;
@@ -4093,16 +4230,38 @@ static void output_arrange(struct vidow_server *server,
 				 * 非 NULL 就走"别覆盖"分支。摘 field 再 cancel 两头都对：
 				 * done 先看到 NULL，不会再回 arrange，cancel 那条也只是把
 				 * 这一帧剩下的活收掉。 */
-				struct vidow_anim *old = output->viewport_anim;
-				output->viewport_anim = NULL;
-				viewport_slide(server, output, viewport, target,
-					server->config.window_move_ms);
-				/* viewport_slide 已经起好新动画；这里一帧最多一行
-				 * INFO，看见"一串 tween"才用得上。 */
-				if (old != NULL) {
-					vidow_anim_cancel(old);
+				/* **弹簧：改道 = 只换目标。**
+				 *
+				 * 下面那套「摘 field → 起新动画 → cancel 旧的」对固定时长
+				 * 曲线是对的（时长该由配置说了算），但对弹簧是把**速度
+				 * 清零**：done 回调会把 viewport_vel 抹掉，于是连按换焦点
+				 * 时每一段都从静止起步，带子一下一顿（用户 2026-11-17：
+				 * 「像是被夹住一样过渡时长太长（像是一个一个窗口过渡）」）。
+				 * 弹簧自带速度状态，改道只是换目标，见 viewport_spring_tick。 */
+				if (output->viewport_spring &&
+						output->viewport_anim != NULL) {
+					output->viewport_spring_to = target;
+					output->viewport_anim_to = target;
+					wlr_log(WLR_INFO,
+						"viewport spring 改道: %.0f -> %.0f"
+						"（速度 %.0fpx/s）",
+						output->viewport_x, target,
+						output->viewport_vel);
+					viewport = output->viewport_x;
+				} else {
+					struct vidow_anim *old =
+						output->viewport_anim;
+					output->viewport_anim = NULL;
+					viewport_slide(server, output, viewport,
+						target,
+						server->config.window_move_ms);
+					/* viewport_slide 已经起好新动画；这里一帧
+					 * 最多一行 INFO，看见"一串 tween"才用得上。 */
+					if (old != NULL) {
+						vidow_anim_cancel(old);
+					}
+					viewport = output->viewport_x;
 				}
-				viewport = output->viewport_x;
 			} else {
 				output->viewport_want_slide = false;
 				viewport = output->viewport_x;

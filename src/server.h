@@ -1611,6 +1611,18 @@ struct vidow_output {
 	 * Pass 2）。关窗 / 列宽变化 / 拖拽落位不置它 —— 那些情况该由每个窗口
 	 * 自己的位移补间表现补位，视口一过渡就会把所有窗口的补间掐掉。 */
 	bool viewport_want_slide;
+	/* **视口弹簧的状态：速度是真的状态。**
+	 *
+	 * 以前每改道一次就重起一条完整时长的弹簧曲线（曲线初速度恒为 0），连按
+	 * 换焦点时每一段都从「静止 → 缓慢加速」起步 —— 带子每按一下就顿一下，
+	 * 观感是「被夹住 / 一个一个窗口地过」（用户 2026-11-17）。真正的弹簧有
+	 * 位置**和速度**：改道只换目标，速度接着用（见 view.c 的
+	 * viewport_spring_tick）。viewport_vel 单位是逻辑像素/秒；
+	 * viewport_spring 为真表示弹簧那条 ticker 正在跑，viewport_spring_to 是
+	 * 它当前的目标。 */
+	double viewport_vel;
+	double viewport_spring_to;
+	bool viewport_spring;
 	/* 切工作区的过渡：正在被推开的（旧的）那块工作区，和驱动它的动画。
 	 * 过渡期间 arrange 会把 slide_from 的列也摆一遍（按它自己的 slide_y），
 	 * 见 view.c 的 output_arrange 和 workspace.c 的 slide_start。 */
