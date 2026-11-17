@@ -136,12 +136,6 @@ static const struct section sections[] = {
 	/* 窗口抓帧（23-…）同样只能往后加。 */
 	{ "窗口抓帧", "23-wincapture.lua",
 		"按窗口录屏 / 窗口截图源抓出来的那一帧长什么样" },
-	/* 小窗（24-…）同样只能往后加。这一族是**小窗模式**（迷你 / 图标 / 自由
-	 * 小窗）：拖到落点区收成迷你、悬停预览、贴边图标、宽高比策略。
-	 * S1 只铺了数据模型 / 配置 / IPC —— 形态还不会自动切换、渲染与输入未动。 */
-	{ "小窗（mini window）", "24-mini.lua",
-		"迷你 / 图标 / 自由小窗这一族：收成小窗的尺寸与落点区、图标贴边与"
-		"悬停预览、形态转换时长、宽高比策略" },
 };
 #define N_SECTIONS ((int)(sizeof(sections) / sizeof(sections[0])))
 /* 「键位 / 工作区 / 规则」那一节：它不是配置键，entries[] 里没有它，打印也
@@ -674,89 +668,6 @@ static const struct entry entries[] = {
 		"屏幕上看到的一样；关掉 = 只有客户端表面本身（给只想要裸窗口内容的用家，"
 		"比如 OBS 的窗口源自己再加边框）" },
 
-	/* 小窗（mini window，configs/24-mini.lua）。位置与尺寸记的是**相对自己那块
-	 * 输出工作区的比例锚点**，不记绝对坐标 —— 改工作区尺寸 / 改缩放 / 拔插屏
-	 * 之后天然跟着走。S1 只铺数据模型 + 配置 + IPC：形态还不会自动切换、渲染与
-	 * 输入路由未动（见 README 第 271 条）。 */
-	{ "mini_enabled", K_BOOL, OFF(mini_enabled), SZ(mini_enabled), 23,
-		"小窗模式总开关。false = 拖到落点区什么都不发生（零行为变化）" },
-	{ "mini_drop_zone", K_BOOL, OFF(mini_drop_zone), SZ(mini_drop_zone), 23,
-		"拖窗口时亮出落点区（拖到那儿松手 = 收成迷你小窗）" },
-	{ "mini_drop_zone_w", K_STRING, OFF(mini_drop_zone_w),
-		SZ(mini_drop_zone_w), 23,
-		"落点区宽（相对工作区的百分比，如 \"15%\"）" },
-	{ "mini_drop_zone_h", K_STRING, OFF(mini_drop_zone_h),
-		SZ(mini_drop_zone_h), 23,
-		"落点区高（相对工作区的百分比，如 \"20%\"）" },
-	{ "mini_w", K_STRING, OFF(mini_w), SZ(mini_w), 23,
-		"迷你态尺寸宽（相对工作区的百分比，如 \"28%\"）。迷你态的尺寸**钉死**"
-		"跟配置，客户端改不动；改配置当场生效" },
-	{ "mini_h", K_STRING, OFF(mini_h), SZ(mini_h), 23,
-		"迷你态尺寸高（相对工作区的百分比，如 \"28%\"）" },
-	{ "mini_free_w", K_STRING, OFF(mini_free_w), SZ(mini_free_w), 23,
-		"自由小窗的初始宽（相对工作区的百分比，如 \"40%\"）；之后尺寸记在窗口"
-		"自己身上（mini_remember_size = false 就每次都用这个初始值）" },
-	{ "mini_free_h", K_STRING, OFF(mini_free_h), SZ(mini_free_h), 23,
-		"自由小窗的初始高（相对工作区的百分比，如 \"45%\"）" },
-	{ "mini_icon_size", K_INT, OFF(mini_icon_size), SZ(mini_icon_size), 23,
-		"图标态边长（逻辑像素，正方形）" },
-	{ "mini_icon_overflow", K_DOUBLE, OFF(mini_icon_overflow),
-		SZ(mini_icon_overflow), 23,
-		"图标沿贴的那条边出屏多少（占自己的比例，0..0.6；0 = 完全在屏内）" },
-	{ "mini_icon_hover_ms", K_INT, OFF(mini_icon_hover_ms),
-		SZ(mini_icon_hover_ms), 23,
-		"图标悬停多久出预览（毫秒）" },
-	{ "mini_icon_hover_leave_ms", K_INT, OFF(mini_icon_hover_leave_ms),
-		SZ(mini_icon_hover_leave_ms), 23,
-		"指针离开图标 / 预览后多久收起来（毫秒）" },
-	{ "mini_icon_hover_grace_ms", K_INT, OFF(mini_icon_hover_grace_ms),
-		SZ(mini_icon_hover_grace_ms), 23,
-		"「从图标移向预览」的宽限期（毫秒），这段时间里不出预览也不收" },
-	{ "mini_icon_preview", K_BOOL, OFF(mini_icon_preview),
-		SZ(mini_icon_preview), 23,
-		"图标悬停预览开关" },
-	{ "mini_toolbar", K_BOOL, OFF(mini_toolbar), SZ(mini_toolbar), 23,
-		"悬停工具条开关（放大 / 收成迷你 / 收成图标那几个按钮）" },
-	{ "mini_edge_snap_px", K_INT, OFF(mini_edge_snap_px),
-		SZ(mini_edge_snap_px), 23,
-		"拖到屏边多少像素内算「贴边」（松手 = 收成图标）" },
-	{ "mini_fling_speed", K_INT, OFF(mini_fling_speed),
-		SZ(mini_fling_speed), 23,
-		"甩出速度阈值（逻辑像素 / 秒）：松手时指针速度超过它 = 甩出"
-		"（朝速度最近的那条边飞过去：那条边外侧有相邻输出就换屏保持形态，"
-		"没有就收成图标）。0 = 关掉甩出" },
-	{ "mini_transition_ms", K_INT, OFF(mini_transition_ms),
-		SZ(mini_transition_ms), 23,
-		"形态转换时长（毫秒，0 = 不做动画）" },
-	{ "mini_hover_fade_in_ms", K_INT, OFF(mini_hover_fade_in_ms),
-		SZ(mini_hover_fade_in_ms), 23,
-		"悬停预览淡入时长（毫秒）" },
-	{ "mini_hover_fade_out_ms", K_INT, OFF(mini_hover_fade_out_ms),
-		SZ(mini_hover_fade_out_ms), 23,
-		"悬停预览淡出时长（毫秒）" },
-	{ "mini_remember_size", K_BOOL, OFF(mini_remember_size),
-		SZ(mini_remember_size), 23,
-		"记住自由小窗的尺寸（false = 每次进自由小窗都用 mini_free_w/h 那对"
-		"初始比例）。迷你 / 图标态的尺寸永远跟配置，不受它影响" },
-	{ "mini_edge_margin", K_INT, OFF(mini_edge_margin),
-		SZ(mini_edge_margin), 23,
-		"迷你小窗离工作区边缘的最小留白（逻辑像素）；**自由小窗不吃这个留白**"
-		"（它是自由摆放的正常窗户，要能贴到工作区的边上）" },
-	{ "mini_preserve_buffer", K_BOOL, OFF(mini_preserve_buffer),
-		SZ(mini_preserve_buffer), 23,
-		"**迷你 / 图标态**要不要保留客户端原生分辨率：保留（默认 true）时合成器"
-		"缩放显示、不重配客户端；false = 按小窗尺寸重配客户端（省显存，但有的游戏"
-		"一 resize 就重置成窗口模式）。自由小窗**不受这个键影响**：它总是按盒子"
-		"尺寸 configure 客户端（客户端跟着重新排版）" },
-	{ "mini_aspect", K_STRING, OFF(mini_aspect), SZ(mini_aspect), 23,
-		"自由小窗的宽高比策略：\"auto\" / \"lock\" / \"free\"（默认 \"free\"）。"
-		"三个取值都是强制语义，优先级：键位 > 窗口规则 > 这个全局键。auto = 让"
-		"自动信号决定（X11 有 PAspect / min==max 提示就锁，否则 free）；lock / "
-		"free 显式压过自动信号。只对自由小窗有效 —— 迷你 / 图标态永远按内容比例" },
-	{ "mini_drag_threshold_px", K_INT, OFF(mini_drag_threshold_px),
-		SZ(mini_drag_threshold_px), 23,
-		"迷你态「单击 = 放大」vs「拖拽 = 移动」的位移阈值（逻辑像素）：指针按下"
-		"后走了这么多像素才算拖拽，没走到就松手当单击" },
 };
 
 /* ------------------------------------------------------------ 配置组
@@ -2519,43 +2430,6 @@ static void defaults(struct vidow_config *cfg) {
 	/* 默认开：录出来就该跟屏幕上看到的一样（关掉只有裸窗口内容，见 server.h） */
 	cfg->wincapture_decor = true;
 
-	/* 小窗（mini window，configs/24-mini.lua）：默认全开，尺寸都是「相对工作区
-	 * 的百分比」。比例锚点记在窗口自己身上，这些数只是各形态的尺寸与手感。 */
-	cfg->mini_enabled = true;
-	cfg->mini_drop_zone = true;
-	snprintf(cfg->mini_drop_zone_w, sizeof(cfg->mini_drop_zone_w), "15%%");
-	snprintf(cfg->mini_drop_zone_h, sizeof(cfg->mini_drop_zone_h), "20%%");
-	snprintf(cfg->mini_w, sizeof(cfg->mini_w), "28%%");
-	snprintf(cfg->mini_h, sizeof(cfg->mini_h), "28%%");
-	snprintf(cfg->mini_free_w, sizeof(cfg->mini_free_w), "40%%");
-	snprintf(cfg->mini_free_h, sizeof(cfg->mini_free_h), "45%%");
-	cfg->mini_icon_size = 64;
-	cfg->mini_icon_overflow = 0.35;
-	cfg->mini_icon_hover_ms = 250;
-	cfg->mini_icon_hover_leave_ms = 300;
-	cfg->mini_icon_hover_grace_ms = 200;
-	cfg->mini_icon_preview = true;
-	cfg->mini_toolbar = true;
-	cfg->mini_edge_snap_px = 24;
-	/* 甩出阈值 800 px/s：有意定位的慢拖通常 < 300 px/s，随手一甩 > 1500 px/s，
-	 * 800 落在中间偏保守的一侧（宁可把「有点快的拖」当拖，不要把它当甩 ——
-	 * 甩错了会收成图标，代价比「甩了没反应、得再拖一下」大）。 */
-	cfg->mini_fling_speed = 800;
-	cfg->mini_transition_ms = 260;
-	cfg->mini_hover_fade_in_ms = 120;
-	cfg->mini_hover_fade_out_ms = 150;
-	cfg->mini_remember_size = true;
-	cfg->mini_edge_margin = 8;
-	/* 默认 true：**迷你 / 图标态**保留客户端原生 buffer（缩略图呈现）。
-	 * 自由小窗不受它影响 —— 永远按盒子尺寸 configure 客户端，见
-	 * vidow_mini_preserve_buffer()。 */
-	cfg->mini_preserve_buffer = true;
-	/* 默认 "free"：自由小窗是**自由摆放的正常窗户**，改大小就该改客户端尺寸、
-	 * 不锁比例（用户报的「自由小窗默认应该不限制比例」）。要按自动信号锁就显式
-	 * 写 "auto"（X11 的 PAspect / min==max 提示才算数），"lock" 是强制锁。
-	 * 窗口规则 / 键位优先级照旧：键位 > 规则 > 这个键。 */
-	snprintf(cfg->mini_aspect, sizeof(cfg->mini_aspect), "free");
-	cfg->mini_drag_threshold_px = 4;
 
 	cfg->blur_enabled = true;
 	cfg->blur_all = true; /* tiled windows blur the wallpaper too */
@@ -3197,18 +3071,6 @@ static void print_keys_lua(FILE *f) {
 "vidow.bind(\"Mod+M\", \"minimize-window\")\n"
 "vidow.bind(\"Mod+Shift+M\", \"restore-window\")\n"
 "vidow.bind(\"Mod+O\", \"toggle-overview\")\n"
-"-- 小窗（mini window，见 configs/24-mini.lua）：形态的键盘通路。\n"
-"--   cycle-mini-state  三态循环：不在小窗态 / 自由 → 迷你 → 图标 → 自由 → 迷你 …\n"
-"--   mini-expand       单步放大：图标 → 迷你 → 自由（不在小窗态时 = 进迷你）\n"
-"--   mini-collapse     单步收拢：自由 → 迷你 → 图标\n"
-"--   unmini-window     还原成列（接回条带）—— 唯一的出口，循环里不出现\n"
-"-- 鼠标那条：拖窗口时每块屏右上角亮出**落点区**，松手 = 迷你小窗；把迷你小窗拖到\n"
-"-- 屏幕**内边缘**（外侧没有相邻输出的那条边）松手 = 收成图标；拖到**跨屏边**松手\n"
-"-- = 移到那块屏、保持形态。悬停迷你 / 图标会露出小工具条。\n"
-"vidow.bind(\"Mod+Shift+W\", \"cycle-mini-state\")\n"
-"vidow.bind(\"Mod+Shift+Up\", \"mini-expand\")\n"
-"vidow.bind(\"Mod+Shift+Down\", \"mini-collapse\")\n"
-"vidow.bind(\"Mod+Shift+Return\", \"unmini-window\")\n"
 "-- Alt+Tab：按住修饰键列出最近用过的窗口（一行预览），连点 Tab 换一个，松开就把\n"
 "-- 焦点给选中的那个；Esc 取消。样式 / 排版见 configs/15-mru.lua。\n"
 "vidow.bind(\"Alt+Tab\", \"next-window\")\n"

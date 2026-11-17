@@ -987,7 +987,7 @@ bool vidow_overview_click(struct vidow_server *server, double sx, double sy) {
 		 * vidow_focus_view()：它开头就把 MINI / ICON 挡回去了（不变量：focused
 		 * 永远不指小窗），于是全景里小窗那块格子点上去只有日志、焦点一点没动。 */
 		vidow_view_activate(hit);
-		vidow_focus_view_expand_mini(hit);
+		vidow_focus_view(hit);
 		/* 点下去就退出，但客户端从没收到这次按下；对应的松手也吃掉，
 		 * 免得它收到一个没有按下配对的 release。 */
 		ov->swallow_release = true;
