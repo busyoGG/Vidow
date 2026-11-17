@@ -496,9 +496,9 @@ void vidow_rule_look(const struct vidow_config *cfg,
  * 它直接铺满整块屏（摆位见 view.c 的 output_arrange，全屏窗口取整块输出框，
  * 不吃 gap、也不理状态栏的占位）。niri 同款：全屏窗口没有圆角。
  *
- * 注意「不画装饰」不等于「关掉 fx」：模糊、内容合成、离屏缓冲照旧走装饰着色器，
+ * 注意「不画装饰」不等于「关掉 fx」：内容合成、离屏缓冲照旧走装饰着色器，
  * 只是那几笔装饰参数是 0（见 decor_draw 的 u_radius / u_border_width /
- * u_shadow_* / u_noise）。 */
+ * u_shadow_* / u_noise）。模糊是例外：全屏连底衬也不采（见下）。 */
 void vidow_view_look(const struct vidow_config *cfg,
 		const struct vidow_rule_eff *eff, bool fullscreen,
 		struct vidow_look *out) {
@@ -510,6 +510,19 @@ void vidow_view_look(const struct vidow_config *cfg,
 	out->border_width = 0.0;
 	out->shadow_radius = 0.0;
 	out->noise = 0.0;
+	/* 背后也不给模糊。
+	 *
+	 * 全屏窗口盖满整块屏，糊谁都糊不到自己身上；可它自己的缓冲只要有一点
+	 * alpha（游戏在开场、切场景、菜单遮罩、Proton 的合成层，都是这样），
+	 * 装饰着色器就会把那片模糊底衬叠在内容后面 —— 屏上看到的是「整个游戏
+	 * 背景在糊」。用户报的「全屏游戏窗口也有背景模糊出现，不应该」就是它。
+	 *
+	 * 放在这里而不是渲染时临门一脚，是因为这份 look 还被
+	 * view_wants_blur_ever() 读：那边决定要不要为这个窗口抓私有底衬、跑
+	 * Kawase 金字塔。关掉之后全屏窗口省掉这些活，IPC 里的 look.blur 也跟
+	 * 「边框 / 圆角 / 阴影 / 噪点」一样报 0，语义一致。 */
+	out->blur = false;
+	out->blur_xray = false;
 }
 
 /* 这个目标该用多长的开合动画：全局时长打底，规则的 open_ms / close_ms 压上去，

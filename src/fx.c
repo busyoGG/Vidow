@@ -618,6 +618,27 @@ static bool view_content_opaque(struct vidow_view *view,
 		PIXMAN_REGION_IN;
 }
 
+/* 这个窗口（装饰后的盒子，布局坐标）把归属的那块输出盖满了没有。
+ *
+ * 给「背后要不要模糊」当判据：盖满整块屏的窗口糊不到自己身上，它的缓冲里那点
+ * alpha 透出来的只会是「整片背景在糊」。留 1 像素容差 —— 缩放和取整会让几何
+ * 偶尔差一个像素，差这一点不该翻判据。 */
+static bool view_covers_output(struct vidow_view *view) {
+	struct wlr_output *out = view->output;
+	if (out == NULL || view->server->output_layout == NULL) {
+		return false;
+	}
+	struct wlr_box obox;
+	wlr_output_layout_get_box(view->server->output_layout, out, &obox);
+	if (obox.width <= 0 || obox.height <= 0) {
+		return false;
+	}
+	return view->geom.x <= obox.x + 1 &&
+		view->geom.y <= obox.y + 1 &&
+		view->geom.x + view->geom.width >= obox.x + obox.width - 1 &&
+		view->geom.y + view->geom.height >= obox.y + obox.height - 1;
+}
+
 /* A window only needs blur when something can show through it. Floating
  * windows always can; tiled ones only when blur_all is set, because their
  * backdrop is the wallpaper and the layer surfaces. */
@@ -628,6 +649,18 @@ static bool view_wants_blur_ever(struct vidow_view *view) {
 	/* blur 那条规则在这里生效：false = 这个窗口背后不模糊（视频、终端那种
 	 * 「糊了更难看」的），true = 平铺也模糊（等于给这一个窗口开 blur_all）。 */
 	if (!look.blur || !view->mapped) {
+		return false;
+	}
+	/* 铺满整块屏的窗口背后也不给模糊。
+	 *
+	 * 只看 view->fullscreen 不够：游戏走 Proton / 无边框窗口时，客户端根本
+	 * 没要过 xdg_toplevel 的 fullscreen，合成器也就不该把它当全屏 —— 可它
+	 * 确实把整块屏盖满了，缓冲里那点 alpha（开场、过场、菜单遮罩）透出来的
+	 * 就是这片屏的模糊底衬，屏上一眼就是「整个游戏背景在糊」。
+	 *
+	 * 判据用「装饰后的窗口盒子把这块输出盖满没有」：盖满了就糊不到自己身上，
+	 * 平铺窗口涨满一列时同理。没盖满的照旧走模糊。 */
+	if (view_covers_output(view)) {
 		return false;
 	}
 	/* overview 里不采样背景模糊：UV 是按窗口自己的位置算的，窗口缩小之后对不上。
