@@ -1061,6 +1061,15 @@ void vidow_jelly_tick(struct vidow_server *server, int64_t now_ns) {
 			if (slot->node == NULL) {
 				continue;
 			}
+			/* 这一格画的就是装饰节点那张缓冲（只是弯了）：装饰节点必须让位，
+			 * 否则同一份内容画两遍 —— 45% 透明的窗口，底衬会从 63 掉到 41
+			 * （等效 alpha 1-(1-0.45)^2 = 0.70，实测暗态正好是这个值），
+			 * 松手前后还在 41 / 63 之间来回跳，看着就是「一拖就闪」。
+			 * fx.c 那边每帧也会写 0，但抓帧恢复 / 动画收尾会把它写回 1.0，
+			 * 这里每帧再压一次最省事（只在果冻期间为真）。 */
+			if (slot->bs != NULL && slot->bs->node != NULL) {
+				wlr_scene_buffer_set_opacity(slot->bs->node, 0.0f);
+			}
 			struct wlr_box nb = {
 				.x = slot->rel_x - (int)lround(JELLY_MARGIN),
 				.y = slot->rel_y - (int)lround(JELLY_MARGIN),
