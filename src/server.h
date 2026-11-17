@@ -1126,6 +1126,20 @@ struct vidow_blur_slot {
 	float mask_saved_opacity;
 	bool capture_enabled;
 	bool dec_valid;          /* Cached decoration was successfully rendered. */
+	/* **这一格自己的底衬版本号**（per-slot，别跟 fx->blur_ver 那个单值混）。
+	 *
+	 * fx->blur_ver 是每窗口一个号，可底衬是按屏分格的：窗口横跨两块屏时，
+	 * 两块屏各给 fx->blur_ver 加一次，帧循环那条「全局号变了就重烘」就永远
+	 * 成立 —— 实测（2026-11-18 用复现脚本 exp-flicker.sh）两块屏每帧都把
+	 * 背景窗口重烘一遍，屏幕上在「模糊 / 不透明」之间一直闪。
+	 *
+	 * ver 由 blur_assign() 写这一格时加，drawn_ver 由烘成功时抄过去；
+	 * 帧循环只看「本屏这一格：drawn_ver != ver」。 */
+	unsigned ver, drawn_ver;
+	/* **这一格自己的内容版本号**。bake_revision 是每窗口单值，两块屏每帧
+	 * 各推进一次，按屏缓存的 dec_revision 永远对不上 → 每帧重烘（跟 ver 同一
+	 * 个病）。rev 由 vidow_fx_bump_revision() 统一推进。 */
+	uint64_t rev;
 	uint64_t dec_revision, dec_blur_ver;
 	double dec_output_scale;
 	struct wlr_box dec_output_box;
@@ -4374,6 +4388,8 @@ bool vidow_inject_text(struct vidow_server *server, const char *text, char *err,
 		size_t errlen);
 /* 区域变了要重画一次：贴图身份没变，不主动失效帧循环不会动。 */
 void vidow_view_blur_invalidate(struct vidow_view *view);
+/* 版本号推进：全局那个单值 + 每一格自己的那个（见 fx.c 里那段注释）。 */
+void vidow_fx_bump_revision(struct vidow_fx_target *fx);
 /* 从 wlr_surface（含子表面）找回它的窗口，找不到返回 NULL。 */
 struct vidow_view *vidow_view_from_surface(struct vidow_server *server,
 		struct wlr_surface *surface);

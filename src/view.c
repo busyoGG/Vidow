@@ -2498,7 +2498,7 @@ static void view_anim_place(struct vidow_view *view) {
  * 底衬错位，因为 u_origin 是烘死的。真要省这笔钱，得把 u_origin 从烘死的
  * uniform 改成每帧传进去的 —— 那是另一层改动。 */
 void vidow_view_apply_anim_place(struct vidow_view *view) {
-	view->fx.bake_revision++;
+	vidow_fx_bump_revision(&view->fx);
 	view_anim_place(view);
 }
 
@@ -2677,7 +2677,7 @@ void vidow_view_apply_anim(struct vidow_view *view) {
 			view->fx.blur_ver,
 			view->anim_open != NULL ? 1 : 0, view->jelly != NULL ? 1 : 0);
 	}
-	view->fx.bake_revision++;
+	vidow_fx_bump_revision(&view->fx);
 	view_anim_place(view);
 	vidow_view_anim_bake(view);
 }

@@ -1209,6 +1209,8 @@ void blur_assign(struct vidow_fx_target *fx, struct wlr_output *out,
 		slot->ry = ry;
 		slot->rw = rw;
 		slot->rh = rh;
+		/* 这一格自己的号也跟着加：帧循环按本屏这一格判「画过没有」。 */
+		slot->ver++;
 		fx->blur_ver++;
 		blur_ver_hits[2665]++;
 		return;
@@ -1868,12 +1870,18 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 	wlr_scene_buffer_set_source_box(node, cropped ? &crop_src : NULL);
 
 	/* This buffer now contains this blur version: the frame loop only has to
-	 * redraw when a later frame hands the window a different backdrop. */
+	 * redraw when a later frame hands the window a different backdrop.
+	 *
+	 * **记到格子自己的号上**（instance->ver），不是每窗口那个单值 —— 单值
+	 * 在两块屏各格的窗口上永远落后，帧循环就每帧重烘（闪）。 */
 	fx->blur_drawn = fx->blur_ver;
 	if (instance != NULL) {
+		instance->drawn_ver = instance->ver;
+	}
+	if (instance != NULL) {
 		instance->dec_valid = true;
-		instance->dec_revision = fx->bake_revision;
-		instance->dec_blur_ver = fx->blur_ver;
+		instance->dec_revision = instance->rev;
+		instance->dec_blur_ver = instance->ver;
 		instance->dec_output_scale = instance->out->scale;
 		wlr_output_layout_get_box(server->output_layout, instance->out,
 			&instance->dec_output_box);
@@ -1886,6 +1894,20 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 }
 /* 区域之类「只影响着色器输出、贴图没换」的变化要显式失效一次，
  * 否则帧循环看到 blur_drawn == blur_ver 就不重画了。 */
+/* **每窗口单值的版本号要同时推进到每一格上。**
+ *
+ * bake_revision 原来只有一份，帧循环每块屏都调一次 apply_anim → 两块屏各推进
+ * 一次；而按屏缓存的装饰记的是「烘的时候那个号」，于是这一块屏的 dec 永远比
+ * 全局号小一 —— 每帧判「要重烘」，两块屏轮流把同一个窗口烘爆（屏幕上一片
+ * 模糊 / 不透明来回闪，用户 2026-11-18 报的那个）。改成「谁烘的记谁那一格的
+ * 号」，两块屏各走各的，收敛。 */
+void vidow_fx_bump_revision(struct vidow_fx_target *fx) {
+	fx->bake_revision++;
+	for (struct vidow_blur_slot *sl = fx->blur_slot; sl != NULL; sl = sl->next) {
+		sl->rev++;
+	}
+}
+
 void vidow_view_blur_invalidate(struct vidow_view *view) {
 	if (!view->fx.active) {
 		return;
@@ -2369,12 +2391,23 @@ static bool view_region_build(struct vidow_server *server,
 	}
 	view_set_capture_visible(view, false);
 	layer_blur_capture_visible(server, false);
+	/* **这块屏自己的**布局原点（设备像素），不是 server->output_x/y。
+	 *
+	 * 那两个是「最后渲染的那块屏」留下的全局量（见 output.c 里那两行的说明）：
+	 * 两屏同帧刷新时后渲染的会把前面的覆盖掉。抓私有底衬时按它算源坐标，
+	 * 跨屏那块窗口抓进来的内容就整体横移一屏 —— 屏幕上是一条条横纹（用户
+	 * 2026-11 报的「跨过去之后采样到的还是旧屏，坐标超出屏幕就成了横条」）。
+	 * view_region_rect 里早就是按这块屏现算的了，这里漏了同一处。 */
+	struct wlr_box ob = {0};
+	wlr_output_layout_get_box(server->output_layout, output->wlr_output, &ob);
+	int my_out_x = (int)lround((double)ob.x * scale);
+	int my_out_y = (int)lround((double)ob.y * scale);
 	struct backdrop_ctx ctx = {
 		.pass = pass,
 		.server = server,
 		.scale = scale,
-		.ox = server->output_x + rx,
-		.oy = server->output_y + ry,
+		.ox = my_out_x + rx,
+		.oy = my_out_y + ry,
 		/* 只画要抓的那一块（partial 时就是损伤那一小块）：底衬别的像素一个都
 		 * 不碰，其余部分还是上一版的内容。 */
 		.clip_x = bx1 - rx,
@@ -3084,8 +3117,8 @@ static void view_bake_for_output(struct vidow_server *server,
 			output->wlr_output, false);
 		if (sl != NULL && sl->dec_valid && sl->node != NULL &&
 				sl->node->node.enabled &&
-				sl->dec_revision == view->fx.bake_revision &&
-				sl->dec_blur_ver == view->fx.blur_ver &&
+				sl->dec_revision == sl->rev &&
+				sl->dec_blur_ver == sl->ver &&
 				sl->dec_output_scale == output->wlr_output->scale &&
 				sl->dec_output_box.x == ob.x && sl->dec_output_box.y == ob.y &&
 				sl->dec_output_box.width == ob.width &&
@@ -3095,8 +3128,8 @@ static void view_bake_for_output(struct vidow_server *server,
 					"rev=%u/%u blur=%u/%u",
 					vidow_view_title(view) != NULL ?
 						vidow_view_title(view) : "(无题)",
-					sl->dec_revision, view->fx.bake_revision,
-					sl->dec_blur_ver, view->fx.blur_ver);
+					sl->dec_revision, sl->rev,
+					sl->dec_blur_ver, sl != NULL ? sl->ver : 0);
 			}
 			continue;
 		}
@@ -3109,8 +3142,9 @@ static void view_bake_for_output(struct vidow_server *server,
 				sl != NULL && sl->node != NULL ?
 					sl->node->node.enabled : -1,
 				sl != NULL ? sl->dec_revision : 0,
-				view->fx.bake_revision,
-				sl != NULL ? sl->dec_blur_ver : 0, view->fx.blur_ver);
+				sl != NULL ? sl->rev : 0,
+				sl != NULL ? sl->dec_blur_ver : 0,
+				sl != NULL ? sl->ver : 0);
 		}
 		/* **烘完把 bake_output 还回去。**
 		 *
@@ -3406,8 +3440,20 @@ bool decor_draw(struct vidow_server *server,
 	if (bs != NULL) {
 		out_x = bs->ox; out_y = bs->oy;
 		out_w = bs->ow; out_h = bs->oh;
-		rg_x = bs->rx; rg_y = bs->ry;
-		rg_w = bs->rw; rg_h = bs->rh;
+		/* **格子里的 rx..rh 只在「私有底衬」那条路上写过**（blur_assign
+		 * 带 region 参数时）；共享底衬（整屏抓的那份）传的是 NULL，
+		 * 格子里的区域一直是 0x0。
+		 *
+		 * 照抄 0x0 进着色器 = 除零 → 整个窗口采到贴图外面，屏幕上就是一整块
+		 * 黑 / 一条条横条（2026-11-18 span 探针实测：region=0,0 0x0）。区域
+		 * 没写过的格子按「整屏」算，那块贴图本来就是整屏抓的。 */
+		if (bs->rw > 0 && bs->rh > 0) {
+			rg_x = bs->rx; rg_y = bs->ry;
+			rg_w = bs->rw; rg_h = bs->rh;
+		} else {
+			rg_x = 0; rg_y = 0;
+			rg_w = out_w; rg_h = out_h;
+		}
 	}
 
 	/* 尺寸取**这一帧那一格**（跨屏时两块屏各一对，尺寸差一倍）。 */

@@ -282,14 +282,19 @@ void vidow_output_render(struct vidow_output *output) {
 		 *
 		 * 所以这里加一条：这一屏那一格的 dec_blur_ver 落后于全局 blur_ver
 		 * 也算要重烘。格子还没建（没跟这块屏碰过）不归这趟管。 */
-		bool stale_here = false;
-		if (view->fx.blur_drawn != view->fx.blur_ver) {
-			stale_here = true;
-		} else if (view->fx.bake_output == output->wlr_output) {
-			struct vidow_blur_slot *sl = blur_slot_for(&view->fx,
-				output->wlr_output, false);
-			stale_here = sl != NULL && sl->node != NULL &&
-				sl->dec_blur_ver != view->fx.blur_ver;
+		/* **判据只看本屏这一格自己的版本号**（per-slot）：
+		 *
+		 * 原来用 blur_drawn != blur_ver 那个每窗口单值 —— 窗口横跨两块屏
+		 * 时两块屏各给 blur_ver 加一次，单值永远追不上，于是每帧都判「要
+		 * 重烘」，两块屏轮着把同一个窗口烘爆，屏幕上就是一直闪（模糊 /
+		 * 不透明交替）。单值只留给没有格子的那条老路。 */
+		struct vidow_blur_slot *sl = blur_slot_for(&view->fx,
+			output->wlr_output, false);
+		bool stale_here;
+		if (sl != NULL && sl->node != NULL) {
+			stale_here = sl->drawn_ver != sl->ver;
+		} else {
+			stale_here = view->fx.blur_drawn != view->fx.blur_ver;
 		}
 		if (stale_here) {
 			if (getenv("VIDOW_DMG_WHY") != NULL) {
@@ -297,19 +302,23 @@ void vidow_output_render(struct vidow_output *output) {
 				int64_t rb_now = vidow_now_ns();
 				if (rb_now - rb_last > 200000000LL) {
 					rb_last = rb_now;
-					wlr_log(WLR_INFO, "REBAKE %s drawn=%u ver=%u",
+					wlr_log(WLR_INFO, "REBAKE %s drawn=%u ver=%u out=%s",
 						vidow_view_title(view) != NULL ?
 							vidow_view_title(view) : "(无题)",
-						view->fx.blur_drawn, view->fx.blur_ver);
+						sl != NULL ? sl->drawn_ver : view->fx.blur_drawn,
+						sl != NULL ? sl->ver : view->fx.blur_ver,
+						output->wlr_output->name);
 				}
 			}
 			if (pump_trace_on()) {
-				wlr_log(WLR_INFO, "PUMPTRACE 每帧重烘: %s drawn=%u ver=%u "
-					"rev=%u",
+				wlr_log(WLR_INFO, "PUMPTRACE 每帧重烘: %s out=%s "
+					"drawn=%u ver=%u rev=%u slot=%p",
 					vidow_view_title(view) != NULL ?
 						vidow_view_title(view) : "(无题)",
-					view->fx.blur_drawn, view->fx.blur_ver,
-					view->fx.bake_revision);
+					output->wlr_output->name,
+					sl != NULL ? sl->drawn_ver : view->fx.blur_drawn,
+					sl != NULL ? sl->ver : view->fx.blur_ver,
+					view->fx.bake_revision, (void *)sl);
 			}
 			vidow_view_apply_anim(view);
 		}
