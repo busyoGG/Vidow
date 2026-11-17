@@ -1456,6 +1456,28 @@ X11 没有 per-window 的缓冲区缩放，所以：
    - 两块屏上的物理尺寸一样（逻辑尺寸一样，而 scale ∝ ppi）
 4. 命中坐标按同一比例换回来：`局部 = (布局坐标 - 窗口原点) × S`，点哪儿就是哪儿。
 
+259. **退出全屏后状态栏回来了、可用区却没变（窗口铺在栏底下）**（用户报「偶尔会出现从全屏
+     状态退出后，bar 显示了但工作区排除区域没有生效的 bug」）。状态栏进全屏的常规做法是
+     `exclusiveZone = 0`（让全屏窗口真铺满），退出全屏再变回 42 —— **表面一直是同一块，
+     中间没有 unmap / map**。而 vidow 只在 `initial_commit` 里调 `vidow_arrange_layers()`
+     重算 `usable_area`，之后独占区的变化没人管：那块屏的可用区一直停在「整屏」，窗口
+     于是铺到状态栏底下。
+
+     修法：`layer_surface_commit` 里比两个整数（`current.exclusive_zone` /
+     `current.layer`）和上次记下的值，变了就 `vidow_arrange_layers()` + `vidow_arrange()`
+     并打一行 INFO。这个处理器每帧都跑（动画中的状态栏每秒交几十帧），所以只做两次
+     比较，没变就什么都不干。
+
+     测试 `./test-layerez.sh`（5 项）：平铺窗口 + 一块顶栏（先独占区 0，1.2s 后改成 42，
+     **只重新 commit**）→ 可用区 `0,42 1280x678`、窗口 y 从 6 挪到 48、日志有
+     「独占区变了」。把修复回退掉跑一遍，后三项全红。
+
+     `tools/layerframes` 补三个探针开关：`VIDOW_TEST_LAYER_EZ`（初始独占区）、
+     `VIDOW_TEST_LAYER_EZ_AT_MS=毫秒:值`（到点改独占区并重新 commit，不重新 map）、
+     `VIDOW_TEST_LAYER_ANCHOR=top`（顶栏锚点；原来是写死的底下那条）。
+
+     回归：layerghost / layermask / layerwin / fullscreen-scroll 全过。
+
 258. **快速连按换焦点时带子像被夹住：视口弹簧把速度清零重来了**（用户报「窗口焦点
      快速切换的时候有时候像是被夹住一样过渡时长太长（像是一个一个窗口过渡一样）」）。
      视口横向滚动用的是弹簧曲线（`viewport_easing = "spring 0.6 370"` ≈ 798ms），

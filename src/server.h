@@ -2310,6 +2310,15 @@ struct vidow_layer_surface {
 	uint32_t layer;
 	/* 上次钉给客户端的 buffer scale（见 layer.c 的 layer_pin_scale）。0 = 还没发。 */
 	int pref_scale;
+	/* **上一次见到的独占区 / 层**。客户端改 exclusive_zone 不会重新 map ——
+	 * 状态栏就是这么进全屏的（exclusiveZone = 0，退出再变回来）。这两个值
+	 * 变了就得重算 output->usable_area（见 layer.c 的 layer_surface_commit），
+	 * 否则退出全屏之后窗口还铺在状态栏底下（用户报的「bar 显示了但工作区
+	 * 排除区域没有生效」）。初值是 0/0 没关系：第一次 commit 走的是
+	 * initial_commit 那一支（那里本来就会 arrange 一遍），记完值之后的变化
+	 * 才会进这条快路径。 */
+	int lay_ez;
+	uint32_t lay_layer;
 	/* 图层规则算出来的作用（rule.c 填）。 */
 	struct vidow_rule_eff rule_eff;
 	/* 上一次 layer 模糊没画成的**原因**（fx.c 的 layer_blur_frame 填）：

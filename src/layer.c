@@ -694,6 +694,33 @@ static void layer_surface_commit(struct wl_listener *listener, void *data) {
 	struct vidow_server *server = ls->server;
 
 	layer_pin_scale(ls);
+	/* **独占区 / 层变了 ⇒ 可用区要重算（哪怕没重新 map）。**
+	 *
+	 * vshell 的顶栏就是靠这条活的：进全屏时 exclusiveZone = 0（让全屏窗口真
+	 * 铺满），退出全屏再变回 42 —— 表面一直是同一块，中间没有 unmap / map。
+	 * 以前这里只在 initial_commit 里调 vidow_arrange_layers()，之后的变化没人
+	 * 管：那块屏的 usable_area 一直停在「整屏」，窗口于是铺到状态栏底下
+	 * （用户报的「偶尔会出现从全屏状态退出后，bar 显示了但工作区排除区域没有
+	 * 生效」）。
+	 *
+	 * 判据只比两个整数：这个处理器每帧都跑（动画中的状态栏每秒交几十帧），
+	 * 不能在这儿做重活。真变了才重排一次。 */
+	{
+		int ez = ls->layer_surface->current.exclusive_zone;
+		uint32_t lyr = ls->layer_surface->current.layer;
+		bool ez_changed = ez != ls->lay_ez || lyr != ls->lay_layer;
+		ls->lay_ez = ez;
+		ls->lay_layer = lyr;
+		if (ez_changed && !ls->layer_surface->initial_commit) {
+			vidow_arrange_layers(server);
+			vidow_arrange(server);
+			wlr_log(WLR_INFO,
+				"layer %s 独占区变了（%d, layer %u）→ 重算可用区",
+				ls->layer_surface->namespace != NULL ?
+					ls->layer_surface->namespace : "?", ez,
+				lyr);
+		}
+	}
 	/* The first configure must reflect the state the client just committed
 	 * (anchor, exclusive zone, desired size). */
 	if (ls->layer_surface->initial_commit) {

@@ -52,6 +52,11 @@ static struct wl_buffer *show_buffer;
 static void *clear_pixels;
 static void *show_pixels;
 static int width = 800, height = 200;
+/* 独占区（见 main 里的 VIDOW_TEST_LAYER_EZ / VIDOW_TEST_LAYER_EZ_AT_MS）。 */
+static int ez_initial = 0;
+static int ez_change_ms = -1;
+static int ez_change_to = 0;
+static bool ez_changed = false;
 
 static int frames;
 static struct timespec start;
@@ -216,6 +221,24 @@ int main(int argc, char *argv[]) {
 	if (show_env != NULL) {
 		show_after_ms = atoi(show_env);
 	}
+	/* 独占区：初始值 + 「过了 N 毫秒改成 M」（**不重新 map，只重新 commit**
+	 * —— 真机的状态栏就是这么干的：进全屏 exclusiveZone = 0，退出再变回来）。
+	 * 量「可用区跟不跟着变」用得上（test-layerez.sh）。 */
+	const char *ez_env = getenv("VIDOW_TEST_LAYER_EZ");
+	if (ez_env != NULL) {
+		int v = atoi(ez_env);
+		if (v > 0) {
+			ez_initial = v;
+		}
+	}
+	const char *ez_at_env = getenv("VIDOW_TEST_LAYER_EZ_AT_MS");
+	if (ez_at_env != NULL) {
+		int ms = 0, v = 0;
+		if (sscanf(ez_at_env, "%d:%d", &ms, &v) == 2 && ms >= 0 && v >= 0) {
+			ez_change_ms = ms;
+			ez_change_to = v;
+		}
+	}
 	const char *size_env = getenv("VIDOW_TEST_LAYER_FRAMES_SIZE");
 	if (size_env != NULL) {
 		int w = 0, h = 0;
@@ -261,11 +284,20 @@ int main(int argc, char *argv[]) {
 		NULL);
 	zwlr_layer_surface_v1_set_size(layer_surface, (uint32_t)width,
 		(uint32_t)height);
-	zwlr_layer_surface_v1_set_anchor(layer_surface,
-		ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM |
+	/* 锚点：默认底下那条（原来的行为）；VIDOW_TEST_LAYER_ANCHOR=top 换成
+	 * 顶上那条 —— 真机的状态栏是顶栏，「独占区从上边扣」才是要测的那条路。 */
+	uint32_t anchor = ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM |
 		ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT |
-		ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT);
-	zwlr_layer_surface_v1_set_exclusive_zone(layer_surface, 0);
+		ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT;
+	const char *anchor_env = getenv("VIDOW_TEST_LAYER_ANCHOR");
+	if (anchor_env != NULL && strcmp(anchor_env, "top") == 0) {
+		anchor = ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP |
+			ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT |
+			ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT;
+	}
+	zwlr_layer_surface_v1_set_anchor(layer_surface, anchor);
+	zwlr_layer_surface_v1_set_exclusive_zone(layer_surface,
+		(uint32_t)ez_initial);
 	zwlr_layer_surface_v1_set_keyboard_interactivity(layer_surface,
 		ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE);
 	wl_surface_commit(surface);
@@ -293,6 +325,22 @@ int main(int argc, char *argv[]) {
 			}
 			if (remain > 1000) {
 				remain = 1000;
+			}
+		}
+		/* 到点了就改独占区并**重新 commit**（不重新 map）—— 对着测
+		 * 「客户端改了独占区，合成器的可用区跟不跟」。 */
+		if (ez_change_ms >= 0 && !ez_changed) {
+			int left = ez_change_ms - ms_since_start();
+			if (left <= 0) {
+				zwlr_layer_surface_v1_set_exclusive_zone(layer_surface,
+					(uint32_t)ez_change_to);
+				wl_surface_commit(surface);
+				ez_changed = true;
+				fprintf(stderr,
+					"layerframes: exclusive_zone -> %d @%dms\n",
+					ez_change_to, ms_since_start());
+			} else if (left < remain) {
+				remain = left;
 			}
 		}
 		struct pollfd pfd = {
