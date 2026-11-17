@@ -842,10 +842,6 @@ void vidow_mini_set_state(struct vidow_view *view, enum vidow_mini_state state) 
 	if (state == VIDOW_MINI_MINI || state == VIDOW_MINI_ICON) {
 		vidow_view_yield_focus_for_mini(view);
 	}
-	/* 小窗（S4）：形态一变，悬停工具条就收掉（它的位置是照**上一个**形态的
-	 * 盒子算的，留着会画在一个已经不在那儿的窗口旁边）。下一次指针动会重新
-	 * 露出来。 */
-	vidow_mini_toolbar_hide(server);
 	/* 小窗（S5）：形态一变，悬停预览也收掉（预览画的是**上一个**形态旁边的
 	 * 那块，留着会停在已经不在那儿的图标旁边）。 */
 	vidow_mini_preview_hide(server);

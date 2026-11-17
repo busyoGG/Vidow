@@ -653,8 +653,6 @@ void vidow_float_grab_update(struct vidow_server *server, double lx,
 	/* 同上：浮动拖拽的落位是推迟到帧里做的，帧一停它一点都不动，所以这里
 	 * 必须保证「就算后端不给帧事件，帧也照出」（见 output.c 的 anim_watchdog）。 */
 	vidow_output_kick_watchdog(server);
-	/* 小窗（S4）落点区：拖动中随时算（只在光标落进去的时候才亮）。 */
-	vidow_mini_drop_zone_update(server);
 }
 
 void vidow_float_end_grab(struct vidow_server *server) {
@@ -682,25 +680,8 @@ void vidow_float_end_grab(struct vidow_server *server) {
 	if (view != NULL) {
 		vidow_jelly_release(view);
 	}
-	/* 小窗（S4）落点区：松手时光标在不在里面，先记下来（下面那些分支都会提前
-	 * return，收尾只能在这儿做一次）。 */
-	bool drop_zone = vidow_mini_drop_zone_hit(server, server->cursor->x,
-		server->cursor->y);
-	vidow_mini_drop_zone_hide(server);
-
 	if (view == NULL || view->popup ||
 			view->float_mode == VIDOW_FLOAT_NONE) {
-		return;
-	}
-
-	/* 小窗（S4）主入口：把**自由小窗 / 浮窗**拖进落点区松手 → 迷你小窗（用户
-	 * 要的「拖窗口时在每块屏右上角亮出落点区，松手 → 迷你小窗」在浮窗这条路
-	 * 也一样）。 */
-	if (drop_zone) {
-		wlr_log(WLR_INFO, "mini: 拖拽落进落点区 → %s 变迷你小窗",
-			vidow_view_title(view) != NULL ?
-				vidow_view_title(view) : "?");
-		vidow_mini_set_state(view, VIDOW_MINI_MINI);
 		return;
 	}
 

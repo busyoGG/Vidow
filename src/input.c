@@ -1511,12 +1511,6 @@ static void focus_follows_mouse(struct vidow_server *server,
 	 * 「窗口焦点移动后…否则会和焦点切换有冲突」）。离开再回来 = 变了，才跟。 */
 	struct vidow_view *prev_hover = server->hovered_view;
 	server->hovered_view = hit;
-	/* 小窗（S2）：迷你 / 图标**不跟**（和锁屏那条同一个位置、同一个形状）。
-	 * 它们不接键盘，鼠标扫过屏幕边缘时不该把焦点从正在打字的窗口上拽走。 */
-	if (hit != NULL && (hit->mini == VIDOW_MINI_MINI ||
-			hit->mini == VIDOW_MINI_ICON)) {
-		return;
-	}
 	/* **弹出物也不跟。** 和上面小窗同一个理由、同一个位置。
 	 *
 	 * X11 的菜单 / 提示是 override-redirect 窗口，它靠 X 自己的 grab 收指针
@@ -1691,244 +1685,12 @@ static void focus_follows_mouse(struct vidow_server *server,
 	vidow_focus_view(hit);
 }
 
-/* ================================================ 小窗（mini window，S2）
- *
- * 迷你 / 图标态**不把任何输入转给客户端**（键盘靠 view.c 的焦点守卫，指针靠这里），
- * 但合成器自己仍然认得它：单击 = 放大（图标 -> 迷你，迷你 -> 自由小窗），拖拽 =
- * 移动它。自由小窗（FREE）照常收输入，这条分流不碰它。
- *
- * ⚠️ 和会话锁（S3）那套**方向相反**：锁屏是「每个入口第一行整条短路」（连命中测试
- * 都不跑），这里是「命中照跑（vidow_view_at 必须能命中迷你态 —— 单击要能放大，
- * 这是和锁屏唯一相反的地方），只有**转给客户端那一份**吞掉」。所以分流点放在命中
- * 测试之后，不在函数第一行。
- *
- * 单击 vs 拖拽按**累计位移**（hypot(dx,dy)，不是每帧增量 —— 慢速拖拽每帧只动 1px，
- * 按增量永远跨不过阈值）和 mini_drag_threshold_px（默认 4 逻辑像素）区分：
- *   ≤ 阈值 松手 = 单击 = 放大；> 阈值 = 拖拽（单向不回退，判成拖拽就锁到松手，
- *   否则慢速拖出去再拖回来会在松手那一刻突然放大）。
- */
-
-/* 这个窗口现在是不是「只看不摸」的形态（迷你 / 图标）。 */
-static bool mini_swallows_input(const struct vidow_view *view) {
-	return view != NULL && (view->mini == VIDOW_MINI_MINI ||
-		view->mini == VIDOW_MINI_ICON);
-}
-
-/* 把客户端那一份指针焦点清掉：光标底下的窗口换成小窗了，它不该再收 enter /
- * motion（只清别人的，没拿着焦点就什么都不做）。 */
-static void mini_pointer_clear_client_focus(struct vidow_server *server) {
-	if (server->seat->pointer_state.focused_surface != NULL) {
-		wlr_seat_pointer_notify_clear_focus(server->seat);
-	}
-}
-
-/* 拖拽中：把窗口挪到「按下点 + 位移」，再折回**比例锚点**（小窗的位置语义就是
- * 比例锚点，见 float.c 的 vidow_mini_resolve_geom）—— 不直接写 float_geom，
- * 那样下一次 arrange 会被锚点算回来。 */
-static void mini_grab_update(struct vidow_server *server) {
-	struct vidow_view *view = server->mini_grab_view;
-	if (view == NULL) {
-		return;
-	}
-	if (!server->mini_grab_dragging) {
-		double dx = server->cursor->x - server->mini_grab_press_x;
-		double dy = server->cursor->y - server->mini_grab_press_y;
-		double threshold = (double)server->config.mini_drag_threshold_px;
-		if (threshold < 0.0) {
-			threshold = 0.0;
-		}
-		if (hypot(dx, dy) <= threshold) {
-			return; /* 还没越过阈值：当它还是单击，什么都不做 */
-		}
-		server->mini_grab_dragging = true; /* 单向：判成拖拽就锁到松手 */
-	}
-	struct wlr_box work = vidow_work_area(server, view->output);
-	if (work.width < 1 || work.height < 1) {
-		return;
-	}
-	double x = server->cursor->x - server->mini_grab_dx;
-	double y = server->cursor->y - server->mini_grab_dy;
-	/* 锚点 0 = 贴工作区左 / 上边，1 = 贴右 / 下边。迷你态**和自由态一样**允许
-	 * 越界（allow_over = true）—— 用户原话「迷你态在工作区有左右死区，无法拖拽
-	 * 过去，自由态可以拖过去」，两者就该一模一样。 */
-	/* 光标在哪块屏上就换归属（和自由态一样）：不换的话迷你态永远拖不到邻屏
-	 * —— 用户：「无法拖拽到另一个屏幕」。 */
-	struct wlr_output *under = wlr_output_layout_output_at(
-		server->output_layout, server->cursor->x, server->cursor->y);
-	if (under != NULL && under != view->output) {
-		vidow_mini_drag_to_output(server, view, under,
-			server->cursor->x, server->cursor->y);
-		vidow_arrange(server);
-		return;
-	}
-	vidow_mini_anchor_from(view, work, view->float_geom.width,
-		view->float_geom.height, x, y, true);
-	if (view->mini == VIDOW_MINI_ICON) {
-		/* 图标吸附：永远贴最近那条工作区边 —— 那条轴上钉死在边上，另一轴跟着
-		 * 光标（所以还能沿边上下 / 左右挪）；出屏方向也跟着这条边（resolve 里
-		 * 按 mini_edge 让 mini_icon_overflow 那点探出屏外）。用户：
-		 * 「icon态需要吸附在屏幕边缘」。 */
-		enum vidow_mini_edge e = vidow_mini_nearest_edge(server, view,
-			view->float_geom.width, view->float_geom.height, x, y);
-		view->mini_edge = e;
-		switch (e) {
-		case VIDOW_MINI_EDGE_LEFT:
-			view->mini_ax = 0.0;
-			break;
-		case VIDOW_MINI_EDGE_RIGHT:
-			view->mini_ax = 1.0;
-			break;
-		case VIDOW_MINI_EDGE_TOP:
-			view->mini_ay = 0.0;
-			break;
-		case VIDOW_MINI_EDGE_BOTTOM:
-			view->mini_ay = 1.0;
-			break;
-		case VIDOW_MINI_EDGE_NONE:
-			break;
-		}
-	}
-	vidow_mini_resolve_geom(view);
-	vidow_arrange(server);
-}
-
-/* 指针按在窗口上。返回 true = 这个按下被小窗吃掉（调用方立刻 return，客户端收
- * 不到任何指针事件）。左键额外起「单击 / 拖拽」判定（见本节顶上那段）。 */
-static bool mini_pointer_press(struct vidow_server *server,
-		struct vidow_view *view, uint32_t button) {
-	if (!mini_swallows_input(view)) {
-		return false;
-	}
-	/* 非左键（中键 / 右键 / 侧键）：照吞，不做任何事 —— 「迷你 / 图标收不到
-	 * 任何输入」是死规矩，不按按钮分。 */
-	if (button != BTN_LEFT) {
-		return true;
-	}
-	/* 小窗（S4）悬停工具条：按下点落在某个按钮上 → 直接做那个动作，不起拖拽。
-	 * 工具条不是表面，命中靠矩形（vidow_mini_toolbar_hit）—— 这里和绘制用的是
-	 * 同一份矩形（server->mini_toolbar_btn_box）。 */
-	int btn = vidow_mini_toolbar_hit(server, view, server->cursor->x,
-		server->cursor->y);
-	if (btn >= 0) {
-		vidow_mini_toolbar_press(server, view, btn);
-		/* 形态可能变了（还原成列 / 关掉 / 换档）：工具条收掉，免得留在
-		 * 一个已经不在小窗态的窗口上。 */
-		vidow_mini_toolbar_hide(server);
-		return true;
-	}
-	server->mini_grab_view = view;
-	server->mini_grab_button = button;
-	server->mini_grab_press_x = server->cursor->x;
-	server->mini_grab_press_y = server->cursor->y;
-	/* 按下点相对窗口左上角的偏移：拖拽时保持它，窗口才不会跳一下。 */
-	server->mini_grab_dx = server->cursor->x - view->float_geom.x;
-	server->mini_grab_dy = server->cursor->y - view->float_geom.y;
-	server->mini_grab_dragging = false;
-	return true;
-}
-
-/* 松手：判定单击还是拖拽。返回 true = 这次松手被吃掉（客户端收不到）。 */
-static bool mini_pointer_release(struct vidow_server *server, uint32_t button) {
-	struct vidow_view *view = server->mini_grab_view;
-	if (view == NULL) {
-		return false;
-	}
-	uint32_t grabbed = server->mini_grab_button;
-	bool dragging = server->mini_grab_dragging;
-	server->mini_grab_view = NULL;
-	server->mini_grab_dragging = false;
-	if (button != grabbed) {
-		return true; /* 别的键的松手：照吞，不结束这次判定 */
-	}
-	if (!dragging) {
-		/* 小窗（S5）甩出**逃生口**：位移没到 mini_drag_threshold_px 但松手速度
-		 * 够快 —— 一次很快的小幅甩动（< 4px）本来会被判成「单击 = 放大」，
-		 * 那和甩出直接冲突。速度优先：够快就算甩出，不是单击。 */
-		double vx = 0.0, vy = 0.0;
-		if (vidow_mini_fling_velocity(server, &vx, &vy) &&
-				vidow_mini_fling(server, view, vx, vy)) {
-			return true;
-		}
-		/* 单击 = 放大：图标 -> 迷你，迷你 -> 自由小窗（计划 T3 / T4）。
-		 * 自由小窗可交互，所以放大之后把焦点给它（vidow_mini_set_state 里
-		 * 对 MINI / ICON 会先交出焦点，FREE 不会 —— 这里是反向那一步）。 */
-		enum vidow_mini_state next = view->mini == VIDOW_MINI_ICON ?
-			VIDOW_MINI_MINI : VIDOW_MINI_FREE;
-		vidow_mini_set_state(view, next);
-		if (view->mini == VIDOW_MINI_FREE) {
-			vidow_focus_view(view);
-		}
-	} else {
-		/* 小窗（S4）：拖拽松手 = 落点判定（用户点名的那条）——
-		 *   内边缘（外侧没有相邻输出）→ 收成图标；
-		 *   跨屏边（外侧有相邻输出）→ 移到那块屏、保持形态。
-		 * 和浮窗拖拽共用同一份（vidow_mini_drag_finish）。
-		 *
-		 * 小窗（S5）：**甩出去**的（松手速度 ≥ mini_fling_speed）优先 ——
-		 * 它按速度方向取最近的那条边，不管光标停在哪。 */
-		vidow_mini_drop_zone_hide(server);
-		double vx = 0.0, vy = 0.0;
-		bool have_v = vidow_mini_fling_velocity(server, &vx, &vy);
-		wlr_log(WLR_DEBUG, "mini fling: 松手速度 %s（%.0f,%.0f px/s，采样 %d 点）",
-			have_v ? "有" : "没有", have_v ? vx : 0.0, have_v ? vy : 0.0,
-			server->mini_fling_n);
-		if (have_v && vidow_mini_fling(server, view, vx, vy)) {
-			return true;
-		}
-		vidow_mini_drag_finish(server, view);
-	}
-	return true;
-}
-
-/* 小窗（S2）分流：指针压在迷你 / 图标上 —— 命中测试照跑（要能点中），但客户端
- * 那一份事件不发。返回 true = 调用方立刻 return。 */
-static bool mini_pointer_hover_swallow(struct vidow_server *server,
-		struct vidow_view *hit) {
-	if (!mini_swallows_input(hit)) {
-		/* 小窗（S4）：光标落在**工具条自己**身上时工具条留着（它不在窗口的命中
-		 * 范围里 —— 不是表面，vidow_view_at 命中不到它），而且这一份移动也不
-		 * 转给客户端（工具条是合成器盖在桌面上的东西）。不这么写的话，指针
-		 * 一离开窗口往按钮上走，工具条就没了 —— 永远点不中。
-		 *
-		 * 判的是**附近**（vidow_mini_toolbar_near，整块外扩 12px）而不是按钮矩形：
-		 * 工具条跟窗口之间隔着 4px（摆在小窗上方 `g.y - h - 4`），指针穿那条缝的
-		 * 一帧既不在窗口上、也不在按钮上 —— 只认按钮矩形的话工具条就在缝里被收掉
-		 * 了（用户报的「整个工具条都不能交互」；注入测试一步跳到按钮上，所以没
-		 * 暴露出来）。 */
-		if (server->mini_toolbar_view != NULL &&
-				vidow_mini_toolbar_near(server, server->cursor->x,
-					server->cursor->y)) {
-			return true;
-		}
-		/* 光标离开小窗（或落在别的东西上）→ 工具条收起来。只在小窗态之间
-		 * 切换时重新摆（下面那句 show 会重算位置）。 */
-		if (server->mini_toolbar_view != NULL &&
-				server->mini_toolbar_view != hit) {
-			vidow_mini_toolbar_hide(server);
-		}
-		return false;
-	}
-	mini_pointer_clear_client_focus(server);
-	/* 小窗（S4）悬停工具条：迷你 / 图标态悬停就露出来（放大 / 收成图标 /
-	 * 还原成列 / 关闭）。重复调用是幂等的，位置每次重算 —— 窗口被拖动 /
-	 * 换屏之后工具条跟着走。 */
-		/* 工具条**删掉了**（用户：「小窗工具栏去掉」）：唯一的 show 调用就在这儿，
-		 * 去掉之后工具栏在任何配置下都不可能露出来。剩下的死代码（drag.c 的
-		 * layout/glyph/show/hide/near、float.c 的 hit/press）下一步整段删。 */
-	return true;
-}
-
 void vidow_pointer_motion(struct vidow_server *server, uint32_t time_msec) {
 	/* 有人在录「光标不进画面」的流（metadata / embedded）：光标的位置就是那一帧
 	 * 的内容，指针一动就得推一帧（否则录进去的光标停在上一帧 —— 静止的窗口上
 	 * 移动指针时尤其明显）。放在最前面：拖着东西 / 摇晃那些分支提前 return 也
 	 * 一样要推（拖拽时光标也在动）。 */
 	vidow_screencast_cursor_moved(server);
-
-	/* 小窗（S5）甩出：每一次指针移动都往采样环里推一格（松手时按最近 ~100ms
-	 * 那一段算速度，见 float.c 的 vidow_mini_fling_velocity）。放在最前面 ——
-	 * 下面拖着东西的分支会提前 return，那正是最需要采样的时候。 */
-	vidow_mini_fling_sample(server, server->cursor->x, server->cursor->y);
 
 	/* 光标隐藏（hide_when_typing / hide_after_inactive_ms）：指针一动就把光标
 	 * 显示回来并重新计时。放在最前面 —— 拖着东西 / 摇晃那些分支提前 return 也
@@ -1991,29 +1753,6 @@ void vidow_pointer_motion(struct vidow_server *server, uint32_t time_msec) {
 		if (vidow_mru_showing(server)) {
 			vidow_mru_hover(server, server->cursor->x, server->cursor->y);
 		}
-		return;
-	}
-
-	/* 小窗（S2）形态拖拽中：指针全归它（客户端一个事件都不收，也不换焦点）。 */
-	if (server->mini_grab_view != NULL) {
-		/* 小窗（S4）：拖拽中工具条收起来（不然它跟着窗口乱飘、还会挡住
-		 * 落点）；落点区照常随时算（拖到落点区松手 = 迷你小窗，和浮窗
-		 * 那条一致）。 */
-		vidow_mini_toolbar_hide(server);
-		mini_grab_update(server);
-		vidow_mini_drop_zone_update(server);
-		mini_pointer_clear_client_focus(server);
-		return;
-	}
-
-	/* 小窗（S5）悬停预览：指针一动就过一次状态机（延迟 / 离开 / 宽限）。
-	 * 放在命中测试之后 —— 它要按「光标底下是不是图标」分流。 */
-	vidow_mini_preview_motion(server, hit);
-
-	/* 小窗（S2）：压在迷你 / 图标上 —— 客户端收不到 enter / motion，悬停聚焦也
-	 * 跳过（focus_follows_mouse 里另有一道）。命中测试上面已经跑过了（必须能
-	 * 命中它 —— 单击要能放大，这是和锁屏相反的地方），这里只吞转发那一份。 */
-	if (mini_pointer_hover_swallow(server, hit)) {
 		return;
 	}
 
@@ -2380,69 +2119,6 @@ void vidow_pointer_button(struct vidow_server *server, uint32_t button,
 		lock_pointer_route(server, time_msec, button, pressed, true);
 		return;
 	}
-	/* 小窗（S5）悬停预览：它是**只读**的（不抢焦点 / 不进 MRU / 不参与命中），
-	 * 但**吞点击** —— 指针底下有一块「像窗口的东西」，点下去却激活了背后的
-	 * 窗口是明显的错。按下 / 松手成对吞掉（客户端两边都没见过，状态对称）。
-	 * 放在最前面：预览可能压在别的窗口上，压着的时候不该把事件给背后那个。 */
-	if (server->mini_preview_view != NULL) {
-		bool on_preview = vidow_mini_preview_hit(server, server->cursor->x,
-			server->cursor->y);
-		if (pressed && on_preview) {
-			server->mini_preview_pressed = true;
-			wlr_log(WLR_INFO, "mini preview: 吞掉点击（%.0f,%.0f，预览 "
-				"%dx%d @ %d,%d）—— 只读，不激活背后的窗口",
-				server->cursor->x, server->cursor->y,
-				server->mini_preview_box.width,
-				server->mini_preview_box.height,
-				server->mini_preview_box.x, server->mini_preview_box.y);
-			return;
-		}
-		if (!pressed && server->mini_preview_pressed) {
-			server->mini_preview_pressed = false;
-			return;
-		}
-	}
-	/* 小窗（S4）悬停工具条：它不是表面（合成器自绘的矩形），命中得单独判一次
-	 * —— 按在按钮上就整个吃掉（不转给客户端、也不起拖拽），松手那次也成对吃掉
-	 * （客户端两边都没见过，状态才是对称的）。
-	 * 放在形态拖拽那条之前：按钮可能压在窗口上，压在按钮上时不该起拖拽。 */
-	if (server->mini_toolbar_view != NULL && pressed) {
-		int btn = vidow_mini_toolbar_hit(server,
-			server->mini_toolbar_view, server->cursor->x,
-			server->cursor->y);
-		if (btn >= 0) {
-			struct vidow_view *tv = server->mini_toolbar_view;
-			vidow_mini_toolbar_press(server, tv, btn);
-			/* 形态可能变了（还原成列 / 关掉 / 换档）：工具条收掉。 */
-			vidow_mini_toolbar_hide(server);
-			server->mini_toolbar_pressed = true;
-			return;
-		}
-	}
-	/* 松手那一半**无条件**吃、并且**无条件清标志**（S3 修）：以前这一支写在
-	 * `if (server->mini_toolbar_view != NULL)` 里面，而按下那条路紧接着
-	 * `vidow_mini_toolbar_hide()` 就把 view 清成 NULL —— 标志就此留在 true 没人
-	 * 清。后果是「悬停着工具条的迷你窗口」上的**下一对**按下 / 松开被这对陈旧
-	 * 标志吞掉：形态不变（按一下没反应），而且那次按下起的 mini_grab 再没人收尾
-	 * —— 紧接着一次普通 pointer-motion 就能把窗口**在没按键的情况下**拖走
-	 * （实测 `place w1 -> 464,506` 就是这么来的）。
-	 *
-	 * 标志被吞过之后 grab 还挂着时（旧状态 / 别的路径丢过松手）接着往下走，让
-	 * 小窗那条松手把它一起收掉。 */
-	if (!pressed && server->mini_toolbar_pressed) {
-		server->mini_toolbar_pressed = false;
-		if (server->mini_grab_view == NULL) {
-			return;
-		}
-	}
-	/* 小窗（S2）形态拖拽：按下那次已经被吃掉（见下面的 mini_pointer_press），
-	 * 这一对松手也整个吃掉 —— 客户端从头到尾没见过这个按键，状态是对称的。 */
-	if (server->mini_grab_view != NULL) {
-		if (!pressed) {
-			mini_pointer_release(server, button);
-		}
-		return;
-	}
 	if (server->grab_mode != VIDOW_GRAB_NONE) {
 		/* the grab owns the pointer: swallow everything until release */
 		if (!pressed) {
@@ -2530,24 +2206,6 @@ void vidow_pointer_button(struct vidow_server *server, uint32_t button,
 		}
 	}
 
-	/* 小窗（S2）：按在迷你 / 图标上 —— 整个事件归小窗（客户端收不到任何指针
-	 * 事件），所以必须在**绑定表之前**分流：不然 Mod+左键的 interactive-move
-	 * 会顺着 keybind 的 view_under_cursor 抓到它，走浮窗那套 grab（那条路松手
-	 * 会把窗口重新认领回某块工作区，和小窗「跟屏不跟工作区」冲突）。
-	 * 命中测试在这儿现做一次（按下才做）：命中是小窗才有意义，正常路径那次
-	 * 照旧跑（它还要算局部坐标给客户端）。 */
-	if (pressed) {
-		double msx = 0, msy = 0;
-		struct wlr_surface *msurface = NULL;
-		struct vidow_view *mhit = vidow_view_at(server, server->cursor->x,
-			server->cursor->y, &msurface, &msx, &msy);
-		if (mini_pointer_press(server, mhit, button)) {
-			return;
-		}
-	}
-
-	/* 绑定表（`vidow.bind("Mod+mouse-left", …)`）：鼠标按键和键盘键同一张表、
-	 * 同一套动作。按下 / 松开都要问 —— 「松开才触发」的绑定靠松开那一下收尾。 */
 	uint32_t mods = pointer_modifiers(server);
 	if (force_mod) {
 		/* 测试注入「假装按着 Mod」（见 server.h）：测试环境里没有真键盘，
@@ -2776,55 +2434,6 @@ void vidow_pointer_axis(struct vidow_server *server,
 		return;
 	}
 
-	/* 小窗（S2/S4）：迷你 / 图标收不到滚轮（客户端一个事件都不收）。命中测试
-	 * 在这儿现做一次 —— 滚轮这条路上没有别处算过命中。
-	 * S4 的档位入口：在小窗上滚轮 = 形态档位，一次一格
-	 *   往下滚（amount > 0）= 降一档：FREE → MINI → ICON（到底了就停）；
-	 *   往上滚 = 升一档：ICON → MINI → FREE（已经在最上面那档就停）。
-	 * FREE 的上滚**照旧转发给客户端**（它是最上面那一档，没有「升」的目标，
-	 * 小窗要能滚内容）；其余情形一律吞掉，不转发。 */
-	{
-		double wsx = 0, wsy = 0;
-		struct wlr_surface *wsurface = NULL;
-		struct vidow_view *whit = vidow_view_at(server, server->cursor->x,
-			server->cursor->y, &wsurface, &wsx, &wsy);
-		if (whit != NULL && whit->mini != VIDOW_MINI_NONE &&
-				amount != 0) {
-			if (whit->mini == VIDOW_MINI_FREE) {
-				if (amount > 0) {
-					vidow_mini_set_state(whit, VIDOW_MINI_MINI);
-					return;
-				}
-				/* 上滚：已经在最上面那档，转发给客户端滚内容。 */
-			} else {
-				enum vidow_mini_state next = whit->mini;
-				if (amount > 0) {
-					next = whit->mini == VIDOW_MINI_MINI ?
-						VIDOW_MINI_ICON : VIDOW_MINI_ICON;
-				} else {
-					next = whit->mini == VIDOW_MINI_ICON ?
-						VIDOW_MINI_MINI : VIDOW_MINI_FREE;
-				}
-				if (next != whit->mini) {
-					vidow_mini_set_state(whit, next);
-					if (whit->mini == VIDOW_MINI_FREE) {
-						vidow_focus_view(whit);
-					}
-					wlr_log(WLR_INFO, "mini: 滚轮 %s → %s",
-						amount > 0 ? "降一档" : "升一档",
-						vidow_mini_state_name(whit->mini));
-				}
-				return;
-			}
-		}
-		if (mini_swallows_input(whit)) {
-			return;
-		}
-	}
-
-	/* 绑定表（`vidow.bind("Mod+wheel-up", …)`）：一个方向一条，和键盘同一套动作。
-	 * 修饰键走 pointer_modifiers()（原因见它上面那段：输入法抢键盘后 seat 上
-	 * 那把是虚拟键盘，修饰键不在它身上）。 */
 	uint32_t mods = pointer_modifiers(server);
 	if (vidow_keybind_wheel(server, orientation, amount, mods,
 			vidow_shortcuts_inhibited(server))) {
