@@ -34,6 +34,18 @@ RUN="/tmp/vidow-perf-$SCENE-$TS"
 DETAIL="/tmp/vidow-perf-$SCENE-$TS.txt"
 LOG="$RUN/vidow.log"
 MSG="$ROOT/build/vidowmsg"
+# 本进程 VRAM：amdgpu 在 fdinfo 里按上下文报 drm-memory-vram，同一上下文多个 fd 报
+# 同一个数，所以取每个 drm-client-id 的最大值再相加，直接累加 fd 会重复计数。
+vram_own() {
+	python3 -c 'import glob,re,sys
+b={}
+for f in glob.glob("/proc/%s/fdinfo/*"%sys.argv[1]):
+    try: t=open(f,errors="replace").read()
+    except OSError: continue
+    c=re.search(r"drm-client-id:\s*(\d+)",t); v=re.search(r"drm-memory-vram:\s*(\d+)",t)
+    if c and v: b[c.group(1)]=max(b.get(c.group(1),0),int(v.group(1)))
+print(sum(b.values())//1024)' "$1" 2>/dev/null || echo 0
+}
 mkdir -p "$RUN/home/.config/vidow" "$RUN/rt"
 cat > "$RUN/home/.config/vidow/config.lua" <<'LUA'
 scale = "1"
@@ -249,9 +261,10 @@ PIDS+=($!)
 
 END=$(( $(date +%s) + SECS ))
 while [ "$(date +%s)" -lt "$END" ]; do
-	printf '%s %s %s\n' "$(date +%s)" \
+	printf '%s %s %s %s\n' "$(date +%s)" \
 		"$(cat "$CARD/gpu_busy_percent" 2>/dev/null || echo NA)" \
 		"$(awk '{printf "%d", $1/1048576}' "$CARD/mem_info_vram_used" 2>/dev/null || echo NA)" \
+		"$(vram_own "$VIDOW_PID")" \
 		>> "$RUN/gpu.txt"
 	sleep 0.2
 done
@@ -294,11 +307,13 @@ try:
     for row in open(run + "/gpu.txt"):
         p = row.split()
         if len(p) >= 3 and p[1] != "NA":
-            gpu.append((float(p[1]), float(p[2])))
+            own = float(p[3]) if len(p) > 3 else 0.0
+            gpu.append((float(p[1]), float(p[2]), own))
 except OSError:
     pass
 busy = [g[0] for g in gpu]
 vram = [g[1] for g in gpu]
+vram_own = [g[2] for g in gpu]
 
 out = {
     "scene": scene, "label": label, "secs": secs,
@@ -313,6 +328,8 @@ out = {
     "gpu_busy_median": med(busy),
     "gpu_busy_max": max(busy) if busy else 0.0,
     "vram_mb_median": med(vram),
+    "vram_own_median": med(vram_own),
+    "vram_own_max": max(vram_own) if vram_own else 0.0,
     "rss_mb": round(int(rss or 0) / 1024.0, 1),
     "drag_started": drag_ok,
     "gpu": gpuslot, "gpu_vram_total_mb": int(gputotal),
