@@ -40,121 +40,6 @@ static struct wlr_swapchain *output_post_swapchain(struct vidow_output *output,
 		int w, int h);
 static void output_grade_lut_set(struct vidow_output *output,
 		struct wlr_color_transform *lut);
-static bool draw_pass_on(struct vidow_server *server) {
-	static int on = -1;
-
-	if (on < 0) {
-		/* 环境变量只认**真值**（给测试和临时试验用）：
-		 * VIDOW_DRAW_PASS=0 / no / false / off 都当关。 */
-		const char *v = getenv("VIDOW_DRAW_PASS");
-		on = (v != NULL && *v != '\0' &&
-			strcmp(v, "0") != 0 && strcmp(v, "no") != 0 &&
-			strcmp(v, "false") != 0 && strcmp(v, "off") != 0) ? 1 : 0;
-	}
-	/* 正路是配置项 `draw_pass`（默认关）；环境变量只是临时开关。 */
-	if (on != 0) {
-		return true;
-	}
-	return server != NULL && server->config.draw_pass;
-}
-
-/* 窗口层：和这块屏一样大的缓冲，懒建、尺寸变了就重建。 */
-static struct wlr_buffer *win_layer_get(struct vidow_output *output, int w,
-		int h, int which) {
-	struct wlr_buffer **slot = which == 0 ? &output->win_layer
-		: &output->win_layer_b;
-	if (output->win_layer_w == w && output->win_layer_h == h) {
-		if (*slot != NULL) {
-			return *slot;
-		}
-	}
-	if (output->win_layer_w != w || output->win_layer_h != h) {
-		/* 尺寸变了：两块一起扔，重建。 */
-		if (output->win_layer != NULL) {
-			wlr_buffer_drop(output->win_layer);
-			output->win_layer = NULL;
-		}
-		if (output->win_layer_b != NULL) {
-			wlr_buffer_drop(output->win_layer_b);
-			output->win_layer_b = NULL;
-		}
-		output->win_layer_w = w;
-		output->win_layer_h = h;
-	}
-	*slot = vidow_alloc_target(output->server, w, h);
-	return *slot;
-}
-
-/* VIDOW_DRAW_PASS=1：把窗口画进「窗口层」，再把这一层贴到这一帧的缓冲上。
- *
- * 为什么要有这一层：自定义装饰着色器只能画进自己分配的缓冲（见 server.h 的
- * win_layer 注释），而场景那一块是 wlroots 的交换链缓冲。一层 33MB 换掉
- * 「每窗 100MB」—— 8 个窗就是 800MB。 */
-/* 窗口层只负责画面，永远不接指针（见 output_draw_pass 里设置的地方）。 */
-static bool win_layer_no_input(struct wlr_scene_buffer *buffer, double *sx,
-		double *sy) {
-	(void)buffer;
-	(void)sx;
-	(void)sy;
-	return false;
-}
-
-static void output_draw_pass(struct vidow_output *output,
-		struct wlr_output_state *state) {
-	struct vidow_server *server = output->server;
-	if (state->buffer == NULL) {
-		return;
-	}
-	int w = state->buffer->width;
-	int h = state->buffer->height;
-	if (w <= 0 || h <= 0) {
-		return;
-	}
-	struct wlr_scene *scene = output->scene_output->scene;
-	if (output->win_node == NULL) {
-		output->win_node = wlr_scene_buffer_create(&scene->tree, NULL);
-		if (output->win_node == NULL) {
-			return;
-		}
-		wlr_scene_node_set_position(&output->win_node->node, 0, 0);
-		wlr_scene_node_raise_to_top(&output->win_node->node);
-		/* 这一层压在**所有**东西上面（包括客户端的节点），指针会先撞上它
-		 * —— 不让它接输入，点哪儿都点不到窗口（实测：拖拽压根起不来）。 */
-		output->win_node->point_accepts_input = win_layer_no_input;
-	}
-	wlr_scene_buffer_set_dest_size(output->win_node, w, h);
-	/* 只有窗口内容真变过才重画这一层：静止画面每帧都换缓冲 = 整屏重画，
-	 * 白白烧电（2026-11-18 实测：damage 100%/帧）。 */
-	bool dirty = false;
-	struct vidow_view *view;
-	wl_list_for_each(view, &server->views, link) {
-		if (view->fx.layer_dirty) {
-			dirty = true;
-			break;
-		}
-	}
-	if (!dirty) {
-		return;
-	}
-	struct wlr_buffer *layer = win_layer_get(output, w, h, 0);
-	if (layer == NULL) {
-		return;
-	}
-	if (!vidow_fx_draw_views(server, layer, w, h)) {
-		return;
-	}
-	/* 损伤区域传 NULL = 「整块都变了」：wlroots 会把整块节点重画。 */
-	if (output->win_node->buffer != layer) {
-		wlr_scene_buffer_set_buffer(output->win_node, layer);
-	} else {
-		/* 同一块缓冲直接写进去，wlroots 看不见内容变了 —— 得自己把改过的
-		 * 那块面积的损伤报上去，否则屏幕上停在上一帧。 */
-		wlr_scene_buffer_set_buffer_with_damage(output->win_node, layer,
-			NULL);
-	}
-	vidow_stats.pass_win_layer++;
-}
-
 static bool output_post_blit(struct vidow_output *output,
 		struct wlr_output_state *state, struct wlr_texture *src, int w, int h);
 static void output_set_hdr(struct vidow_output *output, bool on);
@@ -606,12 +491,6 @@ void vidow_output_render(struct vidow_output *output) {
 		}
 		if (wlr_scene_output_build_state(output->scene_output, &state,
 				options_ptr)) {
-			/* VIDOW_DRAW_PASS=1：窗口内容不烘离屏，直接画进这一帧的
-			 * 缓冲（见 fx.c 的 vidow_fx_draw_views）。位置：场景刚画完、
-			 * 提交之前 —— 窗口就压在背景 / layer 之上。 */
-			if (draw_pass_on(output->server)) {
-				output_draw_pass(output, &state);
-			}
 			bool post_failed = false;
 			if (post_ok) {
 				struct wlr_texture *src = wlr_texture_from_buffer(

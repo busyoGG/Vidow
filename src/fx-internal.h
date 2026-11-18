@@ -97,7 +97,7 @@ struct wlr_buffer *vidow_alloc_target(struct vidow_server *server, int w,
 	int h);
 struct wlr_buffer *pick_free(struct wlr_buffer *bufs[2]);
 bool ensure_targets(struct vidow_server *server, struct vidow_fx_target *fx,
-	int content_w, int content_h, double scale, double os, bool alloc);
+	int content_w, int content_h, double scale, double os);
 void drop_targets(struct vidow_fx_target *fx);
 
 bool blur_set_alloc(struct vidow_server *server, struct vidow_blur_set *set,

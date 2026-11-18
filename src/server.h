@@ -421,12 +421,6 @@ struct vidow_config {
 	 * 窗口源自己再加边框）。见 wincapture.c。 */
 	bool wincapture_decor;
 
-	/* draw-pass：装饰和内容**直接画进这一帧的输出缓冲**，不建每窗那张
-	 * 离屏装饰图，也不再多一趟把窗口层贴回来。省一趟合成和每窗一块
-	 * 装饰缓冲，代价是整屏重绘（损伤按整屏算），且跨屏越界 / 全屏层压
-	 * 两条还有缺口 —— 所以默认关，留给愿意尝的人（ADR 0001/0004）。 */
-	bool draw_pass;
-
 	/* kawase blur behind windows */
 	bool blur_enabled;
 	bool blur_all;        /* also blur behind tiled windows */
@@ -940,10 +934,6 @@ static inline bool vidow_grade_from_config(const struct vidow_config *cfg,
 struct vidow_decor_prog {
 	unsigned int program;
 	int u_texture, u_blur, u_size, u_target_size, u_content_off, u_content_alpha;
-	/* 这次贴到目标的哪个位置（0 = 左上角）。只给「直接画进输出」那条路用，
-	 * 其余路径不设就是 0，屏幕外行为不变。 */
-	int u_dst;   /* 整块目标（贴到输出时比这块装饰大） */
-	int u_pos;
 	int u_radius, u_corner_n, u_border_width, u_border_color, u_shadow_color;
 	int u_shadow_offset, u_shadow_radius, u_shadow_only, u_opacity, u_noise,
 		u_alpha;
@@ -1208,16 +1198,6 @@ struct vidow_fx_target {
 	 * view_scanout_switch 用它判断状态翻转（翻转那一帧要把表面透明度接回去、
 	 * 把装饰节点收起来）。 */
 	bool scanout;
-
-	/* draw-pass：这个窗口的内容自上次「层」重画以来变过没有。output.c 拿它
-	 * 决定要不要给层节点记损伤 —— 静止画面一帧都不重画（每帧都换缓冲 = 整屏
-	 * 重画，白白烧电）。 */
-	bool layer_dirty;
-
-	/* 果冻要拿「烘好的那一张装饰图」当形变源（见 jelly.c 的
-	 * vidow_jelly_begin）。draw-pass 平时不留这张图，起手前临时立一次这个
-	 * 旗子，让那一趟照老路烘一张出来。 */
-	bool force_offscreen;
 
 	/* 越界裁剪（见 view.c 的 vidow_view_apply_clip）：这块窗口只画自己那块屏
 	 * 里的那部分。clip = 那块屏的框（布局逻辑坐标），clip_on 为 false 时整块
@@ -1535,23 +1515,6 @@ struct vidow_output {
 	 *                        的 3×1D LUT，direct scanout 照旧。
 	 * 两个都是中性时为 NULL / false。 */
 	bool grade_post;
-
-	/* draw-pass（VIDOW_DRAW_PASS=1）用的「窗口层」：和这块屏一样大的缓冲，
-	 * 窗口内容 + 装饰直接画进它，再一次性贴到场景缓冲上。
-	 *
-	 * 为什么不直接画进场景那块缓冲：wlroots 0.20 只给自己分配的缓冲开 FBO
-	 * （wlr_gles2_renderer_get_buffer_fbo 对别人的 dmabuf 返回 0，实测
-	 * 「fx: no FBO for a render target」），自定义着色器只能画自己的。
-	 * 一块 3840x2160 的 ARGB 缓冲 = 33MB，比每窗 100MB 便宜。 */
-	struct wlr_buffer *win_layer;
-	struct wlr_texture *win_layer_tex;
-	/* draw-pass：把这一层挂成场景里最上面的一个 buffer 节点（走公开 API 出
-	 * 画面；直接对场景缓冲再开一趟**写不进去**，2026-11-18 实测：红矩形
-	 * 都不显示）。两块缓冲轮流挂，靠「换了 buffer」把损伤记上。 */
-	struct wlr_buffer *win_layer_b;
-	struct wlr_scene_buffer *win_node;
-	int win_flip;
-	int win_layer_w, win_layer_h;
 	struct wlr_color_transform *grade_lut;
 	/* grade_lut 有没有被改过、还没跟着某一帧提交（和 gamma_lut_dirty 一个道理）。 */
 	bool grade_lut_dirty;
@@ -2706,7 +2669,6 @@ struct vidow_frame_stats {
 	uint64_t sched_fired;	/* 结算次数 */
 	int64_t sched_late_ns, sched_late_max_ns, sched_early_ns;
 	int shared, own, under, chains, bakes, tex_new, tex_del, frames, passes;
-	int pass_win_layer; /* draw-pass：这一帧贴了几次窗口层 */
 	int64_t blur_ns, decor_ns, jelly_ns, commit_ns, bake_ns;
 	/* 探针：拖拽的「指针事件 -> 出帧」延迟 */
 	int64_t grab_lat_ns, grab_lat_max_ns;
@@ -3079,17 +3041,6 @@ struct vidow_server {
 	 * u_output_size / u_origin 的基准。 */
 	int output_w, output_h;
 	int output_x, output_y;
-
-	/* 直接画进输出（VIDOW_DRAW_PASS=1）：这一帧要画进去的那块缓冲和尺寸。
-	 * 非 NULL 时窗口内容不再烘到每窗离屏，装饰着色器直接画进这块屏 ——
-	 * 每窗那一对 3840x2160 的装饰缓冲（≈100MB）就一块都不用开。
-	 * 见 fx.c 的 decor_draw / vidow_fx_draw_views。 */
-	struct wlr_buffer *draw_dst;
-	int draw_w, draw_h;
-	bool draw_pass;
-	/* draw-pass 那一层这一趟是否**还开着**：vidow_fx_draw_views 开一次，
-	 * 各窗口的 decor_pass 借用它，不再各自 begin/end（见 decor_pass）。 */
-	bool draw_layer_open;
 
 	struct wl_list anims;    /* vidow_anim.link */
 	/* 正在跑 vidow_anim_tick()。这个标志是给 vidow_anim_cancel() 看的：tick
@@ -4028,8 +3979,6 @@ void vidow_blur_output_finish(struct vidow_output *output);
 void vidow_view_apply_anim(struct vidow_view *view);
 /* 只摆位置（便宜，拖动跟手时每个指针事件走这条） / 只重烘装饰图（贵，一帧一次）。 */
 void vidow_view_anim_bake(struct vidow_view *view);
-bool vidow_fx_draw_views(struct vidow_server *server, struct wlr_buffer *dst,
-		int w, int h);
 void vidow_view_apply_anim_place(struct vidow_view *view);
 
 /* ------------------------------------------------------- 鼠标拖窗口（drag.c） */

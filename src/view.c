@@ -21,27 +21,6 @@
 #include <wlr/util/log.h>
 #include <xcb/xcb.h>
 
-/* VIDOW_DRAW_PASS=1：窗口内容由输出那趟直接画（fx.c 的 vidow_fx_draw_views）。
- * 只问一次环境变量。 */
-static bool draw_pass_on(struct vidow_server *server) {
-	static int on = -1;
-
-	if (on < 0) {
-		/* 环境变量只认**真值**（给测试和临时试验用）：
-		 * VIDOW_DRAW_PASS=0 / no / false / off 都当关。 */
-		const char *v = getenv("VIDOW_DRAW_PASS");
-		on = (v != NULL && *v != '\0' &&
-			strcmp(v, "0") != 0 && strcmp(v, "no") != 0 &&
-			strcmp(v, "false") != 0 && strcmp(v, "off") != 0) ? 1 : 0;
-	}
-	/* 正路是配置项 `draw_pass`（默认关）；环境变量只是临时开关。 */
-	if (on != 0) {
-		return true;
-	}
-	return server != NULL && server->config.draw_pass;
-}
-
-
 /* gap 的算法都在 server.h 里（vidow_gap_side / vidow_gap_inner）：统一值 gaps
  * 管全部，单边设了就用单边的，-1 = 跟随。 */
 
@@ -2571,29 +2550,6 @@ static bool view_scanout_switch(struct vidow_view *view) {
 /* 重烘这个窗口的装饰图（含底衬采样）。贵，一帧一次。位置先用 view_anim_place
  * 摆好；这里把同一套位置参数再算一遍（几个整数，跟重烘比起来不算什么）。 */
 void vidow_view_anim_bake(struct vidow_view *view) {
-	/* draw-pass 模式下**不烘任何离屏**：真正的绘制在输出那趟里（这时
-	 * server->draw_dst 非空）。客户端那张真表面继续藏起来（只留命中测试），
-	 * 否则直角矩形会盖在圆角装饰上 —— 和老路的规矩一样。 */
-	/* draw-pass：静态窗口中不再烘离屏装饰（见 fx.c 的 vidow_fx_draw_views）。
-	 * 果冻 / 开窗缩放这些**还在用离屏缓冲**的形状变换照旧走老路：它们要的是
-	 * 「先烘一张、再拿节点做变形」，先烘这一张本来就躲不掉。 */
-	/* draw-pass：**任何**一次「该重画这个窗口」的请求都记成「这一层脏了」
-	 * —— 真正的绘制在输出那趟里统一做。漏记这一笔的直接后果：层一直不重画，
-	 * 屏幕上留的是第一次那一帧（或者干脆只有客户端那张直角方图）。 */
-	if (draw_pass_on(view->server)) {
-		view->fx.layer_dirty = true;
-	}
-	if (draw_pass_on(view->server) && view->server->draw_dst == NULL && !view->fx.force_offscreen &&
-			view->jelly == NULL && view->fx.anim_scale == 1.0) {
-		if (view->scene_surface != NULL) {
-			wlr_scene_buffer_set_opacity(view->scene_surface->buffer, 0.0f);
-		}
-		/* 内容节点被藏起来了，wlroots 就再也看不见这个窗口在动（它只按场景
-		 * 节点的损伤出帧）—— 少了这一句，窗口一画上就再也不重画，屏幕上停在
-		 * 第一次渲染那一帧。这里按窗口的世界矩形自己标一次脏。 */
-		vidow_backdrop_damage_view(view);
-		return;
-	}
 	if (view->scene_tree == NULL) {
 		return;
 	}
@@ -2692,7 +2648,6 @@ void vidow_view_anim_bake(struct vidow_view *view) {
 	if (view->fx.bake_output != NULL && view->fx.bake_output->scale > 0.0) {
 		bake_scale = view->fx.bake_output->scale;
 	}
-	if (draw_pass_on(view->server) && getenv("VIDOW_DRAW_TRACE")) wlr_log(WLR_INFO, "BAKE call fx_frame x=%d y=%d alpha=%.2f scale=%.2f", x, y, alpha, bake_scale * fx_ov);
 	/* **果冻期间不重烘源图 —— 抄 KWin 的 wobbly windows。**
 	 * KWin 变形的是窗口那张 pixmap，变形期间那张图不重画（更新排队，
 	 * 动画完了再合并）。我们原来每帧都烘：内容一动 bake_revision 就变，
