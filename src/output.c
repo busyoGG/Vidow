@@ -233,7 +233,8 @@ void vidow_output_render(struct vidow_output *output) {
 			if (gap_ns >= stutter_threshold_ns()) {
 				wlr_log(WLR_INFO,
 					"卡顿: 距上一帧 %.1fms（阈值 %.0fms）"
-					" | 上帧: 果冻 %.2f 模糊 %.2f 装饰 %.2f 提交 %.2f "
+					" | 上帧: 果冻 %.2f 模糊 %.2f 装饰 %.2f 提交 %.2f"
+					"(冲 %.2f 建 %.2f 后 %.2f 提 %.2f) "
 					"| 帧数 %d 趟 %d 重烘 %d",
 					(double)gap_ns / 1e6,
 					(double)stutter_threshold_ns() / 1e6,
@@ -241,6 +242,11 @@ void vidow_output_render(struct vidow_output *output) {
 					(double)vidow_stats.blur_ns / 1e6,
 					(double)vidow_stats.decor_ns / 1e6,
 					(double)vidow_stats.commit_ns / 1e6,
+					(double)vidow_stats.flush_ns / 1e6,
+					(double)vidow_stats.build_ns / 1e6,
+					(double)vidow_stats.post_ns / 1e6,
+					(double)(vidow_stats.commit_ns - vidow_stats.flush_ns -
+						vidow_stats.build_ns - vidow_stats.post_ns) / 1e6,
 					vidow_stats.frames, vidow_stats.passes,
 					vidow_stats.bakes);
 			}
@@ -329,6 +335,7 @@ void vidow_output_render(struct vidow_output *output) {
 		}
 	}
 	int64_t st_t3 = vidow_now_ns();
+	int64_t st_t3a = 0, st_t3b = 0, st_t3c = 0;
 
 	/* 屏幕这一帧就是屏幕这一帧：抓帧是 vidow 自己另外渲染的一遍（capture.c /
 	 * screencopy.c），和这里没有任何关系 —— capture = "hide" 的窗口 / layer
@@ -336,6 +343,7 @@ void vidow_output_render(struct vidow_output *output) {
 	/* 这一帧所有离屏趟（模糊链 / 装饰 / 果冻）的命令在这里一次性提交，
 	 * 而不是每趟一次 —— 见 fx.c 的 end_pass。 */
 	vidow_fx_flush(server);
+	st_t3a = vidow_now_ns();
 	/* **真正把这些命令提交到屏幕上**。
 	 *
 	 * 这行之前被删过：删掉之后 vidow_output_render() 只剩发 frame_done，
@@ -489,8 +497,10 @@ void vidow_output_render(struct vidow_output *output) {
 			wlr_log(WLR_ERROR, "color: %s 后处理不可用（没有 FP16 或交换链"
 				"失败），这一帧走直接渲染", output->wlr_output->name);
 		}
-		if (wlr_scene_output_build_state(output->scene_output, &state,
-				options_ptr)) {
+		bool scene_built = wlr_scene_output_build_state(
+			output->scene_output, &state, options_ptr);
+		st_t3b = vidow_now_ns();
+		if (scene_built) {
 			bool post_failed = false;
 			if (post_ok) {
 				struct wlr_texture *src = wlr_texture_from_buffer(
@@ -511,6 +521,7 @@ void vidow_output_render(struct vidow_output *output) {
 					wlr_texture_destroy(src);
 				}
 			}
+			st_t3c = vidow_now_ns();
 			/* LUT 只在「改过」的那一帧提交一次：KMS 的 CTM 属性不会因为
 			 * 后续不带它的提交而丢，每帧重塞只是白算一个 blob。 */
 			if (output->gamma_lut_dirty || output->grade_lut_dirty) {
@@ -534,6 +545,9 @@ void vidow_output_render(struct vidow_output *output) {
 		vidow_stats.jelly_ns += st_t1 - st_t0;
 		vidow_stats.blur_ns += st_t2 - st_t1;
 		vidow_stats.decor_ns += st_t3 - st_t2;
+		vidow_stats.flush_ns += st_t3a - st_t3;
+		vidow_stats.build_ns += st_t3b - st_t3a;
+		vidow_stats.post_ns += st_t3c - st_t3b;
 		vidow_stats.commit_ns += st_t4 - st_t3;
 		vidow_stats.frames++;
 		static int64_t win_ns = 0;
@@ -546,7 +560,8 @@ void vidow_output_render(struct vidow_output *output) {
 				"渲染统计: %d 帧/帧窗(%.0fms) %.1f fps | 模糊 %.2fms/帧"
 				"(shared %d own %d under %d chain %d 抓 %.1fM 链 %.1fM) | "
 				"装饰 %.2fms/帧(%d 次重烘) | "
-				"果冻 %.2fms/帧 | 提交 %.2fms/帧 | 贴图 +%d/-%d | 趟 %d | "
+				"果冻 %.2fms/帧 | 提交 %.2fms/帧(冲 %.2f 建 %.2f 后 %.2f 提 %.2f) | "
+				"贴图 +%d/-%d | 趟 %d | "
 				"重烘 %.2fms/帧 | 拖拽延迟 %.2f/%.2fms(%d) | "
 				"损伤 %.1f%%/帧(整屏 %d/%d 帧) | 源 事件%d 狗%d 踢%d 抓%d | 标脏 bump%d note%d",
 				vidow_stats.frames, (double)(st_t4 - win_ns) / 1e6,
@@ -559,6 +574,11 @@ void vidow_output_render(struct vidow_output *output) {
 				(double)vidow_stats.decor_ns / 1e6 / f, vidow_stats.bakes,
 				(double)vidow_stats.jelly_ns / 1e6 / f,
 				(double)vidow_stats.commit_ns / 1e6 / f,
+				(double)vidow_stats.flush_ns / 1e6 / f,
+				(double)vidow_stats.build_ns / 1e6 / f,
+				(double)vidow_stats.post_ns / 1e6 / f,
+				(double)(vidow_stats.commit_ns - vidow_stats.flush_ns -
+					vidow_stats.build_ns - vidow_stats.post_ns) / 1e6 / (f > 0 ? f : 1),
 				vidow_stats.tex_new, vidow_stats.tex_del, vidow_stats.passes,
 				(double)vidow_stats.bake_ns / 1e6 / f,
 				vidow_stats.grab_lat_n > 0 ?

@@ -2670,6 +2670,8 @@ struct vidow_frame_stats {
 	int64_t sched_late_ns, sched_late_max_ns, sched_early_ns;
 	int shared, own, under, chains, bakes, tex_new, tex_del, frames, passes;
 	int64_t blur_ns, decor_ns, jelly_ns, commit_ns, bake_ns;
+	/* 提交那一段再拆开：冲=离屏趟一起提交、建=场景建帧、后=后处理/校色、提=上屏 */
+	int64_t flush_ns, build_ns, post_ns;
 	/* 探针：拖拽的「指针事件 -> 出帧」延迟 */
 	int64_t grab_lat_ns, grab_lat_max_ns;
 	int grab_lat_n;
