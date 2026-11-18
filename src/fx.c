@@ -4001,27 +4001,60 @@ bool vidow_fx_draw_views(struct vidow_server *server, struct wlr_buffer *dst,
 	 * 跟场景树一致，否则浮窗会被平铺窗口盖住、点一下焦点变了画面不变。
 	 * 场景的兄弟表就是 z 序（先画在下、后画在上，见 view_fully_occluded
 	 * 里的注释），照着它从头往后走即可。 */
+	/* 这块屏上有全屏窗口时，**别把别的窗口画进层里**：层是压在最上面
+	 * 的整屏缓冲，全屏窗口走的是直通（扫的是它自己的缓冲，不进层），
+	 * 于是层里那个浮窗会盖在全屏画面上面 —— 实测 test-floatstack 的
+	 * 「全屏压一切」就是这么红的。全屏铺满整块输出，别的窗口一个像素都
+	 * 露不出来，跳过它们等于给这块屏做了一次遮挡剔除。 */
+	bool has_fs = false;
 	struct wlr_scene_node *n_ = NULL;
 	if (server->layer_toplevels != NULL) {
 		wl_list_for_each(n_, &server->layer_toplevels->children, link) {
-			if (!n_->enabled) {
+			struct vidow_view *fv = view_from_scene_node(n_);
+			if (fv != NULL && fv->mapped && !fv->popup && fv->fullscreen &&
+					!fv->scene_parked) {
+				has_fs = true;
+				break;
+			}
+		}
+	}
+	struct wlr_scene_node *n_2 = NULL;
+	/* 两趟：先画普通窗口，再画**全屏**的。全屏在场景里没有单独的层（它和平铺
+	 * 窗口是同一棵 layer_toplevels 的兄弟，靠节点顺序决定谁在上面），而这条路
+	 * 是一块扁平缓冲 —— 照兄弟表走的话，一个「后开的浮窗」会盖在全屏窗口上面
+	 * （实测 test-floatstack：全屏窗口压不住浮窗）。全屏的语义是「盖住这块屏
+	 * 上所有窗口」，所以它一律最后画。 */
+	for (int pass = 0; pass < 2; pass++) {
+		bool fullscreen_pass = pass == 1;
+		if (server->layer_toplevels == NULL) {
+			break;
+		}
+		wl_list_for_each(n_2, &server->layer_toplevels->children, link) {
+			if (!n_2->enabled) {
 				continue;
 			}
-			struct vidow_view *view = view_from_scene_node(n_);
+			struct vidow_view *view = view_from_scene_node(n_2);
 			if (view == NULL || !view->mapped || view->popup) {
 				continue;
 			}
-			/* 果冻 / 开窗缩放：这两个还靠离屏缓冲（见 view.c 的
-			 * vidow_view_anim_bake），它们的装饰节点自己会画，别重复。 */
-			if (view->jelly != NULL || view->fx.anim_scale != 1.0) {
+			if (view->fullscreen != fullscreen_pass) {
+				continue;
+			}
+			if (has_fs && !view->fullscreen) {
+				continue;
+			}
+			/* 果冻 / 开窗缩放还靠离屏缓冲（见 view.c 的 vidow_view_anim_bake），
+			 * 它们的装饰节点自己会画，别重复。正在拖的窗口也走老路：跨屏时它得
+			 * 在两块屏上各画一半，而这条路一次只往本屏这块缓冲里画。 */
+			if (view->jelly != NULL || view->fx.anim_scale != 1.0 ||
+					view->dragging || server->grab_view == view) {
 				continue;
 			}
 			vidow_view_anim_bake(view);
 			view->fx.layer_dirty = false;
 			n++;
 		}
-	}
-	if (getenv("VIDOW_DRAW_TRACE") != NULL) {
+	}	if (getenv("VIDOW_DRAW_TRACE") != NULL) {
 		wlr_log(WLR_INFO, "DPVIEWS baked=%d dst=%p", n, (void *)dst);
 	}
 	server->draw_layer_open = false;
