@@ -198,6 +198,10 @@ static const struct entry entries[] = {
 	{ "noise",           K_DOUBLE, OFF(noise),           SZ(noise), 1,
 		"往装饰里掺的噪点强度，0 = 不加" },
 
+	{ "draw_pass",       K_BOOL,   OFF(draw_pass),       SZ(draw_pass), 2,
+		"把窗口直接画进这一帧的输出，不建每窗离屏装饰：省一趟合成和每窗"
+		"一块装饰缓冲，代价是整屏重绘。还没打磨完，默认关" },
+
 	{ "blur_enabled",    K_BOOL,   OFF(blur_enabled),    SZ(blur_enabled), 2,
 		"背景模糊总开关" },
 	{ "blur_all",        K_BOOL,   OFF(blur_all),        SZ(blur_all), 2,

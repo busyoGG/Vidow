@@ -40,12 +40,22 @@ static struct wlr_swapchain *output_post_swapchain(struct vidow_output *output,
 		int w, int h);
 static void output_grade_lut_set(struct vidow_output *output,
 		struct wlr_color_transform *lut);
-static bool draw_pass_on(void) {
+static bool draw_pass_on(struct vidow_server *server) {
 	static int on = -1;
+
 	if (on < 0) {
-		on = getenv("VIDOW_DRAW_PASS") != NULL ? 1 : 0;
+		/* 环境变量只认**真值**（给测试和临时试验用）：
+		 * VIDOW_DRAW_PASS=0 / no / false / off 都当关。 */
+		const char *v = getenv("VIDOW_DRAW_PASS");
+		on = (v != NULL && *v != '\0' &&
+			strcmp(v, "0") != 0 && strcmp(v, "no") != 0 &&
+			strcmp(v, "false") != 0 && strcmp(v, "off") != 0) ? 1 : 0;
 	}
-	return on != 0;
+	/* 正路是配置项 `draw_pass`（默认关）；环境变量只是临时开关。 */
+	if (on != 0) {
+		return true;
+	}
+	return server != NULL && server->config.draw_pass;
 }
 
 /* 窗口层：和这块屏一样大的缓冲，懒建、尺寸变了就重建。 */
@@ -599,7 +609,7 @@ void vidow_output_render(struct vidow_output *output) {
 			/* VIDOW_DRAW_PASS=1：窗口内容不烘离屏，直接画进这一帧的
 			 * 缓冲（见 fx.c 的 vidow_fx_draw_views）。位置：场景刚画完、
 			 * 提交之前 —— 窗口就压在背景 / layer 之上。 */
-			if (draw_pass_on()) {
+			if (draw_pass_on(output->server)) {
 				output_draw_pass(output, &state);
 			}
 			bool post_failed = false;

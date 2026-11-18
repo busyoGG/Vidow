@@ -421,6 +421,12 @@ struct vidow_config {
 	 * 窗口源自己再加边框）。见 wincapture.c。 */
 	bool wincapture_decor;
 
+	/* draw-pass：装饰和内容**直接画进这一帧的输出缓冲**，不建每窗那张
+	 * 离屏装饰图，也不再多一趟把窗口层贴回来。省一趟合成和每窗一块
+	 * 装饰缓冲，代价是整屏重绘（损伤按整屏算），且跨屏越界 / 全屏层压
+	 * 两条还有缺口 —— 所以默认关，留给愿意尝的人（ADR 0001/0004）。 */
+	bool draw_pass;
+
 	/* kawase blur behind windows */
 	bool blur_enabled;
 	bool blur_all;        /* also blur behind tiled windows */

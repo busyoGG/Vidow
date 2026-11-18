@@ -23,12 +23,22 @@
 
 /* VIDOW_DRAW_PASS=1：窗口内容由输出那趟直接画（fx.c 的 vidow_fx_draw_views）。
  * 只问一次环境变量。 */
-static bool draw_pass_on(void) {
+static bool draw_pass_on(struct vidow_server *server) {
 	static int on = -1;
+
 	if (on < 0) {
-		on = getenv("VIDOW_DRAW_PASS") != NULL ? 1 : 0;
+		/* 环境变量只认**真值**（给测试和临时试验用）：
+		 * VIDOW_DRAW_PASS=0 / no / false / off 都当关。 */
+		const char *v = getenv("VIDOW_DRAW_PASS");
+		on = (v != NULL && *v != '\0' &&
+			strcmp(v, "0") != 0 && strcmp(v, "no") != 0 &&
+			strcmp(v, "false") != 0 && strcmp(v, "off") != 0) ? 1 : 0;
 	}
-	return on != 0;
+	/* 正路是配置项 `draw_pass`（默认关）；环境变量只是临时开关。 */
+	if (on != 0) {
+		return true;
+	}
+	return server != NULL && server->config.draw_pass;
 }
 
 
@@ -2570,10 +2580,10 @@ void vidow_view_anim_bake(struct vidow_view *view) {
 	/* draw-pass：**任何**一次「该重画这个窗口」的请求都记成「这一层脏了」
 	 * —— 真正的绘制在输出那趟里统一做。漏记这一笔的直接后果：层一直不重画，
 	 * 屏幕上留的是第一次那一帧（或者干脆只有客户端那张直角方图）。 */
-	if (draw_pass_on()) {
+	if (draw_pass_on(view->server)) {
 		view->fx.layer_dirty = true;
 	}
-	if (draw_pass_on() && view->server->draw_dst == NULL && !view->fx.force_offscreen &&
+	if (draw_pass_on(view->server) && view->server->draw_dst == NULL && !view->fx.force_offscreen &&
 			view->jelly == NULL && view->fx.anim_scale == 1.0) {
 		if (view->scene_surface != NULL) {
 			wlr_scene_buffer_set_opacity(view->scene_surface->buffer, 0.0f);
@@ -2682,7 +2692,7 @@ void vidow_view_anim_bake(struct vidow_view *view) {
 	if (view->fx.bake_output != NULL && view->fx.bake_output->scale > 0.0) {
 		bake_scale = view->fx.bake_output->scale;
 	}
-	if (draw_pass_on() && getenv("VIDOW_DRAW_TRACE")) wlr_log(WLR_INFO, "BAKE call fx_frame x=%d y=%d alpha=%.2f scale=%.2f", x, y, alpha, bake_scale * fx_ov);
+	if (draw_pass_on(view->server) && getenv("VIDOW_DRAW_TRACE")) wlr_log(WLR_INFO, "BAKE call fx_frame x=%d y=%d alpha=%.2f scale=%.2f", x, y, alpha, bake_scale * fx_ov);
 	/* **果冻期间不重烘源图 —— 抄 KWin 的 wobbly windows。**
 	 * KWin 变形的是窗口那张 pixmap，变形期间那张图不重画（更新排队，
 	 * 动画完了再合并）。我们原来每帧都烘：内容一动 bake_revision 就变，
