@@ -170,7 +170,12 @@ static bool render_stats_on(void) {
 
 /* 卡顿探针：VIDOW_STUTTER=1 开，VIDOW_STUTTER_MS 改阈值（默认 100ms）。
  * 只问一次环境变量（和上面那两个探针一个规矩）。 */
-static bool stutter_on(void) {
+static bool stutter_on(struct vidow_server *server) {
+	/* 配置那条每帧问一次是故意留的：config.lua 热重载随时能开关探针，
+	 * 不用重启（这个函数一帧最多调一次，代价是一个布尔读）。 */
+	if (server != NULL && server->config.stutter) {
+		return true;
+	}
 	static int done = 0, on = 0;
 	if (!done) {
 		on = getenv("VIDOW_STUTTER") != NULL ? 1 : 0;
@@ -326,7 +331,7 @@ void vidow_output_render(struct vidow_output *output) {
 	 *
 	 * 这里只报超阈值的帧，附带上一帧各阶段耗时（能区分「GPU 慢」和
 	 * 「主循环根本没被唤醒」：后者说明卡在别处，不是渲染）。 */
-	if (stutter_on()) {
+	if (stutter_on(server)) {
 		static int64_t prev_ns = 0;
 		if (prev_ns != 0) {
 			int64_t gap_ns = st_t0 - prev_ns;

@@ -1164,6 +1164,23 @@ int main(int argc, char *argv[]) {
 	 * 剩下的部分在合成器已经开始渲染之后落地。 */
 	vidow_script_load(&server);
 
+	/* 配置里的 log_file（同 VIDOW_LOG_FILE）：环境变量优先（它是启动时就接上
+	 * 的，能记到启动那一段），配置这条更晚 —— 但它不用重登录就能生效，
+	 * 抓「开窗卡一下」这种现场的代价小得多。 */
+	if (log_file == NULL || log_file[0] == 0) {
+		const char *cfg_log = server.config.log_file;
+		if (cfg_log[0] != 0) {
+			FILE *lf = fopen(cfg_log, "a");
+			if (lf != NULL) {
+				dup2(fileno(lf), STDERR_FILENO);
+				dup2(fileno(lf), STDOUT_FILENO);
+				setvbuf(lf, NULL, _IOLBF, 0);
+				wlr_log(WLR_INFO, "日志也写进 %s（配置 log_file）",
+					cfg_log);
+			}
+		}
+	}
+
 	wl_display_run(server.display);
 
 	/* 从这里往下就是拆：wl_display_destroy() 会 finish 后端，键盘 / 输出那些

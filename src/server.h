@@ -448,6 +448,13 @@ struct vidow_config {
 	char shader_close[64];
 	char shader_idle[64]; /* applied permanently while the window lives */
 	char shader_dir[PATH_MAX];
+	/* 卡顿探针（同 VIDOW_STUTTER=1）：逐帧看「上一帧到现在隔了多久」，
+	 * 只报超过 100ms 的，附带那帧各阶段耗时。放在配置里是为了不用重登录
+	 * 就能抓 —— config.lua 改了会热重载。 */
+	bool stutter;
+	/* 日志同时写一份到这个文件（同 VIDOW_LOG_FILE）。SDDM 启动会话时把
+	 * stderr 丢进 /dev/null，没有它就拿不到「卡顿: …」那几行。 */
+	char log_file[PATH_MAX];
 	bool shader_flip_y;   /* sample the source texture bottom-up */
 
 	/* 缩放（见 scale.c）。scale 是所有输出的默认策略："auto" = 按 EDID 的 ppi

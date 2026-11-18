@@ -296,6 +296,12 @@ static const struct entry entries[] = {
 
 	{ "shader_enabled",  K_BOOL,   OFF(shader_enabled),  SZ(shader_enabled), 4,
 		"自定义 shader 总开关（需要 GLES2 渲染器）" },
+	{ "stutter",         K_BOOL,   OFF(stutter),         SZ(stutter), 3,
+		"卡顿探针：每帧记「距上一帧多久」，超过 100ms 就打一行带各阶段耗时的日志"
+		"（LOG 默认级别就能看见）。等价于环境变量 VIDOW_STUTTER=1" },
+	{ "log_file",        K_STRING, OFF(log_file),        SZ(log_file), 3,
+		"日志同时写一份到这个文件（追加）。SDDM 启动会话时 stderr 丢了，"
+		"抓卡顿 / 报错就靠它。等价于环境变量 VIDOW_LOG_FILE" },
 	{ "shader_dir",      K_STRING, OFF(shader_dir),      SZ(shader_dir), 4,
 		"shader 目录，加载 <目录>/<名字>.frag" },
 	{ "shader_flip_y",   K_BOOL,   OFF(shader_flip_y),   SZ(shader_flip_y), 4,
