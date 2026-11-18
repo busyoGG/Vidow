@@ -4773,6 +4773,9 @@ void vidow_float_toggle(struct vidow_view *view);
 /* 浮动窗口的尺寸 / 位置（IPC 用）。尺寸会去问客户端（它可以拒绝），位置是
  * 布局绝对坐标（内部换算成「相对自己那块屏原点」的偏移，跟着屏走）。 */
 void vidow_float_set_size(struct vidow_view *view, int w, int h);
+/* 浮窗挪到别的屏上了：归属（工作区 / 输出）也跟着搬。见 float.c。 */
+bool vidow_float_adopt_output(struct vidow_view *view);
+
 void vidow_float_move_to(struct vidow_view *view, int x, int y);
 void vidow_float_center(struct vidow_view *view);
 void vidow_float_place_all(struct vidow_server *server,

@@ -243,20 +243,35 @@ void vidow_float_update_mode(struct vidow_view *view) {
  * 所以改位置时要同时更新偏移和绝对盒，只改绝对盒会在下一次 arrange 时被
  * float_place_recursive() 用偏移覆盖回去。 */
 
-void vidow_float_move_to(struct vidow_view *view, int x, int y) {
-	if (view == NULL || view->float_mode == VIDOW_FLOAT_NONE) {
-		return;
+/* 浮窗的几何挪到别的屏上了：把归属（工作区 / 输出）也搬过去。
+ *
+ * 这是「窗口跨屏之后凭空不见 / 一闪一闪」的唯一病根：浮窗住在哪块屏由它所在
+ * 的工作区决定（view_home_output = 窗口 -> 工作区 -> 屏）。只改几何不改归属，
+ * 可见性判据（place 跟这块屏求交）算出来是「停在屏外」—— 旧屏上没有它，
+ * 新屏上也没有它，中间只要有一帧两边都算不出来，屏幕上就是闪一下。
+ *
+ * 三个调用点必须走同一条路：IPC 的 set-window-position、跨屏拖拽的落点、
+ * **拖拽过程中的每一帧**（拖过边界之后窗口就整块在新屏上了，等到松手才搬归属
+ * 就是用户报的「跨过去之后会闪烁」）。
+ *
+ * 返回 true = 真的换了屏（调用方要据此重算「相对这块屏」的偏移）。 */
+bool vidow_float_adopt_output(struct vidow_view *view) {
+	struct vidow_server *server = view->server;
+	bool moved = false;
+
+	if (server == NULL || server->output_layout == NULL) {
+		return false;
 	}
-	view->float_geom.x = x;
-	view->float_geom.y = y;
 	/* **归属跟着几何搬**：浮窗「住在哪块屏」是由它的工作区决定的
 	 * （view_home_output = 窗口 -> 工作区 -> 屏）。只改几何不改归属，
 	 * 窗口仍旧挂原来那块屏的工作区上：可见性判据（place 跟这块屏求交）
 	 * 一算就是「停在屏外」，屏幕上窗口直接消失 —— 挪过屏的浮窗凭空不见，
 	 * 底衬也还按旧屏采。IPC set-window-position / 跨屏拖拽松手都走这里。 */
-	if (view->server != NULL && view->server->output_layout != NULL) {
-		double cx = (double)x + (double)view->float_geom.width / 2.0;
-		double cy = (double)y + (double)view->float_geom.height / 2.0;
+	{
+		double cx = (double)view->float_geom.x +
+			(double)view->float_geom.width / 2.0;
+		double cy = (double)view->float_geom.y +
+			(double)view->float_geom.height / 2.0;
 		struct wlr_output *hit = wlr_output_layout_output_at(
 			view->server->output_layout, cx, cy);
 		if (hit != NULL && hit != view->output) {
@@ -290,9 +305,30 @@ void vidow_float_move_to(struct vidow_view *view, int x, int y) {
 				}
 				vidow_output_schedule_frame(view->server, hit,
 					"挪窗口跨屏");
+				/* 拖拽中的搬家要留和松手时同一句日志：
+				 * test-drag.sh 靠它确认「跨屏那一步发生过」。
+				 * 现在搬得早（每次 motion 跟着几何走），松手
+				 * 那一趟已经无需再搬，日志只能在这里打。 */
+				if (view->server->grab_view == view) {
+					wlr_log(WLR_INFO,
+						"grab: 浮窗拖到 %s 上 → 归到那块屏第 %d 块工作区",
+						hit->name != NULL ? hit->name : "?",
+						vidow_workspace_index(ws));
+				}
+				moved = true;
 			}
 		}
 	}
+	return moved;
+}
+
+void vidow_float_move_to(struct vidow_view *view, int x, int y) {
+	if (view == NULL || view->float_mode == VIDOW_FLOAT_NONE) {
+		return;
+	}
+	view->float_geom.x = x;
+	view->float_geom.y = y;
+	vidow_float_adopt_output(view);
 	struct wlr_box box = {0};
 	if (view->output != NULL) {
 		wlr_output_layout_get_box(view->server->output_layout, view->output,

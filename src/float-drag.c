@@ -345,6 +345,11 @@ void vidow_float_grab_update(struct vidow_server *server, double lx,
 
 		view->float_geom.x = x;
 		view->float_geom.y = y;
+		/* 拖过边界、整块落到对面那块屏上时，**归属也要当场搬**：等到松手
+		 * 才搬，中间那些帧里它在两块屏上都算「停在屏外」—— 用户报的
+		 * 「跨过去之后会闪烁」就是这一帧一帧的空白。见 float.c 的
+		 * vidow_float_adopt_output()。 */
+		vidow_float_adopt_output(view);
 		/* 位置是「相对自己那块屏」记的（见本文件顶上那段注释）：只改绝对盒、
 		 * 不刷新 home_dx/home_dy，下一次 arrange 的 float_place_recursive()
 		 * 会按旧偏移把它摆回去 —— 拖了等于没拖。 */
