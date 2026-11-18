@@ -52,12 +52,17 @@ blur_offset = 1.5
 window_open_ms = 0
 window_close_ms = 0
 window_move_ms = 0
+vidow.bind("Mod+mouse-left", "interactive-move")
 CFG
 
 export XDG_RUNTIME_DIR="$RUNDIR/run"
 export WLR_BACKENDS=headless WLR_HEADLESS_OUTPUTS=2 WLR_LIBINPUT_NO_DEVICES=1
 export HOME="$CFGDIR" VIDOW_LOG=debug
 export DISPLAY= WAYLAND_DISPLAY=
+# 指针注入：headless 里没有真鼠标，用 VIDOW_TEST_ACTION 的 FIFO 形式发
+# （和 test-drag.sh 同一套）。跨屏拖拽那条路只能这么验。
+export VIDOW_TEST_ACTION="file:$RUNDIR/actions"
+mkfifo "$RUNDIR/actions"
 
 mark "两块屏：左红右蓝，半透明白窗"
 setsid ./build/vidow > "$LOG" 2>&1 &
@@ -67,6 +72,7 @@ grep -aq "vidow ready" "$LOG" || { echo "vidow 没起来"; tail -5 "$LOG"; exit 
 export WAYLAND_DISPLAY=$(grep -ao "WAYLAND_DISPLAY=[a-z0-9-]*" "$LOG" |
 	tail -1 | cut -d= -f2)
 sleep 0.8
+exec 9> "$RUNDIR/actions"
 
 # 布局顺序由合成器自动排：先起的那块在 0,0，第二块在它右边。
 LNAME=$(grep -a "output HEADLESS-" "$LOG" | grep -a "布局 0,0" |
@@ -89,6 +95,8 @@ sleep 1.0
 python3 ./tools/sheet.py wA 1 1 1 0.5 > "$RUNDIR/wA.log" 2>&1 &
 CLIENT_PIDS="$CLIENT_PIDS $!"
 sleep 1.5
+
+act() { echo "$1" >&9; sleep "${2:-0.3}"; }
 
 win_out() {
 	./build/vidowmsg windows --title wA | python3 -c '
@@ -196,6 +204,57 @@ none|outside) fail "右屏截图拿不到（$COL2）" ;;
 	fi
 	;;
 esac
+
+mark "2b：真的用鼠标从右屏拖回左屏（跨屏拖拽那条路）"
+FL=$(./build/vidowmsg windows --title wA | python3 -c '
+import sys, json
+w = json.load(sys.stdin)
+if isinstance(w, list):
+    w = w[0]
+print(1 if w.get("floating") else 0)')
+if [ "$FL" = "1" ]; then
+	pass "窗口是浮的（拖动才有效）"
+else
+	./build/vidowmsg toggle-floating --title wA >/dev/null
+	sleep 0.5
+	pass "把窗口切成浮窗再拖"
+fi
+read -r GX GY GW GH <<< "$(win_geom)"
+act "pointer-motion $((GX + 200)) $((GY + 200))"
+act "pointer-button left press mod"
+act "pointer-motion $((GX - 200)) $((GY + 200))" 0.25
+act "pointer-motion 900 $((GY + 200))" 0.25
+act "pointer-motion 520 $((GY + 200))" 0.25
+act "pointer-button left release mod" 0.8
+OUT3=$(win_out)
+if [ "$OUT3" = "$LNAME" ]; then
+	pass "拖回左屏 → 归属跟着变回 $LNAME"
+else
+	fail "拖回左屏后归属还是 $OUT3（应该是 $LNAME）"
+fi
+read -r GX3 GY3 GW3 GH3 <<< "$(win_geom)"
+PX3=$((GX3 + GW3 / 2))
+PY3=$((GY3 + GH3 / 4))
+# 左屏底色是纯红：窗口是半透明白，压上去绿色通道必然抬起来。
+COL3=""
+for _i in $(seq 1 40); do
+	COL3=$(sample "$LNAME" "$RUNDIR/after-drag.png" "$PX3" "$PY3")
+	case "$COL3" in
+	none|outside) sleep 0.1; continue ;;
+	esac
+	case "$COL3" in
+	none|outside) sleep 0.1; continue ;;
+	esac
+	G3=$(echo "$COL3" | cut -d, -f2)
+	[ "$G3" -gt 40 ] && break
+	sleep 0.1
+done
+G3=$(echo "$COL3" | cut -d, -f2)
+if [ "${G3:-0}" -gt 40 ]; then
+	pass "拖完左屏上看得见窗口（($PX3,$PY3)=$COL3）"
+else
+	fail "拖完左屏上看不见窗口（($PX3,$PY3)=$COL3）—— 跨屏拖拽之后窗口没画出来"
+fi
 
 mark "3：vidow 全程活着"
 if { [ -n "$VIDOW_PGID" ] && kill -0 -- "-$VIDOW_PGID" 2>/dev/null; }; then

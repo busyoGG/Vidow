@@ -972,7 +972,7 @@ VIDOW_TEST_RENDERER=gles2 ./test-screencast.sh
 ./test-fullscreen-2out.sh            # 同上，但在**混合 DPI 两块屏**上：全屏占自己那块整屏（2 倍屏上就是整个 4K）、越界那半块不画到隔壁屏（全 headless + grim 逐像素，16 项断言）
 ./test-scanout.sh                    # 全屏直通：默认配置下真的扫上屏 / 退全屏回到合成 / 切换全程窗口不消失 / 直通与合成两条路内圈逐像素一样（全 headless + grim 逐像素，11 项断言）
 ./test-mixdpi.sh                     # 跨屏拖窗口：拖着的那段就按对面那块屏的倍率烘（全 headless，7 项断言）
-./test-cross-move.sh                 # 浮窗跨屏挪位置：归属跟着几何搬、新屏上真的看得见、底衬改采新屏（全 headless + grim 逐像素，8 项断言）
+./test-cross-move.sh                 # 浮窗跨屏搬位置：归属跟着几何搬、新屏上真的看得见、底衬改采新屏；再用真指针跨屏拖一趟（IPC 挪窗 + 拖拽，全 headless + grim 逐像素，11 项断言）
 ./test-vt.sh                         # tty 的 VT 切换（Ctrl+Alt+F1..F12 / switch-vt 动作）（全 headless，11 项断言）
 ./test-focus.sh                      # 焦点规则 + 激活请求（全 headless，60 项断言）
 ./test-click-focus.sh                # 点另一块屏的空区域：键盘焦点跟着过去（4 项，见 256）
