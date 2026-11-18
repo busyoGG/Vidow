@@ -1,6 +1,7 @@
 #include "server.h"
 #include "float-internal.h"
 #include "ipc.h"
+#include "workspace.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -248,6 +249,50 @@ void vidow_float_move_to(struct vidow_view *view, int x, int y) {
 	}
 	view->float_geom.x = x;
 	view->float_geom.y = y;
+	/* **归属跟着几何搬**：浮窗「住在哪块屏」是由它的工作区决定的
+	 * （view_home_output = 窗口 -> 工作区 -> 屏）。只改几何不改归属，
+	 * 窗口仍旧挂原来那块屏的工作区上：可见性判据（place 跟这块屏求交）
+	 * 一算就是「停在屏外」，屏幕上窗口直接消失 —— 挪过屏的浮窗凭空不见，
+	 * 底衬也还按旧屏采。IPC set-window-position / 跨屏拖拽松手都走这里。 */
+	if (view->server != NULL && view->server->output_layout != NULL) {
+		double cx = (double)x + (double)view->float_geom.width / 2.0;
+		double cy = (double)y + (double)view->float_geom.height / 2.0;
+		struct wlr_output *hit = wlr_output_layout_output_at(
+			view->server->output_layout, cx, cy);
+		if (hit != NULL && hit != view->output) {
+			struct vidow_workspace *ws =
+				vidow_workspace_shown_for(view->server, hit);
+			if (ws != NULL && ws != view->ws) {
+				wlr_log(WLR_INFO, "float: 挪窗口跨屏，归属搬到 %s",
+					hit->name != NULL ? hit->name : "?");
+				vidow_workspace_move_view(view->server, view, ws);
+				/* 新屏要**主动**要一帧：窗口原先根本不在它的场景里，
+				 * 这一趟 arrange 记的损伤全落在旧屏那块盒子上，新屏
+				 * 一个像素都没脏 —— 它就不出帧，窗口明明已经搬进它的
+				 * 工作区，屏上却还是旧画面（实测：跨屏松手后窗口
+				 * 「不见了」，再随便动一下才出现）。底衬也顺手整屏
+				 * 作废一次：新屏的底衬里还叠着窗口原来那块形状。 */
+				/* **在渲染趟之外就把新屏那份装饰烘好。**
+				 * 装饰是按屏一份的实例节点，第一次烘是「这一帧画到
+				 * 这块屏上」时才发生的 —— 而那时 wlroots 的渲染链表
+				 * 已经建完了，新建/刚填好的节点这一帧根本进不去：
+				 * 客户端那张真表面又因为「已经直画 / 已烘」被藏起来，
+				 * 于是整块窗口一个像素都不画（实测：跨屏挪完窗口凭空
+				 * 消失，再随便动一下才出现 —— 那一帧才有机会进表）。
+				 * 所以归属一搬完，立刻按新屏烘一次，让节点带着缓冲
+				 * 等到下一帧。 */
+				view->fx.bake_output = hit;
+				vidow_view_anim_bake(view);
+				struct vidow_output *vo =
+					vidow_output_lookup(view->server, hit);
+				if (vo != NULL) {
+					vidow_backdrop_damage_output(vo);
+				}
+				vidow_output_schedule_frame(view->server, hit,
+					"挪窗口跨屏");
+			}
+		}
+	}
 	struct wlr_box box = {0};
 	if (view->output != NULL) {
 		wlr_output_layout_get_box(view->server->output_layout, view->output,
