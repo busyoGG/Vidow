@@ -3081,6 +3081,9 @@ struct vidow_server {
 	struct wlr_buffer *draw_dst;
 	int draw_w, draw_h;
 	bool draw_pass;
+	/* draw-pass 那一层这一趟是否**还开着**：vidow_fx_draw_views 开一次，
+	 * 各窗口的 decor_pass 借用它，不再各自 begin/end（见 decor_pass）。 */
+	bool draw_layer_open;
 
 	struct wl_list anims;    /* vidow_anim.link */
 	/* 正在跑 vidow_anim_tick()。这个标志是给 vidow_anim_cancel() 看的：tick

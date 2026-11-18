@@ -3418,11 +3418,16 @@ static bool decor_pass(struct vidow_server *server,
 
 	struct wlr_egl *egl = NULL;
 	/* 直接画进输出（draw-pass）：这块缓冲是**所有窗口共用**的一层，清由
-	 * vidow_fx_draw_views 在循环前统一做一次，每个窗口这一趟只画不清。
-	 * （begin_pass_rect 传一个非 NULL 的 rect 就不清。） */
+	 * vidow_fx_draw_views 统一做一次，这一趟其实就是它开的 —— 每个窗口只
+	 * 往同一个 FBO 里画，不再各自 begin/end 一次。
+	 *
+	 * 为什么能借：这个函数里一行 glEnable / glScissor / glViewport 都没有，
+	 * 目标 FBO、视口、混合状态整层都一样，中间那次 begin_pass_rect 纯属重复
+	 * 的样板（查 FBO、切视口、关混合、eglMakeCurrent）。 */
+	bool borrowed = server->draw_layer_open;
 	const struct wlr_box full = { .x = 0, .y = 0,
 		.width = g->dst_w, .height = g->dst_h };
-	if (begin_pass_rect(server, dst, g->dst_w, g->dst_h,
+	if (!borrowed && begin_pass_rect(server, dst, g->dst_w, g->dst_h,
 			server->draw_dst != NULL ? &full : NULL, &egl) == 0) {
 		return false;
 	}
@@ -3595,7 +3600,9 @@ static bool decor_pass(struct vidow_server *server,
 
 	draw_quad(d->program);
 	glUseProgram(0);
-	end_pass(egl);
+	if (!borrowed) {
+		end_pass(egl);
+	}
 	return true;
 }
 bool decor_draw(struct vidow_server *server,
@@ -3944,20 +3951,6 @@ bool vidow_fx_draw_views(struct vidow_server *server, struct wlr_buffer *dst,
 	if (server->decor.program == 0) {
 		return false;
 	}
-	{
-		/* 这一层是所有窗口共用的：整块清一次，之后每个窗口只画不清
-		 * （见 decor_pass 里的 one_px）。 */
-		struct wlr_egl *egl = NULL;
-		if (begin_pass(server, dst, w, h, &egl) == 0) {
-			return false;
-		}
-		if (getenv("VIDOW_DP_RED") != NULL) {
-			/* 调试：整层涂红，确认「层真的上了屏」。 */
-			glClearColor(1.0f, 0.0f, 0.0f, 1.0f);
-			glClear(GL_COLOR_BUFFER_BIT);
-		}
-		end_pass(egl);
-	}
 	if (getenv("VIDOW_DRAW_TRACE") != NULL) {
 		wlr_log(WLR_INFO, "DRAWVIEWS dst=%p %dx%d", (void *)dst, w, h);
 	}
@@ -3978,33 +3971,52 @@ bool vidow_fx_draw_views(struct vidow_server *server, struct wlr_buffer *dst,
 			av->fx.force_offscreen = false;
 		}
 	}
+	/* **这一层的这一趟从这儿开、到循环结束才关**：清屏和每个窗口的绘制
+	 * 合进同一次 FBO 绑定里（decor_pass 那边靠 draw_layer_open 借用）。 */
+	struct wlr_egl *egl = NULL;
+	if (begin_pass(server, dst, w, h, &egl) == 0) {
+		return false;
+	}
+	if (getenv("VIDOW_DP_RED") != NULL) {
+		/* 调试：整层涂红，确认「层真的上了屏」。 */
+		glClearColor(1.0f, 0.0f, 0.0f, 1.0f);
+		glClear(GL_COLOR_BUFFER_BIT);
+	}
 	server->draw_pass = true;
 	server->draw_dst = dst;
 	server->draw_w = w;
 	server->draw_h = h;
-	struct vidow_view *view;
+	server->draw_layer_open = true;
 	int n = 0;
-	wl_list_for_each(view, &server->views, link) {
-		if (!view->mapped || view->popup) {
-			continue;
+	/* **按 z 序画**：这一层是一块扁平缓冲，谁后画谁在上面 —— 所以顺序必须
+	 * 跟场景树一致，否则浮窗会被平铺窗口盖住、点一下焦点变了画面不变。
+	 * 场景的兄弟表就是 z 序（先画在下、后画在上，见 view_fully_occluded
+	 * 里的注释），照着它从头往后走即可。 */
+	struct wlr_scene_node *n_ = NULL;
+	if (server->layer_toplevels != NULL) {
+		wl_list_for_each(n_, &server->layer_toplevels->children, link) {
+			if (!n_->enabled) {
+				continue;
+			}
+			struct vidow_view *view = view_from_scene_node(n_);
+			if (view == NULL || !view->mapped || view->popup) {
+				continue;
+			}
+			/* 果冻 / 开窗缩放：这两个还靠离屏缓冲（见 view.c 的
+			 * vidow_view_anim_bake），它们的装饰节点自己会画，别重复。 */
+			if (view->jelly != NULL || view->fx.anim_scale != 1.0) {
+				continue;
+			}
+			vidow_view_anim_bake(view);
+			view->fx.layer_dirty = false;
+			n++;
 		}
-		if (getenv("VIDOW_DRAW_TRACE") != NULL) {
-			wlr_log(WLR_INFO, "DRAWVIEW %p mapped=%d popup=%d fxactive=%d surf=%p node=%p",
-				(void *)view, view->mapped, view->popup, view->fx.active,
-				(void *)view->scene_surface, (void *)view->fx.node);
-		}
-		/* 果冻 / 开窗缩放：这两个还靠离屏缓冲（见 view.c 的
-		 * vidow_view_anim_bake），它们的装饰节点自己会画，这一层别重复画。 */
-		if (view->jelly != NULL || view->fx.anim_scale != 1.0) {
-			continue;
-		}
-		vidow_view_anim_bake(view);
-		view->fx.layer_dirty = false;
-		n++;
 	}
 	if (getenv("VIDOW_DRAW_TRACE") != NULL) {
 		wlr_log(WLR_INFO, "DPVIEWS baked=%d dst=%p", n, (void *)dst);
 	}
+	server->draw_layer_open = false;
+	end_pass(egl);
 	server->draw_dst = NULL;
 	return true;
 }
