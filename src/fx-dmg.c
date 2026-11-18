@@ -189,7 +189,29 @@ static void blur_note_damage(struct vidow_server *server,
 		if (view == skip) {
 			continue;
 		}
-		dmg_add(&view->fx.pending_damage, box);
+		/* 只记这块屏上真变的那一条：窗口横着走过屏幕边界时，盒子会跨到
+		 * 隔壁屏去，而那块屏的底衬里根本没画着它 —— 报过去只是白重抓一次。
+		 * 裁一下，跨屏拖动时隔壁屏的私有底衬就不用跟着忙（Hyprland
+		 * #16888 的 copyDamage.intersect() 是同一个意思）。 */
+		struct wlr_box b = *box;
+		if (view->output != NULL) {
+			struct wlr_box ob = {0};
+			wlr_output_layout_get_box(server->output_layout,
+				view->output, &ob);
+			int x0 = b.x > ob.x ? b.x : ob.x;
+			int y0 = b.y > ob.y ? b.y : ob.y;
+			int x1 = (b.x + b.width) < (ob.x + ob.width) ?
+				(b.x + b.width) : (ob.x + ob.width);
+			int y1 = (b.y + b.height) < (ob.y + ob.height) ?
+				(b.y + b.height) : (ob.y + ob.height);
+			if (ob.width > 0 && ob.height > 0 && x1 > x0 && y1 > y0) {
+				b = (struct wlr_box){ .x = x0, .y = y0,
+					.width = x1 - x0, .height = y1 - y0 };
+			} else if (ob.width > 0 && ob.height > 0) {
+				continue;
+			}
+		}
+		dmg_add(&view->fx.pending_damage, &b);
 	}
 	struct vidow_layer_surface *ls;
 	wl_list_for_each(ls, &server->layers, link) {
