@@ -1,7 +1,7 @@
 #!/bin/bash
 # 用法：EASE="spring 1.0 800" RATE=0.03 N=8 ./tools/viewport-ab.sh
 set -u
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 EASE="${EASE:-spring 0.6 800}"
 RATE="${RATE:-0.01}"
 N="${N:-5}"
