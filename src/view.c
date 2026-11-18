@@ -2683,13 +2683,27 @@ void vidow_view_anim_bake(struct vidow_view *view) {
 		bake_scale = view->fx.bake_output->scale;
 	}
 	if (draw_pass_on() && getenv("VIDOW_DRAW_TRACE")) wlr_log(WLR_INFO, "BAKE call fx_frame x=%d y=%d alpha=%.2f scale=%.2f", x, y, alpha, bake_scale * fx_ov);
+	/* **果冻期间不重烘源图 —— 抄 KWin 的 wobbly windows。**
+	 * KWin 变形的是窗口那张 pixmap，变形期间那张图不重画（更新排队，
+	 * 动画完了再合并）。我们原来每帧都烘：内容一动 bake_revision 就变，
+	 * 缓存判据必然不中，实测拖动 6 个动画窗时 12 次/帧。烘出来的图
+	 * 跟上一帧逐像素一样，纯白花。尺寸 / 倍率在果冻期间不变（只动
+	 * anim_off），所以冻住是安全的；果冻收手时 vidow_jelly_end 清标志。 */
+	if (view->jelly != NULL && view->fx.jelly_frozen_out != NULL &&
+		view->fx.bake_output == view->fx.jelly_frozen_out) {
+		return;
+	}
 	bool fx_drawn = vidow_fx_frame(view->server, &view->fx, src, &geo,
 		0, 0, x, y, alpha, view->server->focused == view,
 		view->fullscreen, bake_scale * fx_ov, fx_ov, &view->rule_eff);
 	/* 探针：整块窗口那么大的离屏渲染一共多少钱（见统计行的「重烘」；次数由
 	 * vidow_fx_frame 的 vidow_stats.bakes 记）。拖动 / 滚动动画里每个在动的
 	 * 窗口每帧都要烘一次，所以这项随窗口数线性涨。 */
-	vidow_stats.bake_ns += vidow_now_ns() - bake_t0;
+	if (view->jelly != NULL && view->fx.bake_output != NULL) {
+		view->fx.jelly_frozen_out = view->fx.bake_output;
+	} else {
+		view->fx.jelly_frozen_out = NULL;
+	}
 	/* 装饰图真的画上屏了才把真实表面藏起来（只留给命中测试）。没画出来
 	 * 还藏就是窗口整个消失 —— 关掉 decor/shader 时踩过，屏幕一片黑。
 	 * 拖着果冻的时候也一样：内容归 jelly.c 那个节点画。

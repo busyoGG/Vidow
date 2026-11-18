@@ -36,3 +36,30 @@ busy 场景（6 窗、双屏、每帧重画）实测：装饰重烘 **12 次/帧
 
 - 果冻保持 HEAD 做法（装饰烘在图里 + 网格）。已回退全部试验代码，test-jelly.sh / test-corner.sh / test-drag.sh 全绿。
 - 这个方向不再投入；性能上真正值钱的仍是 docs/adr/0002 里的「装饰直画（draw-pass）」和「被遮挡跳过合成」。
+
+
+## 后续（2026-11-18）：只做「那一行能改的」
+
+ADR 说得很清楚，能改的只有「重烘频率」。KWin 的做法是 `Window::updateWindowPixmap`
+按损伤增量更新，而且动画期间那张图基本不动。照这个思路做了一条最小改动：
+
+- `vidow_view_anim_bake()` 里，果冻跑着的时候**冻住这个窗口那一份装饰图**：
+  只要这次烘的屏（`fx->bake_output`）就是冻住的那块（`fx->jelly_frozen_out`），
+  直接 return，不重烘。果冻收手（`vidow_jelly_end`）时解冻。
+- 为什么安全：果冻期间窗口的尺寸 / 倍率 / 内容尺寸都不变（动的只有 `anim_off`，
+  由 `view_anim_place` 摆节点），所以那张图逐像素不变；而内容一动 `bake_revision`
+  就变，缓存判据必然不中 —— 原来每帧白烘一次。
+
+实测（`tools/perf-scene.sh drag --secs 6`，同一台机、相邻两次）：
+
+| | 帧 | 装饰重烘 | 重烘/帧 |
+|---|---|---|---|
+| 改动前 | 419 | 650 | 1.55 |
+| 改动后 | 456 | 542 | 1.19 |
+
+拖拽场景重烘降 23%。回归：test-jelly / test-drag / test-corner / test-titlebar-drag /
+test-floatstack / test-drag-insert / test-drag-stall / test-tile-resize /
+test-viewport-spring / test-wincapture-lock / test-scanout / test-overview 全部 0 FAIL。
+
+「按损伤增量重烘」没有做：天花板 0.14 ms/帧，风险（损伤坐标要映射进装饰画布的
+设备像素、双缓冲轮转时得保证只增量更新最新的那一份）远大于收益。
