@@ -21,6 +21,9 @@
 #include <wlr/types/wlr_color_management_v1.h>
 #include <wlr/util/log.h>
 
+/* 上一个统计窗口的数（卡顿行在窗口刚重置时改打它）。 */
+static struct vidow_frame_stats stats_prev;
+
 /* 环境变量只问一次。
  *
  * 这两个变量以前是**每帧**问一遍（渲染统计两次、帧追踪钩子一次），而 getenv 要
@@ -231,6 +234,12 @@ void vidow_output_render(struct vidow_output *output) {
 		if (prev_ns != 0) {
 			int64_t gap_ns = st_t0 - prev_ns;
 			if (gap_ns >= stutter_threshold_ns()) {
+				/* 统计窗口刚好在两帧之间重置时，vidow_stats 是全 0，
+				 * 卡顿行会变成「全都是 0.00」看不出东西 —— 那时改打上一
+				 * 个窗口的数（那次卡顿就发生在那个窗口里）。 */
+				const struct vidow_frame_stats *sp =
+					(vidow_stats.frames == 0 && stats_prev.frames > 0) ?
+					&stats_prev : &vidow_stats;
 				wlr_log(WLR_INFO,
 					"卡顿: 距上一帧 %.1fms（阈值 %.0fms）"
 					" | 上帧: 果冻 %.2f 模糊 %.2f 装饰 %.2f 提交 %.2f"
@@ -238,17 +247,16 @@ void vidow_output_render(struct vidow_output *output) {
 					"| 帧数 %d 趟 %d 重烘 %d",
 					(double)gap_ns / 1e6,
 					(double)stutter_threshold_ns() / 1e6,
-					(double)vidow_stats.jelly_ns / 1e6,
-					(double)vidow_stats.blur_ns / 1e6,
-					(double)vidow_stats.decor_ns / 1e6,
-					(double)vidow_stats.commit_ns / 1e6,
-					(double)vidow_stats.flush_ns / 1e6,
-					(double)vidow_stats.build_ns / 1e6,
-					(double)vidow_stats.post_ns / 1e6,
-					(double)(vidow_stats.commit_ns - vidow_stats.flush_ns -
-						vidow_stats.build_ns - vidow_stats.post_ns) / 1e6,
-					vidow_stats.frames, vidow_stats.passes,
-					vidow_stats.bakes);
+					(double)sp->jelly_ns / 1e6,
+					(double)sp->blur_ns / 1e6,
+					(double)sp->decor_ns / 1e6,
+					(double)sp->commit_ns / 1e6,
+					(double)sp->flush_ns / 1e6,
+					(double)sp->build_ns / 1e6,
+					(double)sp->post_ns / 1e6,
+					(double)(sp->commit_ns - sp->flush_ns -
+						sp->build_ns - sp->post_ns) / 1e6,
+					sp->frames, sp->passes, sp->bakes);
 			}
 		}
 		prev_ns = st_t0;
@@ -639,6 +647,7 @@ void vidow_output_render(struct vidow_output *output) {
 						(double)ovns / (double)ovn);
 				}
 			}
+			stats_prev = vidow_stats;
 			vidow_stats = (struct vidow_frame_stats){0};
 			win_ns = st_t4;
 		}
