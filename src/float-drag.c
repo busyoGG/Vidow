@@ -279,7 +279,12 @@ void vidow_float_begin_grab(struct vidow_server *server,
 	server->grab_client_press = from_client;
 	/* 拖动有果冻，改大小没有：改大小每帧换源缓冲尺寸，网格对不上（见 jelly.c）。 */
 	if (!resize) {
-		vidow_jelly_begin(view);
+		/* 果冻的形变源是「烘好的装饰图」：draw-pass 平时不留这张图，起手前
+	 * 临时烘一张（见 view.c 的 vidow_view_anim_bake 守卫）。 */
+	view->fx.force_offscreen = true;
+	vidow_view_anim_bake(view);
+	view->fx.force_offscreen = false;
+	vidow_jelly_begin(view);
 	}
 	server->grab_x = server->cursor->x;
 	server->grab_y = server->cursor->y;

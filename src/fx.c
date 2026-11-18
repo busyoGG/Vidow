@@ -1434,6 +1434,16 @@ static bool anim_draw(struct vidow_server *server,
 
 /* 没画成的原因出口（定义在下面，layer_blur_wanted 也要用）。 */
 /* 抓底衬时要不要把这个 layer surface 自己藏起来（见下面的定义）。 */
+/* VIDOW_DRAW_PASS=0 关掉（默认开）：装饰不烘离屏，直接画进输出。 */
+static bool draw_pass_on(void) {
+	static int on = -1;
+
+	if (on < 0) {
+		on = getenv("VIDOW_DRAW_PASS") != NULL ? 1 : 0;
+	}
+	return on != 0;
+}
+
 bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 		struct wlr_scene_buffer *src, const struct vidow_fx_geo *geo,
 		int x, int y, int ox, int oy,
@@ -1584,7 +1594,11 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 			fx->view != NULL && vidow_view_title(fx->view) != NULL ?
 				vidow_view_title(fx->view) : "(非窗口)");
 	}
-	if (!ensure_targets(server, fx, cw, ch, scale, out_scale)) {
+	/* draw-pass：直接画进输出，**这一对离屏画布一块都不开**（每窗两张
+	 * 3840x2160 ≈ 66MB，加底衬就是那 100MB）。只有果冻起手要一张快照
+	 * （fx->force_offscreen，见 jelly.c 的 vidow_jelly_begin）。 */
+	bool need_buf = !draw_pass_on() || fx->force_offscreen;
+	if (!ensure_targets(server, fx, cw, ch, scale, out_scale, need_buf)) {
 		wlr_log(WLR_DEBUG, "fx-frame ret: ensure");
 		return false;
 	}
@@ -1668,8 +1682,12 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 	struct wlr_buffer *displayed = NULL;
 	struct wlr_buffer *decorated = NULL;
 	const float *border = NULL; /* 重画装饰用（动画那趟失败时） */
+	if (getenv("VIDOW_DRAW_TRACE")) {
+		wlr_log(WLR_INFO, "FX decor=%d prog=%u dst=%p tex=%p", look.decor, server->decor.program, (void *)server->draw_dst, (void *)tex);
+	}
 	if (look.decor && server->decor.program != 0) {
-		struct wlr_buffer *target = pick_free(dbufs);
+		struct wlr_buffer *target = server->draw_dst != NULL ?
+			server->draw_dst : pick_free(dbufs);
 		if (target != NULL) {
 			border = focused ? look.border_color_focus :
 				look.border_color;
@@ -1685,6 +1703,14 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 			}
 			displayed = target;
 			decorated = target;
+			/* 已经直接落在这块屏的缓冲上了：没有离屏缓冲要交回去，也没有
+			 * 节点要摆（draw-pass 模式下那个节点是关着的）。 */
+			if (server->draw_dst != NULL) {
+				if (tex_owned) {
+					wlr_texture_destroy(tex);
+				}
+				return true;
+			}
 		} else {
 			/* 两块装饰目标都还在飞（上一两帧还没上完屏）：这一帧干脆不画，
 			 * 让上帧的画面多停一帧，别拿没装饰的内容顶上去。 */
@@ -3333,6 +3359,13 @@ struct decor_geo {
 	/* 内容那一项的乘子：屏幕那条路是 1，窗口抓帧那条路是 0（内容由场景节点
 	 * 画，这张图里只要底衬 / 画框，但剔除仍按内容 alpha 走）。 */
 	float content_alpha;
+	/* 贴到目标里的位置（目标像素）。0 就是左上角 —— 烘到每窗离屏那条老路。
+	 * 直接画进输出（VIDOW_DRAW_PASS）时这里是窗口在输出里的左上角，于是
+	 * 同一份着色器、同一份几何参数就能落在屏幕上的正确位置，不用先转存。 */
+	float pos_x, pos_y;
+	/* 这块装饰自己的画布尺寸（0 = 就是 dst_w/dst_h，老路）。直接画进输出时
+	 * dst_* 是整块屏，画布尺寸只剩这两个字段记着。 */
+	int own_w, own_h;
 };
 
 
@@ -3383,7 +3416,13 @@ static bool decor_pass(struct vidow_server *server,
 	wlr_gles2_texture_get_attribs(src, &sa);
 
 	struct wlr_egl *egl = NULL;
-	if (begin_pass(server, dst, g->dst_w, g->dst_h, &egl) == 0) {
+	/* 直接画进输出（draw-pass）：这块缓冲是**所有窗口共用**的一层，清由
+	 * vidow_fx_draw_views 在循环前统一做一次，每个窗口这一趟只画不清。
+	 * （begin_pass_rect 传一个非 NULL 的 rect 就不清。） */
+	const struct wlr_box full = { .x = 0, .y = 0,
+		.width = g->dst_w, .height = g->dst_h };
+	if (begin_pass_rect(server, dst, g->dst_w, g->dst_h,
+			server->draw_dst != NULL ? &full : NULL, &egl) == 0) {
 		return false;
 	}
 
@@ -3453,7 +3492,21 @@ static bool decor_pass(struct vidow_server *server,
 	/* 着色器全程在「渲染目标的物理像素」里算：配置里的圆角、边框、阴影都是
 	 * 逻辑单位，乘上倍率才是像素。 */
 	glUniform2f(d->u_size, (float)g->content_w, (float)g->content_h);
-	glUniform2f(d->u_target_size, (float)g->dst_w, (float)g->dst_h);
+	glUniform2f(d->u_target_size,
+		(float)(g->own_w > 0 ? g->own_w : g->dst_w),
+		(float)(g->own_h > 0 ? g->own_h : g->dst_h));
+	glUniform2f(d->u_dst, (float)g->dst_w, (float)g->dst_h);
+	glUniform2f(d->u_pos, g->pos_x, g->pos_y);
+	{
+		static int64_t last = 0;
+		int64_t now = vidow_now_ns();
+		if (getenv("VIDOW_DRAW_TRACE") != NULL && now - last > 500000000LL) {
+			last = now;
+			wlr_log(WLR_INFO, "DRAWTRACE dst=%dx%d own=%dx%d pos=%.1f,%.1f content=%dx%d radius=%.1f scale=%.2f alpha=%.2f",
+				g->dst_w, g->dst_h, g->own_w, g->own_h, g->pos_x, g->pos_y,
+				g->content_w, g->content_h, look->corner_radius, scale, alpha);
+		}
+	}
 	glUniform2f(d->u_content_off, g->off_x, g->off_y);
 	glUniform1f(d->u_radius, (float)(look->corner_radius * scale));
 	/* 圆角的形状指数：2 = 圆弧、4 = 超椭圆。夹一道（配置 / 环境变量 / IPC /
@@ -3588,11 +3641,19 @@ bool decor_draw(struct vidow_server *server,
 	}
 
 	/* 尺寸取**这一帧那一格**（跨屏时两块屏各一对，尺寸差一倍）。 */
-	int dw2 = fx->cur_slot != NULL ? fx->cur_slot->dec_w : fx->w;
-	int dh2 = fx->cur_slot != NULL ? fx->cur_slot->dec_h : fx->h;
-	int dcw2 = fx->cur_slot != NULL ? fx->cur_slot->dec_content_w : fx->content_w;
-	int dch2 = fx->cur_slot != NULL ? fx->cur_slot->dec_content_h : fx->content_h;
-	int dpad2 = fx->cur_slot != NULL ? fx->cur_slot->dec_px_pad : fx->px_pad;
+	/* draw-pass（直接画进输出）：那一对格子缓冲这一帧**根本没分配**，格子里
+	 * 的尺寸全是 0 —— 拿它当画布尺寸就是「四边形退化成 0x0、窗口整个不画」。
+	 * 尺寸一律用 fx->w/h/content/px_pad（ensure_targets 在 alloc=false 那条
+	 * 路上补齐了）。 */
+	bool dp = server->draw_dst != NULL;
+	int dw2 = (!dp && fx->cur_slot != NULL) ? fx->cur_slot->dec_w : fx->w;
+	int dh2 = (!dp && fx->cur_slot != NULL) ? fx->cur_slot->dec_h : fx->h;
+	int dcw2 = (!dp && fx->cur_slot != NULL) ? fx->cur_slot->dec_content_w :
+		fx->content_w;
+	int dch2 = (!dp && fx->cur_slot != NULL) ? fx->cur_slot->dec_content_h :
+		fx->content_h;
+	int dpad2 = (!dp && fx->cur_slot != NULL) ? fx->cur_slot->dec_px_pad :
+		fx->px_pad;
 	if (span_trace_on() && bs != NULL) {
 		wlr_log(WLR_INFO, "span: out=%s scale=%.2f target=%dx%d content=%dx%d origin=%d,%d viewport=%d,%d %dx%d region=%d,%d %dx%d tex=%p",
 			bs->out->name, scale, dw2, dh2, dcw2, dch2, ox, oy,
@@ -3611,6 +3672,26 @@ bool decor_draw(struct vidow_server *server,
 		.out_size_y = (float)(rg_h > 0 ? rg_h : out_h),
 		.content_alpha = 1.0f,
 	};
+	/* **直接画进输出**（VIDOW_DRAW_PASS=1，见 server.h 的 draw_dst）：
+	 * 目标从「这块窗口自己的画布」换成整块屏，位置换成窗口内容在这块屏里的
+	 * 左上角（origin 本来就是「窗口内容在目标里的设备像素坐标」，减去
+	 * off（= px_pad）就是那块含投影的四边形该落的点）。
+	 * 老路（烘离屏）一个像素都不变：pos 恒 0、dst_w/h 就是那块画布。 */
+	if (server->draw_dst != NULL) {
+		/* 这块装饰自己那块画布多大，得单独记着：着色器里的 p 是**画布**坐标
+		 * （v_uv * u_target_size），换成输出尺寸的话圆角 / 边框 / 投影全按
+		 * 整块屏的尺寸算 —— 结果就是「内容照常、四个角全方了」。 */
+		if (getenv("VIDOW_DRAW_TRACE") != NULL) {
+			wlr_log(WLR_INFO, "OVERRIDE dw2=%d dh2=%d draw=%dx%d", dw2, dh2,
+				server->draw_w, server->draw_h);
+		}
+		g.own_w = g.dst_w;
+		g.own_h = g.dst_h;
+		g.pos_x = g.origin_x - g.off_x;
+		g.pos_y = g.origin_y - g.off_y;
+		g.dst_w = server->draw_w;
+		g.dst_h = server->draw_h;
+	}
 
 	/* **跨屏两半各自采自己那块屏的底衬 —— 但不是在这一次渲染里。**
 	 *
@@ -3631,6 +3712,11 @@ bool decor_draw(struct vidow_server *server,
 	 *   采样       = (origin - off + p * blur_scale + bias) / out_size
 	 */
 
+	if (getenv("VIDOW_DRAW_TRACE") != NULL) {
+		wlr_log(WLR_INFO, "DECORDRAW dst=%p draw_dst=%p own=%dx%d pos=%.0f,%.0f",
+			(void *)dst, (void *)server->draw_dst, g.own_w, g.own_h,
+			g.pos_x, g.pos_y);
+	}
 	return decor_pass(server, fx, dst, &g, src, mask, border, alpha, scale, look,
 		false);
 }
@@ -3835,5 +3921,89 @@ bool vidow_fx_begin(struct vidow_server *server, struct vidow_fx_target *fx,
 	if (animated) {
 		vidow_fx_set_shader(server, fx, shader_name, VIDOW_SHADER_OPEN);
 	}
+	return true;
+}
+
+/* 直接把这块屏上的窗口**画进这块输出缓冲**（VIDOW_DRAW_PASS=1）：不建每窗
+ * 离屏，每个窗口一趟装饰着色器，落在输出缓冲上它该在的位置。
+ *
+ * 调用点在 output.c 的 build_state 之后：那时 state.buffer 已经拿到，场景
+ * （背景 / layer / popup）刚画完，窗口按 z 序排在它们**中间** —— 所以这条路
+ * 只该在有 popup / 面板盖住窗口时露馅（见 docs/adr 里记的那条已知缺口）。
+ *
+ * 每个窗口走的是和烘离屏**同一条** vidow_view_anim_bake：几何、底衬、圆角、
+ * 边框、投影、内容全在那边算好了，这里只是把 server->draw_dst 摆上去，
+ * 让 decor_draw 换个目标、加个位移。
+ */
+bool vidow_fx_draw_views(struct vidow_server *server, struct wlr_buffer *dst,
+		int w, int h) {
+	if (dst == NULL || w <= 0 || h <= 0 || server->decor.program == 0) {
+		return false;
+	}
+	if (server->decor.program == 0) {
+		return false;
+	}
+	{
+		/* 这一层是所有窗口共用的：整块清一次，之后每个窗口只画不清
+		 * （见 decor_pass 里的 one_px）。 */
+		struct wlr_egl *egl = NULL;
+		if (begin_pass(server, dst, w, h, &egl) == 0) {
+			return false;
+		}
+		if (getenv("VIDOW_DP_RED") != NULL) {
+			/* 调试：整层涂红，确认「层真的上了屏」。 */
+			glClearColor(1.0f, 0.0f, 0.0f, 1.0f);
+			glClear(GL_COLOR_BUFFER_BIT);
+		}
+		end_pass(egl);
+	}
+	if (getenv("VIDOW_DRAW_TRACE") != NULL) {
+		wlr_log(WLR_INFO, "DRAWVIEWS dst=%p %dx%d", (void *)dst, w, h);
+	}
+	/* 动画窗（果冻 / 开窗缩放）先用**自己的**离屏缓冲烘一遍：它们要一张
+	 * 图去做形变，这一趟必须在「层」这套几何（draw_dst）打开之前跑，否则
+	 * 会被当成画进层里。 */
+	{
+		struct vidow_view *av;
+		wl_list_for_each(av, &server->views, link) {
+			if (!av->mapped || av->popup) {
+				continue;
+			}
+			if (av->jelly == NULL && av->fx.anim_scale == 1.0) {
+				continue;
+			}
+			av->fx.force_offscreen = true;
+			vidow_view_anim_bake(av);
+			av->fx.force_offscreen = false;
+		}
+	}
+	server->draw_pass = true;
+	server->draw_dst = dst;
+	server->draw_w = w;
+	server->draw_h = h;
+	struct vidow_view *view;
+	int n = 0;
+	wl_list_for_each(view, &server->views, link) {
+		if (!view->mapped || view->popup) {
+			continue;
+		}
+		if (getenv("VIDOW_DRAW_TRACE") != NULL) {
+			wlr_log(WLR_INFO, "DRAWVIEW %p mapped=%d popup=%d fxactive=%d surf=%p node=%p",
+				(void *)view, view->mapped, view->popup, view->fx.active,
+				(void *)view->scene_surface, (void *)view->fx.node);
+		}
+		/* 果冻 / 开窗缩放：这两个还靠离屏缓冲（见 view.c 的
+		 * vidow_view_anim_bake），它们的装饰节点自己会画，这一层别重复画。 */
+		if (view->jelly != NULL || view->fx.anim_scale != 1.0) {
+			continue;
+		}
+		vidow_view_anim_bake(view);
+		view->fx.layer_dirty = false;
+		n++;
+	}
+	if (getenv("VIDOW_DRAW_TRACE") != NULL) {
+		wlr_log(WLR_INFO, "DPVIEWS baked=%d dst=%p", n, (void *)dst);
+	}
+	server->draw_dst = NULL;
 	return true;
 }

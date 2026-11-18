@@ -529,6 +529,11 @@ static void tile_drag_activate(struct vidow_server *server,
 	/* 果冻照旧：普通浮窗已经证明「模糊 + 形变」可以共存。拖拽这里变雾是
 	 * 另一条原因（见 tile_drag_activate 里对 anim_alpha 的处理），不能靠
 	 * 关果冻来掩盖。 */
+	/* 果冻的形变源是「烘好的装饰图」：draw-pass 平时不留这张图，起手前
+	 * 临时烘一张（见 view.c 的 vidow_view_anim_bake 守卫）。 */
+	view->fx.force_offscreen = true;
+	vidow_view_anim_bake(view);
+	view->fx.force_offscreen = false;
 	vidow_jelly_begin(view);
 	/* 落点预览块：起拖就摆出来（按现在这个抓点算），层级收一次口（块在所有窗口
 	 * 之上、被拖的这个之下，见 vidow_insert_hint_update）。 */

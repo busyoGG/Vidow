@@ -107,6 +107,26 @@ static const char *vertex_src =
 	"	gl_Position = vec4(a_pos.x * 2.0 - 1.0, a_pos.y * 2.0 - 1.0, 0.0, 1.0);\n"
 	"}\n";
 
+/* 装饰那条路专用：同一个整块四边形，但能贴到目标里的任意位置（u_pos 是目标
+ * 像素里这块装饰的左上角）。u_target_size 是这块装饰自己的尺寸，u_dst 是整块
+ * 目标。两者相等且 u_pos = 0 时跟 vertex_src **逐像素等价** —— 老路（烘到每窗
+ * 离屏）就是那样跑的。
+ *
+ * 为什么不用 vertex_src 直接加 uniform：那个着色器还兼着用户动画着色器，位置
+ * 相关的 uniform 在那些程序里没人设，一加就是「位置全 0」的 bug。 */
+static const char *decor_vertex_src =
+	"attribute vec2 a_pos;\n"
+	"varying vec2 v_uv;\n"
+	"uniform float u_flip_y;\n"
+	"uniform vec2 u_target_size;\n"
+	"uniform vec2 u_dst;\n"
+	"uniform vec2 u_pos;\n"
+	"void main() {\n"
+	"	v_uv = vec2(a_pos.x, u_flip_y > 0.5 ? 1.0 - a_pos.y : a_pos.y);\n"
+	"	vec2 p = a_pos * u_target_size + u_pos;\n"
+	"	gl_Position = vec4(p / u_dst * 2.0 - 1.0, 0.0, 1.0);\n"
+	"}\n";
+
 /* kawase 那两趟专用：顶点不但能盖住整块目标，还能只盖住目标里的一块（u_rect，
  * 目标像素）。整块跑的时候 u_rect = (0,0,w,h)，跟上面那个顶点着色器**逐像素等价**
  * —— 两条路共用同一份采样代码，「只重跑受损那一小块」（见 blur_chain_rect）才
@@ -987,7 +1007,8 @@ static void load_post_program(struct vidow_server *server) {
 static void load_decor_program(struct vidow_server *server) {
 	struct vidow_decor_prog *d = &server->decor;
 	unsigned int prog = 0;
-	if (!link_program(&prog, decor_fragment_src, "decor")) {
+	if (!link_program_full(&prog, decor_vertex_src, decor_fragment_src,
+			"decor")) {
 		return;
 	}
 	d->program = prog;
@@ -996,6 +1017,8 @@ static void load_decor_program(struct vidow_server *server) {
 	LOC(u_blur, "u_blur");
 	LOC(u_size, "u_size");
 	LOC(u_target_size, "u_target_size");
+	LOC(u_dst, "u_dst");
+	LOC(u_pos, "u_pos");
 	LOC(u_content_off, "u_content_off");
 	LOC(u_radius, "u_radius");
 	LOC(u_corner_n, "u_corner_n");
@@ -1398,7 +1421,7 @@ bool fx_node_rejects_input(struct wlr_scene_buffer *buffer,
 
 bool ensure_targets(struct vidow_server *server,
 		struct vidow_fx_target *fx, int content_w, int content_h, double scale,
-		double os) {
+		double os, bool alloc) {
 	if (!(scale > 0.0)) {
 		scale = 1.0;
 	}
@@ -1439,6 +1462,28 @@ bool ensure_targets(struct vidow_server *server,
 		fx->px_pad = sl->dec_px_pad = px_pad;
 		fx->dst_w = sl->dec_dst_w = (int)lround((double)w / scale);
 		fx->dst_h = sl->dec_dst_h = (int)lround((double)h / scale);
+	}
+	/* draw-pass（alloc = false）：只要几何，**一块缓冲都不开**。
+	 * 上面那段只在有 blur slot 时才写字段，没有 slot 的窗口（test-corner 那种
+	 * 单窗无重叠）以前是靠下面分配时顺手写 fx->w 的 —— 跳过分配就必须在这里
+	 * 补齐，否则 fx->w / px_pad 全是 0，装饰四边形退化成一个点（屏幕上看就是
+	 * 窗口整个不画）。 */
+	if (!alloc) {
+		if (getenv("VIDOW_DRAW_TRACE") != NULL) {
+			wlr_log(WLR_INFO, "ALLOC-SKIP fx=%p %dx%d", (void *)fx, w, h);
+		}
+		fx->w = w;
+		fx->h = h;
+		fx->scale = scale;
+		fx->content_w = w - 2 * px_pad;
+		fx->content_h = h - 2 * px_pad;
+		fx->px_pad = px_pad;
+		fx->dst_w = (int)lround((double)w / scale);
+		fx->dst_h = (int)lround((double)h / scale);
+		return true;
+	}
+	if (getenv("VIDOW_DRAW_TRACE") != NULL) {
+		wlr_log(WLR_INFO, "ALLOC fx=%p %dx%d", (void *)fx, w, h);
 	}
 	if (bufs[0] != NULL && *cw == w && *chh == h &&
 			fabs(*cscale - scale) < 1e-3) {
