@@ -168,8 +168,41 @@ static int layer_content_scan(struct vidow_server *server,
 		}
 		return format == 0 ? -1 : 0;
 	}
-	size_t stride = (size_t)w * 4;
-	void *data = malloc(stride * (size_t)h);
+	/* 只读「可能画着东西」的那一块。盒子变大由损伤合并兜底
+	 * （vidow_layer_content_box_expand），读回负责把它缩回真实大小 ——
+	 * 所以读盒子就够，不用读整块缓冲。整块读回在 4K 上 4.7ms/帧，
+	 * 只能 200ms 读一次，面板收起之后模糊就多留一块；限定到盒子之后
+	 * （dock 那种细长条只有整块的百分之几）便宜到能每帧读一次。 */
+	int bx = 0, by = 0, bw = w, bh = h;
+	if (ls->content_w > 0 && ls->content_h > 0 &&
+			ls->geom.width > 0 && ls->geom.height > 0) {
+		double kx = (double)w / (double)ls->geom.width;
+		double ky = (double)h / (double)ls->geom.height;
+		bx = (int)floor((double)ls->content_x * kx);
+		by = (int)floor((double)ls->content_y * ky);
+		bw = (int)ceil((double)ls->content_w * kx);
+		bh = (int)ceil((double)ls->content_h * ky);
+		if (bx < 0) {
+			bx = 0;
+		}
+		if (by < 0) {
+			by = 0;
+		}
+		if (bx + bw > w) {
+			bw = w - bx;
+		}
+		if (by + bh > h) {
+			bh = h - by;
+		}
+		if (bw <= 0 || bh <= 0) {
+			bx = 0;
+			by = 0;
+			bw = w;
+			bh = h;
+		}
+	}
+	size_t stride = (size_t)bw * 4;
+	void *data = malloc(stride * (size_t)bh);
 	if (data == NULL) {
 		if (owned) {
 			wlr_texture_destroy(tex);
@@ -180,7 +213,7 @@ static int layer_content_scan(struct vidow_server *server,
 		.data = data,
 		.format = format,
 		.stride = (uint32_t)stride,
-		.src_box = { .x = 0, .y = 0, .width = w, .height = h },
+		.src_box = { .x = bx, .y = by, .width = bw, .height = bh },
 	};
 	bool ok = wlr_texture_read_pixels(tex, &opts);
 	if (owned) {
@@ -200,10 +233,10 @@ static int layer_content_scan(struct vidow_server *server,
 	const uint32_t visible_alpha = 8;
 	int invisible = 1;
 	int bx0 = 0x3fffffff, by0 = 0x3fffffff, bx1 = -1, by1 = -1;
-	for (int y = 0; y < h; y += 32) {
+	for (int y = 0; y < bh; y += 32) {
 		const uint32_t *row = (const uint32_t *)((const uint8_t *)data +
 			(size_t)y * stride);
-		for (int x = 0; x < w; x += 32) {
+		for (int x = 0; x < bw; x += 32) {
 			uint32_t a = (row[x] & alpha_mask) >> alpha_shift;
 			if (a == 0) {
 				continue;
@@ -247,12 +280,17 @@ static int layer_content_scan(struct vidow_server *server,
 	if (by0 < 0) {
 		by0 = 0;
 	}
-	if (bx1 > w) {
-		bx1 = w;
+	if (bx1 > bw) {
+		bx1 = bw;
 	}
-	if (by1 > h) {
-		by1 = h;
+	if (by1 > bh) {
+		by1 = bh;
 	}
+	/* 读回区域在缓冲里的原点，换算成整块缓冲的坐标。 */
+	bx0 += bx;
+	bx1 += bx;
+	by0 += by;
+	by1 += by;
 	/* 缓冲像素 -> 逻辑（surface 局部）：geom 就是这块 surface 的逻辑尺寸。 */
 	double sx = (double)ls->geom.width / (double)w;
 	double sy = (double)ls->geom.height / (double)h;
@@ -283,7 +321,7 @@ static int layer_content_scan(struct vidow_server *server,
 
 /* 这一帧**画到了哪儿**，立刻并进内容包围盒（commit 里调，见 layer.c）。
  *
- * 为什么必须并：内容盒是 200ms 节流的读回结果，只配当「上界」用。可面板的
+ * 为什么必须并：内容盒是读回结果，读回最快也要等一个 idle，只配当「上界」用。可面板的
  * 开合动画只有 340ms，读回最多赶上两次 —— 客户端申报的模糊区域跟这个旧盒子
  * 求交之后，刚长出来的那一条就落在区域外：屏幕上底板已经画出来了、模糊还停在
  * 旧的底边，最下面那一条「有底色没糊」，过一两帧才补上（用户报的「面板打开
@@ -291,7 +329,7 @@ static int layer_content_scan(struct vidow_server *server,
  *
  * 损伤盒子不慢也不贵：它就是这一帧真正改动的像素，commit 里现成的，不用读回、
  * 不用等 idle。合并只让盒子变大（绝不会裁掉刚画的地方），缩回去交给下一次
- * 节流读回 —— 多报的那点面积顶多让这一小会儿多抓一块底衬，比糊缺一条划算。
+ * 读回 —— 多报的那点面积顶多让这一小会儿多抓一块底衬，比糊缺一条划算。
  *
  * 盒子还没测出来（content_w == 0，全透明 / 没扫过）时不动它：那种情况模糊
  * 路径是拿客户端申报的区域直接用，本来就不会裁，硬塞一个小盒子反而会裁。 */
@@ -392,7 +430,7 @@ static void layer_content_idle(void *data) {
 	vidow_layer_node_update_visible(ls);
 }
 
-/* 内容是不是一个像素都没有（模糊整块跳过）。带 200ms 节流，读回走 idle。
+/* 内容是不是一个像素都没有（模糊整块跳过）。读回走 idle，节流窗口按盒子像素数定。
  *
  * **读回绝不能跑在渲染路径里。** wlr_texture_read_pixels 自己会 begin 一趟
  * render pass（GLES2 上还要建临时 FBO），在渲染途中干这个会把后面要画的东西
@@ -436,9 +474,19 @@ void vidow_layer_content_check_schedule(struct vidow_server *server,
 			server->display == NULL) {
 		return;
 	}
+	/* 节流窗口按「要读多少像素」算，不再一律 200ms：dock / 面板那种
+	 * 十几万像素的盒子读一遍是微秒级，一帧读一次 —— 内容一变，模糊下一帧
+	 * 就跟上（以前最多等 200ms，面板收起之后模糊块会多挂一会儿）。
+	 * 整屏层（4K 八百多万像素）才退回 100ms。盒子还不知道时按整块算。 */
 	uint64_t now = vidow_now_ns();
-	if (ls->content_check_ns != 0 &&
-			now - ls->content_check_ns < 200000000LL) {
+	uint64_t wait = 100000000LL;
+	if (ls->content_w > 0 && ls->content_h > 0) {
+		double area = (double)ls->content_w * (double)ls->content_h;
+		if (area <= 800000.0) {
+			wait = 16666666LL;
+		}
+	}
+	if (ls->content_check_ns != 0 && now - ls->content_check_ns < wait) {
 		return;
 	}
 	ls->content_idle = wl_event_loop_add_idle(
