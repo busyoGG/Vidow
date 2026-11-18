@@ -252,7 +252,7 @@ static const struct entry entries[] = {
 	{ "window_move_easing", K_EASING, OFF(window_move_easing), SZ(window_move_easing), 3,
 		"普通布局重排的位移补间曲线（默认 out_cubic；out_back 会回弹）" },
 	{ "viewport_easing", K_EASING, OFF(viewport_easing), SZ(viewport_easing), 3,
-		"视口横向滚动（换焦点列）的曲线（默认 \"spring 0.6 800\"；"
+		"视口横向滚动（换焦点列）的曲线（默认 \"spring 1.0 800\"，和 niri 的 horizontal-view-movement 同一个数值；"
 		"弹簧的时长与距离无关，快慢节奏一致）" },
 	{ "layer_open_ms",   K_INT,    OFF(layer_open_ms),   SZ(layer_open_ms), 3,
 		"layer-shell（状态栏、通知、挂件）出现的动画时长" },
@@ -1187,7 +1187,7 @@ static bool parse_easing(const char *value, struct vidow_ease *out) {
 		double ratio = 0.0, stiffness = 0.0, eps = 0.0001;
 		if (!parse_number(&p, &ratio) || !parse_number(&p, &stiffness)) {
 			wlr_log(WLR_ERROR, "config: easing '%s' 不对：spring 至少要两个数"
-				"（阻尼比、劲度），比如 \"spring 0.6 800\"", value);
+				"（阻尼比、劲度），比如 \"spring 1.0 800\"", value);
 			return false;
 		}
 		if (!parse_at_end(p)) {
@@ -1250,7 +1250,7 @@ static bool parse_easing(const char *value, struct vidow_ease *out) {
 
 	wlr_log(WLR_ERROR, "config: 没有 '%s' 这条缓动曲线（能写：%s / %s / %s / "
 		"%s / %s / %s，或者 \"bezier x1 y1 x2 y2\"、\"out_back 0.15\"、"
-		"\"spring 0.6 800\"）",
+		"\"spring 1.0 800\"）",
 		value, easing_names[0], easing_names[1], easing_names[2],
 		easing_names[3], easing_names[4], easing_names[5]);
 	return false;
@@ -2346,7 +2346,15 @@ static void defaults(struct vidow_config *cfg) {
 	 * ζ=0.6 保留约 9% 过冲（接近原来 out_back 的观感）；写 1.0 完全不冲过头。
 	 * 时长 = −ln(ε)/β ≈ 543ms，**与距离无关**。 */
 	ease_set(&cfg->viewport_easing, VIDOW_EASE_SPRING);
-	cfg->viewport_easing.damping_ratio = 0.6;
+	/* 临界阻尼（ζ = 1）、劲度 800 —— 和 niri 的 horizontal-view-movement
+	 * 默认值一模一样（niri-config/src/animations.rs:
+	 * SpringParams { damping_ratio: 1.0, stiffness: 800, epsilon: 0.0001 }）。
+	 *
+	 * 原来这里写的是 0.6：欠阻尼，单段过渡就带约 9.5% 的过冲，连按换焦点时
+	 * 动量还会累起来「冲过头再荡回来」—— 用户 2026-11-18：「niri 是完美的
+	 * 不会卡手的」，对照下来差别主要就在这个阻尼比。临界阻尼不过冲，
+	 * 连按时速度接着用，收尾是一条单调的减速曲线。 */
+	cfg->viewport_easing.damping_ratio = 1.0;
 	cfg->viewport_easing.stiffness = 800.0;
 	cfg->viewport_easing.epsilon = 0.0001;
 	ease_set(&cfg->window_anim_easing, VIDOW_EASE_OUT_CUBIC);
