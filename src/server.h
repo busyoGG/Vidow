@@ -2679,6 +2679,11 @@ struct vidow_frame_stats {
 	 * （帧率还是 60，只是每帧多花几毫秒）。damage_px 在 commit 前从
 	 * scene_output->damage_ring.current 读，damage_full 数「面积 >= 整屏」的帧。
 	 * 拖动时这个比例高 = damage 收敛没做到；空闲时非零 = 有东西在空转。 */
+	/* 探针：这一窗口里往底衬缓冲里画了多少像素（抓取）、模糊链跑了多少像素。
+	 * CPU 侧看不到 GPU 排队，但「面积 x 次数」能把 4K 上那种十几毫秒的
+	 * 重建直接暴露出来。 */
+	int64_t grab_px;
+	int64_t chain_px;
 	int64_t damage_px;
 	int64_t damage_area;
 	int damage_frames;

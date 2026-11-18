@@ -349,6 +349,9 @@ void blur_chain_rect(struct vidow_server *server,
 		return;
 	}
 	vidow_stats.chains++;
+	vidow_stats.chain_px += rect != NULL ?
+		(int64_t)rect->width * (int64_t)rect->height :
+		(int64_t)w * (int64_t)h;
 	if (getenv("VIDOW_CHAIN_TRACE") != NULL) {
 		ptrdiff_t d = (char *)__builtin_return_address(0) -
 			(char *)&blur_chain_rect;
@@ -565,6 +568,7 @@ void backdrop_iter(struct wlr_scene_buffer *sb, int sx, int sy,
 
 bool backdrop_render(struct vidow_server *server,
 		struct vidow_output *output, int w, int h) {
+	vidow_stats.grab_px += (int64_t)w * (int64_t)h;
 	struct wlr_render_pass *pass = wlr_renderer_begin_buffer_pass(
 		server->renderer, output->backdrop, NULL);
 	if (pass == NULL) {
