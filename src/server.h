@@ -1241,7 +1241,6 @@ struct vidow_fx_target {
 	uint64_t bake_revision;           /* Content/placement/effect update request. */
 	/* 果冻期间源图冻住（KWin 的 wobbly 就是这么干的：变形那张 pixmap 不在动画里重画）。
 	 * 不冻的话每帧都重烘：内容一动 rev 就变，缓存判据必然不中，实测拖动时每窗每帧烘 2 次。 */
-	struct wlr_output *jelly_frozen_out; /* 果冻冻住的是哪块屏那一份（NULL = 没冻） */
 	float mask_min_used;              /* 当前缓冲是按哪个剔除阈值画的 */
 	struct wlr_texture *blur_own_tex; /* texture of the private pyramid */
 	uint64_t blur_own_id;             /* identity of blur_own_tex */

@@ -13,7 +13,7 @@
 #   * 帧数不取 IPC 累积值（vidow_stats.frames 每 500ms 清零，IPC 读到会变小），直接
 #     解析每行统计里的 fps / 每帧毫秒。
 #
-# 用法: tools/perf-scene.sh <idle|drag|game|multiscreen|capture> [--secs 10] [--label 说明]
+# 用法: tools/perf-scene.sh <idle|drag|game|multiscreen|capture|busy|scroll> [--secs 10] [--label 说明]
 set -u
 cd "$(dirname $0)/.."
 ROOT=$PWD
@@ -24,7 +24,7 @@ while [ $# -gt 0 ]; do
 	case "$1" in
 	--secs) SECS="$2"; shift 2 ;;
 	--label) LABEL="$2"; shift 2 ;;
-	idle|drag|game|multiscreen|capture|busy) SCENE="$1"; shift ;;
+	idle|drag|game|multiscreen|capture|busy|scroll|busyscroll) SCENE="$1"; shift ;;
 	*) echo "用法: $0 <idle|drag|game|multiscreen|capture> [--secs N] [--label 说明]" >&2; exit 2 ;;
 	esac
 done
@@ -168,6 +168,16 @@ game)
 	vmsg toggle-fullscreen
 	sleep 0.8
 	;;
+busyscroll)
+	# busy 的 6 个窗 + 视口滚动：滚动时每个窗的底衬都被记脏，模糊金字塔
+	# 每帧重烘 —— 「焦点滚动过渡时 GPU 飙升」最有嫌疑的一条路。
+	spawn ./build/frames s1 20
+	spawn ./build/frames s2 20
+	spawn ./build/frames s3 20
+	spawn ./build/frames s4 20
+	spawn ./build/frames s5 20
+	sleep 2.0
+	;;
 busy)
 	# 每个窗都在不停重画（模拟视频/滚动/动画）：把每帧的合成路径真正压满
 	spawn python3 tools/spin.py s1 1 0 0 full
@@ -188,6 +198,18 @@ multiscreen)
 	spawn python3 tools/silk.py           # 真半透明窗：逼出私有底衬 + 模糊链
 	spawn python3 tools/pattern.py m2
 	sleep 2.0
+	;;
+scroll)
+	# 视口滚动（focus-column 连按）时整条带子平移：每帧所有窗都要重抓底衬。
+	# 两列各放一个**真半透明**窗 —— 过渡期间两窗同时可见，私有底衬 +
+	# 模糊金字塔每帧都得重烘，这才是「滚动时 GPU 飙升」那条路。
+	spawn env SILK_TITLE=s1 python3 tools/silk.py
+	spawn python3 tools/pattern.py c1
+	sleep 1.5
+	spawn python3 tools/pattern.py c2
+	sleep 1.5
+	# 全转成浮窗：平铺时滚动会把别的列推出屏外（workspace 判「藏起」），
+	# 浮动窗口一直留在视口里 —— 过渡期间几块窗同时在动才是要量的那一路。
 	;;
 capture)
 	spawn python3 tools/pattern.py cap
@@ -235,6 +257,21 @@ drag)
 			fi
 			echo "pointer-motion $x $CY" >&9
 			sleep 0.05
+		done
+	) &
+	PIDS+=($!)
+	;;
+scroll|busyscroll)
+	(
+		i=0
+		while :; do
+			i=$((i + 1))
+			if [ $((i % 2)) -eq 0 ]; then
+				vmsg focus-column 1 >>"$RUN/vmsg.log" 2>&1 \|\| echo "fail1 $?" >>"$RUN/vmsg.log"
+			else
+				vmsg focus-column -1 >>"$RUN/vmsg.log" 2>&1 \|\| echo "fail-1 $?" >>"$RUN/vmsg.log"
+			fi
+			sleep 0.5
 		done
 	) &
 	PIDS+=($!)

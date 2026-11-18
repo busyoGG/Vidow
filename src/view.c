@@ -2689,21 +2689,13 @@ void vidow_view_anim_bake(struct vidow_view *view) {
 	 * 缓存判据必然不中，实测拖动 6 个动画窗时 12 次/帧。烘出来的图
 	 * 跟上一帧逐像素一样，纯白花。尺寸 / 倍率在果冻期间不变（只动
 	 * anim_off），所以冻住是安全的；果冻收手时 vidow_jelly_end 清标志。 */
-	if (view->jelly != NULL && view->fx.jelly_frozen_out != NULL &&
-		view->fx.bake_output == view->fx.jelly_frozen_out) {
-		return;
-	}
+	/* 果冻期间照常重烘：冻住源图会让拖动中的内容停在起手那一帧。 */
 	bool fx_drawn = vidow_fx_frame(view->server, &view->fx, src, &geo,
 		0, 0, x, y, alpha, view->server->focused == view,
 		view->fullscreen, bake_scale * fx_ov, fx_ov, &view->rule_eff);
 	/* 探针：整块窗口那么大的离屏渲染一共多少钱（见统计行的「重烘」；次数由
 	 * vidow_fx_frame 的 vidow_stats.bakes 记）。拖动 / 滚动动画里每个在动的
 	 * 窗口每帧都要烘一次，所以这项随窗口数线性涨。 */
-	if (view->jelly != NULL && view->fx.bake_output != NULL) {
-		view->fx.jelly_frozen_out = view->fx.bake_output;
-	} else {
-		view->fx.jelly_frozen_out = NULL;
-	}
 	/* 装饰图真的画上屏了才把真实表面藏起来（只留给命中测试）。没画出来
 	 * 还藏就是窗口整个消失 —— 关掉 decor/shader 时踩过，屏幕一片黑。
 	 * 拖着果冻的时候也一样：内容归 jelly.c 那个节点画。

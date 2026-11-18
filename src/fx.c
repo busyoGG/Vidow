@@ -3028,7 +3028,8 @@ update_consumers:
 		 * 看着一样，却省掉每帧一条 768x768 的链和那份显存（见
 		 * view_covered_ratio 的注释里那组 100% / 3% 的实测）。 */
 		double covered = overlaps ? view_covered_ratio(view, NULL) : 0.0;
-		bool private_worth = overlaps && covered >= 0.30;
+		/* 拖拽中的窗口另算：手正按着它，底衬一停就在眼皮底下。代价只有这一窗一份。 */
+		bool private_worth = overlaps && (covered >= 0.30 || view->dragging);
 		if (look.blur_xray || !overlaps || !private_worth) {
 			/* Tiled and non-overlapping floating windows all share the
 			 * wallpaper backdrop: one capture and one chain for all of them.

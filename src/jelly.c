@@ -344,7 +344,6 @@ void vidow_jelly_end(struct vidow_view *view) {
 		return;
 	}
 	jelly_free(view->jelly);
-	view->fx.jelly_frozen_out = NULL;  /* 冻住的源图解冻，下一帧重新烘 */
 }
 
 /* 视图正在被销毁（见 view.c 的 view_destroy）：先把果冻收掉。场景节点归
