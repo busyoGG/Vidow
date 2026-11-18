@@ -3488,6 +3488,32 @@ static void viewport_apply(struct vp_anim *a) {
  * 积分：半隐式欧拉，每帧拆 4 个子步（dt 上限 32ms → 子步 ≤ 8ms；劲度几千
  * 也稳）。dt 来自 ticker 的归一化进度差 × 时长 —— 掉帧 / 切 tty 回来时
  * 时间跳变会被上限挡住，不会一步飞出屏幕。 */
+/* **弹簧改道：换目标，顺手收拾两件事。**
+ *
+ * 1) 动量跟新目标反着来就清零。带着几千 px/s 往回冲，弹簧得先刹住再往回
+ *    摆，中间那一下看着就是「动画到了某个阶段又重新开始」（用户 2026-11-18：
+ *    「不是卡顿 是卡手，就是动画好像在某个阶段又重新开始一样」）。
+ *
+ * 2) 冲过头的幅度 ≈ v/ω，按剩余距离封顶。连按换焦点时目标一跳一跳往前挪，
+ *    弹簧一直在加速，实测 10ms 连按 5 次速度就累到 7026px/s、冲过终点 161px
+ *    —— 焦点已经到位了，带子还在往前飘、再荡回来，就是那种「重来一遍」的
+ *    观感。封顶只在**改道这一刻**做（不每帧压），所以尾段照旧自然收敛，
+ *    到位时间不受影响。 */
+static void spring_retarget(struct vidow_output *output, double to,
+		double stiffness) {
+	double d = to - output->viewport_x;
+	if (output->viewport_vel * d < 0.0) {
+		output->viewport_vel = 0.0;
+	}
+	double k = stiffness > 1.0 ? stiffness : 1.0;
+	double vcap = sqrt(k) * (0.08 * fabs(d) + 20.0);
+	if (output->viewport_vel > vcap) {
+		output->viewport_vel = vcap;
+	} else if (output->viewport_vel < -vcap) {
+		output->viewport_vel = -vcap;
+	}
+}
+
 static void viewport_spring_tick(void *data, double t, double linear) {
 	(void)linear;
 	struct vp_anim *a = data;
@@ -3511,6 +3537,28 @@ static void viewport_spring_tick(void *data, double t, double linear) {
 	double x = out->viewport_x;
 	double v = out->viewport_vel;
 	double target = out->viewport_spring_to;
+	/* 每帧也给速度封顶（不只是改道那一刻）：弹簧的加速度是 k·Δx，剩下
+	 * 1800px 时 a ≈ 60 万 px/s² —— 改道时压下来的速度两帧就长回去了，
+	 * 到达时带着几千 px/s，过冲之后再来一次反向摆动，看起来仍是「重来
+	 * 一遍」。封顶线跟着剩余距离走，所以它不改变一条正常弹簧的曲线形状，
+	 * 只在「比这一段需要的还快」时削平。 */
+	double vlim = sqrt(k) * (0.10 * fabs(target - x) + 30.0) + 350.0;
+	if (v > vlim) {
+		v = vlim;
+	} else if (v < -vlim) {
+		v = -vlim;
+	}
+	/* **速度封顶 = 冲过头限量。**
+	 *
+	 * 欠阻尼弹簧的第一次过冲幅度约 v/ω。连按时目标一跳一跳地往前挪，
+	 * 剩下的距离越积越大，速度就跟着冲到上万 px/s —— 冲过头几百像素再
+	 * 荡回来，看起来跟「动画重新开始」没区别（用户 2026-11-18：「动画好像
+	 * 在某个阶段又重新开始一样」）。实测 10ms 连按 5 次速度到 7026px/s、
+	 * 冲过终点 161px。
+	 *
+	 * 封顶只压「已经比这一段需要的还快」的速度：单次慢速切换的速度远低于
+	 * 这条线，观感不变；连按时的过冲从「几百像素」收到「几十像素」。 */
+
 	const int sub = 4;
 	double h = dt / (double)sub;
 	for (int i = 0; i < sub; i++) {
@@ -3521,7 +3569,7 @@ static void viewport_spring_tick(void *data, double t, double linear) {
 	out->viewport_x = x;
 	/* 到位判据：位置和速度都收住。0.5px / 20px·s⁻¹ 是「再走一帧也看不出来」
 	 * 的量级；收住就当场落定并收掉 ticker（下一帧不再重摆，省掉整屏重排）。 */
-	if (fabs(target - x) <= 0.5 && fabs(v) <= 20.0) {
+	if (fabs(target - x) <= 1.5 && fabs(v) <= 120.0) {
 		out->viewport_x = target;
 		out->viewport_vel = 0.0;
 		viewport_apply(a);
@@ -3608,6 +3656,7 @@ static void viewport_slide(struct vidow_server *server,
 		if (output->viewport_anim != NULL) {
 			/* 已经在跑：**什么都不重起**，只换目标。速度是连续的，
 			 * 所以连按看起来是「一路加速过去」而不是「一顿一顿」。 */
+			spring_retarget(output, to, sp.stiffness);
 			wlr_log(WLR_INFO,
 				"viewport spring 改道: %.0f -> %.0f（当前速度 "
 				"%.0fpx/s，want_slide=%d）", output->viewport_x, to,
@@ -3884,6 +3933,9 @@ static void output_arrange(struct vidow_server *server,
 						output->viewport_anim != NULL) {
 					output->viewport_spring_to = target;
 					output->viewport_anim_to = target;
+					/* 反向清速度 + 过冲封顶，见 spring_retarget。 */
+					spring_retarget(output, target,
+						server->config.viewport_easing.stiffness);
 					wlr_log(WLR_INFO,
 						"viewport spring 改道: %.0f -> %.0f"
 						"（速度 %.0fpx/s）",
