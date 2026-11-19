@@ -329,11 +329,13 @@ bool vidow_float_adopt_output(struct vidow_view *view) {
 				 * 等到下一帧。 */
 				view->fx.bake_output = hit;
 				vidow_view_anim_bake(view);
-				struct vidow_output *vo =
-					vidow_output_lookup(view->server, hit);
-				if (vo != NULL) {
-					vidow_backdrop_damage_output(vo);
-				}
+				/* 只要这块窗口自己的盒子，不要整屏。整屏作废会把目标屏
+				 * 的共享底衬整块重抓（shared_blur_rebuild 抓的时候把所有
+				 * 窗口藏起来），4K 上一来一回就是几十毫秒，画面还要在
+				 * 那一帧换一次底衬 —— 跨屏拖拽时看着就是「闪」。
+				 * 这块盒子会经由 blur_note_damage 分给压在上面的其它窗口，
+				 * 该脏的地方一个不少。 */
+				vidow_backdrop_damage_drawn(view);
 				vidow_output_schedule_frame(view->server, hit,
 					"挪窗口跨屏");
 				/* 拖拽中的搬家要留和松手时同一句日志：

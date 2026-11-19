@@ -2669,8 +2669,26 @@ void vidow_view_anim_bake(struct vidow_view *view) {
 	 * 一张直角矩形，装饰节点才有圆角和模糊底衬。半透明阶段把它留在上面，
 	 * 方角就会盖住圆角、底衬也被这块不透明的表面挡掉 —— 表现就是 SSD 圆角
 	 * 裁不出来、窗口背后的模糊变成错的（回滚过一次，就是这么坏的）。 */
-	wlr_scene_buffer_set_opacity(src,
-		(fx_drawn || view->mask_opacity || view->jelly != NULL) ? 0.0f : 1.0f);
+	/* 真实表面藏不藏，要看**这一帧所有屏**上到底画没画装饰。
+	 *
+	 * 按屏烘是逐块屏各算一次 fx_drawn，最后跑的那一块说了算。跨屏拖到
+	 * 新屏上之后，旧屏那次烘经常返回 false（窗口已经不在它那块屏的
+	 * 盒子里了），于是真实表面又被放出来：装饰图上再叠一张直角真
+	 * 表面，一帧闪一下 —— 用户报的「跨过去没放手的时候一直闪」。
+	 * 改成扫所有屏：只要有一块屏上装饰节点是好的，就藏。 */
+	bool any_drawn = fx_drawn || view->mask_opacity ||
+		view->jelly != NULL;
+	if (!any_drawn) {
+		struct vidow_blur_slot *sl;
+		for (sl = view->fx.blur_slot; sl != NULL; sl = sl->next) {
+			if (sl->node != NULL && sl->node->node.enabled &&
+					sl->dec_valid) {
+				any_drawn = true;
+				break;
+			}
+		}
+	}
+	wlr_scene_buffer_set_opacity(src, any_drawn ? 0.0f : 1.0f);
 }
 
 void vidow_view_apply_anim(struct vidow_view *view) {
