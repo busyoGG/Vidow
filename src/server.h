@@ -2222,6 +2222,11 @@ struct vidow_layer_surface {
 	uint64_t content_check_ns;
 	int content_invisible;
 	int content_quiet; /* 连续几次复检盒子没变（退避用） */
+	/* 上次读回之后损伤映射过来的盒子（逻辑坐标）。只用来和读回结果对账，
+	 * 不参与画：损伤证明不了「没画」，拿它并进内容盒会让「面板收起 →
+	 * 盒子收不回去」变成常态。 */
+	int scan_dmg_x, scan_dmg_y, scan_dmg_w, scan_dmg_h;
+	int scan_dmg_log; /* 上次对账结论，只在变化时打日志 */
 	int content_box_x, content_box_y, content_box_w, content_box_h;
 	/* 上次读回之后客户端又交过帧 —— 只有为真才值得再读一遍（vshell 每秒交
 	 * 几十帧，不设这个就是每 200ms 无条件读一块整面板缓冲）。 */

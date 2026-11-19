@@ -318,6 +318,29 @@ static int layer_content_scan(struct vidow_server *server,
 		ls->content_w = cx2 - cx;
 		ls->content_h = cy2 - cy;
 	}
+	/* 读回 / 损伤两路对账（只报不改）。 */
+	if (ls->scan_dmg_w > 0 && ls->content_w > 0) {
+		bool inside = ls->scan_dmg_x >= ls->content_x &&
+			ls->scan_dmg_y >= ls->content_y &&
+			ls->scan_dmg_x + ls->scan_dmg_w <= ls->content_x + ls->content_w &&
+			ls->scan_dmg_y + ls->scan_dmg_h <= ls->content_y + ls->content_h;
+		bool whole = ls->scan_dmg_w >= ls->geom.width * 9 / 10 &&
+			ls->scan_dmg_h >= ls->geom.height * 9 / 10;
+		int verdict = inside ? 1 : (whole ? 2 : 0);
+		if (verdict != ls->scan_dmg_log) {
+			ls->scan_dmg_log = verdict;
+			if (verdict == 0) {
+				wlr_log(WLR_INFO, "ALPHASCAN 对不上 读回 %d,%d %dx%d 损伤 %d,%d %dx%d",
+					ls->content_x, ls->content_y, ls->content_w, ls->content_h,
+					ls->scan_dmg_x, ls->scan_dmg_y, ls->scan_dmg_w, ls->scan_dmg_h);
+			} else if (verdict == 1) {
+				wlr_log(WLR_DEBUG, "ALPHASCAN 一致");
+			}
+		}
+	}
+	ls->scan_dmg_w = 0;
+	ls->scan_dmg_h = 0;
+
 	if (getenv("VIDOW_DMG_WHY") != NULL) {
 		wlr_log(WLR_INFO, "ALPHASCAN ns=%s buf=%dx%d box=%d,%d %dx%d geom=%dx%d",
 			ls->layer_surface->namespace ?: "?", w, h, ls->content_x,
@@ -404,6 +427,27 @@ void vidow_layer_content_box_expand(struct vidow_layer_surface *ls) {
 	ls->content_y = cy;
 	ls->content_w = cx2 - cx;
 	ls->content_h = cy2 - cy;
+	if (ls->scan_dmg_w <= 0 || ls->scan_dmg_h <= 0) {
+		ls->scan_dmg_x = cx;
+		ls->scan_dmg_y = cy;
+		ls->scan_dmg_w = cx2 - cx;
+		ls->scan_dmg_h = cy2 - cy;
+	} else {
+		int x1 = ls->scan_dmg_x < cx ? ls->scan_dmg_x : cx;
+		int y1 = ls->scan_dmg_y < cy ? ls->scan_dmg_y : cy;
+		int x2 = ls->scan_dmg_x + ls->scan_dmg_w;
+		int y2 = ls->scan_dmg_y + ls->scan_dmg_h;
+		if (cx2 > x2) {
+			x2 = cx2;
+		}
+		if (cy2 > y2) {
+			y2 = cy2;
+		}
+		ls->scan_dmg_x = x1;
+		ls->scan_dmg_y = y1;
+		ls->scan_dmg_w = x2 - x1;
+		ls->scan_dmg_h = y2 - y1;
+	}
 }
 
 /* 读回排到事件循环空闲时跑（见下面 layer_content_invisible 的说明）。 */
