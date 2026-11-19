@@ -168,39 +168,16 @@ static int layer_content_scan(struct vidow_server *server,
 		}
 		return format == 0 ? -1 : 0;
 	}
-	/* 只读「可能画着东西」的那一块。盒子变大由损伤合并兜底
-	 * （vidow_layer_content_box_expand），读回负责把它缩回真实大小 ——
-	 * 所以读盒子就够，不用读整块缓冲。整块读回在 4K 上 4.7ms/帧，
-	 * 只能 200ms 读一次，面板收起之后模糊就多留一块；限定到盒子之后
-	 * （dock 那种细长条只有整块的百分之几）便宜到能每帧读一次。 */
+	/* 每次都读整块缓冲。
+	 *
+	 * 以前只读「上一次量出来的盒子」—— 想省那点读回开销。结果那个盒子
+	 * 一旦偏小就长不回来：读的范围被盒子卡住，量出来的只会更小，一轮轮
+	 * 收缩，面板的模糊被截掉一截（电源菜单只剩上面三分之二）。盒子变大
+	 * 只有损伤合并那一路，面板静止时没有任何损伤 —— 这条路是单向收缩的。
+	 *
+	 * 降采样之后一块 4K 面板也就 256x256，按 step 跳着读是几十微秒，
+	 * 不值得为它冒单向收缩的风险。 */
 	int bx = 0, by = 0, bw = w, bh = h;
-	if (ls->content_w > 0 && ls->content_h > 0 &&
-			ls->geom.width > 0 && ls->geom.height > 0) {
-		double kx = (double)w / (double)ls->geom.width;
-		double ky = (double)h / (double)ls->geom.height;
-		bx = (int)floor((double)ls->content_x * kx);
-		by = (int)floor((double)ls->content_y * ky);
-		bw = (int)ceil((double)ls->content_w * kx);
-		bh = (int)ceil((double)ls->content_h * ky);
-		if (bx < 0) {
-			bx = 0;
-		}
-		if (by < 0) {
-			by = 0;
-		}
-		if (bx + bw > w) {
-			bw = w - bx;
-		}
-		if (by + bh > h) {
-			bh = h - by;
-		}
-		if (bw <= 0 || bh <= 0) {
-			bx = 0;
-			by = 0;
-			bw = w;
-			bh = h;
-		}
-	}
 	size_t stride = (size_t)bw * 4;
 	void *data = malloc(stride * (size_t)bh);
 	if (data == NULL) {
