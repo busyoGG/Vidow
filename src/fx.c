@@ -3818,7 +3818,11 @@ bool vidow_fx_begin(struct vidow_server *server, struct vidow_fx_target *fx,
 			if (sl->node != NULL) {
 				wlr_scene_node_reparent(&sl->node->node, parent);
 			}
-			sl->dec_valid = false;
+			/* **不作废装饰**：换父树只是把它挂到另一棵树里，缓冲内容
+			 * 还是好的。作废它会让下一帧没有东西可画，真表面于是露
+			 * 一帧 —— 用户报的「跨屏拖过去之后，动一下闪一下」。
+			 * 真要重烘（换了屏、底衬变了）由 revision / 损伤那条路
+			 * 触发，不靠这里。 */
 		}
 	}
 	wlr_scene_node_raise_to_top(&fx->node->node);

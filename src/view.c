@@ -2692,6 +2692,25 @@ void vidow_view_anim_bake(struct vidow_view *view) {
 			}
 		}
 	}
+	if (getenv("VIDOW_OPACITY_TRACE")) {
+		/* 只在与这块窗口上一帧不同的时候打：跨屏拖拽时「闪」的表现就是
+		 * 这一行在两帧之间翻。 */
+		static struct vidow_view *dbg_view;
+		static float dbg_op = -1.0f;
+		float op = any_drawn ? 0.0f : 1.0f;
+		if (dbg_view != view) {
+			dbg_view = view;
+			dbg_op = op;
+		}
+		if (dbg_op != op) {
+			dbg_op = op;
+			wlr_log(WLR_INFO, "opacity %s -> %.0f（fx_drawn %d jelly %d "
+				"mask %d dragging %d）", vidow_view_title(view), op,
+				(int)fx_drawn, (int)(view->jelly != NULL),
+				(int)(view->mask_opacity > 0.0f),
+				(int)view->dragging);
+		}
+	}
 	wlr_scene_buffer_set_opacity(src, any_drawn ? 0.0f : 1.0f);
 }
 
