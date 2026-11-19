@@ -8181,6 +8181,26 @@ static void popup_scene_register(struct vidow_server *server,
  * 弹出物（layer.c 的 layer_surface_new_popup）。7768fe7 只在窗口那条路上挑了
  * 父树，layer 那条路（状态栏菜单）漏了，子菜单于是还是老样子 —— 一条规则两个
  * 调用点，漏一个就是这次。 */
+/* 登记项 / 父树指针可能是死树：xdg_surface 销毁时 wlroots 会自己把场景树
+ * 释放掉，但 surface 的 destroy 信号还没轮到我们。reparent 内部要沿
+ * parent 链追旧坐标，踩上去就是 SIGSEGV（coredump 338439 / 372296，lact
+ * 温度弹窗关闭时必现）。向上追到没 parent 为止，追不到场景根就当它
+ * 已经死了 —— 宁可退回 fallback 重建，也不把野指针交给 wlroots。 */
+static bool popup_tree_alive(struct vidow_server *server,
+		struct wlr_scene_tree *t) {
+	if (t == NULL || server->scene == NULL) {
+		return false;
+	}
+	struct wlr_scene_node *n = &t->node;
+	for (int guard = 0; n != NULL && guard < 8; guard++) {
+		if (n == &server->scene->tree.node) {
+			return true;
+		}
+		n = n->parent != NULL ? &n->parent->node : NULL;
+	}
+	return false;
+}
+
 struct wlr_scene_tree *vidow_popup_scene_create(struct vidow_server *server,
 		struct wlr_scene_tree *fallback, struct wlr_xdg_popup *popup) {
 	struct wlr_scene_tree *parent = fallback;
@@ -8200,6 +8220,12 @@ struct wlr_scene_tree *vidow_popup_scene_create(struct vidow_server *server,
 	 * 全局的。已经有树就只把它挪到正确的父树里，不再新建。 */
 	struct wlr_scene_tree *tree =
 		popup_scene_tree_for(server, popup->base->surface);
+	if (!popup_tree_alive(server, tree)) {
+		tree = NULL; /* 死树：当没有，下面重建 */
+	}
+	if (!popup_tree_alive(server, parent)) {
+		parent = fallback;
+	}
 	if (tree != NULL) {
 		if (tree->node.parent != parent) {
 			wlr_scene_node_reparent(&tree->node, parent);
