@@ -2427,7 +2427,9 @@ static void defaults(struct vidow_config *cfg) {
 	 * 多两趟离屏渲染，实测四个重叠元素下 25 趟/帧 vs 33 趟/帧。要更糊写 4。 */
 	cfg->blur_levels = 3;
 	cfg->blur_strength = 1.0;
-	cfg->blur_alpha_min = 0.15;
+	/* 0.15 会把画得淡的那圈（圆角、半透明底板）直接剔掉，模糊看着
+	 * 像被裁了一刀；降到 0.04 跟内容盒量测的 8/255 对齐。 */
+	cfg->blur_alpha_min = 0.04;
 	cfg->popup_blur_enabled = true;
 	cfg->popup_blur_alpha_min = 0.0; /* 0 = 用各自默认值 */
 	cfg->blur_offset = 1.5;
