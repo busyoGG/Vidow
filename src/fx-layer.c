@@ -233,10 +233,18 @@ static int layer_content_scan(struct vidow_server *server,
 	const uint32_t visible_alpha = 8;
 	int invisible = 1;
 	int bx0 = 0x3fffffff, by0 = 0x3fffffff, bx1 = -1, by1 = -1;
-	for (int y = 0; y < bh; y += 32) {
+	/* 扫描粒子间距：小缓冲逐像素，大缓冲才跳。
+	 *
+	 * 原来一律每 32 像素取一个点。200x100 的缓冲里画一条 6px 宽的竖条
+	 * （dock / 进度条 / 光标条那种），格点一次都不落在上面 —— 读回结论
+	 * 「整块全零」→ 按「读回没生效」处理 → 盒子永远测不出来 → 模糊
+	 * 一直按整块画（面板的模糊块切不窄）。降采样后图最多 256x256
+	 * = 65536 个像素，逐像素扫是几十微秒，不值得再漏。 */
+	int step = (bw * bh <= 65536) ? 1 : 32;
+	for (int y = 0; y < bh; y += step) {
 		const uint32_t *row = (const uint32_t *)((const uint8_t *)data +
 			(size_t)y * stride);
-		for (int x = 0; x < bw; x += 32) {
+		for (int x = 0; x < bw; x += step) {
 			uint32_t a = (row[x] & alpha_mask) >> alpha_shift;
 			if (a == 0) {
 				continue;
