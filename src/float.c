@@ -274,6 +274,37 @@ bool vidow_float_adopt_output(struct vidow_view *view) {
 			(double)view->float_geom.height / 2.0;
 		struct wlr_output *hit = wlr_output_layout_output_at(
 			view->server->output_layout, cx, cy);
+		/* **别在边界上反复搬。** 只要看「中心落在哪块屏」，窗口横在
+		 * 交界处时中心会在两块屏之间来回跳，每一跳都是一次搬家：
+		 * 归属搬走 → 旧屏那份装饰停用、新屏那份重烘；下一帧再跳回去。
+		 * 屏幕上就是拖着拖着「闪」，松手之前一直闪（用户报的正是
+		 * 「跨屏拖拽未放手还是会闪」）。
+		 * 改成看**面积**：窗口至少 80% 已经落在目标屏上才搬（要搬回去
+		 * 同样得 80%），中间那 60% 是迟滞带，来回抖不会触发第二次。
+		 * 比屏还大的窗口永远到不了 80%，退回「盖住目标屏一半以上」。 */
+		if (hit != NULL && hit != view->output) {
+			struct wlr_box ob = {0};
+			wlr_output_layout_get_box(view->server->output_layout, hit,
+				&ob);
+			double wx0 = (double)view->float_geom.x;
+			double wy0 = (double)view->float_geom.y;
+			double wx1 = wx0 + (double)view->float_geom.width;
+			double wy1 = wy0 + (double)view->float_geom.height;
+			double ix0 = wx0 > ob.x ? wx0 : ob.x;
+			double iy0 = wy0 > ob.y ? wy0 : ob.y;
+			double ix1 = wx1 < ob.x + ob.width ? wx1 : ob.x + ob.width;
+			double iy1 = wy1 < ob.y + ob.height ? wy1 : ob.y + ob.height;
+			double inter = (ix1 > ix0 && iy1 > iy0) ?
+				(ix1 - ix0) * (iy1 - iy0) : 0.0;
+			double warea = (double)view->float_geom.width *
+				(double)view->float_geom.height;
+			double oarea = (double)ob.width * (double)ob.height;
+			bool enough = (warea > 0.0 && inter / warea >= 0.80) ||
+				(oarea > 0.0 && inter / oarea >= 0.50);
+			if (!enough) {
+				hit = NULL;
+			}
+		}
 		if (hit != NULL && hit != view->output) {
 			struct vidow_workspace *ws =
 				vidow_workspace_shown_for(view->server, hit);
