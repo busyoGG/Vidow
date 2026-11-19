@@ -2681,8 +2681,12 @@ void vidow_view_anim_bake(struct vidow_view *view) {
 	if (!any_drawn) {
 		struct vidow_blur_slot *sl;
 		for (sl = view->fx.blur_slot; sl != NULL; sl = sl->next) {
+			/* 拖拽中跨屏、窗口横跨交界的那几步：新屏的槽刚建好还没
+			 * dec_valid，旧屏的槽刚被裁成不可见 —— 两个都不算「画了」，
+			 * 真表面就露一帧，屏幕上闪一下（用户：动一下闪一下）。
+			 * 拖拽期间只要槽还在就认作画了：装饰那条路此刻一定在画。 */
 			if (sl->node != NULL && sl->node->node.enabled &&
-					sl->dec_valid) {
+					(sl->dec_valid || view->dragging)) {
 				any_drawn = true;
 				break;
 			}
