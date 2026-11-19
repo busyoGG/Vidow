@@ -1996,6 +1996,7 @@ bool vidow_fx_frame(struct vidow_server *server, struct vidow_fx_target *fx,
 	}
 	if (instance != NULL) {
 		instance->dec_valid = true;
+		instance->needs_rebake = false;
 		instance->dec_revision = instance->rev;
 		instance->dec_blur_ver = instance->ver;
 		instance->dec_output_scale = instance->out->scale;
@@ -3239,7 +3240,8 @@ static void view_bake_for_output(struct vidow_server *server,
 		 * This also avoids rebaking the owner immediately after apply_anim. */
 		struct vidow_blur_slot *sl = blur_slot_for(&view->fx,
 			output->wlr_output, false);
-		if (sl != NULL && sl->dec_valid && sl->node != NULL &&
+		if (sl != NULL && sl->dec_valid && !sl->needs_rebake &&
+				sl->node != NULL &&
 				sl->node->node.enabled &&
 				sl->dec_revision == sl->rev &&
 				sl->dec_blur_ver == sl->ver &&
@@ -3817,6 +3819,9 @@ bool vidow_fx_begin(struct vidow_server *server, struct vidow_fx_target *fx,
 		for (struct vidow_blur_slot *sl = fx->blur_slot; sl; sl = sl->next) {
 			if (sl->node != NULL) {
 				wlr_scene_node_reparent(&sl->node->node, parent);
+				/* 换父树之后这一格里的装饰是按旧坐标系画的，
+				 * 先别让它上屏（旧内容会横在别的屏上），等重烘。 */
+				sl->needs_rebake = true;
 			}
 			/* **不作废装饰**：换父树只是把它挂到另一棵树里，缓冲内容
 			 * 还是好的。作废它会让下一帧没有东西可画，真表面于是露

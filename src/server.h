@@ -1133,7 +1133,10 @@ struct vidow_blur_slot {
 	int dec_dst_w, dec_dst_h; /* 场景节点尺寸（逻辑单位） */
 	float mask_saved_opacity;
 	bool capture_enabled;
-	bool dec_valid;          /* Cached decoration was successfully rendered. */
+	bool dec_valid;
+	/* 换过父树，旧的装饰不能再用一帧（否则那一帧会拿旧屏的原点画，
+	 * 裁剪完就是一条横在别的屏上的窄带）。置位后本槽不画，等重烘。 */
+	bool needs_rebake;          /* Cached decoration was successfully rendered. */
 	/* **这一格自己的底衬版本号**（per-slot，别跟 fx->blur_ver 那个单值混）。
 	 *
 	 * fx->blur_ver 是每窗口一个号，可底衬是按屏分格的：窗口横跨两块屏时，
