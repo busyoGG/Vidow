@@ -2221,6 +2221,8 @@ struct vidow_layer_surface {
 	struct wl_event_source *content_idle;
 	uint64_t content_check_ns;
 	int content_invisible;
+	int content_quiet; /* 连续几次复检盒子没变（退避用） */
+	int content_box_x, content_box_y, content_box_w, content_box_h;
 	/* 上次读回之后客户端又交过帧 —— 只有为真才值得再读一遍（vshell 每秒交
 	 * 几十帧，不设这个就是每 200ms 无条件读一块整面板缓冲）。 */
 	bool content_dirty;

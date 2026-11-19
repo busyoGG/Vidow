@@ -479,12 +479,29 @@ void vidow_layer_content_check_schedule(struct vidow_server *server,
 	 * 就跟上（以前最多等 200ms，面板收起之后模糊块会多挂一会儿）。
 	 * 整屏层（4K 八百多万像素）才退回 100ms。盒子还不知道时按整块算。 */
 	uint64_t now = vidow_now_ns();
-	uint64_t wait = 100000000LL;
-	if (ls->content_w > 0 && ls->content_h > 0) {
-		double area = (double)ls->content_w * (double)ls->content_h;
-		if (area <= 800000.0) {
-			wait = 16666666LL;
-		}
+	/* 节奏按「有没有东西在变」，不按盒子多大。
+	 *
+	 * 盒子（内容的位置 / 尺寸）变了 = 这块面板真的长了缩了 / 挪了，
+	 * 立刻重测，底衬下一帧就跟上；盒子不变就是它自己在框里换字，
+	 * 那种变化不影响底衬尺寸，逐级退避到 200ms，省掉白读像素。
+	 * 身下背景变了不走这条路：那是损伤驱动，见 blur_note_damage。 */
+	if (ls->content_box_w != ls->content_w ||
+			ls->content_box_h != ls->content_h ||
+			ls->content_box_x != ls->content_x ||
+			ls->content_box_y != ls->content_y) {
+		ls->content_box_x = ls->content_x;
+		ls->content_box_y = ls->content_y;
+		ls->content_box_w = ls->content_w;
+		ls->content_box_h = ls->content_h;
+		ls->content_quiet = 0;
+	} else if (ls->content_quiet < 1000) {
+		ls->content_quiet++;
+	}
+	uint64_t wait = 16666666LL;
+	if (ls->content_quiet >= 16) {
+		wait = 200000000LL;
+	} else if (ls->content_quiet >= 4) {
+		wait = 100000000LL;
 	}
 	if (ls->content_check_ns != 0 && now - ls->content_check_ns < wait) {
 		return;
