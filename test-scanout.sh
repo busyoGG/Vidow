@@ -145,10 +145,10 @@ if grep -aq "scanout: w1 交给场景直画" "$LOG"; then
 else
 	fail "日志里没有「交给场景直画」"
 fi
-if grep -aq "Direct scan-out enabled" "$LOG"; then
-	pass "wlroots：Direct scan-out enabled（真的直通了）"
+if grep -aq "自管直通" "$LOG"; then
+	pass "自管直通：客户端缓冲直接上屏（真的直通了）"
 else
-	fail "wlroots 没有直通（render list 还是多于一项？）"
+	fail "没走到自管直通（候选判据没通过）"
 fi
 
 mark "3) 全屏截图（这一张要拿去和合成那条路比）"
@@ -179,10 +179,10 @@ if grep -aq "scanout: w1 回到合成" "$LOG"; then
 else
 	fail "日志里没有「回到合成」"
 fi
-if grep -aq "Direct scan-out disabled" "$LOG"; then
-	pass "wlroots：Direct scan-out disabled（退回来了）"
+if grep -aq "自管直通" "$LOG"; then
+	pass "自管直通：客户端缓冲直接上屏（绕开 wlroots 的 render list 判据）"
 else
-	fail "wlroots 没报 disabled"
+	fail "日志里没有「自管直通」（没走到自己提交那条路）"
 fi
 if [ "$(count 'scanout:')" = "2" ]; then
 	pass "进出各一次（scanout: 2 次）"

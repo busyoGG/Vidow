@@ -1066,6 +1066,36 @@ unsigned vidow_view_scanout_blockers(struct vidow_view *view) {
  * 这里先按「每个 return 一个位」机械落地，行为与改前完全一致：
  * 任何一位被置上就否决。后续再把位收成有名字的枚举，并补「看不见的
  * 节点不阻塞」那条判据。 */
+/* 自管直通的候选：这块屏上「只看得见一个全屏窗口」时返回它的客户端
+ * 缓冲，其余情况返回 NULL，交给原来的那条路（ADR 0005 第 2 步）。
+ *
+ * 第一版只认最干净的情形：这块屏上映射着、且归属这块屏的窗口恰好一个、
+ * 它铺满整块输出，并且 vidow_view_scanout_blockers() 一位都没置。判据
+ * 按 ADR 再放宽（alpha 覆盖盒 + 遮挡），这里先把「自己提交」这条路打通。 */
+struct wlr_buffer *vidow_output_scanout_buffer(struct vidow_output *vo) {
+	if (vo == NULL || vo->wlr_output == NULL || scanout_off()) {
+		return NULL;
+	}
+	struct vidow_view *only = NULL;
+	struct vidow_view *view;
+	wl_list_for_each(view, &vo->server->views, link) {
+		if (!view->mapped || view->popup || view->output != vo->wlr_output) {
+			continue;
+		}
+		if (only != NULL) {
+			return NULL;
+		}
+		only = view;
+	}
+	if (only == NULL || !vidow_view_scanout_ok(only)) {
+		return NULL;
+	}
+	if (only->scene_surface == NULL || only->scene_surface->buffer == NULL) {
+		return NULL;
+	}
+	return only->scene_surface->buffer->buffer;
+}
+
 bool vidow_view_scanout_ok(struct vidow_view *view) {
 	unsigned b = vidow_view_scanout_blockers(view);
 

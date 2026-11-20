@@ -505,6 +505,28 @@ void vidow_output_render(struct vidow_output *output) {
 			wlr_log(WLR_ERROR, "color: %s 后处理不可用（没有 FP16 或交换链"
 				"失败），这一帧走直接渲染", output->wlr_output->name);
 		}
+		/* 自管直通（ADR 0005）：能直通就直接把客户端缓冲交上去，绕开
+		 * wlroots「render list 正好一项」的判据。失败了照旧往下走合成。 */
+		struct wlr_buffer *scan_buf = vidow_output_scanout_buffer(output);
+		if (scan_buf != NULL) {
+			struct wlr_output_state sst;
+			wlr_output_state_init(&sst);
+			wlr_output_state_set_buffer(&sst, scan_buf);
+			bool sok = wlr_output_test_state(output->wlr_output, &sst);
+			if (sok) {
+				sok = wlr_output_commit_state(output->wlr_output, &sst);
+			}
+			wlr_output_state_finish(&sst);
+			if (sok) {
+				st_t3b = vidow_now_ns();
+				st_t3c = st_t3b;
+				wlr_log(WLR_DEBUG, "自管直通: %s 客户端缓冲直接上屏",
+					output->wlr_output->name);
+				goto frame_committed;
+			}
+			wlr_log(WLR_DEBUG, "自管直通: %s 被拒（test/commit 失败）",
+				output->wlr_output->name);
+		}
 		bool scene_built = wlr_scene_output_build_state(
 			output->scene_output, &state, options_ptr);
 		st_t3b = vidow_now_ns();
@@ -551,6 +573,7 @@ void vidow_output_render(struct vidow_output *output) {
 	int64_t st_t4 = vidow_now_ns();
 	if (render_stats_on()) {
 		vidow_stats.jelly_ns += st_t1 - st_t0;
+	frame_committed:
 		vidow_stats.blur_ns += st_t2 - st_t1;
 		vidow_stats.decor_ns += st_t3 - st_t2;
 		vidow_stats.flush_ns += st_t3a - st_t3;
