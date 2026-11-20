@@ -1,0 +1,62 @@
+# ADR 0005：直通由自己管，判据换成「看不见」
+
+状态：进行中（2026-11-20）
+
+## 背景
+
+现在直通靠 wlroots 的 `scene_entry_try_direct_scanout`：它要求这一帧的
+render list **正好一项**，且这一项铺满整块输出。这条判据太严 —— 场景里还
+可能挂着一堆**根本画不出像素**的节点（禁用、在屏外、全透明、被上层不透
+明节点整个盖住），它们不会被看见，却让 render list 多出一项，直通直接
+被判死。
+
+## 决定
+
+自己管直通，不走 wlroots 那条 `scene` 快路。
+
+### 判据：只看「看得见什么」
+
+`scanout_covers_output(out)`：
+
+1. 遍历这块输出范围内的所有 buffer 节点（用输出盒求交，先剪枝）。
+2. 跳过：`!node.enabled`、与输出盒无交集、`opacity == 0`、把残余可见
+   面积算下来为 0 的节点。
+3. 剩下的集合里必须**恰好一项**，且它是不透明、无 transform / 无缩放、
+   和自己区块一致的 DMA-BUF。
+4. 任何一层比它高的不透明节点只要露出一像素，就判定失败 —— 保守算：
+   算不清就算「露出」。
+
+### 流程：每块输出一台三态机
+
+```
+Composited ──(判据通过)──> ScanningOut
+     ^                          │
+     └────(任何阻塞位置位)──────┘
+```
+
+- 状态、目标缓冲、进入时刻都挂在 `struct vidow_output` 上，一屏一份，
+  不散落在各个窗口上。
+- 每帧只有一个决策点：`vidow_output_scanout_advance(out, state)`。
+  「要不要直通」不在这里判，这里只执行已经算好的结论。
+- 阻塞用位掩码 `blockers`：`BLOCK_LAYER` / `BLOCK_BLUR` /
+  `BLOCK_ROUND` / `BLOCK_JELLY` / `BLOCK_POST` / `BLOCK_DAMAGE` /
+  `BLOCK_CURSOR`。谁破坏直通，谁在产生那个效果的地方置位，**不再维护
+  「允许清单」**（清单会随功能增加而漏）。
+- 退出直通时按位打一行（`VIDOW_SCANOUT_TRACE`）：
+  `scanout off: blockers=0x24（圆角|果冻）`。
+
+### 提交
+
+- 进入：`wlr_output_commit_state(out, &state)`，state 里只放
+  `WLR_OUTPUT_STATE_BUFFER` + 客户端的 `wlr_buffer`。
+- 退出：立刻合成一帧完整内容（不能只补损伤 —— 直通期间屏上的像素不是
+  我们画的，损伤账本对不上）。
+- 直通期间所有 `wlr_scene_output` 的损伤记录要继续攒，用于退出那一帧。
+
+## 后果
+
+- 好处：场景里挂多少不可见节点都不影响直通；新增效果只要置位，不需要
+  改判据。
+- 代价：接管 commit 路径，需要自己处理 `frame_done` / `present` 事件、
+  以及「退出后第一帧必须全屏重画」。
+- 回退开关：`VIDOW_NO_SCANOUT=1` 仍然一律走合成。
