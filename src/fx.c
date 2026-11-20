@@ -862,41 +862,85 @@ bool scanout_off(void) {
  *
  * 切换本身是无感的：判据成立时「合成出来的像素」和「客户端缓冲本身」一样，
  * 所以进出直通两个方向都看不出变化（细节见 view.c 的 view_scanout_switch）。 */
+/* 直通否决位（ADR 0005）。
+ *
+ * 每一位对应一处「这条路画不了，必须走合成」。这样 trace 能直接说
+ * 「为什么没直通」，而不是只知道「没直通」。新增理由就加一位，
+ * 不需要维护允许清单。 */
+enum vidow_scanout_block {
+	SCANOUT_OK = 0u,
+	SCANOUT_B0 = 1u << 0,	/* 非全屏/未映射/弹出 */
+	SCANOUT_B1 = 1u << 1,	/* 直通被关掉 */
+	SCANOUT_B2 = 1u << 2,	/* 不在全屏或停车 */
+	SCANOUT_B3 = 1u << 3,	/* 全景激活 */
+	SCANOUT_B4 = 1u << 4,	/* 场景树缺失 */
+	SCANOUT_B5 = 1u << 5,	/* 缓冲缺失 */
+	SCANOUT_B6 = 1u << 6,	/* 动画/果冻/遮罩 */
+	SCANOUT_B7 = 1u << 7,	/* 透明度或缩放动画 */
+	SCANOUT_B8 = 1u << 8,	/* 自定义着色器 */
+	SCANOUT_B9 = 1u << 9,	/* 被裁掉一块 */
+	SCANOUT_B10 = 1u << 10,	/* 有装饰 */
+	SCANOUT_B11 = 1u << 11,	/* 整窗不透明度<1 */
+	SCANOUT_B12 = 1u << 12,	/* 内容有偏移 */
+	SCANOUT_B13 = 1u << 13,	/* 内容被缩放 */
+	SCANOUT_B14 = 1u << 14,	/* 无输出 */
+	SCANOUT_B15 = 1u << 15,	/* 尺寸与输出不符 */
+};
+
+static const char *const scanout_block_reason[16] = {
+	/*  0 */ "非全屏/未映射/弹出",
+	/*  1 */ "直通被关掉",
+	/*  2 */ "不在全屏或停车",
+	/*  3 */ "全景激活",
+	/*  4 */ "场景树缺失",
+	/*  5 */ "缓冲缺失",
+	/*  6 */ "动画/果冻/遮罩",
+	/*  7 */ "透明度或缩放动画",
+	/*  8 */ "自定义着色器",
+	/*  9 */ "被裁掉一块",
+	/* 10 */ "有装饰",
+	/* 11 */ "整窗不透明度<1",
+	/* 12 */ "内容有偏移",
+	/* 13 */ "内容被缩放",
+	/* 14 */ "无输出",
+	/* 15 */ "尺寸与输出不符",
+};
+
 unsigned vidow_view_scanout_blockers(struct vidow_view *view) {
 	if (view == NULL || !view->mapped || view->popup) {
-		return (1u << 0);
+		return SCANOUT_B0;
 	}
 	/* 关掉直通的开关（和 VIDOW_RENDER_STATS 一样的探针）：怀疑「全屏画面和
 	 * 以前不一样」时先拿它排除直通这条路 —— 两个方向应该一个像素都不差。 */
 	if (scanout_off()) {
-		return (1u << 1);
+		return SCANOUT_B1;
 	}
 	/* 只做全屏：只有它铺满整块输出（wlroots 要求节点的框正好等于输出框）。 */
 	if (!view->fullscreen || view->scene_parked) {
-		return (1u << 2);
+		return SCANOUT_B2;
 	}
 	/* 全景里窗口是被缩小的（ov 那个系数写在 view_anim_place 的缩放里，而那条路
 	 * 挂在 fx.active 上）—— 直通里没人给它缩放，全屏窗口会以原尺寸糊在全景上。 */
 	if (vidow_overview_active(view->server)) {
-		return (1u << 3);
+		return SCANOUT_B3;
 	}
 	if (view->scene_tree == NULL || view->scene_surface == NULL) {
-		return (1u << 4);
+		return SCANOUT_B4;
 	}
 	struct wlr_scene_buffer *src = view->scene_surface->buffer;
 	if (src == NULL || src->buffer == NULL) {
-		return (1u << 5);
+		return SCANOUT_B5;
 	}
 	/* 动画 / 果冻 / 遮罩期间内容不是「缓冲自己」，得走合成那条路。 */
 	if (view->anim_open != NULL || view->anim_move != NULL ||
 			view->jelly != NULL || view->mask_opacity) {
-		return (1u << 6);
+		return SCANOUT_B6;
 	}
 	if (view->anim_alpha < 1.0 || view->anim_scale != 1.0) {
-		return (1u << 7);
+		return SCANOUT_B7;
 	}
 	if (view->fx.shader != NULL) {
-		return (1u << 8);
+		return SCANOUT_B8;
 	}
 	/* 裁过（跨屏那一半 / overview 里缩放）：这条**不能删**，但也不能像
 	 * 以前那样一律退回合成管线 —— 无装饰的窗口（Steam 主窗口就是）退回
@@ -933,7 +977,7 @@ unsigned vidow_view_scanout_blockers(struct vidow_view *view) {
 					view->fx.clip.x, view->fx.clip.y,
 					view->fx.clip.width, view->fx.clip.height);
 			}
-			return (1u << 9); /* 真的被切掉一块：直通画不了 */
+			return SCANOUT_B9; /* 真的被切掉一块：直通画不了 */
 		}
 	}
 	struct vidow_look look;
@@ -941,26 +985,26 @@ unsigned vidow_view_scanout_blockers(struct vidow_view *view) {
 		&look);
 	if (look.corner_radius > 0.0 || look.border_width > 0.0 ||
 			look.shadow_radius > 0.0 || look.noise > 0.0) {
-		return (1u << 10);
+		return SCANOUT_B10;
 	}
 	if (look.opacity < 1.0) {
-		return (1u << 11);
+		return SCANOUT_B11;
 	}
 	/* 客户端自己画装饰（GTK 那套 CSD 阴影）时表面比窗口大一圈：合成那条路按
 	 * 窗口几何裁掉留白，直通扫的是整块缓冲 —— 那圈留白会露出来。 */
 	struct vidow_fx_geo geo = vidow_view_fx_geo(view);
 	if (geo.off_x != 0 || geo.off_y != 0) {
-		return (1u << 12);
+		return SCANOUT_B12;
 	}
 	if (geo.w != geo.src_w || geo.h != geo.src_h) {
-		return (1u << 13);
+		return SCANOUT_B13;
 	}
 	/* 缓冲的设备像素得和这块输出对上（1:1 上屏）。客户端没吃下输出缩放（1x 的
 	 * 客户端放在 2x 屏上）时，合成那条路是**着色器**把 1x 贴图放大到 2x、直通
 	 * 那条路是**场景**自己放大 —— 两条路的采样未必一模一样，这一步不省。 */
 	struct wlr_output *out = view->output;
 	if (out == NULL) {
-		return (1u << 14);
+		return SCANOUT_B14;
 	}
 	int ow = out->width, oh = out->height;
 	if (out->transform % 2 == 1) {
@@ -969,7 +1013,7 @@ unsigned vidow_view_scanout_blockers(struct vidow_view *view) {
 		oh = t;
 	}
 	if (src->buffer->width != ow || src->buffer->height != oh) {
-		return (1u << 15);
+		return SCANOUT_B15;
 	}
 	/* 内容得**整块不透明**：全屏窗口盖住整块屏，只有内容真的不透明，底衬和模糊
 	 * 才一个像素都透不出来 —— 合成那条路也只是拿 content 盖住它（装饰着色器里
@@ -1014,16 +1058,35 @@ unsigned vidow_view_scanout_blockers(struct vidow_view *view) {
 			look.corner_radius, look.border_width,
 			look.shadow_radius, look.noise);
 	}
-	return ok;
+	/* ok 是最后那道尺寸检查的结论；位掩码里没有专门的一位，借用 B15。 */
+	return ok ? SCANOUT_OK : SCANOUT_B15;
+}
 
 /* 0 = 可以直通；非 0 = 位掩码，每一位是一种否决理由（见 ADR 0005）。
  * 这里先按「每个 return 一个位」机械落地，行为与改前完全一致：
  * 任何一位被置上就否决。后续再把位收成有名字的枚举，并补「看不见的
  * 节点不阻塞」那条判据。 */
 bool vidow_view_scanout_ok(struct vidow_view *view) {
-	return vidow_view_scanout_blockers(view) == 0;
+	unsigned b = vidow_view_scanout_blockers(view);
+
+	if (b != 0 && vidow_xtrace_on()) {
+		char why[256];
+		int n = 0;
+		why[0] = 0;
+		for (int i = 0; i < 16; i++) {
+			if ((b & (1u << i)) == 0) {
+				continue;
+			}
+			n += snprintf(why + n, sizeof(why) - (size_t)n, "%s%s",
+				n > 0 ? "|" : "", scanout_block_reason[i]);
+		}
+		wlr_log(WLR_INFO, "scanout off: %s blockers=0x%x（%s）",
+			vidow_view_title(view) != NULL ? vidow_view_title(view) :
+				"(无题)", b, why);
+	}
+	return b == 0;
 }
-}
+
 
 /* Hide/show a toplevel for a backdrop capture. A decorated window is drawn
  * from its fx node and its real surface already sits at zero opacity, so
