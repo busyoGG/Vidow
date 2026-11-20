@@ -862,41 +862,41 @@ bool scanout_off(void) {
  *
  * 切换本身是无感的：判据成立时「合成出来的像素」和「客户端缓冲本身」一样，
  * 所以进出直通两个方向都看不出变化（细节见 view.c 的 view_scanout_switch）。 */
-bool vidow_view_scanout_ok(struct vidow_view *view) {
+unsigned vidow_view_scanout_blockers(struct vidow_view *view) {
 	if (view == NULL || !view->mapped || view->popup) {
-		return false;
+		return (1u << 0);
 	}
 	/* 关掉直通的开关（和 VIDOW_RENDER_STATS 一样的探针）：怀疑「全屏画面和
 	 * 以前不一样」时先拿它排除直通这条路 —— 两个方向应该一个像素都不差。 */
 	if (scanout_off()) {
-		return false;
+		return (1u << 1);
 	}
 	/* 只做全屏：只有它铺满整块输出（wlroots 要求节点的框正好等于输出框）。 */
 	if (!view->fullscreen || view->scene_parked) {
-		return false;
+		return (1u << 2);
 	}
 	/* 全景里窗口是被缩小的（ov 那个系数写在 view_anim_place 的缩放里，而那条路
 	 * 挂在 fx.active 上）—— 直通里没人给它缩放，全屏窗口会以原尺寸糊在全景上。 */
 	if (vidow_overview_active(view->server)) {
-		return false;
+		return (1u << 3);
 	}
 	if (view->scene_tree == NULL || view->scene_surface == NULL) {
-		return false;
+		return (1u << 4);
 	}
 	struct wlr_scene_buffer *src = view->scene_surface->buffer;
 	if (src == NULL || src->buffer == NULL) {
-		return false;
+		return (1u << 5);
 	}
 	/* 动画 / 果冻 / 遮罩期间内容不是「缓冲自己」，得走合成那条路。 */
 	if (view->anim_open != NULL || view->anim_move != NULL ||
 			view->jelly != NULL || view->mask_opacity) {
-		return false;
+		return (1u << 6);
 	}
 	if (view->anim_alpha < 1.0 || view->anim_scale != 1.0) {
-		return false;
+		return (1u << 7);
 	}
 	if (view->fx.shader != NULL) {
-		return false;
+		return (1u << 8);
 	}
 	/* 裁过（跨屏那一半 / overview 里缩放）：这条**不能删**，但也不能像
 	 * 以前那样一律退回合成管线 —— 无装饰的窗口（Steam 主窗口就是）退回
@@ -933,7 +933,7 @@ bool vidow_view_scanout_ok(struct vidow_view *view) {
 					view->fx.clip.x, view->fx.clip.y,
 					view->fx.clip.width, view->fx.clip.height);
 			}
-			return false; /* 真的被切掉一块：直通画不了 */
+			return (1u << 9); /* 真的被切掉一块：直通画不了 */
 		}
 	}
 	struct vidow_look look;
@@ -941,26 +941,26 @@ bool vidow_view_scanout_ok(struct vidow_view *view) {
 		&look);
 	if (look.corner_radius > 0.0 || look.border_width > 0.0 ||
 			look.shadow_radius > 0.0 || look.noise > 0.0) {
-		return false;
+		return (1u << 10);
 	}
 	if (look.opacity < 1.0) {
-		return false;
+		return (1u << 11);
 	}
 	/* 客户端自己画装饰（GTK 那套 CSD 阴影）时表面比窗口大一圈：合成那条路按
 	 * 窗口几何裁掉留白，直通扫的是整块缓冲 —— 那圈留白会露出来。 */
 	struct vidow_fx_geo geo = vidow_view_fx_geo(view);
 	if (geo.off_x != 0 || geo.off_y != 0) {
-		return false;
+		return (1u << 12);
 	}
 	if (geo.w != geo.src_w || geo.h != geo.src_h) {
-		return false;
+		return (1u << 13);
 	}
 	/* 缓冲的设备像素得和这块输出对上（1:1 上屏）。客户端没吃下输出缩放（1x 的
 	 * 客户端放在 2x 屏上）时，合成那条路是**着色器**把 1x 贴图放大到 2x、直通
 	 * 那条路是**场景**自己放大 —— 两条路的采样未必一模一样，这一步不省。 */
 	struct wlr_output *out = view->output;
 	if (out == NULL) {
-		return false;
+		return (1u << 14);
 	}
 	int ow = out->width, oh = out->height;
 	if (out->transform % 2 == 1) {
@@ -969,7 +969,7 @@ bool vidow_view_scanout_ok(struct vidow_view *view) {
 		oh = t;
 	}
 	if (src->buffer->width != ow || src->buffer->height != oh) {
-		return false;
+		return (1u << 15);
 	}
 	/* 内容得**整块不透明**：全屏窗口盖住整块屏，只有内容真的不透明，底衬和模糊
 	 * 才一个像素都透不出来 —— 合成那条路也只是拿 content 盖住它（装饰着色器里
@@ -1015,6 +1015,14 @@ bool vidow_view_scanout_ok(struct vidow_view *view) {
 			look.shadow_radius, look.noise);
 	}
 	return ok;
+
+/* 0 = 可以直通；非 0 = 位掩码，每一位是一种否决理由（见 ADR 0005）。
+ * 这里先按「每个 return 一个位」机械落地，行为与改前完全一致：
+ * 任何一位被置上就否决。后续再把位收成有名字的枚举，并补「看不见的
+ * 节点不阻塞」那条判据。 */
+bool vidow_view_scanout_ok(struct vidow_view *view) {
+	return vidow_view_scanout_blockers(view) == 0;
+}
 }
 
 /* Hide/show a toplevel for a backdrop capture. A decorated window is drawn

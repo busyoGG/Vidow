@@ -3836,6 +3836,7 @@ void vidow_fx_release(struct vidow_fx_target *fx);
  * 只是没省下那两笔 GPU，误判会让画面变样（CSD 留白、半透明、模糊底衬都会在直通
  * 里露出来）。见 view.c 的 view_scanout_switch。 */
 bool vidow_view_blur_wanted(struct vidow_view *view);
+unsigned vidow_view_scanout_blockers(struct vidow_view *view);
 bool vidow_view_scanout_ok(struct vidow_view *view);
 void vidow_fx_flush(struct vidow_server *server);
 /* 输出端全屏后处理（第 9 步，vidow.output{ hdr }）：把场景的 FP16 离屏搬进
