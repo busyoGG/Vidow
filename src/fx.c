@@ -1076,24 +1076,57 @@ struct wlr_buffer *vidow_output_scanout_buffer(struct vidow_output *vo) {
 	if (vo == NULL || vo->wlr_output == NULL || scanout_off()) {
 		return NULL;
 	}
-	struct vidow_view *only = NULL;
+	struct wlr_box obox = {0};
+	wlr_output_layout_get_box(vo->server->output_layout, vo->wlr_output, &obox);
+	if (obox.width <= 0 || obox.height <= 0) {
+		return NULL;
+	}
+	/* 这块屏上有「一个看得见的全屏窗口」就够，别的节点只要**一个像素都
+	 * 画不出来**（透明度 0 / 缩到 0 / 整块在屏外）就不算挡住 —— 这就是
+	 * ADR 0005 里「看不见的不影响直通」的第一版。 */
+	struct vidow_view *cand = NULL;
 	struct vidow_view *view;
 	wl_list_for_each(view, &vo->server->views, link) {
 		if (!view->mapped || view->popup || view->output != vo->wlr_output) {
 			continue;
 		}
-		if (only != NULL) {
-			return NULL;
+		if (vidow_view_scanout_ok(view)) {
+			if (cand != NULL) {
+				return NULL;
+			}
+			cand = view;
+			continue;
 		}
-		only = view;
+		if (view->anim_alpha <= 0.01 || view->anim_scale <= 0.01) {
+			continue;
+		}
+		struct wlr_box vb = {
+			.x = view->geom.x, .y = view->geom.y,
+			.width = view->geom.width,
+			.height = view->geom.height,
+		};
+		struct wlr_box vis = {0};
+		if (!wlr_box_intersection(&vis, &vb, &obox) ||
+				vis.width <= 0 || vis.height <= 0) {
+			continue;
+		}
+		return NULL; /* 真有可见像素：这一帧还是合成 */
 	}
-	if (only == NULL || !vidow_view_scanout_ok(only)) {
+	if (cand == NULL || cand->scene_surface == NULL ||
+			cand->scene_surface->buffer == NULL) {
 		return NULL;
 	}
-	if (only->scene_surface == NULL || only->scene_surface->buffer == NULL) {
+	struct vidow_layer_surface *ls;
+	wl_list_for_each(ls, &vo->server->layers, link) {
+		if (ls->output != vo) {
+			continue;
+		}
+		if (ls->content_invisible == 1) {
+			continue; /* 量出来一个像素都没画 */
+		}
 		return NULL;
 	}
-	return only->scene_surface->buffer->buffer;
+	return cand->scene_surface->buffer->buffer;
 }
 
 bool vidow_view_scanout_ok(struct vidow_view *view) {

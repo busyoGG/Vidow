@@ -1533,6 +1533,8 @@ struct vidow_output {
 	struct wlr_texture *post_tex;
 	struct wlr_scene_output *scene_output;
 	struct wlr_output_layout_output *layout_output;
+	/* 自管直通当前是不是我们提交的（用来只在状态翻转时打日志）。 */
+	bool scanout_self;
 	/* 这块屏的抓帧器（capture.c 的 vidow_capture）：独立的假输出 + 自己的
 	 * scene_output，抓帧时自己渲染一帧。懒建。 */
 	struct vidow_capture *capture;

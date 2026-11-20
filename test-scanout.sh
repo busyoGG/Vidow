@@ -151,6 +151,32 @@ else
 	fail "没走到自管直通（候选判据没通过）"
 fi
 
+
+mark "2b) 看不见的窗口不挡直通；看得见的才挡"
+python3 ./tools/pattern.py w2 > "$RUNDIR/w2.log" 2>&1 &
+sleep 2
+msg toggle-floating --title w2
+sleep 0.4
+# 挪到屏外：一个像素都画不出来，这时**不该**打断直通。
+before=$(count "自管直通: .* 停")
+msg set-window-position --title w2 2400 200
+sleep 1.2
+if [ "$(count "自管直通: .* 停")" = "$before" ]; then
+	pass "屏外的浮窗不挡直通（停在屏外的窗口不算挡住）"
+else
+	fail "屏外的浮窗把直通打断了（$(count "自管直通: .* 停") 次「停」）"
+fi
+# 挪回屏内：真有可见像素，这时**必须**退回合成。
+msg set-window-position --title w2 200 200
+sleep 1.2
+if [ "$(count "自管直通: .* 停")" -gt "$before" ]; then
+	pass "屏内看得见的浮窗挡住了直通（退回合成）"
+else
+	fail "屏内浮窗没挡住直通：可见像素压在上面还是直通了"
+fi
+msg close-window --title w2
+sleep 0.8
+
 mark "3) 全屏截图（这一张要拿去和合成那条路比）"
 grim "$RUNDIR/full-scanout.png" >/dev/null 2>&1
 got=$(dominant "$RUNDIR/full-scanout.png" 300 300)
@@ -184,10 +210,10 @@ if grep -aq "自管直通" "$LOG"; then
 else
 	fail "日志里没有「自管直通」（没走到自己提交那条路）"
 fi
-if [ "$(count 'scanout:')" = "2" ]; then
-	pass "进出各一次（scanout: 2 次）"
+if [ "$(count 'scanout:')" -ge 2 ]; then
+	pass "进出至少各一次（scanout: $(count 'scanout:') 次）"
 else
-	fail "scanout: 出现 $(count 'scanout:') 次，期望 2 次"
+	fail "scanout: 只出现 $(count 'scanout:') 次，至少要进出各一次"
 fi
 
 stop_clients

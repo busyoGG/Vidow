@@ -508,6 +508,11 @@ void vidow_output_render(struct vidow_output *output) {
 		/* 自管直通（ADR 0005）：能直通就直接把客户端缓冲交上去，绕开
 		 * wlroots「render list 正好一项」的判据。失败了照旧往下走合成。 */
 		struct wlr_buffer *scan_buf = vidow_output_scanout_buffer(output);
+		if (scan_buf == NULL && output->scanout_self) {
+			output->scanout_self = false;
+			wlr_log(WLR_INFO, "自管直通: %s 停（不再满足直通判据）",
+				output->wlr_output->name);
+		}
 		if (scan_buf != NULL) {
 			struct wlr_output_state sst;
 			wlr_output_state_init(&sst);
@@ -520,12 +525,18 @@ void vidow_output_render(struct vidow_output *output) {
 			if (sok) {
 				st_t3b = vidow_now_ns();
 				st_t3c = st_t3b;
-				wlr_log(WLR_DEBUG, "自管直通: %s 客户端缓冲直接上屏",
-					output->wlr_output->name);
+				if (!output->scanout_self) {
+					output->scanout_self = true;
+					wlr_log(WLR_INFO, "自管直通: %s 上屏（客户端缓冲直接提交）",
+						output->wlr_output->name);
+				}
 				goto frame_committed;
 			}
-			wlr_log(WLR_DEBUG, "自管直通: %s 被拒（test/commit 失败）",
-				output->wlr_output->name);
+			if (output->scanout_self) {
+				output->scanout_self = false;
+				wlr_log(WLR_INFO, "自管直通: %s 停（test/commit 失败）",
+					output->wlr_output->name);
+			}
 		}
 		bool scene_built = wlr_scene_output_build_state(
 			output->scene_output, &state, options_ptr);
