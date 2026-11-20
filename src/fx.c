@@ -1124,6 +1124,20 @@ struct wlr_buffer *vidow_output_scanout_buffer(struct vidow_output *vo) {
 		if (ls->content_invisible == 1) {
 			continue; /* 量出来一个像素都没画 */
 		}
+		/* 量出来的那一块在屏外（整块不交）也不算挡住：看不见就不影响直通。
+		 * content_x/y 是相对于 geom 的局部坐标，而 geom 已经是布局坐标。 */
+		struct wlr_box cb = {
+			.x = ls->geom.x + ls->content_x,
+			.y = ls->geom.y + ls->content_y,
+			.width = ls->content_w,
+			.height = ls->content_h,
+		};
+		struct wlr_box lvis = {0};
+		if (cb.width <= 0 || cb.height <= 0 ||
+				!wlr_box_intersection(&lvis, &cb, &obox) ||
+				lvis.width <= 0 || lvis.height <= 0) {
+			continue;
+		}
 		return NULL;
 	}
 	return cand->scene_surface->buffer->buffer;
