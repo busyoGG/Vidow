@@ -64,6 +64,26 @@ Composited ──(判据通过)──> ScanningOut
    「scanout off: blockers=0x24（圆角|果冻）」、
    「scanout plain: 叠加层 1 块（bar），平面分配失败」。
 
+### 二级方案（DRM 叠加平面）的可达性：现在够不到
+
+查了装上的头文件（`/usr/include/wlroots-0.20`）：
+
+1. `wlr/types/wlr_output.h` 里 `struct wlr_output_state` **只有一个 `buffer`**
+   （外加 `buffer_src_box` / `buffer_dst_box` / `tearing_page_flip`），没有
+   「一组平面」。也就是说公共 API 一次只能交一块缓冲，wlroots 自己也不做
+   多平面合成。
+2. 私有结构（`struct wlr_drm_plane`、`wlr_drm_connector` 的平面表）在
+   `backend/drm/drm.h`，而这个头**不安装**——`/usr/include/wlroots-0.20/
+   wlr/backend/drm.h` 只有公共接口。
+3. 剩下的路只有两条，都不便宜：
+   - 自己开 DRM fd、绕过 wlroots 做原子提交：会和 wlroots 的原子状态互相
+     打架（它每帧提交自己那份），不现实。
+   - 给 wlroots 上游加 `wlr_output_state` 的多平面能力：那是另一个项目的
+     工作量。
+
+**结论**：一级（有可见叠加层就退出直通）是当前 API 下能做到的正确上限。
+二级留作「等 wlroots 支持多平面」的待办，不写实现代码。
+
 ### 提交
 
 - 进入：`wlr_output_commit_state(out, &state)`，state 里只放
