@@ -426,6 +426,14 @@ void backdrop_clip_check(struct wlr_scene_buffer *sb, int sx, int sy,
 
 void backdrop_iter(struct wlr_scene_buffer *sb, int sx, int sy,
 		void *data) {
+	/* 场景图里已经没有爹的 buffer：wlr_scene 一侧的坐标/输出信息
+	 * 已经不可信了，往上翻父链会撞到 wlroots 里的断言（现场崩溃栈
+	 * layer_blur_frame -> layer_region_build -> backdrop_iter ->
+	 * __assert_fail）。抓底衬不需要它，直接跳过。 */
+	if (sb == NULL || sb->node.parent == NULL) {
+		return;
+	}
+
 	struct backdrop_ctx *ctx = data;
 	if (sb->buffer == NULL) {
 		return;
