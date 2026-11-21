@@ -4666,6 +4666,8 @@ void vidow_overview_exit(struct vidow_server *server);
 void vidow_overview_refresh_layers(struct vidow_server *server);
 /* 每帧渲染前调一次：算好变换（t 变了、布局变了都靠它）并把窗口摆一遍。 */
 void vidow_overview_update(struct vidow_server *server);
+/* overview 里快捷键的目标跟着鼠标所在那块屏（见 overview.c）。 */
+void vidow_overview_follow_pointer(struct vidow_server *server);
 /* 工作区局部坐标 -> 屏幕坐标。ox/oy 是窗口自己的动画偏移（开窗 / 关窗补间，
  * 布局像素），跟着一起缩。t = 0 时是恒等变换。 */
 void vidow_overview_map(struct vidow_server *server, struct vidow_view *view,

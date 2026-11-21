@@ -510,6 +510,9 @@ static void keyboard_key_impl(struct wl_listener *listener, void *data) {
 
 
 	bool handled = false;
+	/* overview 里快捷键作用在**鼠标所在那块屏**（用户：「鼠标在哪个工作区
+	 * 就能在哪个工作区使用」）。不进 overview 时这个函数直接返回。 */
+	vidow_overview_follow_pointer(server);
 	uint32_t mods = wlr_keyboard_get_modifiers(kb->wlr_keyboard);
 	/* 焦点那个表面上有个生效中的「快捷键抑制」（虚拟机的窗口要原样收 Super /
 	 * Alt+Tab，见 keyboardgrab.c）时，vidow 自己的键位全部让路 —— 客户端要的
@@ -2411,6 +2414,8 @@ void vidow_pointer_axis(struct vidow_server *server,
 		 * Mod+滚轮什么都不做（用户报的「overview状态下还是无法通过mod+滚轮
 		 * 移动窗口焦点」）。没命中绑定才轮到列表滚动。 */
 		uint32_t mods0 = pointer_modifiers(server);
+		/* 同上：滚轮触发的快捷键也要作用在鼠标那块屏。 */
+		vidow_overview_follow_pointer(server);
 		if (vidow_keybind_wheel(server, orientation, amount, mods0,
 				vidow_shortcuts_inhibited(server))) {
 			return;

@@ -1110,6 +1110,46 @@ static void overview_track_pointer(struct vidow_server *server) {
 	ov->output = at;
 }
 
+/* overview 里让「快捷键的目标」跟着鼠标所在那块屏。
+ *
+ * 用户：「overview 只能在进入 overview 的工作区使用 super+滚轮，我想要鼠标在哪
+ * 个工作区就能在哪个工作区使用」。进来那一刻 focused_output 定在当时的屏上，
+ * 之后 Super+滚轮（focus-column / workspace up-down 等）全都作用在那块屏，鼠标
+ * 挪到另一块屏上按就没有反应。
+ *
+ * overview 自己的 ov->output 早就跟着鼠标走（overview_track_pointer），但那条只
+ * 影响滚列表和点击，改不了快捷键的目标 —— 目标是 focused_output。
+ *
+ * 所以按键 / 滚轮进来之前先对一次账：光标停在哪块屏，就把键盘焦点交给那块屏
+ * 现在亮着的工作区（vidow_workspace_focus_output = 换屏 + 换焦点窗口）。
+ * **只在 overview 期间调用** —— 桌面时焦点归点击和方向键，不能被鼠标划过改掉。 */
+void vidow_overview_follow_pointer(struct vidow_server *server) {
+	if (server->cursor == NULL || !vidow_overview_active(server)) {
+		return;
+	}
+	struct wlr_output *at = wlr_output_layout_output_at(
+		server->output_layout, server->cursor->x, server->cursor->y);
+	if (at == NULL) {
+		return;
+	}
+	/* 指针一动，input.c 的 vidow_pointer_motion 已经把 focused_output 换成
+	 * 光标那块屏了 —— 所以**不能只比 focused_output**（那样这里永远早退）。
+	 * 真正要跟的是「键盘焦点在哪个工作区」：server->focused->ws。 */
+	struct vidow_workspace *ws = vidow_workspace_active_for(server, at);
+	if (ws == NULL) {
+		return;
+	}
+	struct vidow_output *out = vidow_output_lookup(server, at);
+	if (out == NULL || !out->ov.used) {
+		return;
+	}
+	if (server->focused != NULL && server->focused->ws == ws &&
+			server->focused_output == at) {
+		return;
+	}
+	vidow_workspace_focus_output(server, at);
+}
+
 void vidow_overview_update(struct vidow_server *server) {
 	if (!vidow_overview_active(server)) {
 		return;
