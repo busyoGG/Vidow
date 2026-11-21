@@ -13,6 +13,7 @@
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
 #include <drm_fourcc.h>
+#include <wlr/render/dmabuf.h>
 #include <wlr/render/drm_format_set.h>
 #include <wlr/render/egl.h>
 #include <wlr/render/gles2.h>
@@ -1115,6 +1116,49 @@ struct wlr_buffer *vidow_output_scanout_buffer(struct vidow_output *vo) {
 	if (cand == NULL || cand->scene_surface == NULL ||
 			cand->scene_surface->buffer == NULL) {
 		return NULL;
+	}
+
+	/* **YUV 缓冲不许直通。**
+	 *
+	 * 客户端用 NV12 / P010 这类平面格式时，那张缓冲得先经 shader 转成 RGB 才
+	 * 能跟我们的装饰合成；直接丢给 KMS 就是颜色错（甚至花屏）。Hyprland 在
+	 * 2026-11 加了同一道闸（monitor: block direct scanout of yuv buffers）：
+	 * 照样 advertise yuv dmabuf，只是不进直通。
+	 *
+	 * 只放行 RGB 系白名单：8bit / 10bit / 565 都常见；白名单比「排除 YUV」
+	 * 稳，将来客户端掏出别的平面格式也不会漏进来。wl-shm 缓冲不查 ——
+	 * Wayland 的 shm 格式里本来就没有平面格式。 */
+	{
+		struct wlr_buffer *cbuf = cand->scene_surface->buffer->buffer;
+		struct wlr_dmabuf_attributes attrs;
+		bool rgb = true;
+		uint32_t fmt = 0;
+		if (wlr_buffer_get_dmabuf(cbuf, &attrs)) {
+			fmt = attrs.format;
+			rgb = false;
+			switch (fmt) {
+			case DRM_FORMAT_ARGB8888: case DRM_FORMAT_XRGB8888:
+			case DRM_FORMAT_ABGR8888: case DRM_FORMAT_XBGR8888:
+			case DRM_FORMAT_RGBA8888: case DRM_FORMAT_RGBX8888:
+			case DRM_FORMAT_BGRA8888: case DRM_FORMAT_BGRX8888:
+			case DRM_FORMAT_RGB565: case DRM_FORMAT_BGR565:
+			case DRM_FORMAT_ARGB2101010: case DRM_FORMAT_XRGB2101010:
+			case DRM_FORMAT_ABGR2101010: case DRM_FORMAT_XBGR2101010:
+				rgb = true;
+				break;
+			default:
+				break;
+			}
+		}
+		/* 测试钩子（同 VIDOW_TEST_GRADE_LUT_SIZE 那一路）：把任意缓冲当成平面
+		 * 格式，好让测试能验「这道闸真的拦得住」—— 真拿一个 NV12 客户端来
+		 * 测，测试环境里造不出来。 */
+		if (!rgb || getenv("VIDOW_TEST_SCANOUT_YUV") != NULL) {
+			wlr_log(WLR_DEBUG, "scanout off: %s 缓冲格式 0x%08x 不能直通",
+				vidow_view_title(cand) != NULL ?
+					vidow_view_title(cand) : "(无题)", fmt);
+			return NULL;
+		}
 	}
 	struct vidow_layer_surface *ls;
 	wl_list_for_each(ls, &vo->server->layers, link) {

@@ -270,6 +270,25 @@ else
 	fail "内圈就有差异 —— 直通那条路画的东西和合成不一样"
 fi
 
+mark "6) YUV 缓冲不许直通（VIDOW_TEST_SCANOUT_YUV=1 当测试闸）"
+start_vidow compose "VIDOW_TEST_SCANOUT_YUV=1"
+python3 ./tools/pattern.py w1 > "$RUNDIR/w1c.log" 2>&1 &
+sleep 2
+msg toggle-fullscreen --title w1
+sleep 1.5
+if [ "$(count '自管直通: .* 上屏')" = "0" ]; then
+	pass "平面格式的缓冲没进直通（0 次「上屏」）"
+else
+	fail "平面格式的缓冲还是直通了（$(count '自管直通: .* 上屏') 次）"
+fi
+if grep -aq 'scanout off:.*不能直通' "$LOG"; then
+	pass "日志：scanout off 记了「缓冲格式不能直通」"
+else
+	fail "日志里没有「不能直通」（闸根本没走到）"
+fi
+stop_clients
+stop_vidow
+
 echo
 if [ "$FAILED" = "0" ]; then
 	echo "全部通过（日志：$RUNDIR）"
