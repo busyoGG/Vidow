@@ -204,6 +204,54 @@ static void view_snap(struct vidow_server *server, bool cancelled) {
 	output->gesture_drag = false;
 	vidow_arrange(server);
 	double to = output->viewport_x;
+	/* 松手时把焦点列停在可用区正中（niri 2026-11-18「layout/scrolling:
+	 * Add center snap to view gesture」）。
+	 *
+	 * 上面那次 arrange 给的是「刚好让焦点列全部可见」的最小滚动量 —— 手
+	 * 势拖过去之后停在那个位置，会看到焦点列贴在左边、右边空一大块。
+	 * niri 的做法是手势松手额外吸附到居中。
+	 *
+	 * 只在列装得下时做：比可用区还宽就退回最小滚动（居中等于把窗口推
+	 * 出屏外）。也夹在可滚动范围内，否则会露出条带外面的空白。 */
+	if (!cancelled) {
+		struct vidow_column *fc = server->focused != NULL ?
+			server->focused->column : NULL;
+		double work_w = output->usable_area.width;
+		if (fc != NULL && fc->output == output->wlr_output &&
+				fc->width > 0 && work_w > 0.0 &&
+				(double)fc->width <= work_w) {
+			double centered = (double)fc->offset -
+				(work_w - (double)fc->width) / 2.0;
+			/* 可滚动范围的右端：条带总宽减去可用区宽。 */
+			double max_vp = 0.0;
+			struct vidow_workspace *ws =
+				vidow_workspace_shown_for(server, output->wlr_output);
+			if (ws != NULL) {
+				struct vidow_column *c2;
+				wl_list_for_each(c2, &ws->columns, link) {
+					if (c2->output != output->wlr_output) {
+						continue;
+					}
+					double end = (double)c2->offset +
+						(double)c2->width;
+					if (end > max_vp) {
+						max_vp = end;
+					}
+				}
+				max_vp -= work_w;
+			}
+			if (max_vp < 0.0) {
+				max_vp = 0.0;
+			}
+			if (centered < 0.0) {
+				centered = 0.0;
+			}
+			if (centered > max_vp) {
+				centered = max_vp;
+			}
+			to = centered;
+		}
+	}
 	output->gesture_drag = true;
 	output->gesture_viewport = from;
 	g.snap_from = from;
