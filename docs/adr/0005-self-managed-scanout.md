@@ -131,16 +131,15 @@ Hyprland `monitor: update swapchain when leaving DS to avoid short flickers`
 直通块之后若 `was_scanout && !output->scanout_self` 就
 `wlr_output_configure_primary_swapchain(output->wlr_output, &state, &output->wlr_output->swapchain)`。
 
-### 3) 手势松手居中吸附
+### 3) 手势松手居中吸附 —— 做了又撤了
 
-niri `layout/scrolling: Add center snap to view gesture`（2026-11-18）。手势拖完
-松手时，焦点列停在**可用区正中**，而不是「刚好全部可见」那个最小滚动量 ——
-后者会让焦点列贴左边、右边空一大块。
+niri `layout/scrolling: Add center snap to view gesture`（2026-11-18）：手势拖完松手时让
+焦点列停在可用区正中。
 
-实现：`src/gesture.c` 的 `view_snap()` 在 arrange 出最小滚动量之后改算居中值
-（`fc->offset - (work_w - fc->width) / 2`，夹在 `[0, 条带总宽 - 可用区宽]`）。
-列比可用区还宽时退回最小滚动（居中等于把窗口推出屏外）。窗口换焦点那条路
-不受影响 —— 那是 `layout { center-focused-column }` 管的事。
+实现过一版（`src/gesture.c` 的 `view_snap()`：`fc->offset - (work_w - fc->width) / 2`，
+夹在 `[0, 条带总宽 - 可用区宽]`），**用户明确不要**（2026-11-21「我不需要居中」），
+已 revert（`f57128f`）。现在松手仍是「刚好让焦点列全部可见」的最小滚动量 ——
+要居中请用 `layout { center-focused-column }` 那条配置，它是长期行为、不是手势特例。
 
 ### 4) `stop-cast`：按编号收掉一路录制
 
