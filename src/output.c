@@ -507,6 +507,7 @@ void vidow_output_render(struct vidow_output *output) {
 		}
 		/* 自管直通（ADR 0005）：能直通就直接把客户端缓冲交上去，绕开
 		 * wlroots「render list 正好一项」的判据。失败了照旧往下走合成。 */
+		bool was_scanout = output->scanout_self;
 		struct wlr_buffer *scan_buf = vidow_output_scanout_buffer(output);
 		if (scan_buf == NULL && output->scanout_self) {
 			output->scanout_self = false;
@@ -535,6 +536,20 @@ void vidow_output_render(struct vidow_output *output) {
 			if (output->scanout_self) {
 				output->scanout_self = false;
 				wlr_log(WLR_INFO, "自管直通: %s 停（test/commit 失败）",
+					output->wlr_output->name);
+			}
+		}
+		if (was_scanout && !output->scanout_self) {
+			/* 离开直通的那一帧，先把主交换链按现在的 state 重配一次。
+			 *
+			 * 直通时送上屏的是客户端那张缓冲：格式、修饰都可能跟我们自己
+			 * 的交换链不一样（8bit 客户端 → 10bit/HDR 桌面就是典型）。
+			 * 沿用旧交换链，第一帧会露一次格式不符的闪烁。Hyprland
+			 * 98b642e「monitor: update swapchain when leaving DS to avoid
+			 * short flickers」就是补的这一下。 */
+			if (!wlr_output_configure_primary_swapchain(output->wlr_output,
+					&state, &output->wlr_output->swapchain)) {
+				wlr_log(WLR_ERROR, "自管直通: %s 离开直通时换交换链失败",
 					output->wlr_output->name);
 			}
 		}
