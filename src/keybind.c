@@ -833,6 +833,36 @@ bool vidow_keybind_button(struct vidow_server *server, uint32_t button,
 	return false;
 }
 
+/* 这条滚轮事件会不会命中绑定表：只判断、不执行。
+ *
+ * 全景里要用它先决定「要不要按鼠标指着的那一行对账」：命中绑定说明接下来的
+ * 动作（换列 / 换工作区）该作用在鼠标指着的那块工作区上；没命中就是滚列表，
+ * 那时按行切换会把列表刚滚的那一格又拽回亮着的那块（test-overview 里量到过
+ * 630px 的跳跃）。 */
+bool vidow_keybind_wheel_bound(struct vidow_server *server,
+		enum wl_pointer_axis axis, double amount, uint32_t mods,
+		bool inhibited) {
+	if (server->locked || vidow_mru_active(server) || amount == 0) {
+		return false;
+	}
+	int dir = amount > 0 ? 1 : -1;
+	struct vidow_keybind *bind;
+	wl_list_for_each(bind, &server->keybinds, link) {
+		if (bind->src != VIDOW_SRC_WHEEL || bind->axis != axis ||
+				bind->axis_dir != dir) {
+			continue;
+		}
+		if (inhibited && !bind->inhibited) {
+			continue;
+		}
+		if (!mods_match(mods, bind->mods)) {
+			continue;
+		}
+		return true;
+	}
+	return false;
+}
+
 bool vidow_keybind_wheel(struct vidow_server *server,
 		enum wl_pointer_axis axis, double amount, uint32_t mods,
 		bool inhibited) {

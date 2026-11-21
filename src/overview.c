@@ -1123,7 +1123,27 @@ static void overview_track_pointer(struct vidow_server *server) {
  * 所以按键 / 滚轮进来之前先对一次账：光标停在哪块屏，就把键盘焦点交给那块屏
  * 现在亮着的工作区（vidow_workspace_focus_output = 换屏 + 换焦点窗口）。
  * **只在 overview 期间调用** —— 桌面时焦点归点击和方向键，不能被鼠标划过改掉。 */
-void vidow_overview_follow_pointer(struct vidow_server *server) {
+/* 光标压在哪一行上：返回那一行的工作区（不在任何行上就 NULL）。
+ *
+ * 行表是「这块屏上每一块工作区一行」，所以全景里鼠标指着哪一行、滚轮就该
+ * 作用在哪一块工作区。只认屏幕当前亮着的那块的话，另一块工作区的行怎么滚都
+ * 不响应（用户 2026-11-22 报的「DP-3 两个工作区，只有一个能用 super+滚轮」）。 */
+static struct vidow_workspace *overview_row_ws_at(
+		struct vidow_output *output, double ly) {
+	struct vidow_ov_screen *ov = &output->ov;
+	if (!ov->used || ov->n_rows <= 0) {
+		return NULL;
+	}
+	for (int i = 0; i < ov->n_rows; i++) {
+		double y0 = (double)ov->rows[i].y;
+		if (ly >= y0 && ly < y0 + ov->row_h) {
+			return ov->rows[i].ws;
+		}
+	}
+	return NULL;
+}
+void vidow_overview_follow_pointer(struct vidow_server *server,
+		bool allow_row) {
 	if (server->cursor == NULL || !vidow_overview_active(server)) {
 		return;
 	}
@@ -1141,6 +1161,17 @@ void vidow_overview_follow_pointer(struct vidow_server *server) {
 	}
 	struct vidow_output *out = vidow_output_lookup(server, at);
 	if (out == NULL || !out->ov.used) {
+		return;
+	}
+	/* 鼠标指着的是哪一行，就作用在哪一块工作区：行表里每块工作区占一行。
+	 * 只认「亮着的那块」的话，另一块怎么滚都没反应（用户报的 DP-3 两个
+	 * 工作区只有一个能用 super+滚轮）。换过去等价于点它那一行里的窗口。 */
+	struct wlr_box obox = {0};
+	wlr_output_layout_get_box(server->output_layout, at, &obox);
+	struct vidow_workspace *hover = overview_row_ws_at(out,
+		server->cursor->y - (double)obox.y);
+	if (allow_row && hover != NULL && hover != ws &&
+			vidow_workspace_activate(server, hover)) {
 		return;
 	}
 	if (server->focused != NULL && server->focused->ws == ws &&
