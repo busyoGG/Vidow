@@ -975,6 +975,7 @@ VIDOW_TEST_RENDERER=gles2 ./test-screencast.sh
 ./test-cross-move.sh                 # 浮窗跨屏搬位置：归属跟着几何搬、新屏上真的看得见、底衬改采新屏；再用真指针跨屏拖一趟（IPC 挪窗 + 拖拽，全 headless + grim 逐像素，11 项断言）
 ./test-cross-drag-stable.sh          # 跨屏拖拽时窗口横在交界上：归属不许来回搬（搬一次闪一下），交界两侧都要画出来，真拖过去才搬；5 项断言
 ./test-overview-keys.sh             # 两屏全景：光标在哪块屏，Super+滚轮（focus-column 之类）就作用在哪块屏的窗口焦点上；6 项断言
+./test-overview-ws.sh               # 全景里换工作区：列表要跟着滚到新换的那一块（不然用户看着像「没反应」）；9 项断言
 ./test-vt.sh                         # tty 的 VT 切换（Ctrl+Alt+F1..F12 / switch-vt 动作）（全 headless，11 项断言）
 ./test-focus.sh                      # 焦点规则 + 激活请求（全 headless，60 项断言）
 ./test-click-focus.sh                # 点另一块屏的空区域：键盘焦点跟着过去（4 项，见 256）

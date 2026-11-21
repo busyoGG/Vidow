@@ -1150,6 +1150,30 @@ void vidow_overview_follow_pointer(struct vidow_server *server) {
 	vidow_workspace_focus_output(server, at);
 }
 
+/* 全景开着的时候切了工作区：行表得按新的「亮着的那块」重建一遍。
+ *
+ * 不重建会露两个问题（用户 2026-11-22 报：「同一个屏幕的工作区还是不能换」）：
+ * 一是空工作区在 rows_build 里只有「亮着的」才留一行，换过去之后新块根本没有行；
+ * 二是列表滚动 rows_scroll_to_active 只在进全景时算过一次，换块之后列表还停在
+ * 原来那几行，用户看到的就是「什么都没变」。
+ *
+ * 只在全景期间调用 —— 桌面上切工作区有自己的过渡动画，跟行表无关。 */
+void vidow_overview_workspace_changed(struct vidow_server *server) {
+	if (server == NULL || !vidow_overview_active(server)) {
+		return;
+	}
+	struct vidow_output *output;
+	wl_list_for_each(output, &server->outputs, link) {
+		if (!output->ov.used) {
+			continue;
+		}
+		rows_build(server, output);
+		rows_scale(server, output);
+		rows_scroll_to_active(server, output);
+		rows_place(server, output);
+	}
+}
+
 void vidow_overview_update(struct vidow_server *server) {
 	if (!vidow_overview_active(server)) {
 		return;

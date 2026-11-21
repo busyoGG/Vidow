@@ -1402,6 +1402,8 @@ bool vidow_workspace_activate(struct vidow_server *server,
 	focus_workspace(server, ws);
 	vidow_arrange(server);
 	vidow_workspace_slide_raise(server);
+	/* 全景开着时换工作区：行表重建并滚到新块（见 overview.c）。 */
+	vidow_overview_workspace_changed(server);
 	vidow_ipc_emit_workspace(server, "workspace-activated", ws);
 	/* 刚离开的那块要是空的、没名字的、又在栈中间 —— 收掉（niri：切走就消失）。 */
 	vidow_workspace_cleanup(server);
