@@ -144,6 +144,14 @@ float clamp01(double v);
 /* ---------------------------------------------------------------- 调试探针 */
 
 int blur_dump_limit(void);
+/* 把源框夹进贴图里，返回 false = 夹完是空的，这一笔别画。
+ *
+ * 这些源框都是我们自己按输出几何算出来的，而输出刚恢复、底衬缓冲还是旧尺寸、
+ * 客户端的 src_box 比缓冲还大之类的瞬间，算出来就会越界。wlroots 的 render pass
+ * 对越界的源框是**断言**（直接 abort 掉整个会话），夹一刀比让用户登录重来强。 */
+bool src_box_clamp(struct wlr_texture *tex, struct wlr_fbox *box,
+		const char *where);
+
 void dump_buffer(struct vidow_server *server, struct wlr_buffer *buffer,
 	int w, int h, const char *tag, int index);
 bool ov_stats_on(void);

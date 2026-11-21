@@ -860,12 +860,14 @@ static bool layer_under_ensure(struct vidow_server *server,
 	wlr_render_pass_add_rect(pass, &clear);
 
 	float one = 1.0f;
+	struct wlr_fbox lsrc = {
+		.x = (float)b.x, .y = (float)b.y,
+		.width = (float)b.width, .height = (float)b.height,
+	};
+	if (src_box_clamp(output->backdrop_tex, &lsrc, "layer 底衬")) {
 	struct wlr_render_texture_options base = {
 		.texture = output->backdrop_tex,
-		.src_box = {
-			.x = (float)b.x, .y = (float)b.y,
-			.width = (float)b.width, .height = (float)b.height,
-		},
+		.src_box = lsrc,
 		.dst_box = { .x = 0, .y = 0,
 			.width = b.width, .height = b.height },
 		.alpha = &one,
@@ -874,6 +876,7 @@ static bool layer_under_ensure(struct vidow_server *server,
 		.blend_mode = WLR_RENDER_BLEND_MODE_PREMULTIPLIED,
 	};
 	wlr_render_pass_add_texture(pass, &base);
+	}
 
 	struct backdrop_ctx ctx = {
 		.pass = pass,
@@ -1043,13 +1046,17 @@ bool layer_region_build(struct vidow_server *server,
 		int usx = use_under ? output->under_box.x : 0;
 		int usy = use_under ? output->under_box.y : 0;
 		int dw = bx2 - bx1, dh = by2 - by1;
+		struct wlr_texture *stex = use_under ? output->under_tex :
+				output->backdrop_tex;
+		struct wlr_fbox lsrc = {
+			.x = (float)(bx1 - usx), .y = (float)(by1 - usy),
+			.width = (float)(bx2 - bx1), .height = (float)(by2 - by1),
+		};
 		float one = 1.0f;
+		if (src_box_clamp(stex, &lsrc, "layer 单层底衬")) {
 		struct wlr_render_texture_options base = {
-			.texture = use_under ? output->under_tex : output->backdrop_tex,
-			.src_box = {
-				.x = (float)(bx1 - usx), .y = (float)(by1 - usy),
-				.width = (float)(bx2 - bx1), .height = (float)(by2 - by1),
-			},
+			.texture = stex,
+			.src_box = lsrc,
 			.dst_box = {
 				.x = bx1 - rx, .y = by1 - ry,
 				.width = dw, .height = dh,
@@ -1059,7 +1066,8 @@ bool layer_region_build(struct vidow_server *server,
 			.filter_mode = WLR_SCALE_FILTER_NEAREST,
 			.blend_mode = WLR_RENDER_BLEND_MODE_PREMULTIPLIED,
 		};
-		wlr_render_pass_add_texture(pass, &base);
+			wlr_render_pass_add_texture(pass, &base);
+		}
 	}
 	if (!use_under) {
 

@@ -560,6 +560,12 @@ void backdrop_iter(struct wlr_scene_buffer *sb, int sx, int sy,
 		x2 = cx2;
 		y2 = cy2;
 	}
+	if (!src_box_clamp(tex, &sbox, "底衬-场景缓冲")) {
+		if (tex_owned) {
+			wlr_texture_destroy(tex);
+		}
+		return;
+	}
 	struct wlr_render_texture_options opts = {
 		.texture = tex,
 		.src_box = sbox,
@@ -573,6 +579,43 @@ void backdrop_iter(struct wlr_scene_buffer *sb, int sx, int sy,
 	if (tex_owned) {
 		wlr_texture_destroy(tex);
 	}
+}
+
+/* 见 fx-internal.h 的说明。夹过的写一行日志（只记前 8 次），
+ * 因为真出现时就是「某个源框算错了」，日志里要知道是哪一处。 */
+bool src_box_clamp(struct wlr_texture *tex, struct wlr_fbox *box,
+		const char *where) {
+	if (tex == NULL || box == NULL) {
+		return false;
+	}
+	int tw = (int)tex->width;
+	int th = (int)tex->height;
+	double x1 = box->x, y1 = box->y;
+	double x2 = box->x + box->width, y2 = box->y + box->height;
+	if (!(box->width > 0.0) || !(box->height > 0.0)) {
+		return false;
+	}
+	double cx1 = x1 < 0.0 ? 0.0 : x1;
+	double cy1 = y1 < 0.0 ? 0.0 : y1;
+	double cx2 = x2 > (double)tw ? (double)tw : x2;
+	double cy2 = y2 > (double)th ? (double)th : y2;
+	if (cx2 <= cx1 || cy2 <= cy1) {
+		return false;
+	}
+	if (cx1 != x1 || cy1 != y1 || cx2 != x2 || cy2 != y2) {
+		static int clamped;
+		if (clamped < 8) {
+			clamped++;
+		wlr_log(WLR_INFO, "源框越界（%s）：源 %.0f,%.0f %.0fx%.0f 贴图 %dx%d，夹成 "
+				"%.0f,%.0f %.0fx%.0f", where, x1, y1, box->width, box->height, tw, th,
+				cx1, cy1, cx2 - cx1, cy2 - cy1);
+		}
+	}
+	box->x = cx1;
+	box->y = cy1;
+	box->width = cx2 - cx1;
+	box->height = cy2 - cy1;
+	return true;
 }
 
 bool backdrop_render(struct vidow_server *server,
@@ -2680,12 +2723,14 @@ static bool view_region_build(struct vidow_server *server,
 		by2 = y2;
 	}
 	float one = 1.0f;
+	struct wlr_fbox bsrc = {
+		.x = (float)bx1, .y = (float)by1,
+		.width = (float)(bx2 - bx1), .height = (float)(by2 - by1),
+	};
+	if (src_box_clamp(output->backdrop_tex, &bsrc, "底衬-基座")) {
 	struct wlr_render_texture_options base = {
 		.texture = output->backdrop_tex,
-		.src_box = {
-			.x = (float)bx1, .y = (float)by1,
-			.width = (float)(bx2 - bx1), .height = (float)(by2 - by1),
-		},
+		.src_box = bsrc,
 		.dst_box = {
 			.x = (float)(bx1 - rx), .y = (float)(by1 - ry),
 			.width = (float)(bx2 - bx1), .height = (float)(by2 - by1),
@@ -2696,6 +2741,7 @@ static bool view_region_build(struct vidow_server *server,
 		.blend_mode = WLR_RENDER_BLEND_MODE_NONE,
 	};
 	wlr_render_pass_add_texture(pass, &base);
+	}
 
 	/* 窗口画在基座上：这个窗口自己藏起来，别的照画。只画 toplevels —— 弹出物那
 	 * 一层在窗口**上面**，不该进窗口的底衬（共享底衬那趟也是这么做的）。 */
