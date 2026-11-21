@@ -99,3 +99,67 @@ Composited ──(判据通过)──> ScanningOut
 - 代价：接管 commit 路径，需要自己处理 `frame_done` / `present` 事件、
   以及「退出后第一帧必须全屏重画」。
 - 回退开关：`VIDOW_NO_SCANOUT=1` 仍然一律走合成。
+
+## 后续补齐（2026-11-21）
+
+四条从 niri / Hyprland 最新提交里抄来的缺口，都已落地：
+
+### 1) 平面格式（YUV）缓冲不许直通
+
+Hyprland `monitor: block direct scanout of yuv buffers`（2026-11）。它们照样
+advertise yuv dmabuf，只是不进直通 —— 理由同上：平面格式得先经 shader 转成
+RGB 才能跟我们的装饰合成。
+
+实现在 `vidow_output_scanout_buffer()`（`src/fx.c`）：dmabuf 的 fourcc 走
+**白名单**（ARGB/XRGB/ABGR/XBGR/RGBA/RGBX/BGRA/BGRX 8bit、RGB565/BGR565、
+ARGB/XRGB/ABGR/XBGR 2101010），其余一律 `return NULL` 并在 DEBUG 记一行
+`scanout off: … 缓冲格式 0x… 不能直通`。shm 缓冲不查（Wayland 的 shm 格式里
+没有平面格式）。
+
+测试：`test-scanout.sh` 第 6 段用 `VIDOW_TEST_SCANOUT_YUV=1`（测试钩子，把任意
+缓冲当成平面格式）验「这道闸真的拦得住」—— 真拿 NV12 客户端来测，测试环境里
+造不出来。
+
+### 2) 离开直通那一帧换主交换链
+
+Hyprland `monitor: update swapchain when leaving DS to avoid short flickers`
+（`98b642e`）。直通时送上屏的是客户端那张缓冲：格式、修饰都可能跟我们自己的
+交换链不一样（8bit 客户端 → 10bit/HDR 桌面是典型）。沿用旧交换链，第一帧会露
+一次格式不符的闪烁。
+
+实现：`src/output.c` 的渲染函数里记 `bool was_scanout = output->scanout_self;`，
+直通块之后若 `was_scanout && !output->scanout_self` 就
+`wlr_output_configure_primary_swapchain(output->wlr_output, &state, &output->wlr_output->swapchain)`。
+
+### 3) 手势松手居中吸附
+
+niri `layout/scrolling: Add center snap to view gesture`（2026-11-18）。手势拖完
+松手时，焦点列停在**可用区正中**，而不是「刚好全部可见」那个最小滚动量 ——
+后者会让焦点列贴左边、右边空一大块。
+
+实现：`src/gesture.c` 的 `view_snap()` 在 arrange 出最小滚动量之后改算居中值
+（`fc->offset - (work_w - fc->width) / 2`，夹在 `[0, 条带总宽 - 可用区宽]`）。
+列比可用区还宽时退回最小滚动（居中等于把窗口推出屏外）。窗口换焦点那条路
+不受影响 —— 那是 `layout { center-focused-column }` 管的事。
+
+### 4) `stop-cast`：按编号收掉一路录制
+
+niri `ipc: cast tracking (CastKind / pw_node_id / stop-cast)`。现场的用法：录屏
+客户端被强杀，portal 那一路没回收，桌面上一直挂着一路按帧抓屏（白烧 GPU），
+以前只能重启合成器。
+
+实现：
+- `struct vidow_screencast_stream` 加 `uint64_t id`（单调递增）与 `pid_t pid`
+  （`wl_client_get_credentials`，排「哪个程序在抓帧」用）。
+- `unsigned vidow_screencast_stop(struct vidow_server *, uint64_t id)`：`id == 0`
+  收全部；收之前给客户端发 `closed`。
+- IPC：`screencast`（信息）与 `stop_cast` / `stop-cast`（`{"id": N}`，不写 = 全部），
+  JSON 里多了 `id` / `pid`。
+
+### 没做的两条，以及为什么
+
+- niri `Add workaround for redrawing invisible screencasted windows`：**Vidow 早就
+  有** `vidow_view_capture_held()`（`src/fx.c` 里 `(!view->scene_parked || vidow_view_capture_held(view))`），
+  录屏中的窗口即便滚出视口也照常点亮渲染。
+- Hyprland `815e3a8`（top layer 压全屏）与 `42a7574`（小 surface 按逻辑尺寸）：
+  与直通无关，留给后续。
