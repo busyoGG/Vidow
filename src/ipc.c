@@ -811,6 +811,27 @@ static bool cmd_move_window_direction(struct vidow_server *server,
 	return direction_cmd(server, req, out, err, errlen, vidow_move_window, false);
 }
 
+/* 结束录制：`id` 不写 = 全部收掉（niri 的 `ipc: stop-cast`）。
+ *
+ * 现场的用法：某个录屏客户端被强杀，portal 那一路没回收，桌面上一直挂着
+ * 一路在抓帧（白烧 GPU）。以前只能重启合成器，现在一条命令收掉。 */
+static bool cmd_stop_cast(struct vidow_server *server, struct jval *req,
+		struct jbuf *out, char *err, size_t errlen) {
+	uint64_t id = 0;
+	long long ll = 0;
+	if (jget_int(req, "id", &ll) && ll > 0) {
+		id = (uint64_t)ll;
+	} else if (jget_int(req, "stream", &ll) && ll > 0) {
+		id = (uint64_t)ll;
+	}
+	unsigned n = vidow_screencast_stop(server, id);
+	jb_obj(out);
+	jb_kv_uint(out, "stopped", n);
+	jb_kv_uint(out, "id", id);
+	jb_obj_end(out);
+	return true;
+}
+
 /* 把窗口从它那条列里取出来、单独成一条新列（niri 的 expel-window-from-column）。
  * direction 不写 = 右边（left / -1 = 左边）。 */
 static bool cmd_expel_window_from_column(struct vidow_server *server,
@@ -2567,8 +2588,15 @@ static bool ipc_run(struct vidow_server *server, struct ipc_client *c,
 		vidow_ipc_json_rules(out, server);
 		return true;
 	}
+	if (strcmp(cmd, "screencast") == 0) {
+		vidow_ipc_json_screencast(out, server);
+		return true;
+	}
 	if (strcmp(cmd, "config") == 0 || strcmp(cmd, "get_config") == 0) {
 		return cmd_get_config(server, req, out, err, errlen);
+	}
+	if (strcmp(cmd, "stop_cast") == 0 || strcmp(cmd, "stop-cast") == 0) {
+		return cmd_stop_cast(server, req, out, err, errlen);
 	}
 	if (strcmp(cmd, "seats") == 0) {
 		vidow_ipc_json_seats(out, server);

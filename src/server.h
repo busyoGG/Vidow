@@ -4225,6 +4225,12 @@ struct vidow_screencast_stream {
 	/* 其中多少帧是「指针动了」催出来的（见 vidow_screencast_cursor_moved）。 */
 	uint64_t cursor_pushes;
 	bool closed;
+	/* 这一路的编号（IPC 用，单调递增）：niri 的 `stop-cast` 要按编号
+	 * 精确收掉一路，用列表下标不行 —— 下标会随别人关掉而飘。 */
+	uint64_t id;
+	/* 开这一路的客户端 pid（从 wl_client 的凭据来）。录屏审计 / 排「哪
+	 * 个程序在偷抓帧」都要它。 */
+	pid_t pid;
 	struct wl_listener output_destroy;
 	struct vidow_sc_pw_stream *pw;
 };
@@ -4282,6 +4288,10 @@ void vidow_sc_pw_stream_destroy(struct vidow_screencast_stream *stream);
  * 流的「这一帧长什么样」包含光标位置 / 位图，指针移动本身就是内容变了。只在真的
  * 有这种流的时候做（没有就是一次链表遍历）。 */
 void vidow_screencast_cursor_moved(struct vidow_server *server);
+
+/* 按编号结束录制：`id == 0` 表示全部收掉。返回收掉的路数。
+ * 给 IPC 的 stop-cast 用（见 ipc.c）。 */
+unsigned vidow_screencast_stop(struct vidow_server *server, uint64_t id);
 
 /* 这个抓帧源是不是 vidow 自己出的帧（是的话「有人抓帧」不该惊动屏幕 —— 屏幕那
  * 一帧本来就不受影响）。 */

@@ -999,6 +999,8 @@ void vidow_ipc_json_screencast(struct jbuf *b, struct vidow_server *server) {
 			struct vidow_sc_stream_stats st;
 			vidow_screencast_stream_stats(stream, &st);
 			jb_obj(b);
+			jb_kv_uint(b, "id", stream->id);
+			jb_kv_int(b, "pid", (int)stream->pid);
 			jb_kv_str(b, "kind", sc_kind_name(stream->kind));
 			jb_kv_str(b, "output", stream->output != NULL ?
 				stream->output->name : NULL);

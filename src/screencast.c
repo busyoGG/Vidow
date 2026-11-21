@@ -1559,6 +1559,35 @@ static int count_streams(const struct vidow_screencast *sc) {
 	return n;
 }
 
+/* 按编号结束录制（IPC 的 stop-cast）。id == 0 = 全部收掉。
+ *
+ * 为什么要它：客户端被 SIGKILL 之后，portal 那一路有时来不及走销毁流程，
+ * 桌面上就挂着一路还在按 60fps 抓帧的流（niri 在 2026-11 的
+ * `ipc: stop-cast` 补的就是这个洞）。有这条命令就不必重启合成器。 */
+unsigned vidow_screencast_stop(struct vidow_server *server, uint64_t id) {
+	unsigned n = 0;
+	if (server->screencast == NULL) {
+		return 0;
+	}
+	struct vidow_screencast_stream *st, *tmp;
+	wl_list_for_each_safe(st, tmp, &server->screencast->streams, link) {
+		if (id != 0 && st->id != id) {
+			continue;
+		}
+		wlr_log(WLR_INFO, "录屏: 按请求结束第 %llu 路（%s，pid %d）",
+			(unsigned long long)st->id, kind_name(st->kind),
+			(int)st->pid);
+		/* 先把 resource 的 user_data 摘掉，stream_destroy 里会做，但这里
+		 * 还要防客户端仍在用 —— 通知它这一路结束了。 */
+		if (st->resource != NULL) {
+			zkde_screencast_stream_unstable_v1_send_closed(st->resource);
+		}
+		stream_destroy(st);
+		n++;
+	}
+	return n;
+}
+
 static void stream_destroy(struct vidow_screencast_stream *stream) {
 	struct vidow_screencast *sc = stream->sc;
 	/* 事件：这一路结束了（客户端断开 / 窗口没了 / 输出拔了都会走到这儿）。
@@ -1603,6 +1632,7 @@ static void stream_destroy(struct vidow_screencast_stream *stream) {
 static struct vidow_screencast_stream *stream_create(struct wl_client *client,
 		struct vidow_screencast *sc, uint32_t stream_id, uint32_t version,
 		struct wlr_output *output, uint32_t pointer_mode) {
+	static uint64_t next_stream_id = 1;
 	struct vidow_screencast_stream *stream = calloc(1, sizeof(*stream));
 	if (stream == NULL) {
 		wl_client_post_no_memory(client);
@@ -1614,6 +1644,15 @@ static struct vidow_screencast_stream *stream_create(struct wl_client *client,
 	wl_list_init(&stream->output_destroy.link);
 	wl_list_init(&stream->view_destroy.link);
 	wl_list_insert(&sc->streams, &stream->link);
+	/* 编号从这里发：IPC 的 stop-cast 按它认路。 */
+	stream->id = next_stream_id++;
+	{
+		pid_t cpid = 0;
+		uid_t cuid = 0;
+		gid_t cgid = 0;
+		wl_client_get_credentials(client, &cpid, &cuid, &cgid);
+		stream->pid = cpid;
+	}
 
 	stream->resource = wl_resource_create(client,
 		&zkde_screencast_stream_unstable_v1_interface, (int)version, stream_id);
