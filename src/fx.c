@@ -1211,6 +1211,13 @@ struct wlr_buffer *vidow_output_scanout_buffer(struct vidow_output *vo) {
 		if (ls->content_invisible == 1) {
 			continue; /* 量出来一个像素都没画 */
 		}
+		/* background / bottom 按协议就排在窗口下面：窗口不透明时它们一个
+		 * 像素都露不出来，不该投否决票（ADR 0005 的遮挡那一步）。以前的
+		 * 实现只看「内容盒相交」，壁纸铺满整块屏就把每一块屏的直通全否了。 */
+		if (ls->layer == ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND ||
+				ls->layer == ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM) {
+			continue;
+		}
 		/* 量出来的那一块在屏外（整块不交）也不算挡住：看不见就不影响直通。
 		 * content_x/y 是相对于 geom 的局部坐标，而 geom 已经是布局坐标。 */
 		struct wlr_box cb = {

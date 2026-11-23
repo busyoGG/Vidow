@@ -44,7 +44,7 @@ stop_clients() {
 		[ "$pid" = "$$" ] && continue
 		cmd=$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null) || continue
 		case "$cmd" in
-		*pattern.py*|*grim*) kill "$pid" 2>/dev/null ;;
+		*pattern.py*|*grim*|*dot.py*) kill "$pid" 2>/dev/null ;;
 		esac
 	done 2>/dev/null
 }
@@ -151,6 +151,21 @@ else
 	fail "没走到自管直通（候选判据没通过）"
 fi
 
+
+mark "2c) 背景层（排在窗口下面）不挡直通"
+# vshell 的壁纸就是 background 层：铺满整块屏，但按协议排在窗口下面，窗口
+# 不透明时它一个像素都露不出来。ADR 0005 的判据里它不该投否决票 —— 以前
+# 只看「内容盒和屏相交」，铺满的壁纸把每一块屏的直通全否了。
+# 这块 layer 一直留到测试结束（它就是壁纸），免得半路杀掉让后面几张截图
+# 拍到的底色不一致。
+before=$(count "自管直通: .* 停")
+setsid nohup python3 ./tools/dot.py 300 200 > "$RUNDIR/dot.log" 2>&1 </dev/null &
+sleep 1.8
+if [ "$(count "自管直通: .* 停")" = "$before" ]; then
+	pass "背景层铺满整块屏也不挡直通"
+else
+	fail "背景层把直通打断了（$(count "自管直通: .* 停") 次「停」）"
+fi
 
 mark "2b) 看不见的窗口不挡直通；看得见的才挡"
 python3 ./tools/pattern.py w2 > "$RUNDIR/w2.log" 2>&1 &
