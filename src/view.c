@@ -959,7 +959,12 @@ static void view_sync_drag_outputs(struct vidow_view *view,
 	if (server == NULL) {
 		return;
 	}
-	struct wlr_box box = vidow_view_screen_box(view);
+	/* **判据用几何盒，不用带弹簧偏移的那份**（vidow_view_screen_box 会加上
+	 * anim_off）：果冻 / 拖拽弹簧的位移每帧都在抖，拿它去算「压没压上另一块
+	 * 屏」，窗口贴着交界时 enter / leave 会跟着抖 —— 客户端就跟着在 1 倍 /
+	 * 2 倍之间反复重交缓冲，屏幕上就是一闪一闪（用户 2026-11-24 报的跨屏
+	 * 拖拽回闪）。几何盒是布局给的那份，稳。 */
+	struct wlr_box box = view->geom;
 	struct vidow_output *output;
 	wl_list_for_each(output, &server->outputs, link) {
 		struct wlr_output *wlr_output = output->wlr_output;
@@ -971,6 +976,34 @@ static void view_sync_drag_outputs(struct vidow_view *view,
 		struct wlr_box hit;
 		if (!wlr_box_intersection(&hit, &box, &obox)) {
 			continue;
+		}
+		/* **擦边不算压上**：窗口只压过一两个像素就把这块屏塞进 enter 集合，
+		 * 客户端会按它的倍率交缓冲；光标抖回一个像素又 leave —— 一块 2 倍屏
+		 * 和一块 1 倍屏之间来回翻，屏幕上就是「动一下就回闪一下」。
+		 *
+		 * 用户 2026-11-24 报的跨屏拖拽闪烁就是这个：果冻画的是**按倍率烘的
+		 * 那份装饰缓冲**，倍率每翻一次就整窗重烘一遍（关掉果冻就看不见，
+		 * 因为那时画的是客户端表面，wlroots 自己按屏取缓冲）。
+		 *
+		 * 8 个逻辑像素以内不算压上：肉眼看不出来，足够挡住 1px 抖动。 */
+		if (hit.width < 8 && hit.height < 8) {
+			continue;
+		}
+		/* 只记**真的新进**（send_enter 自己去重，这里照抄那份判据），
+		 * 不然拖拽期间每帧都打一行，日志看不出「翻了几次」。 */
+		bool already = false;
+		struct wlr_surface_output *so_has;
+		wl_list_for_each(so_has, &surface->current_outputs, link) {
+			if (so_has->output == wlr_output) {
+				already = true;
+				break;
+			}
+		}
+		if (!already) {
+			wlr_log(WLR_DEBUG, "拖拽 enter: %s -> %s",
+				vidow_view_title(view) != NULL ?
+					vidow_view_title(view) : "(无题)",
+				wlr_output->name);
 		}
 		wlr_surface_send_enter(surface, wlr_output);
 	}
@@ -1002,9 +1035,17 @@ static void view_sync_drag_outputs(struct vidow_view *view,
 				so->output, &obox);
 			struct wlr_box hit;
 			keep = wlr_box_intersection(&hit, &box, &obox);
+			/* 和上面 enter 同一条门槛：贴边 1px 不算压上，直接 leave。 */
+			if (keep && hit.width < 8 && hit.height < 8) {
+				keep = false;
+			}
 			break;
 		}
 		if (!keep) {
+			wlr_log(WLR_DEBUG, "拖拽 leave: %s <- %s",
+				vidow_view_title(view) != NULL ?
+					vidow_view_title(view) : "(无题)",
+				so->output->name);
 			wlr_surface_send_leave(surface, so->output);
 			entered_changed = true;
 		}
